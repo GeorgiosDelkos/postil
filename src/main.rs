@@ -40,6 +40,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     })
 }
 
+#[expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "main is the command's one output function: usage, bench report, errors"
+)]
 fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,

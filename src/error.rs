@@ -5,7 +5,7 @@ use std::io;
 use std::path::PathBuf;
 
 /// A specialized `Result` for this crate.
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Why opening the repository or the window failed, or why a file could not be shown.
 #[derive(Debug)]

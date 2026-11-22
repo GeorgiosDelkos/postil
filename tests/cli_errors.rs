@@ -27,7 +27,7 @@ fn bad_arguments_print_usage_and_exit_2() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--bench needs a file"), "{stderr}");
     assert!(stderr.contains("usage: postil"), "{stderr}");
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
 }
 
 #[test]

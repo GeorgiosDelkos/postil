@@ -122,7 +122,7 @@ fn serve(dir: &Path, bench: Option<&str>) -> Result<Option<BenchReport>> {
             if let Some(message) = message {
                 // Sending fails only once the event loop is gone, when nobody is left to
                 // act on the message.
-                let _ = proxy.send_event(message);
+                drop(proxy.send_event(message));
             }
         })
         .with_url("postil://localhost/")
@@ -141,7 +141,7 @@ fn serve(dir: &Path, bench: Option<&str>) -> Result<Option<BenchReport>> {
             Event::UserEvent(PageMessage::DragWindow) => {
                 // Fails when the pointer button is already up again: there is then nothing
                 // to drag.
-                let _ = window.drag_window();
+                drop(window.drag_window());
             }
             Event::UserEvent(PageMessage::BenchPainted) => {
                 launch_to_paint = Some(started.elapsed());
@@ -376,7 +376,7 @@ mod tests {
     impl Drop for TempRepo {
         fn drop(&mut self) {
             // Best effort: a leftover directory in the temporary directory fails no test.
-            let _ = fs::remove_dir_all(&self.root);
+            drop(fs::remove_dir_all(&self.root));
         }
     }
 
