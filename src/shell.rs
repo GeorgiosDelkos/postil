@@ -9,6 +9,7 @@
 //! project replaces the current one and the page reloads.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -114,7 +115,9 @@ impl AppEvent {
 
 fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
     let started = Instant::now();
-    let site = Site::new(config_dir()?.join("recent.json"), bench);
+    // Without a configuration directory the recent list is off, which the page says once a
+    // project is open: the list is a convenience, so it never stops the app from starting.
+    let site = Site::new(config_dir().ok().map(|dir| dir.join("recent.json")), bench);
     if let Some(dir) = dir {
         site.open(Repo::open(dir)?);
     }
@@ -133,6 +136,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
 
     let page_proxy = event_loop.create_proxy();
     let drop_proxy = event_loop.create_proxy();
+    let dragging_files = Cell::new(false);
     let webview = WebViewBuilder::new()
         .with_background_color(canvas)
         .with_custom_protocol("postil".to_owned(), move |_webview, request| {
@@ -149,15 +153,33 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 drop(page_proxy.send_event(event));
             }
         })
-        .with_drag_drop_handler(move |event| {
-            if let DragDropEvent::Drop { paths, .. } = event
-                && let Some(path) = paths.into_iter().next()
-            {
+        // A drag that carries files is the app's: the webview would navigate to a dropped
+        // file. Any other drag (text into the note composer) is left to the webview, so the
+        // handler answers `true` only while files are over the window.
+        .with_drag_drop_handler(move |event| match event {
+            DragDropEvent::Enter { paths, .. } => {
+                dragging_files.set(!paths.is_empty());
+                dragging_files.get()
+            }
+            DragDropEvent::Over { .. } => dragging_files.get(),
+            DragDropEvent::Drop { paths, .. } => {
+                dragging_files.set(false);
+                // A project is one folder: the first folder dropped opens, or, when only files
+                // were dropped, the first file, which the page then reports as not a folder.
+                let Some(path) = paths
+                    .iter()
+                    .find(|path| path.is_dir())
+                    .or_else(|| paths.first())
+                    .cloned()
+                else {
+                    return false;
+                };
                 // As above: fails only once the event loop is gone.
                 drop(drop_proxy.send_event(AppEvent::Dropped(path)));
+                true
             }
-            // Handled here: the webview's own handling would navigate to the dropped file.
-            true
+            DragDropEvent::Leave => dragging_files.replace(false),
+            _ => false,
         })
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
         // not reach the `postil://` handlers, which read and write the repository.
@@ -242,19 +264,28 @@ fn build_window(event_loop: &EventLoop<AppEvent>) -> Result<Window> {
 /// Everything the page can ask for.
 ///
 /// The URL scheme handler must be `Send + Sync`, so the open project sits behind a mutex.
-/// Every lock is held only to swap or clone the `Arc`, never across a `git` call or a file
-/// read, and each value is replaced whole, so the state is valid after any panic.
+/// The lock is held only to replace the project or clone it out, never across a `git` call
+/// or a file read, and the project is replaced whole, so the state is valid after any panic.
+/// wry calls the handler on the main thread, one request at a time, so the lock is never
+/// contended; it is there for the bound.
 struct Site {
     /// The open project, if any.
-    project: Mutex<Option<Arc<Repo>>>,
+    project: Mutex<Option<Project>>,
     highlighter: Highlighter,
     /// The file the benchmark opens, when this is a benchmark run.
     bench: Option<String>,
-    /// Where the recent projects are listed (`recent.rs`).
-    recent_file: PathBuf,
-    /// A problem to show once, with the next `/api/repo`: the recent projects could not be
-    /// updated when the project opened. It does not stop the project from opening.
-    warning: Mutex<Option<String>>,
+    /// Where the recent projects are listed (`recent.rs`); `None` when the configuration
+    /// directory is unknown, which turns the list off.
+    recent_file: Option<PathBuf>,
+}
+
+/// The open project.
+#[derive(Clone)]
+struct Project {
+    repo: Arc<Repo>,
+    /// Why the recent projects could not be updated when this project opened, shown under
+    /// the branch name. Kept with the project, so every page load of it shows the line.
+    warning: Option<String>,
 }
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
@@ -300,27 +331,37 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Site {
-    fn new(recent_file: PathBuf, bench: Option<&str>) -> Self {
+    fn new(recent_file: Option<PathBuf>, bench: Option<&str>) -> Self {
         Self {
             project: Mutex::new(None),
             highlighter: Highlighter::new(),
             bench: bench.map(str::to_owned),
             recent_file,
-            warning: Mutex::new(None),
         }
     }
 
-    /// The open project.
+    /// The open project's repository.
     fn repo(&self) -> Result<Arc<Repo>> {
-        lock(&self.project).clone().ok_or(Error::NoProject)
+        lock(&self.project)
+            .as_ref()
+            .map(|project| Arc::clone(&project.repo))
+            .ok_or(Error::NoProject)
     }
 
-    /// Makes `repo` the open project and puts it first among the recent projects.
+    /// Makes `repo` the open project and puts it first among the recent projects. A
+    /// benchmark does not count as opening: a scripted run must not reorder the list.
     fn open(&self, repo: Repo) {
-        if let Err(error) = recent::record(&self.recent_file, repo.root()) {
-            *lock(&self.warning) = Some(error_chain(&error));
-        }
-        *lock(&self.project) = Some(Arc::new(repo));
+        let warning = match (&self.recent_file, &self.bench) {
+            (_, Some(_)) => None,
+            (None, None) => Some(format!("recent projects are off: {}", Error::NoHome)),
+            (Some(file), None) => recent::record(file, repo.root())
+                .err()
+                .map(|error| error_chain(&error)),
+        };
+        *lock(&self.project) = Some(Project {
+            repo: Arc::new(repo),
+            warning,
+        });
     }
 
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
@@ -376,7 +417,7 @@ impl Site {
 
     /// The open project, or `null`: the page then shows the welcome screen.
     fn repo_info(&self) -> Result<Vec<u8>> {
-        let Some(repo) = lock(&self.project).clone() else {
+        let Some(Project { repo, warning }) = lock(&self.project).clone() else {
             return Ok(b"null".to_vec());
         };
         let info = RepoInfo {
@@ -385,13 +426,17 @@ impl Site {
             branch: repo.branch()?,
             files: repo.files()?,
             bench: self.bench.as_deref(),
-            warning: lock(&self.warning).take(),
+            warning,
         };
         Ok(to_json(&info))
     }
 
     fn recent(&self) -> Vec<u8> {
-        let projects: Vec<RecentProject> = recent::list(&self.recent_file)
+        let listed = self.recent_file.as_deref().map(recent::list);
+        // `exists` checks each folder on the main thread. A folder on a network volume that is
+        // gone can make that slow; accepted, as ten checks on local disks take microseconds.
+        let projects: Vec<RecentProject> = listed
+            .unwrap_or_default()
             .into_iter()
             .map(|path| {
                 let folder = Path::new(&path);
@@ -463,7 +508,8 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::OutsideRepository { .. }
                 | Error::InvalidNote(_)
                 | Error::BadRequest(_)
-                | Error::NotAFolder { .. } => StatusCode::BAD_REQUEST,
+                | Error::NotAFolder { .. }
+                | Error::TooBroad { .. } => StatusCode::BAD_REQUEST,
                 Error::NoteTextChanged { .. } | Error::NoProject => StatusCode::CONFLICT,
                 Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
                 // The page tells this one apart: it offers to make the folder a repository.
@@ -591,7 +637,7 @@ mod tests {
         /// A site with no project open, its recent list inside this repository's git
         /// directory, where no file listing sees it and the drop below removes it.
         fn empty_site(&self) -> Site {
-            Site::new(self.root.join(".git/test-recent.json"), None)
+            Site::new(Some(self.root.join(".git/test-recent.json")), None)
         }
     }
 
@@ -1171,12 +1217,12 @@ mod tests {
     }
 
     #[test]
-    fn a_recent_list_that_cannot_be_written_warns_once_and_the_project_still_opens() {
+    fn a_recent_list_that_cannot_be_written_warns_and_the_project_still_opens() {
         let repo = TempRepo::new("recent-unwritable");
         // The list's path is a directory, so no file can be renamed onto it.
         let recent = repo.root.join(".git/recent-dir");
         fs::create_dir_all(recent.join("inside")).unwrap();
-        let site = Site::new(recent, None);
+        let site = Site::new(Some(recent), None);
 
         let (status, body) = post(
             &site,
@@ -1184,17 +1230,59 @@ mod tests {
             &open_request(&repo.root),
         );
         assert_eq!(status, StatusCode::OK, "{body}");
+        // Every load of the project shows it: a request from the page being replaced must
+        // not be the one that takes it.
+        for _ in 0..2 {
+            let info = get_json(&site, "postil://localhost/api/repo");
+            let warning = info["warning"].as_str().unwrap();
+            assert!(
+                warning.contains("cannot update the recent projects"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_configuration_directory_the_recent_list_is_off_and_projects_open() {
+        let repo = TempRepo::new("recent-off");
+        let site = Site::new(None, None);
+
+        site.open(Repo::open(&repo.root).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
-        let warning = info["warning"].as_str().unwrap();
-        assert!(
-            warning.contains("cannot update the recent projects"),
-            "{warning}"
+        assert_eq!(
+            info["warning"],
+            "recent projects are off: cannot find the home directory (is HOME set?)"
         );
+        assert_eq!(get(&site, "postil://localhost/api/recent").1, "[]");
+    }
+
+    #[test]
+    fn a_benchmark_leaves_the_recent_list_alone() {
+        let repo = TempRepo::new("recent-bench");
+        repo.write("a.rs", "fn a() {}\n");
+        let recent = repo.root.join(".git/test-recent.json");
+        let site = Site::new(Some(recent.clone()), Some("a.rs"));
+
+        site.open(Repo::open(&repo.root).unwrap());
+        assert!(!recent.exists());
         assert_eq!(
             get_json(&site, "postil://localhost/api/repo")["warning"],
-            serde_json::Value::Null,
-            "shown once"
+            serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn init_inside_a_repository_opens_it_and_makes_no_repository_within() {
+        let repo = TempRepo::new("init-inside");
+        repo.write("src/a.rs", "fn a() {}\n");
+        let site = repo.empty_site();
+
+        let src = repo.root.join("src");
+        let (status, body) = post(&site, "postil://localhost/api/init", &open_request(&src));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!src.join(".git").exists(), "no nested repository");
+        let info = get_json(&site, "postil://localhost/api/repo");
+        assert_eq!(info["root"], site_root(&repo.root));
     }
 
     #[test]
@@ -1202,7 +1290,8 @@ mod tests {
         let repo = TempRepo::new("recent-moved");
         let site = repo.empty_site();
         let folder = plain_folder("moved");
-        post(&site, "postil://localhost/api/init", &open_request(&folder));
+        let (status, body) = post(&site, "postil://localhost/api/init", &open_request(&folder));
+        assert_eq!(status, StatusCode::OK, "{body}");
         fs::remove_dir_all(&folder).unwrap();
 
         let recent = get_json(&site, "postil://localhost/api/recent");
@@ -1214,7 +1303,10 @@ mod tests {
         let repo = TempRepo::new("subdir");
         repo.write("src/a.rs", "fn a() {}\n");
 
-        let site = Site::new(repo.root.join(".git/test-recent.json"), Some("src/a.rs"));
+        let site = Site::new(
+            Some(repo.root.join(".git/test-recent.json")),
+            Some("src/a.rs"),
+        );
         site.open(Repo::open(&repo.root.join("src")).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
 

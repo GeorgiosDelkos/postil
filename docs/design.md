@@ -415,7 +415,10 @@ retired; the measured numbers above are the baseline to not regress.
    Built: the page saves through `POST api/notes` and reads the file and the notes again when
    the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
    not drawn on code.
-   Not built: editing or deleting a note in the app (edit `review.json` by hand for now).
+   Notes are deleted from the tray (× then Delete) or from the code's right-click menu, through
+   `DELETE /api/notes?id=N1`; ids are not reused. A + on a hovered line number adds a note on
+   that line, as in GitHub's and GitLab's diff views. Not built: editing a note's text in the
+   app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
 5. **Polish.** Motion, focus mode, `agents.json`, an app bundle for macOS.

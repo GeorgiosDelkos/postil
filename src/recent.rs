@@ -3,8 +3,10 @@
 //!
 //! Unlike `review.json`, this list is the app's own convenience, not the engineer's work: a
 //! file that cannot be read or parsed counts as an empty list, and the next open replaces
-//! it. Two windows that open projects at the same moment can lose one entry; the next open
-//! of that project adds it back.
+//! it. The exception is a file a newer Postil wrote: it reads as empty here and is never
+//! replaced, so running an older build does not wipe the newer one's list. Two windows that
+//! open projects at the same moment can lose one entry; the next open of that project adds
+//! it back.
 
 use std::fs;
 use std::path::Path;
@@ -29,20 +31,49 @@ struct RecentFile {
     projects: Vec<String>,
 }
 
-/// The recent projects' roots, newest first. Empty when the file is missing or unreadable
-/// (see the module docs).
+/// The one field every version of the file has; other fields are ignored here on purpose.
+#[derive(Deserialize)]
+struct VersionOnly {
+    version: u32,
+}
+
+/// What the file on disk holds, as far as this build can tell.
+enum Stored {
+    /// A list this build reads.
+    List(Vec<String>),
+    /// A list from a newer build: not read, and not to be replaced.
+    Newer,
+    /// No file, or one that cannot be read or parsed: an empty list, to be replaced.
+    Nothing,
+}
+
+fn stored(file: &Path) -> Stored {
+    let Ok(json) = fs::read_to_string(file) else {
+        return Stored::Nothing;
+    };
+    match serde_json::from_str::<VersionOnly>(&json) {
+        Ok(VersionOnly { version }) if version > VERSION => Stored::Newer,
+        _ => serde_json::from_str::<RecentFile>(&json)
+            .ok()
+            .filter(|recent| recent.version == VERSION)
+            .map_or(Stored::Nothing, |recent| Stored::List(recent.projects)),
+    }
+}
+
+/// The recent projects' roots, newest first. Empty when the file is missing, unreadable, or
+/// from a newer build (see the module docs).
 pub(crate) fn list(file: &Path) -> Vec<String> {
-    fs::read_to_string(file)
-        .ok()
-        .and_then(|json| serde_json::from_str::<RecentFile>(&json).ok())
-        .filter(|recent| recent.version == VERSION)
-        .map_or_else(Vec::new, |recent| recent.projects)
+    match stored(file) {
+        Stored::List(projects) => projects,
+        Stored::Newer | Stored::Nothing => Vec::new(),
+    }
 }
 
 /// Puts `root` first in the list, removing an older entry for it and the oldest entries
 /// beyond the limit.
 ///
 /// A root that is not UTF-8 is not recorded: the list is JSON and the page could not show it.
+/// Nothing is recorded over a list from a newer build either (see the module docs).
 ///
 /// # Errors
 ///
@@ -51,7 +82,11 @@ pub(crate) fn record(file: &Path, root: &Path) -> Result<()> {
     let Some(root) = root.to_str() else {
         return Ok(());
     };
-    let mut projects = list(file);
+    let mut projects = match stored(file) {
+        Stored::List(projects) => projects,
+        Stored::Nothing => Vec::new(),
+        Stored::Newer => return Ok(()),
+    };
     projects.retain(|project| project != root);
     projects.insert(0, root.to_owned());
     projects.truncate(LIMIT);
@@ -111,6 +146,33 @@ mod tests {
 
         record(&file, Path::new("/p/a")).unwrap();
         assert_eq!(list(&file), ["/p/a"]);
+        drop(fs::remove_dir_all(file.parent().unwrap()));
+    }
+
+    #[test]
+    fn a_list_from_a_newer_build_is_neither_read_nor_replaced() {
+        let file = temp_file("newer");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let newer = r#"{"version": 2, "projects": [{"path": "/p/a", "pinned": true}]}"#;
+        fs::write(&file, newer).unwrap();
+
+        assert_eq!(list(&file), Vec::<String>::new());
+        record(&file, Path::new("/p/b")).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), newer);
+        drop(fs::remove_dir_all(file.parent().unwrap()));
+    }
+
+    #[test]
+    fn a_list_from_an_older_version_number_is_replaced() {
+        // Version 0 never existed; it stands for any version this build does not read but a
+        // newer build would not have written either.
+        let file = temp_file("older");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, r#"{"version": 0, "projects": ["/p/old"]}"#).unwrap();
+
+        assert_eq!(list(&file), Vec::<String>::new());
+        record(&file, Path::new("/p/b")).unwrap();
+        assert_eq!(list(&file), ["/p/b"]);
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 }

@@ -10,24 +10,32 @@ use crate::error::{Error, Result};
 /// a crash leaves the old file or the new one and never a part. Creates the directory first
 /// when it does not exist.
 ///
-/// A failure before the rename leaves the old file. After the rename the directory, and its
-/// parent, are synced so the rename survives a power loss; a failure there is ignored,
-/// because the new file is in place and readers see it, and reporting a failed write would
-/// make the caller redo a write that happened (a note saved twice).
+/// A failure before the rename leaves the old file. After the rename the directory is synced,
+/// so the rename survives a power loss, and so is its parent, so a directory just created
+/// survives too; a second new level above that is not synced (accepted: only the recent list
+/// lives that deep in a new `~/.config`). A failure to sync is ignored: the new file is in
+/// place and readers see it, and reporting a failed write would make the caller redo a write
+/// that happened (a note saved twice).
+///
+/// At most one call per `file` may run at a time in one process; callers serialise
+/// (`notes` holds `review.lock`, and `recent` runs only in the URL scheme handler, which wry
+/// calls on the main thread). Separate processes use separate temporary files. A crash
+/// between creating the temporary and the rename leaves it behind; readers ignore it.
 pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = file.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a file to write needs a directory",
-        )
-    })?;
-    fs::create_dir_all(dir)?;
-
-    // The process id keeps two app windows writing the same file from sharing a temporary.
+    let invalid = |problem| io::Error::new(io::ErrorKind::InvalidInput, problem);
+    let dir = file
+        .parent()
+        .ok_or_else(|| invalid("a file to write needs a directory"))?;
     let name = file
         .file_name()
-        .map_or_else(Default::default, |name| name.to_string_lossy());
-    let temporary = dir.join(format!("{name}.{}.tmp", std::process::id()));
+        .ok_or_else(|| invalid("a file to write needs a name"))?;
+    fs::create_dir_all(dir)?;
+
+    let temporary = dir.join(format!(
+        "{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     let written = (|| {
         let mut out = File::create(&temporary)?;
         out.write_all(bytes)?;

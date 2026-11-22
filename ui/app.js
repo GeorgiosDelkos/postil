@@ -63,6 +63,8 @@ const state = {
   activeMatch: 0,
   // Whether the Rust process has a project open; without one, the welcome screen shows.
   projectOpen: false,
+  // Set while a project is being opened, until the page reloads into it.
+  switching: false,
   // The rendered window of lines: [first, last).
   rendered: { first: 0, last: 0 },
 };
@@ -1100,11 +1102,15 @@ function quit() {
 // read again on return and drawn once, so the notes never show on the old text. Not while
 // the composer is open: reading the file again would move its lines under the text.
 async function refresh() {
-  if (!state.projectOpen) {
-    if (!welcomeEl.hidden) await loadRecent();
+  // A project being opened replaces this page: what a refresh drew would be thrown away,
+  // and its requests would already reach the new project.
+  if (state.switching) return;
+  // The welcome screen is what is on screen, whether or not a project is open behind it.
+  if (!welcomeEl.hidden) {
+    await loadRecent();
     return;
   }
-  if (state.composer) return;
+  if (!state.projectOpen || state.composer) return;
   const path = state.wanted;
   const [repo, notes, file] = await Promise.all([
     fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
@@ -1215,11 +1221,21 @@ function chooseFolder() {
 // the reload, so the composer keeps the focus instead.
 async function requestProject(route, path) {
   if (guardDraft("opening another project")) return;
-  const response = await fetch(route, { method: "POST", body: JSON.stringify({ path }) });
+  state.switching = true;
+  let response;
+  try {
+    response = await fetch(route, { method: "POST", body: JSON.stringify({ path }) });
+  } catch (error) {
+    state.switching = false;
+    showWelcome();
+    showWelcomeError(`cannot open ${path}: ${error}`, null);
+    return;
+  }
   if (response.ok) {
     location.reload();
     return;
   }
+  state.switching = false;
   // 422: the folder is not in a repository, which `git init` can fix in place.
   showWelcome();
   showWelcomeError(await response.text(), response.status === 422 ? path : null);

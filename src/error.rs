@@ -59,6 +59,12 @@ pub enum Error {
         /// The directory as given.
         path: PathBuf,
     },
+    /// The directory given to open is the home folder or the root and not in a repository:
+    /// too broad to make one.
+    TooBroad {
+        /// The directory as given.
+        path: PathBuf,
+    },
     /// The list of recent projects could not be written.
     WriteRecent {
         /// The list's path.
@@ -128,6 +134,11 @@ impl fmt::Display for Error {
             Self::NotARepository { path } => {
                 write!(f, "{} is not in a git repository", path.display())
             }
+            Self::TooBroad { path } => write!(
+                f,
+                "{} is not in a git repository (open a project folder inside it)",
+                path.display()
+            ),
             Self::WriteRecent { path, .. } => {
                 write!(f, "cannot update the recent projects in {}", path.display())
             }
@@ -185,6 +196,7 @@ impl std::error::Error for Error {
             | Self::NoProject
             | Self::NotAFolder { .. }
             | Self::NotARepository { .. }
+            | Self::TooBroad { .. }
             | Self::NoHome
             | Self::InvalidNote(_)
             | Self::NoteTextChanged { .. }

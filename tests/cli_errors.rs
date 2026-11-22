@@ -3,13 +3,35 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-fn postil(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_postil"))
-        .args(args)
+/// The `postil` binary, with its configuration (the recent list) in a temporary directory:
+/// a test must not write the engineer's own `~/.config/postil`.
+fn command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_postil"));
+    command
+        .env("XDG_CONFIG_HOME", temp_dir("config"))
         // The assertions quote git's messages, which are translated under other locales.
-        .env("LC_ALL", "C")
+        .env("LC_ALL", "C");
+    command
+}
+
+fn postil(args: &[&str]) -> Output {
+    command()
+        .args(args)
         .output()
         .expect("the test binary was built by cargo")
+}
+
+/// A new git repository in the temporary directory. `name` must differ between tests.
+fn temp_repo(name: &str) -> PathBuf {
+    let dir = temp_dir(name);
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["init", "--quiet"])
+        .status()
+        .expect("git runs");
+    assert!(init.success());
+    dir
 }
 
 /// An empty directory in the temporary directory. `name` must differ between tests.
@@ -21,7 +43,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 #[test]
 fn missing_git_is_named_with_the_fix_and_exits_1() {
-    let output = Command::new(env!("CARGO_BIN_EXE_postil"))
+    let output = command()
         .arg(std::env::temp_dir())
         .env("PATH", "")
         .output()
@@ -70,14 +92,7 @@ fn a_path_that_is_not_a_folder_is_named_and_exits_1() {
 
 #[test]
 fn bench_of_a_missing_file_fails_instead_of_timing_an_empty_pane() {
-    let dir = temp_dir("bench-missing");
-    let init = Command::new("git")
-        .arg("-C")
-        .arg(&dir)
-        .args(["init", "--quiet"])
-        .status()
-        .unwrap();
-    assert!(init.success());
+    let dir = temp_repo("bench-missing");
 
     let output = postil(&[dir.to_str().unwrap(), "--bench", "typo.rs"]);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -89,4 +104,74 @@ fn bench_of_a_missing_file_fails_instead_of_timing_an_empty_pane() {
         output.stdout.is_empty(),
         "no report for a file that was never shown"
     );
+}
+
+// The next tests run a benchmark of a missing file: it fails right after the project opens
+// and before any window, so reaching its "typo.rs" error shows the project opened.
+
+#[test]
+fn a_plain_folder_is_recognised_whatever_the_language_of_git() {
+    let dir = temp_dir("german");
+
+    // German: this machine's git translates its messages, which the app must not depend on.
+    let output = command()
+        .env("LC_ALL", "de_DE.UTF-8")
+        .arg(&dir)
+        .output()
+        .expect("the test binary was built by cargo");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = format!("postil: {} is not in a git repository\n", dir.display());
+    assert_eq!(stderr, expected);
+}
+
+#[test]
+fn without_a_home_directory_a_project_still_opens() {
+    let dir = temp_repo("no-home");
+
+    let output = command()
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .args([dir.to_str().unwrap(), "--bench", "typo.rs"])
+        .output()
+        .expect("the test binary was built by cargo");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("typo.rs"), "{stderr}");
+}
+
+#[test]
+fn the_home_folder_is_never_offered_to_become_a_repository() {
+    let home = temp_dir("home");
+
+    let output = command()
+        .env("HOME", &home)
+        .arg(&home)
+        .output()
+        .expect("the test binary was built by cargo");
+    std::fs::remove_dir_all(&home).unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = format!(
+        "postil: {} is not in a git repository (open a project folder inside it)\n",
+        home.display()
+    );
+    assert_eq!(stderr, expected);
+}
+
+#[test]
+fn a_git_dir_left_in_the_environment_does_not_redirect_git() {
+    let dir = temp_repo("git-dir");
+
+    let output = command()
+        .env("GIT_DIR", "/no/such/git/dir")
+        .args([dir.to_str().unwrap(), "--bench", "typo.rs"])
+        .output()
+        .expect("the test binary was built by cargo");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("typo.rs"), "{stderr}");
 }

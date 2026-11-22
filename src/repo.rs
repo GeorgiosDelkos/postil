@@ -4,6 +4,7 @@
 //! knows the ignore rules.
 
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -25,21 +26,42 @@ impl Repo {
     /// # Errors
     ///
     /// [`Error::NotAFolder`] when `dir` is not a directory, [`Error::NotARepository`] when it
-    /// is not inside a working tree, and the git errors otherwise.
+    /// is not inside a working tree ([`Error::TooBroad`] when it is also the home folder or
+    /// the root), and the git errors otherwise.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        if !dir.is_dir() {
-            return Err(Error::NotAFolder {
-                path: dir.to_owned(),
-            });
+        // Only a path that is missing or not a directory is "not a folder". Any other
+        // failure (no permission to look) is left to git, whose message says what it is.
+        match fs::metadata(dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(Error::NotAFolder {
+                    path: dir.to_owned(),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::NotAFolder {
+                    path: dir.to_owned(),
+                });
+            }
+            Ok(_) | Err(_) => {}
         }
         // git prints one line per option, in the order asked.
         let args = ["rev-parse", "--show-toplevel", "--absolute-git-dir"];
         let paths = match git(dir, &args) {
             Ok(paths) => paths,
-            // `git` runs in the C locale (see `git`), so this message is stable.
-            Err(Error::Git { stderr, .. }) if stderr.contains("not a git repository") => {
-                return Err(Error::NotARepository {
-                    path: dir.to_owned(),
+            // `git` runs in the C locale (see `git`), so this message is stable. A folder
+            // that has a `.git` of its own is a broken repository (a linked worktree whose
+            // git directory is gone, say), not a plain folder: `git init` there would be
+            // wrong, so git's own error stands.
+            Err(Error::Git { stderr, .. })
+                if stderr.contains("not a git repository") && !dir.join(".git").exists() =>
+            {
+                let path = dir.to_owned();
+                // Offering `git init` for these would put every folder below them in one
+                // repository, and listing its files would walk the whole disk.
+                return Err(if is_home_or_root(dir) {
+                    Error::TooBroad { path }
+                } else {
+                    Error::NotARepository { path }
                 });
             }
             Err(error) => return Err(error),
@@ -59,19 +81,23 @@ impl Repo {
         })
     }
 
-    /// Makes `dir` a new git repository (`git init`) and opens it.
+    /// Opens the working tree that contains `dir`, and when there is none, makes `dir` a new
+    /// git repository (`git init`) first. So it never makes a repository inside another one,
+    /// whatever the caller checked before, and it never makes the home folder or the root
+    /// one, which [`Repo::open`] refuses as [`Error::TooBroad`].
     ///
     /// # Errors
     ///
-    /// As [`Repo::open`], and the git error when `git init` fails.
+    /// As [`Repo::open`] except [`Error::NotARepository`], and the git error when `git init`
+    /// fails.
     pub(crate) fn init(dir: &Path) -> Result<Self> {
-        if !dir.is_dir() {
-            return Err(Error::NotAFolder {
-                path: dir.to_owned(),
-            });
+        match Self::open(dir) {
+            Err(Error::NotARepository { .. }) => {
+                git(dir, &["init", "--quiet"])?;
+                Self::open(dir)
+            }
+            opened => opened,
         }
-        git(dir, &["init", "--quiet"])?;
-        Self::open(dir)
     }
 
     /// The top-level directory of the working tree.
@@ -139,6 +165,15 @@ impl Repo {
     }
 }
 
+/// Whether `dir` is the home folder or the root of the disk, after resolving links.
+fn is_home_or_root(dir: &Path) -> bool {
+    let Ok(dir) = dir.canonicalize() else {
+        return false;
+    };
+    let home = std::env::var_os("HOME").and_then(|home| Path::new(&home).canonicalize().ok());
+    dir.parent().is_none() || home.is_some_and(|home| home == dir)
+}
+
 /// Runs `git` in `dir` and returns what it printed.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
@@ -147,6 +182,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         // Messages in English whatever the user's locale: `Repo::open` matches one of them.
         .env("LC_ALL", "C")
+        // The repository is the one `-C` names. These variables, inherited from a terminal
+        // that a script or a hook left them set in, would point git somewhere else, `git init`
+        // included.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .map_err(Error::SpawnGit)?;
 
