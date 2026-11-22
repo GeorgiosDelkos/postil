@@ -330,20 +330,22 @@ kbd {
   cursor: text;
 }
 
-.ln.selected {
-  background: var(--selection);
-}
-
-.ln.selected .n {
-  color: var(--accent);
-}
-
 .ln.noted {
   background: var(--note-wash);
 }
 
 .ln.noted .n {
   color: var(--note);
+}
+
+/* After the note rules: a selection over a noted line must show as selected. */
+
+.ln.selected {
+  background: var(--selection);
+}
+
+.ln.selected .n {
+  color: var(--accent);
 }
 
 .ln .remark {

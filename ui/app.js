@@ -41,10 +41,12 @@ const state = {
   wanted: null,
   // Selected lines as 0-based indexes, both inclusive: { anchor, head }.
   selection: null,
-  // The open note composer: { start, end, text }, lines 0-based and inclusive.
+  // The open note composer: { start, end, text, saving, node }, lines 0-based and inclusive.
+  // `node` is built once and moved, never rebuilt, when the rows re-render: a rebuilt
+  // textarea would lose its focus, caret, and grown height while the engineer types.
   composer: null,
   composerHeight: COMPOSER_HEIGHT_GUESS,
-  // As `api/notes` returns them: { id, path, lines: { start, end }, snippet, body, state },
+  // As `api/notes` returns them: { id, path, lines: { start, end }, snippet, body, anchor },
   // lines 1-based and inclusive, anchor "found" or "lost". A lost note is shown as outdated.
   notes: [],
   // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
@@ -130,32 +132,56 @@ function fileRow(path, label, depth) {
   return row;
 }
 
-// Shows `path` in the code pane. `keepView` is for reading the same file again after it may
-// have changed on disk: the scroll position stays, and so does the selection while it still
-// fits in the file.
-async function openFile(path, { keepView = false } = {}) {
-  state.wanted = path;
-  const response = await fetch(`api/file?path=${encodeURIComponent(path)}`);
-  const body = response.ok ? await response.json() : await response.text();
-  if (state.wanted !== path) return;
+// Moves the `open` mark in the file list from one row to another without rebuilding the
+// list, which holds a row for every file in the repository.
+function markOpenFile(previous, path) {
+  const row = (file) => filesEl.querySelector(`.file[data-path="${CSS.escape(file)}"]`);
+  if (previous) row(previous)?.classList.remove("open");
+  row(path)?.classList.add("open");
+}
 
-  if (!keepView) state.composer = null;
-  const lines = response.ok ? body.lines.length : 0;
+// The reply to `api/file`: { ok, body }, the body a file view or the reason it failed.
+async function fetchFile(path) {
+  const response = await fetch(`api/file?path=${encodeURIComponent(path)}`);
+  return { ok: response.ok, body: response.ok ? await response.json() : await response.text() };
+}
+
+// Opens `path` in the code pane. Returns whether it was shown: not when a draft note would
+// be lost (the composer is focused instead), and not when a newer open overtook this one.
+async function openFile(path) {
+  if (state.composer?.text.trim()) {
+    state.composer.node.querySelector("textarea").focus();
+    return false;
+  }
+  state.composer = null;
+  state.wanted = path;
+  const reply = await fetchFile(path);
+  if (state.wanted !== path) return false;
+  showFile(path, reply, { keepView: false });
+  return true;
+}
+
+// Draws a reply of `fetchFile`. `keepView` is for the same file read again after it may have
+// changed on disk: the scroll position stays, and so does the selection while it still fits
+// in the file.
+function showFile(path, reply, { keepView }) {
+  const previous = state.file?.path;
+  const lines = reply.ok ? reply.body.lines.length : 0;
   if (!keepView || Math.max(state.selection?.anchor ?? 0, state.selection?.head ?? 0) >= lines) {
     state.selection = null;
   }
-  if (response.ok) {
-    state.file = body;
+  if (reply.ok) {
+    state.file = reply.body;
     codeEmptyEl.hidden = true;
   } else {
     state.file = null;
     codeEmptyEl.hidden = false;
-    codeEmptyEl.textContent = body;
+    codeEmptyEl.textContent = reply.body;
   }
 
   indexNotes();
   renderHeader(path);
-  renderFiles();
+  markOpenFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
 }
@@ -217,7 +243,7 @@ function renderCode({ force = false } = {}) {
   const fragment = document.createDocumentFragment();
   for (let index = newFirst; index < newLast; index += 1) {
     fragment.append(lineRow(index));
-    if (state.composer?.end === index) fragment.append(composerElement());
+    if (state.composer?.end === index) fragment.append(state.composer.node);
   }
   rowsEl.replaceChildren(fragment);
   setRowsPadding();
@@ -321,9 +347,19 @@ window.addEventListener("mouseup", () => {
 function openComposer() {
   const range = selectedRange();
   if (!range || state.composer) return;
-  state.composer = { ...range, text: "" };
+
+  // The composer opens under the selection, so the selection must be on screen to see it.
+  const top = lineTop(range.start);
+  const bottom = lineTop(range.end) + LINE_HEIGHT;
+  if (top < codeEl.scrollTop || bottom > codeEl.scrollTop + codeEl.clientHeight) {
+    codeEl.scrollTop = top - codeEl.clientHeight / 3;
+  }
+
+  const composer = { ...range, text: "", saving: false, node: null };
+  composer.node = buildComposer(composer);
+  state.composer = composer;
   renderCode({ force: true });
-  rowsEl.querySelector("textarea")?.focus();
+  composer.node.querySelector("textarea").focus();
 }
 
 // Closes the composer, saving its text as a note first when `save` is set. When saving
@@ -333,14 +369,18 @@ async function closeComposer({ save }) {
   if (!composer || composer.saving) return;
   if (save && composer.text.trim()) {
     composer.saving = true;
-    const failure = await saveNote(composer);
-    composer.saving = false;
+    let failure;
+    try {
+      failure = await saveNote(composer);
+    } catch (error) {
+      failure = `cannot save the note: ${error}`;
+    } finally {
+      composer.saving = false;
+    }
     if (failure) {
-      const label = rowsEl.querySelector(".composer-label");
-      if (label) {
-        label.textContent = failure;
-        label.classList.add("failed");
-      }
+      const label = composer.node.querySelector(".composer-label");
+      label.textContent = failure;
+      label.classList.add("failed");
       return;
     }
   }
@@ -352,12 +392,15 @@ async function closeComposer({ save }) {
   codeEl.focus();
 }
 
-// Sends the composer's note to the Rust process, which takes the snippet from the file on
-// disk and returns every note. Returns the reason on failure, or null.
+// Sends the composer's note to the Rust process with the text the page showed on its lines,
+// so a file changed on disk meanwhile cannot attach the note to other text. Returns the
+// reason on failure, or null.
 async function saveNote(composer) {
+  const shown = state.file.lines.slice(composer.start, composer.end + 1);
   const request = {
     path: state.file.path,
     lines: { start: composer.start + 1, end: composer.end + 1 },
+    snippet: shown.map((tokens) => tokens.map(([, text]) => text).join("")).join("\n"),
     body: composer.text,
   };
   const response = await fetch("api/notes", { method: "POST", body: JSON.stringify(request) });
@@ -367,15 +410,23 @@ async function saveNote(composer) {
   return null;
 }
 
-// Fetches the notes again. A failure (an unreadable review file) is shown in the tray, and
-// the notes drawn so far stay.
-async function loadNotes() {
+// The reply to `api/notes`: { ok, body }, the body the notes or the reason they failed.
+async function fetchNotes() {
   const response = await fetch("api/notes");
-  if (!response.ok) {
-    notesEl.replaceChildren(el("div", "empty", await response.text()));
-    return;
-  }
-  state.notes = (await response.json()).notes;
+  const body = response.ok ? (await response.json()).notes : await response.text();
+  return { ok: response.ok, body };
+}
+
+// Takes a reply of `fetchNotes`. A failure (an unreadable review file) is shown in the tray,
+// and the notes drawn so far stay.
+function applyNotes(reply) {
+  if (reply.ok) state.notes = reply.body;
+  else notesEl.replaceChildren(el("div", "empty", reply.body));
+  return reply.ok;
+}
+
+async function loadNotes() {
+  if (!applyNotes(await fetchNotes())) return;
   indexNotes();
   renderNotes();
   renderFiles();
@@ -397,8 +448,8 @@ function indexNotes() {
   }
 }
 
-function composerElement() {
-  const composer = state.composer;
+// Builds the composer's element once, when it opens. `renderCode` moves this same node.
+function buildComposer(composer) {
   const node = $("composer-template").content.firstElementChild.cloneNode(true);
 
   const label =
@@ -408,7 +459,6 @@ function composerElement() {
   node.querySelector("label").textContent = label;
 
   const textarea = node.querySelector("textarea");
-  textarea.value = composer.text;
   textarea.addEventListener("input", () => {
     composer.text = textarea.value;
     // Grow with the text, then tell the virtual list the new height.
@@ -469,7 +519,7 @@ function renderNotes() {
 }
 
 async function showNote(note) {
-  if (state.file?.path !== note.path) await openFile(note.path);
+  if (state.file?.path !== note.path && !(await openFile(note.path))) return;
   // A third of the way down reads better than the very top edge.
   const top = lineTop(note.lines.start - 1) - codeEl.clientHeight / 3;
   codeEl.scrollTo({ top, behavior: "smooth" });
@@ -510,9 +560,14 @@ filterEl.addEventListener("keydown", (event) => {
     renderFiles();
     filesEl.querySelector(".file.active")?.scrollIntoView({ block: "nearest" });
   } else if (event.key === "Enter") {
+    // During IME composition Enter confirms the text; with no filter text there is no match.
+    if (event.isComposing || !filterEl.value.trim()) return;
     const active = filesEl.querySelector(".file.active") ?? filesEl.querySelector(".file");
-    if (active) openFile(active.dataset.path);
+    // Focus moves to the code so the next `c` opens the composer instead of typing a letter.
+    if (active) openFile(active.dataset.path).then((shown) => shown && codeEl.focus());
   } else if (event.key === "Escape") {
+    // The window's Escape handler would otherwise discard an open draft note.
+    event.stopPropagation();
     filterEl.value = "";
     renderFiles();
     codeEl.focus();
@@ -537,13 +592,31 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
-// There is no file watcher (docs/design.md, "Working with the repository"): files and notes
-// change while the engineer is in another app, so both are read again on return. Not while
+// There is no file watcher (docs/design.md, "Working with the repository"): the file list,
+// the open file, and the notes change while the engineer is in another app, so all three are
+// read again on return and drawn once, so the notes never show on the old text. Not while
 // the composer is open: reading the file again would move its lines under the text.
-window.addEventListener("focus", async () => {
+async function refresh() {
   if (state.composer) return;
-  if (state.file) await openFile(state.file.path, { keepView: true });
-  await loadNotes();
+  const path = state.wanted;
+  const [repo, notes, file] = await Promise.all([
+    fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
+    fetchNotes(),
+    path ? fetchFile(path) : null,
+  ]);
+  // The engineer moved on while the replies were in flight: their action wins.
+  if (state.composer || state.wanted !== path) return;
+
+  if (repo) showRepo(repo);
+  applyNotes(notes);
+  if (file) showFile(path, file, { keepView: true });
+  else indexNotes();
+  renderNotes();
+  renderFiles();
+}
+
+window.addEventListener("focus", () => {
+  refresh().catch((error) => notesEl.replaceChildren(el("div", "empty", String(error))));
 });
 
 // The window has no title bar, so the page says where it can be dragged from.
@@ -590,7 +663,8 @@ async function runBench(path) {
     openFileMs: Math.round(openMs),
     frames: frameMs.length,
     frameMs: { p50: median, p95: at(0.95), max: at(1) },
-    // Frames that took more than one and a half display intervals: a visible stutter.
+    // Frames that took more than one and a half times the median frame, which is the display
+    // interval when scrolling keeps up: a visible stutter.
     slowFrames: frameMs.filter((ms) => ms > median * 1.5).length,
     scrolledPx: Math.round(codeEl.scrollTop),
   };
@@ -599,15 +673,19 @@ async function runBench(path) {
 
 // ---- Start ----------------------------------------------------------------------------
 
+function showRepo(repo) {
+  state.repo = repo;
+  $("repo-name").textContent = repo.name;
+  $("repo-branch").textContent = repo.branch || "detached HEAD";
+}
+
 async function start() {
   const response = await fetch("api/repo");
   if (!response.ok) {
     codeEmptyEl.textContent = await response.text();
     return;
   }
-  state.repo = await response.json();
-  $("repo-name").textContent = state.repo.name;
-  $("repo-branch").textContent = state.repo.branch || "detached HEAD";
+  showRepo(await response.json());
   renderFiles();
   await loadNotes();
 

@@ -60,7 +60,10 @@ test("positions index the matched characters, in order", () => {
   const files = ["src/acp/connection.rs", "tests/fakeAgent.rs", "Cargo.toml", "ui/app.css"];
 
   for (const query of ["conn", "fa", "car", "ac", "s", "rs"]) {
-    for (const { path, positions } of rank(query, files, 10)) {
+    const matches = rank(query, files, 10);
+    // Every query matches at least one file, so the checks below cannot pass by not running.
+    assert.ok(matches.length > 0, query);
+    for (const { path, positions } of matches) {
       const marked = positions.map((index) => path[index].toLowerCase()).join("");
       assert.equal(marked, query, `${query} in ${path}`);
       const increasing = positions.every((index, i) => i === 0 || index > positions[i - 1]);
