@@ -182,17 +182,28 @@ enum NoteState {
 As built in milestone 2 (`src/notes.rs`):
 
 - The file holds `{"version": 1, "notes": [...]}`; a note is `id` (`"N1"`), `path`, `lines`
-  (`{start, end}`, 1-based, inclusive), `snippet`, `body`, and `anchor` (`found` or `lost`).
-  Unknown fields are refused, so a typo in a hand edit fails loudly instead of being dropped on
-  the next write.
-- `state` is not stored yet: milestone 3 adds it with `open` as its default, so a version 1
-  file without it still reads, and no format version change is needed.
-- The Rust process keeps no copy. Every `api/notes` request reads the file and relocates every
+  (`{start, end}`, 1-based, inclusive), `snippet`, `body`, and `anchor` (`found` or `lost`,
+  optional on read because every read recomputes it). Unknown fields are refused, so a typo in
+  a hand edit fails loudly instead of being dropped on the next write.
+- **Every new field is a new format version.** A build refuses fields it does not know, so a
+  milestone 2 build reading a file with milestone 3's `state` must fail on "version 2", not on
+  "unknown field". Milestone 3 therefore writes version 2 and still reads version 1, with
+  `state` defaulting to `open`.
+- **Placing a note:** it stays where its snippet still is, or moves to the only other copy of
+  the snippet; with several copies and none at its last lines its anchor is lost. The nearest
+  copy is not taken: short lines such as `}` repeat, and the nearest is often the wrong one.
+  Storing a few lines of context around the snippet would place more of these notes; that is
+  a new field, so a new version, left for when lost notes on repeated lines prove common.
+- **Adding a note:** the page sends the text it showed with the line numbers. When the file
+  changed meanwhile, the note goes where that text is now (same rule), or the request fails
+  with 409 and the draft stays in the composer.
+- The Rust process keeps no copy. Every `api/notes` request reads the file and places every
   note. Only adding a note writes the file, with every note at its current place; reading never
   writes, so the refresh on focus cannot overwrite a hand edit. A file that does not parse, has
   another version, or repeats an id is reported with its path and never overwritten.
-- Writers are not locked against each other; a change made by someone else between an add's
-  read and its write (milliseconds) is lost. Acceptable while only the engineer adds notes.
+- An add holds an exclusive lock on `<git dir>/postil/review.lock` from its read to its rename,
+  so two app windows on one working tree keep each other's notes. A script that edits
+  `review.json` without that lock can lose an edit made during an add.
 
 ### Working with the repository
 

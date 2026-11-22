@@ -26,7 +26,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     while let Some(arg) = args.next() {
         if arg == "--bench" {
             let file = args.next().ok_or("--bench needs a file")?;
-            bench = Some(file);
+            if bench.replace(file).is_some() {
+                return Err("--bench given twice".to_owned());
+            }
         } else if arg.starts_with('-') {
             return Err(format!("unknown option {arg}"));
         } else if dir.replace(PathBuf::from(&arg)).is_some() {
@@ -108,6 +110,10 @@ mod tests {
     fn rejects_what_it_does_not_understand() {
         assert_eq!(parse(&["--bench"]).unwrap_err(), "--bench needs a file");
         assert_eq!(parse(&["--wat"]).unwrap_err(), "unknown option --wat");
+        assert_eq!(
+            parse(&["--bench", "a", "--bench", "b"]).unwrap_err(),
+            "--bench given twice"
+        );
         assert_eq!(
             parse(&["a", "b"]).unwrap_err(),
             "unexpected second directory b"

@@ -126,6 +126,9 @@ fn serve(dir: &Path, bench: Option<&str>) -> Result<Option<BenchReport>> {
                 drop(proxy.send_event(message));
             }
         })
+        // The page never navigates. Should it ever be sent elsewhere, the other origin must
+        // not reach the `postil://` handlers, which read and write the repository.
+        .with_navigation_handler(|url| url.starts_with("postil://"))
         .with_url("postil://localhost/")
         .build(&window)
         .map_err(Error::Webview)?;
@@ -264,7 +267,7 @@ impl Site {
     /// The reply to `GET /api/notes`: every note, moved to where its snippet is now. Reads
     /// the review file and never writes it.
     fn notes(&self) -> Result<Vec<u8>> {
-        let review = notes::current(&self.repo.review_file(), |path| self.repo.read(path))?;
+        let review = notes::current(&self.repo)?;
         Ok(to_json(&review))
     }
 
@@ -273,7 +276,7 @@ impl Site {
     fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
         let new: NewNote = serde_json::from_slice(body)
             .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
-        let review = notes::add(&self.repo.review_file(), new, |path| self.repo.read(path))?;
+        let review = notes::add(&self.repo, new)?;
         Ok(to_json(&review))
     }
 }
@@ -289,9 +292,21 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
     match body {
         Ok(body) => reply(StatusCode::OK, "application/json", body),
         Err(error) => {
+            // Every variant is listed so that a new one is a decision, not a silent 500.
             let status = match error {
                 Error::OutsideRepository { .. } | Error::InvalidNote(_) => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::NoteTextChanged { .. } => StatusCode::CONFLICT,
+                Error::SpawnGit(_)
+                | Error::Git { .. }
+                | Error::Read { .. }
+                | Error::Highlight(_)
+                | Error::Window(_)
+                | Error::Webview(_)
+                | Error::BenchInterrupted
+                | Error::ReadReview { .. }
+                | Error::ParseReview { .. }
+                | Error::InvalidReview { .. }
+                | Error::WriteReview { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
         }
@@ -441,14 +456,23 @@ mod tests {
         end: usize,
         body: &str,
     ) -> serde_json::Value {
-        let request = serde_json::json!({
-            "path": path,
-            "lines": { "start": start, "end": end },
-            "body": body,
-        });
-        let (status, reply) = post(site, NOTES, &request.to_string());
+        let text = site.repo.read(path).unwrap();
+        let shown: Vec<&str> = text.lines().collect();
+        let request = new_note(path, start, end, &shown[start - 1..end].join("\n"), body);
+        let (status, reply) = post(site, NOTES, &request);
         assert_eq!(status, StatusCode::OK, "{reply}");
         serde_json::from_str(&reply).unwrap()
+    }
+
+    /// A `POST /api/notes` body, as the page builds it.
+    fn new_note(path: &str, start: usize, end: usize, snippet: &str, body: &str) -> String {
+        serde_json::json!({
+            "path": path,
+            "lines": { "start": start, "end": end },
+            "snippet": snippet,
+            "body": body,
+        })
+        .to_string()
     }
 
     /// The notes' `[id, start, end, anchor]`, the fields that anchoring changes.
@@ -468,8 +492,8 @@ mod tests {
             .collect()
     }
 
-    fn anchor(id: &str, start: u64, end: u64, found: &str) -> (String, u64, u64, String) {
-        (id.to_owned(), start, end, found.to_owned())
+    fn anchor(id: &str, start: u64, end: u64, anchor: &str) -> (String, u64, u64, String) {
+        (id.to_owned(), start, end, anchor.to_owned())
     }
 
     #[test]
@@ -556,7 +580,7 @@ mod tests {
         repo.write("a.txt", "x\n");
         let site = repo.site();
         let file = site.repo.review_file();
-        let request = r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":"b"}"#;
+        let request = &new_note("a.txt", 1, 1, "x", "b");
 
         // review.json is a directory: it exists but cannot be read.
         fs::create_dir_all(&file).unwrap();
@@ -602,8 +626,7 @@ mod tests {
         let file = site.repo.review_file();
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let by_hand = r#"{"version": 1, "notes": [{"id": "N5", "path": "a.txt",
-            "lines": {"start": 2, "end": 2}, "snippet": "y", "body": "From a script.",
-            "anchor": "found"}]}"#;
+            "lines": {"start": 2, "end": 2}, "snippet": "y", "body": "From a script."}]}"#;
         fs::write(&file, by_hand).unwrap();
 
         let unchanged = get_json(&site, NOTES);
@@ -628,38 +651,33 @@ mod tests {
         let site = repo.site();
 
         let cases = [
+            (new_note("a.txt", 0, 1, "x", "b"), "1-based"),
+            (new_note("a.txt", 2, 1, "y", "b"), "1-based"),
+            (new_note("a.txt", 1, 1, "x", " \n"), "no text"),
+            (new_note("a.txt", 1, 2, "x", "b"), "does not have 2 lines"),
+            (new_note("../a.txt", 1, 1, "x", "b"), "inside"),
             (
-                r#"{"path":"a.txt","lines":{"start":2,"end":3},"body":"b"}"#,
-                "past the end",
+                r#"{"path":"a.txt","lines":{"start":1,"end":1},"snippet":"x"}"#.to_owned(),
+                "body",
             ),
             (
-                r#"{"path":"a.txt","lines":{"start":0,"end":1},"body":"b"}"#,
-                "1-based",
-            ),
-            (
-                r#"{"path":"a.txt","lines":{"start":2,"end":1},"body":"b"}"#,
-                "1-based",
-            ),
-            (
-                r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":" \n"}"#,
-                "no text",
-            ),
-            (
-                r#"{"path":"../a.txt","lines":{"start":1,"end":1},"body":"b"}"#,
-                "inside",
-            ),
-            (r#"{"path":"a.txt","lines":{"start":1,"end":1}}"#, "body"),
-            (
-                r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":"b","x":1}"#,
+                r#"{"path":"a.txt","lines":{"start":1,"end":1},"snippet":"x","body":"b","x":1}"#
+                    .to_owned(),
                 "`x`",
             ),
-            ("not json", "unreadable request"),
+            ("not json".to_owned(), "unreadable request"),
         ];
         for (request, expected) in cases {
-            let (status, reply) = post(&site, NOTES, request);
+            let (status, reply) = post(&site, NOTES, &request);
             assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {reply}");
             assert!(reply.contains(expected), "{request}: {reply}");
         }
+        assert!(!site.repo.review_file().exists());
+
+        // Lines past the end hold none of the shown text: the file changed since it was shown.
+        let (status, reply) = post(&site, NOTES, &new_note("a.txt", 2, 3, "y\nz", "b"));
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        assert!(reply.contains("select the lines again"), "{reply}");
         assert!(!site.repo.review_file().exists());
 
         let request = Request::builder()
@@ -691,6 +709,13 @@ mod tests {
                 &*format!(r#"{{"version": 1, "notes": [{note}, {note}]}}"#),
                 "N1 is used twice".to_owned(),
             ),
+            (
+                &*format!(
+                    r#"{{"version": 1, "notes": [{}]}}"#,
+                    note.replace(r#""body":"b""#, r#""body":"b","stat":"open""#)
+                ),
+                "unknown field `stat`".to_owned(),
+            ),
         ];
         for (contents, expected) in cases {
             fs::write(&file, contents).unwrap();
@@ -701,11 +726,86 @@ mod tests {
             assert!(reply.contains(&*file.to_string_lossy()), "{reply}");
             assert!(reply.contains("move it aside"), "{reply}");
 
-            let request = r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":"b"}"#;
+            let request = &new_note("a.txt", 1, 1, "x", "b");
             let (status, _) = post(&site, NOTES, request);
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{contents}");
             assert_eq!(fs::read_to_string(&file).unwrap(), contents);
         }
+    }
+
+    #[test]
+    fn a_review_with_the_highest_id_refuses_another_note_and_is_left_alone() {
+        let repo = TempRepo::new("notes-ids");
+        repo.write("a.txt", "x\n");
+        let site = repo.site();
+        let file = site.repo.review_file();
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let full = r#"{"version": 1, "notes": [{"id": "N4294967295", "path": "a.txt",
+            "lines": {"start": 1, "end": 1}, "snippet": "x", "body": "b"}]}"#;
+        fs::write(&file, full).unwrap();
+
+        let (status, reply) = post(&site, NOTES, &new_note("a.txt", 1, 1, "x", "c"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+        assert!(
+            reply.contains("no note id is left after N4294967295"),
+            "{reply}"
+        );
+        assert!(reply.contains("move it aside"), "{reply}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), full);
+    }
+
+    #[test]
+    fn a_note_goes_where_its_shown_text_is_when_the_file_changed_meanwhile() {
+        let repo = TempRepo::new("notes-shown");
+        repo.write("a.txt", "a\nb\nc\n");
+        let site = repo.site();
+
+        // The page showed `b` on line 2; two lines were added above before the save.
+        repo.write("a.txt", "new\nnew\na\nb\nc\n");
+        let (status, reply) = post(&site, NOTES, &new_note("a.txt", 2, 2, "b", "On b."));
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let review: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(anchors(&review), [anchor("N1", 4, 4, "found")]);
+        assert_eq!(review["notes"][0]["snippet"], "b");
+
+        // Two copies, neither where it was shown: the note is refused rather than guessed.
+        repo.write("a.txt", "b\nx\nx\nb\n");
+        let (status, reply) = post(&site, NOTES, &new_note("a.txt", 2, 2, "b", "On b."));
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    }
+
+    #[test]
+    fn notes_added_at_once_from_two_windows_are_all_kept() {
+        let repo = TempRepo::new("notes-race");
+        repo.write("a.txt", "x\n");
+
+        // Each thread stands for one app window: its own `Repo`, the same working tree.
+        let windows: Vec<_> = (0..2)
+            .map(|window| {
+                let root = repo.root.clone();
+                std::thread::spawn(move || {
+                    let repo = Repo::open(&root).unwrap();
+                    for index in 0..10 {
+                        let body = format!("window {window} note {index}");
+                        let new = serde_json::from_str(&new_note("a.txt", 1, 1, "x", &body));
+                        notes::add(&repo, new.unwrap()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for window in windows {
+            window.join().unwrap();
+        }
+
+        let review = get_json(&repo.site(), NOTES);
+        let mut ids: Vec<u32> = review["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["id"].as_str().unwrap()[1..].parse().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=20).collect::<Vec<u32>>());
     }
 
     #[test]

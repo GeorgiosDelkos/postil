@@ -15,8 +15,24 @@ fn postil(args: &[&str]) -> Output {
 /// An empty directory in the temporary directory. `name` must differ between tests.
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("postil-cli-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).expect("the temporary directory is writable");
     dir
+}
+
+#[test]
+fn missing_git_is_named_with_the_fix_and_exits_1() {
+    let output = Command::new(env!("CARGO_BIN_EXE_postil"))
+        .arg(std::env::temp_dir())
+        .env("PATH", "")
+        .output()
+        .expect("the test binary was built by cargo");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot run git (is it installed and on PATH?)"),
+        "{stderr}"
+    );
 }
 
 #[test]

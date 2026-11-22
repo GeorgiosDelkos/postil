@@ -42,6 +42,11 @@ pub enum Error {
     BenchInterrupted,
     /// The page asked for a note that cannot be made; the text says why.
     InvalidNote(String),
+    /// The lines the page showed for a new note are no longer in the file.
+    NoteTextChanged {
+        /// The file the note was written on, relative to the repository root.
+        path: String,
+    },
     /// The review file exists but could not be read.
     ReadReview {
         /// The review file's path.
@@ -88,6 +93,11 @@ impl fmt::Display for Error {
             Self::Webview(_) => write!(f, "cannot create the webview"),
             Self::BenchInterrupted => write!(f, "window closed before the benchmark finished"),
             Self::InvalidNote(problem) => write!(f, "cannot save the note: {problem}"),
+            Self::NoteTextChanged { path } => write!(
+                f,
+                "cannot save the note: the selected lines of {path} changed on disk since they \
+                 were shown (copy the note, press Escape, and select the lines again)"
+            ),
             Self::ReadReview { path, .. } => write!(
                 f,
                 "cannot read {} (fix its permissions or encoding, or move it aside to start \
@@ -130,6 +140,7 @@ impl std::error::Error for Error {
             | Self::OutsideRepository { .. }
             | Self::BenchInterrupted
             | Self::InvalidNote(_)
+            | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. } => None,
         }
     }

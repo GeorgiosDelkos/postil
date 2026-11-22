@@ -1,0 +1,5 @@
+# Applications pin the toolchain CI and every machine build with. Raise it with a commit of its
+# own after checking that clippy and the tests stay clean.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
