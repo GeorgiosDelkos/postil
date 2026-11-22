@@ -9,27 +9,30 @@
 //! project replaces the current one and the page reloads.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
-use wry::{DragDropEvent, WebView, WebViewBuilder};
+use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::dialog;
 use crate::error::{Error, Result};
 use crate::files::config_dir;
 use crate::highlight::{Highlighter, Token};
+#[cfg(target_os = "macos")]
+use crate::menu::Command;
 use crate::notes::{self, NewNote};
 use crate::recent;
 use crate::repo::Repo;
@@ -95,7 +98,7 @@ enum AppEvent {
     DragWindow,
     /// The page asked for the folder dialog (Open Folder).
     ChooseFolder,
-    /// The page confirmed quitting (Quit or Close Window, from the menu or the keys): no
+    /// The page confirmed quitting (Quit or Close Window from the menu, or the close button): no
     /// draft note would be lost.
     Quit,
     /// A folder (or file) was dropped on the window.
@@ -161,7 +164,6 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
 
     let mut event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
     let window = build_window(&event_loop, settings.theme)?;
-    let canvas = canvas_color(window.theme());
 
     // The menu bar lives as long as this function, which is as long as the app.
     #[cfg(target_os = "macos")]
@@ -176,53 +178,25 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         crate::menu::install()
     };
 
-    let page_proxy = event_loop.create_proxy();
-    let drop_proxy = event_loop.create_proxy();
-    let file_drag = RefCell::new(FileDrag::default());
-    let webview = WebViewBuilder::new()
-        .with_background_color(canvas)
-        .with_custom_protocol("postil".to_owned(), move |_webview, request| {
-            site.respond(&request)
-        })
-        .with_ipc_handler(move |message| {
-            let event = AppEvent::parse(message.body());
-            // The page and this handler are compiled into one binary, so a message that
-            // does not parse is a bug in one of them.
-            debug_assert!(event.is_some(), "unknown page message");
-            if let Some(event) = event {
-                // Sending fails only once the event loop is gone, when nobody is left to
-                // act on the message.
-                drop(page_proxy.send_event(event));
-            }
-        })
-        .with_drag_drop_handler(move |event| {
-            match file_drag.borrow_mut().handle(event) {
-                DragOutcome::Pass => false,
-                DragOutcome::Take => true,
-                DragOutcome::Open(path) => {
-                    // As above: fails only once the event loop is gone.
-                    drop(drop_proxy.send_event(AppEvent::Dropped(path)));
-                    true
-                }
-            }
-        })
-        // The page never navigates. Should it ever be sent elsewhere, the other origin must
-        // not reach the `postil://` handlers, which read and write the repository.
-        .with_navigation_handler(|url| url.starts_with("postil://"))
-        .with_url("postil://localhost/")
-        .build(&window)
-        .map_err(Error::Webview)?;
+    let committed = Rc::new(Cell::new(false));
+    let webview = build_webview(&event_loop, &window, site, Rc::clone(&committed))?;
 
+    let page = Page {
+        webview: &webview,
+        committed: &committed,
+        quit: event_loop.create_proxy(),
+    };
     let mut launch_to_paint = None;
     let mut report = None;
     event_loop.run_return(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
+            // The close button does what Close Window does, so a draft note stops it too.
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            }
-            | Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            } => ask_page(&page, "close-window", Unanswered::Quit),
+            Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
             // The system switched between light and dark while the window follows it.
             Event::WindowEvent {
                 event: WindowEvent::ThemeChanged(theme),
@@ -247,10 +221,17 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(AppEvent::Menu(command)) => {
-                // The id is one of `Command::id`'s fixed ASCII names, safe inside quotes.
-                let script = format!("window.postil?.menu(\"{}\")", command.id());
-                // Fails only when the webview is being torn down, when there is no page.
-                drop(webview.evaluate_script(&script));
+                // The app must stay closable whatever state the page is in. The cost: an
+                // exception in the page's draft guard quits and loses the draft, accepted over
+                // a window that cannot be closed.
+                let unanswered = match command {
+                    Command::CloseWindow | Command::Quit => Unanswered::Quit,
+                    Command::OpenFolder
+                    | Command::SwitchProject
+                    | Command::GoToFile
+                    | Command::Settings => Unanswered::Ignore,
+                };
+                ask_page(&page, command.id(), unanswered);
             }
             Event::UserEvent(AppEvent::BenchPainted) => {
                 launch_to_paint = Some(started.elapsed());
@@ -336,6 +317,62 @@ fn offer_folder(webview: &WebView, folder: &Path) {
     drop(webview.evaluate_script(&format!("window.postil?.openFolder({path})")));
 }
 
+/// The webview that shows the page in `window`, served by `site`. It sets `committed` once
+/// the page's first navigation commits (see [`Page`]).
+fn build_webview(
+    event_loop: &EventLoop<AppEvent>,
+    window: &Window,
+    site: Site,
+    committed: Rc<Cell<bool>>,
+) -> Result<WebView> {
+    let page_proxy = event_loop.create_proxy();
+    let drop_proxy = event_loop.create_proxy();
+    let file_drag = RefCell::new(FileDrag::default());
+    WebViewBuilder::new()
+        .with_background_color(canvas_color(window.theme()))
+        .with_custom_protocol("postil".to_owned(), move |_webview, request| {
+            site.respond(&request)
+        })
+        .with_ipc_handler(move |message| {
+            let event = AppEvent::parse(message.body());
+            // The page and this handler are compiled into one binary, so a message that
+            // does not parse is a bug in one of them.
+            debug_assert!(event.is_some(), "unknown page message");
+            if let Some(event) = event {
+                // Sending fails only once the event loop is gone, when nobody is left to
+                // act on the message.
+                drop(page_proxy.send_event(event));
+            }
+        })
+        .with_drag_drop_handler(move |event| {
+            match file_drag.borrow_mut().handle(event) {
+                DragOutcome::Pass => false,
+                DragOutcome::Take => true,
+                DragOutcome::Open(path) => {
+                    // As above: fails only once the event loop is gone.
+                    drop(drop_proxy.send_event(AppEvent::Dropped(path)));
+                    true
+                }
+            }
+        })
+        // The page never navigates. Should it ever be sent elsewhere, the other origin must
+        // not reach the `postil://` handlers, which read and write the repository.
+        .with_navigation_handler(|url| url.starts_with("postil://"))
+        // On macOS, wry fires `Started` from `didCommitNavigation`, before it runs the scripts
+        // it queued and stops queueing (wry 0.57.3, `wkwebview/navigation.rs`,
+        // `did_commit_navigation`); its docs say only "started loading", and other platforms'
+        // backends are unchecked. `ask_page` relies on that order, and no test can check it
+        // without a window: recheck it when bumping wry or adding a platform.
+        .with_on_page_load_handler(move |event, _| {
+            if matches!(event, PageLoadEvent::Started) {
+                committed.set(true);
+            }
+        })
+        .with_url("postil://localhost/")
+        .build(window)
+        .map_err(Error::Webview)
+}
+
 /// The project to open at start: the one containing `dir` when given, else the most recent
 /// project when the settings ask for it and it still opens, else none (the welcome screen).
 ///
@@ -357,6 +394,61 @@ fn startup_repo(
     let recent = recent_file.map_or_else(Vec::new, recent::list);
     let last = recent.first();
     Ok(last.and_then(|root| Repo::open(Path::new(root)).ok()))
+}
+
+/// What to do when the page does not carry out a command it was asked to.
+#[derive(Debug, Clone, Copy)]
+enum Unanswered {
+    /// Quit anyway: for Quit and Close Window, so the app can always be closed.
+    Quit,
+    /// Nothing: the command was only a convenience.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only the macOS menu bar sends such commands")
+    )]
+    Ignore,
+}
+
+/// The page, for [`ask_page`].
+struct Page<'a> {
+    webview: &'a WebView,
+    /// Whether the page's first navigation has committed. Until then wry's macOS backend
+    /// queues a script and drops its callback (wry 0.57.3, `wkwebview::eval`), so an answer
+    /// could never come.
+    committed: &'a Cell<bool>,
+    /// Sends `AppEvent::Quit` when the page cannot answer.
+    quit: EventLoopProxy<AppEvent>,
+}
+
+/// Asks the page to carry out the menu command `id` (`window.postil.menu` in ui/app.js), so
+/// its guards apply, such as a draft note stopping Quit; the page posts `quit` itself when
+/// nothing stops it.
+///
+/// The script ends in `true`, which WebKit hands back only when it ran to the end. An
+/// exception, a page whose app.js did not load (no `window.postil`), or a web content process
+/// that is gone hands back an empty string instead, and `unanswered` decides. Before the
+/// page's first navigation commits there is no answer to wait for, and no draft note to
+/// protect either (app.js has not run), so `unanswered` decides at once.
+fn ask_page(page: &Page<'_>, id: &'static str, unanswered: Unanswered) {
+    let proxy = page.quit.clone();
+    let carried_out = move |done: bool| {
+        if !done && matches!(unanswered, Unanswered::Quit) {
+            // Fails only once the event loop is gone, when the app is quitting anyway.
+            drop(proxy.send_event(AppEvent::Quit));
+        }
+    };
+    if !page.committed.get() {
+        carried_out(false);
+        return;
+    }
+    // `id` is one of the fixed ASCII command names, safe inside quotes.
+    let script = format!("window.postil.menu(\"{id}\"); true");
+    let answered = move |answer: String| carried_out(answer == "true");
+    // Fails only when the webview is being torn down, when there is no page to ask.
+    drop(
+        page.webview
+            .evaluate_script_with_callback(&script, answered),
+    );
 }
 
 /// The colour painted behind the page in `theme`: the page's `--canvas`.
