@@ -73,40 +73,52 @@ const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// second (more with a slow start-up file), and the URL scheme handler that serves the
 /// settings runs on the main thread, which must not wait for it.
 ///
-/// A scan starts when the scanner is made and on every [`Scanner::rescan`]. While the latest
-/// scan runs, [`Scanner::path`] is `None` and the page asks again shortly. An older scan
-/// that finishes after a newer one started is dropped, so a rescan always shows its own
-/// result.
+/// The first scan starts when the path is first asked for, so a launch that never opens the
+/// settings never runs the engineer's start-up files; another starts on every
+/// [`Scanner::rescan`]. While the latest scan runs, [`Scanner::path`] is `None` and the page
+/// asks again shortly. An older scan that finishes after a newer one started is dropped, so
+/// a rescan always shows its own result.
 pub(crate) struct Scanner {
     find: Arc<dyn Fn() -> OsString + Send + Sync>,
-    /// The number of the latest scan, and the path it found once it finished. Locked only to
-    /// read or replace both; never held while a scan runs.
+    /// The number of the latest scan (0 before the first), and the path it found once it
+    /// finished. Locked only to read or replace both; never held while a scan runs.
     state: Arc<Mutex<(u64, Option<OsString>)>>,
 }
 
 impl Scanner {
-    /// Starts the first scan, which calls `find` (in the app, [`search_path`]).
+    /// A scanner whose scans call `find` (in the app, [`search_path`]). No scan runs yet.
     pub(crate) fn new(find: impl Fn() -> OsString + Send + Sync + 'static) -> Self {
-        let scanner = Self {
+        Self {
             find: Arc::new(find),
             state: Arc::new(Mutex::new((0, None))),
-        };
-        scanner.rescan();
-        scanner
+        }
     }
 
     /// Starts a new scan; the result of any scan still running is dropped.
     pub(crate) fn rescan(&self) {
-        let scan = {
-            let mut state = lock(&self.state);
-            *state = (state.0 + 1, None);
-            state.0
-        };
+        self.start(&mut lock(&self.state));
+    }
+
+    /// The latest scan's search path, or `None` while it runs. The first call starts the
+    /// first scan.
+    pub(crate) fn path(&self) -> Option<OsString> {
+        let mut state = lock(&self.state);
+        if state.0 == 0 {
+            self.start(&mut state);
+        }
+        state.1.clone()
+    }
+
+    /// Starts a scan, with the state already locked so two first calls start one scan. The
+    /// scan's thread takes the lock only after `find` returns.
+    fn start(&self, state: &mut (u64, Option<OsString>)) {
+        *state = (state.0 + 1, None);
+        let scan = state.0;
         let find = Arc::clone(&self.find);
-        let state = Arc::clone(&self.state);
+        let shared = Arc::clone(&self.state);
         let finish = move || {
             let path = find();
-            let mut state = lock(&state);
+            let mut state = lock(&shared);
             if state.0 == scan {
                 state.1 = Some(path);
             }
@@ -117,13 +129,8 @@ impl Scanner {
         if spawned.is_err() {
             // Fails only when the process is out of threads or memory. The settings then list
             // every agent as not found rather than wait for a scan that never runs.
-            lock(&self.state).1 = Some(OsString::new());
+            state.1 = Some(OsString::new());
         }
-    }
-
-    /// The latest scan's search path, or `None` while it runs.
-    pub(crate) fn path(&self) -> Option<OsString> {
-        lock(&self.state).1.clone()
     }
 }
 
@@ -181,9 +188,8 @@ const END: &str = "__POSTIL_PATH_END__";
 /// runs, so output larger than the pipe holds does not block it, and the reading stops at the
 /// end marker: a background job that a start-up file left holding the pipe cannot keep it
 /// waiting. The timeout covers starting, printing and reading; after it, or after the
-/// `PATH` arrived, the shell is killed if it still runs. A reader still blocked then (no end
-/// marker, and a background job holding the pipe) ends when that job does; accepted, as it
-/// holds nothing but the pipe.
+/// `PATH` arrived, the shell's process group is killed ([`kill_group`]), which also closes
+/// the pipe and so ends a reader still waiting on it.
 fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut child = Command::new(shell)
         .process_group(0)
@@ -207,10 +213,27 @@ fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
         reader.ok()?;
         receiver.recv_timeout(timeout).ok().flatten()
     });
-    // Fails when the shell already exited, which is the usual case and fine.
+    kill_group(child.id());
+    // Fails when the group's kill already took the shell, or it had exited: both fine.
     drop(child.kill());
     drop(child.wait());
     path
+}
+
+/// Kills every process in the group `leader` leads: the shell and whatever its start-up files
+/// started and left running, such as a command that hung (the shell is killed at the
+/// timeout, and the command would run on) or an `ssh-agent` started per shell. They belong to
+/// this one probe, not to any terminal. `/bin/kill` with a negative id signals the group; it
+/// fails when the group is already gone, which is fine. Run as a command because signalling
+/// a group from Rust needs `libc` and `unsafe`.
+fn kill_group(leader: u32) {
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{leader}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    drop(killed);
 }
 
 /// The line between the [`START`] and [`END`] lines of `out`, read only as far as `END`.
@@ -377,11 +400,33 @@ mod tests {
     }
 
     #[test]
+    fn only_a_non_empty_line_between_both_markers_is_a_path() {
+        let read = |text: &str| marked_path(text.as_bytes());
+        let marked = |middle: &str| format!("noise\n{START}\n{middle}\n{END}\n");
+        assert_eq!(read(&marked(" /a:/b ")), Some(OsString::from("/a:/b")));
+        assert_eq!(read(&marked("  ")), None, "an empty PATH is no PATH");
+        assert_eq!(
+            read(&format!("{START}\n/a\n")),
+            None,
+            "cut off before the end"
+        );
+        assert_eq!(read(&format!("{START}\n/a\nnot the end\n")), None);
+        assert_eq!(read("/a\n"), None, "no markers");
+    }
+
+    #[test]
     fn a_login_shell_that_fails_hangs_or_is_missing_gives_no_path() {
         let dir = Dir::new("bad-shell");
         let failing = dir.file("failing", "#!/bin/sh\nexit 3\n", 0o755);
         let silent = dir.file("silent", "#!/bin/sh\necho no markers here\n", 0o755);
-        let hanging = dir.file("hanging", "#!/bin/sh\nexec sleep 30\n", 0o755);
+        // Like a start-up file whose command hangs: the shell waits on a child that the
+        // timeout must not leave running. The child's pid goes to a file for the check below.
+        let pid_file = dir.0.join("hung.pid");
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\necho $! > {}\nwait\n",
+            pid_file.display()
+        );
+        let hanging = dir.file("hanging", &script, 0o755);
 
         assert_eq!(login_shell_path(&failing, LOGIN_SHELL_TIMEOUT), None);
         assert_eq!(login_shell_path(&silent, LOGIN_SHELL_TIMEOUT), None);
@@ -391,11 +436,26 @@ mod tests {
         );
 
         let started = Instant::now();
-        assert_eq!(login_shell_path(&hanging, Duration::from_millis(200)), None);
+        assert_eq!(login_shell_path(&hanging, Duration::from_secs(2)), None);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "a hanging shell is killed at the timeout, not waited for"
         );
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let alive = || {
+            Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        // Killed with the group; launchd reaps it a moment later.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() {
+            assert!(Instant::now() < deadline, "the hung command still runs");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Waits for the scanner's current scan, for at most five seconds.
@@ -431,6 +491,7 @@ mod tests {
                 None => OsString::from("new"),
             }
         });
+        assert_eq!(scanner.path(), None, "asking starts the first scan");
         first_running.recv().unwrap();
         assert_eq!(
             scanner.path(),

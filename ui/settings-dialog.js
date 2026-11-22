@@ -37,8 +37,9 @@ function button(text, key, onClick, className = "button") {
 }
 
 // `apply` is called with the settings in effect whenever they change (and once on opening),
-// so the page can follow them; `closed` when the dialog closes.
-export function settingsDialog(dialogEl, { apply, closed }) {
+// so the page can follow them. Closing gives the focus back to where it was when the dialog
+// opened, as `<dialog>` does: a note being written keeps it.
+export function settingsDialog(dialogEl, { apply }) {
   const ui = {
     // The reply of api/settings, or null before the first one.
     view: null,
@@ -56,7 +57,9 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     pending: 0,
     // The control to focus after the next redraw, when it is not the one focused now.
     focusNext: null,
-    rescanning: false,
+    // Whether an agent scan runs. The agents of the last scan stay listed meanwhile, so the
+    // dialog does not jump.
+    scanning: false,
     pollTimer: null,
   };
 
@@ -70,15 +73,28 @@ export function settingsDialog(dialogEl, { apply, closed }) {
   // Takes a reply of api/settings. Its settings replace the ones on screen only when no save
   // is waiting: until then the screen holds changes the reply does not know of, and the next
   // change must start from them, or a quick second change would undo the first.
+  //
+  // While a scan runs, the reply is asked for again shortly; a reply that changes nothing is
+  // not drawn, since a redraw replaces every control and a click pressed on one of them and
+  // released on its replacement does nothing.
   function show(view) {
     const ahead = ui.pending > 0 && ui.view !== null;
-    ui.view = { ...view, settings: ahead ? ui.view.settings : view.settings };
+    const scanning = view.agents === null;
+    const next = {
+      ...view,
+      settings: ahead ? ui.view.settings : view.settings,
+      agents: scanning ? (ui.view?.agents ?? null) : view.agents,
+    };
+    const unchanged =
+      scanning === ui.scanning && JSON.stringify(next) === JSON.stringify(ui.view);
+    ui.view = next;
+    ui.scanning = scanning;
     if (!ahead) apply(view.settings);
     clearTimeout(ui.pollTimer);
-    if (view.agents === null && dialogEl.open) {
+    if (scanning && dialogEl.open) {
       ui.pollTimer = setTimeout(() => refresh().catch(fail), SCAN_POLL_MS);
     }
-    render();
+    if (!unchanged) render();
   }
 
   function fail(error) {
@@ -105,10 +121,14 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     render();
     ui.queue = ui.queue.then(async () => {
       try {
-        const body = JSON.stringify(next.settings);
+        // The revision of the last reply: the file as this save expects to find it. A save
+        // queued behind another gets the revision that one's reply brought.
+        const body = JSON.stringify({ revision: ui.view.revision, settings: next.settings });
         const reply = await load("api/settings", { method: "PUT", body });
         ui.pending -= 1;
         ui.saved = ui.pending === 0;
+        // This save carried every change before it, so an earlier failure no longer holds.
+        if (ui.saved) ui.error = null;
         show(reply);
         return true;
       } catch (error) {
@@ -298,6 +318,7 @@ export function settingsDialog(dialogEl, { apply, closed }) {
           "work, one after another.",
       ),
     );
+    // Only before the first scan finished is there no list to show.
     if (ui.view.agents === null) {
       node.append(el("p", "settings-hint scanning", "Looking for installed agents…"));
       return node;
@@ -309,20 +330,20 @@ export function settingsDialog(dialogEl, { apply, closed }) {
       openForm({ previous: null, name: "", command: "" });
     });
     add.disabled = locked() || ui.form !== null;
-    // One scan at a time: every click would start another login shell.
+    // One scan at a time: every click would start another login shell. The button is off
+    // from the click until the scan's result arrives.
     const rescan = button("Rescan", "rescan", async () => {
-      ui.rescanning = true;
+      ui.scanning = true;
       render();
       try {
         show(await load("api/agents/rescan", { method: "POST" }));
       } catch (error) {
+        ui.scanning = false;
         fail(error);
-      } finally {
-        ui.rescanning = false;
-        render();
       }
     });
-    rescan.disabled = ui.rescanning;
+    rescan.disabled = ui.scanning;
+    if (ui.scanning) actions.append(el("span", "settings-hint", "Looking for installed agents…"));
     actions.append(add, rescan);
     node.append(list);
     if (ui.form) node.append(agentForm());
@@ -332,7 +353,9 @@ export function settingsDialog(dialogEl, { apply, closed }) {
 
   function agentRow(agent) {
     const node = el("div", "agent-row");
-    const id = `agent-${agent.name}`;
+    // Keys of per-agent controls hold a `/`, which no fixed key does, so an agent named
+    // "add" cannot take the key of the Add agent button.
+    const id = `enable/${agent.name}`;
     const box = el("input");
     box.type = "checkbox";
     box.id = id;
@@ -364,10 +387,10 @@ export function settingsDialog(dialogEl, { apply, closed }) {
 
     if (!agent.builtIn) {
       const actions = el("div", "agent-actions");
-      const edit = button("Edit", `edit-${agent.name}`, () => {
+      const edit = button("Edit", `edit/${agent.name}`, () => {
         openForm({ previous: agent.name, name: agent.name, command: agent.command });
       });
-      const remove = button("Remove", `remove-${agent.name}`, () => {
+      const remove = button("Remove", `remove/${agent.name}`, () => {
         save(removeCustomAgent(ui.view.settings, agent.name));
       });
       edit.disabled = remove.disabled = locked() || ui.form !== null;
@@ -545,7 +568,6 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     clearTimeout(ui.pollTimer);
     ui.form = null;
     ui.confirmReset = false;
-    closed();
   });
   // A click on the backdrop lands on the dialog element itself, outside its panel.
   dialogEl.addEventListener("mousedown", (event) => {

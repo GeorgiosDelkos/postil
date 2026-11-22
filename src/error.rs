@@ -116,6 +116,8 @@ pub enum Error {
     /// reset.
     /// The text says why, naming the file.
     SettingsLocked(String),
+    /// The settings file changed after the page read it (another window, or a hand edit).
+    SettingsChanged,
     /// The settings file could not be written.
     WriteSettings {
         /// The settings file's path.
@@ -190,6 +192,11 @@ impl fmt::Display for Error {
                 f,
                 "cannot save the settings: {problem} (fix the file, or reset the settings)"
             ),
+            Self::SettingsChanged => write!(
+                f,
+                "cannot save the settings: the file changed since this window read it (the \
+                 dialog now shows the file; make the change again)"
+            ),
             Self::WriteSettings { path, .. } => write!(
                 f,
                 "cannot write {} (check that its directory is writable; the settings were not \
@@ -227,7 +234,8 @@ impl std::error::Error for Error {
             | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. }
             | Self::InvalidSettings(_)
-            | Self::SettingsLocked(_) => None,
+            | Self::SettingsLocked(_)
+            | Self::SettingsChanged => None,
         }
     }
 }

@@ -223,6 +223,11 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 ..
             }
             | Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            // The system switched between light and dark while the window follows it.
+            Event::WindowEvent {
+                event: WindowEvent::ThemeChanged(theme),
+                ..
+            } => drop(webview.set_background_color(canvas_color(theme))),
             Event::UserEvent(AppEvent::DragWindow) => {
                 // Fails when the pointer button is already up again: there is then nothing
                 // to drag.
@@ -455,6 +460,8 @@ struct SettingsView<'a> {
     settings: &'a Settings,
     /// Why the settings file is not in use; saving is refused while this is set.
     problem: Option<String>,
+    /// The file's revision, which a save names (`settings::save`).
+    revision: String,
     /// The settings file, for the dialog to name; `None` without a home directory.
     file: Option<String>,
     /// Every agent, built-in ones first; `None` while the agent scan runs.
@@ -462,6 +469,15 @@ struct SettingsView<'a> {
     /// The smallest and largest code font size.
     font_sizes: [u8; 2],
     tab_widths: [u8; 3],
+}
+
+/// The body of `PUT /api/settings`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveSettings {
+    /// The revision of the settings file the change started from.
+    revision: String,
+    settings: Settings,
 }
 
 /// An agent as the settings dialog lists it.
@@ -699,6 +715,7 @@ impl Site {
                 settings::Loaded {
                     settings: Settings::default(),
                     problem: Some(format!("settings are off: {}", Error::NoHome)),
+                    revision: String::new(),
                 },
                 None,
             ),
@@ -710,6 +727,7 @@ impl Site {
         to_json(&SettingsView {
             settings: &loaded.settings,
             problem: loaded.problem,
+            revision: loaded.revision,
             file,
             agents,
             font_sizes: [*settings::FONT_SIZES.start(), *settings::FONT_SIZES.end()],
@@ -717,11 +735,13 @@ impl Site {
         })
     }
 
-    /// The reply to `PUT /api/settings`: checks and saves the settings in the body.
+    /// The reply to `PUT /api/settings`: checks and saves the settings in the body, if the
+    /// file is still at the revision the body names.
     fn save_settings(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let new: Settings = serde_json::from_slice(body)
+        let request: SaveSettings = serde_json::from_slice(body)
             .map_err(|error| Error::InvalidSettings(format!("unreadable request: {error}")))?;
-        settings::save(self.settings_file.as_deref().ok_or(Error::NoHome)?, &new)?;
+        let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
+        settings::save(file, &request.settings, &request.revision)?;
         Ok(self.settings())
     }
 
@@ -774,9 +794,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::NotAFolder { .. }
                 | Error::TooBroad { .. }
                 | Error::InvalidSettings(_) => StatusCode::BAD_REQUEST,
-                Error::NoteTextChanged { .. } | Error::NoProject | Error::SettingsLocked(_) => {
-                    StatusCode::CONFLICT
-                }
+                Error::NoteTextChanged { .. }
+                | Error::NoProject
+                | Error::SettingsLocked(_)
+                | Error::SettingsChanged => StatusCode::CONFLICT,
                 Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
                 // The page tells this one apart: it offers to make the folder a repository.
                 Error::NotARepository { .. } => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1814,6 +1835,17 @@ mod tests {
         (reply.status(), body)
     }
 
+    /// Saves `settings` (JSON text, possibly malformed) as the page does: naming the
+    /// revision of the file it last read.
+    fn save(site: &Site, settings: &str) -> (StatusCode, String) {
+        let revision = get_json(site, SETTINGS)["revision"].clone();
+        put(
+            site,
+            SETTINGS,
+            &format!("{{\"revision\": {revision}, \"settings\": {settings}}}"),
+        )
+    }
+
     /// The settings view once the agent scan has finished, waiting at most five seconds.
     fn scanned_settings(site: &Site) -> serde_json::Value {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1855,7 +1887,7 @@ mod tests {
         assert_eq!(view["tabWidths"], serde_json::json!([2, 4, 8]));
         assert!(!file.exists(), "reading the defaults writes nothing");
 
-        let (status, body) = put(&repo.empty_site(), SETTINGS, &custom_settings().to_string());
+        let (status, body) = save(&repo.empty_site(), &custom_settings().to_string());
         assert_eq!(status, StatusCode::OK, "{body}");
         let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -1939,7 +1971,7 @@ mod tests {
             ("not json".to_owned(), "unreadable request"),
         ];
         for (body, expected) in cases {
-            let (status, reply) = put(&site, SETTINGS, &body);
+            let (status, reply) = save(&site, &body);
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
             assert!(reply.starts_with("cannot save the settings: "), "{reply}");
             assert!(reply.contains(expected), "{body}: {reply}");
@@ -1948,13 +1980,26 @@ mod tests {
             { "name": "Local", "command": "a" },
             { "name": "LOCAL", "command": "b" },
         ]);
-        let (status, reply) = put(&site, SETTINGS, &with("customAgents", two_locals));
+        let (status, reply) = save(&site, &with("customAgents", two_locals));
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
             reply.contains("already an agent called \"LOCAL\""),
             "{reply}"
         );
         assert!(!file.exists());
+
+        // The limits themselves are allowed: a 40 character name, sizes 11 and 20.
+        let longest = "a".repeat(40);
+        let mut at_limits = custom_settings();
+        at_limits["customAgents"] = serde_json::json!([{ "name": longest, "command": "x" }]);
+        at_limits["enabledAgents"] = serde_json::json!([longest]);
+        at_limits["agent"] = longest.into();
+        at_limits["reviewers"] = serde_json::json!([]);
+        for size in [11, 20] {
+            at_limits["codeFontSize"] = size.into();
+            let (status, reply) = save(&site, &at_limits.to_string());
+            assert_eq!(status, StatusCode::OK, "{reply}");
+        }
     }
 
     #[test]
@@ -1989,7 +2034,7 @@ mod tests {
             assert!(problem.contains("saving is off until"), "{problem}");
             assert_eq!(view["settings"]["tabWidth"], 4, "the defaults are in use");
 
-            let (status, reply) = put(&site, SETTINGS, &custom_settings().to_string());
+            let (status, reply) = save(&site, &custom_settings().to_string());
             assert_eq!(status, StatusCode::CONFLICT, "{reply}");
             assert!(reply.contains(expected), "{reply}");
             assert_eq!(fs::read_to_string(&file).unwrap(), text, "left as it was");
@@ -2000,8 +2045,45 @@ mod tests {
         let view: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(view["problem"], serde_json::Value::Null);
         assert_eq!(view["settings"]["tabWidth"], 4);
-        let (status, reply) = put(&site, SETTINGS, &custom_settings().to_string());
+        let (status, reply) = save(&site, &custom_settings().to_string());
         assert_eq!(status, StatusCode::OK, "saving works again: {reply}");
+    }
+
+    #[test]
+    fn a_save_from_before_another_change_is_refused_and_the_other_change_kept() {
+        let repo = TempRepo::new("settings-changed");
+        let file = repo.config().join("settings.json");
+        let (status, reply) = save(&repo.empty_site(), &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
+
+        // A window reads the settings; then a hand edit (or another window) changes them.
+        let site = repo.empty_site();
+        let stale = get_json(&site, SETTINGS)["revision"].clone();
+        let edited = "{\"version\": 1, \"settings\": {\"theme\": \"light\"}}";
+        fs::write(&file, edited).unwrap();
+
+        let body = format!(
+            "{{\"revision\": {stale}, \"settings\": {}}}",
+            custom_settings()
+        );
+        let (status, reply) = put(&site, SETTINGS, &body);
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        assert!(
+            reply.contains("the file changed since this window read it"),
+            "{reply}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            edited,
+            "the other change is kept"
+        );
+
+        // Read again, the window saves on top of the edit.
+        let fresh = get_json(&site, SETTINGS);
+        assert_eq!(fresh["settings"]["theme"], "light");
+        assert_ne!(fresh["revision"], stale);
+        let (status, reply) = save(&site, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
     }
 
     #[test]
@@ -2029,7 +2111,7 @@ mod tests {
             "settings are off: cannot find the home directory (is HOME set?)"
         );
         assert_eq!(view["file"], serde_json::Value::Null);
-        let (status, reply) = put(&site, SETTINGS, &custom_settings().to_string());
+        let (status, reply) = save(&site, &custom_settings().to_string());
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(reply, "cannot find the home directory (is HOME set?)");
     }
@@ -2061,7 +2143,7 @@ mod tests {
                 }
             }),
         );
-        let (status, body) = put(&site, SETTINGS, &custom_settings().to_string());
+        let (status, body) = save(&site, &custom_settings().to_string());
         assert_eq!(status, StatusCode::OK, "{body}");
 
         let agents = scanned_settings(&site)["agents"].clone();
@@ -2134,7 +2216,7 @@ mod tests {
             problem.contains("settings.json cannot be read"),
             "{problem}"
         );
-        let (status, reply) = put(&site, SETTINGS, &custom_settings().to_string());
+        let (status, reply) = save(&site, &custom_settings().to_string());
         assert_eq!(status, StatusCode::CONFLICT, "{reply}");
         assert!(
             reply.ends_with("(fix the file, or reset the settings)"),
@@ -2146,11 +2228,7 @@ mod tests {
         let blocked = TempRepo::new("settings-unwritable");
         fs::create_dir_all(blocked.config()).unwrap();
         fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o555)).unwrap();
-        let (status, reply) = put(
-            &blocked.empty_site(),
-            SETTINGS,
-            &custom_settings().to_string(),
-        );
+        let (status, reply) = save(&blocked.empty_site(), &custom_settings().to_string());
         // Writable again, so the repository's drop can remove it.
         fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
@@ -2179,6 +2257,21 @@ mod tests {
     }
 
     #[test]
+    fn the_window_paints_the_page_s_canvas_colour_in_each_theme() {
+        // app.css declares --canvas once for the dark palette (first) and once for the light
+        // one; the window paints the same colour behind the page so nothing flashes.
+        let hex: Vec<(u8, u8, u8, u8)> = APP_CSS
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("--canvas: #"))
+            .map(|value| {
+                let channel = |at: usize| u8::from_str_radix(&value[at..at + 2], 16).unwrap();
+                (channel(0), channel(2), channel(4), 0xff)
+            })
+            .collect();
+        assert_eq!(hex, [canvas_color(Theme::Dark), canvas_color(Theme::Light)]);
+    }
+
+    #[test]
     fn the_page_names_each_theme_as_the_settings_file_does() {
         // ui/app.js posts `theme:${settings.theme}`, the theme as api/settings sends it.
         for theme in [
@@ -2193,15 +2286,6 @@ mod tests {
             };
             assert_eq!(serde_json::to_value(parsed).unwrap(), name);
         }
-        assert!(window_theme(settings::Theme::System).is_none());
-        assert!(matches!(
-            window_theme(settings::Theme::Light),
-            Some(Theme::Light)
-        ));
-        assert!(matches!(
-            window_theme(settings::Theme::Dark),
-            Some(Theme::Dark)
-        ));
     }
 
     #[test]

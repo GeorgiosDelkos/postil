@@ -209,15 +209,19 @@ pub(crate) struct Loaded {
     pub(crate) settings: Settings,
     /// Set when the file exists but cannot be used; saving is blocked until Reset.
     pub(crate) problem: Option<String>,
+    /// Which version of the file this is; a save names the revision it started from.
+    pub(crate) revision: String,
 }
 
 /// Reads the settings from `file`. Never fails: a file that cannot be used gives the defaults
 /// and the reason (see the module docs).
 pub(crate) fn load(file: &Path) -> Loaded {
-    match read(file) {
+    let (read, revision) = read(file);
+    match read {
         Ok(settings) => Loaded {
             settings: settings.unwrap_or_default(),
             problem: None,
+            revision,
         },
         Err(problem) => Loaded {
             settings: Settings::default(),
@@ -225,19 +229,42 @@ pub(crate) fn load(file: &Path) -> Loaded {
                 "{problem}. The defaults are in use, and saving is off until the file is fixed \
                  or reset."
             )),
+            revision,
         },
     }
 }
 
-/// The file's settings, `None` when there is no file, or why the file cannot be used.
-fn read(file: &Path) -> std::result::Result<Option<Settings>, String> {
+/// The file's settings (`None` when there is no file) or why the file cannot be used, and
+/// its revision.
+fn read(file: &Path) -> (std::result::Result<Option<Settings>, String>, String) {
+    match fs::read_to_string(file) {
+        Ok(json) => {
+            let revision = revision_of(&json);
+            (parse(file, &json).map(Some), revision)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (Ok(None), String::new()),
+        Err(error) => (
+            Err(format!("{} cannot be read: {error}", file.display())),
+            String::new(),
+        ),
+    }
+}
+
+/// A fingerprint of the file's text: FNV-1a, 64 bits, in hex. Not a defence against anyone;
+/// it tells two versions of a small file apart, and is the same in every build, so two
+/// Postil versions open at once agree on it. Empty for no file, or one that cannot be read.
+fn revision_of(json: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let hash = json.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    format!("{hash:016x}")
+}
+
+fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
     let shown = file.display();
-    let json = match fs::read_to_string(file) {
-        Ok(json) => json,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("{shown} cannot be read: {error}")),
-    };
-    match serde_json::from_str::<VersionOnly>(&json) {
+    match serde_json::from_str::<VersionOnly>(json) {
         Ok(VersionOnly { version }) if version > VERSION => {
             return Err(format!(
                 "{shown} was written by a newer Postil (format version {version})"
@@ -248,26 +275,34 @@ fn read(file: &Path) -> std::result::Result<Option<Settings>, String> {
         }
         _ => {}
     }
-    let stored: SettingsFile<Settings> = serde_json::from_str(&json)
+    let stored: SettingsFile<Settings> = serde_json::from_str(json)
         .map_err(|error| format!("{shown} is not valid settings JSON: {error}"))?;
     stored
         .settings
         .check()
         .map_err(|problem| format!("{shown} breaks a rule: {problem}"))?;
-    Ok(Some(stored.settings))
+    Ok(stored.settings)
 }
 
-/// Writes `settings` to `file`.
+/// Writes `settings` to `file`, if the file is still at `revision`: the one the change
+/// started from. Another window, or a hand edit, may have changed it since, and saving the
+/// whole settings over that would drop the other change without a word.
 ///
 /// # Errors
 ///
 /// - [`Error::InvalidSettings`] when `settings` breaks a rule; nothing is written.
+/// - [`Error::SettingsChanged`] when the file is no longer at `revision`; nothing is
+///   written.
 /// - [`Error::SettingsLocked`] when the file on disk cannot be used (see the module docs);
 ///   nothing is written.
 /// - [`Error::WriteSettings`] when the file cannot be written.
-pub(crate) fn save(file: &Path, settings: &Settings) -> Result<()> {
+pub(crate) fn save(file: &Path, settings: &Settings, revision: &str) -> Result<()> {
     settings.check().map_err(Error::InvalidSettings)?;
-    if let Err(problem) = read(file) {
+    let (read, current) = read(file);
+    if current != revision {
+        return Err(Error::SettingsChanged);
+    }
+    if let Err(problem) = read {
         return Err(Error::SettingsLocked(problem));
     }
     write(file, settings)

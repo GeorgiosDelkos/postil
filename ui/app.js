@@ -1358,9 +1358,15 @@ function applySettings(settings) {
     // offset at another line height would show another part of the file.
     const top = lineAt(codeEl.scrollTop);
     lineHeight = metrics.lineHeight;
-    codeEl.scrollTop = lineTop(top);
-    // Rows are placed by line height, so they are placed again.
-    if (state.file) renderCode({ force: true });
+    if (state.file) {
+      // Rows are placed by line height, so they are placed again, and the padding that
+      // stands in for the other lines grows or shrinks with them. Only then can the scroll
+      // offset go where the top line now is: before, the browser would cut it to the old
+      // height of the file.
+      renderCode({ force: true });
+      codeEl.scrollTop = lineTop(top);
+      renderCode({ force: true });
+    }
   }
   // The first settings are the ones the window started with.
   if (appliedTheme !== null && settings.theme !== appliedTheme) {
@@ -1369,12 +1375,7 @@ function applySettings(settings) {
   appliedTheme = settings.theme;
 }
 
-const settings = settingsDialog(settingsEl, {
-  apply: applySettings,
-  closed: () => {
-    if (welcomeEl.hidden) codeEl.focus();
-  },
-});
+const settings = settingsDialog(settingsEl, { apply: applySettings });
 $("open-settings").addEventListener("click", () => settings.open());
 
 async function start() {

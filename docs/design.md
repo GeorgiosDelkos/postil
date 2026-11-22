@@ -312,8 +312,8 @@ authentication, the run panel says which command to run in a terminal.
 
 ### Settings
 
-`~/.config/postil/settings.json` (`src/settings.rs`), edited in the settings dialog: the gear
-at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change saves at once. The
+`~/.config/postil/settings.json` (`src/settings.rs`), edited in the settings dialog: the Settings
+button at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change saves at once. The
 settings are the theme (system, light, dark), the code font size (11 to 20 px; the line
 height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
 reopens the last project, and the agents above.
@@ -322,6 +322,10 @@ The theme is set on the window, and WebKit answers the page's `prefers-color-sch
 window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:
 one that cannot be read, does not parse, breaks a rule, or comes from a newer Postil leaves the
 defaults in effect and is never written over until the engineer chooses Reset in the dialog.
+Every reply carries the file's revision (a hash of its text), and a save names the revision
+it started from; a file changed since (another window, a hand edit) refuses the save, and the
+dialog shows the file as it now is. Without that, saving the whole settings would drop the
+other change.
 
 ## Dependencies
 
