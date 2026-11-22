@@ -154,12 +154,15 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
             }
         })
         .with_drag_drop_handler(move |event| {
-            let outcome = file_drag.borrow_mut().handle(event);
-            if let Some(path) = outcome.open {
-                // As above: fails only once the event loop is gone.
-                drop(drop_proxy.send_event(AppEvent::Dropped(path)));
+            match file_drag.borrow_mut().handle(event) {
+                DragOutcome::Pass => false,
+                DragOutcome::Take => true,
+                DragOutcome::Open(path) => {
+                    // As above: fails only once the event loop is gone.
+                    drop(drop_proxy.send_event(AppEvent::Dropped(path)));
+                    true
+                }
             }
-            outcome.handled
         })
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
         // not reach the `postil://` handlers, which read and write the repository.
@@ -221,42 +224,44 @@ struct FileDrag {
 }
 
 /// What the drag handler does with one event.
-#[derive(Debug, PartialEq, Eq)]
-struct DragOutcome {
-    /// Whether the app handles the event, keeping it from the webview.
-    handled: bool,
-    /// The folder to open, after a drop.
-    open: Option<PathBuf>,
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+enum DragOutcome {
+    /// Leave the event to the webview.
+    Pass,
+    /// Keep the event from the webview.
+    Take,
+    /// Keep the drop from the webview and open this folder.
+    Open(PathBuf),
 }
 
 impl FileDrag {
     fn handle(&mut self, event: DragDropEvent) -> DragOutcome {
-        let pass = |handled| DragOutcome {
-            handled,
-            open: None,
+        let take_if = |files| {
+            if files {
+                DragOutcome::Take
+            } else {
+                DragOutcome::Pass
+            }
         };
         match event {
             DragDropEvent::Enter { paths, .. } => {
                 self.carries_files = !paths.is_empty();
-                pass(self.carries_files)
+                take_if(self.carries_files)
             }
-            DragDropEvent::Over { .. } => pass(self.carries_files),
+            DragDropEvent::Over { .. } => take_if(self.carries_files),
             DragDropEvent::Drop { paths, .. } => {
                 self.carries_files = false;
                 // A project is one folder: the first folder dropped opens, or, when only files
                 // were dropped, the first file, which the page then reports as not a folder.
-                let open = paths
+                paths
                     .iter()
                     .find(|path| path.is_dir())
                     .or_else(|| paths.first())
-                    .cloned();
-                DragOutcome {
-                    handled: open.is_some(),
-                    open,
-                }
+                    .map_or(DragOutcome::Pass, |path| DragOutcome::Open(path.clone()))
             }
-            DragDropEvent::Leave => pass(std::mem::take(&mut self.carries_files)),
-            _ => pass(false),
+            DragDropEvent::Leave => take_if(std::mem::take(&mut self.carries_files)),
+            _ => DragOutcome::Pass,
         }
     }
 }
@@ -960,25 +965,31 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_note_is_gone_and_only_the_newest_id_is_freed() {
+    fn a_deleted_note_is_gone_and_ids_above_the_highest_left_are_reused() {
         let repo = TempRepo::new("notes-delete");
         repo.write("a.txt", "x\ny\nz\n");
         let site = repo.site();
-        post_note(&site, "a.txt", 1, 1, "one");
-        post_note(&site, "a.txt", 2, 2, "two");
+        for line in 1..=3 {
+            post_note(&site, "a.txt", line, line, "note");
+        }
 
+        // An id below the highest left stays unused.
         let (status, body) = delete(&site, &format!("{NOTES}?id=N2"));
         assert_eq!(status, StatusCode::OK, "{body}");
         let review: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(anchors(&review), [anchor("N1", 1, 1, "found")]);
+        assert_eq!(
+            anchors(&review),
+            [anchor("N1", 1, 1, "found"), anchor("N3", 3, 3, "found")]
+        );
         let stored = fs::read_to_string(site.repo().unwrap().review_file()).unwrap();
         assert!(!stored.contains("\"N2\""), "{stored}");
 
-        let review = post_note(&site, "a.txt", 3, 3, "three");
+        // Once N3 is gone too, the highest left is N1: N2 is handed out again.
+        delete(&site, &format!("{NOTES}?id=N3"));
+        let review = post_note(&site, "a.txt", 2, 2, "again");
         assert_eq!(
             anchors(&review),
-            [anchor("N1", 1, 1, "found"), anchor("N2", 3, 3, "found")],
-            "the highest id left is N1, so the next is N2 again"
+            [anchor("N1", 1, 1, "found"), anchor("N2", 2, 2, "found")]
         );
     }
 
@@ -1277,41 +1288,33 @@ mod tests {
         fs::write(&file, "x").unwrap();
         let position = (0, 0);
         let mut drags = FileDrag::default();
-        let pass = |handled| DragOutcome {
-            handled,
-            open: None,
-        };
+        let over = DragDropEvent::Over { position };
+        let enter = |paths| DragDropEvent::Enter { paths, position };
+        let dropped = |paths| DragDropEvent::Drop { paths, position };
 
         // Text dragged into the composer: no paths, left to the webview throughout.
-        let enter = DragDropEvent::Enter {
-            paths: Vec::new(),
-            position,
-        };
-        assert_eq!(drags.handle(enter), pass(false));
-        assert_eq!(drags.handle(DragDropEvent::Over { position }), pass(false));
+        assert_eq!(drags.handle(enter(Vec::new())), DragOutcome::Pass);
+        assert_eq!(drags.handle(over.clone()), DragOutcome::Pass);
 
-        // Files: taken from entering to leaving.
-        let enter = DragDropEvent::Enter {
-            paths: drag(&[&file]),
-            position,
-        };
-        assert_eq!(drags.handle(enter), pass(true));
-        assert_eq!(drags.handle(DragDropEvent::Over { position }), pass(true));
-        assert_eq!(drags.handle(DragDropEvent::Leave), pass(true));
-        assert_eq!(drags.handle(DragDropEvent::Over { position }), pass(false));
+        // Files: taken from entering to leaving, and not after.
+        assert_eq!(drags.handle(enter(drag(&[&file]))), DragOutcome::Take);
+        assert_eq!(drags.handle(over.clone()), DragOutcome::Take);
+        assert_eq!(drags.handle(DragDropEvent::Leave), DragOutcome::Take);
+        assert_eq!(drags.handle(over.clone()), DragOutcome::Pass);
 
-        // A drop opens the first folder among the items, else the first item.
-        let dropped = |paths| DragDropEvent::Drop { paths, position };
-        let open = |path: &Path| DragOutcome {
-            handled: true,
-            open: Some(path.to_path_buf()),
-        };
+        // A drop opens the first folder among the items, else the first item, and ends the
+        // drag: a later event is the webview's again.
+        drags.handle(enter(drag(&[&file, &folder])));
         assert_eq!(
             drags.handle(dropped(drag(&[&file, &folder]))),
-            open(&folder)
+            DragOutcome::Open(folder.clone())
         );
-        assert_eq!(drags.handle(dropped(drag(&[&file]))), open(&file));
-        assert_eq!(drags.handle(dropped(Vec::new())), pass(false));
+        assert_eq!(drags.handle(over), DragOutcome::Pass);
+        assert_eq!(
+            drags.handle(dropped(drag(&[&file]))),
+            DragOutcome::Open(file.clone())
+        );
+        assert_eq!(drags.handle(dropped(Vec::new())), DragOutcome::Pass);
         drop(fs::remove_dir_all(&folder));
     }
 

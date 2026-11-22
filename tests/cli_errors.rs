@@ -115,7 +115,8 @@ fn a_plain_folder_is_recognised_whatever_the_language_of_git() {
 
     // German, when git here speaks it: the app must not depend on git's language. A git built
     // without translations, or a machine without the locale, prints English anyway, and this
-    // test then proves nothing, so it says so and stops.
+    // test then proves nothing, so on a laptop it says so and stops. On CI it fails instead:
+    // a skip there would leave the property unchecked everywhere.
     let probe = Command::new("git")
         .arg("-C")
         .arg(&dir)
@@ -124,8 +125,12 @@ fn a_plain_folder_is_recognised_whatever_the_language_of_git() {
         .output()
         .expect("git runs");
     if String::from_utf8_lossy(&probe.stderr).contains("not a git repository") {
-        eprintln!("skipped: git here does not translate its messages to German");
         std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI's git must translate to German for this test; install one that does"
+        );
+        eprintln!("skipped: git here does not translate its messages to German");
         return;
     }
     let output = command()
