@@ -6,6 +6,7 @@
 // saving, and when the window regains focus.
 
 import { rank } from "./fuzzy.js";
+import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -53,6 +54,10 @@ const state = {
   // file, and the number of notes in each file.
   noteByLine: new Map(),
   noteCountByPath: new Map(),
+  // The repository's files as a tree (tree.js), rebuilt when the file list changes, and the
+  // paths of the folders open in it.
+  tree: buildTree([]),
+  expanded: new Set(),
   // The index of the highlighted row while the file filter has text.
   activeMatch: 0,
   // The rendered window of lines: [first, last).
@@ -68,10 +73,28 @@ function el(tag, className, text) {
 
 // ---- Files ----------------------------------------------------------------------------
 
+// Pixels of indent per level of the tree, and before the first level.
+const INDENT = 12;
+const INDENT_BASE = 4;
+
+const rowSelector = (path) => `[data-path="${CSS.escape(path)}"]`;
+
 function renderFiles() {
   const needle = filterEl.value.trim().toLowerCase();
-  const rows = needle ? filteredFileRows(needle) : treeFileRows();
-  filesEl.replaceChildren(...rows);
+  // A row with keyboard focus is replaced; focus moves to the new row for the same path.
+  const focused = filesEl.contains(document.activeElement)
+    ? document.activeElement.dataset.path
+    : null;
+
+  if (needle) {
+    filesEl.removeAttribute("role");
+    filesEl.replaceChildren(...filteredFileRows(needle));
+  } else {
+    filesEl.setAttribute("role", "tree");
+    filesEl.replaceChildren(...treeRows());
+    setTabStop(filesEl.querySelector(".file.open") ?? filesEl.querySelector(".file, .dir"));
+  }
+  if (focused) filesEl.querySelector(rowSelector(focused))?.focus();
 }
 
 // With a filter: a flat list of the best fuzzy matches, with the matched characters marked.
@@ -80,7 +103,7 @@ function filteredFileRows(needle) {
   const matches = rank(needle, state.repo.files, MAX_MATCHES);
   state.activeMatch = Math.min(state.activeMatch, Math.max(0, matches.length - 1));
   return matches.map(({ path, positions }, index) => {
-    const row = fileRow(path, markedPath(path, positions), 0);
+    const row = fileRow(path, markedPath(path, positions));
     row.classList.toggle("active", index === state.activeMatch);
     return row;
   });
@@ -96,35 +119,38 @@ function markedPath(path, positions) {
   return label;
 }
 
-// Without a filter: the sorted paths as an indented tree. A directory row is emitted the
-// first time a path enters that directory.
-function treeFileRows() {
-  const rows = [];
-  let open = [];
-  for (const path of state.repo.files) {
-    const parts = path.split("/");
-    const dirs = parts.slice(0, -1);
-    let shared = 0;
-    while (shared < dirs.length && shared < open.length && dirs[shared] === open[shared]) {
-      shared += 1;
-    }
-    for (let depth = shared; depth < dirs.length; depth += 1) {
-      const row = el("div", "dir", dirs[depth]);
-      row.style.paddingLeft = `${8 + 14 * depth}px`;
-      rows.push(row);
-    }
-    open = dirs;
-    rows.push(fileRow(path, el("span", "", parts.at(-1)), dirs.length));
-  }
-  return rows;
+// Without a filter: the tree, showing the contents of open folders only. A closed folder
+// carries the count of notes inside it, so collapsing it does not hide that they exist.
+function treeRows() {
+  const totals = folderCounts(state.noteCountByPath);
+  return visibleRows(state.tree, state.expanded).map((row) => {
+    const button = row.kind === "folder" ? folderRow(row, totals) : fileRow(row.path, row.name);
+    // Files get an empty chevron slot, so names line up with their folder's siblings.
+    if (row.kind === "file") button.prepend(el("span", "chevron"));
+    button.style.paddingLeft = `${INDENT_BASE + INDENT * row.depth}px`;
+    button.setAttribute("role", "treeitem");
+    button.setAttribute("aria-level", String(row.depth + 1));
+    return button;
+  });
 }
 
-function fileRow(path, label, depth) {
+function folderRow(row, totals) {
+  const button = el("button", "dir");
+  button.type = "button";
+  button.dataset.path = row.path;
+  button.setAttribute("aria-expanded", String(row.open));
+  button.append(el("span", "chevron"), el("span", "name", row.name));
+  const count = row.open ? 0 : totals.get(row.path);
+  if (count) button.append(el("span", "count", String(count)));
+  return button;
+}
+
+// `label` is the text to show, or an element (the filter marks matched characters).
+function fileRow(path, label) {
   const row = el("button", "file");
   row.type = "button";
   row.dataset.path = path;
-  row.style.paddingLeft = `${8 + 14 * depth}px`;
-  row.append(label);
+  row.append(typeof label === "string" ? el("span", "name", label) : label);
   if (state.file?.path === path) row.classList.add("open");
 
   const count = state.noteCountByPath.get(path);
@@ -132,12 +158,34 @@ function fileRow(path, label, depth) {
   return row;
 }
 
-// Moves the `open` mark in the file list from one row to another without rebuilding the
-// list, which holds a row for every file in the repository.
-function markOpenFile(previous, path) {
-  const row = (file) => filesEl.querySelector(`.file[data-path="${CSS.escape(file)}"]`);
-  if (previous) row(previous)?.classList.remove("open");
-  row(path)?.classList.add("open");
+// One row of the tree is in the Tab order; the arrow keys move between rows (the ARIA tree
+// pattern). Without this, Tab would stop on every visible file.
+function setTabStop(row) {
+  for (const other of filesEl.querySelectorAll(".file, .dir")) {
+    if (other !== row) other.tabIndex = -1;
+  }
+  if (row) row.tabIndex = 0;
+}
+
+function setFolderOpen(path, open) {
+  if (open) state.expanded.add(path);
+  else state.expanded.delete(path);
+  renderFiles();
+}
+
+// Opens the folders around `path` so its row exists, marks it as the open file, and scrolls
+// it into view. Moves the mark without rebuilding the list when no folder had to open.
+function revealFile(previous, path) {
+  const closed = ancestors(path).filter((folder) => !state.expanded.has(folder));
+  for (const folder of closed) state.expanded.add(folder);
+
+  if (closed.length > 0) {
+    renderFiles();
+  } else {
+    if (previous) filesEl.querySelector(`.file${rowSelector(previous)}`)?.classList.remove("open");
+    filesEl.querySelector(`.file${rowSelector(path)}`)?.classList.add("open");
+  }
+  filesEl.querySelector(`.file${rowSelector(path)}`)?.scrollIntoView({ block: "nearest" });
 }
 
 // The reply to `api/file`: { ok, body }, the body a file view or the reason it failed.
@@ -181,7 +229,7 @@ function showFile(path, reply, { keepView }) {
 
   indexNotes();
   renderHeader(path);
-  markOpenFile(previous, path);
+  revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
 }
@@ -544,8 +592,45 @@ codeEl.addEventListener(
 new ResizeObserver(() => renderCode()).observe(codeEl);
 
 filesEl.addEventListener("click", (event) => {
-  const row = event.target.closest(".file");
-  if (row) openFile(row.dataset.path);
+  const row = event.target.closest(".file, .dir");
+  if (!row) return;
+  if (row.classList.contains("dir")) {
+    setFolderOpen(row.dataset.path, row.getAttribute("aria-expanded") !== "true");
+  } else {
+    openFile(row.dataset.path);
+  }
+});
+
+filesEl.addEventListener("focusin", (event) => {
+  const row = event.target.closest(".file, .dir");
+  if (row && filesEl.getAttribute("role") === "tree") setTabStop(row);
+});
+
+// The keys of a file tree in an IDE: up and down move between visible rows; right opens a
+// folder, or moves into an open one; left closes an open folder, or moves to the parent.
+// Enter and Space are the buttons' own: open the file, or toggle the folder.
+filesEl.addEventListener("keydown", (event) => {
+  const row = event.target.closest(".file, .dir");
+  if (!row || filesEl.getAttribute("role") !== "tree") return;
+
+  const rows = [...filesEl.querySelectorAll(".file, .dir")];
+  const index = rows.indexOf(row);
+  const path = row.dataset.path;
+  const folder = row.classList.contains("dir");
+  const open = row.getAttribute("aria-expanded") === "true";
+
+  if (event.key === "ArrowDown") rows[index + 1]?.focus();
+  else if (event.key === "ArrowUp") rows[index - 1]?.focus();
+  else if (event.key === "Home") rows[0]?.focus();
+  else if (event.key === "End") rows.at(-1)?.focus();
+  else if (event.key === "ArrowRight" && folder && !open) setFolderOpen(path, true);
+  else if (event.key === "ArrowRight" && folder) rows[index + 1]?.focus();
+  else if (event.key === "ArrowLeft" && folder && open) setFolderOpen(path, false);
+  else if (event.key === "ArrowLeft") {
+    const parent = ancestors(path).at(-1);
+    if (parent !== undefined) filesEl.querySelector(rowSelector(parent))?.focus();
+  } else return;
+  event.preventDefault();
 });
 
 filterEl.addEventListener("input", () => {
@@ -675,6 +760,7 @@ async function runBench(path) {
 
 function showRepo(repo) {
   state.repo = repo;
+  state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
 }

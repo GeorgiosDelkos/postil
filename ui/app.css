@@ -195,36 +195,37 @@ kbd {
   font-size: 12.5px;
 }
 
+/* A row of the file tree or the filter's list. The tree sets each row's left padding inline,
+   by depth; the filter's flat list uses this one. */
 .file,
 .dir {
+  width: 100%;
   height: 26px;
   display: flex;
   align-items: center;
-  padding-right: 8px;
+  padding: 0 8px;
+  background: none;
+  border: 0;
   border-radius: 6px;
+  font: inherit;
+  text-align: left;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  transition: background-color 80ms linear;
   /* Rows far from the viewport skip layout and paint, which keeps a long list cheap. */
   content-visibility: auto;
   contain-intrinsic-size: auto 26px;
 }
 
-.dir {
-  color: var(--text-muted);
-}
-
 .file {
-  width: 100%;
-  background: none;
-  border: 0;
   color: var(--text-soft);
-  font: inherit;
-  text-align: left;
-  transition: background-color 80ms linear;
 }
 
-.file:hover {
+.dir {
+  color: var(--text);
+}
+
+.file:hover,
+.dir:hover {
   background: var(--hover);
 }
 
@@ -233,7 +234,43 @@ kbd {
   color: var(--text-strong);
 }
 
-.file .count {
+.file:focus-visible,
+.dir:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.file .name,
+.dir .name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A folder's disclosure triangle, pointing right when closed and down when open. Files have
+   the same slot, empty, so their names line up with the folders beside them. */
+.chevron {
+  flex: none;
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+.dir .chevron::before {
+  content: "";
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform 80ms linear;
+}
+
+.dir[aria-expanded="true"] .chevron::before {
+  transform: rotate(90deg);
+}
+
+.file .count,
+.dir .count {
   margin-left: auto;
   padding-left: 8px;
   font: 11px "Geist Mono", monospace;

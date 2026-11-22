@@ -391,7 +391,12 @@ retired; the measured numbers above are the baseline to not regress.
    to trimmed egui and keep everything below unchanged: `app.rs`, `notes.rs`, `repo.rs`, and
    `acp/` do not depend on the UI layer.
 1. **Read.** Open a repository, file tree, fuzzy finder, highlighting, both themes. Built: the
-   finder is the sidebar's filter box (`Cmd-P` focuses it, arrows move, Enter opens).
+   finder is the sidebar's filter box (`Cmd-P` focuses it, arrows move, Enter opens). The
+   tree (`ui/tree.js`) lists folders before files, names case-insensitively with digits by
+   value; folders start closed, opening a file opens the folders around it, and a closed
+   folder shows the count of notes inside it. Keys follow the ARIA tree pattern: up and down
+   move, right opens or enters a folder, left closes it or goes to the parent, Enter opens.
+   Which folders are open is not kept across restarts yet.
 2. **Note.** Line selection, the composer, the tray, `review.json`, anchoring across file changes.
    Built: the page saves through `POST api/notes` and reads the file and the notes again when
    the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
