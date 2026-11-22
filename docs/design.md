@@ -31,8 +31,11 @@ panel. It is not an editor, not a terminal, and not a PR tool.
 1. **Open.** `postil .` in a repository, or drop a folder on the window. The file list comes
    from `git ls-files` plus untracked files that are not ignored.
 2. **Read.** A file tree on the left, a fuzzy finder on `Cmd-P`, one code pane with syntax colors.
-3. **Note.** Select lines (drag in the gutter, or `v` then `j`/`k`), press `c`, type, `Cmd-Enter`.
-   The note composer opens under the selected lines, inside the code, so the eyes do not move.
+3. **Note.** Select lines (drag in the gutter, drag across the code text, or `v` then `j`/`k`),
+   press `c` or right-click and choose Add note, type, `Cmd-Enter`. The note composer opens
+   under the selected lines, inside the code, so the eyes do not move. The right-click menu
+   also copies the selection (code only, never the line numbers) and its `path:lines`
+   reference. `v`/`j`/`k` is not built yet.
 4. **Collect.** Notes list in the tray on the right, grouped by file. Clicking one jumps to its
    lines. Notes survive restarts.
 5. **Send.** Pick an agent, press `Cmd-Shift-Enter`. The prompt preview shows the exact text the

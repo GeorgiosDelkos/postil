@@ -417,9 +417,197 @@ rowsEl.addEventListener("mousemove", (event) => {
   redecorateRows();
 });
 
-window.addEventListener("mouseup", () => {
+window.addEventListener("mouseup", (event) => {
+  const fromGutter = dragging;
   dragging = false;
+  if (!fromGutter && event.button === 0) selectFromText(event);
 });
+
+// A drag across the code text selects the lines it touches, as a drag in the gutter does, so
+// the next `c` or right-click acts on them. The text stays highlighted for copying. A plain
+// click in the code clears the selection, as in an editor.
+function selectFromText(event) {
+  if (state.composer || !rowsEl.contains(event.target)) return;
+  const range = textSelectionLines();
+  state.selection = range ? { anchor: range.start, head: range.end } : null;
+  redecorateRows();
+}
+
+// The lines the browser's text selection covers in the code, or null when nothing is
+// selected there.
+function textSelectionLines() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const lineOf = (node) => {
+    const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    const row = element?.closest(".ln");
+    return row && rowsEl.contains(row) ? row : null;
+  };
+  const first = lineOf(range.startContainer);
+  const last = lineOf(range.endContainer);
+  if (!first || !last) return null;
+
+  const start = Number(first.dataset.line);
+  let end = Number(last.dataset.line);
+  // A selection that runs to the very start of a line (a triple click, or a drag down to
+  // the left edge) takes none of that line's text, so the line is not part of it.
+  if (end > start) {
+    const before = document.createRange();
+    before.setStart(last.querySelector(".c") ?? last, 0);
+    before.setEnd(range.endContainer, range.endOffset);
+    if (before.toString() === "") end -= 1;
+  }
+  return { start, end };
+}
+
+// The text of lines `start` to `end` (0-based, inclusive) as the page shows them.
+function linesText({ start, end }) {
+  const lines = state.file.lines.slice(start, end + 1);
+  return lines.map((tokens) => tokens.map(([, text]) => text).join("")).join("\n");
+}
+
+// The code the text selection covers, without the line numbers and note remarks that sit
+// in the same rows: WebKit's own selection text includes them even though they cannot be
+// selected (seen 2026-11-22: a two-line selection copied the gutter's "3"). Null when the
+// selection is not in the code.
+function selectedCodeText() {
+  const lines = textSelectionLines();
+  if (!lines) return null;
+  const range = window.getSelection().getRangeAt(0);
+  const code = (line) => rowsEl.querySelector(`.ln[data-line="${line}"] .c`);
+  // How many characters of `cell` come before (container, offset), or null when that
+  // position is not inside the cell (it is in the gutter, or on another line).
+  const offsetIn = (cell, container, offset) => {
+    if (!cell?.contains(container)) return null;
+    const before = document.createRange();
+    before.setStart(cell, 0);
+    before.setEnd(container, offset);
+    return before.toString().length;
+  };
+
+  const text = linesText(lines);
+  const from = offsetIn(code(lines.start), range.startContainer, range.startOffset) ?? 0;
+  const lastLine = linesText({ start: lines.end, end: lines.end });
+  const to = offsetIn(code(lines.end), range.endContainer, range.endOffset) ?? lastLine.length;
+  return text.slice(from, text.length - (lastLine.length - to));
+}
+
+rowsEl.addEventListener("copy", (event) => {
+  const text = selectedCodeText();
+  if (text === null) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", text);
+});
+
+// ---- Context menu ---------------------------------------------------------------------
+//
+// Right-click on the code opens actions for the selected lines. A click outside the
+// selection first selects the clicked line, as editors move the cursor there.
+
+const menuEl = $("context-menu");
+
+rowsEl.addEventListener("contextmenu", (event) => {
+  // The composer's textarea keeps the system menu: spelling, paste, and the like.
+  if (event.target.closest(".composer")) return;
+  const line = lineOfEvent(event);
+  if (line === null || !state.file) return;
+  event.preventDefault();
+
+  const range = selectedRange();
+  if (!range || line < range.start || line > range.end) {
+    state.selection = { anchor: line, head: line };
+    redecorateRows();
+  }
+  openMenu(event.clientX, event.clientY, codeActions());
+});
+
+function codeActions() {
+  const range = selectedRange();
+  const first = range.start + 1;
+  const last = range.end + 1;
+  const reference = `${state.file.path}:${first === last ? first : `${first}-${last}`}`;
+  // The text selection when there is one inside the code, else the whole selected lines.
+  const text = selectedCodeText() ?? linesText(range);
+  return [
+    { label: "Add note", key: "C", run: openComposer, disabled: Boolean(state.composer) },
+    { label: "Copy", key: "⌘C", run: () => copyText(text) },
+    { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
+  ];
+}
+
+function openMenu(x, y, actions) {
+  const items = actions.map((action) => {
+    const item = el("button", "menu-item");
+    item.type = "button";
+    item.setAttribute("role", "menuitem");
+    item.disabled = Boolean(action.disabled);
+    item.append(el("span", "menu-label", action.label));
+    if (action.key) item.append(el("kbd", "", action.key));
+    item.addEventListener("click", () => {
+      closeMenu();
+      action.run();
+    });
+    return item;
+  });
+  menuEl.replaceChildren(...items);
+  menuEl.hidden = false;
+
+  // Opens at the pointer, moved back inside the window when it would cross an edge.
+  const { width, height } = menuEl.getBoundingClientRect();
+  menuEl.style.left = `${Math.max(4, Math.min(x, innerWidth - width - 4))}px`;
+  menuEl.style.top = `${Math.max(4, Math.min(y, innerHeight - height - 4))}px`;
+  menuEl.querySelector("button:not(:disabled)")?.focus();
+}
+
+function closeMenu() {
+  if (menuEl.hidden) return;
+  menuEl.hidden = true;
+  if (menuEl.contains(document.activeElement) || document.activeElement === document.body) {
+    codeEl.focus();
+  }
+}
+
+menuEl.addEventListener("keydown", (event) => {
+  const items = [...menuEl.querySelectorAll("button:not(:disabled)")];
+  const index = items.indexOf(document.activeElement);
+  if (event.key === "ArrowDown") items[(index + 1) % items.length]?.focus();
+  else if (event.key === "ArrowUp") items[(index - 1 + items.length) % items.length]?.focus();
+  else if (event.key === "Escape") closeMenu();
+  else return;
+  event.preventDefault();
+  // Escape here closes only the menu, not the composer or the selection behind it.
+  event.stopPropagation();
+});
+
+// Any press outside the menu, a scroll of the code, or leaving the window closes it.
+window.addEventListener(
+  "mousedown",
+  (event) => {
+    if (!menuEl.contains(event.target)) closeMenu();
+  },
+  true,
+);
+window.addEventListener("blur", closeMenu);
+
+// The Clipboard API needs a secure context, which a custom URL scheme may not count as; the
+// older copy command works from any page with a selection, so it is the fallback.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // Fall through to the copy command below.
+  }
+  const area = el("textarea");
+  area.value = text;
+  area.className = "copy-buffer";
+  document.body.append(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+  codeEl.focus();
+}
 
 // ---- Composer and notes ---------------------------------------------------------------
 
@@ -610,6 +798,7 @@ let renderQueued = false;
 codeEl.addEventListener(
   "scroll",
   () => {
+    closeMenu();
     if (renderQueued) return;
     renderQueued = true;
     requestAnimationFrame(() => {

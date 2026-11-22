@@ -597,3 +597,64 @@ kbd {
   margin-right: 6px;
   filter: saturate(0.8);
 }
+
+/* The right-click menu on the code. Its `display: flex` would otherwise win over the
+   browser's own rule for the `hidden` attribute, leaving a closed menu on screen. */
+
+.context-menu[hidden] {
+  display: none;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 10;
+  min-width: 200px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.menu-item {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 10px;
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.menu-item:hover:not(:disabled),
+.menu-item:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.menu-item:disabled {
+  color: var(--text-muted);
+}
+
+.menu-item kbd {
+  margin-left: auto;
+  border: 0;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+/* The off-screen text the fallback copy command copies from. */
+
+.copy-buffer {
+  position: fixed;
+  top: -1000px;
+  opacity: 0;
+}
