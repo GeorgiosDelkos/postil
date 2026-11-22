@@ -110,6 +110,21 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The page sent settings that break a rule (`settings.rs`); the text says which.
+    InvalidSettings(String),
+    /// The settings file on disk cannot be used, so saving over it is refused until it is
+    /// reset.
+    SettingsLocked {
+        /// Why the file cannot be used, naming it.
+        problem: String,
+    },
+    /// The settings file could not be written.
+    WriteSettings {
+        /// The settings file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
 }
 
 // Written by hand instead of with `thiserror` to keep the dependency tree small
@@ -172,6 +187,16 @@ impl fmt::Display for Error {
                 "cannot write {} (check that its directory is writable; the note was not saved)",
                 path.display()
             ),
+            Self::InvalidSettings(problem) => write!(f, "cannot save the settings: {problem}"),
+            Self::SettingsLocked { problem } => {
+                write!(f, "cannot save the settings: {problem}")
+            }
+            Self::WriteSettings { path, .. } => write!(
+                f,
+                "cannot write {} (check that its directory is writable; the settings were not \
+                 saved)",
+                path.display()
+            ),
         }
     }
 }
@@ -183,7 +208,8 @@ impl std::error::Error for Error {
             | Self::Read { source, .. }
             | Self::ReadReview { source, .. }
             | Self::WriteReview { source, .. }
-            | Self::WriteRecent { source, .. } => Some(source),
+            | Self::WriteRecent { source, .. }
+            | Self::WriteSettings { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
             Self::Highlight(source) => Some(source),
             Self::Window(source) => Some(source),
@@ -200,7 +226,9 @@ impl std::error::Error for Error {
             | Self::NoHome
             | Self::InvalidNote(_)
             | Self::NoteTextChanged { .. }
-            | Self::InvalidReview { .. } => None,
+            | Self::InvalidReview { .. }
+            | Self::InvalidSettings(_)
+            | Self::SettingsLocked { .. } => None,
         }
     }
 }

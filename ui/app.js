@@ -7,6 +7,8 @@
 
 import { rank } from "./fuzzy.js";
 import { fileIcon, folderIcon } from "./icons.js";
+import { settingsDialog } from "./settings-dialog.js";
+import { codeMetrics } from "./settings.js";
 import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
@@ -18,8 +20,9 @@ const rowsEl = $("code-rows");
 const codeEmptyEl = $("code-empty");
 const notesEl = $("notes");
 
-// One code line's height in px, owned by `--line-height` in app.css.
-const LINE_HEIGHT = parseFloat(
+// One code line's height in px: `--line-height` in app.css until the settings arrive, then
+// what they give (`applySettings`), which sets the CSS variable too.
+let lineHeight = parseFloat(
   getComputedStyle(document.documentElement).getPropertyValue("--line-height"),
 );
 // `.code-rows` has this much padding above the first and below the last line (app.css).
@@ -302,18 +305,18 @@ function lineCount() {
 // The y position of the top of line `index` inside the scroll content.
 function lineTop(index) {
   const pushed = state.composer && index > state.composer.end ? state.composerHeight : 0;
-  return ROWS_PADDING + index * LINE_HEIGHT + pushed;
+  return ROWS_PADDING + index * lineHeight + pushed;
 }
 
 // The line at scroll offset `y`: the inverse of `lineTop`.
 function lineAt(y) {
   const composer = state.composer;
   if (composer) {
-    const composerTop = lineTop(composer.end) + LINE_HEIGHT;
+    const composerTop = lineTop(composer.end) + lineHeight;
     if (y >= composerTop + state.composerHeight) y -= state.composerHeight;
     else if (y >= composerTop) return composer.end;
   }
-  const index = Math.floor((y - ROWS_PADDING) / LINE_HEIGHT);
+  const index = Math.floor((y - ROWS_PADDING) / lineHeight);
   return Math.max(0, Math.min(lineCount(), index));
 }
 
@@ -350,8 +353,8 @@ function setRowsPadding() {
   const composer = state.composer;
   const above = composer && composer.end < first ? state.composerHeight : 0;
   const below = composer && composer.end >= last ? state.composerHeight : 0;
-  rowsEl.style.paddingTop = `${ROWS_PADDING + first * LINE_HEIGHT + above}px`;
-  rowsEl.style.paddingBottom = `${ROWS_PADDING + (lineCount() - last) * LINE_HEIGHT + below}px`;
+  rowsEl.style.paddingTop = `${ROWS_PADDING + first * lineHeight + above}px`;
+  rowsEl.style.paddingBottom = `${ROWS_PADDING + (lineCount() - last) * lineHeight + below}px`;
 }
 
 function lineRow(index) {
@@ -762,7 +765,7 @@ function openComposer(range = selectedRange()) {
 
   // The composer opens under the selection, so the selection must be on screen to see it.
   const top = lineTop(range.start);
-  const bottom = lineTop(range.end) + LINE_HEIGHT;
+  const bottom = lineTop(range.end) + lineHeight;
   if (top < codeEl.scrollTop || bottom > codeEl.scrollTop + codeEl.clientHeight) {
     codeEl.scrollTop = top - codeEl.clientHeight / 3;
   }
@@ -1068,7 +1071,9 @@ filterEl.addEventListener("keydown", (event) => {
 window.addEventListener("keydown", (event) => {
   // Cmd-Q, Cmd-W, Cmd-O, Cmd-Shift-O and Cmd-P belong to the menu bar (src/menu.rs), which
   // calls `window.postil.menu`. The page leaves them alone, so each shortcut is defined once.
-  // The welcome screen covers the panes: their keys must not act on what cannot be seen.
+  // The settings dialog and the welcome screen cover the panes: their keys must not act on
+  // what cannot be seen. The dialog handles its own keys (Escape closes it).
+  if (settingsEl.open) return;
   if (!welcomeEl.hidden) {
     if (event.key === "Escape" && state.projectOpen) hideWelcome();
     return;
@@ -1235,6 +1240,7 @@ window.postil = {
     if (command === "open-folder") chooseFolder();
     else if (command === "switch-project") showWelcome();
     else if (command === "go-to-file") goToFile();
+    else if (command === "settings") settings.open();
     else if (command === "close-window" || command === "quit") quit();
   },
 };
@@ -1327,9 +1333,48 @@ $("open-folder").addEventListener("click", chooseFolder);
 $("welcome-back").addEventListener("click", hideWelcome);
 $("repo-name").addEventListener("click", showWelcome);
 
+// ---- Settings -------------------------------------------------------------------------
+//
+// The Rust process keeps them (src/settings.rs) and sets the window's theme at start; the
+// page applies the rest, and sends a changed theme back to the window.
+
+const settingsEl = $("settings");
+
+// The theme the window has, so only a change is sent.
+let appliedTheme = null;
+
+function applySettings(settings) {
+  const metrics = codeMetrics(settings.codeFontSize);
+  const root = document.documentElement.style;
+  root.setProperty("--code-font-size", `${metrics.fontSize}px`);
+  root.setProperty("--line-height", `${metrics.lineHeight}px`);
+  root.setProperty("--tab-width", String(settings.tabWidth));
+  if (metrics.lineHeight !== lineHeight) {
+    lineHeight = metrics.lineHeight;
+    // Rows are placed by line height, so they are placed again.
+    if (state.file) renderCode({ force: true });
+  }
+  // The first settings are the ones the window started with.
+  if (appliedTheme !== null && settings.theme !== appliedTheme) {
+    window.ipc.postMessage(`theme:${settings.theme}`);
+  }
+  appliedTheme = settings.theme;
+}
+
+const settings = settingsDialog(settingsEl, {
+  apply: applySettings,
+  closed: () => {
+    if (welcomeEl.hidden) codeEl.focus();
+  },
+});
+$("open-settings").addEventListener("click", () => settings.open());
+
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.
   loadIcons();
+  // Before the first file is drawn, so it is drawn once at the right size. The defaults in
+  // app.css stand when the settings cannot be read; the dialog says why when opened.
+  await settings.load().catch(() => {});
   const response = await fetch("api/repo");
   if (!response.ok) {
     codeEmptyEl.textContent = await response.text();
