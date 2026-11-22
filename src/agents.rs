@@ -188,8 +188,9 @@ const END: &str = "__POSTIL_PATH_END__";
 /// runs, so output larger than the pipe holds does not block it, and the reading stops at the
 /// end marker: a background job that a start-up file left holding the pipe cannot keep it
 /// waiting. The timeout covers starting, printing and reading; after it, or after the
-/// `PATH` arrived, the shell's process group is killed ([`kill_group`]), which also closes
-/// the pipe and so ends a reader still waiting on it.
+/// `PATH` arrived, the shell's process group is killed ([`kill_group`]), which closes the
+/// pipe, and so ends a reader still waiting on it, unless a process outside the group holds
+/// it too.
 fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut child = Command::new(shell)
         .process_group(0)
@@ -221,11 +222,13 @@ fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
 }
 
 /// Kills every process in the group `leader` leads: the shell and whatever its start-up files
-/// started and left running, such as a command that hung (the shell is killed at the
-/// timeout, and the command would run on) or an `ssh-agent` started per shell. They belong to
-/// this one probe, not to any terminal. `/bin/kill` with a negative id signals the group; it
-/// fails when the group is already gone, which is fine. Run as a command because signalling
-/// a group from Rust needs `libc` and `unsafe`.
+/// left running in it, such as a command that hung (the shell is killed at the timeout, and
+/// the command would run on). They belong to this one probe, not to any terminal. A process
+/// that left the group (`setsid`, as daemons do) is out of reach. The leader is not reaped
+/// until after this call, so its pid, and with it the group id, cannot have been reused.
+/// `/bin/kill` with a negative id signals the group; it fails when the group is already
+/// gone, which is fine. Run as a command because signalling a group from Rust needs `libc`
+/// and `unsafe`.
 fn kill_group(leader: u32) {
     let killed = Command::new("/bin/kill")
         .args(["-KILL", "--", &format!("-{leader}")])
@@ -388,14 +391,10 @@ mod tests {
             ),
             0o755,
         );
-        let started = Instant::now();
+        // Reading to the end of the output would wait the 30 s and time out with no path.
         assert_eq!(
             login_shell_path(&shell, LOGIN_SHELL_TIMEOUT),
             Some(OsString::from("/opt/daemon/bin"))
-        );
-        assert!(
-            started.elapsed() < LOGIN_SHELL_TIMEOUT,
-            "read up to the end marker only"
         );
     }
 

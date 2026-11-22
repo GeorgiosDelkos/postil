@@ -209,7 +209,8 @@ pub(crate) struct Loaded {
     pub(crate) settings: Settings,
     /// Set when the file exists but cannot be used; saving is blocked until Reset.
     pub(crate) problem: Option<String>,
-    /// Which version of the file this is; a save names the revision it started from.
+    /// A fingerprint of the file's text ([`revision_of`]), empty when there is no file or
+    /// it cannot be read. A save names the revision it started from.
     pub(crate) revision: String,
 }
 
@@ -252,7 +253,7 @@ fn read(file: &Path) -> (std::result::Result<Option<Settings>, String>, String) 
 
 /// A fingerprint of the file's text: FNV-1a, 64 bits, in hex. Not a defence against anyone;
 /// it tells two versions of a small file apart, and is the same in every build, so two
-/// Postil versions open at once agree on it. Empty for no file, or one that cannot be read.
+/// Postil versions open at once agree on it.
 fn revision_of(json: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0100_0000_01b3;
@@ -286,7 +287,9 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
 
 /// Writes `settings` to `file`, if the file is still at `revision`: the one the change
 /// started from. Another window, or a hand edit, may have changed it since, and saving the
-/// whole settings over that would drop the other change without a word.
+/// whole settings over that would drop the other change without a word. The check and the
+/// write are not one step: within a process saves run on the main thread one at a time, but
+/// two Postil processes saving in the same instant can both pass it, and the later wins.
 ///
 /// # Errors
 ///
@@ -328,4 +331,17 @@ fn write(file: &Path, settings: &Settings) -> Result<()> {
         path: file.to_owned(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_revision_is_fnv_1a_so_every_build_agrees_on_it() {
+        // FNV-1a 64-bit of "" and "a" in the FNV reference test suite (test_fnv.c by Landon
+        // Curt Noll, the fnv1a_64 vectors).
+        assert_eq!(revision_of(""), "cbf29ce484222325");
+        assert_eq!(revision_of("a"), "af63dc4c8601ec8c");
+    }
 }
