@@ -6,6 +6,8 @@
 // saving, and when the window regains focus.
 
 import { rank } from "./fuzzy.js";
+import { fileIcon, folderIcon } from "./icons.js";
+import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -53,6 +55,10 @@ const state = {
   // file, and the number of notes in each file.
   noteByLine: new Map(),
   noteCountByPath: new Map(),
+  // The repository's files as a tree (tree.js), rebuilt when the file list changes, and the
+  // paths of the folders open in it.
+  tree: buildTree([]),
+  expanded: new Set(),
   // The index of the highlighted row while the file filter has text.
   activeMatch: 0,
   // The rendered window of lines: [first, last).
@@ -66,12 +72,63 @@ function el(tag, className, text) {
   return node;
 }
 
+const SVG = "http://www.w3.org/2000/svg";
+
+// An icon from the sprite that `loadIcons` put in the page, by symbol id.
+function icon(id) {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(SVG, "use");
+  use.setAttribute("href", `#${id}`);
+  svg.append(use);
+  return svg;
+}
+
+// Puts icons.svg into the page once, so every icon refers to a symbol in this document.
+// Until it arrives, or if it fails, the icons are empty boxes and nothing else changes.
+async function loadIcons() {
+  const response = await fetch("icons.svg");
+  if (!response.ok) return;
+  const sprite = new DOMParser().parseFromString(await response.text(), "image/svg+xml");
+  const root = document.importNode(sprite.documentElement, true);
+  root.setAttribute("class", "icon-sprite");
+  root.setAttribute("aria-hidden", "true");
+  document.body.prepend(root);
+}
+
 // ---- Files ----------------------------------------------------------------------------
+
+// Pixels of indent per level of the tree, and before the first level.
+const INDENT = 12;
+const INDENT_BASE = 4;
+
+const rowSelector = (path) => `[data-path="${CSS.escape(path)}"]`;
 
 function renderFiles() {
   const needle = filterEl.value.trim().toLowerCase();
-  const rows = needle ? filteredFileRows(needle) : treeFileRows();
-  filesEl.replaceChildren(...rows);
+  // A row with keyboard focus is replaced; focus moves to the new row for the same path.
+  const focused = filesEl.contains(document.activeElement)
+    ? document.activeElement.dataset.path
+    : null;
+
+  if (needle) {
+    filesEl.removeAttribute("role");
+    replaceRows(filesEl, filteredFileRows(needle));
+  } else {
+    filesEl.setAttribute("role", "tree");
+    replaceRows(filesEl, treeRows());
+    setTabStop(filesEl.querySelector(".file.open") ?? filesEl.querySelector(".file, .dir"));
+  }
+  if (focused) filesEl.querySelector(rowSelector(focused))?.focus();
+}
+
+// Replaces the children one by one instead of spreading them into one call: a folder can
+// hold more children than an engine accepts as arguments (about 65,000 in JavaScriptCore).
+function replaceRows(container, rows) {
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) fragment.append(row);
+  container.replaceChildren(fragment);
 }
 
 // With a filter: a flat list of the best fuzzy matches, with the matched characters marked.
@@ -80,7 +137,8 @@ function filteredFileRows(needle) {
   const matches = rank(needle, state.repo.files, MAX_MATCHES);
   state.activeMatch = Math.min(state.activeMatch, Math.max(0, matches.length - 1));
   return matches.map(({ path, positions }, index) => {
-    const row = fileRow(path, markedPath(path, positions), 0);
+    const row = fileRow(path, markedPath(path, positions));
+    row.prepend(icon(fileIcon(path.split("/").at(-1))));
     row.classList.toggle("active", index === state.activeMatch);
     return row;
   });
@@ -88,7 +146,7 @@ function filteredFileRows(needle) {
 
 // `path` as a label with the characters at `positions` wrapped in <mark>.
 function markedPath(path, positions) {
-  const label = el("span");
+  const label = el("span", "name");
   const marked = new Set(positions);
   for (let index = 0; index < path.length; index += 1) {
     label.append(marked.has(index) ? el("mark", "", path[index]) : path[index]);
@@ -96,35 +154,42 @@ function markedPath(path, positions) {
   return label;
 }
 
-// Without a filter: the sorted paths as an indented tree. A directory row is emitted the
-// first time a path enters that directory.
-function treeFileRows() {
-  const rows = [];
-  let open = [];
-  for (const path of state.repo.files) {
-    const parts = path.split("/");
-    const dirs = parts.slice(0, -1);
-    let shared = 0;
-    while (shared < dirs.length && shared < open.length && dirs[shared] === open[shared]) {
-      shared += 1;
-    }
-    for (let depth = shared; depth < dirs.length; depth += 1) {
-      const row = el("div", "dir", dirs[depth]);
-      row.style.paddingLeft = `${8 + 14 * depth}px`;
-      rows.push(row);
-    }
-    open = dirs;
-    rows.push(fileRow(path, el("span", "", parts.at(-1)), dirs.length));
-  }
-  return rows;
+// Without a filter: the tree, showing the contents of open folders only. A closed folder
+// carries the count of notes inside it, so collapsing it does not hide that they exist.
+function treeRows() {
+  const totals = folderCounts(state.noteCountByPath);
+  return visibleRows(state.tree, state.expanded).map((row) => {
+    const button = row.kind === "folder" ? folderRow(row, totals) : fileRow(row.path, row.name);
+    // Files get an empty chevron slot, so names line up with their folder's siblings.
+    if (row.kind === "file") button.prepend(el("span", "chevron"), icon(fileIcon(row.name)));
+    button.style.paddingLeft = `${INDENT_BASE + INDENT * row.depth}px`;
+    button.setAttribute("role", "treeitem");
+    button.setAttribute("aria-level", String(row.depth + 1));
+    return button;
+  });
 }
 
-function fileRow(path, label, depth) {
+function folderRow(row, totals) {
+  const button = el("button", "dir");
+  button.type = "button";
+  button.dataset.path = row.path;
+  button.setAttribute("aria-expanded", String(row.open));
+  button.append(
+    el("span", "chevron"),
+    icon(folderIcon(row.name, row.open)),
+    el("span", "name", row.name),
+  );
+  const count = row.open ? 0 : totals.get(row.path);
+  if (count) button.append(el("span", "count", String(count)));
+  return button;
+}
+
+// `label` is the text to show, or an element (the filter marks matched characters).
+function fileRow(path, label) {
   const row = el("button", "file");
   row.type = "button";
   row.dataset.path = path;
-  row.style.paddingLeft = `${8 + 14 * depth}px`;
-  row.append(label);
+  row.append(typeof label === "string" ? el("span", "name", label) : label);
   if (state.file?.path === path) row.classList.add("open");
 
   const count = state.noteCountByPath.get(path);
@@ -132,12 +197,37 @@ function fileRow(path, label, depth) {
   return row;
 }
 
-// Moves the `open` mark in the file list from one row to another without rebuilding the
-// list, which holds a row for every file in the repository.
-function markOpenFile(previous, path) {
-  const row = (file) => filesEl.querySelector(`.file[data-path="${CSS.escape(file)}"]`);
-  if (previous) row(previous)?.classList.remove("open");
-  row(path)?.classList.add("open");
+// One row of the tree is in the Tab order; the arrow keys move between rows (the ARIA tree
+// pattern). Without this, Tab would stop on every visible file.
+function setTabStop(row) {
+  for (const other of filesEl.querySelectorAll(".file, .dir")) {
+    if (other !== row) other.tabIndex = -1;
+  }
+  if (row) row.tabIndex = 0;
+}
+
+function setFolderOpen(path, open) {
+  if (open) state.expanded.add(path);
+  else state.expanded.delete(path);
+  renderFiles();
+}
+
+// Opens the folders around `path` so its row exists, marks it as the open file, and scrolls
+// it into view. Moves the mark without rebuilding the list when no folder had to open.
+function revealFile(previous, path) {
+  const closed = ancestors(path).filter((folder) => !state.expanded.has(folder));
+  for (const folder of closed) state.expanded.add(folder);
+
+  if (closed.length > 0) {
+    renderFiles();
+  } else {
+    if (previous) filesEl.querySelector(`.file${rowSelector(previous)}`)?.classList.remove("open");
+    const row = filesEl.querySelector(`.file${rowSelector(path)}`);
+    row?.classList.add("open");
+    // Tab into the tree lands on the open file, as it does after a rebuild.
+    if (row && filesEl.getAttribute("role") === "tree") setTabStop(row);
+  }
+  filesEl.querySelector(`.file${rowSelector(path)}`)?.scrollIntoView({ block: "nearest" });
 }
 
 // The reply to `api/file`: { ok, body }, the body a file view or the reason it failed.
@@ -181,7 +271,7 @@ function showFile(path, reply, { keepView }) {
 
   indexNotes();
   renderHeader(path);
-  markOpenFile(previous, path);
+  revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
 }
@@ -324,6 +414,8 @@ rowsEl.addEventListener("mousedown", (event) => {
 
   event.preventDefault();
   codeEl.focus();
+  // A text selection elsewhere would otherwise stay highlighted, and be what Copy copies.
+  window.getSelection().removeAllRanges();
   const anchor = event.shiftKey && state.selection ? state.selection.anchor : line;
   state.selection = { anchor, head: line };
   dragging = true;
@@ -338,9 +430,256 @@ rowsEl.addEventListener("mousemove", (event) => {
   redecorateRows();
 });
 
-window.addEventListener("mouseup", () => {
-  dragging = false;
+// A drag across the code text selects the lines it touches, as a drag in the gutter does, so
+// the next `c` or right-click acts on them. The text stays highlighted for copying. A plain
+// click in the code clears the selection, as in an editor.
+//
+// While the button is down, `textDrag.lines` follows the browser's selection. It is kept
+// rather than read once at the release: a drag that scrolls the pane makes the virtual list
+// rebuild its rows, and the browser drops the selection with the nodes it was in. The
+// release itself may land anywhere, the sidebar included.
+let textDrag = null;
+
+rowsEl.addEventListener("mousedown", (event) => {
+  if (event.button !== 0 || event.target.classList.contains("n") || state.composer) return;
+  textDrag = { lines: null };
 });
+
+document.addEventListener("selectionchange", () => {
+  if (textDrag) textDrag.lines = currentDragLines(textDrag.lines);
+});
+
+window.addEventListener("mouseup", (event) => {
+  dragging = false;
+  if (!textDrag || event.button !== 0) return;
+  // `selectionchange` is delivered after the event that caused it, so the last change of
+  // the drag may not have arrived yet: read the selection once more here.
+  const lines = currentDragLines(textDrag.lines);
+  textDrag = null;
+  if (state.composer) return;
+  state.selection = lines ? { anchor: lines.start, head: lines.end } : null;
+  redecorateRows();
+});
+
+// The lines the drag covers now: those of the selection when it is in the code (none for a
+// collapsed one, a plain click), else the last ones seen (the rows it was in were rebuilt).
+function currentDragLines(last) {
+  const selection = window.getSelection();
+  const inCode = selection.rangeCount > 0 && rowsEl.contains(selection.anchorNode);
+  return inCode ? textSelectionLines() : last;
+}
+
+// The lines the browser's text selection covers in the code, or null when nothing is
+// selected there. As in VS Code, the line a selection starts on counts even when it starts
+// at that line's end, and the line it ends on does not count when it ends at its start.
+function textSelectionLines() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const lineOf = (node) => {
+    const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    const row = element?.closest(".ln");
+    return row && rowsEl.contains(row) ? row : null;
+  };
+  const first = lineOf(range.startContainer);
+  const last = lineOf(range.endContainer);
+  if (!first || !last) return null;
+
+  const start = Number(first.dataset.line);
+  let end = Number(last.dataset.line);
+  // A selection that runs to the very start of a line (a triple click, or a drag down to
+  // the left edge) takes none of that line's text, so the line is not part of it.
+  if (end > start) {
+    const before = document.createRange();
+    before.setStart(last.querySelector(".c") ?? last, 0);
+    before.setEnd(range.endContainer, range.endOffset);
+    if (before.toString() === "") end -= 1;
+  }
+  return { start, end };
+}
+
+// The text of lines `start` to `end` (0-based, inclusive) as the page shows them.
+function linesText({ start, end }) {
+  const lines = state.file.lines.slice(start, end + 1);
+  return lines.map((tokens) => tokens.map(([, text]) => text).join("")).join("\n");
+}
+
+// The code the text selection covers, without the line numbers and note remarks that sit
+// in the same rows: WebKit's own selection text includes them even though they cannot be
+// selected (seen 2026-11-22: a two-line selection copied the gutter's "3"). Null when the
+// selection is not in the code, or covers other lines than the selected ones (a leftover
+// from before the gutter or a right-click chose new lines).
+function selectedCodeText() {
+  const lines = textSelectionLines();
+  const chosen = selectedRange();
+  if (!lines || !chosen || lines.start !== chosen.start || lines.end !== chosen.end) return null;
+  const range = window.getSelection().getRangeAt(0);
+  const code = (line) => rowsEl.querySelector(`.ln[data-line="${line}"] .c`);
+  // How many characters of `cell` come before (container, offset), or null when that
+  // position is not inside the cell (it is in the gutter, or on another line).
+  const offsetIn = (cell, container, offset) => {
+    if (!cell?.contains(container)) return null;
+    const before = document.createRange();
+    before.setStart(cell, 0);
+    before.setEnd(container, offset);
+    return before.toString().length;
+  };
+
+  const text = linesText(lines);
+  const from = offsetIn(code(lines.start), range.startContainer, range.startOffset) ?? 0;
+  const lastLine = linesText({ start: lines.end, end: lines.end });
+  const to = offsetIn(code(lines.end), range.endContainer, range.endOffset) ?? lastLine.length;
+  return text.slice(from, text.length - (lastLine.length - to));
+}
+
+rowsEl.addEventListener("copy", (event) => {
+  const text = selectedCodeText();
+  if (text === null) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", text);
+});
+
+// ---- Context menu ---------------------------------------------------------------------
+//
+// Right-click on the code opens actions for the selected lines. A click outside the
+// selection first selects the clicked line, as editors move the cursor there.
+
+const menuEl = $("context-menu");
+
+rowsEl.addEventListener("contextmenu", (event) => {
+  // The composer's textarea keeps the system menu: spelling, paste, and the like.
+  if (event.target.closest(".composer")) return;
+  const line = lineOfEvent(event);
+  if (line === null || !state.file) return;
+  event.preventDefault();
+
+  const range = selectedRange();
+  if (!range || line < range.start || line > range.end) {
+    window.getSelection().removeAllRanges();
+    state.selection = { anchor: line, head: line };
+    redecorateRows();
+  }
+  openMenu(event.clientX, event.clientY, codeActions());
+});
+
+function codeActions() {
+  const range = selectedRange();
+  const first = range.start + 1;
+  const last = range.end + 1;
+  const reference = `${state.file.path}:${first === last ? first : `${first}-${last}`}`;
+  // The text selection when there is one inside the code, else the whole selected lines.
+  const text = selectedCodeText() ?? linesText(range);
+  // `matches` is the action's own key, which works while the menu is open, as it is shown.
+  return [
+    {
+      label: "Add note",
+      key: "C",
+      matches: (event) => event.key === "c" && !event.metaKey,
+      run: openComposer,
+      disabled: Boolean(state.composer),
+    },
+    {
+      label: "Copy",
+      key: "⌘C",
+      matches: (event) => event.key === "c" && event.metaKey,
+      run: () => copyText(text),
+    },
+    { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
+  ];
+}
+
+// The actions of the open menu, for its keyboard shortcuts.
+let menuActions = [];
+
+function openMenu(x, y, actions) {
+  menuActions = actions;
+  const items = actions.map((action) => {
+    const item = el("button", "menu-item");
+    item.type = "button";
+    item.setAttribute("role", "menuitem");
+    item.disabled = Boolean(action.disabled);
+    item.append(el("span", "menu-label", action.label));
+    if (action.key) item.append(el("kbd", "", action.key));
+    item.addEventListener("click", () => {
+      closeMenu();
+      action.run();
+    });
+    return item;
+  });
+  menuEl.replaceChildren(...items);
+  menuEl.hidden = false;
+
+  // Opens at the pointer, moved back inside the window when it would cross an edge.
+  const { width, height } = menuEl.getBoundingClientRect();
+  menuEl.style.left = `${Math.max(4, Math.min(x, innerWidth - width - 4))}px`;
+  menuEl.style.top = `${Math.max(4, Math.min(y, innerHeight - height - 4))}px`;
+  menuEl.querySelector("button:not(:disabled)")?.focus();
+}
+
+function closeMenu() {
+  if (menuEl.hidden) return;
+  menuEl.hidden = true;
+  if (menuEl.contains(document.activeElement) || document.activeElement === document.body) {
+    codeEl.focus();
+  }
+}
+
+// While open, the menu owns the keyboard, as system menus do: no key reaches the window's
+// handlers, so `c` cannot open a composer under it and Escape cannot discard one.
+menuEl.addEventListener("keydown", (event) => {
+  event.stopPropagation();
+  // Enter and Space are the focused item's own: they click it.
+  if (event.key === "Enter" || event.key === " ") return;
+  event.preventDefault();
+
+  const items = [...menuEl.querySelectorAll("button:not(:disabled)")];
+  const index = items.indexOf(document.activeElement);
+  if (event.key === "ArrowDown") items[(index + 1) % items.length]?.focus();
+  else if (event.key === "ArrowUp") items[(index - 1 + items.length) % items.length]?.focus();
+  else if (event.key === "Home") items[0]?.focus();
+  else if (event.key === "End") items.at(-1)?.focus();
+  else if (event.key === "Escape" || event.key === "Tab") closeMenu();
+  else {
+    const action = menuActions.find((each) => !each.disabled && each.matches?.(event));
+    if (action) {
+      closeMenu();
+      action.run();
+    }
+  }
+});
+
+menuEl.addEventListener("focusout", (event) => {
+  if (!menuEl.contains(event.relatedTarget)) closeMenu();
+});
+
+// Any press outside the menu, a scroll of the code, or leaving the window closes it.
+window.addEventListener(
+  "mousedown",
+  (event) => {
+    if (!menuEl.contains(event.target)) closeMenu();
+  },
+  true,
+);
+window.addEventListener("blur", closeMenu);
+
+// The Clipboard API needs a secure context, which a custom URL scheme may not count as; the
+// older copy command works from any page with a selection, so it is the fallback.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // Fall through to the copy command below.
+  }
+  const area = el("textarea");
+  area.value = text;
+  area.className = "copy-buffer";
+  document.body.append(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+  codeEl.focus();
+}
 
 // ---- Composer and notes ---------------------------------------------------------------
 
@@ -531,6 +870,7 @@ let renderQueued = false;
 codeEl.addEventListener(
   "scroll",
   () => {
+    closeMenu();
     if (renderQueued) return;
     renderQueued = true;
     requestAnimationFrame(() => {
@@ -544,8 +884,45 @@ codeEl.addEventListener(
 new ResizeObserver(() => renderCode()).observe(codeEl);
 
 filesEl.addEventListener("click", (event) => {
-  const row = event.target.closest(".file");
-  if (row) openFile(row.dataset.path);
+  const row = event.target.closest(".file, .dir");
+  if (!row) return;
+  if (row.classList.contains("dir")) {
+    setFolderOpen(row.dataset.path, row.getAttribute("aria-expanded") !== "true");
+  } else {
+    openFile(row.dataset.path);
+  }
+});
+
+filesEl.addEventListener("focusin", (event) => {
+  const row = event.target.closest(".file, .dir");
+  if (row && filesEl.getAttribute("role") === "tree") setTabStop(row);
+});
+
+// The keys of a file tree in an IDE: up and down move between visible rows; right opens a
+// folder, or moves into an open one; left closes an open folder, or moves to the parent.
+// Enter and Space are the buttons' own: open the file, or toggle the folder.
+filesEl.addEventListener("keydown", (event) => {
+  const row = event.target.closest(".file, .dir");
+  if (!row || filesEl.getAttribute("role") !== "tree") return;
+
+  const rows = [...filesEl.querySelectorAll(".file, .dir")];
+  const index = rows.indexOf(row);
+  const path = row.dataset.path;
+  const folder = row.classList.contains("dir");
+  const open = row.getAttribute("aria-expanded") === "true";
+
+  if (event.key === "ArrowDown") rows[index + 1]?.focus();
+  else if (event.key === "ArrowUp") rows[index - 1]?.focus();
+  else if (event.key === "Home") rows[0]?.focus();
+  else if (event.key === "End") rows.at(-1)?.focus();
+  else if (event.key === "ArrowRight" && folder && !open) setFolderOpen(path, true);
+  else if (event.key === "ArrowRight" && folder) rows[index + 1]?.focus();
+  else if (event.key === "ArrowLeft" && folder && open) setFolderOpen(path, false);
+  else if (event.key === "ArrowLeft") {
+    const parent = ancestors(path).at(-1);
+    if (parent !== undefined) filesEl.querySelector(rowSelector(parent))?.focus();
+  } else return;
+  event.preventDefault();
 });
 
 filterEl.addEventListener("input", () => {
@@ -582,6 +959,12 @@ window.addEventListener("keydown", (event) => {
       state.selection = null;
       redecorateRows();
     }
+  } else if (event.key === "c" && event.metaKey && !typing && state.file && state.selection) {
+    // With text selected, the browser copies and the `copy` handler fixes the text. Lines
+    // chosen in the gutter have no text selection, so the whole lines are copied here.
+    if (selectedCodeText() !== null) return;
+    event.preventDefault();
+    copyText(linesText(selectedRange()));
   } else if (event.key === "c" && !typing && !event.metaKey && !event.ctrlKey) {
     event.preventDefault();
     openComposer();
@@ -675,11 +1058,14 @@ async function runBench(path) {
 
 function showRepo(repo) {
   state.repo = repo;
+  state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
 }
 
 async function start() {
+  // The icons load beside the repository, not before it: the tree can draw without them.
+  loadIcons();
   const response = await fetch("api/repo");
   if (!response.ok) {
     codeEmptyEl.textContent = await response.text();

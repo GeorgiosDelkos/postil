@@ -195,36 +195,37 @@ kbd {
   font-size: 12.5px;
 }
 
+/* A row of the file tree or the filter's list. The tree sets each row's left padding inline,
+   by depth; the filter's flat list uses this one. */
 .file,
 .dir {
+  width: 100%;
   height: 26px;
   display: flex;
   align-items: center;
-  padding-right: 8px;
+  padding: 0 8px;
+  background: none;
+  border: 0;
   border-radius: 6px;
+  font: inherit;
+  text-align: left;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  transition: background-color 80ms linear;
   /* Rows far from the viewport skip layout and paint, which keeps a long list cheap. */
   content-visibility: auto;
   contain-intrinsic-size: auto 26px;
 }
 
-.dir {
-  color: var(--text-muted);
-}
-
 .file {
-  width: 100%;
-  background: none;
-  border: 0;
   color: var(--text-soft);
-  font: inherit;
-  text-align: left;
-  transition: background-color 80ms linear;
 }
 
-.file:hover {
+.dir {
+  color: var(--text);
+}
+
+.file:hover,
+.dir:hover {
   background: var(--hover);
 }
 
@@ -233,7 +234,43 @@ kbd {
   color: var(--text-strong);
 }
 
-.file .count {
+.file:focus-visible,
+.dir:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.file .name,
+.dir .name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A folder's disclosure triangle, pointing right when closed and down when open. Files have
+   the same slot, empty, so their names line up with the folders beside them. */
+.chevron {
+  flex: none;
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+.dir .chevron::before {
+  content: "";
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform 80ms linear;
+}
+
+.dir[aria-expanded="true"] .chevron::before {
+  transform: rotate(90deg);
+}
+
+.file .count,
+.dir .count {
   margin-left: auto;
   padding-left: 8px;
   font: 11px "Geist Mono", monospace;
@@ -540,4 +577,84 @@ kbd {
 
 .composer-label.failed {
   color: var(--text-strong);
+}
+
+/* File tree icons (icons.svg, Material Icon Theme). The sprite is in the page only so rows
+   can refer to its symbols; it takes no space. The icons' colours are toned down a little to
+   sit with the low-contrast palettes, which reserve full colour for code and notes. */
+
+.icon-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-right: 6px;
+  filter: saturate(0.8);
+}
+
+/* The right-click menu on the code. Its `display: flex` would otherwise win over the
+   browser's own rule for the `hidden` attribute, leaving a closed menu on screen. */
+
+.context-menu[hidden] {
+  display: none;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 10;
+  min-width: 200px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.menu-item {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 10px;
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.menu-item:hover:not(:disabled),
+.menu-item:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.menu-item:disabled {
+  color: var(--text-muted);
+}
+
+.menu-item kbd {
+  margin-left: auto;
+  border: 0;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+/* The off-screen text the fallback copy command copies from. */
+
+.copy-buffer {
+  position: fixed;
+  top: -1000px;
+  opacity: 0;
 }

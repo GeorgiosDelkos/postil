@@ -31,8 +31,11 @@ panel. It is not an editor, not a terminal, and not a PR tool.
 1. **Open.** `postil .` in a repository, or drop a folder on the window. The file list comes
    from `git ls-files` plus untracked files that are not ignored.
 2. **Read.** A file tree on the left, a fuzzy finder on `Cmd-P`, one code pane with syntax colors.
-3. **Note.** Select lines (drag in the gutter, or `v` then `j`/`k`), press `c`, type, `Cmd-Enter`.
-   The note composer opens under the selected lines, inside the code, so the eyes do not move.
+3. **Note.** Select lines (drag in the gutter, drag across the code text, or `v` then `j`/`k`),
+   press `c` or right-click and choose Add note, type, `Cmd-Enter`. The note composer opens
+   under the selected lines, inside the code, so the eyes do not move. The right-click menu
+   also copies the selection (code only, never the line numbers) and its `path:lines`
+   reference. `v`/`j`/`k` is not built yet.
 4. **Collect.** Notes list in the tray on the right, grouped by file. Clicking one jumps to its
    lines. Notes survive restarts.
 5. **Send.** Pick an agent, press `Cmd-Shift-Enter`. The prompt preview shows the exact text the
@@ -391,7 +394,16 @@ retired; the measured numbers above are the baseline to not regress.
    to trimmed egui and keep everything below unchanged: `app.rs`, `notes.rs`, `repo.rs`, and
    `acp/` do not depend on the UI layer.
 1. **Read.** Open a repository, file tree, fuzzy finder, highlighting, both themes. Built: the
-   finder is the sidebar's filter box (`Cmd-P` focuses it, arrows move, Enter opens).
+   finder is the sidebar's filter box (`Cmd-P` focuses it, arrows move, Enter opens). The
+   tree (`ui/tree.js`) lists folders before files, names case-insensitively with digits by
+   value; folders start closed, opening a file opens the folders around it, and a closed
+   folder shows the count of notes inside it. Keys follow the ARIA tree pattern: up and down
+   move, right opens or enters a folder, left closes it or goes to the parent, Enter opens.
+   Which folders are open is not kept across restarts yet. Rows carry file-type and folder
+   icons from Material Icon Theme (MIT, `ui/icons.LICENSE`), the set VS Code users know,
+   chosen 2026-11-22 over monochrome glyphs. They are one SVG sprite, `ui/icons.svg`, taken
+   at a pinned upstream commit (the sprite's header comment says how), with colours toned
+   down by a CSS filter; `ui/icons.js` maps names and extensions to symbols.
 2. **Note.** Line selection, the composer, the tray, `review.json`, anchoring across file changes.
    Built: the page saves through `POST api/notes` and reads the file and the notes again when
    the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
