@@ -11,8 +11,9 @@
 <nav class="sidebar" aria-label="Files">
   <div class="drag-strip" data-drag></div>
   <div class="repo" data-drag>
-    <div class="repo-name" id="repo-name"></div>
+    <button type="button" class="repo-name" id="repo-name" title="Switch project (⌘O)"></button>
     <div class="repo-branch" id="repo-branch"></div>
+    <div class="repo-warning" id="repo-warning" hidden></div>
   </div>
   <div class="filter">
     <label class="visually-hidden" for="filter">Find file</label>
@@ -41,6 +42,27 @@
     <div class="empty">Select lines, then press <kbd>c</kbd> to write a note.</div>
   </div>
 </aside>
+
+<section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>
+  <div class="drag-strip" data-drag></div>
+  <div class="welcome-body">
+    <h1 class="welcome-title" id="welcome-title">Postil</h1>
+    <p class="welcome-tagline">Read a repository, write notes on its lines, send them to an agent.</p>
+    <div class="welcome-actions">
+      <button type="button" class="button primary" id="open-folder">Open Folder… <kbd>⌘O</kbd></button>
+      <button type="button" class="button" id="welcome-back" hidden></button>
+    </div>
+    <p class="welcome-hint">or drop a folder on this window</p>
+    <div class="welcome-error" id="welcome-error" role="alert" hidden>
+      <p class="welcome-error-text" id="welcome-error-text"></p>
+      <button type="button" class="button" id="init-repo" hidden>Make it a git repository</button>
+    </div>
+    <h2 class="welcome-heading">Recent</h2>
+    <div class="recent" id="recent"></div>
+  </div>
+</section>
+
+<div class="toast" id="toast" role="status" hidden></div>
 
 <div class="context-menu" id="context-menu" role="menu" aria-label="Actions on the selected lines" hidden></div>
 

@@ -93,6 +93,13 @@
   box-sizing: border-box;
 }
 
+/* The page hides elements with the `hidden` attribute. The browser's own rule for it loses
+   to any `display` set here (it did twice: a closed menu and an empty button stayed on
+   screen), so it is restated to win everywhere. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
@@ -346,9 +353,33 @@ kbd {
 }
 
 .ln {
+  position: relative;
   display: flex;
   height: var(--line-height);
   line-height: var(--line-height);
+}
+
+/* The + that a hovered line number shows: click it to add a note on that line. It sits at
+   the gutter's left edge, clear of the right-aligned number. */
+.ln .add-note {
+  position: absolute;
+  left: 6px;
+  top: calc((var(--line-height) - 16px) / 2);
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font: 600 13px/16px "Geist", sans-serif;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 80ms linear;
+}
+
+.ln:hover .add-note {
+  opacity: 1;
 }
 
 .ln .n {
@@ -598,12 +629,7 @@ kbd {
   filter: saturate(0.8);
 }
 
-/* The right-click menu on the code. Its `display: flex` would otherwise win over the
-   browser's own rule for the `hidden` attribute, leaving a closed menu on screen. */
-
-.context-menu[hidden] {
-  display: none;
-}
+/* The right-click menu on the code. */
 
 .context-menu {
   position: fixed;
@@ -657,4 +683,225 @@ kbd {
   position: fixed;
   top: -1000px;
   opacity: 0;
+}
+
+/* Welcome screen: shown when no project is open, or when the engineer switches projects. The
+   body's three columns give way to one, holding only this screen. */
+
+body.welcome-mode {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 0;
+}
+
+body.welcome-mode > .sidebar,
+body.welcome-mode > .pane {
+  display: none;
+}
+
+.welcome {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.welcome-body {
+  width: min(560px, 100% - 48px);
+  margin: 10vh auto 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.welcome-title {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.welcome-tagline,
+.welcome-hint {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.welcome-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.welcome-actions .button {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.welcome-actions kbd {
+  border-color: currentColor;
+  opacity: 0.7;
+}
+
+.welcome-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
+.welcome-error-text {
+  margin: 0;
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+
+.welcome-heading {
+  margin: 24px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.recent {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 10px;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  transition: background-color 80ms linear;
+}
+
+.recent-item:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.recent-item:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.recent-item:disabled {
+  opacity: 0.5;
+}
+
+.recent-name {
+  flex: none;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+
+.recent-path {
+  min-width: 0;
+  margin-left: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.recent-empty {
+  color: var(--text-muted);
+}
+
+/* The project name in the sidebar is the way back to the welcome screen. */
+
+button.repo-name {
+  display: block;
+  max-width: 100%;
+  padding: 0;
+  background: none;
+  border: 0;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+button.repo-name:hover {
+  color: var(--accent);
+}
+
+.repo-warning {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+
+/* A note card in the tray with its delete button, which shows on hover and asks once. */
+
+.note-item {
+  position: relative;
+}
+
+.note-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  height: 22px;
+  min-width: 22px;
+  padding: 0 6px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 20px;
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.note-item:hover .note-delete,
+.note-delete:focus-visible,
+.note-item.confirming .note-delete {
+  opacity: 1;
+}
+
+.note-item.confirming .note-delete {
+  color: var(--text-strong);
+  border-color: var(--text-muted);
+}
+
+/* Failures with no better place to show, for a few seconds at the bottom of the window. */
+
+.toast {
+  position: fixed;
+  z-index: 20;
+  left: 50%;
+  bottom: 20px;
+  max-width: min(560px, 100% - 48px);
+  transform: translateX(-50%);
+  padding: 10px 14px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  color: var(--text-strong);
 }

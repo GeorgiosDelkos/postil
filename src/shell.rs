@@ -3,24 +3,33 @@
 //! The page is served from `postil://localhost/`. It is compiled into the binary, and it
 //! gets its data by `fetch` on the same scheme, which [`Site::respond`] answers in this
 //! process. No socket is opened.
+//!
+//! One window shows one project at a time. Without one, the page shows the welcome screen
+//! (open a folder, the recent projects, or a folder dropped on the window); opening another
+//! project replaces the current one and the page reloads.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
-use wry::WebViewBuilder;
 use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
+use wry::{DragDropEvent, WebView, WebViewBuilder};
 
+use crate::dialog;
 use crate::error::{Error, Result};
+use crate::files::config_dir;
 use crate::highlight::{Highlighter, Token};
 use crate::notes::{self, NewNote};
+use crate::recent;
 use crate::repo::Repo;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -47,18 +56,19 @@ pub struct BenchReport {
     pub page: String,
 }
 
-/// Opens the review window for the repository that contains `dir` and returns when the
-/// window closes.
+/// Opens the window and returns when it closes. With `dir`, the window opens on the
+/// repository that contains it; without, on the welcome screen.
 ///
 /// # Errors
 ///
-/// Fails when `dir` is not inside a git working tree, or when the window or the webview
-/// cannot be created.
-pub fn run(dir: &Path) -> Result<()> {
+/// Fails when `dir` is not inside a git working tree, when the home directory is unknown,
+/// or when the window or the webview cannot be created.
+pub fn run(dir: Option<&Path>) -> Result<()> {
     serve(dir, None).map(|_| ())
 }
 
-/// Opens the window, shows `file`, scrolls through it, and returns the measurements.
+/// Opens the window on the repository that contains `dir`, shows `file`, scrolls through
+/// it, and returns the measurements.
 ///
 /// `file` is relative to the repository root.
 ///
@@ -66,24 +76,35 @@ pub fn run(dir: &Path) -> Result<()> {
 ///
 /// As [`run`], and [`Error::BenchInterrupted`] when the window closes first.
 pub fn bench(dir: &Path, file: &str) -> Result<BenchReport> {
-    serve(dir, Some(file))?.ok_or(Error::BenchInterrupted)
+    serve(Some(dir), Some(file))?.ok_or(Error::BenchInterrupted)
 }
 
-/// What the page tells the event loop through `window.ipc.postMessage`.
-enum PageMessage {
+/// What reaches the event loop: the page's messages (through `window.ipc.postMessage`) and
+/// folders dropped on the window.
+#[derive(Debug)]
+enum AppEvent {
     /// The pointer went down on the window's drag strip.
     DragWindow,
+    /// The page asked for the folder dialog (Open Folder).
+    ChooseFolder,
+    /// The engineer pressed Cmd-Q or Cmd-W. The window has no menu bar, which is where macOS
+    /// would otherwise find Quit, so the page forwards the keys.
+    Quit,
+    /// A folder (or file) was dropped on the window.
+    Dropped(PathBuf),
     /// The benchmark's file is on screen.
     BenchPainted,
     /// The benchmark finished; the payload is its JSON report.
     BenchDone(String),
 }
 
-impl PageMessage {
+impl AppEvent {
     /// Reads a message as `ui/app.js` posts it.
     fn parse(body: &str) -> Option<Self> {
         match body {
             "drag" => Some(Self::DragWindow),
+            "choose-folder" => Some(Self::ChooseFolder),
+            "quit" => Some(Self::Quit),
             "bench-painted" => Some(Self::BenchPainted),
             _ => body
                 .strip_prefix("bench:")
@@ -92,41 +113,55 @@ impl PageMessage {
     }
 }
 
-fn serve(dir: &Path, bench: Option<&str>) -> Result<Option<BenchReport>> {
+fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
     let started = Instant::now();
-    let site = Site {
-        repo: Repo::open(dir)?,
-        highlighter: Highlighter::new(),
-        bench: bench.map(str::to_owned),
-    };
+    // Without a configuration directory the recent list is off, which the page says once a
+    // project is open: the list is a convenience, so it never stops the app from starting.
+    let site = Site::new(config_dir().ok().map(|dir| dir.join("recent.json")), bench);
+    if let Some(dir) = dir {
+        site.open(Repo::open(dir)?);
+    }
     // A benchmark of a file that cannot be read would time an empty pane and report it as a
     // result. Fail here instead, before the window opens.
     if let Some(file) = bench {
-        site.repo.read(file)?;
+        site.repo()?.read(file)?;
     }
 
-    let mut event_loop: EventLoop<PageMessage> = EventLoopBuilder::with_user_event().build();
+    let mut event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
     let window = build_window(&event_loop)?;
     let canvas = match window.theme() {
         Theme::Dark => DARK_CANVAS,
         _ => LIGHT_CANVAS,
     };
 
-    let proxy = event_loop.create_proxy();
+    let page_proxy = event_loop.create_proxy();
+    let drop_proxy = event_loop.create_proxy();
+    let file_drag = RefCell::new(FileDrag::default());
     let webview = WebViewBuilder::new()
         .with_background_color(canvas)
         .with_custom_protocol("postil".to_owned(), move |_webview, request| {
             site.respond(&request)
         })
         .with_ipc_handler(move |message| {
-            let message = PageMessage::parse(message.body());
+            let event = AppEvent::parse(message.body());
             // The page and this handler are compiled into one binary, so a message that
             // does not parse is a bug in one of them.
-            debug_assert!(message.is_some(), "unknown page message");
-            if let Some(message) = message {
+            debug_assert!(event.is_some(), "unknown page message");
+            if let Some(event) = event {
                 // Sending fails only once the event loop is gone, when nobody is left to
                 // act on the message.
-                drop(proxy.send_event(message));
+                drop(page_proxy.send_event(event));
+            }
+        })
+        .with_drag_drop_handler(move |event| {
+            match file_drag.borrow_mut().handle(event) {
+                DragOutcome::Pass => false,
+                DragOutcome::Take => true,
+                DragOutcome::Open(path) => {
+                    // As above: fails only once the event loop is gone.
+                    drop(drop_proxy.send_event(AppEvent::Dropped(path)));
+                    true
+                }
             }
         })
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
@@ -144,16 +179,23 @@ fn serve(dir: &Path, bench: Option<&str>) -> Result<Option<BenchReport>> {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
-            Event::UserEvent(PageMessage::DragWindow) => {
+            }
+            | Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(AppEvent::DragWindow) => {
                 // Fails when the pointer button is already up again: there is then nothing
                 // to drag.
                 drop(window.drag_window());
             }
-            Event::UserEvent(PageMessage::BenchPainted) => {
+            Event::UserEvent(AppEvent::ChooseFolder) => {
+                if let Some(folder) = dialog::choose_folder() {
+                    offer_folder(&webview, &folder);
+                }
+            }
+            Event::UserEvent(AppEvent::Dropped(path)) => offer_folder(&webview, &path),
+            Event::UserEvent(AppEvent::BenchPainted) => {
                 launch_to_paint = Some(started.elapsed());
             }
-            Event::UserEvent(PageMessage::BenchDone(page)) => {
+            Event::UserEvent(AppEvent::BenchDone(page)) => {
                 report = Some(BenchReport {
                     // The page posts `bench-painted` before `bench:`; if it somehow did
                     // not, the time until now is the honest upper bound.
@@ -172,7 +214,69 @@ fn serve(dir: &Path, bench: Option<&str>) -> Result<Option<BenchReport>> {
     Ok(report)
 }
 
-fn build_window(event_loop: &EventLoop<PageMessage>) -> Result<Window> {
+/// Which drags over the window are the app's. A drag that carries files is: the webview
+/// would navigate to a dropped file. Any other drag (text into the note composer) is left to
+/// the webview, so the handler answers `true` only while files are over the window.
+#[derive(Debug, Default)]
+struct FileDrag {
+    /// Whether the drag now over the window carries files.
+    carries_files: bool,
+}
+
+/// What the drag handler does with one event.
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+enum DragOutcome {
+    /// Leave the event to the webview.
+    Pass,
+    /// Keep the event from the webview.
+    Take,
+    /// Keep the drop from the webview and open this path: the first folder dropped, else the
+    /// first file, which the page reports as not a folder.
+    Open(PathBuf),
+}
+
+impl FileDrag {
+    fn handle(&mut self, event: DragDropEvent) -> DragOutcome {
+        let take_if = |files| {
+            if files {
+                DragOutcome::Take
+            } else {
+                DragOutcome::Pass
+            }
+        };
+        match event {
+            DragDropEvent::Enter { paths, .. } => {
+                self.carries_files = !paths.is_empty();
+                take_if(self.carries_files)
+            }
+            DragDropEvent::Over { .. } => take_if(self.carries_files),
+            DragDropEvent::Drop { paths, .. } => {
+                self.carries_files = false;
+                // A project is one folder: the first folder dropped opens, or, when only files
+                // were dropped, the first file, which the page then reports as not a folder.
+                paths
+                    .iter()
+                    .find(|path| path.is_dir())
+                    .or_else(|| paths.first())
+                    .map_or(DragOutcome::Pass, |path| DragOutcome::Open(path.clone()))
+            }
+            DragDropEvent::Leave => take_if(std::mem::take(&mut self.carries_files)),
+            _ => DragOutcome::Pass,
+        }
+    }
+}
+
+/// Hands a chosen or dropped folder to the page, which opens it through `/api/open`: the
+/// page decides what to show for a folder that is not a repository.
+fn offer_folder(webview: &WebView, folder: &Path) {
+    let path = serde_json::to_string(&folder.to_string_lossy())
+        .expect("a string always serializes to JSON");
+    // Fails only when the webview is being torn down, when there is no page to tell.
+    drop(webview.evaluate_script(&format!("window.postil?.openFolder({path})")));
+}
+
+fn build_window(event_loop: &EventLoop<AppEvent>) -> Result<Window> {
     let builder = WindowBuilder::new()
         .with_title("Postil")
         .with_inner_size(LogicalSize::new(1440.0, 900.0));
@@ -194,20 +298,58 @@ fn build_window(event_loop: &EventLoop<PageMessage>) -> Result<Window> {
 }
 
 /// Everything the page can ask for.
+///
+/// The URL scheme handler must be `Send + Sync`, so the open project sits behind a mutex.
+/// The lock is held only to replace the project or clone it out, never across a `git` call
+/// or a file read, and the project is replaced whole, so the state is valid after any panic.
+/// wry calls the handler on the main thread, one request at a time, so the lock is never
+/// contended; it is there for the bound.
 struct Site {
-    repo: Repo,
+    /// The open project, if any.
+    project: Mutex<Option<Project>>,
     highlighter: Highlighter,
     /// The file the benchmark opens, when this is a benchmark run.
     bench: Option<String>,
+    /// Where the recent projects are listed (`recent.rs`); `None` when the configuration
+    /// directory is unknown, which turns the list off. `config_dir` fails only with
+    /// `Error::NoHome`, which is the reason `open` gives for a `None` here.
+    recent_file: Option<PathBuf>,
 }
 
-/// The reply to `/api/repo`.
+/// The open project.
+#[derive(Clone)]
+struct Project {
+    repo: Arc<Repo>,
+    /// Why the recent projects could not be updated when this project opened, shown under
+    /// the branch name. Kept with the project, so every page load of it shows the line.
+    warning: Option<String>,
+}
+
+/// The reply to `/api/repo` when a project is open; `null` when none is.
 #[derive(Serialize)]
 struct RepoInfo<'a> {
     name: String,
+    root: String,
     branch: String,
     files: Vec<String>,
     bench: Option<&'a str>,
+    warning: Option<String>,
+}
+
+/// An entry of the reply to `/api/recent`.
+#[derive(Serialize)]
+struct RecentProject {
+    path: String,
+    name: String,
+    /// Whether the folder is still there; a moved or deleted one is listed, greyed out.
+    exists: bool,
+}
+
+/// The body of `POST /api/open` and `POST /api/init`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderRequest {
+    path: PathBuf,
 }
 
 /// The reply to `/api/file`.
@@ -219,9 +361,49 @@ struct FileView<'a> {
 
 type Reply = Response<Cow<'static, [u8]>>;
 
+/// Locks one of `Site`'s mutexes. Poisoning is ignored: every value is replaced whole, so a
+/// panic elsewhere cannot leave one half-written.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Site {
+    fn new(recent_file: Option<PathBuf>, bench: Option<&str>) -> Self {
+        Self {
+            project: Mutex::new(None),
+            highlighter: Highlighter::new(),
+            bench: bench.map(str::to_owned),
+            recent_file,
+        }
+    }
+
+    /// The open project's repository.
+    fn repo(&self) -> Result<Arc<Repo>> {
+        lock(&self.project)
+            .as_ref()
+            .map(|project| Arc::clone(&project.repo))
+            .ok_or(Error::NoProject)
+    }
+
+    /// Makes `repo` the open project and puts it first among the recent projects. A
+    /// benchmark does not count as opening: a scripted run must not reorder the list.
+    fn open(&self, repo: Repo) {
+        let warning = match (&self.recent_file, &self.bench) {
+            (_, Some(_)) => None,
+            (None, None) => Some(format!("recent projects are off: {}", Error::NoHome)),
+            (Some(file), None) => recent::record(file, repo.root())
+                .err()
+                .map(|error| error_chain(&error)),
+        };
+        *lock(&self.project) = Some(Project {
+            repo: Arc::new(repo),
+            warning,
+        });
+    }
+
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
         let uri = request.uri();
+        let post = *request.method() == Method::POST;
         match uri.path() {
             "/" => reply(StatusCode::OK, "text/html", INDEX_HTML.as_bytes()),
             "/app.css" => reply(StatusCode::OK, "text/css", APP_CSS.as_bytes()),
@@ -233,15 +415,31 @@ impl Site {
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
             "/api/repo" => json_or_error(self.repo_info()),
+            "/api/recent" => json_or_error(Ok(self.recent())),
+            "/api/open" if post => json_or_error(self.open_folder(request.body(), Repo::open)),
+            "/api/init" if post => json_or_error(self.open_folder(request.body(), Repo::init)),
             "/api/notes" => match *request.method() {
                 Method::GET => json_or_error(self.notes()),
                 Method::POST => json_or_error(self.add_note(request.body())),
+                Method::DELETE => match query_value(uri.query().unwrap_or(""), "id") {
+                    Some(id) => json_or_error(self.delete_note(&id)),
+                    None => reply(
+                        StatusCode::BAD_REQUEST,
+                        "text/plain",
+                        &b"expected ?id=<note id>"[..],
+                    ),
+                },
                 _ => reply(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "text/plain",
-                    &b"GET the notes, or POST a new one"[..],
+                    &b"GET the notes, POST a new one, or DELETE ?id=N1"[..],
                 ),
             },
+            "/api/open" | "/api/init" => reply(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                &b"POST {\"path\": ...}"[..],
+            ),
             "/api/file" => match query_value(uri.query().unwrap_or(""), "path") {
                 Some(path) => json_or_error(self.file_view(&path)),
                 None => reply(
@@ -254,18 +452,55 @@ impl Site {
         }
     }
 
+    /// The open project, or `null`: the page then shows the welcome screen.
     fn repo_info(&self) -> Result<Vec<u8>> {
+        let Some(Project { repo, warning }) = lock(&self.project).clone() else {
+            return Ok(b"null".to_vec());
+        };
         let info = RepoInfo {
-            name: self.repo.name(),
-            branch: self.repo.branch()?,
-            files: self.repo.files()?,
+            name: repo.name(),
+            root: repo.root().to_string_lossy().into_owned(),
+            branch: repo.branch()?,
+            files: repo.files()?,
             bench: self.bench.as_deref(),
+            warning,
         };
         Ok(to_json(&info))
     }
 
+    fn recent(&self) -> Vec<u8> {
+        let listed = self.recent_file.as_deref().map(recent::list);
+        // `exists` checks each folder on the main thread. A folder on a network volume that is
+        // gone can make that slow; accepted, as ten checks on local disks take microseconds.
+        let projects: Vec<RecentProject> = listed
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| {
+                let folder = Path::new(&path);
+                RecentProject {
+                    name: folder
+                        .file_name()
+                        .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned()),
+                    exists: folder.is_dir(),
+                    path,
+                }
+            })
+            .collect();
+        to_json(&projects)
+    }
+
+    /// The reply to `POST /api/open` and `POST /api/init`: makes the folder in the body the
+    /// open project, through `open_repo` (`Repo::open`, or `Repo::init` to make it a
+    /// repository first), and answers `{}`. The page then reloads.
+    fn open_folder(&self, body: &[u8], open_repo: fn(&Path) -> Result<Repo>) -> Result<Vec<u8>> {
+        let request: FolderRequest = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        self.open(open_repo(&request.path)?);
+        Ok(b"{}".to_vec())
+    }
+
     fn file_view(&self, path: &str) -> Result<Vec<u8>> {
-        let text = self.repo.read(path)?;
+        let text = self.repo()?.read(path)?;
         let lines = self.highlighter.lines(path, &text)?;
         Ok(to_json(&FileView { path, lines }))
     }
@@ -273,7 +508,7 @@ impl Site {
     /// The reply to `GET /api/notes`: every note, moved to where its snippet is now. Reads
     /// the review file and never writes it.
     fn notes(&self) -> Result<Vec<u8>> {
-        let review = notes::current(&self.repo)?;
+        let review = notes::current(&*self.repo()?)?;
         Ok(to_json(&review))
     }
 
@@ -282,7 +517,14 @@ impl Site {
     fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
         let new: NewNote = serde_json::from_slice(body)
             .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
-        let review = notes::add(&self.repo, new)?;
+        let review = notes::add(&*self.repo()?, new)?;
+        Ok(to_json(&review))
+    }
+
+    /// The reply to `DELETE /api/notes?id=N1`: removes the note, saves, and returns the
+    /// other notes.
+    fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
+        let review = notes::delete(&*self.repo()?, id)?;
         Ok(to_json(&review))
     }
 }
@@ -300,8 +542,15 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
         Err(error) => {
             // Every variant is listed so that a new one is a decision, not a silent 500.
             let status = match error {
-                Error::OutsideRepository { .. } | Error::InvalidNote(_) => StatusCode::BAD_REQUEST,
-                Error::NoteTextChanged { .. } => StatusCode::CONFLICT,
+                Error::OutsideRepository { .. }
+                | Error::InvalidNote(_)
+                | Error::BadRequest(_)
+                | Error::NotAFolder { .. }
+                | Error::TooBroad { .. } => StatusCode::BAD_REQUEST,
+                Error::NoteTextChanged { .. } | Error::NoProject => StatusCode::CONFLICT,
+                Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
+                // The page tells this one apart: it offers to make the folder a repository.
+                Error::NotARepository { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }
@@ -312,7 +561,9 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::ReadReview { .. }
                 | Error::ParseReview { .. }
                 | Error::InvalidReview { .. }
-                | Error::WriteReview { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                | Error::WriteReview { .. }
+                | Error::WriteRecent { .. }
+                | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
         }
@@ -413,12 +664,17 @@ mod tests {
             fs::write(self.root.join(file), text).unwrap();
         }
 
+        /// A site with this repository open.
         fn site(&self) -> Site {
-            Site {
-                repo: Repo::open(&self.root).unwrap(),
-                highlighter: Highlighter::new(),
-                bench: None,
-            }
+            let site = self.empty_site();
+            site.open(Repo::open(&self.root).unwrap());
+            site
+        }
+
+        /// A site with no project open, its recent list inside this repository's git
+        /// directory, where no file listing sees it and the drop below removes it.
+        fn empty_site(&self) -> Site {
+            Site::new(Some(self.root.join(".git/test-recent.json")), None)
         }
     }
 
@@ -462,7 +718,7 @@ mod tests {
         end: usize,
         body: &str,
     ) -> serde_json::Value {
-        let text = site.repo.read(path).unwrap();
+        let text = site.repo().unwrap().read(path).unwrap();
         let shown: Vec<&str> = text.lines().collect();
         let request = new_note(path, start, end, &shown[start - 1..end].join("\n"), body);
         let (status, reply) = post(site, NOTES, &request);
@@ -515,7 +771,7 @@ mod tests {
         assert_eq!(note["body"], "Merge these.", "the body is trimmed");
         assert_eq!(note["anchor"], "found");
 
-        let file = site.repo.review_file();
+        let file = site.repo().unwrap().review_file();
         assert!(
             file.ends_with(".git/postil/review.json"),
             "{}",
@@ -549,7 +805,8 @@ mod tests {
         );
         // Reading never writes, so a hand edit cannot be overwritten by the page refreshing.
         let stored = || -> serde_json::Value {
-            serde_json::from_str(&fs::read_to_string(site.repo.review_file()).unwrap()).unwrap()
+            serde_json::from_str(&fs::read_to_string(site.repo().unwrap().review_file()).unwrap())
+                .unwrap()
         };
         assert_eq!(anchors(&stored()), [anchor("N1", 2, 3, "found")]);
 
@@ -585,7 +842,7 @@ mod tests {
         let repo = TempRepo::new("notes-io");
         repo.write("a.txt", "x\n");
         let site = repo.site();
-        let file = site.repo.review_file();
+        let file = site.repo().unwrap().review_file();
         let request = &new_note("a.txt", 1, 1, "x", "b");
 
         // review.json is a directory: it exists but cannot be read.
@@ -629,7 +886,7 @@ mod tests {
         let repo = TempRepo::new("notes-by-hand");
         repo.write("a.txt", "x\ny\n");
         let site = repo.site();
-        let file = site.repo.review_file();
+        let file = site.repo().unwrap().review_file();
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let by_hand = r#"{"version": 1, "notes": [{"id": "N5", "path": "a.txt",
             "lines": {"start": 2, "end": 2}, "snippet": "y", "body": "From a script."}]}"#;
@@ -678,16 +935,16 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {reply}");
             assert!(reply.contains(expected), "{request}: {reply}");
         }
-        assert!(!site.repo.review_file().exists());
+        assert!(!site.repo().unwrap().review_file().exists());
 
         // Lines past the end hold none of the shown text: the file changed since it was shown.
         let (status, reply) = post(&site, NOTES, &new_note("a.txt", 2, 3, "y\nz", "b"));
         assert_eq!(status, StatusCode::CONFLICT, "{reply}");
         assert!(reply.contains("select the lines again"), "{reply}");
-        assert!(!site.repo.review_file().exists());
+        assert!(!site.repo().unwrap().review_file().exists());
 
         let request = Request::builder()
-            .method(Method::DELETE)
+            .method(Method::PUT)
             .uri(NOTES)
             .body(Vec::new())
             .unwrap();
@@ -697,12 +954,73 @@ mod tests {
         );
     }
 
+    fn delete(site: &Site, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(uri)
+            .body(Vec::new())
+            .unwrap();
+        let reply = site.respond(&request);
+        let body = String::from_utf8(reply.body().to_vec()).unwrap();
+        (reply.status(), body)
+    }
+
+    #[test]
+    fn a_deleted_note_is_gone_and_ids_above_the_highest_left_are_reused() {
+        let repo = TempRepo::new("notes-delete");
+        repo.write("a.txt", "x\ny\nz\n");
+        let site = repo.site();
+        for line in 1..=3 {
+            post_note(&site, "a.txt", line, line, "note");
+        }
+
+        // Deleting N2 leaves N1 and N3 with their ids.
+        let (status, body) = delete(&site, &format!("{NOTES}?id=N2"));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let review: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            anchors(&review),
+            [anchor("N1", 1, 1, "found"), anchor("N3", 3, 3, "found")]
+        );
+        let stored = fs::read_to_string(site.repo().unwrap().review_file()).unwrap();
+        assert!(!stored.contains("\"N2\""), "{stored}");
+
+        // Once N3 is gone too, the highest left is N1: N2 is handed out again.
+        delete(&site, &format!("{NOTES}?id=N3"));
+        let review = post_note(&site, "a.txt", 2, 2, "again");
+        assert_eq!(
+            anchors(&review),
+            [anchor("N1", 1, 1, "found"), anchor("N2", 2, 2, "found")]
+        );
+    }
+
+    #[test]
+    fn deleting_a_missing_or_malformed_id_says_so_and_changes_nothing() {
+        let repo = TempRepo::new("notes-delete-bad");
+        repo.write("a.txt", "x\n");
+        let site = repo.site();
+        post_note(&site, "a.txt", 1, 1, "one");
+        let file = site.repo().unwrap().review_file();
+        let before = fs::read_to_string(&file).unwrap();
+
+        let (status, body) = delete(&site, &format!("{NOTES}?id=N9"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("there is no note N9"), "{body}");
+        let (status, body) = delete(&site, &format!("{NOTES}?id=nine"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("note id \"nine\""), "{body}");
+        let (status, _) = delete(&site, NOTES);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    }
+
     #[test]
     fn a_broken_review_file_is_reported_and_never_overwritten() {
         let repo = TempRepo::new("notes-broken");
         repo.write("a.txt", "x\n");
         let site = repo.site();
-        let file = site.repo.review_file();
+        let file = site.repo().unwrap().review_file();
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let note = r#"{"id":"N1","path":"a.txt","lines":{"start":1,"end":1},"snippet":"x",
             "body":"b","anchor":"found"}"#;
@@ -744,7 +1062,7 @@ mod tests {
         let repo = TempRepo::new("notes-ids");
         repo.write("a.txt", "x\n");
         let site = repo.site();
-        let file = site.repo.review_file();
+        let file = site.repo().unwrap().review_file();
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let full = r#"{"version": 1, "notes": [{"id": "N4294967295", "path": "a.txt",
             "lines": {"start": 1, "end": 1}, "snippet": "x", "body": "b"}]}"#;
@@ -837,16 +1155,262 @@ mod tests {
         assert_eq!(info["bench"], serde_json::Value::Null);
     }
 
+    /// A plain folder in the temporary directory, outside any repository.
+    fn plain_folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("postil-{}-plain-{name}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn open_request(path: &Path) -> String {
+        serde_json::json!({ "path": path }).to_string()
+    }
+
+    #[test]
+    fn without_a_project_the_page_gets_null_and_project_routes_say_to_open_one() {
+        let repo = TempRepo::new("no-project");
+        let site = repo.empty_site();
+
+        let (status, body) = get(&site, "postil://localhost/api/repo");
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "null"));
+        for uri in ["/api/notes", "/api/file?path=a.rs"] {
+            let (status, body) = get(&site, &format!("postil://localhost{uri}"));
+            assert_eq!(status, StatusCode::CONFLICT, "{uri}");
+            assert!(body.contains("open a folder first"), "{uri}: {body}");
+        }
+    }
+
+    #[test]
+    fn opening_a_folder_makes_its_repository_the_project_and_lists_it_first() {
+        let first = TempRepo::new("open-first");
+        let second = TempRepo::new("open-second");
+        second.write("src/b.rs", "fn b() {}\n");
+        let site = first.empty_site();
+
+        for repo in [&first, &second] {
+            let (status, body) = post(
+                &site,
+                "postil://localhost/api/open",
+                &open_request(&repo.root),
+            );
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let info = get_json(&site, "postil://localhost/api/repo");
+        assert_eq!(info["files"], serde_json::json!(["src/b.rs"]));
+        assert_eq!(info["warning"], serde_json::Value::Null);
+
+        let recent = get_json(&site, "postil://localhost/api/recent");
+        let paths: Vec<&str> = recent
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|project| project["path"].as_str().unwrap())
+            .collect();
+        let root = |repo: &TempRepo| site_root(&repo.root);
+        assert_eq!(paths, [root(&second), root(&first)]);
+        assert_eq!(recent[0]["exists"], true);
+        assert_eq!(
+            recent[0]["name"],
+            second.root.file_name().unwrap().to_str().unwrap()
+        );
+    }
+
+    /// The root as git reports it, which resolves symbolic links such as /var to
+    /// /private/var on macOS.
+    fn site_root(dir: &Path) -> String {
+        Repo::open(dir).unwrap().root().to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_plain_folder_is_refused_with_its_own_status_until_it_is_made_a_repository() {
+        let repo = TempRepo::new("init-recent");
+        let site = repo.empty_site();
+        let folder = plain_folder("init");
+
+        let (status, body) = post(&site, "postil://localhost/api/open", &open_request(&folder));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("is not in a git repository"), "{body}");
+        assert_eq!(get(&site, "postil://localhost/api/repo").1, "null");
+
+        let (status, body) = post(&site, "postil://localhost/api/init", &open_request(&folder));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(folder.join(".git").is_dir());
+        let info = get_json(&site, "postil://localhost/api/repo");
+        assert_eq!(info["root"], site_root(&folder));
+        drop(fs::remove_dir_all(&folder));
+    }
+
+    #[test]
+    fn bad_open_requests_name_the_problem() {
+        let repo = TempRepo::new("open-bad");
+        let site = repo.empty_site();
+
+        let missing = open_request(Path::new("/no/such/folder"));
+        let (status, body) = post(&site, "postil://localhost/api/open", &missing);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "/no/such/folder is not a folder");
+
+        let (status, body) = post(&site, "postil://localhost/api/open", "{\"dir\": \"x\"}");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("unreadable request"), "{body}");
+
+        for route in ["open", "init"] {
+            let (status, _) = get(&site, &format!("postil://localhost/api/{route}"));
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{route}");
+        }
+    }
+
+    #[test]
+    fn a_folder_with_a_broken_git_link_gets_git_s_error_and_no_offer_to_init() {
+        let repo = TempRepo::new("broken-gitlink");
+        let site = repo.empty_site();
+        let folder = plain_folder("broken-gitlink");
+        // What a linked worktree looks like after its git directory was removed.
+        fs::write(folder.join(".git"), "gitdir: /no/such/git/dir\n").unwrap();
+
+        let (status, body) = post(&site, "postil://localhost/api/open", &open_request(&folder));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.starts_with("git rev-parse"), "{body}");
+        let (status, _) = post(&site, "postil://localhost/api/init", &open_request(&folder));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(folder.join(".git").is_file(), "the link is left as it was");
+        drop(fs::remove_dir_all(&folder));
+    }
+
+    fn drag(paths: &[&Path]) -> Vec<PathBuf> {
+        paths.iter().map(|path| path.to_path_buf()).collect()
+    }
+
+    #[test]
+    fn only_drags_that_carry_files_are_taken_from_the_webview() {
+        let folder = plain_folder("drag");
+        let file = folder.join("a.txt");
+        fs::write(&file, "x").unwrap();
+        let position = (0, 0);
+        let mut drags = FileDrag::default();
+        let over = DragDropEvent::Over { position };
+        let enter = |paths| DragDropEvent::Enter { paths, position };
+        let dropped = |paths| DragDropEvent::Drop { paths, position };
+
+        // Text dragged into the composer: no paths, left to the webview throughout.
+        assert_eq!(drags.handle(enter(Vec::new())), DragOutcome::Pass);
+        assert_eq!(drags.handle(over.clone()), DragOutcome::Pass);
+
+        // Files: taken from entering to leaving, and not after.
+        assert_eq!(drags.handle(enter(drag(&[&file]))), DragOutcome::Take);
+        assert_eq!(drags.handle(over.clone()), DragOutcome::Take);
+        assert_eq!(drags.handle(DragDropEvent::Leave), DragOutcome::Take);
+        assert_eq!(drags.handle(over.clone()), DragOutcome::Pass);
+
+        // A drop opens the first folder among the items, else the first item, and ends the
+        // drag: a later event is the webview's again.
+        drags.handle(enter(drag(&[&file, &folder])));
+        assert_eq!(
+            drags.handle(dropped(drag(&[&file, &folder]))),
+            DragOutcome::Open(folder.clone())
+        );
+        assert_eq!(drags.handle(over), DragOutcome::Pass);
+        assert_eq!(
+            drags.handle(dropped(drag(&[&file]))),
+            DragOutcome::Open(file.clone())
+        );
+        assert_eq!(drags.handle(dropped(Vec::new())), DragOutcome::Pass);
+        drop(fs::remove_dir_all(&folder));
+    }
+
+    #[test]
+    fn a_recent_list_that_cannot_be_written_warns_and_the_project_still_opens() {
+        let repo = TempRepo::new("recent-unwritable");
+        // The list's path is a directory, so no file can be renamed onto it.
+        let recent = repo.root.join(".git/recent-dir");
+        fs::create_dir_all(recent.join("inside")).unwrap();
+        let site = Site::new(Some(recent), None);
+
+        let (status, body) = post(
+            &site,
+            "postil://localhost/api/open",
+            &open_request(&repo.root),
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Every load of the project shows it: a request from the page being replaced must
+        // not be the one that takes it.
+        for _ in 0..2 {
+            let info = get_json(&site, "postil://localhost/api/repo");
+            let warning = info["warning"].as_str().unwrap();
+            assert!(
+                warning.contains("cannot update the recent projects"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_configuration_directory_the_recent_list_is_off_and_projects_open() {
+        let repo = TempRepo::new("recent-off");
+        let site = Site::new(None, None);
+
+        site.open(Repo::open(&repo.root).unwrap());
+        let info = get_json(&site, "postil://localhost/api/repo");
+        assert_eq!(
+            info["warning"],
+            "recent projects are off: cannot find the home directory (is HOME set?)"
+        );
+        assert_eq!(get(&site, "postil://localhost/api/recent").1, "[]");
+    }
+
+    #[test]
+    fn a_benchmark_leaves_the_recent_list_alone() {
+        let repo = TempRepo::new("recent-bench");
+        repo.write("a.rs", "fn a() {}\n");
+        let recent = repo.root.join(".git/test-recent.json");
+        let site = Site::new(Some(recent.clone()), Some("a.rs"));
+
+        site.open(Repo::open(&repo.root).unwrap());
+        assert!(!recent.exists());
+        assert_eq!(
+            get_json(&site, "postil://localhost/api/repo")["warning"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn init_inside_a_repository_opens_it_and_makes_no_repository_within() {
+        let repo = TempRepo::new("init-inside");
+        repo.write("src/a.rs", "fn a() {}\n");
+        let site = repo.empty_site();
+
+        let src = repo.root.join("src");
+        let (status, body) = post(&site, "postil://localhost/api/init", &open_request(&src));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!src.join(".git").exists(), "no nested repository");
+        let info = get_json(&site, "postil://localhost/api/repo");
+        assert_eq!(info["root"], site_root(&repo.root));
+    }
+
+    #[test]
+    fn a_recent_project_that_was_moved_is_listed_as_missing() {
+        let repo = TempRepo::new("recent-moved");
+        let site = repo.empty_site();
+        let folder = plain_folder("moved");
+        let (status, body) = post(&site, "postil://localhost/api/init", &open_request(&folder));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        fs::remove_dir_all(&folder).unwrap();
+
+        let recent = get_json(&site, "postil://localhost/api/recent");
+        assert_eq!(recent[0]["exists"], false);
+    }
+
     #[test]
     fn repo_is_found_from_a_subdirectory() {
         let repo = TempRepo::new("subdir");
         repo.write("src/a.rs", "fn a() {}\n");
 
-        let site = Site {
-            repo: Repo::open(&repo.root.join("src")).unwrap(),
-            highlighter: Highlighter::new(),
-            bench: Some("src/a.rs".to_owned()),
-        };
+        let site = Site::new(
+            Some(repo.root.join(".git/test-recent.json")),
+            Some("src/a.rs"),
+        );
+        site.open(Repo::open(&repo.root.join("src")).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
 
         assert_eq!(info["files"], serde_json::json!(["src/a.rs"]));
@@ -952,18 +1516,23 @@ mod tests {
     #[test]
     fn page_messages_parse_as_the_page_posts_them() {
         assert!(matches!(
-            PageMessage::parse("drag"),
-            Some(PageMessage::DragWindow)
+            AppEvent::parse("drag"),
+            Some(AppEvent::DragWindow)
         ));
         assert!(matches!(
-            PageMessage::parse("bench-painted"),
-            Some(PageMessage::BenchPainted)
+            AppEvent::parse("choose-folder"),
+            Some(AppEvent::ChooseFolder)
+        ));
+        assert!(matches!(AppEvent::parse("quit"), Some(AppEvent::Quit)));
+        assert!(matches!(
+            AppEvent::parse("bench-painted"),
+            Some(AppEvent::BenchPainted)
         ));
         assert!(matches!(
-            PageMessage::parse("bench:{\"a\":1}"),
-            Some(PageMessage::BenchDone(report)) if report == "{\"a\":1}"
+            AppEvent::parse("bench:{\"a\":1}"),
+            Some(AppEvent::BenchDone(report)) if report == "{\"a\":1}"
         ));
-        assert!(PageMessage::parse("nonsense").is_none());
+        assert!(AppEvent::parse("nonsense").is_none());
     }
 
     #[test]

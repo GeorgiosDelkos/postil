@@ -28,8 +28,12 @@ panel. It is not an editor, not a terminal, and not a PR tool.
 
 ## The loop
 
-1. **Open.** `postil .` in a repository, or drop a folder on the window. The file list comes
-   from `git ls-files` plus untracked files that are not ignored.
+1. **Open.** `postil .` in a repository; or `postil` alone, which shows the welcome screen:
+   Open Folder (`Cmd-O`, the native dialog), the recent projects, or a folder dropped on the
+   window. A folder outside any repository gets an offer to make it one (`git init`). One
+   window shows one project; opening another replaces it, and the project name in the sidebar
+   leads back to the welcome screen. The file list comes from `git ls-files` plus untracked
+   files that are not ignored.
 2. **Read.** A file tree on the left, a fuzzy finder on `Cmd-P`, one code pane with syntax colors.
 3. **Note.** Select lines (drag in the gutter, drag across the code text, or `v` then `j`/`k`),
    press `c` or right-click and choose Add note, type, `Cmd-Enter`. The note composer opens
@@ -129,6 +133,9 @@ schedule three tasks.
 | `src/app.rs` | `App` state and `App::update(Event)`. No drawing, no I/O: testable headless. |
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
+| `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
+| `src/files.rs` | Atomic file writes and the configuration directory. |
+| `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
 | `src/acp/wire.rs` | Serde types for the ACP messages the app sends and receives. |
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
@@ -408,7 +415,10 @@ retired; the measured numbers above are the baseline to not regress.
    Built: the page saves through `POST api/notes` and reads the file and the notes again when
    the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
    not drawn on code.
-   Not built: editing or deleting a note in the app (edit `review.json` by hand for now).
+   Notes are deleted from the tray (× then Delete) or from the code's right-click menu, through
+   `DELETE /api/notes?id=N1`; ids are not reused. A + on a hovered line number adds a note on
+   that line, as in GitHub's and GitLab's diff views. Not built: editing a note's text in the
+   app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
 5. **Polish.** Motion, focus mode, `agents.json`, an app bundle for macOS.
@@ -448,6 +458,12 @@ Assumed until someone objects:
    tracked file in the repository that teammates can see.
 6. **Name.** Postil, chosen 2026-11-22: a postil is a note written in the margin of a text. The
    name was free on crates.io and Homebrew that day; trademarks and domains were not checked.
+7. **Projects.** One window, switchable: opening another project replaces the current one,
+   rather than a window per project, chosen 2026-11-22. One repository per process keeps the
+   notes lock and the git calls simple. Only git repositories open; a plain folder is offered
+   `git init`, because snapshots and diffs (milestone 4) need git. Decided 2026-11-22. The
+   recent list is the app's own convenience, so an unreadable `recent.json` counts as empty
+   and is replaced, unlike `review.json`.
 
 ## Sources
 

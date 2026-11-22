@@ -40,6 +40,40 @@ pub enum Error {
     Webview(wry::Error),
     /// The window was closed before the benchmark page reported its measurements.
     BenchInterrupted,
+    /// The page sent a request this process cannot read; the text says why.
+    BadRequest(String),
+    /// No note has the id the page named; another window or a hand edit removed it.
+    NoSuchNote {
+        /// The id as the page sent it.
+        id: String,
+    },
+    /// The page asked for something that needs an open project, and none is open.
+    NoProject,
+    /// The path given to open is not a directory.
+    NotAFolder {
+        /// The path as given.
+        path: PathBuf,
+    },
+    /// The directory given to open is not inside a git working tree.
+    NotARepository {
+        /// The directory as given.
+        path: PathBuf,
+    },
+    /// The directory given to open is the home folder or the root and not in a repository:
+    /// too broad to make one.
+    TooBroad {
+        /// The directory as given.
+        path: PathBuf,
+    },
+    /// The list of recent projects could not be written.
+    WriteRecent {
+        /// The list's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// The home directory, which holds the app's configuration, is not known.
+    NoHome,
     /// The page asked for a note that cannot be made; the text says why.
     InvalidNote(String),
     /// The lines the page showed for a new note are no longer where it showed them, and are
@@ -93,6 +127,22 @@ impl fmt::Display for Error {
             Self::Window(_) => write!(f, "cannot create the window"),
             Self::Webview(_) => write!(f, "cannot create the webview"),
             Self::BenchInterrupted => write!(f, "window closed before the benchmark finished"),
+            Self::BadRequest(problem) => write!(f, "{problem}"),
+            Self::NoSuchNote { id } => write!(f, "there is no note {id}"),
+            Self::NoProject => write!(f, "no project is open (open a folder first)"),
+            Self::NotAFolder { path } => write!(f, "{} is not a folder", path.display()),
+            Self::NotARepository { path } => {
+                write!(f, "{} is not in a git repository", path.display())
+            }
+            Self::TooBroad { path } => write!(
+                f,
+                "{} is not in a git repository (open a project folder inside it)",
+                path.display()
+            ),
+            Self::WriteRecent { path, .. } => {
+                write!(f, "cannot update the recent projects in {}", path.display())
+            }
+            Self::NoHome => write!(f, "cannot find the home directory (is HOME set?)"),
             Self::InvalidNote(problem) => write!(f, "cannot save the note: {problem}"),
             Self::NoteTextChanged { path } => write!(
                 f,
@@ -132,7 +182,8 @@ impl std::error::Error for Error {
             Self::SpawnGit(source)
             | Self::Read { source, .. }
             | Self::ReadReview { source, .. }
-            | Self::WriteReview { source, .. } => Some(source),
+            | Self::WriteReview { source, .. }
+            | Self::WriteRecent { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
             Self::Highlight(source) => Some(source),
             Self::Window(source) => Some(source),
@@ -140,6 +191,13 @@ impl std::error::Error for Error {
             Self::Git { .. }
             | Self::OutsideRepository { .. }
             | Self::BenchInterrupted
+            | Self::BadRequest(_)
+            | Self::NoSuchNote { .. }
+            | Self::NoProject
+            | Self::NotAFolder { .. }
+            | Self::NotARepository { .. }
+            | Self::TooBroad { .. }
+            | Self::NoHome
             | Self::InvalidNote(_)
             | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. } => None,

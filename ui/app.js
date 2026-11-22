@@ -61,6 +61,10 @@ const state = {
   expanded: new Set(),
   // The index of the highlighted row while the file filter has text.
   activeMatch: 0,
+  // Whether the Rust process has a project open; without one, the welcome screen shows.
+  projectOpen: false,
+  // Set while a project is being opened, until the page reloads into it.
+  switching: false,
   // The rendered window of lines: [first, last).
   rendered: { first: 0, last: 0 },
 };
@@ -353,7 +357,13 @@ function setRowsPadding() {
 function lineRow(index) {
   const row = el("div", "ln");
   row.dataset.line = String(index);
-  row.append(el("span", "n", String(index + 1)));
+  // The + that hovering a line number shows, as in GitHub's and GitLab's diff views. It is
+  // out of the Tab order: the keyboard way is a selection and `c`.
+  const add = el("button", "add-note", "+");
+  add.type = "button";
+  add.tabIndex = -1;
+  add.setAttribute("aria-label", `Add a note on line ${index + 1}`);
+  row.append(add, el("span", "n", String(index + 1)));
 
   const code = el("span", "c");
   for (const [className, text] of state.file.lines[index]) {
@@ -441,8 +451,22 @@ rowsEl.addEventListener("mousemove", (event) => {
 let textDrag = null;
 
 rowsEl.addEventListener("mousedown", (event) => {
+  // A press on the + starts neither a text selection nor a drag: its click adds the note.
+  if (event.target.closest(".add-note")) {
+    event.preventDefault();
+    return;
+  }
   if (event.button !== 0 || event.target.classList.contains("n") || state.composer) return;
   textDrag = { lines: null };
+});
+
+// The + on a line: a note on that line, or on the whole selection when the line is in it.
+rowsEl.addEventListener("click", (event) => {
+  if (!event.target.closest(".add-note")) return;
+  const line = lineOfEvent(event);
+  const range = selectedRange();
+  const inSelection = range && range.start <= line && line <= range.end;
+  openComposer(inSelection ? range : { start: line, end: line });
 });
 
 document.addEventListener("selectionchange", () => {
@@ -559,10 +583,11 @@ rowsEl.addEventListener("contextmenu", (event) => {
     state.selection = { anchor: line, head: line };
     redecorateRows();
   }
-  openMenu(event.clientX, event.clientY, codeActions());
+  openMenu(event.clientX, event.clientY, codeActions(line));
 });
 
-function codeActions() {
+// The actions for the selected lines; `line` is the one right-clicked, for its note.
+function codeActions(line) {
   const range = selectedRange();
   const first = range.start + 1;
   const last = range.end + 1;
@@ -570,12 +595,12 @@ function codeActions() {
   // The text selection when there is one inside the code, else the whole selected lines.
   const text = selectedCodeText() ?? linesText(range);
   // `matches` is the action's own key, which works while the menu is open, as it is shown.
-  return [
+  const actions = [
     {
       label: "Add note",
       key: "C",
       matches: (event) => event.key === "c" && !event.metaKey,
-      run: openComposer,
+      run: () => openComposer(range),
       disabled: Boolean(state.composer),
     },
     {
@@ -586,10 +611,35 @@ function codeActions() {
     },
     { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
   ];
+  const note = state.noteByLine.get(line);
+  if (note) actions.push({ label: `Delete note ${note.id}`, run: () => deleteNote(note) });
+  return actions;
 }
 
 // The actions of the open menu, for its keyboard shortcuts.
 let menuActions = [];
+
+// Closes the menu and runs `action`. A failure is shown, never swallowed: an action that
+// silently did nothing is what made notes look broken once.
+async function runAction(action) {
+  closeMenu();
+  try {
+    await action.run();
+  } catch (error) {
+    showToast(`${action.label} failed: ${error}`);
+  }
+}
+
+// A short message at the bottom of the window, for failures with no better place to show.
+function showToast(text) {
+  const toast = $("toast");
+  toast.textContent = text;
+  toast.hidden = false;
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => {
+    toast.hidden = true;
+  }, 5000);
+}
 
 function openMenu(x, y, actions) {
   menuActions = actions;
@@ -600,10 +650,7 @@ function openMenu(x, y, actions) {
     item.disabled = Boolean(action.disabled);
     item.append(el("span", "menu-label", action.label));
     if (action.key) item.append(el("kbd", "", action.key));
-    item.addEventListener("click", () => {
-      closeMenu();
-      action.run();
-    });
+    item.addEventListener("click", () => runAction(action));
     return item;
   });
   menuEl.replaceChildren(...items);
@@ -641,10 +688,7 @@ menuEl.addEventListener("keydown", (event) => {
   else if (event.key === "Escape" || event.key === "Tab") closeMenu();
   else {
     const action = menuActions.find((each) => !each.disabled && each.matches?.(event));
-    if (action) {
-      closeMenu();
-      action.run();
-    }
+    if (action) runAction(action);
   }
 });
 
@@ -683,9 +727,12 @@ async function copyText(text) {
 
 // ---- Composer and notes ---------------------------------------------------------------
 
-function openComposer() {
-  const range = selectedRange();
+// Opens the composer on `range` (0-based lines), by default the selection. The context
+// menu passes the lines it was opened on, so its Add note acts on them whatever happened
+// to the selection between the right-click and the click.
+function openComposer(range = selectedRange()) {
   if (!range || state.composer) return;
+  state.selection = { anchor: range.start, head: range.end };
 
   // The composer opens under the selection, so the selection must be on screen to see it.
   const top = lineTop(range.start);
@@ -841,7 +888,7 @@ function renderNotes() {
     return;
   }
 
-  const cards = state.notes.map((note) => {
+  const items = state.notes.map((note) => {
     const outdated = note.anchor === "lost";
     const card = el("button", outdated ? "note outdated" : "note");
     card.type = "button";
@@ -852,9 +899,50 @@ function renderNotes() {
     where.append(el("span", "", `${note.path}:${lines}`), el("span", "note-id", id));
     card.append(where, el("div", "note-body", note.body));
     card.addEventListener("click", () => showNote(note));
-    return card;
+
+    const item = el("div", "note-item");
+    item.append(card, deleteButton(item, note));
+    return item;
   });
-  notesEl.replaceChildren(...cards);
+  notesEl.replaceChildren(...items);
+}
+
+// The ×  on a note card. A note is the engineer's writing, so deleting takes two clicks: the
+// first turns the button into "Delete", the second deletes. Leaving the card undoes the first.
+function deleteButton(item, note) {
+  const button = el("button", "note-delete", "×");
+  button.type = "button";
+  button.setAttribute("aria-label", `Delete note ${note.id}`);
+  const reset = () => {
+    item.classList.remove("confirming");
+    button.textContent = "×";
+  };
+  button.addEventListener("click", () => {
+    if (item.classList.contains("confirming")) {
+      deleteNote(note);
+      return;
+    }
+    item.classList.add("confirming");
+    button.textContent = "Delete";
+  });
+  item.addEventListener("mouseleave", reset);
+  button.addEventListener("blur", reset);
+  return button;
+}
+
+async function deleteNote(note) {
+  const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    showToast(await response.text());
+    return;
+  }
+  state.notes = (await response.json()).notes;
+  indexNotes();
+  renderNotes();
+  renderFiles();
+  redecorateRows();
 }
 
 async function showNote(note) {
@@ -952,6 +1040,24 @@ filterEl.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
+  // The window has no menu bar, where macOS would find Quit and Close, so the page handles
+  // their keys; with one window, closing it quits. They and Open Folder work everywhere.
+  if (event.metaKey && (event.key === "q" || event.key === "w")) {
+    event.preventDefault();
+    quit();
+    return;
+  }
+  if (event.metaKey && event.key === "o") {
+    event.preventDefault();
+    chooseFolder();
+    return;
+  }
+  // The welcome screen covers the panes: their keys must not act on what cannot be seen.
+  if (!welcomeEl.hidden) {
+    if (event.key === "Escape" && state.projectOpen) hideWelcome();
+    return;
+  }
+
   const typing = event.target.matches("input, textarea");
   if (event.key === "Escape") {
     if (state.composer) closeComposer({ save: false });
@@ -975,12 +1081,36 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+// A draft note lives only in the page, so anything that would end the page (quitting,
+// switching projects) first sends the engineer back to it. Returns whether there is one.
+function guardDraft(action) {
+  if (!state.composer?.text.trim()) return false;
+  hideWelcome();
+  const label = state.composer.node.querySelector(".composer-label");
+  label.textContent = `Save or discard this note before ${action}.`;
+  label.classList.add("failed");
+  state.composer.node.querySelector("textarea").focus();
+  return true;
+}
+
+function quit() {
+  if (!guardDraft("quitting")) window.ipc.postMessage("quit");
+}
+
 // There is no file watcher (docs/design.md, "Working with the repository"): the file list,
 // the open file, and the notes change while the engineer is in another app, so all three are
 // read again on return and drawn once, so the notes never show on the old text. Not while
 // the composer is open: reading the file again would move its lines under the text.
 async function refresh() {
-  if (state.composer) return;
+  // A project being opened replaces this page: what a refresh drew would be thrown away,
+  // and its requests would already reach the new project.
+  if (state.switching) return;
+  // The welcome screen is what is on screen, whether or not a project is open behind it.
+  if (!welcomeEl.hidden) {
+    await loadRecent();
+    return;
+  }
+  if (!state.projectOpen || state.composer) return;
   const path = state.wanted;
   const [repo, notes, file] = await Promise.all([
     fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
@@ -1060,8 +1190,107 @@ function showRepo(repo) {
   state.repo = repo;
   state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
+  $("repo-name").title = `${repo.root}\nSwitch project (⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
+  // Set once by the Rust process when the recent projects could not be updated. It does
+  // not stop anything, so it is a line under the branch, not a dialog.
+  const warning = $("repo-warning");
+  warning.hidden = !repo.warning;
+  if (repo.warning) warning.textContent = repo.warning;
 }
+
+// ---- Projects -------------------------------------------------------------------------
+//
+// One window shows one project. Without one, the welcome screen offers Open Folder, the
+// recent projects, and dropping a folder on the window. Opening another project replaces the
+// current one in the Rust process; the page then reloads, which resets everything it drew.
+
+const welcomeEl = $("welcome");
+
+// The Rust process calls this with the folder from the Open Folder dialog, or one dropped
+// on the window.
+window.postil = { openFolder: (path) => requestProject("api/open", path) };
+
+// Checked before the dialog opens too, so a folder is never chosen only to be refused.
+function chooseFolder() {
+  if (!guardDraft("opening another project")) window.ipc.postMessage("choose-folder");
+}
+
+// Asks the Rust process to open `path` (`api/open`), or to make it a git repository first
+// (`api/init`). On success the page reloads into the project. A draft note would be lost by
+// the reload, so the composer keeps the focus instead.
+async function requestProject(route, path) {
+  if (guardDraft("opening another project")) return;
+  state.switching = true;
+  let response;
+  try {
+    response = await fetch(route, { method: "POST", body: JSON.stringify({ path }) });
+  } catch (error) {
+    state.switching = false;
+    showWelcome();
+    showWelcomeError(`cannot open ${path}: ${error}`, null);
+    return;
+  }
+  if (response.ok) {
+    location.reload();
+    return;
+  }
+  state.switching = false;
+  // 422: the folder is not in a repository, which `git init` can fix in place.
+  showWelcome();
+  showWelcomeError(await response.text(), response.status === 422 ? path : null);
+}
+
+function showWelcomeError(text, folderToInit) {
+  $("welcome-error").hidden = false;
+  $("welcome-error-text").textContent = text;
+  const init = $("init-repo");
+  init.hidden = folderToInit === null;
+  init.onclick = () => requestProject("api/init", folderToInit);
+}
+
+function showWelcome() {
+  document.body.classList.add("welcome-mode");
+  welcomeEl.hidden = false;
+  const back = $("welcome-back");
+  back.hidden = !state.projectOpen;
+  if (state.projectOpen) back.textContent = `Back to ${state.repo.name}`;
+  loadRecent();
+  $("open-folder").focus();
+}
+
+function hideWelcome() {
+  document.body.classList.remove("welcome-mode");
+  welcomeEl.hidden = true;
+  $("welcome-error").hidden = true;
+  codeEl.focus();
+}
+
+async function loadRecent() {
+  const response = await fetch("api/recent");
+  const projects = response.ok ? await response.json() : [];
+  const recentEl = $("recent");
+  if (projects.length === 0) {
+    recentEl.replaceChildren(el("div", "recent-empty", "Projects you open appear here."));
+    return;
+  }
+  recentEl.replaceChildren(
+    ...projects.map((project) => {
+      const row = el("button", "recent-item");
+      row.type = "button";
+      row.disabled = !project.exists;
+      row.append(icon(folderIcon(project.name, false)), el("span", "recent-name", project.name));
+      const where = project.exists ? project.path : `${project.path} (moved or deleted)`;
+      row.append(el("span", "recent-path", where));
+      row.addEventListener("click", () => requestProject("api/open", project.path));
+      return row;
+    }),
+  );
+}
+
+$("open-folder").addEventListener("click", chooseFolder);
+$("welcome-back").addEventListener("click", hideWelcome);
+$("repo-name").addEventListener("click", showWelcome);
 
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.
@@ -1071,7 +1300,13 @@ async function start() {
     codeEmptyEl.textContent = await response.text();
     return;
   }
-  showRepo(await response.json());
+  const repo = await response.json();
+  if (repo === null) {
+    showWelcome();
+    return;
+  }
+  state.projectOpen = true;
+  showRepo(repo);
   renderFiles();
   await loadNotes();
 

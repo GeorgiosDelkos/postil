@@ -18,18 +18,19 @@
 //! The notes live in `<git dir>/postil/review.json` (docs/design.md, "Data structures"). That
 //! file is the only copy: every request reads it, so an agent or a script that edits it is
 //! seen on the next request, and the page holds nothing that a reload would lose. The module
-//! offers two operations, [`current`] and [`add`], each of which does every step (read,
-//! relocate, and for `add` lock and write) so that no caller can skip one.
+//! offers three operations, [`current`], [`add`] and [`delete`], each of which does every
+//! step (read, relocate, and for the two writers lock and write) so that no caller can skip
+//! one.
 //!
-//! Only [`add`] writes. Reading the notes, which the page does whenever the window regains
-//! focus, never rewrites the file, so it cannot overwrite an edit made by hand. The cost: the
-//! stored lines catch up with the code only on the next added note, and until then each read
-//! relocates from the older lines.
+//! Only [`add`] and [`delete`] write. Reading the notes, which the page does whenever the
+//! window regains focus, never rewrites the file, so it cannot overwrite an edit made by
+//! hand. The cost: the stored lines catch up with the code only on the next write, and until
+//! then each read relocates from the older lines.
 //!
-//! [`add`] holds an exclusive lock on `review.lock` beside the file from its read to its
-//! rename, so two app windows on one working tree cannot drop each other's notes. A script
-//! that edits `review.json` without taking that lock can still lose an edit made during an
-//! add, a window of milliseconds.
+//! Each writer holds an exclusive lock on `review.lock` beside the file from its read to its
+//! rename, so two app windows on one working tree cannot drop each other's changes. A script
+//! that edits `review.json` without taking that lock can still lose an edit made during a
+//! write, a window of milliseconds.
 //!
 //! The format has a version. Every field added is a new version: a build refuses fields it
 //! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
@@ -38,7 +39,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use serde::de::{self, Deserializer};
@@ -46,6 +47,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::files::write_atomically;
 use crate::repo::Repo;
 
 /// The format version this build reads and writes. A file with another version is refused,
@@ -117,6 +119,33 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
     Ok(review)
 }
 
+/// Deletes the note whose id is `id` (written `N1`), saves, and returns the other notes.
+///
+/// The next note gets the highest id left plus one, so every id above the highest remaining
+/// note is free again, including ones deleted earlier; an id below it is not reused while
+/// that higher note remains. Never reusing any id would need the file to store the next id, a
+/// new field and so a new format version.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] when `id` is not a note id, [`Error::NoSuchNote`] when no note has
+/// it, as [`current`] for reading the file, and [`Error::WriteReview`] when the lock or the
+/// file cannot be written.
+pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
+    let wanted = NoteId::parse(id)
+        .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
+    let file = repo.review_file();
+    let _lock = lock(&file)?;
+    let mut review = current(repo)?;
+    let before = review.notes.len();
+    review.notes.retain(|note| note.id != wanted);
+    if review.notes.len() == before {
+        return Err(Error::NoSuchNote { id: id.to_owned() });
+    }
+    review.save(&file)?;
+    Ok(review)
+}
+
 /// Every note of one working tree, as stored in `review.json`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +194,17 @@ pub(crate) struct NewNote {
 /// A note's number, written `N1`, `N2`: shown in the page and sent to the agent.
 #[derive(Debug, PartialEq, Eq)]
 struct NoteId(u32);
+
+impl NoteId {
+    /// Reads `N` and a positive number, as `Display` writes it.
+    fn parse(text: &str) -> Option<Self> {
+        text.strip_prefix('N')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok())
+            .filter(|&number| number > 0)
+            .map(Self)
+    }
+}
 
 /// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,8 +283,7 @@ impl Review {
         Ok(review)
     }
 
-    /// Replaces the review file with this review. Its directory must exist: [`lock`], which
-    /// every writer takes first, creates it.
+    /// Replaces the review file with this review (`write_atomically`).
     fn save(&self, file: &Path) -> Result<()> {
         let mut json = serde_json::to_vec_pretty(self)
             .expect("a review is plain structs, strings, and numbers, which always serialize");
@@ -323,40 +362,6 @@ fn lock(review_file: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`.
-/// A failure before the rename leaves the old file.
-fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = file
-        .parent()
-        .expect("the review file is <git dir>/postil/review.json, which has a parent");
-
-    // Only `add` writes, and it holds `review.lock`, so two writers never share this name at
-    // once.
-    let temporary = dir.join("review.json.tmp");
-    let written = (|| {
-        let mut out = File::create(&temporary)?;
-        out.write_all(bytes)?;
-        out.sync_all()?;
-        fs::rename(&temporary, file)
-    })();
-    if written.is_err() {
-        // Best effort: a leftover temporary file is ignored by every reader.
-        drop(fs::remove_file(&temporary));
-    }
-    written?;
-
-    // The rename is the commit: the new file is in place and readers see it. Syncing the
-    // directory makes the rename survive a power loss. A failure here cannot be undone, and
-    // reporting the note as unsaved would make the engineer save it twice, so it is ignored.
-    // The parent is synced too, so the `postil` directory that `lock` may just have created
-    // survives as well; two directory syncs per added note are cheap.
-    drop(File::open(dir).and_then(|dir| dir.sync_all()));
-    if let Some(parent) = dir.parent() {
-        drop(File::open(parent).and_then(|parent| parent.sync_all()));
-    }
-    Ok(())
-}
-
 // Debug output shows ids, paths, and anchors, never note text: notes can quote code that is
 // not meant to leave the machine, and Debug output ends up in logs.
 impl fmt::Debug for Review {
@@ -403,16 +408,11 @@ impl Serialize for NoteId {
 impl<'de> Deserialize<'de> for NoteId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        text.strip_prefix('N')
-            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|digits| digits.parse().ok())
-            .filter(|&number| number > 0)
-            .map(Self)
-            .ok_or_else(|| {
-                de::Error::custom(format!(
-                    "note id {text:?}: expected N and a number, like N1"
-                ))
-            })
+        Self::parse(&text).ok_or_else(|| {
+            de::Error::custom(format!(
+                "note id {text:?}: expected N and a number, like N1"
+            ))
+        })
     }
 }
 
