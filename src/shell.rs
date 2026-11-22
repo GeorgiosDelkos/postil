@@ -87,11 +87,14 @@ enum AppEvent {
     DragWindow,
     /// The page asked for the folder dialog (Open Folder).
     ChooseFolder,
-    /// The engineer pressed Cmd-Q or Cmd-W. The window has no menu bar, which is where macOS
-    /// would otherwise find Quit, so the page forwards the keys.
+    /// The page confirmed quitting (Quit or Close Window, from the menu or the keys): no
+    /// draft note would be lost.
     Quit,
     /// A folder (or file) was dropped on the window.
     Dropped(PathBuf),
+    /// A menu command was chosen; the page carries it out.
+    #[cfg(target_os = "macos")]
+    Menu(crate::menu::Command),
     /// The benchmark's file is on screen.
     BenchPainted,
     /// The benchmark finished; the payload is its JSON report.
@@ -132,6 +135,19 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     let canvas = match window.theme() {
         Theme::Dark => DARK_CANVAS,
         _ => LIGHT_CANVAS,
+    };
+
+    // The menu bar lives as long as this function, which is as long as the app.
+    #[cfg(target_os = "macos")]
+    let _menu = {
+        let menu_proxy = event_loop.create_proxy();
+        muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+            if let Some(command) = crate::menu::Command::from_id(event.id.as_ref()) {
+                // Fails only once the event loop is gone.
+                drop(menu_proxy.send_event(AppEvent::Menu(command)));
+            }
+        }));
+        crate::menu::install()
     };
 
     let page_proxy = event_loop.create_proxy();
@@ -192,6 +208,13 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 }
             }
             Event::UserEvent(AppEvent::Dropped(path)) => offer_folder(&webview, &path),
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(AppEvent::Menu(command)) => {
+                // The id is one of `Command::id`'s fixed ASCII names, safe inside quotes.
+                let script = format!("window.postil?.menu(\"{}\")", command.id());
+                // Fails only when the webview is being torn down, when there is no page.
+                drop(webview.evaluate_script(&script));
+            }
             Event::UserEvent(AppEvent::BenchPainted) => {
                 launch_to_paint = Some(started.elapsed());
             }

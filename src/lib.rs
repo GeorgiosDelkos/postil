@@ -12,6 +12,8 @@ mod dialog;
 mod error;
 mod files;
 mod highlight;
+#[cfg(target_os = "macos")]
+mod menu;
 mod notes;
 mod recent;
 mod repo;

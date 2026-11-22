@@ -597,7 +597,7 @@ function codeActions(line) {
   // `matches` is the action's own key, which works while the menu is open, as it is shown.
   const actions = [
     {
-      label: "Add note",
+      label: "Add Note",
       key: "C",
       matches: (event) => event.key === "c" && !event.metaKey,
       run: () => openComposer(range),
@@ -609,10 +609,13 @@ function codeActions(line) {
       matches: (event) => event.key === "c" && event.metaKey,
       run: () => copyText(text),
     },
-    { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
+    { label: "Copy Reference", detail: reference, run: () => copyText(reference) },
   ];
   const note = state.noteByLine.get(line);
-  if (note) actions.push({ label: `Delete note ${note.id}`, run: () => deleteNote(note) });
+  if (note) {
+    // A separator sets the one destructive item apart, as macOS menus do.
+    actions.push({ label: `Delete Note ${note.id}`, separated: true, run: () => deleteNote(note) });
+  }
   return actions;
 }
 
@@ -643,15 +646,24 @@ function showToast(text) {
 
 function openMenu(x, y, actions) {
   menuActions = actions;
-  const items = actions.map((action) => {
+  const items = actions.flatMap((action) => {
     const item = el("button", "menu-item");
     item.type = "button";
     item.setAttribute("role", "menuitem");
     item.disabled = Boolean(action.disabled);
     item.append(el("span", "menu-label", action.label));
+    if (action.detail) item.append(el("span", "menu-detail", action.detail));
     if (action.key) item.append(el("kbd", "", action.key));
     item.addEventListener("click", () => runAction(action));
-    return item;
+    // The highlight is the focus, and the pointer moves it, so the pointer and the arrow keys
+    // never highlight two items at once.
+    // A disabled item cannot take the focus, so hovering it clears the highlight instead of
+    // leaving it on the item before, which Enter would then run.
+    item.addEventListener("mouseenter", () => (item.disabled ? menuEl : item).focus());
+    if (!action.separated) return [item];
+    const separator = el("div", "menu-separator");
+    separator.setAttribute("role", "separator");
+    return [separator, item];
   });
   menuEl.replaceChildren(...items);
   menuEl.hidden = false;
@@ -660,7 +672,9 @@ function openMenu(x, y, actions) {
   const { width, height } = menuEl.getBoundingClientRect();
   menuEl.style.left = `${Math.max(4, Math.min(x, innerWidth - width - 4))}px`;
   menuEl.style.top = `${Math.max(4, Math.min(y, innerHeight - height - 4))}px`;
-  menuEl.querySelector("button:not(:disabled)")?.focus();
+  // Opened by the pointer, so no item is highlighted yet, as in a macOS menu. The menu itself
+  // takes the focus so the arrow keys and Escape still reach it.
+  menuEl.focus();
 }
 
 function closeMenu() {
@@ -674,15 +688,24 @@ function closeMenu() {
 // While open, the menu owns the keyboard, as system menus do: no key reaches the window's
 // handlers, so `c` cannot open a composer under it and Escape cannot discard one.
 menuEl.addEventListener("keydown", (event) => {
+  // A Command shortcut the menu has no item for (Cmd-Q, Cmd-H, Cmd-Shift-O) belongs to the
+  // menu bar: close this menu and let the key through, so WebKit passes it on.
+  const own = menuActions.some((each) => !each.disabled && each.matches?.(event));
+  if (event.metaKey && !own) {
+    closeMenu();
+    return;
+  }
   event.stopPropagation();
   // Enter and Space are the focused item's own: they click it.
   if (event.key === "Enter" || event.key === " ") return;
   event.preventDefault();
 
   const items = [...menuEl.querySelectorAll("button:not(:disabled)")];
+  // -1 while no item is highlighted: Down then takes the first item and Up the last.
   const index = items.indexOf(document.activeElement);
+  const up = index === -1 ? items.length - 1 : (index - 1 + items.length) % items.length;
   if (event.key === "ArrowDown") items[(index + 1) % items.length]?.focus();
-  else if (event.key === "ArrowUp") items[(index - 1 + items.length) % items.length]?.focus();
+  else if (event.key === "ArrowUp") items[up]?.focus();
   else if (event.key === "Home") items[0]?.focus();
   else if (event.key === "End") items.at(-1)?.focus();
   else if (event.key === "Escape" || event.key === "Tab") closeMenu();
@@ -692,9 +715,12 @@ menuEl.addEventListener("keydown", (event) => {
   }
 });
 
-menuEl.addEventListener("focusout", (event) => {
-  if (!menuEl.contains(event.relatedTarget)) closeMenu();
-});
+// WebKit does not focus a button that is clicked: the press would move focus out of the menu
+// first. Keeping the focus where it is lets the click reach the item. (A `focusout` handler
+// that closed the menu here once made every item do nothing.)
+menuEl.addEventListener("mousedown", (event) => event.preventDefault());
+// Leaving the menu clears the highlight, as in a macOS menu.
+menuEl.addEventListener("mouseleave", () => menuEl.focus());
 
 // Any press outside the menu, a scroll of the code, or leaving the window closes it.
 window.addEventListener(
@@ -1040,18 +1066,8 @@ filterEl.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  // The window has no menu bar, where macOS would find Quit and Close, so the page handles
-  // their keys; with one window, closing it quits. They and Open Folder work everywhere.
-  if (event.metaKey && (event.key === "q" || event.key === "w")) {
-    event.preventDefault();
-    quit();
-    return;
-  }
-  if (event.metaKey && event.key === "o") {
-    event.preventDefault();
-    chooseFolder();
-    return;
-  }
+  // Cmd-Q, Cmd-W, Cmd-O, Cmd-Shift-O and Cmd-P belong to the menu bar (src/menu.rs), which
+  // calls `window.postil.menu`. The page leaves them alone, so each shortcut is defined once.
   // The welcome screen covers the panes: their keys must not act on what cannot be seen.
   if (!welcomeEl.hidden) {
     if (event.key === "Escape" && state.projectOpen) hideWelcome();
@@ -1074,10 +1090,6 @@ window.addEventListener("keydown", (event) => {
   } else if (event.key === "c" && !typing && !event.metaKey && !event.ctrlKey) {
     event.preventDefault();
     openComposer();
-  } else if (event.key === "p" && event.metaKey) {
-    event.preventDefault();
-    filterEl.focus();
-    filterEl.select();
   }
 });
 
@@ -1190,7 +1202,7 @@ function showRepo(repo) {
   state.repo = repo;
   state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
-  $("repo-name").title = `${repo.root}\nSwitch project (⌘O)`;
+  $("repo-name").title = `${repo.root}\nSwitch project (⇧⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
   // Set once by the Rust process when the recent projects could not be updated. It does
   // not stop anything, so it is a line under the branch, not a dialog.
@@ -1207,9 +1219,32 @@ function showRepo(repo) {
 
 const welcomeEl = $("welcome");
 
-// The Rust process calls this with the folder from the Open Folder dialog, or one dropped
-// on the window.
-window.postil = { openFolder: (path) => requestProject("api/open", path) };
+// What the Rust process calls into the page:
+// - `openFolder`, with the folder from the Open Folder dialog, or one dropped on the window;
+// - `menu`, with the id of a menu bar command (src/menu.rs, `Command::id`). The page runs
+//   them, so they share its guards, such as a draft note blocking Quit.
+window.postil = {
+  openFolder: (path) => {
+    closeMenu();
+    requestProject("api/open", path);
+  },
+  menu: (command) => {
+    // A click in the menu bar reaches the page as no event at all, so nothing else closes
+    // the right-click menu: it would stay drawn over the welcome screen or the filter.
+    closeMenu();
+    if (command === "open-folder") chooseFolder();
+    else if (command === "switch-project") showWelcome();
+    else if (command === "go-to-file") goToFile();
+    else if (command === "close-window" || command === "quit") quit();
+  },
+};
+
+// Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
+function goToFile() {
+  if (!welcomeEl.hidden) return;
+  filterEl.focus();
+  filterEl.select();
+}
 
 // Checked before the dialog opens too, so a folder is never chosen only to be refused.
 function chooseFolder() {

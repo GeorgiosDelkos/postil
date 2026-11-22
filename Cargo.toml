@@ -50,6 +50,11 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSSavePanel",
     "NSWindow",
 ] }
+# The menu bar (Tauri's menu crate, made for tao). It adds 13 crates (119 to 132), measured
+# 2026-11-22. The alternative, NSMenu through objc2-app-kit, needs an Objective-C class for the
+# menu's actions, which takes `unsafe`, and this crate forbids it. The default feature is GTK
+# for Linux, which the app does not build for yet.
+muda = { version = "0.21.2", default-features = false }
 
 [profile.release]
 # The binary ships to laptops: favor size and start time over build time.
