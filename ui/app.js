@@ -114,13 +114,21 @@ function renderFiles() {
 
   if (needle) {
     filesEl.removeAttribute("role");
-    filesEl.replaceChildren(...filteredFileRows(needle));
+    replaceRows(filesEl, filteredFileRows(needle));
   } else {
     filesEl.setAttribute("role", "tree");
-    filesEl.replaceChildren(...treeRows());
+    replaceRows(filesEl, treeRows());
     setTabStop(filesEl.querySelector(".file.open") ?? filesEl.querySelector(".file, .dir"));
   }
   if (focused) filesEl.querySelector(rowSelector(focused))?.focus();
+}
+
+// Replaces the children one by one instead of spreading them into one call: a folder can
+// hold more children than an engine accepts as arguments (about 65,000 in JavaScriptCore).
+function replaceRows(container, rows) {
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) fragment.append(row);
+  container.replaceChildren(fragment);
 }
 
 // With a filter: a flat list of the best fuzzy matches, with the matched characters marked.
@@ -138,7 +146,7 @@ function filteredFileRows(needle) {
 
 // `path` as a label with the characters at `positions` wrapped in <mark>.
 function markedPath(path, positions) {
-  const label = el("span");
+  const label = el("span", "name");
   const marked = new Set(positions);
   for (let index = 0; index < path.length; index += 1) {
     label.append(marked.has(index) ? el("mark", "", path[index]) : path[index]);
@@ -214,7 +222,10 @@ function revealFile(previous, path) {
     renderFiles();
   } else {
     if (previous) filesEl.querySelector(`.file${rowSelector(previous)}`)?.classList.remove("open");
-    filesEl.querySelector(`.file${rowSelector(path)}`)?.classList.add("open");
+    const row = filesEl.querySelector(`.file${rowSelector(path)}`);
+    row?.classList.add("open");
+    // Tab into the tree lands on the open file, as it does after a rebuild.
+    if (row && filesEl.getAttribute("role") === "tree") setTabStop(row);
   }
   filesEl.querySelector(`.file${rowSelector(path)}`)?.scrollIntoView({ block: "nearest" });
 }
@@ -403,6 +414,8 @@ rowsEl.addEventListener("mousedown", (event) => {
 
   event.preventDefault();
   codeEl.focus();
+  // A text selection elsewhere would otherwise stay highlighted, and be what Copy copies.
+  window.getSelection().removeAllRanges();
   const anchor = event.shiftKey && state.selection ? state.selection.anchor : line;
   state.selection = { anchor, head: line };
   dragging = true;
@@ -417,24 +430,48 @@ rowsEl.addEventListener("mousemove", (event) => {
   redecorateRows();
 });
 
-window.addEventListener("mouseup", (event) => {
-  const fromGutter = dragging;
-  dragging = false;
-  if (!fromGutter && event.button === 0) selectFromText(event);
-});
-
 // A drag across the code text selects the lines it touches, as a drag in the gutter does, so
 // the next `c` or right-click acts on them. The text stays highlighted for copying. A plain
 // click in the code clears the selection, as in an editor.
-function selectFromText(event) {
-  if (state.composer || !rowsEl.contains(event.target)) return;
-  const range = textSelectionLines();
-  state.selection = range ? { anchor: range.start, head: range.end } : null;
+//
+// While the button is down, `textDrag.lines` follows the browser's selection. It is kept
+// rather than read once at the release: a drag that scrolls the pane makes the virtual list
+// rebuild its rows, and the browser drops the selection with the nodes it was in. The
+// release itself may land anywhere, the sidebar included.
+let textDrag = null;
+
+rowsEl.addEventListener("mousedown", (event) => {
+  if (event.button !== 0 || event.target.classList.contains("n") || state.composer) return;
+  textDrag = { lines: null };
+});
+
+document.addEventListener("selectionchange", () => {
+  if (textDrag) textDrag.lines = currentDragLines(textDrag.lines);
+});
+
+window.addEventListener("mouseup", (event) => {
+  dragging = false;
+  if (!textDrag || event.button !== 0) return;
+  // `selectionchange` is delivered after the event that caused it, so the last change of
+  // the drag may not have arrived yet: read the selection once more here.
+  const lines = currentDragLines(textDrag.lines);
+  textDrag = null;
+  if (state.composer) return;
+  state.selection = lines ? { anchor: lines.start, head: lines.end } : null;
   redecorateRows();
+});
+
+// The lines the drag covers now: those of the selection when it is in the code (none for a
+// collapsed one, a plain click), else the last ones seen (the rows it was in were rebuilt).
+function currentDragLines(last) {
+  const selection = window.getSelection();
+  const inCode = selection.rangeCount > 0 && rowsEl.contains(selection.anchorNode);
+  return inCode ? textSelectionLines() : last;
 }
 
 // The lines the browser's text selection covers in the code, or null when nothing is
-// selected there.
+// selected there. As in VS Code, the line a selection starts on counts even when it starts
+// at that line's end, and the line it ends on does not count when it ends at its start.
 function textSelectionLines() {
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
@@ -470,10 +507,12 @@ function linesText({ start, end }) {
 // The code the text selection covers, without the line numbers and note remarks that sit
 // in the same rows: WebKit's own selection text includes them even though they cannot be
 // selected (seen 2026-11-22: a two-line selection copied the gutter's "3"). Null when the
-// selection is not in the code.
+// selection is not in the code, or covers other lines than the selected ones (a leftover
+// from before the gutter or a right-click chose new lines).
 function selectedCodeText() {
   const lines = textSelectionLines();
-  if (!lines) return null;
+  const chosen = selectedRange();
+  if (!lines || !chosen || lines.start !== chosen.start || lines.end !== chosen.end) return null;
   const range = window.getSelection().getRangeAt(0);
   const code = (line) => rowsEl.querySelector(`.ln[data-line="${line}"] .c`);
   // How many characters of `cell` come before (container, offset), or null when that
@@ -516,6 +555,7 @@ rowsEl.addEventListener("contextmenu", (event) => {
 
   const range = selectedRange();
   if (!range || line < range.start || line > range.end) {
+    window.getSelection().removeAllRanges();
     state.selection = { anchor: line, head: line };
     redecorateRows();
   }
@@ -529,14 +569,30 @@ function codeActions() {
   const reference = `${state.file.path}:${first === last ? first : `${first}-${last}`}`;
   // The text selection when there is one inside the code, else the whole selected lines.
   const text = selectedCodeText() ?? linesText(range);
+  // `matches` is the action's own key, which works while the menu is open, as it is shown.
   return [
-    { label: "Add note", key: "C", run: openComposer, disabled: Boolean(state.composer) },
-    { label: "Copy", key: "⌘C", run: () => copyText(text) },
+    {
+      label: "Add note",
+      key: "C",
+      matches: (event) => event.key === "c" && !event.metaKey,
+      run: openComposer,
+      disabled: Boolean(state.composer),
+    },
+    {
+      label: "Copy",
+      key: "⌘C",
+      matches: (event) => event.key === "c" && event.metaKey,
+      run: () => copyText(text),
+    },
     { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
   ];
 }
 
+// The actions of the open menu, for its keyboard shortcuts.
+let menuActions = [];
+
 function openMenu(x, y, actions) {
+  menuActions = actions;
   const items = actions.map((action) => {
     const item = el("button", "menu-item");
     item.type = "button";
@@ -568,16 +624,32 @@ function closeMenu() {
   }
 }
 
+// While open, the menu owns the keyboard, as system menus do: no key reaches the window's
+// handlers, so `c` cannot open a composer under it and Escape cannot discard one.
 menuEl.addEventListener("keydown", (event) => {
+  event.stopPropagation();
+  // Enter and Space are the focused item's own: they click it.
+  if (event.key === "Enter" || event.key === " ") return;
+  event.preventDefault();
+
   const items = [...menuEl.querySelectorAll("button:not(:disabled)")];
   const index = items.indexOf(document.activeElement);
   if (event.key === "ArrowDown") items[(index + 1) % items.length]?.focus();
   else if (event.key === "ArrowUp") items[(index - 1 + items.length) % items.length]?.focus();
-  else if (event.key === "Escape") closeMenu();
-  else return;
-  event.preventDefault();
-  // Escape here closes only the menu, not the composer or the selection behind it.
-  event.stopPropagation();
+  else if (event.key === "Home") items[0]?.focus();
+  else if (event.key === "End") items.at(-1)?.focus();
+  else if (event.key === "Escape" || event.key === "Tab") closeMenu();
+  else {
+    const action = menuActions.find((each) => !each.disabled && each.matches?.(event));
+    if (action) {
+      closeMenu();
+      action.run();
+    }
+  }
+});
+
+menuEl.addEventListener("focusout", (event) => {
+  if (!menuEl.contains(event.relatedTarget)) closeMenu();
 });
 
 // Any press outside the menu, a scroll of the code, or leaving the window closes it.
@@ -887,6 +959,12 @@ window.addEventListener("keydown", (event) => {
       state.selection = null;
       redecorateRows();
     }
+  } else if (event.key === "c" && event.metaKey && !typing && state.file && state.selection) {
+    // With text selected, the browser copies and the `copy` handler fixes the text. Lines
+    // chosen in the gutter have no text selection, so the whole lines are copied here.
+    if (selectedCodeText() !== null) return;
+    event.preventDefault();
+    copyText(linesText(selectedRange()));
   } else if (event.key === "c" && !typing && !event.metaKey && !event.ctrlKey) {
     event.preventDefault();
     openComposer();

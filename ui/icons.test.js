@@ -35,6 +35,17 @@ test("folders have a closed and an open icon, special names their own", () => {
   assert.equal(folderIcon("acp", true), "icon-folder-base-open");
 });
 
+test("no icon paints its bounding box", () => {
+  // Some upstream icons start with a full-size box path that only their root's
+  // fill="none" keeps invisible; a symbol that lost it draws a solid black tile.
+  for (const [, id, attributes, body] of sprite.matchAll(
+    /<symbol id="([^"]+)"([^>]*)>([\s\S]*?)<\/symbol>/g,
+  )) {
+    const unfilledBox = /<path d="M0 0h\d+v\d+H0z"\/>/.test(body);
+    assert.ok(!unfilledBox || attributes.includes('fill="none"'), `${id} paints a black box`);
+  }
+});
+
 test("every icon the mapping can return is in the sprite", () => {
   // Read the mapping's tables back through its functions: every folder kind, open and
   // closed, and every file icon over a sample of names that reaches each entry.
