@@ -956,6 +956,8 @@ mod tests {
         // encodeURIComponent("src/my file+é.rs")
         let query = "path=src%2Fmy%20file%2B%C3%A9.rs";
         assert_eq!(query_value(query, "path").unwrap(), "src/my file+é.rs");
+        // Percent-encoding allows lowercase hex too, though the page never writes it.
+        assert_eq!(query_value("path=%c3%a9%2f", "path").unwrap(), "é/");
     }
 
     #[test]

@@ -416,6 +416,11 @@ mod tests {
                 let lines = highlighter.lines(path, text).unwrap();
                 assert_eq!(rejoin(&lines), normalized(text), "{path} {text:?}");
                 assert_eq!(lines.len(), text.lines().count(), "{path} {text:?}");
+                // Adjacent text of one class is one token: fewer elements for the page.
+                for line in &lines {
+                    let repeated = line.windows(2).any(|pair| pair[0].0 == pair[1].0);
+                    assert!(!repeated, "{path} {text:?}: {line:?}");
+                }
             }
         }
     }
