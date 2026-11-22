@@ -65,8 +65,12 @@ fn build() -> muda::Result<Menu> {
     let about = AboutMetadata {
         name: Some("Postil".to_owned()),
         version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        comments: Some(env!("CARGO_PKG_DESCRIPTION").to_owned()),
-        license: Some(env!("CARGO_PKG_LICENSE").to_owned()),
+        // macOS shows neither `comments` nor `license` (muda 0.21.2 docs), only `credits`.
+        credits: Some(format!(
+            "{}\n{} license",
+            env!("CARGO_PKG_DESCRIPTION"),
+            env!("CARGO_PKG_LICENSE")
+        )),
         ..AboutMetadata::default()
     };
     let app = Submenu::with_items(

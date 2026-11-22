@@ -657,7 +657,9 @@ function openMenu(x, y, actions) {
     item.addEventListener("click", () => runAction(action));
     // The highlight is the focus, and the pointer moves it, so the pointer and the arrow keys
     // never highlight two items at once.
-    item.addEventListener("mouseenter", () => item.focus());
+    // A disabled item cannot take the focus, so hovering it clears the highlight instead of
+    // leaving it on the item before, which Enter would then run.
+    item.addEventListener("mouseenter", () => (item.disabled ? menuEl : item).focus());
     if (!action.separated) return [item];
     const separator = el("div", "menu-separator");
     separator.setAttribute("role", "separator");
@@ -686,6 +688,13 @@ function closeMenu() {
 // While open, the menu owns the keyboard, as system menus do: no key reaches the window's
 // handlers, so `c` cannot open a composer under it and Escape cannot discard one.
 menuEl.addEventListener("keydown", (event) => {
+  // A Command shortcut the menu has no item for (Cmd-Q, Cmd-H, Cmd-Shift-O) belongs to the
+  // menu bar: close this menu and let the key through, so WebKit passes it on.
+  const own = menuActions.some((each) => !each.disabled && each.matches?.(event));
+  if (event.metaKey && !own) {
+    closeMenu();
+    return;
+  }
   event.stopPropagation();
   // Enter and Space are the focused item's own: they click it.
   if (event.key === "Enter" || event.key === " ") return;
@@ -1057,21 +1066,8 @@ filterEl.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  // Quit, Close Window and Open Folder are also menu bar items (src/menu.rs). WebKit offers a
-  // key to the page before the menu, and the page takes these (preventDefault), so a press
-  // runs once, through the same functions the menu calls. With one window, closing it quits.
-  // They work everywhere, the welcome screen included.
-  if (event.metaKey && (event.key === "q" || event.key === "w")) {
-    event.preventDefault();
-    quit();
-    return;
-  }
-  // Not with Shift: Cmd-Shift-O is the menu's Switch Project, which the page leaves to it.
-  if (event.metaKey && !event.shiftKey && event.key === "o") {
-    event.preventDefault();
-    chooseFolder();
-    return;
-  }
+  // Cmd-Q, Cmd-W, Cmd-O, Cmd-Shift-O and Cmd-P belong to the menu bar (src/menu.rs), which
+  // calls `window.postil.menu`. The page leaves them alone, so each shortcut is defined once.
   // The welcome screen covers the panes: their keys must not act on what cannot be seen.
   if (!welcomeEl.hidden) {
     if (event.key === "Escape" && state.projectOpen) hideWelcome();
@@ -1094,9 +1090,6 @@ window.addEventListener("keydown", (event) => {
   } else if (event.key === "c" && !typing && !event.metaKey && !event.ctrlKey) {
     event.preventDefault();
     openComposer();
-  } else if (event.key === "p" && event.metaKey) {
-    event.preventDefault();
-    goToFile();
   }
 });
 
@@ -1209,7 +1202,7 @@ function showRepo(repo) {
   state.repo = repo;
   state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
-  $("repo-name").title = `${repo.root}\nSwitch project (⌘O)`;
+  $("repo-name").title = `${repo.root}\nSwitch project (⇧⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
   // Set once by the Rust process when the recent projects could not be updated. It does
   // not stop anything, so it is a line under the branch, not a dialog.
@@ -1231,8 +1224,14 @@ const welcomeEl = $("welcome");
 // - `menu`, with the id of a menu bar command (src/menu.rs, `Command::id`). The page runs
 //   them, so they share its guards, such as a draft note blocking Quit.
 window.postil = {
-  openFolder: (path) => requestProject("api/open", path),
+  openFolder: (path) => {
+    closeMenu();
+    requestProject("api/open", path);
+  },
   menu: (command) => {
+    // A click in the menu bar reaches the page as no event at all, so nothing else closes
+    // the right-click menu: it would stay drawn over the welcome screen or the filter.
+    closeMenu();
     if (command === "open-folder") chooseFolder();
     else if (command === "switch-project") showWelcome();
     else if (command === "go-to-file") goToFile();
