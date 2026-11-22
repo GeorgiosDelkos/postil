@@ -3,6 +3,8 @@ name = "postil"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
+repository = "https://github.com/GeorgiosDelkos/postil"
 description = "Read a repository, write review notes on lines, and send them to a coding agent."
 
 # Every dependency here was counted and chosen in docs/design.md, "Dependencies". A new one
