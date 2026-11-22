@@ -39,7 +39,7 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
@@ -83,10 +83,10 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
     if body.is_empty() {
         return Err(Error::InvalidNote("the note has no text".to_owned()));
     }
-    if new.snippet.split('\n').count() != new.lines.end - new.lines.start + 1 {
+    let count = new.lines.end - new.lines.start + 1;
+    if new.snippet.split('\n').count() != count {
         return Err(Error::InvalidNote(format!(
-            "the snippet does not have {} lines",
-            new.lines.end - new.lines.start + 1
+            "the snippet does not have {count} lines"
         )));
     }
 
@@ -243,7 +243,8 @@ impl Review {
         Ok(review)
     }
 
-    /// Replaces the review file with this review, creating its directory when needed.
+    /// Replaces the review file with this review. Its directory must exist: [`lock`], which
+    /// every writer takes first, creates it.
     fn save(&self, file: &Path) -> Result<()> {
         let mut json = serde_json::to_vec_pretty(self)
             .expect("a review is plain structs, strings, and numbers, which always serialize");
@@ -329,8 +330,9 @@ fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .expect("the review file is <git dir>/postil/review.json, which has a parent");
 
-    // The process id keeps two app windows on one repository from sharing a temporary file.
-    let temporary: PathBuf = dir.join(format!("review.json.{}.tmp", std::process::id()));
+    // Only `add` writes, and it holds `review.lock`, so two writers never share this name at
+    // once.
+    let temporary = dir.join("review.json.tmp");
     let written = (|| {
         let mut out = File::create(&temporary)?;
         out.write_all(bytes)?;

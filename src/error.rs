@@ -42,7 +42,8 @@ pub enum Error {
     BenchInterrupted,
     /// The page asked for a note that cannot be made; the text says why.
     InvalidNote(String),
-    /// The lines the page showed for a new note are no longer in the file.
+    /// The lines the page showed for a new note are no longer where it showed them, and are
+    /// not at exactly one other place in the file.
     NoteTextChanged {
         /// The file the note was written on, relative to the repository root.
         path: String,
