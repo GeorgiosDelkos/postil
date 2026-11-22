@@ -629,40 +629,50 @@ kbd {
   filter: saturate(0.8);
 }
 
-/* The right-click menu on the code. */
+/* The right-click menu on the code, drawn as a macOS menu: a translucent, blurred panel with
+   tight rows, the item under the pointer filled with the accent, shortcuts at the right. */
 
 .context-menu {
   position: fixed;
   z-index: 10;
-  min-width: 200px;
-  padding: 4px;
+  min-width: 220px;
+  padding: 5px;
   display: flex;
   flex-direction: column;
-  background: var(--raised);
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
+  background: color-mix(in srgb, var(--raised) 82%, transparent);
+  backdrop-filter: blur(24px) saturate(1.6);
+  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  border: 0.5px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow:
+    0 0 0 0.5px rgb(0 0 0 / 25%),
+    0 12px 32px rgb(0 0 0 / 30%);
 }
 
 .menu-item {
-  height: 28px;
+  height: 24px;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 10px;
   padding: 0 10px;
   background: none;
   border: 0;
   border-radius: 5px;
-  color: var(--text);
+  color: var(--text-strong);
   font: inherit;
-  font-size: 12.5px;
+  font-size: 13px;
   text-align: left;
   white-space: nowrap;
 }
 
-.menu-item:hover:not(:disabled),
-.menu-item:focus-visible {
-  background: var(--hover);
+.context-menu:focus {
+  outline: none;
+}
+
+/* The focus is the highlight: the pointer moves it (app.js, openMenu), so :hover is not used. */
+.menu-item:focus:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-text);
   outline: none;
 }
 
@@ -670,11 +680,32 @@ kbd {
   color: var(--text-muted);
 }
 
+.menu-detail {
+  min-width: 0;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
 .menu-item kbd {
   margin-left: auto;
+  padding: 0 0 0 16px;
   border: 0;
-  padding: 0;
+  font: 12px "Geist", sans-serif;
   color: var(--text-muted);
+}
+
+.menu-item:focus:not(:disabled) :is(kbd, .menu-detail) {
+  color: inherit;
+  opacity: 0.75;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 5px 10px;
+  background: var(--border-strong);
 }
 
 /* The off-screen text the fallback copy command copies from. */
@@ -905,3 +936,4 @@ button.repo-name:hover {
   box-shadow: var(--shadow);
   color: var(--text-strong);
 }
+

@@ -597,7 +597,7 @@ function codeActions(line) {
   // `matches` is the action's own key, which works while the menu is open, as it is shown.
   const actions = [
     {
-      label: "Add note",
+      label: "Add Note",
       key: "C",
       matches: (event) => event.key === "c" && !event.metaKey,
       run: () => openComposer(range),
@@ -609,10 +609,13 @@ function codeActions(line) {
       matches: (event) => event.key === "c" && event.metaKey,
       run: () => copyText(text),
     },
-    { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
+    { label: "Copy Reference", detail: reference, run: () => copyText(reference) },
   ];
   const note = state.noteByLine.get(line);
-  if (note) actions.push({ label: `Delete note ${note.id}`, run: () => deleteNote(note) });
+  if (note) {
+    // A separator sets the one destructive item apart, as macOS menus do.
+    actions.push({ label: `Delete Note ${note.id}`, separated: true, run: () => deleteNote(note) });
+  }
   return actions;
 }
 
@@ -643,15 +646,22 @@ function showToast(text) {
 
 function openMenu(x, y, actions) {
   menuActions = actions;
-  const items = actions.map((action) => {
+  const items = actions.flatMap((action) => {
     const item = el("button", "menu-item");
     item.type = "button";
     item.setAttribute("role", "menuitem");
     item.disabled = Boolean(action.disabled);
     item.append(el("span", "menu-label", action.label));
+    if (action.detail) item.append(el("span", "menu-detail", action.detail));
     if (action.key) item.append(el("kbd", "", action.key));
     item.addEventListener("click", () => runAction(action));
-    return item;
+    // The highlight is the focus, and the pointer moves it, so the pointer and the arrow keys
+    // never highlight two items at once.
+    item.addEventListener("mouseenter", () => item.focus());
+    if (!action.separated) return [item];
+    const separator = el("div", "menu-separator");
+    separator.setAttribute("role", "separator");
+    return [separator, item];
   });
   menuEl.replaceChildren(...items);
   menuEl.hidden = false;
@@ -660,7 +670,9 @@ function openMenu(x, y, actions) {
   const { width, height } = menuEl.getBoundingClientRect();
   menuEl.style.left = `${Math.max(4, Math.min(x, innerWidth - width - 4))}px`;
   menuEl.style.top = `${Math.max(4, Math.min(y, innerHeight - height - 4))}px`;
-  menuEl.querySelector("button:not(:disabled)")?.focus();
+  // Opened by the pointer, so no item is highlighted yet, as in a macOS menu. The menu itself
+  // takes the focus so the arrow keys and Escape still reach it.
+  menuEl.focus();
 }
 
 function closeMenu() {
@@ -680,9 +692,11 @@ menuEl.addEventListener("keydown", (event) => {
   event.preventDefault();
 
   const items = [...menuEl.querySelectorAll("button:not(:disabled)")];
+  // -1 while no item is highlighted: Down then takes the first item and Up the last.
   const index = items.indexOf(document.activeElement);
+  const up = index === -1 ? items.length - 1 : (index - 1 + items.length) % items.length;
   if (event.key === "ArrowDown") items[(index + 1) % items.length]?.focus();
-  else if (event.key === "ArrowUp") items[(index - 1 + items.length) % items.length]?.focus();
+  else if (event.key === "ArrowUp") items[up]?.focus();
   else if (event.key === "Home") items[0]?.focus();
   else if (event.key === "End") items.at(-1)?.focus();
   else if (event.key === "Escape" || event.key === "Tab") closeMenu();
@@ -692,9 +706,12 @@ menuEl.addEventListener("keydown", (event) => {
   }
 });
 
-menuEl.addEventListener("focusout", (event) => {
-  if (!menuEl.contains(event.relatedTarget)) closeMenu();
-});
+// WebKit does not focus a button that is clicked: the press would move focus out of the menu
+// first. Keeping the focus where it is lets the click reach the item. (A `focusout` handler
+// that closed the menu here once made every item do nothing.)
+menuEl.addEventListener("mousedown", (event) => event.preventDefault());
+// Leaving the menu clears the highlight, as in a macOS menu.
+menuEl.addEventListener("mouseleave", () => menuEl.focus());
 
 // Any press outside the menu, a scroll of the code, or leaving the window closes it.
 window.addEventListener(
