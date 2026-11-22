@@ -1040,8 +1040,10 @@ filterEl.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  // The window has no menu bar, where macOS would find Quit and Close, so the page handles
-  // their keys; with one window, closing it quits. They and Open Folder work everywhere.
+  // Quit, Close Window and Open Folder are also menu bar items (src/menu.rs). WebKit offers a
+  // key to the page before the menu, and the page takes these (preventDefault), so a press
+  // runs once, through the same functions the menu calls. With one window, closing it quits.
+  // They work everywhere, the welcome screen included.
   if (event.metaKey && (event.key === "q" || event.key === "w")) {
     event.preventDefault();
     quit();
@@ -1076,8 +1078,7 @@ window.addEventListener("keydown", (event) => {
     openComposer();
   } else if (event.key === "p" && event.metaKey) {
     event.preventDefault();
-    filterEl.focus();
-    filterEl.select();
+    goToFile();
   }
 });
 
@@ -1207,9 +1208,26 @@ function showRepo(repo) {
 
 const welcomeEl = $("welcome");
 
-// The Rust process calls this with the folder from the Open Folder dialog, or one dropped
-// on the window.
-window.postil = { openFolder: (path) => requestProject("api/open", path) };
+// What the Rust process calls into the page:
+// - `openFolder`, with the folder from the Open Folder dialog, or one dropped on the window;
+// - `menu`, with the id of a menu bar command (src/menu.rs, `Command::id`). The page runs
+//   them, so they share its guards, such as a draft note blocking Quit.
+window.postil = {
+  openFolder: (path) => requestProject("api/open", path),
+  menu: (command) => {
+    if (command === "open-folder") chooseFolder();
+    else if (command === "switch-project") showWelcome();
+    else if (command === "go-to-file") goToFile();
+    else if (command === "close-window" || command === "quit") quit();
+  },
+};
+
+// Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
+function goToFile() {
+  if (!welcomeEl.hidden) return;
+  filterEl.focus();
+  filterEl.select();
+}
 
 // Checked before the dialog opens too, so a folder is never chosen only to be refused.
 function chooseFolder() {
