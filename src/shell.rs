@@ -179,7 +179,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     };
 
     let committed = Rc::new(Cell::new(false));
-    let webview = build_webview(&event_loop, &window, site, &committed)?;
+    let webview = build_webview(&event_loop, &window, site, Rc::clone(&committed))?;
 
     let page = Page {
         webview: &webview,
@@ -323,7 +323,7 @@ fn build_webview(
     event_loop: &EventLoop<AppEvent>,
     window: &Window,
     site: Site,
-    committed: &Rc<Cell<bool>>,
+    committed: Rc<Cell<bool>>,
 ) -> Result<WebView> {
     let page_proxy = event_loop.create_proxy();
     let drop_proxy = event_loop.create_proxy();
@@ -358,12 +358,13 @@ fn build_webview(
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
         // not reach the `postil://` handlers, which read and write the repository.
         .with_navigation_handler(|url| url.starts_with("postil://"))
-        .with_on_page_load_handler({
-            let committed = Rc::clone(committed);
-            move |event, _| {
-                if matches!(event, PageLoadEvent::Started) {
-                    committed.set(true);
-                }
+        // wry fires `Started` from `didCommitNavigation`, before it runs the scripts it
+        // queued and stops queueing (wry 0.57.3, `wkwebview/navigation.rs`,
+        // `did_commit_navigation`); its docs say only "started loading". `ask_page` relies on
+        // that order, and no test can check it without a window: recheck it when bumping wry.
+        .with_on_page_load_handler(move |event, _| {
+            if matches!(event, PageLoadEvent::Started) {
+                committed.set(true);
             }
         })
         .with_url("postil://localhost/")
@@ -427,22 +428,20 @@ struct Page<'a> {
 /// page's first navigation commits there is no answer to wait for, and no draft note to
 /// protect either (app.js has not run), so `unanswered` decides at once.
 fn ask_page(page: &Page<'_>, id: &'static str, unanswered: Unanswered) {
-    if !page.committed.get() {
-        if matches!(unanswered, Unanswered::Quit) {
-            // Fails only once the event loop is gone, when the app is quitting anyway.
-            drop(page.quit.send_event(AppEvent::Quit));
-        }
-        return;
-    }
-    // `id` is one of the fixed ASCII command names, safe inside quotes.
-    let script = format!("window.postil.menu(\"{id}\"); true");
     let proxy = page.quit.clone();
-    let answered = move |answer: String| {
-        if answer != "true" && matches!(unanswered, Unanswered::Quit) {
+    let carried_out = move |done: bool| {
+        if !done && matches!(unanswered, Unanswered::Quit) {
             // Fails only once the event loop is gone, when the app is quitting anyway.
             drop(proxy.send_event(AppEvent::Quit));
         }
     };
+    if !page.committed.get() {
+        carried_out(false);
+        return;
+    }
+    // `id` is one of the fixed ASCII command names, safe inside quotes.
+    let script = format!("window.postil.menu(\"{id}\"); true");
+    let answered = move |answer: String| carried_out(answer == "true");
     // Fails only when the webview is being torn down, when there is no page to ask.
     drop(
         page.webview
