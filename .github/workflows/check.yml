@@ -1,0 +1,49 @@
+# Derived from rust-style/templates/ci/check.yml (jonhoo/rust-ci-conf @ de512da1e85b with house
+# additions), adapted for an application that ships on macOS only:
+# - fmt: rustfmt; needs no build, so it runs on Linux.
+# - clippy: no warnings, blocking. On macOS, because wry builds against GTK on Linux.
+# Dropped from the template: semver, doc and msrv (libraries only), hack (no features), and the
+# beta clippy run: rust-toolchain.toml pins the toolchain, which would override the matrix.
+# A draft PR gets no CI (gh-actions-style): every job carries the draft condition and no job has
+# `needs:`, so a skipped run's green is replaced as soon as the PR is marked ready.
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}-${{ github.event.pull_request.draft }}
+  cancel-in-progress: true
+name: check
+jobs:
+  fmt:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    name: fmt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the toolchain and components that rust-toolchain.toml names.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: cargo fmt --check
+        run: cargo fmt --check
+  clippy:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-latest
+    name: clippy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --all-features
+        env:
+          # Fails the build on any warning without touching RUSTFLAGS, so the build cache stays
+          # shared with other cargo invocations.
+          CARGO_BUILD_WARNINGS: deny
