@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::header::CONTENT_TYPE;
@@ -213,26 +213,17 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         .build(&window)
         .map_err(Error::Webview)?;
 
+    let quit_proxy = event_loop.create_proxy();
     let mut launch_to_paint = None;
     let mut report = None;
     event_loop.run_return(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
-            // The close button asks the page, as Close Window does, so a draft note stops it
-            // too; the page answers with `quit` when nothing would be lost. A page without
-            // `window.postil` (app.js failed to load) posts `quit` itself, so the window always
-            // closes. Only a page stuck in a script would keep it open, as it would keep the
-            // menu's Quit from acting too; Force Quit remains.
+            // The close button does what Close Window does, so a draft note stops it too.
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => {
-                let ask = "window.postil ? window.postil.menu(\"close-window\") \
-                           : window.ipc.postMessage(\"quit\")";
-                if webview.evaluate_script(ask).is_err() {
-                    *control_flow = ControlFlow::Exit;
-                }
-            }
+            } => ask_page(&webview, "close-window", Unanswered::Quit, &quit_proxy),
             Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
             // The system switched between light and dark while the window follows it.
             Event::WindowEvent {
@@ -258,10 +249,16 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(AppEvent::Menu(command)) => {
-                // The id is one of `Command::id`'s fixed ASCII names, safe inside quotes.
-                let script = format!("window.postil?.menu(\"{}\")", command.id());
-                // Fails only when the webview is being torn down, when there is no page.
-                drop(webview.evaluate_script(&script));
+                use crate::menu::Command;
+                // The app must stay closable whatever state the page is in.
+                let unanswered = match command {
+                    Command::CloseWindow | Command::Quit => Unanswered::Quit,
+                    Command::OpenFolder
+                    | Command::SwitchProject
+                    | Command::GoToFile
+                    | Command::Settings => Unanswered::Ignore,
+                };
+                ask_page(&webview, command.id(), unanswered, &quit_proxy);
             }
             Event::UserEvent(AppEvent::BenchPainted) => {
                 launch_to_paint = Some(started.elapsed());
@@ -368,6 +365,47 @@ fn startup_repo(
     let recent = recent_file.map_or_else(Vec::new, recent::list);
     let last = recent.first();
     Ok(last.and_then(|root| Repo::open(Path::new(root)).ok()))
+}
+
+/// What to do when the page does not carry out a command it was asked to.
+#[derive(Debug, Clone, Copy)]
+enum Unanswered {
+    /// Quit anyway: for Quit and Close Window, so the app can always be closed.
+    Quit,
+    /// Nothing: the command was only a convenience.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only the macOS menu bar sends such commands")
+    )]
+    Ignore,
+}
+
+/// Asks the page to carry out the menu command `id` (`window.postil.menu` in ui/app.js), so
+/// its guards apply, such as a draft note stopping Quit; the page posts `quit` itself when
+/// nothing stops it.
+///
+/// The script ends in `true`, which WebKit hands back only when it ran to the end. An
+/// exception, a page whose app.js did not load (no `window.postil`), or a web content process
+/// that is gone hands back an empty string instead, and `unanswered` decides. A script sent
+/// before the page first loaded waits for the load and its answer is not reported (wry
+/// 0.57.3, `wkwebview::eval`); the page then carries the command out when it runs it.
+fn ask_page(
+    webview: &WebView,
+    id: &'static str,
+    unanswered: Unanswered,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
+    // `id` is one of the fixed ASCII command names, safe inside quotes.
+    let script = format!("window.postil.menu(\"{id}\"); true");
+    let proxy = proxy.clone();
+    let answered = move |answer: String| {
+        if answer != "true" && matches!(unanswered, Unanswered::Quit) {
+            // Fails only once the event loop is gone, when the app is quitting anyway.
+            drop(proxy.send_event(AppEvent::Quit));
+        }
+    };
+    // Fails only when the webview is being torn down, when there is no page to ask.
+    drop(webview.evaluate_script_with_callback(&script, answered));
 }
 
 /// The colour painted behind the page in `theme`: the page's `--canvas`.
