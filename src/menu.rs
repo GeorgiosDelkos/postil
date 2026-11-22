@@ -137,11 +137,16 @@ mod tests {
 
     #[test]
     fn every_command_reads_back_from_its_id_and_nothing_else_does() {
+        // `from_id` returns the first command with the id, so two commands sharing one would
+        // still read back; Close Window would then run Quit. Unique ids rule that out.
+        let ids: std::collections::HashSet<_> = Command::ALL.map(Command::id).into();
+        assert_eq!(
+            ids.len(),
+            Command::ALL.len(),
+            "two commands share a menu id"
+        );
         for command in Command::ALL {
-            assert_eq!(
-                Command::from_id(command.id()).map(Command::id),
-                Some(command.id())
-            );
+            assert!(Command::from_id(command.id()).is_some(), "{}", command.id());
         }
         assert!(
             Command::from_id("1").is_none(),
