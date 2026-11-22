@@ -45,7 +45,7 @@ const state = {
   composer: null,
   composerHeight: COMPOSER_HEIGHT_GUESS,
   // As `api/notes` returns them: { id, path, lines: { start, end }, snippet, body, state },
-  // lines 1-based and inclusive, state "open" or "outdated".
+  // lines 1-based and inclusive, anchor "found" or "lost". A lost note is shown as outdated.
   notes: [],
   // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
   // file, and the number of notes in each file.
@@ -382,7 +382,7 @@ async function loadNotes() {
   redecorateRows();
 }
 
-// Rebuilds the two lookups derived from `state.notes`. Outdated notes are counted but not
+// Rebuilds the two lookups derived from `state.notes`. Lost notes are counted but not
 // drawn on the code: their lines no longer hold their text. When notes overlap on a line,
 // the newest one is shown there.
 function indexNotes() {
@@ -390,7 +390,7 @@ function indexNotes() {
   state.noteCountByPath = new Map();
   for (const note of state.notes) {
     state.noteCountByPath.set(note.path, (state.noteCountByPath.get(note.path) ?? 0) + 1);
-    if (note.path !== state.file?.path || note.state !== "open") continue;
+    if (note.path !== state.file?.path || note.anchor !== "found") continue;
     for (let line = note.lines.start - 1; line < note.lines.end; line += 1) {
       state.noteByLine.set(line, note);
     }
@@ -453,7 +453,7 @@ function renderNotes() {
   }
 
   const cards = state.notes.map((note) => {
-    const outdated = note.state === "outdated";
+    const outdated = note.anchor === "lost";
     const card = el("button", outdated ? "note outdated" : "note");
     card.type = "button";
     const { start, end } = note.lines;

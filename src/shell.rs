@@ -451,7 +451,7 @@ mod tests {
         serde_json::from_str(&reply).unwrap()
     }
 
-    /// The notes' `[id, start, end, state]`, the fields that anchoring changes.
+    /// The notes' `[id, start, end, anchor]`, the fields that anchoring changes.
     fn anchors(review: &serde_json::Value) -> Vec<(String, u64, u64, String)> {
         review["notes"]
             .as_array()
@@ -462,14 +462,14 @@ mod tests {
                     note["id"].as_str().unwrap().to_owned(),
                     note["lines"]["start"].as_u64().unwrap(),
                     note["lines"]["end"].as_u64().unwrap(),
-                    note["state"].as_str().unwrap().to_owned(),
+                    note["anchor"].as_str().unwrap().to_owned(),
                 )
             })
             .collect()
     }
 
-    fn anchor(id: &str, start: u64, end: u64, state: &str) -> (String, u64, u64, String) {
-        (id.to_owned(), start, end, state.to_owned())
+    fn anchor(id: &str, start: u64, end: u64, found: &str) -> (String, u64, u64, String) {
+        (id.to_owned(), start, end, found.to_owned())
     }
 
     #[test]
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(note["id"], "N1");
         assert_eq!(note["snippet"], "    one();\n    two();");
         assert_eq!(note["body"], "Merge these.", "the body is trimmed");
-        assert_eq!(note["state"], "open");
+        assert_eq!(note["anchor"], "found");
 
         let file = site.repo.review_file();
         assert!(
@@ -501,7 +501,7 @@ mod tests {
         let review = post_note(&restarted, "src/a.rs", 1, 1, "Second.");
         assert_eq!(
             anchors(&review),
-            [anchor("N1", 2, 3, "open"), anchor("N2", 1, 1, "open")]
+            [anchor("N1", 2, 3, "found"), anchor("N2", 1, 1, "found")]
         );
     }
 
@@ -515,41 +515,38 @@ mod tests {
         repo.write("src/a.rs", "new 1\nnew 2\na\nb\nc\nd\n");
         assert_eq!(
             anchors(&get_json(&site, NOTES)),
-            [anchor("N1", 4, 5, "open")]
+            [anchor("N1", 4, 5, "found")]
         );
         // Reading never writes, so a hand edit cannot be overwritten by the page refreshing.
         let stored = || -> serde_json::Value {
             serde_json::from_str(&fs::read_to_string(site.repo.review_file()).unwrap()).unwrap()
         };
-        assert_eq!(anchors(&stored()), [anchor("N1", 2, 3, "open")]);
+        assert_eq!(anchors(&stored()), [anchor("N1", 2, 3, "found")]);
 
         // Adding a note saves every note where it is now.
         post_note(&site, "src/a.rs", 1, 1, "On new 1.");
         assert_eq!(
             anchors(&stored()),
-            [anchor("N1", 4, 5, "open"), anchor("N2", 1, 1, "open")]
+            [anchor("N1", 4, 5, "found"), anchor("N2", 1, 1, "found")]
         );
 
         repo.write("src/a.rs", "new 1\nnew 2\na\nb\nC\nd\n");
         assert_eq!(
             anchors(&get_json(&site, NOTES)),
-            [anchor("N1", 4, 5, "outdated"), anchor("N2", 1, 1, "open")],
+            [anchor("N1", 4, 5, "lost"), anchor("N2", 1, 1, "found")],
             "the snippet is gone: the note keeps its last saved lines"
         );
 
         repo.write("src/a.rs", "b\nc\n");
         assert_eq!(
             anchors(&get_json(&site, NOTES)),
-            [anchor("N1", 1, 2, "open"), anchor("N2", 1, 1, "outdated")]
+            [anchor("N1", 1, 2, "found"), anchor("N2", 1, 1, "lost")]
         );
 
         fs::remove_file(repo.root.join("src/a.rs")).unwrap();
         assert_eq!(
             anchors(&get_json(&site, NOTES)),
-            [
-                anchor("N1", 4, 5, "outdated"),
-                anchor("N2", 1, 1, "outdated")
-            ]
+            [anchor("N1", 4, 5, "lost"), anchor("N2", 1, 1, "lost")]
         );
     }
 
@@ -606,11 +603,11 @@ mod tests {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let by_hand = r#"{"version": 1, "notes": [{"id": "N5", "path": "a.txt",
             "lines": {"start": 2, "end": 2}, "snippet": "y", "body": "From a script.",
-            "state": "open"}]}"#;
+            "anchor": "found"}]}"#;
         fs::write(&file, by_hand).unwrap();
 
         let unchanged = get_json(&site, NOTES);
-        assert_eq!(anchors(&unchanged), [anchor("N5", 2, 2, "open")]);
+        assert_eq!(anchors(&unchanged), [anchor("N5", 2, 2, "found")]);
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             by_hand,
@@ -620,7 +617,7 @@ mod tests {
         let review = post_note(&site, "a.txt", 1, 1, "Mine.");
         assert_eq!(
             anchors(&review),
-            [anchor("N5", 2, 2, "open"), anchor("N6", 1, 1, "open")]
+            [anchor("N5", 2, 2, "found"), anchor("N6", 1, 1, "found")]
         );
     }
 
@@ -684,7 +681,7 @@ mod tests {
         let file = site.repo.review_file();
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let note = r#"{"id":"N1","path":"a.txt","lines":{"start":1,"end":1},"snippet":"x",
-            "body":"b","state":"open"}"#;
+            "body":"b","anchor":"found"}"#;
 
         let cases = [
             ("{\"version\": 1, \"notes\": [", "cannot parse".to_owned()),

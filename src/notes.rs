@@ -2,7 +2,14 @@
 //!
 //! A note is anchored by its snippet: the text of its lines when it was written. Its line
 //! numbers are a hint. Whenever the notes are read, each one is moved to the place where its
-//! snippet is now, nearest the old place, or marked outdated when the snippet is gone.
+//! snippet is now, nearest the old place, or marked [`Anchor::Lost`] when the snippet is
+//! gone.
+//!
+//! The anchor says only whether the text is still there. It is kept apart from a note's
+//! lifecycle (open, sent, resolved, from milestone 3 on): a sent note whose text the agent
+//! replaced is the expected outcome, while an open note whose text vanished means the code
+//! drifted under it, and the page shows the two differently. One enum would need a variant
+//! for every combination.
 //!
 //! The notes live in `<git dir>/postil/review.json` (docs/design.md, "Data structures"). That
 //! file is the only copy: every request reads it, so an agent or a script that edits it is
@@ -36,7 +43,7 @@ const VERSION: u32 = 1;
 /// Reads the review file and moves every note to where its snippet is now. Does not write.
 ///
 /// `read` returns a file's text by its repository path. A note whose file cannot be read is
-/// outdated.
+/// lost.
 ///
 /// # Errors
 ///
@@ -98,7 +105,7 @@ struct Note {
     /// `\n`.
     snippet: String,
     body: String,
-    state: NoteState,
+    anchor: Anchor,
 }
 
 /// What the page sends to create a note.
@@ -131,14 +138,15 @@ struct RawLineRange {
     end: usize,
 }
 
+/// Whether a note's snippet is still in its file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum NoteState {
+enum Anchor {
     /// The snippet is in the file, at `lines`.
-    Open,
+    Found,
     /// The snippet is no longer in the file, or the file cannot be read. `lines` is where it
     /// was last seen.
-    Outdated,
+    Lost,
 }
 
 impl Review {
@@ -216,9 +224,9 @@ impl Review {
             match found {
                 Some(lines) => {
                     note.lines = lines;
-                    note.state = NoteState::Open;
+                    note.anchor = Anchor::Found;
                 }
-                None => note.state = NoteState::Outdated,
+                None => note.anchor = Anchor::Lost,
             }
         }
     }
@@ -253,13 +261,13 @@ impl Review {
             lines: new.lines,
             snippet: lines[start - 1..end].join("\n"),
             body: body.to_owned(),
-            state: NoteState::Open,
+            anchor: Anchor::Found,
         });
         Ok(())
     }
 }
 
-// Debug output shows ids, paths, and states, never note text: notes can quote code that is
+// Debug output shows ids, paths, and anchors, never note text: notes can quote code that is
 // not meant to leave the machine, and Debug output ends up in logs.
 impl fmt::Debug for Review {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -276,7 +284,7 @@ impl fmt::Debug for Note {
             .field("id", &self.id)
             .field("path", &self.path)
             .field("lines", &self.lines)
-            .field("state", &self.state)
+            .field("anchor", &self.anchor)
             .finish_non_exhaustive()
     }
 }

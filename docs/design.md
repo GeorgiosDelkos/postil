@@ -143,20 +143,29 @@ struct Note {
     lines: LineRange,              // 1-based, inclusive.
     snippet: String,               // The selected text at the time of writing: the real anchor.
     body: String,
-    state: NoteState,
+    anchor: Anchor,                // Whether the snippet is still in the file.
+    state: NoteState,              // Where the note is in the loop. From milestone 3 on.
+}
+
+enum Anchor {
+    Found,
+    Lost,                          // The snippet no longer exists in the file.
 }
 
 enum NoteState {
     Open,
     Sent { run: RunId },
     Resolved,
-    Outdated,                      // The snippet no longer exists in the file.
 }
 ```
 
 - **Notes** live in a `Vec<Note>`. A review holds tens of notes, so every operation is a scan.
   The line numbers are a cache: after a file changes, `relocate` finds the snippet nearest the
-  old line and updates `lines`, or marks the note `Outdated`.
+  old line and updates `lines`, or marks the note's anchor `Lost`.
+- **Anchor and state are two fields** because they answer two questions, decided 2026-11-22.
+  A sent note whose text the agent replaced is the expected result of a run; an open note whose
+  text vanished means the code drifted under it. The verify view shows these differently, and
+  one enum would need a variant for every combination.
 - **An open file** is one `String`, a `Vec<u32>` of line start offsets, and a sorted
   `Vec<(Range<u32>, Style)>` of highlight spans. Read-only text needs no rope. Drawing lines
   `a..b` is two slices and a binary search.
@@ -173,12 +182,11 @@ enum NoteState {
 As built in milestone 2 (`src/notes.rs`):
 
 - The file holds `{"version": 1, "notes": [...]}`; a note is `id` (`"N1"`), `path`, `lines`
-  (`{start, end}`, 1-based, inclusive), `snippet`, `body`, and `state`. Unknown fields are
-  refused, so a typo in a hand edit fails loudly instead of being dropped on the next write.
-- `state` has only `open` and `outdated` so far: `Sent` and `Resolved` arrive with the
-  milestones that set them. Open question for milestone 4: a sent note whose snippet the agent
-  replaced is expected, not outdated, so anchoring may need to be a field of its own beside the
-  lifecycle state rather than one more state.
+  (`{start, end}`, 1-based, inclusive), `snippet`, `body`, and `anchor` (`found` or `lost`).
+  Unknown fields are refused, so a typo in a hand edit fails loudly instead of being dropped on
+  the next write.
+- `state` is not stored yet: milestone 3 adds it with `open` as its default, so a version 1
+  file without it still reads, and no format version change is needed.
 - The Rust process keeps no copy. Every `api/notes` request reads the file and relocates every
   note. Only adding a note writes the file, with every note at its current place; reading never
   writes, so the refresh on focus cannot overwrite a hand edit. A file that does not parse, has
@@ -375,7 +383,8 @@ retired; the measured numbers above are the baseline to not regress.
    finder is the sidebar's filter box (`Cmd-P` focuses it, arrows move, Enter opens).
 2. **Note.** Line selection, the composer, the tray, `review.json`, anchoring across file changes.
    Built: the page saves through `POST api/notes` and reads the file and the notes again when
-   the window regains focus; outdated notes stay in the tray, dashed, and are not drawn on code.
+   the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
+   not drawn on code.
    Not built: editing or deleting a note in the app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
