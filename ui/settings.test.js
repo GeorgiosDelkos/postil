@@ -92,8 +92,10 @@ test("a new custom agent is trimmed, enabled, and checked as the Rust process ch
 });
 
 test("renaming a custom agent renames it wherever it is chosen", () => {
+  // Local is the agent and also the second of three reviewers.
+  const before = { ...settings(), reviewers: ["Grok", "Local", "Claude"] };
   const renamed = saveCustomAgent(
-    settings(),
+    before,
     { name: "Mine", command: "mine --acp" },
     "Local",
     BUILT_IN,
@@ -101,6 +103,7 @@ test("renaming a custom agent renames it wherever it is chosen", () => {
   assert.deepEqual(renamed.customAgents, [{ name: "Mine", command: "mine --acp" }]);
   assert.deepEqual(renamed.enabledAgents, ["Grok", "Mine", "Claude"]);
   assert.equal(renamed.agent, "Mine");
+  assert.deepEqual(renamed.reviewers, ["Grok", "Mine", "Claude"]);
 
   const kept = saveCustomAgent(settings(), { name: "Local", command: "other" }, "Local", BUILT_IN);
   assert.equal(kept.error, undefined, "keeping its own name is not a clash");

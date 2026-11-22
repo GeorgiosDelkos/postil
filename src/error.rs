@@ -114,10 +114,8 @@ pub enum Error {
     InvalidSettings(String),
     /// The settings file on disk cannot be used, so saving over it is refused until it is
     /// reset.
-    SettingsLocked {
-        /// Why the file cannot be used, naming it.
-        problem: String,
-    },
+    /// The text says why, naming the file.
+    SettingsLocked(String),
     /// The settings file could not be written.
     WriteSettings {
         /// The settings file's path.
@@ -188,9 +186,10 @@ impl fmt::Display for Error {
                 path.display()
             ),
             Self::InvalidSettings(problem) => write!(f, "cannot save the settings: {problem}"),
-            Self::SettingsLocked { problem } => {
-                write!(f, "cannot save the settings: {problem}")
-            }
+            Self::SettingsLocked(problem) => write!(
+                f,
+                "cannot save the settings: {problem} (fix the file, or reset the settings)"
+            ),
             Self::WriteSettings { path, .. } => write!(
                 f,
                 "cannot write {} (check that its directory is writable; the settings were not \
@@ -228,7 +227,7 @@ impl std::error::Error for Error {
             | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. }
             | Self::InvalidSettings(_)
-            | Self::SettingsLocked { .. } => None,
+            | Self::SettingsLocked(_) => None,
         }
     }
 }

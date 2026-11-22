@@ -12,12 +12,13 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Read;
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::time::Duration;
 
 /// An agent in the catalog.
 #[derive(Debug)]
@@ -66,7 +67,7 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
 /// How long the login shell may take to print its `PATH`. Arbitrary: a slow shell start-up
 /// (nvm, conda) takes about a second; longer means it is waiting for something that will not
 /// come, and the settings must not hang on it.
-pub(crate) const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The search path, found on a background thread. Asking the login shell takes up to a
 /// second (more with a slow start-up file), and the URL scheme handler that serves the
@@ -142,8 +143,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The directories to look for agents in: the login shell's `PATH`, then this process's.
 /// Either part is left out when it is unknown.
+///
+/// Started from a terminal (standard input is one), this process's `PATH` already is the
+/// login shell's, so the shell is not asked: an interactive shell started under a terminal
+/// can take the terminal over, and the engineer's prompt would stop answering.
 pub(crate) fn search_path() -> OsString {
-    let shell = std::env::var_os("SHELL").map(PathBuf::from);
+    let from_terminal = std::io::stdin().is_terminal();
+    let shell = std::env::var_os("SHELL")
+        .filter(|_| !from_terminal)
+        .map(PathBuf::from);
     let login = shell.and_then(|shell| login_shell_path(&shell, LOGIN_SHELL_TIMEOUT));
     let own = std::env::var_os("PATH");
     let parts = [login, own];
@@ -153,22 +161,32 @@ pub(crate) fn search_path() -> OsString {
             .flatten()
             .flat_map(|path| std::env::split_paths(path)),
     )
-    // Fails only for a directory with a `:` in its name, which cannot come from a `PATH`.
-    .unwrap_or_default()
+    .expect("split_paths never yields a part holding `:`, the one thing join_paths refuses")
 }
 
+/// The markers around the `PATH` in the login shell's output.
+const START: &str = "__POSTIL_PATH_START__";
+const END: &str = "__POSTIL_PATH_END__";
+
 /// The `PATH` that `shell` sets up for an interactive login, or `None` when the shell cannot
-/// be started, fails, prints nothing usable, or takes longer than `timeout` (it is killed).
+/// be started, prints nothing usable, or does not print it within `timeout`.
 ///
 /// The shell runs `-i -l -c` so both its login and its interactive start-up files run: nvm
 /// and most installers add themselves to `.zshrc` or `.bashrc`, which only interactive shells
 /// read. Those files may print, so the value is read between two marker lines. The command
 /// uses only `echo`, `;` and an absolute `printenv`, which sh, bash, zsh and fish all accept.
-pub(crate) fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
-    const START: &str = "__POSTIL_PATH_START__";
-    const END: &str = "__POSTIL_PATH_END__";
-
+///
+/// The shell runs in its own process group, so even with a terminal at hand it cannot make
+/// itself the terminal's foreground job. Its output is read on a thread of its own while it
+/// runs, so output larger than the pipe holds does not block it, and the reading stops at the
+/// end marker: a background job that a start-up file left holding the pipe cannot keep it
+/// waiting. The timeout covers starting, printing and reading; after it, or after the
+/// `PATH` arrived, the shell is killed if it still runs. A reader still blocked then (no end
+/// marker, and a background job holding the pipe) ends when that job does; accepted, as it
+/// holds nothing but the pipe.
+fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut child = Command::new(shell)
+        .process_group(0)
         .args(["-i", "-l", "-c"])
         .arg(format!("echo {START}; /usr/bin/printenv PATH; echo {END}"))
         .stdin(Stdio::null())
@@ -177,28 +195,31 @@ pub(crate) fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsStri
         .spawn()
         .ok()?;
 
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) | Err(_) => {
-                // Best effort: the shell may have exited between the check and the kill.
-                drop(child.kill());
-                drop(child.wait());
-                return None;
-            }
-        }
-    };
-    if !status.success() {
-        return None;
-    }
+    let path = child.stdout.take().and_then(|stdout| {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let read = move || {
+            // The receiver is gone once the timeout passed; nobody wants the value then.
+            drop(sender.send(marked_path(BufReader::new(stdout))));
+        };
+        let reader = std::thread::Builder::new()
+            .name("login-shell-path".to_owned())
+            .spawn(read);
+        reader.ok()?;
+        receiver.recv_timeout(timeout).ok().flatten()
+    });
+    // Fails when the shell already exited, which is the usual case and fine.
+    drop(child.kill());
+    drop(child.wait());
+    path
+}
 
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    let after_start = out.split_once(&format!("{START}\n"))?.1;
-    let path = after_start.split_once(&format!("\n{END}"))?.0.trim();
-    (!path.is_empty()).then(|| OsString::from(path))
+/// The line between the [`START`] and [`END`] lines of `out`, read only as far as `END`.
+fn marked_path(out: impl BufRead) -> Option<OsString> {
+    let mut lines = out.lines().map_while(Result::ok);
+    lines.find(|line| line == START)?;
+    let path = lines.next()?;
+    let path = path.trim();
+    (lines.next()? == END && !path.is_empty()).then(|| OsString::from(path))
 }
 
 /// Where `program` is: itself when it is a path (it contains a `/`), else the first
@@ -228,6 +249,7 @@ pub(crate) fn program_of(command: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Instant;
 
     use super::*;
 
@@ -310,6 +332,51 @@ mod tests {
     }
 
     #[test]
+    fn start_up_output_larger_than_the_pipe_does_not_block_the_shell() {
+        let dir = Dir::new("loud-shell");
+        // 200 kB of noise: three times what the pipe holds on macOS.
+        let shell = dir.file(
+            "loud",
+            concat!(
+                "#!/bin/sh\n",
+                "head -c 200000 /dev/zero | tr '\\0' x\n",
+                "echo\n",
+                "PATH=/opt/loud/bin exec /bin/sh -c \"$4\"\n",
+            ),
+            0o755,
+        );
+        assert_eq!(
+            login_shell_path(&shell, LOGIN_SHELL_TIMEOUT),
+            Some(OsString::from("/opt/loud/bin"))
+        );
+    }
+
+    #[test]
+    fn a_background_job_holding_the_output_open_does_not_hold_up_the_path() {
+        let dir = Dir::new("daemon-shell");
+        // Like a .zshrc that starts a daemon without redirecting its output: the job keeps
+        // the pipe open for 30 s after the shell exits.
+        let shell = dir.file(
+            "daemon",
+            concat!(
+                "#!/bin/sh\n",
+                "sleep 30 &\n",
+                "PATH=/opt/daemon/bin exec /bin/sh -c \"$4\"\n",
+            ),
+            0o755,
+        );
+        let started = Instant::now();
+        assert_eq!(
+            login_shell_path(&shell, LOGIN_SHELL_TIMEOUT),
+            Some(OsString::from("/opt/daemon/bin"))
+        );
+        assert!(
+            started.elapsed() < LOGIN_SHELL_TIMEOUT,
+            "read up to the end marker only"
+        );
+    }
+
+    #[test]
     fn a_login_shell_that_fails_hangs_or_is_missing_gives_no_path() {
         let dir = Dir::new("bad-shell");
         let failing = dir.file("failing", "#!/bin/sh\nexit 3\n", 0o755);
@@ -345,33 +412,46 @@ mod tests {
 
     #[test]
     fn a_rescan_shows_its_own_result_even_when_an_older_scan_finishes_later() {
-        let calls = Arc::new(Mutex::new(0));
-        let counter = Arc::clone(&calls);
-        // The first scan is slow and finds "old"; the second is quick and finds "new".
+        // The first scan to run takes the gate, says so on `entered`, waits for `release`,
+        // and finds "old"; any later scan finds "new" at once. The rescan starts only after
+        // the first scan took the gate, so the held scan is the older one.
+        let (release, gate) = mpsc::channel::<()>();
+        let (entered, first_running) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some((gate, entered)));
         let scanner = Scanner::new(move || {
-            let call = {
-                let mut calls = lock(&counter);
-                *calls += 1;
-                *calls
-            };
-            if call == 1 {
-                std::thread::sleep(Duration::from_millis(300));
-                OsString::from("old")
-            } else {
-                OsString::from("new")
+            // Taken in its own statement: a guard in the `match` would be held while the
+            // first scan waits, and the second scan would wait for the lock.
+            let first = lock(&gate).take();
+            match first {
+                Some((gate, entered)) => {
+                    entered.send(()).unwrap();
+                    gate.recv().expect("the test releases the first scan");
+                    OsString::from("old")
+                }
+                None => OsString::from("new"),
             }
         });
-        assert_eq!(scanner.path(), None, "the first scan is still running");
+        first_running.recv().unwrap();
+        assert_eq!(
+            scanner.path(),
+            None,
+            "the first scan is held, so it is still running"
+        );
 
         scanner.rescan();
         assert_eq!(finished(&scanner), "new");
-        std::thread::sleep(Duration::from_millis(400));
+        release.send(()).unwrap();
+        // Each scan thread holds a clone of the state until it ends, after its store.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&scanner.state) > 1 {
+            assert!(Instant::now() < deadline, "the first scan did not end");
+            std::thread::yield_now();
+        }
         assert_eq!(
             scanner.path(),
             Some(OsString::from("new")),
-            "the slow scan was dropped"
+            "the older scan's result was dropped"
         );
-        assert_eq!(*lock(&calls), 2);
     }
 
     #[test]

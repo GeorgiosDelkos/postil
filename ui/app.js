@@ -270,6 +270,10 @@ function showFile(path, reply, { keepView }) {
   if (reply.ok) {
     state.file = reply.body;
     codeEmptyEl.hidden = true;
+    // The gutter fits the file's largest line number, and at least three digits so short
+    // files keep one width.
+    const digits = Math.max(3, String(lines).length);
+    rowsEl.style.setProperty("--gutter-digits", String(digits));
   } else {
     state.file = null;
     codeEmptyEl.hidden = false;
@@ -1350,7 +1354,11 @@ function applySettings(settings) {
   root.setProperty("--line-height", `${metrics.lineHeight}px`);
   root.setProperty("--tab-width", String(settings.tabWidth));
   if (metrics.lineHeight !== lineHeight) {
+    // The line at the top stays at the top: the scroll offset is in pixels, and the same
+    // offset at another line height would show another part of the file.
+    const top = lineAt(codeEl.scrollTop);
     lineHeight = metrics.lineHeight;
+    codeEl.scrollTop = lineTop(top);
     // Rows are placed by line height, so they are placed again.
     if (state.file) renderCode({ force: true });
   }

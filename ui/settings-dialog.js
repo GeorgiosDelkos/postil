@@ -51,6 +51,12 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     confirmReset: false,
     // Saves run one after another, in the order the changes were made.
     queue: Promise.resolve(),
+    // Saves not answered yet. While there are any, the settings on screen are ahead of the
+    // process's: they hold changes still waiting to be saved.
+    pending: 0,
+    // The control to focus after the next redraw, when it is not the one focused now.
+    focusNext: null,
+    rescanning: false,
     pollTimer: null,
   };
 
@@ -61,9 +67,13 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     return JSON.parse(text);
   }
 
+  // Takes a reply of api/settings. Its settings replace the ones on screen only when no save
+  // is waiting: until then the screen holds changes the reply does not know of, and the next
+  // change must start from them, or a quick second change would undo the first.
   function show(view) {
-    ui.view = view;
-    apply(view.settings);
+    const ahead = ui.pending > 0 && ui.view !== null;
+    ui.view = { ...view, settings: ahead ? ui.view.settings : view.settings };
+    if (!ahead) apply(view.settings);
     clearTimeout(ui.pollTimer);
     if (view.agents === null && dialogEl.open) {
       ui.pollTimer = setTimeout(() => refresh().catch(fail), SCAN_POLL_MS);
@@ -81,40 +91,56 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     show(await load());
   }
 
-  // Shows `next` at once and saves it. A refusal puts the last saved settings back.
+  // Shows `next` at once and saves it, after the saves before it. Resolves to whether it was
+  // saved. A refusal shows why; once no other save waits, the saved settings come back.
   function save(next) {
     if (next.error) {
       fail(new Error(next.error));
-      return;
+      return Promise.resolve(false);
     }
     ui.error = null;
     ui.saved = false;
+    ui.pending += 1;
     ui.view = { ...ui.view, settings: next.settings };
     render();
     ui.queue = ui.queue.then(async () => {
       try {
         const body = JSON.stringify(next.settings);
-        show(await load("api/settings", { method: "PUT", body }));
-        ui.saved = true;
-        render();
+        const reply = await load("api/settings", { method: "PUT", body });
+        ui.pending -= 1;
+        ui.saved = ui.pending === 0;
+        show(reply);
+        return true;
       } catch (error) {
+        ui.pending -= 1;
         fail(error);
-        await refresh().catch(() => {});
+        if (ui.pending === 0) await refresh().catch(() => {});
+        return false;
       }
     });
+    return ui.queue;
   }
 
   const change = (update) => () => save(update(ui.view.settings));
 
   // ---- Drawing --------------------------------------------------------------------------
 
-  // Redraws the dialog where it was: same scroll position, same focused control.
+  // Redraws the dialog where it was: same scroll position, same focused control. When that
+  // control is now disabled (+ at the largest size), the first enabled control beside it
+  // takes the focus; when it is gone (a removed reviewer), the dialog does, so the keyboard
+  // stays inside.
   function render() {
-    const focused = document.activeElement?.dataset?.key;
+    const active = document.activeElement;
+    const focused = ui.focusNext ?? (dialogEl.contains(active) ? active.dataset.key : undefined);
+    ui.focusNext = null;
     const scrolled = dialogEl.querySelector(".settings-body")?.scrollTop ?? 0;
     dialogEl.replaceChildren(panel());
     dialogEl.querySelector(".settings-body").scrollTop = scrolled;
-    if (focused) dialogEl.querySelector(`[data-key="${CSS.escape(focused)}"]`)?.focus();
+    if (!focused) return;
+    const target = dialogEl.querySelector(`[data-key="${CSS.escape(focused)}"]`);
+    const enabled = "button:not(:disabled), select:not(:disabled), input:not(:disabled)";
+    if (target && !target.disabled) target.focus();
+    else (target?.parentElement.querySelector(enabled) ?? dialogEl).focus();
   }
 
   function panel() {
@@ -283,13 +309,20 @@ export function settingsDialog(dialogEl, { apply, closed }) {
       openForm({ previous: null, name: "", command: "" });
     });
     add.disabled = locked() || ui.form !== null;
+    // One scan at a time: every click would start another login shell.
     const rescan = button("Rescan", "rescan", async () => {
+      ui.rescanning = true;
+      render();
       try {
         show(await load("api/agents/rescan", { method: "POST" }));
       } catch (error) {
         fail(error);
+      } finally {
+        ui.rescanning = false;
+        render();
       }
     });
+    rescan.disabled = ui.rescanning;
     actions.append(add, rescan);
     node.append(list);
     if (ui.form) node.append(agentForm());
@@ -396,7 +429,9 @@ export function settingsDialog(dialogEl, { apply, closed }) {
       submit,
     );
     node.append(actions);
-    node.addEventListener("submit", (event) => {
+    // The form stays open until the process accepts the agent, and shows its refusal: the
+    // page's rules are a first check only (a pasted name with an unusual space passes them).
+    node.addEventListener("submit", async (event) => {
       event.preventDefault();
       const builtIn = ui.view.agents.filter((agent) => agent.builtIn).map((agent) => agent.name);
       const next = saveCustomAgent(ui.view.settings, form, form.previous, builtIn);
@@ -405,8 +440,12 @@ export function settingsDialog(dialogEl, { apply, closed }) {
         render();
         return;
       }
-      ui.form = null;
-      save(next);
+      if (await save(next)) ui.form = null;
+      else {
+        form.error = ui.error;
+        ui.error = null;
+      }
+      render();
     });
     // Escape in the form closes the form, not the dialog.
     node.addEventListener("keydown", (event) => {
@@ -451,7 +490,11 @@ export function settingsDialog(dialogEl, { apply, closed }) {
     settings.reviewers.forEach((name, index) => {
       const item = el("li", "reviewer");
       item.append(el("span", "reviewer-name", name));
-      const move = (step) => change((s) => moveReviewer(s, index, step));
+      // The focus follows the reviewer it moved, so pressing again keeps moving it.
+      const move = (step) => () => {
+        ui.focusNext = `${step < 0 ? "up" : "down"}-${index + step}`;
+        save(moveReviewer(ui.view.settings, index, step));
+      };
       const up = button("↑", `up-${index}`, move(-1), "icon-button");
       const down = button("↓", `down-${index}`, move(1), "icon-button");
       const unreview = change((s) => removeReviewer(s, index));

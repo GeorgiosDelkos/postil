@@ -161,10 +161,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
 
     let mut event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
     let window = build_window(&event_loop, settings.theme)?;
-    let canvas = match window.theme() {
-        Theme::Dark => DARK_CANVAS,
-        _ => LIGHT_CANVAS,
-    };
+    let canvas = canvas_color(window.theme());
 
     // The menu bar lives as long as this function, which is as long as the app.
     #[cfg(target_os = "macos")]
@@ -237,7 +234,12 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 }
             }
             Event::UserEvent(AppEvent::Dropped(path)) => offer_folder(&webview, &path),
-            Event::UserEvent(AppEvent::SetTheme(theme)) => window.set_theme(window_theme(theme)),
+            Event::UserEvent(AppEvent::SetTheme(theme)) => {
+                window.set_theme(window_theme(theme));
+                // Behind the page, seen where it has not painted yet, such as during a resize.
+                // Fails only when the webview is being torn down.
+                drop(webview.set_background_color(canvas_color(window.theme())));
+            }
             #[cfg(target_os = "macos")]
             Event::UserEvent(AppEvent::Menu(command)) => {
                 // The id is one of `Command::id`'s fixed ASCII names, safe inside quotes.
@@ -350,6 +352,14 @@ fn startup_repo(
     let recent = recent_file.map_or_else(Vec::new, recent::list);
     let last = recent.first();
     Ok(last.and_then(|root| Repo::open(Path::new(root)).ok()))
+}
+
+/// The colour painted behind the page in `theme`: the page's `--canvas`.
+fn canvas_color(theme: Theme) -> (u8, u8, u8, u8) {
+    match theme {
+        Theme::Dark => DARK_CANVAS,
+        _ => LIGHT_CANVAS,
+    }
 }
 
 /// The window appearance for a theme setting; `None` follows the system.
@@ -764,7 +774,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::NotAFolder { .. }
                 | Error::TooBroad { .. }
                 | Error::InvalidSettings(_) => StatusCode::BAD_REQUEST,
-                Error::NoteTextChanged { .. } | Error::NoProject | Error::SettingsLocked { .. } => {
+                Error::NoteTextChanged { .. } | Error::NoProject | Error::SettingsLocked(_) => {
                     StatusCode::CONFLICT
                 }
                 Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
@@ -2034,11 +2044,22 @@ mod tests {
             fs::write(&path, "#!/bin/sh\n").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let search_path = bin.clone().into_os_string();
+        // The first scan finds `bin`; every later one finds nothing, so a rescan shows.
+        let scans = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&scans);
+        let first_path = bin.clone().into_os_string();
         let site = Site::new(
             Some(&repo.config()),
             None,
-            Scanner::new(move || search_path.clone()),
+            Scanner::new(move || {
+                let mut scans = lock(&counter);
+                *scans += 1;
+                if *scans == 1 {
+                    first_path.clone()
+                } else {
+                    OsString::new()
+                }
+            }),
         );
         let (status, body) = put(&site, SETTINGS, &custom_settings().to_string());
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -2073,10 +2094,114 @@ mod tests {
         );
         assert_eq!(agent("Local")["builtIn"], false);
 
-        // A rescan starts over: the page sees the scan running, then its result.
+        // A rescan starts over, and its result replaces the first one.
         let (status, body) = post(&site, "postil://localhost/api/agents/rescan", "");
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(scanned_settings(&site)["agents"], agents);
+        let rescanned = scanned_settings(&site)["agents"].clone();
+        let found: Vec<&serde_json::Value> = rescanned
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| &agent["found"])
+            .collect();
+        assert!(found.iter().all(|found| found.is_null()), "{rescanned}");
+        assert_eq!(*lock(&scans), 2);
+
+        // Reset and rescan change state, so they take POST only.
+        for route in ["api/settings/reset", "api/agents/rescan"] {
+            let (status, _) = get(&site, &format!("postil://localhost/{route}"));
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{route}");
+        }
+        assert_eq!(*lock(&scans), 2, "a refused rescan does not scan");
+        assert_eq!(
+            get_json(&site, SETTINGS)["settings"],
+            custom_settings(),
+            "nor reset"
+        );
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_or_written_say_so() {
+        let repo = TempRepo::new("settings-io");
+        // A directory where the settings file should be cannot be read as one.
+        fs::create_dir_all(repo.config().join("settings.json")).unwrap();
+        let site = repo.empty_site();
+        let problem = get_json(&site, SETTINGS)["problem"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            problem.contains("settings.json cannot be read"),
+            "{problem}"
+        );
+        let (status, reply) = put(&site, SETTINGS, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        assert!(
+            reply.ends_with("(fix the file, or reset the settings)"),
+            "{reply}"
+        );
+
+        // A read-only configuration directory: the file is missing, so saving may go ahead,
+        // and then the write fails.
+        let blocked = TempRepo::new("settings-unwritable");
+        fs::create_dir_all(blocked.config()).unwrap();
+        fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o555)).unwrap();
+        let (status, reply) = put(
+            &blocked.empty_site(),
+            SETTINGS,
+            &custom_settings().to_string(),
+        );
+        // Writable again, so the repository's drop can remove it.
+        fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+        assert!(reply.contains("the settings were not saved"), "{reply}");
+    }
+
+    #[test]
+    fn every_page_module_is_served() {
+        // The page imports its modules by name; one left out of `respond` stops the page.
+        let site = Site::new(None, None, no_agents());
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        for entry in fs::read_dir(&ui).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let path = Path::new(&name);
+            let script = path.extension().is_some_and(|extension| extension == "js");
+            let test = path
+                .file_stem()
+                .is_some_and(|stem| stem.to_string_lossy().ends_with(".test"));
+            if !script || test {
+                continue;
+            }
+            let (status, body) = get(&site, &format!("postil://localhost/{name}"));
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(body, fs::read_to_string(ui.join(&name)).unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_page_names_each_theme_as_the_settings_file_does() {
+        // ui/app.js posts `theme:${settings.theme}`, the theme as api/settings sends it.
+        for theme in [
+            settings::Theme::System,
+            settings::Theme::Light,
+            settings::Theme::Dark,
+        ] {
+            let name = serde_json::to_value(theme).unwrap();
+            let message = format!("theme:{}", name.as_str().unwrap());
+            let Some(AppEvent::SetTheme(parsed)) = AppEvent::parse(&message) else {
+                panic!("{message} is not a theme message");
+            };
+            assert_eq!(serde_json::to_value(parsed).unwrap(), name);
+        }
+        assert!(window_theme(settings::Theme::System).is_none());
+        assert!(matches!(
+            window_theme(settings::Theme::Light),
+            Some(Theme::Light)
+        ));
+        assert!(matches!(
+            window_theme(settings::Theme::Dark),
+            Some(Theme::Dark)
+        ));
     }
 
     #[test]

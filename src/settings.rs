@@ -42,11 +42,10 @@ pub(crate) const TAB_WIDTHS: [u8; 3] = [2, 4, 8];
 const MAX_NAME: usize = 40;
 
 /// The window's appearance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Theme {
     /// Follow the system's light or dark appearance.
-    #[default]
     System,
     Light,
     Dark,
@@ -77,54 +76,6 @@ pub(crate) struct Settings {
     pub(crate) reviewers: Vec<String>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: Theme::System,
-            // The size the code view had before it was a setting.
-            code_font_size: 13,
-            tab_width: 4,
-            reopen_last_project: false,
-            custom_agents: Vec::new(),
-            enabled_agents: Vec::new(),
-            agent: None,
-            reviewers: Vec::new(),
-        }
-    }
-}
-
-/// An agent the engineer added.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CustomAgent {
-    pub(crate) name: String,
-    /// The command that starts it as an ACP server: a program and its arguments, split on
-    /// whitespace.
-    pub(crate) command: String,
-}
-
-/// The file: read with `S` = [`Settings`], written with `S` = `&Settings`.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SettingsFile<S> {
-    version: u32,
-    settings: S,
-}
-
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
-}
-
-/// The settings in effect, and why the file was not used when it was not.
-#[derive(Debug)]
-pub(crate) struct Loaded {
-    pub(crate) settings: Settings,
-    /// Set when the file exists but cannot be used; saving is blocked until Reset.
-    pub(crate) problem: Option<String>,
-}
-
 impl Settings {
     /// Checks the rules in the module docs. The error says which rule failed, in words for
     /// the dialog.
@@ -138,8 +89,11 @@ impl Settings {
             ));
         }
         if !TAB_WIDTHS.contains(&self.tab_width) {
+            // Destructured, so a change to the offered widths fails to compile here until
+            // the message follows it.
+            let [narrow, middle, wide] = TAB_WIDTHS;
             return Err(format!(
-                "the tab width must be 2, 4 or 8, not {}",
+                "the tab width must be {narrow}, {middle} or {wide}, not {}",
                 self.tab_width
             ));
         }
@@ -209,6 +163,54 @@ impl Settings {
     }
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::System,
+            // The size the code view had before it was a setting.
+            code_font_size: 13,
+            tab_width: 4,
+            reopen_last_project: false,
+            custom_agents: Vec::new(),
+            enabled_agents: Vec::new(),
+            agent: None,
+            reviewers: Vec::new(),
+        }
+    }
+}
+
+/// An agent the engineer added.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CustomAgent {
+    pub(crate) name: String,
+    /// The command that starts it as an ACP server: a program and its arguments, split on
+    /// whitespace.
+    pub(crate) command: String,
+}
+
+/// The file: read with `S` = [`Settings`], written with `S` = `&Settings`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsFile<S> {
+    version: u32,
+    settings: S,
+}
+
+/// The one field every version of the file has; other fields are ignored here on purpose.
+#[derive(Deserialize)]
+struct VersionOnly {
+    version: u32,
+}
+
+/// The settings in effect, and why the file was not used when it was not.
+#[derive(Debug)]
+pub(crate) struct Loaded {
+    pub(crate) settings: Settings,
+    /// Set when the file exists but cannot be used; saving is blocked until Reset.
+    pub(crate) problem: Option<String>,
+}
+
 /// Reads the settings from `file`. Never fails: a file that cannot be used gives the defaults
 /// and the reason (see the module docs).
 pub(crate) fn load(file: &Path) -> Loaded {
@@ -266,7 +268,7 @@ fn read(file: &Path) -> std::result::Result<Option<Settings>, String> {
 pub(crate) fn save(file: &Path, settings: &Settings) -> Result<()> {
     settings.check().map_err(Error::InvalidSettings)?;
     if let Err(problem) = read(file) {
-        return Err(Error::SettingsLocked { problem });
+        return Err(Error::SettingsLocked(problem));
     }
     write(file, settings)
 }

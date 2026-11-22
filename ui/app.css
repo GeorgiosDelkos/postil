@@ -349,9 +349,21 @@ kbd {
   font-variant-ligatures: none;
 }
 
+/* The line-number gutter's width: 24 px on the left for the + button (6 px in, 16 px wide,
+   2 px clear), the file's widest line number (ui/app.js sets --gutter-digits; `ch` is a
+   digit's width in the code font), and 18 px before the code. Registered as a length so it
+   is computed in .code-rows, in the code font, and the composer, in another font, inherits
+   the same pixels. */
+@property --gutter-width {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 66px;
+}
+
 /* Holds only the lines near the viewport. ui/app.js sets its padding to stand in for the
    lines above and below, so the scrollbar spans the whole file. */
 .code-rows {
+  --gutter-width: calc(24px + var(--gutter-digits, 3) * 1ch + 18px);
   min-width: max-content;
   padding: 12px 0;
 }
@@ -388,7 +400,7 @@ kbd {
 
 .ln .n {
   flex: none;
-  width: 56px;
+  width: var(--gutter-width);
   padding-right: 18px;
   text-align: right;
   color: var(--line-number);
@@ -443,10 +455,10 @@ kbd {
 
 .composer {
   position: sticky;
-  left: 56px;
+  left: var(--gutter-width);
   width: min(640px, calc(100vw - 700px));
   min-width: 320px;
-  margin: 8px 0 10px 56px;
+  margin: 8px 0 10px var(--gutter-width);
   display: flex;
   flex-direction: column;
   background: var(--raised);
