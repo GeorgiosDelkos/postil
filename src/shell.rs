@@ -231,7 +231,8 @@ enum DragOutcome {
     Pass,
     /// Keep the event from the webview.
     Take,
-    /// Keep the drop from the webview and open this folder.
+    /// Keep the drop from the webview and open this path: the first folder dropped, else the
+    /// first file, which the page reports as not a folder.
     Open(PathBuf),
 }
 
@@ -973,7 +974,7 @@ mod tests {
             post_note(&site, "a.txt", line, line, "note");
         }
 
-        // An id below the highest left stays unused.
+        // Deleting N2 leaves N1 and N3 with their ids.
         let (status, body) = delete(&site, &format!("{NOTES}?id=N2"));
         assert_eq!(status, StatusCode::OK, "{body}");
         let review: serde_json::Value = serde_json::from_str(&body).unwrap();

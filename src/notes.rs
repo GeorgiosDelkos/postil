@@ -122,9 +122,9 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
 /// Deletes the note whose id is `id` (written `N1`), saves, and returns the other notes.
 ///
 /// The next note gets the highest id left plus one, so every id above the highest remaining
-/// note is free again, including ones deleted earlier; ids below it are never reused. Never
-/// reusing any id would need the file to store the next id, a new field and so a new format
-/// version.
+/// note is free again, including ones deleted earlier; an id below it is not reused while
+/// that higher note remains. Never reusing any id would need the file to store the next id, a
+/// new field and so a new format version.
 ///
 /// # Errors
 ///
