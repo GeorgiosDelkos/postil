@@ -1,0 +1,36 @@
+[package]
+name = "postil"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Read a repository, write review notes on lines, and send them to a coding agent."
+
+# Every dependency here was counted and chosen in docs/design.md, "Dependencies". A new one
+# needs the same justification: the goal is a small tree.
+[dependencies]
+# The system webview (WKWebView on macOS) that draws the page. `os-webview` is the webview
+# itself and is required on every platform.
+wry = { version = "0.57.3", default-features = false, features = ["os-webview"] }
+# The window and event loop the webview lives in. `rwh_06` is the window-handle version wry
+# builds against.
+tao = { version = "0.37.3", default-features = false, features = ["rwh_06"] }
+# JSON for the page: the file list and the highlighted lines.
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+# Syntax colors. One grammar crate per language.
+tree-sitter-highlight = "0.27.2"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-bash = "0.25.1"
+
+[profile.release]
+# The binary ships to laptops: favor size and start time over build time.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
