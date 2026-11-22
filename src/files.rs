@@ -1,5 +1,6 @@
 //! Writing the app's own files: the notes and the list of recent projects.
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,8 +19,9 @@ use crate::error::{Error, Result};
 /// that happened (a note saved twice).
 ///
 /// At most one call per `file` may run at a time in one process; callers serialise
-/// (`notes` holds `review.lock`, and `recent` runs only in the URL scheme handler, which wry
-/// calls on the main thread). Separate processes use separate temporary files. A crash
+/// (`notes` holds `review.lock`, and `recent` runs only on the main thread: from `serve`
+/// before the event loop starts, then in the URL scheme handler, which wry calls on that
+/// thread). Separate processes use separate temporary files. A crash
 /// between creating the temporary and the rename leaves it behind; readers ignore it.
 pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let invalid = |problem| io::Error::new(io::ErrorKind::InvalidInput, problem);
@@ -62,13 +64,52 @@ pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
 ///
 /// [`Error::NoHome`] when neither variable gives a directory.
 pub(crate) fn config_dir() -> Result<PathBuf> {
-    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// `config_dir` from the two variables' values, so tests need not change the environment.
+fn config_dir_from(xdg_config_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+    if let Some(config) = xdg_config_home.map(PathBuf::from)
         && config.is_absolute()
     {
         return Ok(config.join("postil"));
     }
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or(Error::NoHome)?;
+    let home = home.filter(|home| !home.is_empty()).ok_or(Error::NoHome)?;
     Ok(PathBuf::from(home).join(".config").join("postil"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_dir_prefers_an_absolute_xdg_config_home_and_falls_back_to_home() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            config_dir_from(xdg.map(OsString::from), home.map(OsString::from))
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(dir(Some("/x"), Some("/h")), Ok(PathBuf::from("/x/postil")));
+        assert_eq!(
+            dir(Some("relative"), Some("/h")),
+            Ok(PathBuf::from("/h/.config/postil")),
+            "a relative XDG_CONFIG_HOME is ignored, as the XDG spec says"
+        );
+        assert_eq!(
+            dir(None, Some("/h")),
+            Ok(PathBuf::from("/h/.config/postil"))
+        );
+        for home in [None, Some("")] {
+            let expected = Err("cannot find the home directory (is HOME set?)".to_owned());
+            assert_eq!(dir(None, home), expected);
+        }
+    }
+
+    #[test]
+    fn a_path_without_a_file_name_is_refused_before_anything_is_written() {
+        let error = write_atomically(Path::new("/"), b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 }

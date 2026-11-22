@@ -31,18 +31,14 @@ impl Repo {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         // Only a path that is missing or not a directory is "not a folder". Any other
         // failure (no permission to look) is left to git, whose message says what it is.
-        match fs::metadata(dir) {
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(Error::NotAFolder {
-                    path: dir.to_owned(),
-                });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(Error::NotAFolder {
-                    path: dir.to_owned(),
-                });
-            }
-            Ok(_) | Err(_) => {}
+        let not_a_folder = match fs::metadata(dir) {
+            Ok(metadata) => !metadata.is_dir(),
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        };
+        if not_a_folder {
+            return Err(Error::NotAFolder {
+                path: dir.to_owned(),
+            });
         }
         // git prints one line per option, in the order asked.
         let args = ["rev-parse", "--show-toplevel", "--absolute-git-dir"];

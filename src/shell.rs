@@ -9,7 +9,7 @@
 //! project replaces the current one and the page reloads.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -136,7 +136,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
 
     let page_proxy = event_loop.create_proxy();
     let drop_proxy = event_loop.create_proxy();
-    let dragging_files = Cell::new(false);
+    let file_drag = RefCell::new(FileDrag::default());
     let webview = WebViewBuilder::new()
         .with_background_color(canvas)
         .with_custom_protocol("postil".to_owned(), move |_webview, request| {
@@ -153,33 +153,13 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 drop(page_proxy.send_event(event));
             }
         })
-        // A drag that carries files is the app's: the webview would navigate to a dropped
-        // file. Any other drag (text into the note composer) is left to the webview, so the
-        // handler answers `true` only while files are over the window.
-        .with_drag_drop_handler(move |event| match event {
-            DragDropEvent::Enter { paths, .. } => {
-                dragging_files.set(!paths.is_empty());
-                dragging_files.get()
-            }
-            DragDropEvent::Over { .. } => dragging_files.get(),
-            DragDropEvent::Drop { paths, .. } => {
-                dragging_files.set(false);
-                // A project is one folder: the first folder dropped opens, or, when only files
-                // were dropped, the first file, which the page then reports as not a folder.
-                let Some(path) = paths
-                    .iter()
-                    .find(|path| path.is_dir())
-                    .or_else(|| paths.first())
-                    .cloned()
-                else {
-                    return false;
-                };
+        .with_drag_drop_handler(move |event| {
+            let outcome = file_drag.borrow_mut().handle(event);
+            if let Some(path) = outcome.open {
                 // As above: fails only once the event loop is gone.
                 drop(drop_proxy.send_event(AppEvent::Dropped(path)));
-                true
             }
-            DragDropEvent::Leave => dragging_files.replace(false),
-            _ => false,
+            outcome.handled
         })
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
         // not reach the `postil://` handlers, which read and write the repository.
@@ -231,6 +211,56 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     Ok(report)
 }
 
+/// Which drags over the window are the app's. A drag that carries files is: the webview
+/// would navigate to a dropped file. Any other drag (text into the note composer) is left to
+/// the webview, so the handler answers `true` only while files are over the window.
+#[derive(Debug, Default)]
+struct FileDrag {
+    /// Whether the drag now over the window carries files.
+    carries_files: bool,
+}
+
+/// What the drag handler does with one event.
+#[derive(Debug, PartialEq, Eq)]
+struct DragOutcome {
+    /// Whether the app handles the event, keeping it from the webview.
+    handled: bool,
+    /// The folder to open, after a drop.
+    open: Option<PathBuf>,
+}
+
+impl FileDrag {
+    fn handle(&mut self, event: DragDropEvent) -> DragOutcome {
+        let pass = |handled| DragOutcome {
+            handled,
+            open: None,
+        };
+        match event {
+            DragDropEvent::Enter { paths, .. } => {
+                self.carries_files = !paths.is_empty();
+                pass(self.carries_files)
+            }
+            DragDropEvent::Over { .. } => pass(self.carries_files),
+            DragDropEvent::Drop { paths, .. } => {
+                self.carries_files = false;
+                // A project is one folder: the first folder dropped opens, or, when only files
+                // were dropped, the first file, which the page then reports as not a folder.
+                let open = paths
+                    .iter()
+                    .find(|path| path.is_dir())
+                    .or_else(|| paths.first())
+                    .cloned();
+                DragOutcome {
+                    handled: open.is_some(),
+                    open,
+                }
+            }
+            DragDropEvent::Leave => pass(std::mem::take(&mut self.carries_files)),
+            _ => pass(false),
+        }
+    }
+}
+
 /// Hands a chosen or dropped folder to the page, which opens it through `/api/open`: the
 /// page decides what to show for a folder that is not a repository.
 fn offer_folder(webview: &WebView, folder: &Path) {
@@ -275,7 +305,8 @@ struct Site {
     /// The file the benchmark opens, when this is a benchmark run.
     bench: Option<String>,
     /// Where the recent projects are listed (`recent.rs`); `None` when the configuration
-    /// directory is unknown, which turns the list off.
+    /// directory is unknown, which turns the list off. `config_dir` fails only with
+    /// `Error::NoHome`, which is the reason `open` gives for a `None` here.
     recent_file: Option<PathBuf>,
 }
 
@@ -929,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_note_is_gone_from_the_file_and_its_id_is_not_reused() {
+    fn a_deleted_note_is_gone_and_only_the_newest_id_is_freed() {
         let repo = TempRepo::new("notes-delete");
         repo.write("a.txt", "x\ny\nz\n");
         let site = repo.site();
@@ -1212,8 +1243,76 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("unreadable request"), "{body}");
 
-        let (status, _) = get(&site, "postil://localhost/api/open");
-        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        for route in ["open", "init"] {
+            let (status, _) = get(&site, &format!("postil://localhost/api/{route}"));
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{route}");
+        }
+    }
+
+    #[test]
+    fn a_folder_with_a_broken_git_link_gets_git_s_error_and_no_offer_to_init() {
+        let repo = TempRepo::new("broken-gitlink");
+        let site = repo.empty_site();
+        let folder = plain_folder("broken-gitlink");
+        // What a linked worktree looks like after its git directory was removed.
+        fs::write(folder.join(".git"), "gitdir: /no/such/git/dir\n").unwrap();
+
+        let (status, body) = post(&site, "postil://localhost/api/open", &open_request(&folder));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.starts_with("git rev-parse"), "{body}");
+        let (status, _) = post(&site, "postil://localhost/api/init", &open_request(&folder));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(folder.join(".git").is_file(), "the link is left as it was");
+        drop(fs::remove_dir_all(&folder));
+    }
+
+    fn drag(paths: &[&Path]) -> Vec<PathBuf> {
+        paths.iter().map(|path| path.to_path_buf()).collect()
+    }
+
+    #[test]
+    fn only_drags_that_carry_files_are_taken_from_the_webview() {
+        let folder = plain_folder("drag");
+        let file = folder.join("a.txt");
+        fs::write(&file, "x").unwrap();
+        let position = (0, 0);
+        let mut drags = FileDrag::default();
+        let pass = |handled| DragOutcome {
+            handled,
+            open: None,
+        };
+
+        // Text dragged into the composer: no paths, left to the webview throughout.
+        let enter = DragDropEvent::Enter {
+            paths: Vec::new(),
+            position,
+        };
+        assert_eq!(drags.handle(enter), pass(false));
+        assert_eq!(drags.handle(DragDropEvent::Over { position }), pass(false));
+
+        // Files: taken from entering to leaving.
+        let enter = DragDropEvent::Enter {
+            paths: drag(&[&file]),
+            position,
+        };
+        assert_eq!(drags.handle(enter), pass(true));
+        assert_eq!(drags.handle(DragDropEvent::Over { position }), pass(true));
+        assert_eq!(drags.handle(DragDropEvent::Leave), pass(true));
+        assert_eq!(drags.handle(DragDropEvent::Over { position }), pass(false));
+
+        // A drop opens the first folder among the items, else the first item.
+        let dropped = |paths| DragDropEvent::Drop { paths, position };
+        let open = |path: &Path| DragOutcome {
+            handled: true,
+            open: Some(path.to_path_buf()),
+        };
+        assert_eq!(
+            drags.handle(dropped(drag(&[&file, &folder]))),
+            open(&folder)
+        );
+        assert_eq!(drags.handle(dropped(drag(&[&file]))), open(&file));
+        assert_eq!(drags.handle(dropped(Vec::new())), pass(false));
+        drop(fs::remove_dir_all(&folder));
     }
 
     #[test]

@@ -18,18 +18,19 @@
 //! The notes live in `<git dir>/postil/review.json` (docs/design.md, "Data structures"). That
 //! file is the only copy: every request reads it, so an agent or a script that edits it is
 //! seen on the next request, and the page holds nothing that a reload would lose. The module
-//! offers two operations, [`current`] and [`add`], each of which does every step (read,
-//! relocate, and for `add` lock and write) so that no caller can skip one.
+//! offers three operations, [`current`], [`add`] and [`delete`], each of which does every
+//! step (read, relocate, and for the two writers lock and write) so that no caller can skip
+//! one.
 //!
-//! Only [`add`] writes. Reading the notes, which the page does whenever the window regains
-//! focus, never rewrites the file, so it cannot overwrite an edit made by hand. The cost: the
-//! stored lines catch up with the code only on the next added note, and until then each read
-//! relocates from the older lines.
+//! Only [`add`] and [`delete`] write. Reading the notes, which the page does whenever the
+//! window regains focus, never rewrites the file, so it cannot overwrite an edit made by
+//! hand. The cost: the stored lines catch up with the code only on the next write, and until
+//! then each read relocates from the older lines.
 //!
-//! [`add`] holds an exclusive lock on `review.lock` beside the file from its read to its
-//! rename, so two app windows on one working tree cannot drop each other's notes. A script
-//! that edits `review.json` without taking that lock can still lose an edit made during an
-//! add, a window of milliseconds.
+//! Each writer holds an exclusive lock on `review.lock` beside the file from its read to its
+//! rename, so two app windows on one working tree cannot drop each other's changes. A script
+//! that edits `review.json` without taking that lock can still lose an edit made during a
+//! write, a window of milliseconds.
 //!
 //! The format has a version. Every field added is a new version: a build refuses fields it
 //! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
@@ -119,12 +120,16 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
 }
 
 /// Deletes the note whose id is `id` (written `N1`), saves, and returns the other notes.
-/// Ids are not reused: the next note still gets the highest id plus one.
+///
+/// The next note gets the highest id left plus one, so deleting the newest note frees its id
+/// for the next one; any other deleted id stays unused. Never reusing an id would need the
+/// file to store the next id, a new field and so a new format version.
 ///
 /// # Errors
 ///
 /// [`Error::BadRequest`] when `id` is not a note id, [`Error::NoSuchNote`] when no note has
-/// it, and as [`add`] for reading and writing the file.
+/// it, as [`current`] for reading the file, and [`Error::WriteReview`] when the lock or the
+/// file cannot be written.
 pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
     let wanted = NoteId::parse(id)
         .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
@@ -188,6 +193,17 @@ pub(crate) struct NewNote {
 /// A note's number, written `N1`, `N2`: shown in the page and sent to the agent.
 #[derive(Debug, PartialEq, Eq)]
 struct NoteId(u32);
+
+impl NoteId {
+    /// Reads `N` and a positive number, as `Display` writes it.
+    fn parse(text: &str) -> Option<Self> {
+        text.strip_prefix('N')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok())
+            .filter(|&number| number > 0)
+            .map(Self)
+    }
+}
 
 /// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,17 +401,6 @@ impl fmt::Display for NoteId {
 impl Serialize for NoteId {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         serializer.collect_str(self)
-    }
-}
-
-impl NoteId {
-    /// Reads `N` and a positive number, as `Display` writes it.
-    fn parse(text: &str) -> Option<Self> {
-        text.strip_prefix('N')
-            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|digits| digits.parse().ok())
-            .filter(|&number| number > 0)
-            .map(Self)
     }
 }
 

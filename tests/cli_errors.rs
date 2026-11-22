@@ -113,7 +113,21 @@ fn bench_of_a_missing_file_fails_instead_of_timing_an_empty_pane() {
 fn a_plain_folder_is_recognised_whatever_the_language_of_git() {
     let dir = temp_dir("german");
 
-    // German: this machine's git translates its messages, which the app must not depend on.
+    // German, when git here speaks it: the app must not depend on git's language. A git built
+    // without translations, or a machine without the locale, prints English anyway, and this
+    // test then proves nothing, so it says so and stops.
+    let probe = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .arg("rev-parse")
+        .env("LC_ALL", "de_DE.UTF-8")
+        .output()
+        .expect("git runs");
+    if String::from_utf8_lossy(&probe.stderr).contains("not a git repository") {
+        eprintln!("skipped: git here does not translate its messages to German");
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
     let output = command()
         .env("LC_ALL", "de_DE.UTF-8")
         .arg(&dir)
@@ -174,4 +188,43 @@ fn a_git_dir_left_in_the_environment_does_not_redirect_git() {
 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("typo.rs"), "{stderr}");
+}
+
+#[test]
+fn a_file_given_as_the_folder_is_named_and_exits_1() {
+    let dir = temp_dir("file-not-folder");
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "").expect("the temporary directory is writable");
+
+    let output = postil(&[file.to_str().unwrap()]);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        format!("postil: {} is not a folder\n", file.display())
+    );
+}
+
+#[test]
+fn a_folder_that_cannot_be_looked_at_keeps_git_s_explanation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A folder inside a parent nobody may enter: it exists, so it is not "not a folder".
+    let parent = temp_dir("locked");
+    let inside = parent.join("project");
+    std::fs::create_dir_all(&inside).expect("the temporary directory is writable");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+        .expect("the test owns the folder");
+
+    let output = postil(&[inside.to_str().unwrap()]);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+        .expect("the test owns the folder");
+    std::fs::remove_dir_all(&parent).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("postil: git rev-parse"), "{stderr}");
+    assert!(!stderr.contains("is not a folder"), "{stderr}");
 }

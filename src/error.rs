@@ -128,7 +128,7 @@ impl fmt::Display for Error {
             Self::Webview(_) => write!(f, "cannot create the webview"),
             Self::BenchInterrupted => write!(f, "window closed before the benchmark finished"),
             Self::BadRequest(problem) => write!(f, "{problem}"),
-            Self::NoSuchNote { id } => write!(f, "there is no note {id} (it was already removed)"),
+            Self::NoSuchNote { id } => write!(f, "there is no note {id}"),
             Self::NoProject => write!(f, "no project is open (open a folder first)"),
             Self::NotAFolder { path } => write!(f, "{} is not a folder", path.display()),
             Self::NotARepository { path } => {
