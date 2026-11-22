@@ -355,7 +355,13 @@ function setRowsPadding() {
 function lineRow(index) {
   const row = el("div", "ln");
   row.dataset.line = String(index);
-  row.append(el("span", "n", String(index + 1)));
+  // The + that hovering a line number shows, as in GitHub's and GitLab's diff views. It is
+  // out of the Tab order: the keyboard way is a selection and `c`.
+  const add = el("button", "add-note", "+");
+  add.type = "button";
+  add.tabIndex = -1;
+  add.setAttribute("aria-label", `Add a note on line ${index + 1}`);
+  row.append(add, el("span", "n", String(index + 1)));
 
   const code = el("span", "c");
   for (const [className, text] of state.file.lines[index]) {
@@ -443,8 +449,22 @@ rowsEl.addEventListener("mousemove", (event) => {
 let textDrag = null;
 
 rowsEl.addEventListener("mousedown", (event) => {
+  // A press on the + starts neither a text selection nor a drag: its click adds the note.
+  if (event.target.closest(".add-note")) {
+    event.preventDefault();
+    return;
+  }
   if (event.button !== 0 || event.target.classList.contains("n") || state.composer) return;
   textDrag = { lines: null };
+});
+
+// The + on a line: a note on that line, or on the whole selection when the line is in it.
+rowsEl.addEventListener("click", (event) => {
+  if (!event.target.closest(".add-note")) return;
+  const line = lineOfEvent(event);
+  const range = selectedRange();
+  const inSelection = range && range.start <= line && line <= range.end;
+  openComposer(inSelection ? range : { start: line, end: line });
 });
 
 document.addEventListener("selectionchange", () => {
@@ -561,10 +581,11 @@ rowsEl.addEventListener("contextmenu", (event) => {
     state.selection = { anchor: line, head: line };
     redecorateRows();
   }
-  openMenu(event.clientX, event.clientY, codeActions());
+  openMenu(event.clientX, event.clientY, codeActions(line));
 });
 
-function codeActions() {
+// The actions for the selected lines; `line` is the one right-clicked, for its note.
+function codeActions(line) {
   const range = selectedRange();
   const first = range.start + 1;
   const last = range.end + 1;
@@ -572,12 +593,12 @@ function codeActions() {
   // The text selection when there is one inside the code, else the whole selected lines.
   const text = selectedCodeText() ?? linesText(range);
   // `matches` is the action's own key, which works while the menu is open, as it is shown.
-  return [
+  const actions = [
     {
       label: "Add note",
       key: "C",
       matches: (event) => event.key === "c" && !event.metaKey,
-      run: openComposer,
+      run: () => openComposer(range),
       disabled: Boolean(state.composer),
     },
     {
@@ -588,10 +609,35 @@ function codeActions() {
     },
     { label: `Copy reference  ${reference}`, run: () => copyText(reference) },
   ];
+  const note = state.noteByLine.get(line);
+  if (note) actions.push({ label: `Delete note ${note.id}`, run: () => deleteNote(note) });
+  return actions;
 }
 
 // The actions of the open menu, for its keyboard shortcuts.
 let menuActions = [];
+
+// Closes the menu and runs `action`. A failure is shown, never swallowed: an action that
+// silently did nothing is what made notes look broken once.
+async function runAction(action) {
+  closeMenu();
+  try {
+    await action.run();
+  } catch (error) {
+    showToast(`${action.label} failed: ${error}`);
+  }
+}
+
+// A short message at the bottom of the window, for failures with no better place to show.
+function showToast(text) {
+  const toast = $("toast");
+  toast.textContent = text;
+  toast.hidden = false;
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => {
+    toast.hidden = true;
+  }, 5000);
+}
 
 function openMenu(x, y, actions) {
   menuActions = actions;
@@ -602,10 +648,7 @@ function openMenu(x, y, actions) {
     item.disabled = Boolean(action.disabled);
     item.append(el("span", "menu-label", action.label));
     if (action.key) item.append(el("kbd", "", action.key));
-    item.addEventListener("click", () => {
-      closeMenu();
-      action.run();
-    });
+    item.addEventListener("click", () => runAction(action));
     return item;
   });
   menuEl.replaceChildren(...items);
@@ -643,10 +686,7 @@ menuEl.addEventListener("keydown", (event) => {
   else if (event.key === "Escape" || event.key === "Tab") closeMenu();
   else {
     const action = menuActions.find((each) => !each.disabled && each.matches?.(event));
-    if (action) {
-      closeMenu();
-      action.run();
-    }
+    if (action) runAction(action);
   }
 });
 
@@ -685,9 +725,12 @@ async function copyText(text) {
 
 // ---- Composer and notes ---------------------------------------------------------------
 
-function openComposer() {
-  const range = selectedRange();
+// Opens the composer on `range` (0-based lines), by default the selection. The context
+// menu passes the lines it was opened on, so its Add note acts on them whatever happened
+// to the selection between the right-click and the click.
+function openComposer(range = selectedRange()) {
   if (!range || state.composer) return;
+  state.selection = { anchor: range.start, head: range.end };
 
   // The composer opens under the selection, so the selection must be on screen to see it.
   const top = lineTop(range.start);
@@ -843,7 +886,7 @@ function renderNotes() {
     return;
   }
 
-  const cards = state.notes.map((note) => {
+  const items = state.notes.map((note) => {
     const outdated = note.anchor === "lost";
     const card = el("button", outdated ? "note outdated" : "note");
     card.type = "button";
@@ -854,9 +897,50 @@ function renderNotes() {
     where.append(el("span", "", `${note.path}:${lines}`), el("span", "note-id", id));
     card.append(where, el("div", "note-body", note.body));
     card.addEventListener("click", () => showNote(note));
-    return card;
+
+    const item = el("div", "note-item");
+    item.append(card, deleteButton(item, note));
+    return item;
   });
-  notesEl.replaceChildren(...cards);
+  notesEl.replaceChildren(...items);
+}
+
+// The ×  on a note card. A note is the engineer's writing, so deleting takes two clicks: the
+// first turns the button into "Delete", the second deletes. Leaving the card undoes the first.
+function deleteButton(item, note) {
+  const button = el("button", "note-delete", "×");
+  button.type = "button";
+  button.setAttribute("aria-label", `Delete note ${note.id}`);
+  const reset = () => {
+    item.classList.remove("confirming");
+    button.textContent = "×";
+  };
+  button.addEventListener("click", () => {
+    if (item.classList.contains("confirming")) {
+      deleteNote(note);
+      return;
+    }
+    item.classList.add("confirming");
+    button.textContent = "Delete";
+  });
+  item.addEventListener("mouseleave", reset);
+  button.addEventListener("blur", reset);
+  return button;
+}
+
+async function deleteNote(note) {
+  const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    showToast(await response.text());
+    return;
+  }
+  state.notes = (await response.json()).notes;
+  indexNotes();
+  renderNotes();
+  renderFiles();
+  redecorateRows();
 }
 
 async function showNote(note) {
@@ -954,6 +1038,24 @@ filterEl.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
+  // The window has no menu bar, where macOS would find Quit and Close, so the page handles
+  // their keys; with one window, closing it quits. They and Open Folder work everywhere.
+  if (event.metaKey && (event.key === "q" || event.key === "w")) {
+    event.preventDefault();
+    quit();
+    return;
+  }
+  if (event.metaKey && event.key === "o") {
+    event.preventDefault();
+    chooseFolder();
+    return;
+  }
+  // The welcome screen covers the panes: their keys must not act on what cannot be seen.
+  if (!welcomeEl.hidden) {
+    if (event.key === "Escape" && state.projectOpen) hideWelcome();
+    return;
+  }
+
   const typing = event.target.matches("input, textarea");
   if (event.key === "Escape") {
     if (state.composer) closeComposer({ save: false });
@@ -974,13 +1076,24 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     filterEl.focus();
     filterEl.select();
-  } else if (event.key === "o" && event.metaKey) {
-    event.preventDefault();
-    chooseFolder();
-  } else if (event.key === "Escape" && !welcomeEl.hidden && state.projectOpen) {
-    hideWelcome();
   }
 });
+
+// A draft note lives only in the page, so anything that would end the page (quitting,
+// switching projects) first sends the engineer back to it. Returns whether there is one.
+function guardDraft(action) {
+  if (!state.composer?.text.trim()) return false;
+  hideWelcome();
+  const label = state.composer.node.querySelector(".composer-label");
+  label.textContent = `Save or discard this note before ${action}.`;
+  label.classList.add("failed");
+  state.composer.node.querySelector("textarea").focus();
+  return true;
+}
+
+function quit() {
+  if (!guardDraft("quitting")) window.ipc.postMessage("quit");
+}
 
 // There is no file watcher (docs/design.md, "Working with the repository"): the file list,
 // the open file, and the notes change while the engineer is in another app, so all three are
@@ -1092,19 +1205,16 @@ const welcomeEl = $("welcome");
 // on the window.
 window.postil = { openFolder: (path) => requestProject("api/open", path) };
 
+// Checked before the dialog opens too, so a folder is never chosen only to be refused.
 function chooseFolder() {
-  window.ipc.postMessage("choose-folder");
+  if (!guardDraft("opening another project")) window.ipc.postMessage("choose-folder");
 }
 
 // Asks the Rust process to open `path` (`api/open`), or to make it a git repository first
 // (`api/init`). On success the page reloads into the project. A draft note would be lost by
 // the reload, so the composer keeps the focus instead.
 async function requestProject(route, path) {
-  if (state.composer?.text.trim()) {
-    hideWelcome();
-    state.composer.node.querySelector("textarea").focus();
-    return;
-  }
+  if (guardDraft("opening another project")) return;
   const response = await fetch(route, { method: "POST", body: JSON.stringify({ path }) });
   if (response.ok) {
     location.reload();

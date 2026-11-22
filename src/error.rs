@@ -42,6 +42,11 @@ pub enum Error {
     BenchInterrupted,
     /// The page sent a request this process cannot read; the text says why.
     BadRequest(String),
+    /// No note has the id the page named; another window or a hand edit removed it.
+    NoSuchNote {
+        /// The id as the page sent it.
+        id: String,
+    },
     /// The page asked for something that needs an open project, and none is open.
     NoProject,
     /// The path given to open is not a directory.
@@ -117,6 +122,7 @@ impl fmt::Display for Error {
             Self::Webview(_) => write!(f, "cannot create the webview"),
             Self::BenchInterrupted => write!(f, "window closed before the benchmark finished"),
             Self::BadRequest(problem) => write!(f, "{problem}"),
+            Self::NoSuchNote { id } => write!(f, "there is no note {id} (it was already removed)"),
             Self::NoProject => write!(f, "no project is open (open a folder first)"),
             Self::NotAFolder { path } => write!(f, "{} is not a folder", path.display()),
             Self::NotARepository { path } => {
@@ -175,6 +181,7 @@ impl std::error::Error for Error {
             | Self::OutsideRepository { .. }
             | Self::BenchInterrupted
             | Self::BadRequest(_)
+            | Self::NoSuchNote { .. }
             | Self::NoProject
             | Self::NotAFolder { .. }
             | Self::NotARepository { .. }

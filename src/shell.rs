@@ -86,6 +86,9 @@ enum AppEvent {
     DragWindow,
     /// The page asked for the folder dialog (Open Folder).
     ChooseFolder,
+    /// The engineer pressed Cmd-Q or Cmd-W. The window has no menu bar, which is where macOS
+    /// would otherwise find Quit, so the page forwards the keys.
+    Quit,
     /// A folder (or file) was dropped on the window.
     Dropped(PathBuf),
     /// The benchmark's file is on screen.
@@ -100,6 +103,7 @@ impl AppEvent {
         match body {
             "drag" => Some(Self::DragWindow),
             "choose-folder" => Some(Self::ChooseFolder),
+            "quit" => Some(Self::Quit),
             "bench-painted" => Some(Self::BenchPainted),
             _ => body
                 .strip_prefix("bench:")
@@ -170,7 +174,8 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            }
+            | Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
             Event::UserEvent(AppEvent::DragWindow) => {
                 // Fails when the pointer button is already up again: there is then nothing
                 // to drag.
@@ -338,10 +343,18 @@ impl Site {
             "/api/notes" => match *request.method() {
                 Method::GET => json_or_error(self.notes()),
                 Method::POST => json_or_error(self.add_note(request.body())),
+                Method::DELETE => match query_value(uri.query().unwrap_or(""), "id") {
+                    Some(id) => json_or_error(self.delete_note(&id)),
+                    None => reply(
+                        StatusCode::BAD_REQUEST,
+                        "text/plain",
+                        &b"expected ?id=<note id>"[..],
+                    ),
+                },
                 _ => reply(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "text/plain",
-                    &b"GET the notes, or POST a new one"[..],
+                    &b"GET the notes, POST a new one, or DELETE ?id=N1"[..],
                 ),
             },
             "/api/open" | "/api/init" => reply(
@@ -425,6 +438,13 @@ impl Site {
         let review = notes::add(&*self.repo()?, new)?;
         Ok(to_json(&review))
     }
+
+    /// The reply to `DELETE /api/notes?id=N1`: removes the note, saves, and returns the
+    /// other notes.
+    fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
+        let review = notes::delete(&*self.repo()?, id)?;
+        Ok(to_json(&review))
+    }
 }
 
 fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
@@ -445,6 +465,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::BadRequest(_)
                 | Error::NotAFolder { .. } => StatusCode::BAD_REQUEST,
                 Error::NoteTextChanged { .. } | Error::NoProject => StatusCode::CONFLICT,
+                Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
                 // The page tells this one apart: it offers to make the folder a repository.
                 Error::NotARepository { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                 Error::SpawnGit(_)
@@ -840,7 +861,7 @@ mod tests {
         assert!(!site.repo().unwrap().review_file().exists());
 
         let request = Request::builder()
-            .method(Method::DELETE)
+            .method(Method::PUT)
             .uri(NOTES)
             .body(Vec::new())
             .unwrap();
@@ -848,6 +869,61 @@ mod tests {
             site.respond(&request).status(),
             StatusCode::METHOD_NOT_ALLOWED
         );
+    }
+
+    fn delete(site: &Site, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(uri)
+            .body(Vec::new())
+            .unwrap();
+        let reply = site.respond(&request);
+        let body = String::from_utf8(reply.body().to_vec()).unwrap();
+        (reply.status(), body)
+    }
+
+    #[test]
+    fn a_deleted_note_is_gone_from_the_file_and_its_id_is_not_reused() {
+        let repo = TempRepo::new("notes-delete");
+        repo.write("a.txt", "x\ny\nz\n");
+        let site = repo.site();
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+
+        let (status, body) = delete(&site, &format!("{NOTES}?id=N2"));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let review: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(anchors(&review), [anchor("N1", 1, 1, "found")]);
+        let stored = fs::read_to_string(site.repo().unwrap().review_file()).unwrap();
+        assert!(!stored.contains("\"N2\""), "{stored}");
+
+        let review = post_note(&site, "a.txt", 3, 3, "three");
+        assert_eq!(
+            anchors(&review),
+            [anchor("N1", 1, 1, "found"), anchor("N2", 3, 3, "found")],
+            "the highest id left is N1, so the next is N2 again"
+        );
+    }
+
+    #[test]
+    fn deleting_a_missing_or_malformed_id_says_so_and_changes_nothing() {
+        let repo = TempRepo::new("notes-delete-bad");
+        repo.write("a.txt", "x\n");
+        let site = repo.site();
+        post_note(&site, "a.txt", 1, 1, "one");
+        let file = site.repo().unwrap().review_file();
+        let before = fs::read_to_string(&file).unwrap();
+
+        let (status, body) = delete(&site, &format!("{NOTES}?id=N9"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("there is no note N9"), "{body}");
+        let (status, body) = delete(&site, &format!("{NOTES}?id=nine"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("note id \"nine\""), "{body}");
+        let (status, _) = delete(&site, NOTES);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
     }
 
     #[test]
@@ -1252,6 +1328,7 @@ mod tests {
             AppEvent::parse("choose-folder"),
             Some(AppEvent::ChooseFolder)
         ));
+        assert!(matches!(AppEvent::parse("quit"), Some(AppEvent::Quit)));
         assert!(matches!(
             AppEvent::parse("bench-painted"),
             Some(AppEvent::BenchPainted)

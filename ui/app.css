@@ -353,9 +353,33 @@ kbd {
 }
 
 .ln {
+  position: relative;
   display: flex;
   height: var(--line-height);
   line-height: var(--line-height);
+}
+
+/* The + that a hovered line number shows: click it to add a note on that line. It sits at
+   the gutter's left edge, clear of the right-aligned number. */
+.ln .add-note {
+  position: absolute;
+  left: 6px;
+  top: calc((var(--line-height) - 16px) / 2);
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font: 600 13px/16px "Geist", sans-serif;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 80ms linear;
+}
+
+.ln:hover .add-note {
+  opacity: 1;
 }
 
 .ln .n {
@@ -828,4 +852,56 @@ button.repo-name:hover {
   margin-top: 6px;
   font-size: 11.5px;
   color: var(--text-soft);
+}
+
+/* A note card in the tray with its delete button, which shows on hover and asks once. */
+
+.note-item {
+  position: relative;
+}
+
+.note-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  height: 22px;
+  min-width: 22px;
+  padding: 0 6px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 20px;
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.note-item:hover .note-delete,
+.note-delete:focus-visible,
+.note-item.confirming .note-delete {
+  opacity: 1;
+}
+
+.note-item.confirming .note-delete {
+  color: var(--text-strong);
+  border-color: var(--text-muted);
+}
+
+/* Failures with no better place to show, for a few seconds at the bottom of the window. */
+
+.toast {
+  position: fixed;
+  z-index: 20;
+  left: 50%;
+  bottom: 20px;
+  max-width: min(560px, 100% - 48px);
+  transform: translateX(-50%);
+  padding: 10px 14px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  color: var(--text-strong);
 }

@@ -118,6 +118,28 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
     Ok(review)
 }
 
+/// Deletes the note whose id is `id` (written `N1`), saves, and returns the other notes.
+/// Ids are not reused: the next note still gets the highest id plus one.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] when `id` is not a note id, [`Error::NoSuchNote`] when no note has
+/// it, and as [`add`] for reading and writing the file.
+pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
+    let wanted = NoteId::parse(id)
+        .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
+    let file = repo.review_file();
+    let _lock = lock(&file)?;
+    let mut review = current(repo)?;
+    let before = review.notes.len();
+    review.notes.retain(|note| note.id != wanted);
+    if review.notes.len() == before {
+        return Err(Error::NoSuchNote { id: id.to_owned() });
+    }
+    review.save(&file)?;
+    Ok(review)
+}
+
 /// Every note of one working tree, as stored in `review.json`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,19 +388,25 @@ impl Serialize for NoteId {
     }
 }
 
-impl<'de> Deserialize<'de> for NoteId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
+impl NoteId {
+    /// Reads `N` and a positive number, as `Display` writes it.
+    fn parse(text: &str) -> Option<Self> {
         text.strip_prefix('N')
             .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|digits| digits.parse().ok())
             .filter(|&number| number > 0)
             .map(Self)
-            .ok_or_else(|| {
-                de::Error::custom(format!(
-                    "note id {text:?}: expected N and a number, like N1"
-                ))
-            })
+    }
+}
+
+impl<'de> Deserialize<'de> for NoteId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            de::Error::custom(format!(
+                "note id {text:?}: expected N and a number, like N1"
+            ))
+        })
     }
 }
 
