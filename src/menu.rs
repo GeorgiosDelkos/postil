@@ -9,7 +9,7 @@ use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
 /// A menu command that the page carries out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum Command {
     OpenFolder,
     SwitchProject,
@@ -51,12 +51,13 @@ impl Command {
 
 /// Builds the menu bar and makes it the app's. The returned menu must live as long as the app:
 /// dropping it removes the items' handlers.
-///
-/// # Errors
-///
-/// Fails when muda cannot add an item to a menu, which happens only for a menu built wrongly
-/// in this function.
-pub(crate) fn install() -> muda::Result<Menu> {
+pub(crate) fn install() -> Menu {
+    // muda fails to add an item only to a menu built wrongly, and this one is fixed: a failure
+    // is a bug here, seen at the first launch.
+    build().expect("the menu bar is fixed, so muda accepts every item")
+}
+
+fn build() -> muda::Result<Menu> {
     let command = |key| Accelerator::new(Modifiers::META, key);
     let shift_command = |key| Accelerator::new(Modifiers::META | Modifiers::SHIFT, key);
     let separator = PredefinedMenuItem::separator;
@@ -133,11 +134,13 @@ mod tests {
     #[test]
     fn every_command_reads_back_from_its_id_and_nothing_else_does() {
         for command in Command::ALL {
-            assert_eq!(Command::from_id(command.id()), Some(command));
+            assert_eq!(
+                Command::from_id(command.id()).map(Command::id),
+                Some(command.id())
+            );
         }
-        assert_eq!(
-            Command::from_id("1"),
-            None,
+        assert!(
+            Command::from_id("1").is_none(),
             "an id muda made up for a predefined item"
         );
     }
@@ -149,7 +152,7 @@ mod tests {
         let page = include_str!("../ui/app.js");
         for command in Command::ALL {
             assert!(
-                page.contains(&format!("\"{}\"", command.id())),
+                page.contains(&format!("command === \"{}\"", command.id())),
                 "{}",
                 command.id()
             );

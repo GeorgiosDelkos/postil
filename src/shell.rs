@@ -148,7 +148,6 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
             }
         }));
         crate::menu::install()
-            .expect("menu::install builds a fixed menu, whose items always fit their menus")
     };
 
     let page_proxy = event_loop.create_proxy();

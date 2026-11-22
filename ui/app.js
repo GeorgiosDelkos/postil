@@ -1066,7 +1066,8 @@ window.addEventListener("keydown", (event) => {
     quit();
     return;
   }
-  if (event.metaKey && event.key === "o") {
+  // Not with Shift: Cmd-Shift-O is the menu's Switch Project, which the page leaves to it.
+  if (event.metaKey && !event.shiftKey && event.key === "o") {
     event.preventDefault();
     chooseFolder();
     return;
