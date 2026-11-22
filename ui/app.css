@@ -1,0 +1,543 @@
+/* The look of the app. Two palettes as custom properties: Graphite (dark, the default) and
+   Paper (light), chosen by the system appearance. Every color in the rules below is a
+   variable, so a third theme is a new block of variables and nothing else. */
+
+@font-face {
+  font-family: "Geist";
+  src: url("fonts/Geist-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("fonts/GeistMono-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* --canvas is also painted by the window before the page loads: keep DARK_CANVAS and
+     LIGHT_CANVAS in src/shell.rs equal to it. */
+  --canvas: #15171b;
+  --chrome: #1a1c21;
+  --surface: #1b1d22;
+  --raised: #22252c;
+  --card: #20232a;
+  --hover: #23262d;
+  --border: #272a31;
+  --border-strong: #3a4352;
+  --shadow: 0 10px 30px rgb(0 0 0 / 35%);
+
+  --text: #d4d6db;
+  --text-strong: #e6e7ea;
+  --text-soft: #b4b8c0;
+  --text-muted: #8b909b;
+  --line-number: #7d828d;
+
+  --accent: #9db4d6;
+  --accent-text: #12151a;
+  --selection: rgb(157 180 214 / 11%);
+  --note: #e2c08d;
+  --note-wash: rgb(226 192 141 / 7%);
+
+  --syntax-keyword: #b9a7d3;
+  --syntax-function: #9bb7dc;
+  --syntax-string: #a9c194;
+  --syntax-type: #8fc1c7;
+  --syntax-comment: #868b96;
+  --syntax-constant: #dcc28c;
+  --syntax-punctuation: #a9adb6;
+
+  /* The height of one code line. ui/app.js reads it to place rows: change it only here. */
+  --line-height: 22px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --canvas: #f4f4f1;
+    --chrome: #ecece8;
+    --surface: #ffffff;
+    --raised: #ffffff;
+    --card: #f7f7f4;
+    --hover: #e4e4df;
+    --border: #e2e2dd;
+    --border-strong: #c9c9c2;
+    --shadow: 0 10px 30px rgb(30 30 20 / 14%);
+
+    --text: #25272c;
+    --text-strong: #111214;
+    --text-soft: #3d4047;
+    --text-muted: #5f636d;
+    --line-number: #6f7480;
+
+    --accent: #2f5fa8;
+    --accent-text: #ffffff;
+    --selection: rgb(47 95 168 / 10%);
+    --note: #855600;
+    --note-wash: rgb(160 110 10 / 8%);
+
+    --syntax-keyword: #7140b8;
+    --syntax-function: #1f5cc0;
+    --syntax-string: #1c7334;
+    --syntax-type: #0f6a70;
+    --syntax-comment: #6a6e78;
+    --syntax-constant: #855600;
+    --syntax-punctuation: #4a4d55;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr) 320px;
+  gap: 8px;
+  padding: 0 8px 0 0;
+  overflow: hidden;
+  background: var(--canvas);
+  color: var(--text);
+  font: 13px/1.4 "Geist", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  /* The app is a tool, not a document: text is selectable only where it is content. */
+  user-select: none;
+  cursor: default;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+kbd {
+  font: 11.5px "Geist Mono", monospace;
+  padding: 1px 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+}
+
+.empty {
+  padding: 24px 16px;
+  color: var(--text-muted);
+}
+
+/* Sidebar */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--chrome);
+  border-right: 1px solid var(--border);
+}
+
+/* The window buttons sit over this strip; src/shell.rs places them. */
+.drag-strip {
+  height: 44px;
+  flex: none;
+}
+
+.repo {
+  padding: 4px 16px 12px;
+}
+
+.repo-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.repo-branch {
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.filter {
+  padding: 0 12px 10px;
+}
+
+.filter input {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 80ms linear;
+}
+
+.filter input:focus {
+  border-color: var(--accent);
+}
+
+.files {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+  font-size: 12.5px;
+}
+
+.file,
+.dir {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  padding-right: 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Rows far from the viewport skip layout and paint, which keeps a long list cheap. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 26px;
+}
+
+.dir {
+  color: var(--text-muted);
+}
+
+.file {
+  width: 100%;
+  background: none;
+  border: 0;
+  color: var(--text-soft);
+  font: inherit;
+  text-align: left;
+  transition: background-color 80ms linear;
+}
+
+.file:hover {
+  background: var(--hover);
+}
+
+.file.open {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+.file .count {
+  margin-left: auto;
+  padding-left: 8px;
+  font: 11px "Geist Mono", monospace;
+  color: var(--note);
+}
+
+/* Panes */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin: 8px 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.pane-header {
+  height: 40px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.pane-title {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.crumbs {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.crumbs b {
+  font-weight: 400;
+  color: var(--text-strong);
+}
+
+.meta {
+  flex: none;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+/* Code */
+
+.code {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: auto;
+  outline: none;
+  font: 13px "Geist Mono", ui-monospace, monospace;
+  /* Ligatures change the shape of operators a reviewer is reading closely. */
+  font-variant-ligatures: none;
+}
+
+/* Holds only the lines near the viewport. ui/app.js sets its padding to stand in for the
+   lines above and below, so the scrollbar spans the whole file. */
+.code-rows {
+  min-width: max-content;
+  padding: 12px 0;
+}
+
+.ln {
+  display: flex;
+  height: var(--line-height);
+  line-height: var(--line-height);
+}
+
+.ln .n {
+  flex: none;
+  width: 56px;
+  padding-right: 18px;
+  text-align: right;
+  color: var(--line-number);
+  cursor: pointer;
+}
+
+.ln .c {
+  white-space: pre;
+  padding-right: 24px;
+  user-select: text;
+  cursor: text;
+}
+
+.ln.noted {
+  background: var(--note-wash);
+}
+
+.ln.noted .n {
+  color: var(--note);
+}
+
+/* After the note rules: a selection over a noted line must show as selected. */
+
+.ln.selected {
+  background: var(--selection);
+}
+
+.ln.selected .n {
+  color: var(--accent);
+}
+
+.ln .remark {
+  flex: none;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 12px "Geist", sans-serif;
+  line-height: var(--line-height);
+  color: var(--note);
+}
+
+.k { color: var(--syntax-keyword); }
+.f { color: var(--syntax-function); }
+.s { color: var(--syntax-string); }
+.t { color: var(--syntax-type); }
+.m { color: var(--syntax-comment); }
+.o { color: var(--syntax-constant); }
+.p { color: var(--syntax-punctuation); }
+
+/* Composer: opens under the selected lines, inside the code. */
+
+.composer {
+  position: sticky;
+  left: 56px;
+  width: min(640px, calc(100vw - 700px));
+  min-width: 320px;
+  margin: 8px 0 10px 56px;
+  display: flex;
+  flex-direction: column;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  font-family: "Geist", sans-serif;
+  animation: composer-open 120ms ease-out;
+}
+
+@keyframes composer-open {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer {
+    animation: none;
+  }
+}
+
+.composer-label {
+  padding: 10px 14px 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.composer textarea {
+  padding: 6px 14px 8px;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  resize: none;
+  color: var(--text-strong);
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 20px;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px 10px 14px;
+}
+
+.hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.button {
+  height: 30px;
+  padding: 0 12px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 12.5px;
+  transition: background-color 80ms linear;
+}
+
+.button:hover {
+  background: var(--hover);
+}
+
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.button.primary:hover {
+  filter: brightness(1.08);
+}
+
+/* Tray */
+
+.notes {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  transition: border-color 80ms linear;
+}
+
+.note:hover {
+  border-color: var(--border-strong);
+}
+
+.note-where {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.note-id {
+  color: var(--note);
+}
+
+.note-body {
+  font-size: 13px;
+  line-height: 19px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* File filter results */
+
+.file.active {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+.file mark {
+  background: none;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* A note whose text is no longer in its file. It stays in the tray at its last lines and is
+   not drawn on the code. */
+
+.note.outdated {
+  border-style: dashed;
+}
+
+.note.outdated .note-id,
+.note.outdated .note-body {
+  color: var(--text-muted);
+}
+
+/* The composer's label turns into the reason when saving fails; the text stays. */
+
+.composer-label.failed {
+  color: var(--text-strong);
+}

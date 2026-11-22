@@ -1,0 +1,32 @@
+# Derived from rust-style/templates/ci/test.yml (jonhoo/rust-ci-conf @ de512da1e85b with house
+# additions), adapted for an application that ships on macOS only: one job, on macOS, with the
+# toolchain rust-toolchain.toml pins. `cargo test` rather than nextest: it also runs the doc
+# tests, and the suite takes seconds. It needs Node.js for the page tests (tests/page_logic.rs);
+# GitHub's macOS runners have it installed.
+# Dropped from the template: minimal-versions (libraries only), Windows (not a target), and
+# coverage (no Codecov account).
+# See check.yml for how drafts and concurrency are handled.
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}-${{ github.event.pull_request.draft }}
+  cancel-in-progress: true
+name: test
+jobs:
+  test:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-latest
+    name: macos / test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: cargo test --locked
+        run: cargo test --locked --all-features

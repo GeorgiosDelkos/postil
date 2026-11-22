@@ -1,0 +1,548 @@
+//! Review notes and the file that stores them.
+//!
+//! A note is anchored by its snippet: the text of its lines when it was written. Its line
+//! numbers are a hint. Whenever the notes are read, each one is placed by [`locate`]: it stays
+//! where its snippet still is, or moves to the only other copy of the snippet, or else its
+//! anchor becomes [`Anchor::Lost`]. A snippet found several times elsewhere is lost rather
+//! than guessed: a short line such as `}` repeats, and the nearest copy is often the wrong
+//! one.
+//!
+//! The anchor says only whether the text is still there. It is kept apart from a note's
+//! lifecycle (open, sent, resolved, from milestone 3 on): a sent note whose text the agent
+//! replaced is the expected outcome, while an open note whose text vanished means the code
+//! drifted under it, and the page shows the two differently. One enum would need a variant
+//! for every combination.
+//!
+//! # The file
+//!
+//! The notes live in `<git dir>/postil/review.json` (docs/design.md, "Data structures"). That
+//! file is the only copy: every request reads it, so an agent or a script that edits it is
+//! seen on the next request, and the page holds nothing that a reload would lose. The module
+//! offers two operations, [`current`] and [`add`], each of which does every step (read,
+//! relocate, and for `add` lock and write) so that no caller can skip one.
+//!
+//! Only [`add`] writes. Reading the notes, which the page does whenever the window regains
+//! focus, never rewrites the file, so it cannot overwrite an edit made by hand. The cost: the
+//! stored lines catch up with the code only on the next added note, and until then each read
+//! relocates from the older lines.
+//!
+//! [`add`] holds an exclusive lock on `review.lock` beside the file from its read to its
+//! rename, so two app windows on one working tree cannot drop each other's notes. A script
+//! that edits `review.json` without taking that lock can still lose an edit made during an
+//! add, a window of milliseconds.
+//!
+//! The format has a version. Every field added is a new version: a build refuses fields it
+//! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
+//! write), and an older build must say "version 2" rather than "unknown field". A newer build
+//! reads every older version.
+
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::Path;
+
+use serde::de::{self, Deserializer};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+use crate::repo::Repo;
+
+/// The format version this build reads and writes. A file with another version is refused,
+/// not rewritten.
+const VERSION: u32 = 1;
+
+/// Reads the review file and places every note where its snippet is now. Does not write.
+///
+/// # Errors
+///
+/// [`Error::ReadReview`], [`Error::ParseReview`], or [`Error::InvalidReview`] when the review
+/// file exists but cannot be read or accepted. A note whose own file cannot be read is not
+/// an error: its anchor is lost.
+pub(crate) fn current(repo: &Repo) -> Result<Review> {
+    let mut review = Review::load(&repo.review_file())?;
+    review.relocate(repo);
+    Ok(review)
+}
+
+/// Adds a note and saves the review file with every note at its current place, then returns
+/// all notes.
+///
+/// `new.snippet` is the text the page showed on `new.lines`. When the file changed since,
+/// the note goes where that text is now, by the same rule as [`current`].
+///
+/// # Errors
+///
+/// As [`current`]; the error of reading the note's file; [`Error::InvalidNote`] for a blank
+/// body or a snippet that does not span `new.lines`; [`Error::NoteTextChanged`] when the
+/// shown text cannot be placed in the file any more; [`Error::WriteReview`] when the lock or
+/// the file cannot be written.
+pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
+    let file = repo.review_file();
+    let body = new.body.trim();
+    if body.is_empty() {
+        return Err(Error::InvalidNote("the note has no text".to_owned()));
+    }
+    let count = new.lines.end - new.lines.start + 1;
+    if new.snippet.split('\n').count() != count {
+        return Err(Error::InvalidNote(format!(
+            "the snippet does not have {count} lines"
+        )));
+    }
+
+    let _lock = lock(&file)?;
+    let text = repo.read(&new.path)?;
+    let lines = locate(&text, &new.snippet, new.lines).ok_or_else(|| Error::NoteTextChanged {
+        path: new.path.clone(),
+    })?;
+
+    let mut review = current(repo)?;
+    // The highest id plus one, not the count plus one: ids stay unique when someone removes
+    // a note by editing the file.
+    let highest = review.notes.iter().map(|note| note.id.0).max().unwrap_or(0);
+    let id = highest.checked_add(1).ok_or_else(|| Error::InvalidReview {
+        path: file.clone(),
+        problem: format!("no note id is left after N{highest}"),
+    })?;
+
+    review.notes.push(Note {
+        id: NoteId(id),
+        path: new.path,
+        lines,
+        snippet: new.snippet,
+        body: body.to_owned(),
+        anchor: Anchor::Found,
+    });
+    review.save(&file)?;
+    Ok(review)
+}
+
+/// Every note of one working tree, as stored in `review.json`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Review {
+    version: u32,
+    notes: Vec<Note>,
+}
+
+/// The one field of a review file that every format version has. Unknown fields are
+/// ignored here on purpose.
+#[derive(Deserialize)]
+struct VersionOnly {
+    version: u32,
+}
+
+/// A note the engineer wrote on a line range.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Note {
+    id: NoteId,
+    /// Relative to the repository root.
+    path: String,
+    /// Where the snippet was found last.
+    lines: LineRange,
+    /// The text of the lines when the note was written, without line endings, joined with
+    /// `\n`.
+    snippet: String,
+    body: String,
+    /// Recomputed on every read, so a note written by hand may leave it out.
+    #[serde(default)]
+    anchor: Anchor,
+}
+
+/// What the page sends to create a note.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewNote {
+    /// Relative to the repository root.
+    path: String,
+    lines: LineRange,
+    /// The text of `lines` as the page showed it, lines joined with `\n`.
+    snippet: String,
+    body: String,
+}
+
+/// A note's number, written `N1`, `N2`: shown in the page and sent to the agent.
+#[derive(Debug, PartialEq, Eq)]
+struct NoteId(u32);
+
+/// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawLineRange")]
+struct LineRange {
+    start: usize,
+    end: usize,
+}
+
+/// A [`LineRange`] before its bounds are checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLineRange {
+    start: usize,
+    end: usize,
+}
+
+/// Whether a note's snippet is still in its file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Anchor {
+    /// The snippet is in the file, at `lines`.
+    #[default]
+    Found,
+    /// The snippet is not in the file where [`locate`] may place it, or the file cannot be
+    /// read. `lines` is where it was last seen.
+    Lost,
+}
+
+impl Review {
+    /// Reads the review file, or returns an empty review when there is none yet. Leaves the
+    /// file as it is in every case.
+    fn load(file: &Path) -> Result<Self> {
+        let json = match fs::read_to_string(file) {
+            Ok(json) => json,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    version: VERSION,
+                    notes: Vec::new(),
+                });
+            }
+            Err(source) => {
+                return Err(Error::ReadReview {
+                    path: file.to_owned(),
+                    source,
+                });
+            }
+        };
+        let parse_error = |source| Error::ParseReview {
+            path: file.to_owned(),
+            source,
+        };
+        let invalid = |problem| Error::InvalidReview {
+            path: file.to_owned(),
+            problem,
+        };
+
+        // The version is read on its own first: a newer format would otherwise fail on its
+        // first new field, with a message that hides the real reason.
+        let VersionOnly { version } = serde_json::from_str(&json).map_err(parse_error)?;
+        if version != VERSION {
+            return Err(invalid(format!(
+                "version {version}, but this build of Postil reads version {VERSION}"
+            )));
+        }
+
+        let review: Self = serde_json::from_str(&json).map_err(parse_error)?;
+        for (index, note) in review.notes.iter().enumerate() {
+            if review.notes[..index]
+                .iter()
+                .any(|other| other.id == note.id)
+            {
+                return Err(invalid(format!("note id {} is used twice", note.id)));
+            }
+        }
+        Ok(review)
+    }
+
+    /// Replaces the review file with this review. Its directory must exist: [`lock`], which
+    /// every writer takes first, creates it.
+    fn save(&self, file: &Path) -> Result<()> {
+        let mut json = serde_json::to_vec_pretty(self)
+            .expect("a review is plain structs, strings, and numbers, which always serialize");
+        json.push(b'\n');
+        write_atomically(file, &json).map_err(|source| Error::WriteReview {
+            path: file.to_owned(),
+            source,
+        })
+    }
+
+    /// Places every note by [`locate`] in its file as it is now.
+    ///
+    /// Reads one file per note and compares every position in it with the snippet. A review
+    /// holds tens of notes, so this stays well under a frame for files of a few thousand
+    /// lines; an index of each file's lines would be the next step if it does not.
+    fn relocate(&mut self, repo: &Repo) {
+        for note in &mut self.notes {
+            let text = repo.read(&note.path).ok();
+            match text.and_then(|text| locate(&text, &note.snippet, note.lines)) {
+                Some(lines) => {
+                    note.lines = lines;
+                    note.anchor = Anchor::Found;
+                }
+                None => note.anchor = Anchor::Lost,
+            }
+        }
+    }
+}
+
+/// Where the lines of `snippet` are in `text`, given that they were last at `last`:
+/// `last` itself when they are still there, otherwise the only place they are, otherwise
+/// `None` (gone, or several places and no way to tell which).
+fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
+    // `str::lines` drops `\r\n` and `\n` alike, as the highlighter does, so the line numbers
+    // here are the ones the page shows.
+    let lines: Vec<&str> = text.lines().collect();
+    let wanted: Vec<&str> = snippet.split('\n').collect();
+
+    let mut found = lines
+        .windows(wanted.len())
+        .enumerate()
+        .filter(|(_, window)| *window == wanted.as_slice())
+        .map(|(index, _)| LineRange {
+            start: index + 1,
+            end: index + wanted.len(),
+        });
+
+    let first = found.next()?;
+    let mut others = found.peekable();
+    if first == last || others.peek().is_none() {
+        return Some(first);
+    }
+    others.find(|&range| range == last)
+}
+
+/// Takes the exclusive lock on `review.lock` beside the review file, waiting for another
+/// window's add to finish. The lock is released when the returned file is dropped.
+fn lock(review_file: &Path) -> Result<File> {
+    let path = review_file.with_extension("lock");
+    let error = |source| Error::WriteReview {
+        path: path.clone(),
+        source,
+    };
+    let dir = path
+        .parent()
+        .expect("the review file is <git dir>/postil/review.json, which has a parent");
+    fs::create_dir_all(dir).map_err(error)?;
+
+    let file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(error)?;
+    file.lock().map_err(error)?;
+    Ok(file)
+}
+
+/// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`.
+/// A failure before the rename leaves the old file.
+fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = file
+        .parent()
+        .expect("the review file is <git dir>/postil/review.json, which has a parent");
+
+    // Only `add` writes, and it holds `review.lock`, so two writers never share this name at
+    // once.
+    let temporary = dir.join("review.json.tmp");
+    let written = (|| {
+        let mut out = File::create(&temporary)?;
+        out.write_all(bytes)?;
+        out.sync_all()?;
+        fs::rename(&temporary, file)
+    })();
+    if written.is_err() {
+        // Best effort: a leftover temporary file is ignored by every reader.
+        drop(fs::remove_file(&temporary));
+    }
+    written?;
+
+    // The rename is the commit: the new file is in place and readers see it. Syncing the
+    // directory makes the rename survive a power loss. A failure here cannot be undone, and
+    // reporting the note as unsaved would make the engineer save it twice, so it is ignored.
+    // The parent is synced too, so the `postil` directory that `lock` may just have created
+    // survives as well; two directory syncs per added note are cheap.
+    drop(File::open(dir).and_then(|dir| dir.sync_all()));
+    if let Some(parent) = dir.parent() {
+        drop(File::open(parent).and_then(|parent| parent.sync_all()));
+    }
+    Ok(())
+}
+
+// Debug output shows ids, paths, and anchors, never note text: notes can quote code that is
+// not meant to leave the machine, and Debug output ends up in logs.
+impl fmt::Debug for Review {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Review")
+            .field("version", &self.version)
+            .field("notes", &self.notes)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Note {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Note")
+            .field("id", &self.id)
+            .field("path", &self.path)
+            .field("lines", &self.lines)
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for NewNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewNote")
+            .field("path", &self.path)
+            .field("lines", &self.lines)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for NoteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "N{}", self.0)
+    }
+}
+
+impl Serialize for NoteId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for NoteId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.strip_prefix('N')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok())
+            .filter(|&number| number > 0)
+            .map(Self)
+            .ok_or_else(|| {
+                de::Error::custom(format!(
+                    "note id {text:?}: expected N and a number, like N1"
+                ))
+            })
+    }
+}
+
+impl TryFrom<RawLineRange> for LineRange {
+    type Error = String;
+
+    fn try_from(raw: RawLineRange) -> std::result::Result<Self, Self::Error> {
+        let RawLineRange { start, end } = raw;
+        if start == 0 || start > end {
+            return Err(format!(
+                "lines {start}-{end}: lines are 1-based and start must not be after end"
+            ));
+        }
+        Ok(Self { start, end })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(start: usize, end: usize) -> LineRange {
+        LineRange { start, end }
+    }
+
+    #[test]
+    fn snippet_moves_with_every_insertion_and_deletion_around_it() {
+        // Ten distinct lines with a note on lines 4 to 6. Every way to insert one or three
+        // lines, and every way to delete one line, is checked against where the snippet
+        // must end up.
+        let original: Vec<String> = (1..=10).map(|n| format!("line {n}")).collect();
+        let snippet = original[3..6].join("\n");
+
+        for count in [1, 3] {
+            for at in 0..=original.len() {
+                let mut lines = original.clone();
+                for _ in 0..count {
+                    lines.insert(at, "new".to_owned());
+                }
+                let expected = if at <= 3 {
+                    Some(range(4 + count, 6 + count))
+                } else if at < 6 {
+                    None
+                } else {
+                    Some(range(4, 6))
+                };
+                let text = lines.join("\n");
+                let found = locate(&text, &snippet, range(4, 6));
+                assert_eq!(found, expected, "{count} at {at}");
+            }
+        }
+
+        for at in 0..original.len() {
+            let mut lines = original.clone();
+            lines.remove(at);
+            let expected = match at {
+                0..=2 => Some(range(3, 5)),
+                3..=5 => None,
+                _ => Some(range(4, 6)),
+            };
+            let found = locate(&lines.join("\n"), &snippet, range(4, 6));
+            assert_eq!(found, expected, "{at}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_snippet_stays_put_or_is_lost_but_never_jumps_to_another_copy() {
+        // `}` is on lines 2, 4, and 8.
+        let text = "a\n}\nb\n}\nc\nd\ne\n}\n";
+        assert_eq!(locate(text, "}", range(4, 4)), Some(range(4, 4)));
+        assert_eq!(locate(text, "}", range(8, 8)), Some(range(8, 8)));
+        // The note was on the `}` that is now on line 4 or 8 after lines moved: no way to
+        // tell which, and the nearest copy (line 4) is the wrong one when two lines were
+        // inserted above line 6.
+        assert_eq!(locate(text, "}", range(6, 6)), None);
+        // One copy left: it is the note's, wherever it moved.
+        assert_eq!(locate("x\n}\n", "}", range(6, 6)), Some(range(2, 2)));
+    }
+
+    #[test]
+    fn snippet_matches_whole_lines_only_and_ignores_line_endings() {
+        assert_eq!(locate("ab\nb\n", "b", range(1, 1)), Some(range(2, 2)));
+        assert_eq!(locate("ab\n", "b", range(1, 1)), None);
+        let crlf = "a\r\nb\r\nc\r\n";
+        assert_eq!(locate(crlf, "b\nc", range(1, 2)), Some(range(2, 3)));
+        assert_eq!(
+            locate("a\n", "a\nb", range(1, 2)),
+            None,
+            "longer than the file"
+        );
+    }
+
+    #[test]
+    fn note_ids_read_only_n_and_a_positive_number() {
+        let parse = |json: &str| serde_json::from_str::<NoteId>(json).ok();
+        assert_eq!(parse("\"N1\""), Some(NoteId(1)));
+        assert_eq!(parse("\"N42\""), Some(NoteId(42)));
+        for bad in [
+            "\"N0\"", "\"N\"", "\"N+1\"", "\"1\"", "\"n1\"", "\"N1x\"", "1",
+        ] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+        assert_eq!(serde_json::to_string(&NoteId(7)).unwrap(), "\"N7\"");
+    }
+
+    #[test]
+    fn debug_output_names_notes_but_never_shows_their_text() {
+        let new = NewNote {
+            path: "src/a.rs".to_owned(),
+            lines: range(1, 1),
+            snippet: "secret snippet".to_owned(),
+            body: "secret body".to_owned(),
+        };
+        let note = Note {
+            id: NoteId(1),
+            path: "src/a.rs".to_owned(),
+            lines: range(1, 1),
+            snippet: "secret snippet".to_owned(),
+            body: "secret body".to_owned(),
+            anchor: Anchor::Found,
+        };
+        let review = Review {
+            version: VERSION,
+            notes: vec![note],
+        };
+
+        for debug in [format!("{review:?}"), format!("{new:?}")] {
+            assert!(debug.contains("src/a.rs"), "{debug}");
+            assert!(!debug.contains("secret"), "{debug}");
+        }
+        assert!(format!("{review:?}").contains("NoteId(1)"));
+    }
+}
