@@ -358,10 +358,11 @@ fn build_webview(
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
         // not reach the `postil://` handlers, which read and write the repository.
         .with_navigation_handler(|url| url.starts_with("postil://"))
-        // wry fires `Started` from `didCommitNavigation`, before it runs the scripts it
-        // queued and stops queueing (wry 0.57.3, `wkwebview/navigation.rs`,
-        // `did_commit_navigation`); its docs say only "started loading". `ask_page` relies on
-        // that order, and no test can check it without a window: recheck it when bumping wry.
+        // On macOS, wry fires `Started` from `didCommitNavigation`, before it runs the scripts
+        // it queued and stops queueing (wry 0.57.3, `wkwebview/navigation.rs`,
+        // `did_commit_navigation`); its docs say only "started loading", and other platforms'
+        // backends are unchecked. `ask_page` relies on that order, and no test can check it
+        // without a window: recheck it when bumping wry or adding a platform.
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Started) {
                 committed.set(true);
@@ -411,8 +412,9 @@ enum Unanswered {
 /// The page, for [`ask_page`].
 struct Page<'a> {
     webview: &'a WebView,
-    /// Whether the page's first navigation has committed. Until then wry queues a script and
-    /// drops its callback (wry 0.57.3, `wkwebview::eval`), so an answer could never come.
+    /// Whether the page's first navigation has committed. Until then wry's macOS backend
+    /// queues a script and drops its callback (wry 0.57.3, `wkwebview::eval`), so an answer
+    /// could never come.
     committed: &'a Cell<bool>,
     /// Sends `AppEvent::Quit` when the page cannot answer.
     quit: EventLoopProxy<AppEvent>,
