@@ -6,6 +6,7 @@
 // saving, and when the window regains focus.
 
 import { rank } from "./fuzzy.js";
+import { fileIcon, folderIcon } from "./icons.js";
 import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
@@ -71,6 +72,31 @@ function el(tag, className, text) {
   return node;
 }
 
+const SVG = "http://www.w3.org/2000/svg";
+
+// An icon from the sprite that `loadIcons` put in the page, by symbol id.
+function icon(id) {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(SVG, "use");
+  use.setAttribute("href", `#${id}`);
+  svg.append(use);
+  return svg;
+}
+
+// Puts icons.svg into the page once, so every icon refers to a symbol in this document.
+// Until it arrives, or if it fails, the icons are empty boxes and nothing else changes.
+async function loadIcons() {
+  const response = await fetch("icons.svg");
+  if (!response.ok) return;
+  const sprite = new DOMParser().parseFromString(await response.text(), "image/svg+xml");
+  const root = document.importNode(sprite.documentElement, true);
+  root.setAttribute("class", "icon-sprite");
+  root.setAttribute("aria-hidden", "true");
+  document.body.prepend(root);
+}
+
 // ---- Files ----------------------------------------------------------------------------
 
 // Pixels of indent per level of the tree, and before the first level.
@@ -104,6 +130,7 @@ function filteredFileRows(needle) {
   state.activeMatch = Math.min(state.activeMatch, Math.max(0, matches.length - 1));
   return matches.map(({ path, positions }, index) => {
     const row = fileRow(path, markedPath(path, positions));
+    row.prepend(icon(fileIcon(path.split("/").at(-1))));
     row.classList.toggle("active", index === state.activeMatch);
     return row;
   });
@@ -126,7 +153,7 @@ function treeRows() {
   return visibleRows(state.tree, state.expanded).map((row) => {
     const button = row.kind === "folder" ? folderRow(row, totals) : fileRow(row.path, row.name);
     // Files get an empty chevron slot, so names line up with their folder's siblings.
-    if (row.kind === "file") button.prepend(el("span", "chevron"));
+    if (row.kind === "file") button.prepend(el("span", "chevron"), icon(fileIcon(row.name)));
     button.style.paddingLeft = `${INDENT_BASE + INDENT * row.depth}px`;
     button.setAttribute("role", "treeitem");
     button.setAttribute("aria-level", String(row.depth + 1));
@@ -139,7 +166,11 @@ function folderRow(row, totals) {
   button.type = "button";
   button.dataset.path = row.path;
   button.setAttribute("aria-expanded", String(row.open));
-  button.append(el("span", "chevron"), el("span", "name", row.name));
+  button.append(
+    el("span", "chevron"),
+    icon(folderIcon(row.name, row.open)),
+    el("span", "name", row.name),
+  );
   const count = row.open ? 0 : totals.get(row.path);
   if (count) button.append(el("span", "count", String(count)));
   return button;
@@ -766,6 +797,8 @@ function showRepo(repo) {
 }
 
 async function start() {
+  // The icons load beside the repository, not before it: the tree can draw without them.
+  loadIcons();
   const response = await fetch("api/repo");
   if (!response.ok) {
     codeEmptyEl.textContent = await response.text();

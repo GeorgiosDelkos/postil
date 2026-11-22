@@ -28,6 +28,8 @@ const APP_CSS: &str = include_str!("../ui/app.css");
 const APP_JS: &str = include_str!("../ui/app.js");
 const FUZZY_JS: &str = include_str!("../ui/fuzzy.js");
 const TREE_JS: &str = include_str!("../ui/tree.js");
+const ICONS_JS: &str = include_str!("../ui/icons.js");
+const ICONS_SVG: &str = include_str!("../ui/icons.svg");
 const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
 const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
 
@@ -226,6 +228,8 @@ impl Site {
             "/app.js" => reply(StatusCode::OK, "text/javascript", APP_JS.as_bytes()),
             "/fuzzy.js" => reply(StatusCode::OK, "text/javascript", FUZZY_JS.as_bytes()),
             "/tree.js" => reply(StatusCode::OK, "text/javascript", TREE_JS.as_bytes()),
+            "/icons.js" => reply(StatusCode::OK, "text/javascript", ICONS_JS.as_bytes()),
+            "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
             "/api/repo" => json_or_error(self.repo_info()),
@@ -907,6 +911,8 @@ mod tests {
             ("/app.js", "text/javascript"),
             ("/fuzzy.js", "text/javascript"),
             ("/tree.js", "text/javascript"),
+            ("/icons.js", "text/javascript"),
+            ("/icons.svg", "image/svg+xml"),
             ("/fonts/Geist-Variable.woff2", "font/woff2"),
             ("/fonts/GeistMono-Variable.woff2", "font/woff2"),
         ];
@@ -930,6 +936,11 @@ mod tests {
         }
         assert!(APP_JS.contains("\"./fuzzy.js\""), "app.js imports fuzzy.js");
         assert!(APP_JS.contains("\"./tree.js\""), "app.js imports tree.js");
+        assert!(APP_JS.contains("\"./icons.js\""), "app.js imports icons.js");
+        assert!(
+            APP_JS.contains("\"icons.svg\""),
+            "app.js loads the icon sprite"
+        );
         for font in [
             "fonts/Geist-Variable.woff2",
             "fonts/GeistMono-Variable.woff2",

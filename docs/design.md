@@ -396,7 +396,11 @@ retired; the measured numbers above are the baseline to not regress.
    value; folders start closed, opening a file opens the folders around it, and a closed
    folder shows the count of notes inside it. Keys follow the ARIA tree pattern: up and down
    move, right opens or enters a folder, left closes it or goes to the parent, Enter opens.
-   Which folders are open is not kept across restarts yet.
+   Which folders are open is not kept across restarts yet. Rows carry file-type and folder
+   icons from Material Icon Theme (MIT, `ui/icons.LICENSE`), the set VS Code users know,
+   chosen 2026-11-22 over monochrome glyphs. They are one SVG sprite, `ui/icons.svg`, taken
+   at a pinned upstream commit (the sprite's header comment says how), with colours toned
+   down by a CSS filter; `ui/icons.js` maps names and extensions to symbols.
 2. **Note.** Line selection, the composer, the tray, `review.json`, anchoring across file changes.
    Built: the page saves through `POST api/notes` and reads the file and the notes again when
    the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
