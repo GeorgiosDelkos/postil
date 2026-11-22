@@ -1,20 +1,21 @@
-//! The `postil` command: opens the review window for a repository.
+//! The `postil` command: opens the review window, on a repository or on the welcome screen.
 
 use std::error::Error as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage: postil [DIR] [--bench FILE]
 
-  DIR           a directory inside a git repository (default: the current directory)
-  --bench FILE  open FILE (relative to the repository root), scroll through it,
-                print launch and frame timings, and exit";
+  DIR           a directory inside a git repository; without it, the window opens on the
+                welcome screen (open a folder, or a recent project)
+  --bench FILE  open FILE (relative to the root of DIR's repository, or of the current
+                directory's), scroll through it, print launch and frame timings, and exit";
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
-    dir: PathBuf,
+    dir: Option<PathBuf>,
     bench: Option<String>,
 }
 
@@ -36,10 +37,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         }
     }
 
-    Ok(Args {
-        dir: dir.unwrap_or_else(|| PathBuf::from(".")),
-        bench,
-    })
+    Ok(Args { dir, bench })
 }
 
 #[expect(
@@ -57,11 +55,15 @@ fn main() -> ExitCode {
     };
 
     let outcome = match &args.bench {
-        Some(file) => postil::bench(&args.dir, file).map(|report| {
-            println!("launch_to_paint_ms {}", report.launch_to_paint.as_millis());
-            println!("page {}", report.page);
-        }),
-        None => postil::run(&args.dir),
+        // A benchmark needs a project: the current directory's when none is given.
+        Some(file) => {
+            let dir = args.dir.as_deref().unwrap_or(Path::new("."));
+            postil::bench(dir, file).map(|report| {
+                println!("launch_to_paint_ms {}", report.launch_to_paint.as_millis());
+                println!("page {}", report.page);
+            })
+        }
+        None => postil::run(args.dir.as_deref()),
     };
 
     match outcome {
@@ -88,9 +90,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_the_current_directory() {
+    fn without_a_directory_there_is_no_project_to_open() {
         let expected = Args {
-            dir: PathBuf::from("."),
+            dir: None,
             bench: None,
         };
         assert_eq!(parse(&[]).unwrap(), expected);
@@ -99,7 +101,7 @@ mod tests {
     #[test]
     fn takes_a_directory_and_a_bench_file_in_either_order() {
         let expected = Args {
-            dir: PathBuf::from("repo"),
+            dir: Some(PathBuf::from("repo")),
             bench: Some("src/a.rs".to_owned()),
         };
         assert_eq!(parse(&["repo", "--bench", "src/a.rs"]).unwrap(), expected);

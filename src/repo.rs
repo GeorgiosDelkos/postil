@@ -21,10 +21,29 @@ pub(crate) struct Repo {
 
 impl Repo {
     /// Finds the working tree that contains `dir`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotAFolder`] when `dir` is not a directory, [`Error::NotARepository`] when it
+    /// is not inside a working tree, and the git errors otherwise.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
+        if !dir.is_dir() {
+            return Err(Error::NotAFolder {
+                path: dir.to_owned(),
+            });
+        }
         // git prints one line per option, in the order asked.
         let args = ["rev-parse", "--show-toplevel", "--absolute-git-dir"];
-        let paths = git(dir, &args)?;
+        let paths = match git(dir, &args) {
+            Ok(paths) => paths,
+            // `git` runs in the C locale (see `git`), so this message is stable.
+            Err(Error::Git { stderr, .. }) if stderr.contains("not a git repository") => {
+                return Err(Error::NotARepository {
+                    path: dir.to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let mut paths = paths.lines();
         let (Some(root), Some(git_dir)) = (paths.next(), paths.next()) else {
             return Err(Error::Git {
@@ -38,6 +57,26 @@ impl Repo {
             root: PathBuf::from(root),
             git_dir: PathBuf::from(git_dir),
         })
+    }
+
+    /// Makes `dir` a new git repository (`git init`) and opens it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Repo::open`], and the git error when `git init` fails.
+    pub(crate) fn init(dir: &Path) -> Result<Self> {
+        if !dir.is_dir() {
+            return Err(Error::NotAFolder {
+                path: dir.to_owned(),
+            });
+        }
+        git(dir, &["init", "--quiet"])?;
+        Self::open(dir)
+    }
+
+    /// The top-level directory of the working tree.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Where this working tree's notes are stored. Inside the git directory, so the file is
@@ -106,6 +145,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .arg("-C")
         .arg(dir)
         .args(args)
+        // Messages in English whatever the user's locale: `Repo::open` matches one of them.
+        .env("LC_ALL", "C")
         .output()
         .map_err(Error::SpawnGit)?;
 

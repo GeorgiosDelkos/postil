@@ -47,7 +47,7 @@ fn bad_arguments_print_usage_and_exit_2() {
 }
 
 #[test]
-fn directory_outside_a_repository_reports_git_and_exits_1() {
+fn directory_outside_a_repository_is_named_and_exits_1() {
     let dir = temp_dir("not-a-repo");
 
     let output = postil(&[dir.to_str().unwrap()]);
@@ -55,8 +55,17 @@ fn directory_outside_a_repository_reports_git_and_exits_1() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.starts_with("postil: git rev-parse"), "{stderr}");
-    assert!(stderr.contains("not a git repository"), "{stderr}");
+    let expected = format!("postil: {} is not in a git repository\n", dir.display());
+    assert_eq!(stderr, expected);
+}
+
+#[test]
+fn a_path_that_is_not_a_folder_is_named_and_exits_1() {
+    let output = postil(&["/no/such/folder"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr, "postil: /no/such/folder is not a folder\n");
 }
 
 #[test]

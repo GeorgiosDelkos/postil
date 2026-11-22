@@ -38,7 +38,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use serde::de::{self, Deserializer};
@@ -46,6 +46,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::files::write_atomically;
 use crate::repo::Repo;
 
 /// The format version this build reads and writes. A file with another version is refused,
@@ -243,8 +244,7 @@ impl Review {
         Ok(review)
     }
 
-    /// Replaces the review file with this review. Its directory must exist: [`lock`], which
-    /// every writer takes first, creates it.
+    /// Replaces the review file with this review (`write_atomically`).
     fn save(&self, file: &Path) -> Result<()> {
         let mut json = serde_json::to_vec_pretty(self)
             .expect("a review is plain structs, strings, and numbers, which always serialize");
@@ -321,40 +321,6 @@ fn lock(review_file: &Path) -> Result<File> {
         .map_err(error)?;
     file.lock().map_err(error)?;
     Ok(file)
-}
-
-/// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`.
-/// A failure before the rename leaves the old file.
-fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = file
-        .parent()
-        .expect("the review file is <git dir>/postil/review.json, which has a parent");
-
-    // Only `add` writes, and it holds `review.lock`, so two writers never share this name at
-    // once.
-    let temporary = dir.join("review.json.tmp");
-    let written = (|| {
-        let mut out = File::create(&temporary)?;
-        out.write_all(bytes)?;
-        out.sync_all()?;
-        fs::rename(&temporary, file)
-    })();
-    if written.is_err() {
-        // Best effort: a leftover temporary file is ignored by every reader.
-        drop(fs::remove_file(&temporary));
-    }
-    written?;
-
-    // The rename is the commit: the new file is in place and readers see it. Syncing the
-    // directory makes the rename survive a power loss. A failure here cannot be undone, and
-    // reporting the note as unsaved would make the engineer save it twice, so it is ignored.
-    // The parent is synced too, so the `postil` directory that `lock` may just have created
-    // survives as well; two directory syncs per added note are cheap.
-    drop(File::open(dir).and_then(|dir| dir.sync_all()));
-    if let Some(parent) = dir.parent() {
-        drop(File::open(parent).and_then(|parent| parent.sync_all()));
-    }
-    Ok(())
 }
 
 // Debug output shows ids, paths, and anchors, never note text: notes can quote code that is

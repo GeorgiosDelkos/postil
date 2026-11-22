@@ -61,6 +61,8 @@ const state = {
   expanded: new Set(),
   // The index of the highlighted row while the file filter has text.
   activeMatch: 0,
+  // Whether the Rust process has a project open; without one, the welcome screen shows.
+  projectOpen: false,
   // The rendered window of lines: [first, last).
   rendered: { first: 0, last: 0 },
 };
@@ -972,6 +974,11 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     filterEl.focus();
     filterEl.select();
+  } else if (event.key === "o" && event.metaKey) {
+    event.preventDefault();
+    chooseFolder();
+  } else if (event.key === "Escape" && !welcomeEl.hidden && state.projectOpen) {
+    hideWelcome();
   }
 });
 
@@ -980,6 +987,10 @@ window.addEventListener("keydown", (event) => {
 // read again on return and drawn once, so the notes never show on the old text. Not while
 // the composer is open: reading the file again would move its lines under the text.
 async function refresh() {
+  if (!state.projectOpen) {
+    if (!welcomeEl.hidden) await loadRecent();
+    return;
+  }
   if (state.composer) return;
   const path = state.wanted;
   const [repo, notes, file] = await Promise.all([
@@ -1060,8 +1071,100 @@ function showRepo(repo) {
   state.repo = repo;
   state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
+  $("repo-name").title = `${repo.root}\nSwitch project (⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
+  // Set once by the Rust process when the recent projects could not be updated. It does
+  // not stop anything, so it is a line under the branch, not a dialog.
+  const warning = $("repo-warning");
+  warning.hidden = !repo.warning;
+  if (repo.warning) warning.textContent = repo.warning;
 }
+
+// ---- Projects -------------------------------------------------------------------------
+//
+// One window shows one project. Without one, the welcome screen offers Open Folder, the
+// recent projects, and dropping a folder on the window. Opening another project replaces the
+// current one in the Rust process; the page then reloads, which resets everything it drew.
+
+const welcomeEl = $("welcome");
+
+// The Rust process calls this with the folder from the Open Folder dialog, or one dropped
+// on the window.
+window.postil = { openFolder: (path) => requestProject("api/open", path) };
+
+function chooseFolder() {
+  window.ipc.postMessage("choose-folder");
+}
+
+// Asks the Rust process to open `path` (`api/open`), or to make it a git repository first
+// (`api/init`). On success the page reloads into the project. A draft note would be lost by
+// the reload, so the composer keeps the focus instead.
+async function requestProject(route, path) {
+  if (state.composer?.text.trim()) {
+    hideWelcome();
+    state.composer.node.querySelector("textarea").focus();
+    return;
+  }
+  const response = await fetch(route, { method: "POST", body: JSON.stringify({ path }) });
+  if (response.ok) {
+    location.reload();
+    return;
+  }
+  // 422: the folder is not in a repository, which `git init` can fix in place.
+  showWelcome();
+  showWelcomeError(await response.text(), response.status === 422 ? path : null);
+}
+
+function showWelcomeError(text, folderToInit) {
+  $("welcome-error").hidden = false;
+  $("welcome-error-text").textContent = text;
+  const init = $("init-repo");
+  init.hidden = folderToInit === null;
+  init.onclick = () => requestProject("api/init", folderToInit);
+}
+
+function showWelcome() {
+  document.body.classList.add("welcome-mode");
+  welcomeEl.hidden = false;
+  const back = $("welcome-back");
+  back.hidden = !state.projectOpen;
+  if (state.projectOpen) back.textContent = `Back to ${state.repo.name}`;
+  loadRecent();
+  $("open-folder").focus();
+}
+
+function hideWelcome() {
+  document.body.classList.remove("welcome-mode");
+  welcomeEl.hidden = true;
+  $("welcome-error").hidden = true;
+  codeEl.focus();
+}
+
+async function loadRecent() {
+  const response = await fetch("api/recent");
+  const projects = response.ok ? await response.json() : [];
+  const recentEl = $("recent");
+  if (projects.length === 0) {
+    recentEl.replaceChildren(el("div", "recent-empty", "Projects you open appear here."));
+    return;
+  }
+  recentEl.replaceChildren(
+    ...projects.map((project) => {
+      const row = el("button", "recent-item");
+      row.type = "button";
+      row.disabled = !project.exists;
+      row.append(icon(folderIcon(project.name, false)), el("span", "recent-name", project.name));
+      const where = project.exists ? project.path : `${project.path} (moved or deleted)`;
+      row.append(el("span", "recent-path", where));
+      row.addEventListener("click", () => requestProject("api/open", project.path));
+      return row;
+    }),
+  );
+}
+
+$("open-folder").addEventListener("click", chooseFolder);
+$("welcome-back").addEventListener("click", hideWelcome);
+$("repo-name").addEventListener("click", showWelcome);
 
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.
@@ -1071,7 +1174,13 @@ async function start() {
     codeEmptyEl.textContent = await response.text();
     return;
   }
-  showRepo(await response.json());
+  const repo = await response.json();
+  if (repo === null) {
+    showWelcome();
+    return;
+  }
+  state.projectOpen = true;
+  showRepo(repo);
   renderFiles();
   await loadNotes();
 

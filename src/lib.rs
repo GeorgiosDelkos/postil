@@ -8,9 +8,12 @@
 //! highlighted code view, and notes on line ranges, stored in the git directory and anchored
 //! by their text.
 
+mod dialog;
 mod error;
+mod files;
 mod highlight;
 mod notes;
+mod recent;
 mod repo;
 mod shell;
 
