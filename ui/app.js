@@ -1106,6 +1106,8 @@ window.addEventListener("keydown", (event) => {
 // switching projects) first sends the engineer back to it. Returns whether there is one.
 function guardDraft(action) {
   if (!state.composer?.text.trim()) return false;
+  // The note must be in view to be saved or discarded.
+  if (settingsEl.open) settingsEl.close();
   hideWelcome();
   const label = state.composer.node.querySelector(".composer-label");
   label.textContent = `Save or discard this note before ${action}.`;

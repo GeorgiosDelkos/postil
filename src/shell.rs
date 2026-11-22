@@ -95,7 +95,7 @@ enum AppEvent {
     DragWindow,
     /// The page asked for the folder dialog (Open Folder).
     ChooseFolder,
-    /// The page confirmed quitting (Quit or Close Window, from the menu or the keys): no
+    /// The page confirmed quitting (Quit or Close Window from the menu, or the close button): no
     /// draft note would be lost.
     Quit,
     /// A folder (or file) was dropped on the window.
@@ -218,11 +218,22 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     event_loop.run_return(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
+            // The close button asks the page, as Close Window does, so a draft note stops it
+            // too; the page answers with `quit` when nothing would be lost. A page without
+            // `window.postil` (app.js failed to load) posts `quit` itself, so the window always
+            // closes. Only a page stuck in a script would keep it open, as it would keep the
+            // menu's Quit from acting too; Force Quit remains.
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
+            } => {
+                let ask = "window.postil ? window.postil.menu(\"close-window\") \
+                           : window.ipc.postMessage(\"quit\")";
+                if webview.evaluate_script(ask).is_err() {
+                    *control_flow = ControlFlow::Exit;
+                }
             }
-            | Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
             // The system switched between light and dark while the window follows it.
             Event::WindowEvent {
                 event: WindowEvent::ThemeChanged(theme),
