@@ -136,6 +136,8 @@ schedule three tasks.
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
 | `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
+| `src/menu.rs` | The macOS menu bar through `muda`; its commands run in the page. |
+| `scripts/bundle.sh` | Builds `target/release/Postil.app` with the icon from `assets/`. |
 | `src/acp/wire.rs` | Serde types for the ACP messages the app sends and receives. |
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
@@ -421,7 +423,13 @@ retired; the measured numbers above are the baseline to not regress.
    app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
-5. **Polish.** Motion, focus mode, `agents.json`, an app bundle for macOS.
+5. **Polish.** Motion, focus mode, `agents.json`, an app bundle for macOS. Started early, at
+   the owner's request (2026-11-22): a menu bar (Postil, File, Edit, View, Window) through
+   `muda`, 13 more crates, because AppKit menus by hand need `unsafe` for their actions; and
+   `scripts/bundle.sh`, which wraps the release binary in `Postil.app` with the icon (a white
+   P on black, drawn by `assets/make-icon.swift`). The Dock, Finder and Cmd-Tab show the icon
+   only for the bundle, since macOS reads it from `Info.plist`; `cargo run` shows the generic
+   one. Not yet: signing, notarizing, or installing into `/Applications`.
 
 ## Testing
 
