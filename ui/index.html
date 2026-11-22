@@ -20,6 +20,18 @@
     <input id="filter" type="text" placeholder="Find file" autocomplete="off" spellcheck="false">
   </div>
   <div class="files" id="files"></div>
+  <div class="sidebar-footer">
+    <button type="button" class="settings-button" id="open-settings" title="Settings (⌘,)">
+      <svg class="settings-glyph" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M2 4.5h6M12 4.5h2M2 8h1.5M7.5 8H14M2 11.5h8M14 11.5h0"/>
+        <circle cx="10" cy="4.5" r="1.75"/>
+        <circle cx="5.5" cy="8" r="1.75"/>
+        <circle cx="12" cy="11.5" r="1.75"/>
+      </svg>
+      <span>Settings</span>
+      <kbd>⌘,</kbd>
+    </button>
+  </div>
 </nav>
 
 <main class="pane code-pane">
@@ -63,6 +75,8 @@
 </section>
 
 <div class="toast" id="toast" role="status" hidden></div>
+
+<dialog class="settings" id="settings" aria-labelledby="settings-title" tabindex="-1"></dialog>
 
 <div class="context-menu" id="context-menu" role="menu" aria-label="Actions on the selected lines" tabindex="-1" hidden></div>
 

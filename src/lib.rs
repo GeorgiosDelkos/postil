@@ -8,6 +8,7 @@
 //! highlighted code view, and notes on line ranges, stored in the git directory and anchored
 //! by their text.
 
+mod agents;
 mod dialog;
 mod error;
 mod files;
@@ -17,6 +18,7 @@ mod menu;
 mod notes;
 mod recent;
 mod repo;
+mod settings;
 mod shell;
 
 pub use crate::error::Error;

@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 use wry::{DragDropEvent, WebView, WebViewBuilder};
 
+use crate::agents::{self, BUILT_IN, Scanner};
 use crate::dialog;
 use crate::error::{Error, Result};
 use crate::files::config_dir;
@@ -31,6 +33,7 @@ use crate::highlight::{Highlighter, Token};
 use crate::notes::{self, NewNote};
 use crate::recent;
 use crate::repo::Repo;
+use crate::settings::{self, Settings};
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_CSS: &str = include_str!("../ui/app.css");
@@ -38,9 +41,14 @@ const APP_JS: &str = include_str!("../ui/app.js");
 const FUZZY_JS: &str = include_str!("../ui/fuzzy.js");
 const TREE_JS: &str = include_str!("../ui/tree.js");
 const ICONS_JS: &str = include_str!("../ui/icons.js");
+const SETTINGS_JS: &str = include_str!("../ui/settings.js");
+const SETTINGS_DIALOG_JS: &str = include_str!("../ui/settings-dialog.js");
 const ICONS_SVG: &str = include_str!("../ui/icons.svg");
 const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
 const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
+
+/// The settings' file name in the configuration directory.
+const SETTINGS_FILE: &str = "settings.json";
 
 /// The `--canvas` colors of `ui/app.css`, painted behind the page so the window does not
 /// flash white before the first frame.
@@ -92,6 +100,8 @@ enum AppEvent {
     Quit,
     /// A folder (or file) was dropped on the window.
     Dropped(PathBuf),
+    /// The page saved a theme setting, to apply to the window.
+    SetTheme(settings::Theme),
     /// A menu command was chosen; the page carries it out.
     #[cfg(target_os = "macos")]
     Menu(crate::menu::Command),
@@ -109,6 +119,9 @@ impl AppEvent {
             "choose-folder" => Some(Self::ChooseFolder),
             "quit" => Some(Self::Quit),
             "bench-painted" => Some(Self::BenchPainted),
+            "theme:system" => Some(Self::SetTheme(settings::Theme::System)),
+            "theme:light" => Some(Self::SetTheme(settings::Theme::Light)),
+            "theme:dark" => Some(Self::SetTheme(settings::Theme::Dark)),
             _ => body
                 .strip_prefix("bench:")
                 .map(|report| Self::BenchDone(report.to_owned())),
@@ -116,26 +129,39 @@ impl AppEvent {
     }
 }
 
-fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
-    let started = Instant::now();
-    // Without a configuration directory the recent list is off, which the page says once a
-    // project is open: the list is a convenience, so it never stops the app from starting.
-    let site = Site::new(config_dir().ok().map(|dir| dir.join("recent.json")), bench);
-    if let Some(dir) = dir {
-        site.open(Repo::open(dir)?);
+/// The site the page talks to, with the start-up project open (see [`startup_repo`]), and
+/// the settings the window starts with.
+fn start_site(dir: Option<&Path>, bench: Option<&str>) -> Result<(Site, Settings)> {
+    // Without a configuration directory the recent list and the settings are off, which the
+    // page says: both are conveniences, so they never stop the app from starting.
+    let config = config_dir().ok();
+    let settings = config.as_ref().map_or_else(Settings::default, |dir| {
+        settings::load(&dir.join(SETTINGS_FILE)).settings
+    });
+    // A benchmark measures the window, so it does not spend a core asking the login shell.
+    let agents = match bench {
+        Some(_) => Scanner::new(OsString::new),
+        None => Scanner::new(agents::search_path),
+    };
+    let site = Site::new(config.as_deref(), bench, agents);
+    if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
+        site.open(repo);
     }
     // A benchmark of a file that cannot be read would time an empty pane and report it as a
     // result. Fail here instead, before the window opens.
     if let Some(file) = bench {
         site.repo()?.read(file)?;
     }
+    Ok((site, settings))
+}
+
+fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
+    let started = Instant::now();
+    let (site, settings) = start_site(dir, bench)?;
 
     let mut event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
-    let window = build_window(&event_loop)?;
-    let canvas = match window.theme() {
-        Theme::Dark => DARK_CANVAS,
-        _ => LIGHT_CANVAS,
-    };
+    let window = build_window(&event_loop, settings.theme)?;
+    let canvas = canvas_color(window.theme());
 
     // The menu bar lives as long as this function, which is as long as the app.
     #[cfg(target_os = "macos")]
@@ -197,6 +223,11 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 ..
             }
             | Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            // The system switched between light and dark while the window follows it.
+            Event::WindowEvent {
+                event: WindowEvent::ThemeChanged(theme),
+                ..
+            } => drop(webview.set_background_color(canvas_color(theme))),
             Event::UserEvent(AppEvent::DragWindow) => {
                 // Fails when the pointer button is already up again: there is then nothing
                 // to drag.
@@ -208,6 +239,12 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 }
             }
             Event::UserEvent(AppEvent::Dropped(path)) => offer_folder(&webview, &path),
+            Event::UserEvent(AppEvent::SetTheme(theme)) => {
+                window.set_theme(window_theme(theme));
+                // Behind the page, seen where it has not painted yet, such as during a resize.
+                // Fails only when the webview is being torn down.
+                drop(webview.set_background_color(canvas_color(window.theme())));
+            }
             #[cfg(target_os = "macos")]
             Event::UserEvent(AppEvent::Menu(command)) => {
                 // The id is one of `Command::id`'s fixed ASCII names, safe inside quotes.
@@ -299,8 +336,51 @@ fn offer_folder(webview: &WebView, folder: &Path) {
     drop(webview.evaluate_script(&format!("window.postil?.openFolder({path})")));
 }
 
-fn build_window(event_loop: &EventLoop<AppEvent>) -> Result<Window> {
+/// The project to open at start: the one containing `dir` when given, else the most recent
+/// project when the settings ask for it and it still opens, else none (the welcome screen).
+///
+/// # Errors
+///
+/// As [`Repo::open`], for `dir` only: a recent project that no longer opens is skipped, and
+/// the welcome screen lists it as missing.
+fn startup_repo(
+    dir: Option<&Path>,
+    settings: &Settings,
+    recent_file: Option<&Path>,
+) -> Result<Option<Repo>> {
+    if let Some(dir) = dir {
+        return Repo::open(dir).map(Some);
+    }
+    if !settings.reopen_last_project {
+        return Ok(None);
+    }
+    let recent = recent_file.map_or_else(Vec::new, recent::list);
+    let last = recent.first();
+    Ok(last.and_then(|root| Repo::open(Path::new(root)).ok()))
+}
+
+/// The colour painted behind the page in `theme`: the page's `--canvas`.
+fn canvas_color(theme: Theme) -> (u8, u8, u8, u8) {
+    match theme {
+        Theme::Dark => DARK_CANVAS,
+        _ => LIGHT_CANVAS,
+    }
+}
+
+/// The window appearance for a theme setting; `None` follows the system.
+fn window_theme(theme: settings::Theme) -> Option<Theme> {
+    match theme {
+        settings::Theme::System => None,
+        settings::Theme::Light => Some(Theme::Light),
+        settings::Theme::Dark => Some(Theme::Dark),
+    }
+}
+
+/// Builds the window. Its appearance also sets the page's: WebKit answers the page's
+/// `prefers-color-scheme` from the window, so `ui/app.css` needs no theme of its own.
+fn build_window(event_loop: &EventLoop<AppEvent>, theme: settings::Theme) -> Result<Window> {
     let builder = WindowBuilder::new()
+        .with_theme(window_theme(theme))
         .with_title("Postil")
         .with_inner_size(LogicalSize::new(1440.0, 900.0));
 
@@ -337,6 +417,11 @@ struct Site {
     /// directory is unknown, which turns the list off. `config_dir` fails only with
     /// `Error::NoHome`, which is the reason `open` gives for a `None` here.
     recent_file: Option<PathBuf>,
+    /// Where the settings are kept (`settings.rs`); `None`, for the same reason as
+    /// `recent_file`, turns them off: the defaults apply and saving fails.
+    settings_file: Option<PathBuf>,
+    /// Where agents' programs are looked for, found in the background.
+    agents: Scanner,
 }
 
 /// The open project.
@@ -368,6 +453,44 @@ struct RecentProject {
     exists: bool,
 }
 
+/// The reply to `/api/settings`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsView<'a> {
+    settings: &'a Settings,
+    /// Why the settings file is not in use; saving is refused while this is set.
+    problem: Option<String>,
+    /// The file's revision, which a save names (`settings::save`).
+    revision: String,
+    /// The settings file, for the dialog to name; `None` without a home directory.
+    file: Option<String>,
+    /// Every agent, built-in ones first; `None` while the agent scan runs.
+    agents: Option<Vec<AgentView<'a>>>,
+    /// The smallest and largest code font size.
+    font_sizes: [u8; 2],
+    tab_widths: [u8; 3],
+}
+
+/// The body of `PUT /api/settings`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveSettings {
+    /// The revision of the settings file the change started from.
+    revision: String,
+    settings: Settings,
+}
+
+/// An agent as the settings dialog lists it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentView<'a> {
+    name: &'a str,
+    command: &'a str,
+    built_in: bool,
+    /// Where the agent's program is; `None` when it is not installed.
+    found: Option<String>,
+}
+
 /// The body of `POST /api/open` and `POST /api/init`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -391,12 +514,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Site {
-    fn new(recent_file: Option<PathBuf>, bench: Option<&str>) -> Self {
+    /// A site with no project open, keeping its files in `config` (`None` turns the recent
+    /// list and the settings off).
+    fn new(config: Option<&Path>, bench: Option<&str>, agents: Scanner) -> Self {
         Self {
             project: Mutex::new(None),
             highlighter: Highlighter::new(),
             bench: bench.map(str::to_owned),
-            recent_file,
+            recent_file: config.map(|dir| dir.join("recent.json")),
+            settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
+            agents,
         }
     }
 
@@ -434,6 +561,12 @@ impl Site {
             "/fuzzy.js" => reply(StatusCode::OK, "text/javascript", FUZZY_JS.as_bytes()),
             "/tree.js" => reply(StatusCode::OK, "text/javascript", TREE_JS.as_bytes()),
             "/icons.js" => reply(StatusCode::OK, "text/javascript", ICONS_JS.as_bytes()),
+            "/settings.js" => reply(StatusCode::OK, "text/javascript", SETTINGS_JS.as_bytes()),
+            "/settings-dialog.js" => reply(
+                StatusCode::OK,
+                "text/javascript",
+                SETTINGS_DIALOG_JS.as_bytes(),
+            ),
             "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
@@ -458,6 +591,25 @@ impl Site {
                     &b"GET the notes, POST a new one, or DELETE ?id=N1"[..],
                 ),
             },
+            "/api/settings" => match *request.method() {
+                Method::GET => reply(StatusCode::OK, "application/json", self.settings()),
+                Method::PUT => json_or_error(self.save_settings(request.body())),
+                _ => reply(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "text/plain",
+                    &b"GET the settings or PUT new ones"[..],
+                ),
+            },
+            "/api/settings/reset" if post => json_or_error(self.reset_settings()),
+            "/api/agents/rescan" if post => {
+                self.agents.rescan();
+                reply(StatusCode::OK, "application/json", self.settings())
+            }
+            "/api/settings/reset" | "/api/agents/rescan" => reply(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                &b"POST with no body"[..],
+            ),
             "/api/open" | "/api/init" => reply(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "text/plain",
@@ -550,6 +702,77 @@ impl Site {
         let review = notes::delete(&*self.repo()?, id)?;
         Ok(to_json(&review))
     }
+
+    /// The reply to `GET /api/settings`, and to every request that changes them: the
+    /// settings in effect, why the file is not used if it is not, and the agents.
+    fn settings(&self) -> Vec<u8> {
+        let (loaded, file) = match &self.settings_file {
+            Some(file) => (
+                settings::load(file),
+                Some(file.to_string_lossy().into_owned()),
+            ),
+            None => (
+                settings::Loaded {
+                    settings: Settings::default(),
+                    problem: Some(format!("settings are off: {}", Error::NoHome)),
+                    revision: String::new(),
+                },
+                None,
+            ),
+        };
+        let agents = self
+            .agents
+            .path()
+            .map(|path| agent_views(&loaded.settings, &path));
+        to_json(&SettingsView {
+            settings: &loaded.settings,
+            problem: loaded.problem,
+            revision: loaded.revision,
+            file,
+            agents,
+            font_sizes: [*settings::FONT_SIZES.start(), *settings::FONT_SIZES.end()],
+            tab_widths: settings::TAB_WIDTHS,
+        })
+    }
+
+    /// The reply to `PUT /api/settings`: checks and saves the settings in the body, if the
+    /// file is still at the revision the body names.
+    fn save_settings(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: SaveSettings = serde_json::from_slice(body)
+            .map_err(|error| Error::InvalidSettings(format!("unreadable request: {error}")))?;
+        let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
+        settings::save(file, &request.settings, &request.revision)?;
+        Ok(self.settings())
+    }
+
+    /// The reply to `POST /api/settings/reset`: writes the defaults over the file.
+    fn reset_settings(&self) -> Result<Vec<u8>> {
+        settings::reset(self.settings_file.as_deref().ok_or(Error::NoHome)?)?;
+        Ok(self.settings())
+    }
+}
+
+/// The built-in agents, then the custom ones, each with where its program was found on
+/// `search_path`.
+fn agent_views<'a>(settings: &'a Settings, search_path: &OsStr) -> Vec<AgentView<'a>> {
+    let found = |program: Option<&str>| {
+        program
+            .and_then(|program| agents::find_program(program, search_path))
+            .map(|path| path.to_string_lossy().into_owned())
+    };
+    let built_in = BUILT_IN.iter().map(|agent| AgentView {
+        name: agent.name,
+        command: agent.command,
+        built_in: true,
+        found: found(Some(agent.program)),
+    });
+    let custom = settings.custom_agents.iter().map(|agent| AgentView {
+        name: &agent.name,
+        command: &agent.command,
+        built_in: false,
+        found: found(agents::program_of(&agent.command)),
+    });
+    built_in.chain(custom).collect()
 }
 
 fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
@@ -569,8 +792,12 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::InvalidNote(_)
                 | Error::BadRequest(_)
                 | Error::NotAFolder { .. }
-                | Error::TooBroad { .. } => StatusCode::BAD_REQUEST,
-                Error::NoteTextChanged { .. } | Error::NoProject => StatusCode::CONFLICT,
+                | Error::TooBroad { .. }
+                | Error::InvalidSettings(_) => StatusCode::BAD_REQUEST,
+                Error::NoteTextChanged { .. }
+                | Error::NoProject
+                | Error::SettingsLocked(_)
+                | Error::SettingsChanged => StatusCode::CONFLICT,
                 Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
                 // The page tells this one apart: it offers to make the folder a repository.
                 Error::NotARepository { .. } => StatusCode::UNPROCESSABLE_ENTITY,
@@ -586,6 +813,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::InvalidReview { .. }
                 | Error::WriteReview { .. }
                 | Error::WriteRecent { .. }
+                | Error::WriteSettings { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
@@ -653,6 +881,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -694,11 +923,22 @@ mod tests {
             site
         }
 
-        /// A site with no project open, its recent list inside this repository's git
-        /// directory, where no file listing sees it and the drop below removes it.
+        /// A site with no project open, its configuration in [`Self::config`] and no agents
+        /// installed.
         fn empty_site(&self) -> Site {
-            Site::new(Some(self.root.join(".git/test-recent.json")), None)
+            Site::new(Some(&self.config()), None, no_agents())
         }
+
+        /// The configuration directory of this repository's sites: inside its git directory,
+        /// where no file listing sees it and the drop below removes it.
+        fn config(&self) -> PathBuf {
+            self.root.join(".git/test-config")
+        }
+    }
+
+    /// A scanner whose search path is empty: every agent is missing.
+    fn no_agents() -> Scanner {
+        Scanner::new(OsString::new)
     }
 
     impl Drop for TempRepo {
@@ -1346,9 +1586,8 @@ mod tests {
     fn a_recent_list_that_cannot_be_written_warns_and_the_project_still_opens() {
         let repo = TempRepo::new("recent-unwritable");
         // The list's path is a directory, so no file can be renamed onto it.
-        let recent = repo.root.join(".git/recent-dir");
-        fs::create_dir_all(recent.join("inside")).unwrap();
-        let site = Site::new(Some(recent), None);
+        fs::create_dir_all(repo.config().join("recent.json/inside")).unwrap();
+        let site = repo.empty_site();
 
         let (status, body) = post(
             &site,
@@ -1371,7 +1610,7 @@ mod tests {
     #[test]
     fn without_a_configuration_directory_the_recent_list_is_off_and_projects_open() {
         let repo = TempRepo::new("recent-off");
-        let site = Site::new(None, None);
+        let site = Site::new(None, None, no_agents());
 
         site.open(Repo::open(&repo.root).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
@@ -1386,8 +1625,8 @@ mod tests {
     fn a_benchmark_leaves_the_recent_list_alone() {
         let repo = TempRepo::new("recent-bench");
         repo.write("a.rs", "fn a() {}\n");
-        let recent = repo.root.join(".git/test-recent.json");
-        let site = Site::new(Some(recent.clone()), Some("a.rs"));
+        let recent = repo.config().join("recent.json");
+        let site = Site::new(Some(&repo.config()), Some("a.rs"), no_agents());
 
         site.open(Repo::open(&repo.root).unwrap());
         assert!(!recent.exists());
@@ -1429,10 +1668,7 @@ mod tests {
         let repo = TempRepo::new("subdir");
         repo.write("src/a.rs", "fn a() {}\n");
 
-        let site = Site::new(
-            Some(repo.root.join(".git/test-recent.json")),
-            Some("src/a.rs"),
-        );
+        let site = Site::new(Some(&repo.config()), Some("src/a.rs"), no_agents());
         site.open(Repo::open(&repo.root.join("src")).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
 
@@ -1582,5 +1818,508 @@ mod tests {
         assert_eq!(query_value("path=%4", "path"), None, "escape cut short");
         assert_eq!(query_value("path=%zz", "path"), None, "not hex");
         assert_eq!(query_value("path=%ff", "path"), None, "not UTF-8");
+    }
+
+    // ---- Settings ------------------------------------------------------------------------
+
+    const SETTINGS: &str = "postil://localhost/api/settings";
+
+    fn put(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .body(body.as_bytes().to_vec())
+            .unwrap();
+        let reply = site.respond(&request);
+        let body = String::from_utf8(reply.body().to_vec()).unwrap();
+        (reply.status(), body)
+    }
+
+    /// Saves `settings` (JSON text, possibly malformed) as the page does: naming the
+    /// revision of the file it last read.
+    fn save(site: &Site, settings: &str) -> (StatusCode, String) {
+        let revision = get_json(site, SETTINGS)["revision"].clone();
+        put(
+            site,
+            SETTINGS,
+            &format!("{{\"revision\": {revision}, \"settings\": {settings}}}"),
+        )
+    }
+
+    /// The settings view once the agent scan has finished, waiting at most five seconds.
+    fn scanned_settings(site: &Site) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let view = get_json(site, SETTINGS);
+            if !view["agents"].is_null() {
+                return view;
+            }
+            assert!(Instant::now() < deadline, "the agent scan did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Settings that pass every rule and differ from the defaults in every field.
+    fn custom_settings() -> serde_json::Value {
+        serde_json::json!({
+            "theme": "dark",
+            "codeFontSize": 15,
+            "tabWidth": 2,
+            "reopenLastProject": true,
+            "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
+            "enabledAgents": ["Grok", "Local"],
+            "agent": "Local",
+            "reviewers": ["Grok", "Grok"],
+        })
+    }
+
+    #[test]
+    fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
+        let repo = TempRepo::new("settings-saved");
+        let file = repo.config().join("settings.json");
+        let view = get_json(&repo.empty_site(), SETTINGS);
+        assert_eq!(view["settings"]["theme"], "system");
+        assert_eq!(view["settings"]["codeFontSize"], 13);
+        assert_eq!(view["settings"]["tabWidth"], 4);
+        assert_eq!(view["problem"], serde_json::Value::Null);
+        assert_eq!(view["file"], file.to_str().unwrap());
+        assert_eq!(view["fontSizes"], serde_json::json!([11, 20]));
+        assert_eq!(view["tabWidths"], serde_json::json!([2, 4, 8]));
+        assert!(!file.exists(), "reading the defaults writes nothing");
+
+        let (status, body) = save(&repo.empty_site(), &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            saved["settings"],
+            custom_settings(),
+            "the reply is the new settings"
+        );
+
+        let restarted = get_json(&repo.empty_site(), SETTINGS);
+        assert_eq!(restarted["settings"], custom_settings());
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(stored["version"], 1);
+        assert_eq!(stored["settings"], custom_settings());
+    }
+
+    #[test]
+    fn settings_that_break_a_rule_are_refused_and_nothing_is_written() {
+        let repo = TempRepo::new("settings-refused");
+        let site = repo.empty_site();
+        let file = repo.config().join("settings.json");
+        let with = |field: &str, value: serde_json::Value| {
+            let mut settings = custom_settings();
+            settings[field] = value;
+            settings.to_string()
+        };
+        let agent =
+            |name: &str, command: &str| serde_json::json!([{ "name": name, "command": command }]);
+        let cases = [
+            (
+                with("codeFontSize", 10.into()),
+                "code font size must be 11 to 20",
+            ),
+            (
+                with("codeFontSize", 21.into()),
+                "code font size must be 11 to 20",
+            ),
+            (with("tabWidth", 3.into()), "tab width must be 2, 4 or 8"),
+            (with("theme", "sepia".into()), "unknown variant `sepia`"),
+            (
+                with("customAgents", agent("claude", "x")),
+                "already an agent called \"claude\"",
+            ),
+            (
+                with("customAgents", agent(" Local", "x")),
+                "cannot be empty or start or end",
+            ),
+            (
+                with("customAgents", agent("", "x")),
+                "cannot be empty or start or end",
+            ),
+            (
+                with("customAgents", agent(&"a".repeat(41), "x")),
+                "at most 40 characters",
+            ),
+            (
+                with("customAgents", agent("Local", "  ")),
+                "needs a command",
+            ),
+            (
+                with("customAgents", agent("Local", "run \"a b\"")),
+                "cannot hold quotes",
+            ),
+            (
+                with("enabledAgents", serde_json::json!(["Nobody"])),
+                "no agent called \"Nobody\"",
+            ),
+            (
+                with("enabledAgents", serde_json::json!(["Grok", "Grok"])),
+                "enabled twice",
+            ),
+            (
+                with("agent", "Claude".into()),
+                "notes cannot go to \"Claude\"",
+            ),
+            (
+                with("reviewers", serde_json::json!(["Claude"])),
+                "\"Claude\" cannot review",
+            ),
+            (with("colour", "red".into()), "unknown field `colour`"),
+            ("not json".to_owned(), "unreadable request"),
+        ];
+        for (body, expected) in cases {
+            let (status, reply) = save(&site, &body);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+            assert!(reply.starts_with("cannot save the settings: "), "{reply}");
+            assert!(reply.contains(expected), "{body}: {reply}");
+        }
+        let two_locals = serde_json::json!([
+            { "name": "Local", "command": "a" },
+            { "name": "LOCAL", "command": "b" },
+        ]);
+        let (status, reply) = save(&site, &with("customAgents", two_locals));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            reply.contains("already an agent called \"LOCAL\""),
+            "{reply}"
+        );
+        assert!(!file.exists());
+
+        // The limits themselves are allowed: a 40 character name, sizes 11 and 20.
+        let longest = "a".repeat(40);
+        let mut at_limits = custom_settings();
+        at_limits["customAgents"] = serde_json::json!([{ "name": longest, "command": "x" }]);
+        at_limits["enabledAgents"] = serde_json::json!([longest]);
+        at_limits["agent"] = longest.into();
+        at_limits["reviewers"] = serde_json::json!([]);
+        for size in [11, 20] {
+            at_limits["codeFontSize"] = size.into();
+            let (status, reply) = save(&site, &at_limits.to_string());
+            assert_eq!(status, StatusCode::OK, "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
+        let repo = TempRepo::new("settings-broken");
+        let site = repo.empty_site();
+        let file = repo.config().join("settings.json");
+        fs::create_dir_all(repo.config()).unwrap();
+        let unusable = [
+            (
+                "{ \"version\": 1, \"settings\": { \"theme\": ",
+                "is not valid settings JSON",
+            ),
+            (
+                "{\"version\": 2, \"settings\": {}}",
+                "written by a newer Postil (format version 2)",
+            ),
+            (
+                "{\"version\": 0, \"settings\": {}}",
+                "unknown format version 0",
+            ),
+            (
+                "{\"version\": 1, \"settings\": {\"tabWidth\": 5}}",
+                "breaks a rule: the tab width must be 2, 4 or 8, not 5",
+            ),
+        ];
+        for (text, expected) in unusable {
+            fs::write(&file, text).unwrap();
+            let view = get_json(&site, SETTINGS);
+            let problem = view["problem"].as_str().unwrap();
+            assert!(problem.contains(expected), "{problem}");
+            assert!(problem.contains("saving is off until"), "{problem}");
+            assert_eq!(view["settings"]["tabWidth"], 4, "the defaults are in use");
+
+            let (status, reply) = save(&site, &custom_settings().to_string());
+            assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+            assert!(reply.contains(expected), "{reply}");
+            assert_eq!(fs::read_to_string(&file).unwrap(), text, "left as it was");
+        }
+
+        let (status, reply) = post(&site, "postil://localhost/api/settings/reset", "");
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let view: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(view["problem"], serde_json::Value::Null);
+        assert_eq!(view["settings"]["tabWidth"], 4);
+        let (status, reply) = save(&site, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "saving works again: {reply}");
+    }
+
+    #[test]
+    fn a_save_from_before_another_change_is_refused_and_the_other_change_kept() {
+        let repo = TempRepo::new("settings-changed");
+        let file = repo.config().join("settings.json");
+        let (status, reply) = save(&repo.empty_site(), &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
+
+        // A window reads the settings; then a hand edit (or another window) changes them.
+        let site = repo.empty_site();
+        let stale = get_json(&site, SETTINGS)["revision"].clone();
+        let edited = "{\"version\": 1, \"settings\": {\"theme\": \"light\"}}";
+        fs::write(&file, edited).unwrap();
+
+        let body = format!(
+            "{{\"revision\": {stale}, \"settings\": {}}}",
+            custom_settings()
+        );
+        let (status, reply) = put(&site, SETTINGS, &body);
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        assert!(
+            reply.contains("the file changed since this window read it"),
+            "{reply}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            edited,
+            "the other change is kept"
+        );
+
+        // Read again, the window saves on top of the edit.
+        let fresh = get_json(&site, SETTINGS);
+        assert_eq!(fresh["settings"]["theme"], "light");
+        assert_ne!(fresh["revision"], stale);
+        let (status, reply) = save(&site, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+
+    #[test]
+    fn a_settings_file_written_by_hand_may_name_only_what_it_changes() {
+        let repo = TempRepo::new("settings-partial");
+        fs::create_dir_all(repo.config()).unwrap();
+        fs::write(
+            repo.config().join("settings.json"),
+            "{\"version\": 1, \"settings\": {\"theme\": \"light\"}}",
+        )
+        .unwrap();
+        let view = get_json(&repo.empty_site(), SETTINGS);
+        assert_eq!(view["problem"], serde_json::Value::Null);
+        assert_eq!(view["settings"]["theme"], "light");
+        assert_eq!(view["settings"]["codeFontSize"], 13);
+        assert_eq!(view["settings"]["enabledAgents"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn without_a_configuration_directory_settings_are_the_defaults_and_cannot_be_saved() {
+        let site = Site::new(None, None, no_agents());
+        let view = get_json(&site, SETTINGS);
+        assert_eq!(
+            view["problem"],
+            "settings are off: cannot find the home directory (is HOME set?)"
+        );
+        assert_eq!(view["file"], serde_json::Value::Null);
+        let (status, reply) = save(&site, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(reply, "cannot find the home directory (is HOME set?)");
+    }
+
+    #[test]
+    fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
+        let repo = TempRepo::new("settings-agents");
+        let bin = repo.root.join(".git/test-bin");
+        fs::create_dir_all(&bin).unwrap();
+        for program in ["grok", "local-agent"] {
+            let path = bin.join(program);
+            fs::write(&path, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The first scan finds `bin`; every later one finds nothing, so a rescan shows.
+        let scans = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&scans);
+        let first_path = bin.clone().into_os_string();
+        let site = Site::new(
+            Some(&repo.config()),
+            None,
+            Scanner::new(move || {
+                let mut scans = lock(&counter);
+                *scans += 1;
+                if *scans == 1 {
+                    first_path.clone()
+                } else {
+                    OsString::new()
+                }
+            }),
+        );
+        let (status, body) = save(&site, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let agents = scanned_settings(&site)["agents"].clone();
+        let names: Vec<&str> = agents
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Claude", "Codex", "Gemini", "Grok", "OpenCode", "Local"]
+        );
+        let agent = |name: &str| {
+            agents
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(agent("Grok")["found"], bin.join("grok").to_str().unwrap());
+        assert_eq!(agent("Grok")["command"], "grok agent stdio");
+        assert_eq!(agent("Grok")["builtIn"], true);
+        assert_eq!(agent("Claude")["found"], serde_json::Value::Null);
+        assert_eq!(
+            agent("Local")["found"],
+            bin.join("local-agent").to_str().unwrap()
+        );
+        assert_eq!(agent("Local")["builtIn"], false);
+
+        // A rescan starts over, and its result replaces the first one.
+        let (status, body) = post(&site, "postil://localhost/api/agents/rescan", "");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rescanned = scanned_settings(&site)["agents"].clone();
+        let found: Vec<&serde_json::Value> = rescanned
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| &agent["found"])
+            .collect();
+        assert!(found.iter().all(|found| found.is_null()), "{rescanned}");
+        assert_eq!(*lock(&scans), 2);
+
+        // Reset and rescan change state, so they take POST only.
+        for route in ["api/settings/reset", "api/agents/rescan"] {
+            let (status, _) = get(&site, &format!("postil://localhost/{route}"));
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{route}");
+        }
+        assert_eq!(*lock(&scans), 2, "a refused rescan does not scan");
+        assert_eq!(
+            get_json(&site, SETTINGS)["settings"],
+            custom_settings(),
+            "nor reset"
+        );
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_or_written_say_so() {
+        let repo = TempRepo::new("settings-io");
+        // A directory where the settings file should be cannot be read as one.
+        fs::create_dir_all(repo.config().join("settings.json")).unwrap();
+        let site = repo.empty_site();
+        let problem = get_json(&site, SETTINGS)["problem"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            problem.contains("settings.json cannot be read"),
+            "{problem}"
+        );
+        let (status, reply) = save(&site, &custom_settings().to_string());
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        assert!(
+            reply.ends_with("(fix the file, or reset the settings)"),
+            "{reply}"
+        );
+
+        // A read-only configuration directory: the file is missing, so saving may go ahead,
+        // and then the write fails.
+        let blocked = TempRepo::new("settings-unwritable");
+        fs::create_dir_all(blocked.config()).unwrap();
+        fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o555)).unwrap();
+        let (status, reply) = save(&blocked.empty_site(), &custom_settings().to_string());
+        // Writable again, so the repository's drop can remove it.
+        fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+        assert!(reply.contains("the settings were not saved"), "{reply}");
+    }
+
+    #[test]
+    fn every_page_module_is_served() {
+        // The page imports its modules by name; one left out of `respond` stops the page.
+        let site = Site::new(None, None, no_agents());
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        for entry in fs::read_dir(&ui).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let path = Path::new(&name);
+            let script = path.extension().is_some_and(|extension| extension == "js");
+            let test = path
+                .file_stem()
+                .is_some_and(|stem| stem.to_string_lossy().ends_with(".test"));
+            if !script || test {
+                continue;
+            }
+            let (status, body) = get(&site, &format!("postil://localhost/{name}"));
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(body, fs::read_to_string(ui.join(&name)).unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_window_paints_the_page_s_canvas_colour_in_each_theme() {
+        // app.css declares --canvas once for the dark palette (first) and once for the light
+        // one; the window paints the same colour behind the page so nothing flashes.
+        let hex: Vec<(u8, u8, u8, u8)> = APP_CSS
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("--canvas: #"))
+            .map(|value| {
+                let channel = |at: usize| u8::from_str_radix(&value[at..at + 2], 16).unwrap();
+                (channel(0), channel(2), channel(4), 0xff)
+            })
+            .collect();
+        assert_eq!(hex, [canvas_color(Theme::Dark), canvas_color(Theme::Light)]);
+    }
+
+    #[test]
+    fn the_page_names_each_theme_as_the_settings_file_does() {
+        // ui/app.js posts `theme:${settings.theme}`, the theme as api/settings sends it.
+        for theme in [
+            settings::Theme::System,
+            settings::Theme::Light,
+            settings::Theme::Dark,
+        ] {
+            let name = serde_json::to_value(theme).unwrap();
+            let message = format!("theme:{}", name.as_str().unwrap());
+            let Some(AppEvent::SetTheme(parsed)) = AppEvent::parse(&message) else {
+                panic!("{message} is not a theme message");
+            };
+            assert_eq!(serde_json::to_value(parsed).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn the_last_project_reopens_only_when_the_settings_ask_and_it_still_opens() {
+        let repo = TempRepo::new("settings-reopen");
+        let other = TempRepo::new("settings-reopen-other");
+        let recent = repo.config().join("recent.json");
+        recent::record(&recent, Path::new(&site_root(&other.root))).unwrap();
+        let reopen = Settings {
+            reopen_last_project: true,
+            ..Settings::default()
+        };
+        let root = |found: Option<Repo>| found.map(|repo| repo.root().to_owned());
+
+        let opened = startup_repo(None, &reopen, Some(&recent)).unwrap();
+        assert_eq!(root(opened), Some(PathBuf::from(site_root(&other.root))));
+        let off = startup_repo(None, &Settings::default(), Some(&recent)).unwrap();
+        assert_eq!(root(off), None, "off by default");
+        let given = startup_repo(Some(&repo.root), &reopen, Some(&recent)).unwrap();
+        assert_eq!(
+            root(given),
+            Some(PathBuf::from(site_root(&repo.root))),
+            "a folder on the command line wins"
+        );
+        assert_eq!(root(startup_repo(None, &reopen, None).unwrap()), None);
+
+        let other_root = other.root.clone();
+        drop(other);
+        assert!(!other_root.exists());
+        let gone = startup_repo(None, &reopen, Some(&recent)).unwrap();
+        assert_eq!(
+            root(gone),
+            None,
+            "a project that is gone shows the welcome screen"
+        );
     }
 }

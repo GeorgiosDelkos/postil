@@ -134,6 +134,8 @@ schedule three tasks.
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
+| `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
+| `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
 | `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
 | `src/menu.rs` | The macOS menu bar through `muda`; its commands run in the page. |
@@ -142,6 +144,7 @@ schedule three tasks.
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables. |
+| `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
 
 ### Data structures
 
@@ -277,18 +280,52 @@ edits the file.
 
 ### Agents
 
-`~/.config/postil/agents.json` lists agents as a name and a command. Shipped defaults, to be
-confirmed against each tool when the ACP milestone starts:
+An agent is a name and the command that starts it as an ACP server. Postil ships a catalog
+(`src/agents.rs`, `BUILT_IN`) and finds which of them are installed; the engineer adds others
+in the settings. Each catalog command is confirmed end to end when the ACP milestone starts:
 
-| Name | Command | ACP support |
-|---|---|---|
-| Claude | `npx -y @agentclientprotocol/claude-agent-acp` | Adapter around Claude Code. |
-| Grok | `grok agent stdio` | Native. |
-| Codex | `npx -y @zed-industries/codex-acp` | Adapter. |
-| Gemini | `npx -y @google/gemini-cli --acp` | Native. |
+| Name | Found by | Command | ACP support |
+|---|---|---|---|
+| Claude | `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Adapter around Claude Code. |
+| Codex | `codex` | `npx -y @zed-industries/codex-acp` | Adapter. |
+| Gemini | `gemini` | `gemini --acp` | Native (`--acp` checked 2026-11-22). |
+| Grok | `grok` | `grok agent stdio` | Native (checked 2026-11-22). |
+| OpenCode | `opencode` | `opencode acp` | Native. |
 
-Any other ACP agent works by adding a line. Login is not handled in version 1 of the app: when an
-agent reports that it needs authentication, the run panel says which command to run in a terminal.
+Cursor's CLI (`cursor-agent`) had no ACP mode on 2026-11-22, so it is not in the catalog.
+
+An agent is installed when its program is on the search path: the login shell's `PATH`, then
+the app's own. An app opened from the Dock gets launchd's short `PATH`, which misses
+`~/.local/bin`, Homebrew and nvm, so the login shell is asked once, on a background thread,
+with a 5 second limit (`$SHELL -i -l -c`). The settings dialog has Rescan for an agent
+installed while the app runs.
+
+The settings (`~/.config/postil/settings.json`, below) keep which agents are turned on, the
+custom agents, the agent notes are sent to, and the reviewers: an ordered list of agents, the
+same one allowed more than once, that each review the agent's work in turn before it comes
+back to the engineer. An empty list means no review. The send step (milestone 3) uses the
+agent; the review step (milestone 4) runs the reviewers, and the send step can change the list
+for one send, for a change that needs more eyes. Asked for by the owner on 2026-11-22.
+
+Login is not handled in version 1 of the app: when an agent reports that it needs
+authentication, the run panel says which command to run in a terminal.
+
+### Settings
+
+`~/.config/postil/settings.json` (`src/settings.rs`), edited in the settings dialog: the Settings
+button at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change saves at once. The
+settings are the theme (system, light, dark), the code font size (11 to 20 px; the line
+height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
+reopens the last project, and the agents above.
+
+The theme is set on the window, and WebKit answers the page's `prefers-color-scheme` from the
+window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:
+one that cannot be read, does not parse, breaks a rule, or comes from a newer Postil leaves the
+defaults in effect and is never written over until the engineer chooses Reset in the dialog.
+Every reply carries the file's revision (a hash of its text), and a save names the revision
+it started from; a file changed since (another window, a hand edit) refuses the save, and the
+dialog shows the file as it now is. Without that, saving the whole settings would drop the
+other change.
 
 ## Dependencies
 
@@ -423,10 +460,12 @@ retired; the measured numbers above are the baseline to not regress.
    app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
-5. **Polish.** Motion, focus mode, `agents.json`, an app bundle for macOS. Started early, at
-   the owner's request (2026-11-22): a menu bar (Postil, File, Edit, View, Window) through
-   `muda`, 13 more crates, because AppKit menus by hand need `unsafe` for their actions; and
-   `scripts/bundle.sh`, which wraps the release binary in `Postil.app` with the icon (a white
+5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at
+   the owner's request (2026-11-22): the settings dialog and file, with agent detection,
+   custom agents, the agent and the reviewers (sections "Agents" and "Settings"; it replaces
+   the hand-edited `agents.json` planned before); a menu bar (Postil, File, Edit, View,
+   Window) through `muda`, 13 more crates, because AppKit menus by hand need `unsafe` for
+   their actions; and `scripts/bundle.sh`, which wraps the release binary in `Postil.app` with the icon (a white
    P on black, drawn by `assets/make-icon.swift`). The Dock, Finder and Cmd-Tab show the icon
    only for the bundle, since macOS reads it from `Info.plist`; `cargo run` shows the generic
    one. Not yet: signing, notarizing, or installing into `/Applications`.
