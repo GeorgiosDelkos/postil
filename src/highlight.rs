@@ -336,8 +336,9 @@ impl<'a> Lines<'a> {
     }
 
     fn finish(mut self) -> Vec<Vec<Token<'a>>> {
-        // A file that ends with a newline has no line after it.
-        if self.text.ends_with('\n') {
+        // A file that ends with a newline has no line after it, and an empty file has no
+        // lines at all: the count then agrees with `str::lines`, which `notes` uses.
+        if self.text.is_empty() || self.text.ends_with('\n') {
             self.lines.pop();
         }
         let text = self.text;
@@ -390,6 +391,32 @@ mod tests {
         for (path, text) in cases {
             let lines = highlighter.lines(path, text).unwrap();
             assert_eq!(rejoin(&lines), normalized(text), "{path}");
+        }
+    }
+
+    #[test]
+    fn every_short_text_keeps_its_text_and_its_line_count() {
+        // Every string of up to five characters from an alphabet that opens and closes Rust
+        // comments and strings and mixes both line endings. The fixed cases above miss what
+        // this found once: an empty file came back as one line.
+        let alphabet = ['a', '\n', '\r', '"', '/', '*'];
+        let highlighter = Highlighter::new();
+        let mut texts = vec![String::new()];
+        let mut longest = vec![String::new()];
+        for _ in 0..5 {
+            longest = longest
+                .iter()
+                .flat_map(|text| alphabet.iter().map(move |c| format!("{text}{c}")))
+                .collect();
+            texts.extend(longest.iter().cloned());
+        }
+
+        for text in &texts {
+            for path in ["a.rs", "a.txt"] {
+                let lines = highlighter.lines(path, text).unwrap();
+                assert_eq!(rejoin(&lines), normalized(text), "{path} {text:?}");
+                assert_eq!(lines.len(), text.lines().count(), "{path} {text:?}");
+            }
         }
     }
 
