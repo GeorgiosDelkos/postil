@@ -16,10 +16,11 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::WebViewBuilder;
 use wry::http::header::CONTENT_TYPE;
-use wry::http::{Request, Response, StatusCode};
+use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::error::{Error, Result};
 use crate::highlight::{Highlighter, Token};
+use crate::notes::{self, NewNote};
 use crate::repo::Repo;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -223,6 +224,15 @@ impl Site {
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
             "/api/repo" => json_or_error(self.repo_info()),
+            "/api/notes" => match *request.method() {
+                Method::GET => json_or_error(self.notes()),
+                Method::POST => json_or_error(self.add_note(request.body())),
+                _ => reply(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "text/plain",
+                    &b"GET the notes, or POST a new one"[..],
+                ),
+            },
             "/api/file" => match query_value(uri.query().unwrap_or(""), "path") {
                 Some(path) => json_or_error(self.file_view(&path)),
                 None => reply(
@@ -250,11 +260,29 @@ impl Site {
         let lines = self.highlighter.lines(path, &text)?;
         Ok(to_json(&FileView { path, lines }))
     }
+
+    /// The reply to `GET /api/notes`: every note, moved to where its snippet is now. Reads
+    /// the review file and never writes it.
+    fn notes(&self) -> Result<Vec<u8>> {
+        let review = notes::current(&self.repo.review_file(), |path| self.repo.read(path))?;
+        Ok(to_json(&review))
+    }
+
+    /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
+    /// notes.
+    fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let new: NewNote = serde_json::from_slice(body)
+            .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
+        let review = notes::add(&self.repo.review_file(), new, |path| self.repo.read(path))?;
+        Ok(to_json(&review))
+    }
 }
 
 fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
-    serde_json::to_vec(value)
-        .expect("the reply types hold only strings and sequences, which always serialize")
+    serde_json::to_vec(value).expect(
+        "the reply types are plain structs of strings, numbers, and sequences, which always \
+         serialize",
+    )
 }
 
 fn json_or_error(body: Result<Vec<u8>>) -> Reply {
@@ -262,7 +290,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
         Ok(body) => reply(StatusCode::OK, "application/json", body),
         Err(error) => {
             let status = match error {
-                Error::OutsideRepository { .. } => StatusCode::BAD_REQUEST,
+                Error::OutsideRepository { .. } | Error::InvalidNote(_) => StatusCode::BAD_REQUEST,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
@@ -391,6 +419,296 @@ mod tests {
         let (status, body) = get(site, uri);
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         serde_json::from_str(&body).unwrap()
+    }
+
+    const NOTES: &str = "postil://localhost/api/notes";
+
+    fn post(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .body(body.as_bytes().to_vec())
+            .unwrap();
+        let reply = site.respond(&request);
+        let body = String::from_utf8(reply.body().to_vec()).unwrap();
+        (reply.status(), body)
+    }
+
+    fn post_note(
+        site: &Site,
+        path: &str,
+        start: usize,
+        end: usize,
+        body: &str,
+    ) -> serde_json::Value {
+        let request = serde_json::json!({
+            "path": path,
+            "lines": { "start": start, "end": end },
+            "body": body,
+        });
+        let (status, reply) = post(site, NOTES, &request.to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    /// The notes' `[id, start, end, state]`, the fields that anchoring changes.
+    fn anchors(review: &serde_json::Value) -> Vec<(String, u64, u64, String)> {
+        review["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| {
+                (
+                    note["id"].as_str().unwrap().to_owned(),
+                    note["lines"]["start"].as_u64().unwrap(),
+                    note["lines"]["end"].as_u64().unwrap(),
+                    note["state"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn anchor(id: &str, start: u64, end: u64, state: &str) -> (String, u64, u64, String) {
+        (id.to_owned(), start, end, state.to_owned())
+    }
+
+    #[test]
+    fn notes_are_stored_in_the_git_dir_and_survive_a_restart() {
+        let repo = TempRepo::new("notes-store");
+        repo.write("src/a.rs", "fn a() {\n    one();\n    two();\n}\n");
+        let site = repo.site();
+
+        let review = post_note(&site, "src/a.rs", 2, 3, "  Merge these.\n");
+        let note = &review["notes"][0];
+        assert_eq!(note["id"], "N1");
+        assert_eq!(note["snippet"], "    one();\n    two();");
+        assert_eq!(note["body"], "Merge these.", "the body is trimmed");
+        assert_eq!(note["state"], "open");
+
+        let file = site.repo.review_file();
+        assert!(
+            file.ends_with(".git/postil/review.json"),
+            "{}",
+            file.display()
+        );
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(stored["version"], 1);
+        assert_eq!(stored["notes"], review["notes"]);
+
+        // A new process reads the same file.
+        let restarted = repo.site();
+        assert_eq!(get_json(&restarted, NOTES), review);
+        let review = post_note(&restarted, "src/a.rs", 1, 1, "Second.");
+        assert_eq!(
+            anchors(&review),
+            [anchor("N1", 2, 3, "open"), anchor("N2", 1, 1, "open")]
+        );
+    }
+
+    #[test]
+    fn notes_follow_their_text_when_the_file_changes() {
+        let repo = TempRepo::new("notes-follow");
+        repo.write("src/a.rs", "a\nb\nc\nd\n");
+        let site = repo.site();
+        post_note(&site, "src/a.rs", 2, 3, "On b and c.");
+
+        repo.write("src/a.rs", "new 1\nnew 2\na\nb\nc\nd\n");
+        assert_eq!(
+            anchors(&get_json(&site, NOTES)),
+            [anchor("N1", 4, 5, "open")]
+        );
+        // Reading never writes, so a hand edit cannot be overwritten by the page refreshing.
+        let stored = || -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(site.repo.review_file()).unwrap()).unwrap()
+        };
+        assert_eq!(anchors(&stored()), [anchor("N1", 2, 3, "open")]);
+
+        // Adding a note saves every note where it is now.
+        post_note(&site, "src/a.rs", 1, 1, "On new 1.");
+        assert_eq!(
+            anchors(&stored()),
+            [anchor("N1", 4, 5, "open"), anchor("N2", 1, 1, "open")]
+        );
+
+        repo.write("src/a.rs", "new 1\nnew 2\na\nb\nC\nd\n");
+        assert_eq!(
+            anchors(&get_json(&site, NOTES)),
+            [anchor("N1", 4, 5, "outdated"), anchor("N2", 1, 1, "open")],
+            "the snippet is gone: the note keeps its last saved lines"
+        );
+
+        repo.write("src/a.rs", "b\nc\n");
+        assert_eq!(
+            anchors(&get_json(&site, NOTES)),
+            [anchor("N1", 1, 2, "open"), anchor("N2", 1, 1, "outdated")]
+        );
+
+        fs::remove_file(repo.root.join("src/a.rs")).unwrap();
+        assert_eq!(
+            anchors(&get_json(&site, NOTES)),
+            [
+                anchor("N1", 4, 5, "outdated"),
+                anchor("N2", 1, 1, "outdated")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_review_file_that_cannot_be_read_or_written_is_reported_with_the_next_step() {
+        let repo = TempRepo::new("notes-io");
+        repo.write("a.txt", "x\n");
+        let site = repo.site();
+        let file = site.repo.review_file();
+        let request = r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":"b"}"#;
+
+        // review.json is a directory: it exists but cannot be read.
+        fs::create_dir_all(&file).unwrap();
+        let (status, reply) = get(&site, NOTES);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(reply.contains("cannot read"), "{reply}");
+        assert!(reply.contains(&*file.to_string_lossy()), "{reply}");
+        assert!(reply.contains("move it aside"), "{reply}");
+        assert!(
+            reply.contains("os error"),
+            "the cause reaches the page: {reply}"
+        );
+        fs::remove_dir(&file).unwrap();
+
+        // The postil directory is read-only: there is no review yet, and none can be written.
+        let dir = file.parent().unwrap();
+        let mut permissions = fs::metadata(dir).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(dir, permissions.clone()).unwrap();
+        let (status, reply) = post(&site, NOTES, request);
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "restores write access so the temporary repository can be removed"
+        )]
+        permissions.set_readonly(false);
+        fs::set_permissions(dir, permissions).unwrap();
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(reply.contains("cannot write"), "{reply}");
+        assert!(reply.contains("the note was not saved"), "{reply}");
+        assert_eq!(
+            fs::read_dir(dir).unwrap().count(),
+            0,
+            "no review and no temporary file is left behind"
+        );
+    }
+
+    #[test]
+    fn notes_written_into_the_file_by_hand_are_read_and_ids_continue_after_them() {
+        let repo = TempRepo::new("notes-by-hand");
+        repo.write("a.txt", "x\ny\n");
+        let site = repo.site();
+        let file = site.repo.review_file();
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let by_hand = r#"{"version": 1, "notes": [{"id": "N5", "path": "a.txt",
+            "lines": {"start": 2, "end": 2}, "snippet": "y", "body": "From a script.",
+            "state": "open"}]}"#;
+        fs::write(&file, by_hand).unwrap();
+
+        let unchanged = get_json(&site, NOTES);
+        assert_eq!(anchors(&unchanged), [anchor("N5", 2, 2, "open")]);
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            by_hand,
+            "nothing moved, so the file is not rewritten"
+        );
+
+        let review = post_note(&site, "a.txt", 1, 1, "Mine.");
+        assert_eq!(
+            anchors(&review),
+            [anchor("N5", 2, 2, "open"), anchor("N6", 1, 1, "open")]
+        );
+    }
+
+    #[test]
+    fn bad_note_requests_are_refused_and_nothing_is_written() {
+        let repo = TempRepo::new("notes-bad");
+        repo.write("a.txt", "x\ny\n");
+        let site = repo.site();
+
+        let cases = [
+            (
+                r#"{"path":"a.txt","lines":{"start":2,"end":3},"body":"b"}"#,
+                "past the end",
+            ),
+            (
+                r#"{"path":"a.txt","lines":{"start":0,"end":1},"body":"b"}"#,
+                "1-based",
+            ),
+            (
+                r#"{"path":"a.txt","lines":{"start":2,"end":1},"body":"b"}"#,
+                "1-based",
+            ),
+            (
+                r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":" \n"}"#,
+                "no text",
+            ),
+            (
+                r#"{"path":"../a.txt","lines":{"start":1,"end":1},"body":"b"}"#,
+                "inside",
+            ),
+            (r#"{"path":"a.txt","lines":{"start":1,"end":1}}"#, "body"),
+            (
+                r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":"b","x":1}"#,
+                "`x`",
+            ),
+            ("not json", "unreadable request"),
+        ];
+        for (request, expected) in cases {
+            let (status, reply) = post(&site, NOTES, request);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {reply}");
+            assert!(reply.contains(expected), "{request}: {reply}");
+        }
+        assert!(!site.repo.review_file().exists());
+
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(NOTES)
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            site.respond(&request).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+
+    #[test]
+    fn a_broken_review_file_is_reported_and_never_overwritten() {
+        let repo = TempRepo::new("notes-broken");
+        repo.write("a.txt", "x\n");
+        let site = repo.site();
+        let file = site.repo.review_file();
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let note = r#"{"id":"N1","path":"a.txt","lines":{"start":1,"end":1},"snippet":"x",
+            "body":"b","state":"open"}"#;
+
+        let cases = [
+            ("{\"version\": 1, \"notes\": [", "cannot parse".to_owned()),
+            (r#"{"version": 2, "notes": []}"#, "version 2".to_owned()),
+            (r#"{"notes": []}"#, "cannot parse".to_owned()),
+            (
+                &*format!(r#"{{"version": 1, "notes": [{note}, {note}]}}"#),
+                "N1 is used twice".to_owned(),
+            ),
+        ];
+        for (contents, expected) in cases {
+            fs::write(&file, contents).unwrap();
+
+            let (status, reply) = get(&site, NOTES);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{contents}");
+            assert!(reply.contains(&expected), "{contents}: {reply}");
+            assert!(reply.contains(&*file.to_string_lossy()), "{reply}");
+            assert!(reply.contains("move it aside"), "{reply}");
+
+            let request = r#"{"path":"a.txt","lines":{"start":1,"end":1},"body":"b"}"#;
+            let (status, _) = post(&site, NOTES, request);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{contents}");
+            assert_eq!(fs::read_to_string(&file).unwrap(), contents);
+        }
     }
 
     #[test]

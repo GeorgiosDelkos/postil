@@ -1,8 +1,8 @@
 # Postil: design plan
 
 Status: 2026-11-22. The UI layer is decided (a system webview through wry, core in Rust).
-Milestones 0 and 1 are built and uncommitted. Section "Decisions" lists what is settled and what
-is still assumed.
+Milestones 0, 1, and 2 are built. Section "Decisions" lists what is settled and what is still
+assumed.
 
 Mockups: https://claude.ai/code/artifact/68e1a720-a3d5-4d71-92d4-9acd76ea9d5e (private to the
 owner until shared).
@@ -169,6 +169,22 @@ enum NoteState {
   change. It sits inside the git directory, so it is never committed and needs no `.gitignore`
   entry. An agent or script can read and write notes by editing this file; the app reloads it on
   focus.
+
+As built in milestone 2 (`src/notes.rs`):
+
+- The file holds `{"version": 1, "notes": [...]}`; a note is `id` (`"N1"`), `path`, `lines`
+  (`{start, end}`, 1-based, inclusive), `snippet`, `body`, and `state`. Unknown fields are
+  refused, so a typo in a hand edit fails loudly instead of being dropped on the next write.
+- `state` has only `open` and `outdated` so far: `Sent` and `Resolved` arrive with the
+  milestones that set them. Open question for milestone 4: a sent note whose snippet the agent
+  replaced is expected, not outdated, so anchoring may need to be a field of its own beside the
+  lifecycle state rather than one more state.
+- The Rust process keeps no copy. Every `api/notes` request reads the file and relocates every
+  note. Only adding a note writes the file, with every note at its current place; reading never
+  writes, so the refresh on focus cannot overwrite a hand edit. A file that does not parse, has
+  another version, or repeats an id is reported with its path and never overwritten.
+- Writers are not locked against each other; a change made by someone else between an add's
+  read and its write (milliseconds) is lost. Acceptable while only the engineer adds notes.
 
 ### Working with the repository
 
@@ -358,6 +374,9 @@ retired; the measured numbers above are the baseline to not regress.
 1. **Read.** Open a repository, file tree, fuzzy finder, highlighting, both themes. Built: the
    finder is the sidebar's filter box (`Cmd-P` focuses it, arrows move, Enter opens).
 2. **Note.** Line selection, the composer, the tray, `review.json`, anchoring across file changes.
+   Built: the page saves through `POST api/notes` and reads the file and the notes again when
+   the window regains focus; outdated notes stay in the tray, dashed, and are not drawn on code.
+   Not built: editing or deleting a note in the app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
 5. **Polish.** Motion, focus mode, `agents.json`, an app bundle for macOS.

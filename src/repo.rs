@@ -14,15 +14,36 @@ use crate::error::{Error, Result};
 pub(crate) struct Repo {
     /// The top-level directory of the working tree.
     root: PathBuf,
+    /// This working tree's git directory: `.git`, or `.git/worktrees/<name>` for a linked
+    /// worktree, so each worktree keeps its own notes.
+    git_dir: PathBuf,
 }
 
 impl Repo {
     /// Finds the working tree that contains `dir`.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let root = git(dir, &["rev-parse", "--show-toplevel"])?;
+        // git prints one line per option, in the order asked.
+        let args = ["rev-parse", "--show-toplevel", "--absolute-git-dir"];
+        let paths = git(dir, &args)?;
+        let mut paths = paths.lines();
+        let (Some(root), Some(git_dir)) = (paths.next(), paths.next()) else {
+            return Err(Error::Git {
+                command: args.join(" "),
+                // git exited successfully and wrote nothing to stderr; this field then says
+                // what was wrong with its output instead.
+                stderr: "(no error output, but fewer than two lines on stdout)".to_owned(),
+            });
+        };
         Ok(Self {
-            root: PathBuf::from(root.trim_end_matches('\n')),
+            root: PathBuf::from(root),
+            git_dir: PathBuf::from(git_dir),
         })
+    }
+
+    /// Where this working tree's notes are stored. Inside the git directory, so the file is
+    /// never committed and needs no `.gitignore` entry.
+    pub(crate) fn review_file(&self) -> PathBuf {
+        self.git_dir.join("postil").join("review.json")
     }
 
     /// The directory name of the working tree, for display.

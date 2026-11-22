@@ -521,3 +521,21 @@ kbd {
   color: var(--accent);
   font-weight: 600;
 }
+
+/* A note whose text is no longer in its file. It stays in the tray at its last lines and is
+   not drawn on the code. */
+
+.note.outdated {
+  border-style: dashed;
+}
+
+.note.outdated .note-id,
+.note.outdated .note-body {
+  color: var(--text-muted);
+}
+
+/* The composer's label turns into the reason when saving fails; the text stays. */
+
+.composer-label.failed {
+  color: var(--text-strong);
+}

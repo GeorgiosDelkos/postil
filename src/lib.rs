@@ -4,11 +4,13 @@
 //! data and a page in the system webview draws it. The page is compiled into the binary and
 //! talks to this process over a private URL scheme.
 //!
-//! Built so far (milestones 0 and 1): the window, the file list with its fuzzy finder, and
-//! the highlighted code view.
+//! Built so far (milestones 0 to 2): the window, the file list with its fuzzy finder, the
+//! highlighted code view, and notes on line ranges, stored in the git directory and anchored
+//! by their text.
 
 mod error;
 mod highlight;
+mod notes;
 mod repo;
 mod shell;
 
