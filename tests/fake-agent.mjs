@@ -220,7 +220,8 @@ async function prompt(id, params) {
         });
         say(`read ${read.result.outcome.optionId}`);
         say(`saw the edit: ${blocks[0].includes("src/a.rs, before:\n```\na\n```\nafter:\n```\nb\n```")}`);
-        say('Found one.\n\n```json\n[{"note": "N1", "path": "a.txt", "line": 1, "finding": "a is too short", "fix": "say more"}]\n```');
+        // The fix quotes a fence, as a fix that shows a block does: the findings still read.
+        say('Found one.\n\n```json\n[{"note": "N1", "path": "a.txt", "line": 1, "finding": "a is too short", "fix": "say more, as ```json [] ``` does"}]\n```');
       } else {
         say(`judged: ${blocks[0].includes("F1 [N1] a.txt:1: a is too short") ? "saw F1" : "no F1"}`);
         say("F1: accepted - said more");
@@ -267,6 +268,21 @@ async function prompt(id, params) {
     case "exit-after-turn":
       send({ id, result: { stopReason: "end_turn" } });
       return process.exit(0);
+    case "exit-leaving-stderr": {
+      // A grandchild keeps standard error open after the agent exits, as one an agent starts
+      // can: the reader then waits out its grace for the agent's last words. Once the agent
+      // has exited (the grandchild gets a new parent), it writes `<pid file>.exited`, which a
+      // test cannot learn from the pid: an exited agent stays a zombie until it is reaped.
+      // The agent's pid, not the grandchild's first `ppid`: the agent may be gone by the time
+      // the grandchild runs.
+      const exited = JSON.stringify(`${extra[0]}.exited`);
+      const watch = `setInterval(() => {
+          if (process.ppid !== ${process.pid}) require("node:fs").writeFileSync(${exited}, "x");
+        }, 10);`;
+      spawn(process.execPath, ["-e", watch], { stdio: ["ignore", "ignore", "inherit"] });
+      send({ id, result: { stopReason: "end_turn" } });
+      return process.exit(0);
+    }
     case "garbage": {
       process.stdout.write("not json\n");
       send({ result: {} });
@@ -276,6 +292,14 @@ async function prompt(id, params) {
       say(`bad permission answered ${fs.error?.code}`);
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "long-line":
+      // A line of exactly the line limit the tests build with (`LINE_LIMIT` in
+      // src/acp/connection.rs, 1 MiB), newline included, which is read whole; then 1.5 MiB
+      // with no newline until the end, which is over it; then a message.
+      process.stdout.write(`${"y".repeat((1 << 20) - 1)}\n`);
+      process.stdout.write(`${"x".repeat(3 << 19)}\n`);
+      say("after the long line");
+      return send({ id, result: { stopReason: "end_turn" } });
     case "odd-error":
       // An error object without a code, though JSON-RPC requires one.
       return send({ id, error: { message: "no code here" } });
@@ -290,7 +314,7 @@ async function prompt(id, params) {
 }
 
 // These agents say who they are, so a test can check that they are gone.
-if (["silent", "exit-after-turn"].includes(scenario) && extra[0]) {
+if (["silent", "exit-after-turn", "exit-leaving-stderr"].includes(scenario) && extra[0]) {
   writeFileSync(extra[0], String(process.pid));
 }
 

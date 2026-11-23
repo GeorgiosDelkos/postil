@@ -366,7 +366,7 @@ export function statusLine(run) {
     case "failed":
       return { text: "Failed", tone: "failed" };
     default:
-      return { text: "Unfinished: Postil closed during it, or another window runs it", tone: "idle" };
+      return { text: "Unfinished: Postil crashed during it, or another window runs it", tone: "idle" };
   }
 }
 

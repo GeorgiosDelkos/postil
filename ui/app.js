@@ -1986,15 +1986,17 @@ function chooseFolder() {
 
 // Asks the Rust process to open `path` (`api/open`), or to make it a git repository first
 // (`api/init`). On success the page reloads into the project. A draft note would be lost by
-// the reload, so the composer keeps the focus instead.
-async function requestProject(route, path) {
+// the reload, so the composer keeps the focus instead. A run under way in the open project
+// is stopped only with `{ stop: true }`, sent once the engineer agreed: without it, opening
+// another project during a run answers 409.
+async function requestProject(route, path, { stop = false } = {}) {
   if (guardDraft("opening another project")) return;
   // A save still waiting would land in the next project: its folders are dropped instead.
   clearTimeout(foldersTimer);
   state.switching = true;
   let response;
   try {
-    response = await fetch(route, { method: "POST", body: JSON.stringify({ path }) });
+    response = await fetch(route, { method: "POST", body: JSON.stringify({ path, stop }) });
   } catch (error) {
     state.switching = false;
     showWelcome();
@@ -2006,17 +2008,30 @@ async function requestProject(route, path) {
     return;
   }
   state.switching = false;
-  // 422: the folder is not in a repository, which `git init` can fix in place.
   showWelcome();
-  showWelcomeError(await response.text(), response.status === 422 ? path : null);
+  if (response.status === 409) {
+    // WKWebView in wry shows no `confirm()` dialog, so the question is the welcome error.
+    const name = path.split("/").filter(Boolean).pop() ?? path;
+    showWelcomeError(`A run is in progress. Stop it and open ${name}?`, {
+      label: "Stop the run and open",
+      run: () => requestProject(route, path, { stop: true }),
+    });
+    return;
+  }
+  // 422: the folder is not in a repository, which `git init` can fix in place.
+  const init = { label: "Make it a git repository", run: () => requestProject("api/init", path) };
+  showWelcomeError(await response.text(), response.status === 422 ? init : null);
 }
 
-function showWelcomeError(text, folderToInit) {
+// Shows `text` on the welcome screen, with a button for `action` (`{ label, run }`) or none.
+function showWelcomeError(text, action) {
   $("welcome-error").hidden = false;
   $("welcome-error-text").textContent = text;
-  const init = $("init-repo");
-  init.hidden = folderToInit === null;
-  init.onclick = () => requestProject("api/init", folderToInit);
+  const button = $("welcome-error-action");
+  button.hidden = action === null;
+  if (action === null) return;
+  button.textContent = action.label;
+  button.onclick = action.run;
 }
 
 function showWelcome() {

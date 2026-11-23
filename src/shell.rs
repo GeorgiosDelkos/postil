@@ -227,7 +227,7 @@ fn start_site(dir: Option<&Path>, bench: Option<&str>, notify: Notify) -> Result
     };
     let site = Site::new(config.as_deref(), bench, agents, notify);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
-        site.open(repo);
+        site.open(repo, LiveRun::Stop)?;
     }
     // A benchmark of a file that cannot be read would time an empty pane and report it as a
     // result. Fail here instead, before the window opens.
@@ -778,6 +778,19 @@ struct PreviewView {
 #[serde(deny_unknown_fields)]
 struct FolderRequest {
     path: PathBuf,
+    /// Whether to stop a run under way in another project; refused (409) without it. The
+    /// page sends it once the engineer agreed.
+    #[serde(default)]
+    stop: bool,
+}
+
+/// What opening another project does while the open one has a run under way.
+#[derive(Debug, Clone, Copy)]
+enum LiveRun {
+    /// Refuses to open it, so the page can ask first.
+    Refuse,
+    /// Stops the run.
+    Stop,
 }
 
 /// The reply to `/api/file`.
@@ -832,7 +845,27 @@ impl Site {
 
     /// Makes `repo` the open project and puts it first among the recent projects. A
     /// benchmark does not count as opening: a scripted run must not reorder the list.
-    fn open(&self, repo: Repo) {
+    ///
+    /// Opening the project that is open keeps its runner, and with it a run under way and
+    /// the kept agent: the page only reloads. Opening another one stops the open project's
+    /// agent, and `live` says whether to do that during a run (decided with the owner on
+    /// 2026-11-23: the page asks first). No page request starts a run between the check and
+    /// the switch, because requests are answered one at a time (`respond` runs on the main
+    /// thread); a review's next stage, which starts without one, counts as under way
+    /// ([`Runner::busy`]). Takes the runner's slot lock under the project's; nothing takes
+    /// them the other way round.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RunInOpenProject`] when `live` is [`LiveRun::Refuse`], `repo` is another
+    /// project, and the open project has a run or a review under way.
+    fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
+        let mut project = lock(&self.project);
+        let open = project.as_ref();
+        let same = open.is_some_and(|open| open.repo.root() == repo.root());
+        if !same && matches!(live, LiveRun::Refuse) && open.is_some_and(|open| open.runner.busy()) {
+            return Err(Error::RunInOpenProject);
+        }
         let warning = match (&self.recent_file, &self.bench) {
             (_, Some(_)) => None,
             (None, None) => Some(format!("recent projects are off: {}", Error::NoHome)),
@@ -840,21 +873,28 @@ impl Site {
                 .err()
                 .map(|error| error_chain(&error)),
         };
+        if let Some(open) = project.as_mut().filter(|_| same) {
+            open.warning = warning;
+            return Ok(());
+        }
         let repo = Arc::new(repo);
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
             Arc::clone(&self.notify),
         );
-        let old = lock(&self.project).replace(Project {
+        let old = project.replace(Project {
             repo,
             runner,
             warning,
         });
-        // Stops the agent of the project this one replaces.
+        drop(project);
+        // Stops the agent of the project this one replaces, after the lock: that waits for
+        // its process.
         if let Some(old) = old {
             old.runner.close();
         }
+        Ok(())
     }
 
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
@@ -988,7 +1028,12 @@ impl Site {
     fn open_folder(&self, body: &[u8], open_repo: fn(&Path) -> Result<Repo>) -> Result<Vec<u8>> {
         let request: FolderRequest = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
-        self.open(open_repo(&request.path)?);
+        let live = if request.stop {
+            LiveRun::Stop
+        } else {
+            LiveRun::Refuse
+        };
+        self.open(open_repo(&request.path)?, live)?;
         Ok(b"{}".to_vec())
     }
 
@@ -1387,7 +1432,8 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
                 | Error::TurnRunning
-                | Error::RunElsewhere => StatusCode::CONFLICT,
+                | Error::RunElsewhere
+                | Error::RunInOpenProject => StatusCode::CONFLICT,
                 Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
                     StatusCode::NOT_FOUND
                 }
@@ -1518,7 +1564,8 @@ mod tests {
         /// A site with this repository open.
         fn site(&self) -> Site {
             let site = self.empty_site();
-            site.open(Repo::open(&self.root).unwrap());
+            site.open(Repo::open(&self.root).unwrap(), LiveRun::Stop)
+                .unwrap();
             site
         }
 
@@ -2211,7 +2258,8 @@ mod tests {
         let root = repo.root.clone();
         std::thread::spawn(move || {
             let site = Site::new(None, None, no_agents(), quiet());
-            site.open(Repo::open(&root).unwrap());
+            site.open(Repo::open(&root).unwrap(), LiveRun::Stop)
+                .unwrap();
             drop(sender.send(post(&site, NOTES, &new_note("a.txt", 1, 1, "x", "Hi."))));
         });
         let (status, reply) = replies
@@ -2514,7 +2562,8 @@ mod tests {
         let repo = TempRepo::new("recent-off");
         let site = Site::new(None, None, no_agents(), quiet());
 
-        site.open(Repo::open(&repo.root).unwrap());
+        site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         let info = get_json(&site, "postil://localhost/api/repo");
         assert_eq!(
             info["warning"],
@@ -2530,7 +2579,8 @@ mod tests {
         let recent = repo.config().join("recent.json");
         let site = Site::new(Some(&repo.config()), Some("a.rs"), no_agents(), quiet());
 
-        site.open(Repo::open(&repo.root).unwrap());
+        site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         assert!(!recent.exists());
         assert_eq!(
             get_json(&site, "postil://localhost/api/repo")["warning"],
@@ -2571,7 +2621,8 @@ mod tests {
         repo.write("src/a.rs", "fn a() {}\n");
 
         let site = Site::new(Some(&repo.config()), Some("src/a.rs"), no_agents(), quiet());
-        site.open(Repo::open(&repo.root.join("src")).unwrap());
+        site.open(Repo::open(&repo.root.join("src")).unwrap(), LiveRun::Stop)
+            .unwrap();
         let info = get_json(&site, "postil://localhost/api/repo");
 
         assert_eq!(info["files"], serde_json::json!(["src/a.rs"]));
@@ -3319,7 +3370,8 @@ mod tests {
             Scanner::new(move || path.clone()),
             notify,
         );
-        site.open(Repo::open(&repo.root).unwrap());
+        site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         set_agents(&site, &[("Fake", &fake_agent(scenario))], "Fake");
         (site, nudges)
     }
@@ -4104,6 +4156,51 @@ mod tests {
     }
 
     #[test]
+    fn a_send_that_fails_between_two_stages_leaves_the_review_going() {
+        let repo = TempRepo::new("run-review-refused-send");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        set_reviewers(
+            &site,
+            "plain",
+            &[("First", "reviewer"), ("Judge", "reviewer")],
+        );
+        let release = site.runner().unwrap().hold_next_stage();
+        let body = serde_json::json!({ "of": "R1" }).to_string();
+        assert_eq!(
+            post(&site, &format!("{RUN}/review"), &body).0,
+            StatusCode::OK
+        );
+        wait_for_run(&site, &nudges, "R2");
+        assert!(site.runner().unwrap().reviewing(), "the judge is next");
+
+        // A send between the proposer's end and the judge's start, whose log cannot be made.
+        let runs = repo.root.join(".git/postil/runs");
+        fs::set_permissions(&runs, fs::Permissions::from_mode(0o555)).unwrap();
+        let (status, body) = send(&site, &["N1"]);
+        fs::set_permissions(&runs, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        drop(release);
+
+        let judge = loop {
+            let run = get_json(&site, RUN);
+            if run["review"]["reviewer"] == 2 && run["status"] == "ended" {
+                break run;
+            }
+            nudges
+                .recv_timeout(WAIT)
+                .unwrap_or_else(|_| panic!("no judge after the refused send: {run}"));
+        };
+        assert!(
+            kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
+            "{judge}"
+        );
+    }
+
+    #[test]
     fn a_single_reviewer_only_proposes_and_a_send_after_a_review_starts_a_fresh_agent() {
         let repo = TempRepo::new("run-review-single");
         repo.write("a.txt", "a\nb\n");
@@ -4679,7 +4776,8 @@ mod tests {
         };
         assert!(alive(), "the agent is kept after its run");
 
-        site.open(Repo::open(&other.root).unwrap());
+        site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         assert!(!alive(), "opening another project stopped it");
         assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
     }
@@ -4875,7 +4973,8 @@ mod tests {
         send(&site, &["N1"]);
         wait_for_pid(&pid_file);
 
-        site.open(Repo::open(&other.root).unwrap());
+        site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         wait_for_exit(&pid_file);
     }
 
@@ -5052,6 +5151,147 @@ mod tests {
     }
 
     #[test]
+    fn a_line_over_the_limit_is_reported_and_the_run_goes_on() {
+        let repo = TempRepo::new("run-long-line");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "long-line");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let run = wait_for_run(&site, &nudges, "R1");
+        assert_eq!(run["status"], "ended", "{}", run["status"]);
+        let problems: Vec<String> = entries(&run)
+            .iter()
+            .filter(|entry| entry["kind"] == "unreadable")
+            .map(|entry| entry["problem"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            problems.len(),
+            2,
+            "the rest of the long line is skipped, not read as a line: {problems:?}"
+        );
+        assert!(
+            problems[0].starts_with("a line that is not JSON-RPC"),
+            "a line of exactly the limit is read whole: {}",
+            &problems[0][..80]
+        );
+        assert!(
+            problems[1].starts_with("a line longer than 1048576 bytes, skipped: xxx"),
+            "{}",
+            &problems[1][..80]
+        );
+        let kinds = kinds(&run);
+        assert!(
+            kinds.contains(&"message:after the long line".to_owned()),
+            "the line after it is read whole"
+        );
+    }
+
+    #[test]
+    fn opening_during_a_run_keeps_it_for_the_same_project_and_asks_first_for_another() {
+        let repo = TempRepo::new("run-open-live");
+        let other = TempRepo::new("run-open-live-other");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "ask");
+        post_note(&site, "a.txt", 1, 1, "one");
+        let open = |path: &Path, stop: bool| {
+            let body = serde_json::json!({ "path": path, "stop": stop }).to_string();
+            post(&site, "postil://localhost/api/open", &body)
+        };
+        send(&site, &["N1"]);
+        let waiting = wait_for(&site, &nudges, "waiting");
+
+        // Dropping the open project on the window again: the run and its agent stay.
+        assert_eq!(open(&repo.root, false).0, StatusCode::OK);
+        assert_eq!(get_json(&site, RUN)["status"], "waiting");
+        let (status, body) = open(&other.root, false);
+        assert_eq!(status, StatusCode::CONFLICT, "another project: {body}");
+        assert_eq!(get_json(&site, RUN)["status"], "waiting");
+        let request = first_of_kind(&waiting, "question")["request"].clone();
+        let content = serde_json::json!({ "question_0": "Yes" });
+        let body = serde_json::json!({ "request": request, "content": content }).to_string();
+        let (status, body) = post(&site, &format!("{RUN}/question"), &body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the agent that asked is still there: {body}"
+        );
+        wait_for(&site, &nudges, "ended");
+
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "waiting");
+        let (status, body) = open(&other.root, true);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            get_json(&site, "postil://localhost/api/repo")["root"],
+            site_root(&other.root)
+        );
+        assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
+
+        // The stopped run says it was stopped, so it does not read as another window's.
+        let stopped = fs::read_to_string(repo.root.join(".git/postil/runs/R2.jsonl")).unwrap();
+        let end = stopped.lines().last().unwrap();
+        assert!(
+            end.contains("Postil closed the project while it ran"),
+            "{end}"
+        );
+        // And it has the snapshot after it, so its changes view still shows what it did.
+        assert!(
+            stopped.contains(r#""kind":"snapshot","point":"after""#),
+            "{stopped}"
+        );
+    }
+
+    #[test]
+    fn a_review_between_stages_holds_the_project_and_one_that_failed_to_start_does_not() {
+        let repo = TempRepo::new("run-open-review");
+        let other = TempRepo::new("run-open-review-other");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        let open_other = || {
+            post(
+                &site,
+                "postil://localhost/api/open",
+                &open_request(&other.root),
+            )
+        };
+        let review = |of: &str| {
+            let body = serde_json::json!({ "of": of }).to_string();
+            assert_eq!(
+                post(&site, &format!("{RUN}/review"), &body).0,
+                StatusCode::OK
+            );
+        };
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+
+        // A reviewer whose agent speaks another protocol version never starts.
+        set_reviewers(&site, "plain", &[("Broken", "version-2")]);
+        review("R1");
+        assert_eq!(wait_for_run(&site, &nudges, "R2")["status"], "failed");
+        let (status, body) = open_other();
+        assert_eq!(status, StatusCode::OK, "nothing runs: {body}");
+
+        let (status, body) = post(
+            &site,
+            "postil://localhost/api/open",
+            &open_request(&repo.root),
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        set_reviewers(
+            &site,
+            "plain",
+            &[("First", "reviewer"), ("Judge", "reviewer")],
+        );
+        let release = site.runner().unwrap().hold_next_stage();
+        review("R1");
+        wait_for_run(&site, &nudges, "R3");
+        let (status, body) = open_other();
+        assert_eq!(status, StatusCode::CONFLICT, "the judge is next: {body}");
+        drop(release);
+    }
+
+    #[test]
     fn a_kept_agent_that_exited_is_started_again() {
         let repo = TempRepo::new("run-dead-kept");
         repo.write("a.txt", "a\n");
@@ -5073,6 +5313,46 @@ mod tests {
             kinds(&second).contains(&"message:prompt 1".to_owned()),
             "a new process: {second}"
         );
+    }
+
+    #[test]
+    fn a_send_right_after_the_kept_agent_exited_starts_a_fresh_one() {
+        let repo = TempRepo::new("run-dead-at-once");
+        repo.write("a.txt", "a\n");
+        let pid_file = repo.root.join(".git/agent.pid");
+        let (site, nudges) = run_site(&repo, "plain");
+        let command = format!(
+            "{} {}",
+            fake_agent("exit-leaving-stderr"),
+            pid_file.display()
+        );
+        set_agents(&site, &[("Fake", &command)], "Fake");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        // Exited, and not yet reaped: the reader waits out its grace for standard error,
+        // which the agent's grandchild holds open, so no exit event has come.
+        wait_for_exited(&pid_file);
+
+        send(&site, &["N1"]);
+        let second = wait_for_run(&site, &nudges, "R2");
+        assert_eq!(second["status"], "ended", "{second}");
+        assert!(
+            kinds(&second).contains(&"message:prompt 1".to_owned()),
+            "a new process: {second}"
+        );
+    }
+
+    /// Waits until the fake agent's grandchild saw the agent exit (`exit-leaving-stderr`
+    /// writes `<pid file>.exited`). `kill -0` cannot tell: it succeeds on a process that
+    /// exited and is not reaped yet.
+    fn wait_for_exited(pid_file: &Path) {
+        let exited = pid_file.with_extension("pid.exited");
+        let deadline = Instant::now() + WAIT;
+        while !exited.exists() {
+            assert!(Instant::now() < deadline, "the agent did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -5218,7 +5498,9 @@ mod tests {
         // the project's.
         let other = TempRepo::new("layout-other");
         let again = Site::new(Some(&repo.config()), None, no_agents(), quiet());
-        again.open(Repo::open(&other.root).unwrap());
+        again
+            .open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         let kept = get_json(&again, LAYOUT);
         assert_eq!(
             (kept["sidebar"].clone(), kept["tray"].clone()),

@@ -35,17 +35,18 @@
 //! The app never rewrites a log. It reads logs to show runs, and deletes one with the last of
 //! its notes (`Runner::delete_runs_without_notes`). `runs/active.lock` also holds the highest
 //! run number ever given, so a deleted run's number is not given again unless a crash loses
-//! the counter (`last_run`). A log with no end is shown as unfinished: the app quit or the
-//! project was closed while it ran, or another window is running it.
+//! the counter (`last_run`). A log with no end is shown as unfinished: the app crashed or was
+//! killed while it ran, or another window is running it. Closing the project or quitting ends
+//! a run under way as failed ([`Runner::close`]).
 //!
 //! # Threads and locks
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
-//! an agent's start on a thread of its own, and a review's next stage on one more
-//! (`review-next`, [`Runner::advance`]). Three locks, always taken in this order: the
-//! runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`], which takes
-//! no other), then a run's state; no snapshot is taken under a run's state. The page is told
-//! about every change through `notify`, and fetches what it has not seen.
+//! and an agent's start on a thread of its own. A review's next stage starts on the reader
+//! thread of the stage that ended ([`Runner::advance`]). Three locks, always taken in this
+//! order: the runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`],
+//! which takes no other), then a run's state; no snapshot is taken under a run's state. The
+//! page is told about every change through `notify`, and fetches what it has not seen.
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -109,6 +110,11 @@ pub(crate) struct Runner {
     agents: Scanner,
     notify: Notify,
     slot: Mutex<Slot>,
+    /// Holds a review's next stage, once, until a test lets it start
+    /// ([`Runner::hold_next_stage`]): between a stage's end and the next stage's start is a
+    /// window no request can otherwise be timed into.
+    #[cfg(test)]
+    next_stage_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl fmt::Debug for Chain {
@@ -198,6 +204,31 @@ struct Pending {
     generation: u64,
 }
 
+/// A run for [`Runner::launch`] to start.
+#[derive(Debug)]
+struct NewRun {
+    agent: AgentChoice,
+    /// The notes in the run's header: it goes with the last of them.
+    notes: Vec<String>,
+    prompt: Prompt,
+    origin: Origin,
+    conversation: Conversation,
+    /// The review the run is a stage of, which becomes the one under way; `None` ends the
+    /// review under way, if any.
+    review: Option<Chain>,
+}
+
+/// Which agent a launched run goes to.
+#[derive(Debug)]
+enum Conversation {
+    /// The kept agent, whose conversation the run continues, when it is the run's agent and
+    /// alive; otherwise a fresh one. A follow-up checks the same, under the same lock, to
+    /// choose its prompt.
+    Kept,
+    /// A fresh agent, which replaces the kept one.
+    Fresh,
+}
+
 impl Runner {
     pub(crate) fn new(repo: Arc<Repo>, agents: Scanner, notify: Notify) -> Arc<Self> {
         Arc::new(Self {
@@ -205,6 +236,8 @@ impl Runner {
             agents,
             notify,
             slot: Mutex::new(Slot::default()),
+            #[cfg(test)]
+            next_stage_gate: Mutex::new(None),
         })
     }
 
@@ -230,51 +263,28 @@ impl Runner {
     /// [`Error::RunElsewhere`] while another window's is; as [`notes::prompt`]; and
     /// [`Error::WriteRun`] when the run log cannot be created.
     pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
-        let mut slot = self.slot();
-        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
-            return Err(Error::TurnRunning);
-        }
+        let slot = self.slot();
         let prompt = notes::prompt(&self.repo, ids)?;
-        slot.chain = None;
         // The agent kept from a reviewer's run holds that reviewer's conversation (told not to
         // change files, or to judge findings), so a send after a review starts afresh.
         let after_review = slot
             .run
             .as_ref()
             .is_some_and(|run| run.state().header.review.is_some());
-        let run = Arc::new(Run::create(
-            &self.repo.runs_dir(),
-            &agent.name,
-            ids,
-            &prompt.text,
-            Origin::Notes,
-        )?);
-        self.record_snapshot(&run, Point::Before);
-        slot.run = Some(Arc::clone(&run));
-
-        let replaced = match &slot.agent {
-            Held::Ready(kept, live) if *kept == agent && live.is_alive() && !after_review => {
-                self.begin(live, &run, ids, &prompt);
-                Held::None
-            }
-            _ => {
-                // The agent kept from the last run, if any, is stopped when this is dropped.
-                let replaced = slot.release();
-                let pending = Pending {
-                    agent,
-                    run,
-                    ids: ids.to_vec(),
-                    prompt,
-                    generation: slot.generation,
-                };
-                self.start(pending);
-                replaced
-            }
+        let conversation = if after_review {
+            Conversation::Fresh
+        } else {
+            Conversation::Kept
         };
-        drop(slot);
-        drop(replaced);
-        (self.notify)();
-        Ok(())
+        let new = NewRun {
+            agent,
+            notes: ids.to_vec(),
+            prompt,
+            origin: Origin::Notes,
+            conversation,
+            review: None,
+        };
+        self.launch(slot, new)
     }
 
     /// Sends `text`, the engineer's follow-up to run `of`, to `agent` as a new run that
@@ -322,11 +332,7 @@ impl Runner {
                 "{next} already follows {of}: follow up {next}"
             )));
         }
-        let mut slot = self.slot();
-        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
-            return Err(Error::TurnRunning);
-        }
-        slot.chain = None;
+        let slot = self.slot();
         let same_conversation = matches!(
             &slot.agent,
             Held::Ready(kept, live) if *kept == agent && live.is_alive()
@@ -349,41 +355,22 @@ impl Runner {
                 files: edited_files(&diffs),
             }
         };
-        let run = Arc::new(Run::create(
-            &self.repo.runs_dir(),
-            &agent.name,
-            &notes,
-            &prompt.text,
-            Origin::FollowUp(FollowUp {
+        let new = NewRun {
+            agent,
+            notes,
+            prompt,
+            origin: Origin::FollowUp(FollowUp {
                 of: of.to_owned(),
                 text: text.to_owned(),
             }),
-        )?);
-        self.record_snapshot(&run, Point::Before);
-        slot.run = Some(Arc::clone(&run));
-        let replaced = match &slot.agent {
-            Held::Ready(_, live) if same_conversation => {
-                // A follow-up marks no note sent: the notes went to the run it follows.
-                self.begin(live, &run, &[], &prompt);
-                Held::None
-            }
-            _ => {
-                let replaced = slot.release();
-                let pending = Pending {
-                    agent,
-                    run,
-                    ids: Vec::new(),
-                    prompt,
-                    generation: slot.generation,
-                };
-                self.start(pending);
-                replaced
-            }
+            conversation: if same_conversation {
+                Conversation::Kept
+            } else {
+                Conversation::Fresh
+            },
+            review: None,
         };
-        drop(slot);
-        drop(replaced);
-        (self.notify)();
-        Ok(())
+        self.launch(slot, new)
     }
 
     /// The runs of the thread that ends with run `of`: the run of notes it started from, then
@@ -453,10 +440,6 @@ impl Runner {
             ));
         }
         let reviewed = self.run_by_id(of)?;
-        let mut slot = self.slot();
-        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
-            return Err(Error::TurnRunning);
-        }
         let (notes, work, files) = {
             let state = reviewed.state();
             if state.header.review.is_some() {
@@ -486,11 +469,7 @@ impl Runner {
             files,
             findings: Vec::new(),
         };
-        let replaced = self.start_stage(&mut slot, chain)?;
-        drop(slot);
-        drop(replaced);
-        (self.notify)();
-        Ok(())
+        self.start_stage(self.slot(), chain)
     }
 
     /// The run `of`, this window's when it is that one, else read from its log.
@@ -513,74 +492,118 @@ impl Runner {
     }
 
     /// Starts `chain`'s current stage as a new run, with a fresh agent, so a reviewer never
-    /// inherits the reviewed agent's conversation. Returns the agent it replaced, to drop
-    /// outside the lock.
-    fn start_stage(self: &Arc<Self>, slot: &mut Slot, chain: Chain) -> Result<Held> {
-        let agent = chain.reviewers[chain.stage.reviewer - 1].clone();
+    /// inherits the reviewed agent's conversation; `chain` becomes the review under way.
+    fn start_stage(self: &Arc<Self>, slot: MutexGuard<'_, Slot>, chain: Chain) -> Result<()> {
         let text = if chain.stage.judges() {
             review::judge_prompt(&chain.work, &chain.findings)
         } else {
             review::propose_prompt(&chain.work)
         };
-        let run = Arc::new(Run::create(
-            &self.repo.runs_dir(),
-            &agent.name,
-            &chain.notes,
-            &text,
-            Origin::Review(chain.stage.clone()),
-        )?);
-        if chain.stage.judges() {
-            self.record_snapshot(&run, Point::Before);
-        }
-        slot.run = Some(Arc::clone(&run));
-        let replaced = slot.release();
-        let pending = Pending {
-            agent,
-            run,
-            // A review marks no note sent: the notes went to the reviewed run.
-            ids: Vec::new(),
+        let new = NewRun {
+            agent: chain.reviewers[chain.stage.reviewer - 1].clone(),
+            notes: chain.notes.clone(),
             prompt: Prompt {
                 text,
                 files: chain.files.clone(),
             },
-            generation: slot.generation,
+            origin: Origin::Review(chain.stage.clone()),
+            conversation: Conversation::Fresh,
+            review: Some(chain),
         };
-        slot.chain = Some(chain);
-        self.start(pending);
-        Ok(replaced)
+        self.launch(slot, new)
     }
 
     /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
-    /// ended. Runs on a thread of its own: the stage's agent is replaced, and dropping an
-    /// agent from its own reader thread would wait on itself.
-    fn advance(self: &Arc<Self>, ended: &str) {
+    /// ended. Runs on the ended agent's reader thread, and replaces that agent there, as
+    /// [`on_event`] does with an agent that exited: [`Agent`]'s drop kills and reaps the
+    /// process but never joins its threads, and the reader holds none of the agent's locks
+    /// while it delivers an event.
+    fn advance(self: &Arc<Self>, ended: &Arc<Run>) {
         let mut slot = self.slot();
         // A send, a stop, or another review meanwhile took the chain, or replaced its run.
-        let current = slot.run.as_ref().map(|run| run.state().header.id.clone());
+        if !slot.run.as_ref().is_some_and(|run| Arc::ptr_eq(run, ended)) {
+            return;
+        }
         let Some(chain) = slot.chain.take() else {
             return;
         };
-        if current.as_deref() != Some(ended) {
-            slot.chain = Some(chain);
-            return;
+        if let Err(error) = self.start_stage(slot, chain) {
+            // The chain went with the stage that could not start, so the review ends, and the
+            // stage that ended says why.
+            ended.state().problem.get_or_insert(format!(
+                "the next reviewer could not start: {}",
+                error_chain(&error)
+            ));
+            (self.notify)();
         }
-        match self.start_stage(&mut slot, chain) {
-            Ok(replaced) => {
-                drop(slot);
-                drop(replaced);
-            }
-            Err(error) => {
-                // The stage that ended says why the review stopped there.
-                if let Some(run) = &slot.run {
-                    run.state().problem.get_or_insert(format!(
-                        "the next reviewer could not start: {}",
-                        error_chain(&error)
-                    ));
-                }
-                drop(slot);
-            }
+    }
+
+    /// Makes `new` this window's run and its review the one under way, sends the run to its
+    /// agent, then tells the page. Takes the snapshot before the run, except for a proposer,
+    /// which may not edit. The slot changes only once the run's log exists, so a launch that
+    /// fails leaves the review and the kept agent as they were. The agent it replaces is
+    /// dropped after `slot` is released.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TurnRunning`] while a run of this window is under way, and as [`Run::create`].
+    fn launch(self: &Arc<Self>, mut slot: MutexGuard<'_, Slot>, new: NewRun) -> Result<()> {
+        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
+            return Err(Error::TurnRunning);
         }
+        let NewRun {
+            agent,
+            notes,
+            prompt,
+            origin,
+            conversation,
+            review,
+        } = new;
+        let snapshot = !matches!(&origin, Origin::Review(stage) if !stage.judges());
+        // A follow-up and a review mark no note sent: the notes went to the run they follow or
+        // review.
+        let marks = match origin {
+            Origin::Notes => notes.clone(),
+            Origin::Review(_) | Origin::FollowUp(_) => Vec::new(),
+        };
+        let run = Arc::new(Run::create(
+            &self.repo.runs_dir(),
+            &agent.name,
+            &notes,
+            &prompt.text,
+            origin,
+        )?);
+
+        slot.chain = review;
+        if snapshot {
+            self.record_snapshot(&run, Point::Before);
+        }
+        slot.run = Some(Arc::clone(&run));
+        let replaced = if let (Held::Ready(choice, kept), Conversation::Kept) =
+            (&slot.agent, conversation)
+            && *choice == agent
+            && kept.is_alive()
+        {
+            self.begin(kept, &run, &marks, &prompt);
+            Held::None
+        } else {
+            // The agent kept from the last run, if any, is stopped when this is dropped.
+            let replaced = slot.release();
+            let pending = Pending {
+                agent,
+                run,
+                ids: marks,
+                prompt,
+                generation: slot.generation,
+            };
+            self.start(pending);
+            replaced
+        };
+        drop(slot);
+        // Dropping an agent waits for its process to be reaped.
+        drop(replaced);
         (self.notify)();
+        Ok(())
     }
 
     /// Stops the run (module docs, "Stopping").
@@ -865,16 +888,47 @@ impl Runner {
         Ok(())
     }
 
+    /// Whether this window has a run under way, or a review between two stages, whose next
+    /// stage starts with no request from the page.
+    pub(crate) fn busy(&self) -> bool {
+        let slot = self.slot();
+        let Some(run) = &slot.run else {
+            return false;
+        };
+        let state = run.state();
+        // Between two stages `decide` has moved the chain on to the next one, so it names
+        // another stage than the run that ended. A stage whose agent failed to start ended
+        // with the chain still on it: no stage follows that one.
+        state.live()
+            || slot
+                .chain
+                .as_ref()
+                .is_some_and(|chain| state.header.review.as_ref() != Some(&chain.stage))
+    }
+
     /// Stops the agent, running or starting, and ignores anything it would still report: the
-    /// project is closing, or the app quits.
+    /// project is closing, or the app quits. A run under way ends as failed, saying so, so it
+    /// does not read as another window's.
     pub(crate) fn close(&self) {
-        let released = {
+        let (released, run) = {
             let mut slot = self.slot();
             slot.closed = true;
             slot.chain = None;
-            slot.release()
+            (slot.release(), slot.run.clone())
         };
+        // The agent is gone first, so nothing it reports lands after the end. `closed` drops
+        // its events anyway.
         drop(released);
+        if let Some(run) = run {
+            // As a forced Stop does: the agent's exit is not reported, so the snapshot after
+            // the run is taken here, or its changes view would stay empty. It runs `git add`
+            // on the closing thread, the main one when the app quits. Both calls do nothing
+            // for a run that already ended.
+            self.record_end_snapshot(&run);
+            run.record(Entry::Failed {
+                error: "stopped: Postil closed the project while it ran".to_owned(),
+            });
+        }
     }
 
     fn slot(&self) -> MutexGuard<'_, Slot> {
@@ -1023,6 +1077,23 @@ impl Runner {
         self.slot().chain.is_some()
     }
 
+    /// Holds the next review stage after the current one ends, until the returned sender
+    /// sends or is dropped. Once: the stage after it starts as usual.
+    pub(crate) fn hold_next_stage(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        *lock(&self.next_stage_gate) = Some(gate);
+        release
+    }
+
+    /// Waits at the gate [`Runner::hold_next_stage`] set, if any.
+    fn pass_next_stage_gate(&self) {
+        let gate = lock(&self.next_stage_gate).take();
+        if let Some(gate) = gate {
+            // A dropped sender lets the stage go as well.
+            gate.recv().ok();
+        }
+    }
+
     /// Moves the run's first Stop back by [`FORCE_AFTER`], so a test can force a stop without
     /// waiting that long.
     pub(crate) fn backdate_stop(&self) {
@@ -1105,10 +1176,12 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         };
         let run = slot.run.clone();
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
-        // sees the decision, and no Stop or new review can replace the chain meanwhile. Only
-        // starting the next stage waits for a thread of its own.
+        // sees the decision, and no Stop or new review can replace the chain meanwhile. The
+        // next stage starts once the end is logged.
         let next = match (&stage, &run) {
-            (Some(stage), Some(run)) if ended_well => decide(&mut slot, run, stage),
+            (Some(stage), Some(run)) if ended_well => {
+                decide(&mut slot, run, stage).then(|| Arc::clone(run))
+            }
             _ => None,
         };
         (run, released, answer, next)
@@ -1126,39 +1199,26 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     drop(released);
     (runner.notify)();
     if let Some(ended) = next {
-        let next = Arc::clone(&runner);
-        let advanced = std::thread::Builder::new()
-            .name("review-next".to_owned())
-            .spawn(move || next.advance(&ended));
-        if let Err(error) = advanced {
-            let mut slot = runner.slot();
-            slot.chain = None;
-            if let Some(run) = &slot.run {
-                run.state().problem.get_or_insert(format!(
-                    "the next reviewer could not start: no thread for it ({error})"
-                ));
-            }
-        }
+        #[cfg(test)]
+        runner.pass_next_stage_gate();
+        runner.advance(&ended);
     }
 }
 
 /// Ends review stage `stage` of `run`, whose turn ended well, and decides whether the review
-/// goes on: the id of the ended run when the next stage is to start, else `None`, the chain
-/// then cleared. A proposer's findings are logged here, before the end, while the run still
-/// takes entries.
-fn decide(slot: &mut Slot, run: &Run, stage: &Stage) -> Option<String> {
+/// goes on: true when the next stage is to start, else false, the chain then cleared. A
+/// proposer's findings are logged here, before the end, while the run still takes entries.
+fn decide(slot: &mut Slot, run: &Run, stage: &Stage) -> bool {
     let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
     let findings = end_stage(run, stage, found);
     let goes = match (findings, slot.chain.as_mut()) {
         (Some(findings), Some(chain)) => goes_on(chain, findings),
         _ => false,
     };
-    if goes {
-        Some(run.state().header.id.clone())
-    } else {
+    if !goes {
         slot.chain = None;
-        None
     }
+    goes
 }
 
 /// Answers a permission request as Postil does on the engineer's behalf (docs/design.md,
@@ -1302,6 +1362,7 @@ struct Header {
 
 /// What a new run is: a send of notes, a reviewer's stage, or a follow-up. One value, so a
 /// header never holds both a review and a follow-up.
+#[derive(Debug)]
 enum Origin {
     Notes,
     Review(Stage),
@@ -1480,8 +1541,8 @@ pub(crate) enum Status {
     Cancelling,
     Ended,
     Failed,
-    /// The log has no end and this process does not run it: the app quit or the project was
-    /// closed while it ran, or another window is running it.
+    /// The log has no end and this process does not run it: the app crashed or was killed
+    /// while it ran, or another window is running it.
     Unfinished,
 }
 
