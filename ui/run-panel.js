@@ -189,6 +189,11 @@ export function runPanel({
     const steps = stepsOf(items);
     const messages = items.filter((item) => item.type === "message");
     const wanted = [];
+    // Which run this is, and its agent: the tray header has room only for the status.
+    const started = new Date(run.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const about = `${run.id} · ${run.agent} · started ${started}`;
+    wanted.push(["about", about, () => el("div", "run-about", about)]);
+
     for (const item of asking) {
       wanted.push([itemKey(item, items.indexOf(item)), signature(item, live), () => permissionView(item)]);
     }
@@ -299,7 +304,6 @@ export function runPanel({
     title.append(
       statusIcon(kind ?? "stopped"),
       el("strong", `run-word ${tone}`, word),
-      el("span", "run-meta", ` · ${run.id} · ${run.agent}`),
       time,
     );
     const parts = [title];
@@ -412,7 +416,7 @@ export function runPanel({
       case "tool": {
         const row = toolRow(item, isLive(run));
         const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
-        const state = el("span", `tool-state${tone}`, row.state);
+        const state = row.running ? statusIcon("working") : el("span", `tool-state${tone}`, row.state);
         const node = card(`step${row.running ? " running" : ""}`, [
           el("span", "tool-verb", row.verb),
           el("span", "run-card-text tool-target", row.target),
@@ -447,7 +451,10 @@ export function runPanel({
     detail = what;
     detailDrawn = null;
     drawDetail();
-    if (!detailEl.open) detailEl.showModal();
+    if (!detailEl.open) {
+      detailEl.showModal();
+      detailEl.focus();
+    }
     // The list opens at its end: the latest step is the one being watched.
     if (what.kind === "steps") {
       const body = detailEl.querySelector(".note-dialog-body");
@@ -561,11 +568,15 @@ export function runPanel({
       });
       actions.push(show);
     }
-    if (item.title !== row.target) body.append(el("pre", "run-detail-command", item.title));
+    // A command's title is the command; a file tool's only repeats the header.
+    const onFile = ["read", "edit", "delete", "move"].includes(item.tool);
+    if (!onFile) body.append(el("pre", "run-detail-command", item.title));
     for (const part of item.output) {
       if (part.type === "diff") {
-        if (item.output.length > 1) body.append(el("div", "run-label", part.path));
-        body.append(diffView(part));
+        // Each diff under its file's name, close to it.
+        const block = el("section", "note-dialog-section");
+        block.append(el("div", "note-dialog-label", part.path), diffView(part));
+        body.append(block);
       } else body.append(el("pre", "tool-output", part.text));
     }
     if (item.output.length === 0) {
@@ -577,7 +588,7 @@ export function runPanel({
   function replyDetail(text) {
     const body = el("div", "note-dialog-body");
     body.append(markdownView(text));
-    return [detailHeader(null, `${run.agent}'s reply`, run.id), body];
+    return [detailHeader(null, isLive(run) ? `${run.agent} is writing` : `${run.agent}'s reply`, run.id), body];
   }
 
   function planDetail(plan) {

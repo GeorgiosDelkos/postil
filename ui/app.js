@@ -1018,9 +1018,9 @@ function fetchRuns() {
       .then(async (response) => {
         if (!response.ok) throw new Error(await response.text());
         const run = await response.json();
-        // A run still going (another window's) is asked for again on the next draw.
-        if (isLive(run)) state.runsAsked.delete(id);
-        else state.runCache.set(id, run);
+        // Kept even while still going (another window's run): asking again on every draw
+        // would fetch it in a loop. `refresh` drops the ones still going, to be read again.
+        state.runCache.set(id, run);
         renderNotes();
       })
       // The card says "Sent in R2" and the detail shows no history: the tray stays usable.
@@ -1059,7 +1059,8 @@ function groupHeader(left, right) {
   return header;
 }
 
-function noteItem(note, card) {
+// A note's card: its status, its place and id, and the note in two lines at most.
+function noteCard(card, onClick) {
   const { start, end } = card.lines;
   const lines = start === end ? start : `${start}-${end}`;
   const button = el("button", `note ${card.status.kind}${card.outdated ? " outdated" : ""}`);
@@ -1071,10 +1072,13 @@ function noteItem(note, card) {
   place.title = card.path;
   head.append(label, place, el("span", "note-id", card.id));
   button.append(head, el("div", "note-body", card.body));
-  button.addEventListener("click", () => noteDetail.open(note.id));
+  button.addEventListener("click", onClick);
+  return button;
+}
 
+function noteItem(note, card) {
   const item = el("div", "note-item");
-  item.append(button);
+  item.append(noteCard(card, () => noteDetail.open(note.id)));
   if (card.sendable) item.append(sendButton(note));
   item.append(deleteButton(item, note));
   return item;
@@ -1092,23 +1096,10 @@ function sendButton(note) {
 }
 
 // A card of the send step: its checkbox, and a click that ticks it.
+// A card of the send step: the same card, with its checkbox, and a click that ticks it.
 function sendItem(note) {
-  const outdated = note.anchor === "lost";
-  const card = el("button", outdated ? "note outdated" : "note");
-  card.type = "button";
-  const { start, end } = note.lines;
-  const lines = start === end ? start : `${start}-${end}`;
-  const where = el("div", "note-where");
-  const run = sentIn(note);
-  const marks = [note.id, outdated ? "outdated" : null, run ? `sent in ${run}` : null];
-  where.append(
-    el("span", "", `${note.path}:${lines}`),
-    el("span", "note-id", marks.filter(Boolean).join(" · ")),
-  );
-  card.append(where, el("div", "note-body", note.body));
-  card.addEventListener("click", () => toggleTick(note.id));
-  const item = el("div", run ? "note-item sent" : "note-item");
-  item.append(tickBox(note), card, deleteButton(item, note));
+  const item = el("div", "note-item");
+  item.append(tickBox(note), noteCard(cardOf(note), () => toggleTick(note.id)), deleteButton(item, note));
   return item;
 }
 
@@ -1696,6 +1687,11 @@ async function refresh() {
   // A project being opened replaces this page: what a refresh drew would be thrown away,
   // and its requests would already reach the new project.
   if (state.switching) return;
+  for (const [id, run] of state.runCache) {
+    if (!isLive(run)) continue;
+    state.runCache.delete(id);
+    state.runsAsked.delete(id);
+  }
   // The welcome screen is what is on screen, whether or not a project is open behind it.
   if (!welcomeEl.hidden) {
     await loadRecent();

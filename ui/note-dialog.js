@@ -2,8 +2,8 @@
 // a card's click (docs/design.md, "Notes and their status"). It is drawn from the note and its
 // run (status.js), and drawn again when either changes while it is open.
 
-import { isLive, statusLine } from "./run.js";
-import { agentSaid, fileStats, noteHistory, noteStatus } from "./status.js";
+import { isLive, partLines, statusLine } from "./run.js";
+import { agentSaid, fileDiffs, fileStats, noteHistory, noteStatus } from "./status.js";
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -93,14 +93,19 @@ export function noteDialog(dialogEl, { find, canSend, showInCode, send, remove, 
     main.append(section("Your note", el("div", "note-dialog-note", note.body)));
 
     const lost = note.anchor === "lost";
-    const stats = run && fileStats(note, run);
     const label = lost ? "Its lines when written; they are no longer in the file" : "Its lines";
-    const lines = section(label, snippetView(note));
-    if (stats) lines.firstChild.append(el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`));
-    main.append(lines);
+    main.append(section(label, snippetView(note)));
 
     if (run) {
       main.append(section(`What ${run.agent} said about ${note.id}`, said(note, run)));
+      // What the run did to the note's file, whole: the card only says the note's status.
+      const diffs = fileDiffs(note, run);
+      if (diffs.length) {
+        const stats = fileStats(note, run);
+        const changed = section(`What changed in ${note.path}`, diffsView(diffs));
+        changed.firstChild.append(el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`));
+        main.append(changed);
+      }
       main.append(section(`History · ${run.id} · ${run.agent}`, history(note, run)));
     }
     return main;
@@ -198,6 +203,18 @@ function section(label, content) {
   title.append(el("span", "", label));
   part.append(title, content);
   return part;
+}
+
+// Diffs as lines marked removed, added or unchanged (run.js `partLines`), one block each.
+function diffsView(diffs) {
+  const view = el("div", "note-dialog-diffs");
+  const marks = { same: "  ", del: "- ", add: "+ " };
+  for (const diff of diffs) {
+    const block = el("pre", "tool-diff");
+    for (const line of partLines(diff)) block.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
+    view.append(block);
+  }
+  return view;
 }
 
 // The note's lines as they were when it was written, numbered from where they are now.

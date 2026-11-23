@@ -108,10 +108,14 @@ function touches(tool, path) {
 
 // Lines added and removed on the note's file over the whole run, or null when none.
 export function fileStats(note, run) {
-  const parts = foldRun(run.entries)
+  return diffStats(fileDiffs(note, run));
+}
+
+// The diffs the run's finished tool calls made to the note's file, in order.
+export function fileDiffs(note, run) {
+  return foldRun(run.entries)
     .items.filter((item) => item.type === "tool" && item.status === "completed")
     .flatMap((tool) => tool.output.filter((part) => part.type === "diff" && part.path === note.path));
-  return diffStats(parts);
 }
 
 // The tray's groups, each in the tray's order: the notes of the live run, the open ones, and

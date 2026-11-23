@@ -1671,10 +1671,6 @@ button.repo-name:hover {
   accent-color: var(--accent);
 }
 
-.note-item.sent .note-id {
-  color: var(--text-muted);
-}
-
 .code-pane {
   position: relative;
 }
@@ -1755,12 +1751,6 @@ button.repo-name:hover {
 .run-title strong {
   font-weight: 500;
   color: var(--text-strong);
-}
-
-.run-title .run-meta {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .run-title .status-icon {
@@ -1845,6 +1835,7 @@ button.repo-name:hover {
 }
 
 .run-progress {
+  display: block;
   height: 4px;
   overflow: hidden;
   background: var(--border);
@@ -1852,6 +1843,7 @@ button.repo-name:hover {
 }
 
 .run-progress-fill {
+  display: block;
   height: 100%;
   background: var(--accent);
   transition: width 200ms ease-out;
@@ -1989,9 +1981,15 @@ button.repo-name:hover {
   overflow-wrap: anywhere;
 }
 
-.run-detail .tool-diff,
-.run-detail .tool-output {
+.note-dialog .tool-diff,
+.note-dialog .tool-output {
   max-height: none;
+}
+
+.note-dialog-diffs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .run-plan {
@@ -2541,6 +2539,10 @@ body.resizing * {
 }
 
 .note-dialog-title {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   margin: 0;
   font-size: 14px;
   font-weight: 600;
@@ -2709,4 +2711,18 @@ body.resizing * {
 
 .run-steps-list {
   gap: 6px;
+}
+
+.run-about {
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.run-card.step .status-icon {
+  width: 11px;
+  height: 11px;
+}
+
+.run-detail:focus {
+  outline: none;
 }
