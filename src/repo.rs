@@ -107,6 +107,12 @@ impl Repo {
         self.git_dir.join("postil").join("review.json")
     }
 
+    /// Where this working tree's run logs are stored (`run.rs`): beside the review file, for
+    /// the same reason.
+    pub(crate) fn runs_dir(&self) -> PathBuf {
+        self.git_dir.join("postil").join("runs")
+    }
+
     /// The directory name of the working tree, for display.
     pub(crate) fn name(&self) -> String {
         self.root.file_name().map_or_else(

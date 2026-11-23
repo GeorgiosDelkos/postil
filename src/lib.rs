@@ -4,10 +4,11 @@
 //! data and a page in the system webview draws it. The page is compiled into the binary and
 //! talks to this process over a private URL scheme.
 //!
-//! Built so far (milestones 0 to 2): the window, the file list with its fuzzy finder, the
-//! highlighted code view, and notes on line ranges, stored in the git directory and anchored
-//! by their text.
+//! Built so far (milestones 0 to 2, and the core of 3): the window, the file list with its
+//! fuzzy finder, the highlighted code view, notes on line ranges, stored in the git directory
+//! and anchored by their text, and runs that send notes to a coding agent over ACP.
 
+mod acp;
 mod agents;
 mod dialog;
 mod error;
@@ -18,6 +19,7 @@ mod menu;
 mod notes;
 mod recent;
 mod repo;
+mod run;
 mod settings;
 mod shell;
 

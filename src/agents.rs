@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 /// An agent in the catalog.
@@ -78,11 +78,14 @@ const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`Scanner::rescan`]. While the latest scan runs, [`Scanner::path`] is `None` and the page
 /// asks again shortly. An older scan that finishes after a newer one started is dropped, so
 /// a rescan always shows its own result.
+#[derive(Clone)]
 pub(crate) struct Scanner {
     find: Arc<dyn Fn() -> OsString + Send + Sync>,
     /// The number of the latest scan (0 before the first), and the path it found once it
     /// finished. Locked only to read or replace both; never held while a scan runs.
     state: Arc<Mutex<(u64, Option<OsString>)>>,
+    /// Signalled whenever a scan stores its path, for [`Scanner::wait`].
+    found: Arc<Condvar>,
 }
 
 impl Scanner {
@@ -91,6 +94,7 @@ impl Scanner {
         Self {
             find: Arc::new(find),
             state: Arc::new(Mutex::new((0, None))),
+            found: Arc::new(Condvar::new()),
         }
     }
 
@@ -109,6 +113,24 @@ impl Scanner {
         state.1.clone()
     }
 
+    /// The latest scan's search path, waiting for the scan to finish. Starts the first scan
+    /// when none ran. A rescan started while this waits is waited for too.
+    pub(crate) fn wait(&self) -> OsString {
+        let mut state = lock(&self.state);
+        if state.0 == 0 {
+            self.start(&mut state);
+        }
+        loop {
+            if let Some(path) = &state.1 {
+                return path.clone();
+            }
+            state = self
+                .found
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     /// Starts a scan, with the state already locked so two first calls start one scan. The
     /// scan's thread takes the lock only after `find` returns.
     fn start(&self, state: &mut (u64, Option<OsString>)) {
@@ -116,11 +138,13 @@ impl Scanner {
         let scan = state.0;
         let find = Arc::clone(&self.find);
         let shared = Arc::clone(&self.state);
+        let found = Arc::clone(&self.found);
         let finish = move || {
             let path = find();
             let mut state = lock(&shared);
             if state.0 == scan {
                 state.1 = Some(path);
+                found.notify_all();
             }
         };
         let spawned = std::thread::Builder::new()
@@ -229,7 +253,7 @@ fn login_shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
 /// `/bin/kill` with a negative id signals the group; it fails when the group is already
 /// gone, which is fine. Run as a command because signalling a group from Rust needs `libc`
 /// and `unsafe`.
-fn kill_group(leader: u32) {
+pub(crate) fn kill_group(leader: u32) {
     let killed = Command::new("/bin/kill")
         .args(["-KILL", "--", &format!("-{leader}")])
         .stdin(Stdio::null())
@@ -457,18 +481,6 @@ mod tests {
         }
     }
 
-    /// Waits for the scanner's current scan, for at most five seconds.
-    fn finished(scanner: &Scanner) -> OsString {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(path) = scanner.path() {
-                return path;
-            }
-            assert!(Instant::now() < deadline, "the scan did not finish");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     #[test]
     fn a_rescan_shows_its_own_result_even_when_an_older_scan_finishes_later() {
         // The first scan to run takes the gate, says so on `entered`, waits for `release`,
@@ -498,8 +510,13 @@ mod tests {
             "the first scan is held, so it is still running"
         );
 
-        scanner.rescan();
-        assert_eq!(finished(&scanner), "new");
+        std::thread::scope(|scope| {
+            // Whether it starts waiting before the rescan or after, a waiter gets the newest
+            // scan's path: the older scan is held until the end of this scope.
+            let waiting = scope.spawn(|| scanner.wait());
+            scanner.rescan();
+            assert_eq!(waiting.join().unwrap(), "new");
+        });
         release.send(()).unwrap();
         // Each scan thread holds a clone of the state until it ends, after its store.
         let deadline = Instant::now() + Duration::from_secs(5);

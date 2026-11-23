@@ -35,7 +35,8 @@
 //! The format has a version. Every field added is a new version: a build refuses fields it
 //! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
 //! write), and an older build must say "version 2" rather than "unknown field". A newer build
-//! reads every older version.
+//! reads every older version. Version 2 added each note's `state`; a version 1 file reads
+//! with every note open, and the next write makes it version 2.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -50,9 +51,9 @@ use crate::error::{Error, Result};
 use crate::files::write_atomically;
 use crate::repo::Repo;
 
-/// The format version this build reads and writes. A file with another version is refused,
-/// not rewritten.
-const VERSION: u32 = 1;
+/// The format version this build writes. It reads this one and every older one; a file with
+/// a newer version is refused, not rewritten.
+const VERSION: u32 = 2;
 
 /// Reads the review file and places every note where its snippet is now. Does not write.
 ///
@@ -114,6 +115,7 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
         snippet: new.snippet,
         body: body.to_owned(),
         anchor: Anchor::Found,
+        state: NoteState::Open {},
     });
     review.save(&file)?;
     Ok(review)
@@ -144,6 +146,100 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
     }
     review.save(&file)?;
     Ok(review)
+}
+
+/// The prompt that sends the notes `ids` to an agent, in that order (docs/design.md, "The
+/// prompt"): an introduction, then each note's heading, its quoted snippet and its body. The
+/// quoted snippet travels with each note because line numbers go stale the moment the agent
+/// edits a file.
+///
+/// # Errors
+///
+/// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, or holds
+/// something that is not a note id; [`Error::NoSuchNote`] when no note has one of them.
+pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
+    let wanted = parse_ids(ids)?;
+    let review = current(repo)?;
+    let mut text = String::from(
+        "These are review notes an engineer wrote while reading this repository.\n\
+         Address every note. Change nothing the notes do not ask for.\n\
+         When you finish, list each note id with one line on what you did.\n",
+    );
+    let mut files: Vec<String> = Vec::new();
+    for id in &wanted {
+        let note = review
+            .notes
+            .iter()
+            .find(|note| note.id == *id)
+            .ok_or_else(|| Error::NoSuchNote { id: id.to_string() })?;
+        let LineRange { start, end } = note.lines;
+        let lines = if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        };
+        text.push_str(&format!("\n[{}] {}:{lines}\n", note.id, note.path));
+        if note.anchor == Anchor::Lost {
+            text.push_str("(These lines are no longer in the file; they were:)\n");
+        }
+        for line in note.snippet.split('\n') {
+            text.push_str(&format!("> {line}\n"));
+        }
+        text.push_str(note.body.trim_end());
+        text.push('\n');
+        if !files.contains(&note.path) {
+            files.push(note.path.clone());
+        }
+    }
+    Ok(Prompt { text, files })
+}
+
+/// A prompt built from notes. Its `Debug` output leaves out the text, as for [`Note`].
+pub(crate) struct Prompt {
+    /// The text the agent receives.
+    pub(crate) text: String,
+    /// The notes' files, relative to the repository root, each once, in note order.
+    pub(crate) files: Vec<String>,
+}
+
+/// Marks the notes `ids` sent in `run` and saves. A note deleted meanwhile is skipped: the
+/// run it went to is under way, and the engineer removed it.
+///
+/// # Errors
+///
+/// As [`current`]; [`Error::BadRequest`] as for [`prompt`]; [`Error::WriteReview`] when
+/// the lock or the file cannot be written.
+pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<()> {
+    let wanted = parse_ids(ids)?;
+    let file = repo.review_file();
+    let _lock = lock(&file)?;
+    let mut review = current(repo)?;
+    for note in &mut review.notes {
+        if wanted.contains(&note.id) {
+            note.state = NoteState::Sent {
+                run: run.to_owned(),
+            };
+        }
+    }
+    review.save(&file)
+}
+
+/// Reads note ids as the page sends them: at least one, none twice.
+fn parse_ids(ids: &[String]) -> Result<Vec<NoteId>> {
+    if ids.is_empty() {
+        return Err(Error::BadRequest("no notes were chosen".to_owned()));
+    }
+    let mut wanted = Vec::with_capacity(ids.len());
+    for text in ids {
+        let id = NoteId::parse(text).ok_or_else(|| {
+            Error::BadRequest(format!("note id {text:?}: expected N and a number"))
+        })?;
+        if wanted.contains(&id) {
+            return Err(Error::BadRequest(format!("note {text} is chosen twice")));
+        }
+        wanted.push(id);
+    }
+    Ok(wanted)
 }
 
 /// Every note of one working tree, as stored in `review.json`.
@@ -177,6 +273,25 @@ struct Note {
     /// Recomputed on every read, so a note written by hand may leave it out.
     #[serde(default)]
     anchor: Anchor,
+    /// Absent in version 1, where every note is open; a note written by hand may leave it
+    /// out too.
+    #[serde(default)]
+    state: NoteState,
+}
+
+/// Where a note is in the loop. Kept apart from [`Anchor`] (module docs). Always an object
+/// with a `kind` (`{"kind": "open"}`, `{"kind": "sent", "run": "R1"}`), so a script reads
+/// one shape whatever the state.
+///
+/// Each variant has braces: `deny_unknown_fields` checks only struct variants, so a unit
+/// `Open` would accept `{"kind": "open", "typo": 1}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum NoteState {
+    /// Not sent yet, or sent in a run the agent never took up.
+    Open {},
+    /// Sent to the agent in the run with this id (`R1`).
+    Sent { run: String },
 }
 
 /// What the page sends to create a note.
@@ -223,7 +338,7 @@ struct RawLineRange {
 }
 
 /// Whether a note's snippet is still in its file.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Anchor {
     /// The snippet is in the file, at `lines`.
@@ -265,13 +380,15 @@ impl Review {
         // The version is read on its own first: a newer format would otherwise fail on its
         // first new field, with a message that hides the real reason.
         let VersionOnly { version } = serde_json::from_str(&json).map_err(parse_error)?;
-        if version != VERSION {
+        if !(1..=VERSION).contains(&version) {
             return Err(invalid(format!(
-                "version {version}, but this build of Postil reads version {VERSION}"
+                "version {version}, but this build of Postil reads versions 1 to {VERSION}"
             )));
         }
 
-        let review: Self = serde_json::from_str(&json).map_err(parse_error)?;
+        let mut review: Self = serde_json::from_str(&json).map_err(parse_error)?;
+        // An older file is read as this version, and written as this version next time.
+        review.version = VERSION;
         for (index, note) in review.notes.iter().enumerate() {
             if review.notes[..index]
                 .iter()
@@ -380,7 +497,17 @@ impl fmt::Debug for Note {
             .field("path", &self.path)
             .field("lines", &self.lines)
             .field("anchor", &self.anchor)
+            .field("state", &self.state)
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Prompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prompt")
+            .field("len", &self.text.len())
+            .field("files", &self.files)
+            .finish()
     }
 }
 
@@ -390,6 +517,12 @@ impl fmt::Debug for NewNote {
             .field("path", &self.path)
             .field("lines", &self.lines)
             .finish_non_exhaustive()
+    }
+}
+
+impl Default for NoteState {
+    fn default() -> Self {
+        Self::Open {}
     }
 }
 
@@ -533,6 +666,9 @@ mod tests {
             snippet: "secret snippet".to_owned(),
             body: "secret body".to_owned(),
             anchor: Anchor::Found,
+            state: NoteState::Sent {
+                run: "R1".to_owned(),
+            },
         };
         let review = Review {
             version: VERSION,
