@@ -15,7 +15,7 @@ import { escapeAction, foldRun, isLive, isOpen, isResolved, promptLines, sendabl
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, reviewOf, runOf } from "./status.js";
-import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
+import { ancestors, buildTree, folderCounts, shouldReveal, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -322,7 +322,7 @@ function showFile(path, reply, { keepView }) {
   // The changes view holds the header while it is open over the file; a refresh of the file
   // under it (on focus, or as a run moves on) leaves the header alone.
   if (!changes.isOpen()) renderHeader(path);
-  revealFile(previous, path);
+  if (shouldReveal(previous, path, { keepView })) revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
 }
