@@ -165,9 +165,6 @@ export function openPermission(items) {
   return items.findLast((item) => item.type === "permission" && item.answer === undefined) ?? null;
 }
 
-// Which key answers with which option: `a` allows once, `A` (Shift-a) always, `r` rejects.
-// "Always" is offered only when the agent offers it (docs/design.md, "ACP integration"); a
-// reject falls back to "reject always" when the agent offers no plain reject.
 // Whether the agent has not yet reported a tool call finished.
 export function underWay(tool) {
   return tool.status === "pending" || tool.status === "in_progress";
@@ -185,6 +182,9 @@ export function permissionKey(event) {
   return null;
 }
 
+// Which key answers with which option: `a` allows once, `A` (Shift-a) always, `r` rejects.
+// "Always" is offered only when the agent offers it (docs/design.md, "ACP integration"); a
+// reject falls back to "reject always" when the agent offers no plain reject.
 export function permissionKeys(options) {
   const first = (kind) => options.find((option) => option.kind === kind)?.id;
   const keys = new Map();
@@ -373,6 +373,31 @@ export function statusLine(run) {
 // Whether the run is still going: it can be stopped, and no other can start.
 export function isLive(run) {
   return ["starting", "running", "waiting", "cancelling"].includes(run?.status);
+}
+
+// Which Stop button the tray header shows: the live run's id, or null when there is none.
+// The button is built again only when this changes, not on every update of the run: a press
+// and a release on two different nodes is no click, so a Stop rebuilt as the agent writes
+// would miss the engineer's click.
+export function stopKey(run) {
+  return isLive(run) ? run.id : null;
+}
+
+// What Escape does in the window, when no dialog is open and the welcome screen is hidden:
+// it closes or clears the nearest thing on screen, and stops the run only when nothing else
+// is left. Focus mode gives way first, as what it hides cannot be seen. The changes view
+// covers the file, so it closes before the file's selection clears. Its own handler takes
+// Escape while it has the focus; this is for when the focus is elsewhere.
+// `page` says what is open: `{ focusMode, composer, send, changes, selection, live }`, each a
+// boolean. Returns the action's name, or null.
+export function escapeAction({ focusMode, composer, send, changes, selection, live }) {
+  if (focusMode && !composer) return "leave-focus";
+  if (composer) return "close-composer";
+  if (send) return "close-send";
+  if (changes) return "close-changes";
+  if (selection) return "clear-selection";
+  if (live) return "stop";
+  return null;
 }
 
 // Seconds as `m:ss`, or `h:mm:ss` from an hour on.

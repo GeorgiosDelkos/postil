@@ -1,7 +1,8 @@
 # From rust-style/templates/ci/dependabot.yml (jonhoo/rust-ci-conf @ de512da1e85b), with the
 # house 7-day cooldown: a release must age a week before a PR, which lets a compromised or broken
 # release be yanked first. Postil is an application, so it takes patch and minor cargo updates
-# (grouped) instead of ignoring them as a library would: the binary is built from this lockfile.
+# (grouped; a major update gets a PR of its own) instead of ignoring them as a library would: the
+# binary is built from this lockfile.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -25,5 +26,8 @@ updates:
     groups:
       cargo-bump:
         applies-to: version-updates
+        update-types:
+          - "patch"
+          - "minor"
         patterns:
           - "*"

@@ -4,7 +4,16 @@
 
 import { questionContent, questionFields } from "./question.js";
 import { isLive, isResolved, openQuestion, foldRun, partLines, statusLine } from "./run.js";
-import { agentSaid, fileDiffs, fileStats, noteHistory, noteStatus, runStatus } from "./status.js";
+import {
+  agentSaid,
+  fileDiffs,
+  fileStats,
+  noteDialogKey,
+  noteHistory,
+  noteStatus,
+  runFailure,
+  runStatus,
+} from "./status.js";
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -140,16 +149,18 @@ export function noteDialog(
   // The open question's form, kept while it stays open: a redraw must not drop what the
   // engineer has chosen or typed.
   let asking = null;
-  // The editor of the note's text while it is open, `{ id, form }`, kept across redraws for
-  // the same reason.
+  // The editor of the note's text while it is open, `{ id, form, hold(action) }`, kept across
+  // redraws for the same reason.
   let editing = null;
-  // What the dialog was drawn from: drawn again only when this changes, so a run's every
-  // token leaves the dialog, its scroll and its focus alone.
+  // What the dialog was drawn from (`noteDialogKey`): drawn again only when this changes.
   let drawn = null;
+  // The note whose dialog body's scroll a redraw keeps.
+  let scrolledId = null;
 
   dialogEl.addEventListener("close", () => {
     shownId = null;
     drawn = null;
+    scrolledId = null;
     asking = null;
     editing = null;
   });
@@ -181,18 +192,22 @@ export function noteDialog(
     }
     const { note, run } = found;
     const review = run ? reviewOf(run.id) : null;
-    const reviewKey = review && review.stages.map((stage) => [stage.id, stage.status, stage.total]);
-    const key = JSON.stringify([note, run?.id, run?.status, run?.total, canSend(note), agent(), reviewKey, live()]);
+    const key = noteDialogKey(note, run, review, [canSend(note), agent(), reviewers(), live()]);
     if (key === drawn) return;
     drawn = key;
+    const same = shownId === scrolledId;
+    scrolledId = shownId;
     // The question's form is the same node across redraws, and so is the control that had
     // the focus in it, which gets it back; a button outside it is found by its class.
     const active = document.activeElement;
     const typing = [asking?.form, editing?.form].some((form) => form?.contains(active)) ? active : null;
     const focused = typing ? null : active?.className;
+    const scroll = dialogEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
     dialogEl.replaceChildren(header(note, run), body(note, run), footer(note, run));
     typing?.focus();
     if (focused) dialogEl.getElementsByClassName(focused)[0]?.focus();
+    // The same note drawn again keeps its place; another note starts at its top.
+    if (same) dialogEl.querySelector(".note-dialog-body").scrollTop = scroll;
   }
 
   function header(note, run) {
@@ -273,8 +288,9 @@ export function noteDialog(
     const save = el("button", "button primary");
     save.type = "submit";
     save.append("Save", el("kbd", "", "⌘↵"));
+    const why = el("span", "note-dialog-why");
     const actions = el("div", "note-edit-actions");
-    actions.append(cancel, save);
+    actions.append(why, cancel, save);
     form.append(input, actions);
     const stop = () => {
       editing = null;
@@ -304,10 +320,25 @@ export function noteDialog(
         stop();
       }
     });
-    editing = { id: note.id, form };
+    // A changed text is a draft: `holdDraft` keeps it from being lost.
+    const hold = (action) => {
+      const text = input.value.trim();
+      if (!text || text === note.body) return false;
+      why.textContent = `Save or cancel this edit before ${action}.`;
+      why.classList.add("failed");
+      input.focus();
+      return true;
+    };
+    editing = { id: note.id, form, hold };
     drawn = null;
     draw();
     input.focus();
+  }
+
+  // When the note's text is being edited and changed, says so in the editor, focuses it, and
+  // returns true: what would end the page (`action`, "quitting") waits for the engineer.
+  function holdDraft(action) {
+    return editing?.hold(action) ?? false;
   }
 
   function said(note, run) {
@@ -321,7 +352,7 @@ export function noteDialog(
         : `${run.agent} is waiting for you in the run.`,
       silent: `Nothing: the run ended without a line for ${note.id}.`,
       stopped: "Nothing: the run was stopped before the agent wrote its summary.",
-      failed: run.problem ?? failure(run) ?? "The run failed.",
+      failed: run.problem ?? runFailure(run) ?? "The run failed.",
     }[runStatus(note, run).kind];
     const text = el("div", "note-dialog-said muted", words ?? "");
     // A permission request with no allow option waits in the run, not here.
@@ -454,7 +485,7 @@ export function noteDialog(
     return button;
   }
 
-  return { open, draw, isOpen: () => dialogEl.open };
+  return { open, draw, holdDraft, isOpen: () => dialogEl.open };
 }
 
 function section(label, content) {
@@ -491,8 +522,4 @@ function snippetView(note) {
 function where(note) {
   const { start, end } = note.lines;
   return `${note.id} · ${note.path}:${start === end ? start : `${start}-${end}`}`;
-}
-
-function failure(run) {
-  return run.entries.findLast((entry) => entry.kind === "failed")?.error ?? null;
 }

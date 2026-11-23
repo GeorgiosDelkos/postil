@@ -63,6 +63,15 @@ export function visibleRows(root, expanded) {
   return rows;
 }
 
+// Whether showing file `path` reveals it in the tree (opens its folders and scrolls to it).
+// `previous` is the file shown before, or undefined; `keepView` is true when the same file
+// is read again after it may have changed (a refresh, on focus or as a run edits). A file
+// opened, or another file, is revealed. The same file read again is not: the refresh would
+// open again every folder the engineer closed above it, and scroll the list back to it.
+export function shouldReveal(previous, path, { keepView }) {
+  return !keepView || previous !== path;
+}
+
 // The folders that contain `path`, outermost first: the ones to open to show it.
 export function ancestors(path) {
   const parts = path.split("/").slice(0, -1);
