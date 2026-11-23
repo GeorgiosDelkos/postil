@@ -1202,10 +1202,12 @@ const runs = runPanel({
   panelEl: $("run"),
   headerEl: $("run-header"),
   statusEl: $("agent-status"),
+  detailEl: $("run-detail"),
   onChange: followRun,
   onError: showToast,
   noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
   openNote: (id) => noteDetail.open(id),
+  openFile,
 });
 
 const noteDialogEl = $("note-dialog");
@@ -1634,9 +1636,9 @@ filterEl.addEventListener("keydown", (event) => {
 window.addEventListener("keydown", (event) => {
   // Cmd-Q, Cmd-W, Cmd-O, Cmd-Shift-O and Cmd-P belong to the menu bar (src/menu.rs), which
   // calls `window.postil.menu`. The page leaves them alone, so each shortcut is defined once.
-  // The settings dialog and the welcome screen cover the panes: their keys must not act on
-  // what cannot be seen. The dialog handles its own keys (Escape closes it).
-  if (settingsEl.open || noteDialogEl.open) return;
+  // A dialog and the welcome screen cover the panes: their keys must not act on what cannot be
+  // seen. Each dialog handles its own keys (Escape closes it).
+  if (document.querySelector("dialog[open]")) return;
   if (!welcomeEl.hidden) {
     if (event.key === "Escape" && state.projectOpen) hideWelcome();
     return;

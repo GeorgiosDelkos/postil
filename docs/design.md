@@ -366,6 +366,23 @@ One source of run state, the log, so the Rust process has no second summary to k
   it ticked. Decided with the owner on 2026-11-23. A run that starts no longer takes the tray
   to the Run tab unless it came from the send step; one that needs the engineer still does.
 
+### The Run tab
+
+The Run tab (`ui/run-panel.js`) is a column of small cards, each opening a dialog, so the
+tray stays short however long the run (board 12 on the design canvas, chosen by the owner on
+2026-11-23 over a long scrolling transcript):
+
+- **Header:** the status's icon and word, the run id, the agent, and while live its time and
+  Stop.
+- **Top to bottom:** an open permission request (inline: it needs an answer now), the plan
+  (progress bar and the step it is at), one card per note sent (its status, or the agent's line
+  about it; it opens the note detail), the steps (one card per tool call, thought or answered
+  request; a finished run shows its last five until Show all), and the agent's reply (three
+  lines).
+- **The detail dialog** shows a step whole (its command, diffs and output; the arrow keys or
+  ‹ › move to the steps beside it), the whole reply, or every plan step. It is drawn again only
+  when what it shows changes, so it keeps its scroll while the run streams.
+
 ### Agents
 
 An agent is a name and the command that starts it as an ACP server. Postil ships a catalog

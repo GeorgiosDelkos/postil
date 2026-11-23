@@ -26,9 +26,7 @@ import { agentSaid, noteStatus, planProgress } from "./status.js";
 // Run tab"). Arbitrary: enough to see how the run ended.
 const STEPS_SHOWN = 5;
 
-// A reply longer than this many characters is cut until "Show the whole reply". Arbitrary:
-// about ten lines in a tray of the default width.
-const REPLY_CUT = 700;
+const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -41,7 +39,18 @@ function el(tag, className, text) {
 // detail. `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
 // sidebar's agent status. `onChange(run, previous)` is called after every fetch that
 // changed the run, so the page can follow it (switch tabs, re-read files).
-export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteOf, openNote }) {
+// `detailEl` is the `<dialog>` a card opens; `openFile(path)` shows a file in the code pane.
+export function runPanel({
+  panelEl,
+  headerEl,
+  statusEl,
+  detailEl,
+  onChange,
+  onError,
+  noteOf,
+  openNote,
+  openFile,
+}) {
   let run = null;
   let fetching = false;
   let again = false;
@@ -52,9 +61,23 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
   // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
   let views = new Map();
   let drawnRun = null;
-  // Whether the engineer asked for every step of a finished run, and for its whole reply.
+  // Whether the engineer asked for every step of a finished run.
   let allSteps = false;
-  let wholeReply = false;
+  // What the detail dialog shows while open: `{ kind: "step", key }`, `{ kind: "reply" }` or
+  // `{ kind: "plan" }`; and what it was drawn from, to draw it again only when that changes.
+  let detail = null;
+  let detailDrawn = null;
+  detailEl.addEventListener("close", () => {
+    detail = null;
+    detailDrawn = null;
+  });
+  detailEl.addEventListener("keydown", (event) => {
+    if (detail?.kind !== "step" || event.metaKey || event.altKey || event.ctrlKey) return;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      moveStep(event.key === "ArrowLeft" ? -1 : 1);
+    }
+  });
   // Whether the panel follows the end of the run: true until the engineer scrolls up, and
   // again once they scroll back to the end. Scrolling up is read as any move above where
   // `reveal` last put the panel, not as a distance from the end: a slow trackpad scroll moves
@@ -156,7 +179,7 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
       follow = true;
       forceAt = null;
       allSteps = false;
-      wholeReply = false;
+      if (detailEl.open) detailEl.close();
     }
     renderStatus();
     renderHeader();
@@ -165,51 +188,43 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
       return;
     }
     // Top to bottom: what needs the engineer, the plan, each note's result, the steps, and the
-    // agent's reply (docs/design.md, "The Run tab").
+    // agent's reply, each a card of a line or two that opens the detail dialog (docs/design.md,
+    // "The Run tab").
     const { plan, items } = foldRun(run.entries);
     const live = isLive(run);
     const asking = items.filter((item) => item.type === "permission" && item.answer === undefined);
-    const steps = items.filter((item) => item.type !== "message" && !asking.includes(item));
+    const steps = stepsOf(items);
     const messages = items.filter((item) => item.type === "message");
     const wanted = [];
-    const itemEntry = (item, index) => [
-      itemKey(item, index),
-      signature(item, live),
-      item.output ?? null,
-      (open) => itemView(item, open),
-    ];
-    for (const item of asking) wanted.push(itemEntry(item, items.indexOf(item)));
-    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), null, () => planView(plan)]);
+    for (const item of asking) {
+      wanted.push([itemKey(item, items.indexOf(item)), signature(item, live), () => permissionView(item)]);
+    }
+    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), () => planCard(plan)]);
 
     const cards = run.notes.map((id) => noteCard(id));
-    wanted.push(["notes", JSON.stringify(cards), null, () => notesView(cards)]);
+    wanted.push(["notes", JSON.stringify(cards), () => notesView(cards)]);
 
     if (steps.length) {
       const cut = !live && !allSteps && steps.length > STEPS_SHOWN + 1;
-      wanted.push(["steps", JSON.stringify([steps.length, cut]), null, () => stepsLabel(steps.length, cut)]);
-      for (const item of cut ? steps.slice(-STEPS_SHOWN) : steps) {
-        wanted.push(itemEntry(item, items.indexOf(item)));
+      wanted.push(["steps", JSON.stringify([steps.length, cut]), () => stepsLabel(steps.length, cut)]);
+      for (const { item, key } of cut ? steps.slice(-STEPS_SHOWN) : steps) {
+        wanted.push([key, signature(item, live), () => stepCard(item, key)]);
       }
     }
     if (messages.length) {
-      const texts = messages.map((message) => message.text);
-      const cut = !live && !wholeReply && texts.join("").length > REPLY_CUT;
-      wanted.push(["reply", JSON.stringify([texts, live, cut]), null, () => replyView(texts, live, cut)]);
+      const text = messages.map((message) => message.text.trim()).join("\n\n");
+      wanted.push(["reply", JSON.stringify([text, live]), () => replyCard(text, live)]);
     }
-    if (run.problem) wanted.push(["problem", run.problem, null, () => el("div", "run-notice", run.problem)]);
+    if (run.problem) wanted.push(["problem", run.problem, () => el("div", "run-notice", run.problem)]);
     if (wanted.length === 0) {
-      wanted.push(["empty", statusLine(run).text, null, () => el("div", "empty", statusLine(run).text)]);
+      wanted.push(["empty", statusLine(run).text, () => el("div", "empty", statusLine(run).text)]);
     }
 
     const next = new Map();
-    // `data` is the object the signature leaves out, compared by identity: a tool's output,
-    // which an update replaces whole and entries keep from one fetch to the next.
-    const nodes = wanted.map(([key, sig, data, build]) => {
+    const nodes = wanted.map(([key, sig, build]) => {
       const drawn = views.get(key);
-      const same = drawn?.sig === sig && drawn.data === data;
-      // A redrawn tool opens, filled at once, as the one it replaces was.
-      const node = same ? drawn.node : build(drawn?.node.open === true);
-      next.set(key, { sig, data, node });
+      const node = drawn?.sig === sig ? drawn.node : build();
+      next.set(key, { sig, node });
       return node;
     });
     views = next;
@@ -219,6 +234,15 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
     });
     while (panelEl.childNodes.length > nodes.length) panelEl.lastChild.remove();
     reveal();
+    drawDetail();
+  }
+
+  // The run's steps in order, each with its key: every item but the agent's messages and an
+  // open permission request, which shows above.
+  function stepsOf(items) {
+    return items
+      .map((item, index) => ({ item, key: itemKey(item, index) }))
+      .filter(({ item }) => item.type !== "message" && !(item.type === "permission" && item.answer === undefined));
   }
 
   // Scrolls to the end while the panel follows it. Measured only while the panel shows: a
@@ -244,8 +268,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
     switch (item.type) {
       case "tool":
         // `live` only changes how a call still under way is drawn, so a run's end leaves the
-        // finished ones, and any text selected in them, alone.
-        return JSON.stringify([item.title, item.tool, item.status, item.places, underWay(item) && live]);
+        // finished ones alone.
+        return JSON.stringify(toolRow(item, live && underWay(item)));
       case "permission":
         return JSON.stringify([item.title, item.answer ?? "open"]);
       default:
@@ -331,17 +355,15 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
     );
     view.append(label);
     for (const card of cards) {
-      const button = el("button", `run-note ${card.kind}`);
+      const button = el("button", `run-card ${card.kind}`);
       button.type = "button";
-      const head = el("span", "run-note-head");
-      head.append(
+      button.title = card.said ?? card.label;
+      button.append(
         statusIcon(card.kind),
-        el("span", `run-note-status ${card.tone}`, card.label),
+        el("span", `run-card-text run-note-status ${card.said ? "" : card.tone}`, card.said ?? card.label),
         el("span", "run-note-where", card.where),
         el("span", "note-id", card.id),
       );
-      button.append(head);
-      if (card.said) button.append(el("span", "run-note-said", card.said));
       button.addEventListener("click", () => openNote(card.id));
       view.append(button);
     }
@@ -363,64 +385,207 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
     return label;
   }
 
-  function replyView(texts, live, cut) {
+  // A card: a button of one line (or a few, for the reply) that opens the detail dialog.
+  function card(className, parts, open) {
+    const button = el("button", `run-card ${className}`);
+    button.type = "button";
+    button.append(...parts, el("span", "run-chevron", "›"));
+    button.addEventListener("click", open);
+    return button;
+  }
+
+  function replyCard(text, live) {
     const view = el("section", "run-reply");
     view.append(el("div", "run-label", live ? `${run.agent} is writing` : `${run.agent}'s reply`));
-    const body = el("div", cut ? "run-reply-body cut" : "run-reply-body");
-    for (const text of texts) body.append(markdownView(text));
-    view.append(body);
-    if (cut) {
-      const more = el("button", "button run-whole", "Show the whole reply");
-      more.type = "button";
-      more.addEventListener("click", () => {
-        wholeReply = true;
-        render();
-      });
-      view.append(more);
-    }
+    const preview = el("span", "run-card-text run-reply-preview", text.replace(/\s+/g, " "));
+    view.append(card("reply", [preview], () => openDetail({ kind: "reply" })));
     return view;
   }
 
-  function planView(plan) {
+  function planCard(plan) {
     const view = el("section", "run-plan");
     const progress = planProgress(run);
-    const label = el("div", "run-label");
-    label.append(el("span", "", `Plan · ${progress.done} of ${progress.total}`));
-    const bar = el("div", "run-progress");
-    const fill = el("div", "run-progress-fill");
+    view.append(el("div", "run-label", `Plan · ${progress.done} of ${progress.total}`));
+    const bar = el("span", "run-progress");
+    const fill = el("span", "run-progress-fill");
     fill.style.width = `${(100 * progress.done) / progress.total}%`;
     bar.append(fill);
-    view.append(label, bar);
-    for (const step of plan) {
-      const row = el("div", `plan-step ${step.status}`);
-      const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
-      mark.setAttribute("aria-hidden", "true");
-      row.append(mark, el("span", "", step.content));
-      view.append(row);
-    }
+    // The step under way, else the next to do, else the last: what the plan is at.
+    const at =
+      plan.find((step) => step.status === "in_progress") ??
+      plan.find((step) => step.status === "pending") ??
+      plan.at(-1);
+    const body = el("span", "run-plan-body");
+    body.append(bar, el("span", "run-card-text", at.content));
+    view.append(card("plan", [body], () => openDetail({ kind: "plan" })));
     return view;
   }
 
-  // `open`: an expandable item is drawn open, as the node it replaces was.
-  function itemView(item, open) {
+  function stepCard(item, key) {
+    const open = () => openDetail({ kind: "step", key });
     switch (item.type) {
-      case "message":
-        return markdownView(item.text);
-      case "thought": {
-        const details = el("details", "run-thought");
-        details.append(el("summary", "", "Thinking"), el("div", "", item.text.trim()));
-        details.open = open;
-        return details;
+      case "tool": {
+        const row = toolRow(item, isLive(run));
+        const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
+        const state = el("span", `tool-state${tone}`, row.state);
+        const node = card(`step${row.running ? " running" : ""}`, [
+          el("span", "tool-verb", row.verb),
+          el("span", "run-card-text tool-target", row.target),
+          state,
+        ], open);
+        node.title = item.title;
+        return node;
       }
-      case "tool":
-        return toolView(item, open);
-      case "permission":
-        return permissionView(item);
+      case "thought":
+        return card("step", [
+          el("span", "tool-verb", "think"),
+          el("span", "run-card-text run-thought-preview", item.text.trim().replace(/\s+/g, " ")),
+        ], open);
+      case "permission": {
+        const chosen = item.options.find((option) => option.id === item.answer);
+        return card("step", [
+          el("span", "tool-verb", "ask"),
+          el("span", "run-card-text", item.title),
+          el("span", "tool-state", chosen ? chosen.name : "cancelled"),
+        ], open);
+      }
       case "error":
         return el("div", "run-error", item.text);
       default:
         return el("div", "run-notice", item.text);
     }
+  }
+
+  // ---- The detail dialog --------------------------------------------------------------
+
+  function openDetail(what) {
+    detail = what;
+    detailDrawn = null;
+    drawDetail();
+    if (!detailEl.open) detailEl.showModal();
+  }
+
+  // Draws the dialog again when what it shows changed: a step's state or output, the reply's
+  // text, the plan. Its scroll is kept otherwise, while the run streams.
+  function drawDetail() {
+    if (!detail || !run) return;
+    const { plan, items } = foldRun(run.entries);
+    const steps = stepsOf(items);
+    let stamp;
+    let draw;
+    if (detail.kind === "step") {
+      const index = steps.findIndex((step) => step.key === detail.key);
+      if (index < 0) return;
+      const { item } = steps[index];
+      stamp = [detail.key, item.status, item.output, item.text, item.answer, isLive(run)];
+      draw = () => stepDetail(item, index, steps.length);
+    } else if (detail.kind === "reply") {
+      const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
+      stamp = ["reply", text];
+      draw = () => replyDetail(text);
+    } else {
+      stamp = ["plan", JSON.stringify(plan)];
+      draw = () => planDetail(plan ?? []);
+    }
+    if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) return;
+    detailDrawn = stamp;
+    const scroll = detailEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
+    const sameItem = detailEl.dataset.shown === stamp[0];
+    detailEl.dataset.shown = stamp[0];
+    detailEl.replaceChildren(...draw());
+    const body = detailEl.querySelector(".note-dialog-body");
+    if (body && sameItem) body.scrollTop = scroll;
+  }
+
+  function moveStep(by) {
+    const steps = stepsOf(foldRun(run.entries).items);
+    const index = steps.findIndex((step) => step.key === detail.key);
+    const next = steps[index + by];
+    if (next) openDetail({ kind: "step", key: next.key });
+  }
+
+  function detailHeader(icon, title, extra, actions = []) {
+    const head = el("header", "note-dialog-header");
+    const heading = el("h2", "note-dialog-title", title);
+    heading.id = "run-detail-title";
+    const close = el("button", "button", "esc");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close");
+    close.addEventListener("click", () => detailEl.close());
+    const right = el("span", "note-dialog-actions");
+    right.append(...actions, close);
+    head.append(...(icon ? [icon] : []), heading, el("span", "note-dialog-where", extra), right);
+    return head;
+  }
+
+  function stepDetail(item, index, count) {
+    const body = el("div", "note-dialog-body");
+    const nav = el("div", "run-detail-nav");
+    const previous = el("button", "button", "‹");
+    previous.type = "button";
+    previous.setAttribute("aria-label", "The step before");
+    previous.disabled = index === 0;
+    previous.addEventListener("click", () => moveStep(-1));
+    const following = el("button", "button", "›");
+    following.type = "button";
+    following.setAttribute("aria-label", "The step after");
+    following.disabled = index === count - 1;
+    following.addEventListener("click", () => moveStep(1));
+    nav.append(el("span", "", `Step ${index + 1} of ${count} · ← → to move`), previous, following);
+    body.append(nav);
+
+    if (item.type === "thought") {
+      body.append(el("div", "run-detail-text", item.text.trim()));
+      return [detailHeader(null, "Thinking", run.id), body];
+    }
+    if (item.type === "permission") {
+      const chosen = item.options.find((option) => option.id === item.answer);
+      body.append(el("div", "run-detail-text", `Answered: ${chosen ? chosen.name : "cancelled"}`));
+      return [detailHeader(null, item.title, run.id), body];
+    }
+    const row = toolRow(item, isLive(run));
+    const kind = item.status === "failed" ? "failed" : row.running ? "working" : "addressed";
+    const actions = [];
+    const path = item.places[0]?.path ?? item.output.find((part) => part.type === "diff")?.path;
+    if (path) {
+      const show = el("button", "button", "Open file");
+      show.type = "button";
+      show.addEventListener("click", () => {
+        detailEl.close();
+        openFile(path);
+      });
+      actions.push(show);
+    }
+    if (item.title !== row.target) body.append(el("pre", "run-detail-command", item.title));
+    for (const part of item.output) {
+      if (part.type === "diff") {
+        if (item.output.length > 1) body.append(el("div", "run-label", part.path));
+        body.append(diffView(part));
+      } else body.append(el("pre", "tool-output", part.text));
+    }
+    if (item.output.length === 0) {
+      body.append(el("div", "run-detail-text muted", row.running ? "Under way…" : "No output."));
+    }
+    return [detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions), body];
+  }
+
+  function replyDetail(text) {
+    const body = el("div", "note-dialog-body");
+    body.append(markdownView(text));
+    return [detailHeader(null, `${run.agent}'s reply`, run.id), body];
+  }
+
+  function planDetail(plan) {
+    const body = el("div", "note-dialog-body");
+    for (const step of plan) {
+      const row = el("div", `plan-step ${step.status}`);
+      const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
+      mark.setAttribute("aria-hidden", "true");
+      row.append(mark, el("span", "", step.content));
+      body.append(row);
+    }
+    const progress = planProgress(run);
+    return [detailHeader(null, "Plan", progress ? `${progress.done} of ${progress.total} done` : ""), body];
   }
 
   // The agent's Markdown as elements, built node by node: its text is never parsed as HTML.
@@ -444,43 +609,6 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteO
       node.append(wrap ? el(wrap, "", part.text) : part.text);
     }
     return node;
-  }
-
-  // `open`: the tool is drawn open, with its output, as the node it replaces was.
-  function toolView(tool, open) {
-    const row = toolRow(tool, isLive(run));
-    const diffs = tool.output.filter((part) => part.type === "diff");
-    const texts = tool.output.filter((part) => part.type === "text");
-    const line = el("div", `tool-line${row.running ? " running" : ""}`);
-    line.append(el("span", "tool-verb", row.verb), el("span", "tool-target", row.target));
-    const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
-    const state = el("span", `tool-state${tone}`, row.state);
-    line.append(state);
-    if (diffs.length === 0 && texts.length === 0) {
-      line.title = tool.title;
-      return line;
-    }
-    // A call with output opens to show it: its diffs, or what it printed. They are built when
-    // first opened: a run can carry many large diffs nobody opens.
-    const details = el("details", "tool");
-    const summary = el("summary");
-    summary.append(line);
-    details.append(summary);
-    let built = false;
-    const fill = () => {
-      if (built) return;
-      built = true;
-      for (const diff of diffs) details.append(diffView(diff));
-      for (const text of texts) details.append(el("pre", "tool-output", text.text));
-    };
-    details.addEventListener("toggle", () => {
-      if (details.open) fill();
-    });
-    if (open) {
-      fill();
-      details.open = true;
-    }
-    return details;
   }
 
   function diffView(diff) {

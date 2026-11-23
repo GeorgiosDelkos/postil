@@ -1873,40 +1873,63 @@ button.repo-name:hover {
   gap: 6px;
 }
 
-.run-note {
+/* Every part of a run is a card of one line (the reply: three) that opens the detail dialog
+   (docs/design.md, "The Run tab"). */
+.run-card {
   display: flex;
-  flex-direction: column;
-  gap: 5px;
+  align-items: center;
+  gap: 8px;
   width: 100%;
-  padding: 9px 12px;
+  min-height: 34px;
+  padding: 6px 10px;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text);
   font: inherit;
+  font-size: 12.5px;
   text-align: left;
 }
 
-.run-note:hover {
+.run-card:hover,
+.run-card:focus-visible {
   border-color: var(--border-strong);
+  outline: none;
 }
 
-.run-note.needs {
+.run-card.needs {
   border-color: var(--attention-border);
 }
 
-.run-note-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+.run-card.step {
   font: 11.5px "Geist Mono", monospace;
+  font-variant-ligatures: none;
+  color: var(--text-soft);
+}
+
+.run-card-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.run-thought-preview {
+  font: 12.5px "Geist", system-ui, sans-serif;
   color: var(--text-muted);
 }
 
-.run-note-status {
-  flex: 1;
-  font-family: "Geist", system-ui, sans-serif;
-  color: var(--text-soft);
+.run-chevron {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.run-note-where {
+  flex: none;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
 }
 
 .run-note-status.done {
@@ -1921,32 +1944,74 @@ button.repo-name:hover {
   color: var(--removed);
 }
 
-.run-note-said {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  font-size: 12.5px;
-  line-height: 18px;
-}
-
 .run-reply {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.run-reply-body.cut {
-  max-height: 200px;
-  overflow: hidden;
-  mask-image: linear-gradient(to bottom, black 70%, transparent);
-  -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent);
+.run-card.reply {
+  align-items: flex-start;
+  padding: 8px 10px;
 }
 
-.run-whole {
-  align-self: flex-start;
+.run-reply-preview {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  line-height: 18px;
+}
+
+.run-plan-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.run-detail-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.run-detail-nav > span {
+  flex: 1;
+}
+
+.run-detail-nav .button {
   height: 26px;
-  font-size: 12px;
+  padding: 0 10px;
+}
+
+.run-detail-text {
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-detail-text.muted {
+  color: var(--text-muted);
+}
+
+.run-detail-command {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--canvas);
+  border-radius: 8px;
+  font: 12px/18px "Geist Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-detail .tool-diff,
+.run-detail .tool-output {
+  max-height: none;
 }
 
 .run-plan {
@@ -2025,19 +2090,6 @@ button.repo-name:hover {
 .tool-line.running .tool-state::after {
   content: "…";
   color: var(--text-muted);
-}
-
-details.tool > summary {
-  list-style: none;
-}
-
-details.tool > summary::-webkit-details-marker {
-  display: none;
-}
-
-details.tool > summary:hover .tool-line,
-details.tool[open] .tool-line {
-  background: var(--hover);
 }
 
 .tool-diff,
@@ -2197,22 +2249,6 @@ details.tool[open] .tool-line {
   border-radius: 6px;
   font: 11.5px/18px "Geist Mono", monospace;
   font-variant-ligatures: none;
-}
-
-.run-thought {
-  color: var(--text-muted);
-}
-
-.run-thought summary {
-  font-size: 11.5px;
-  cursor: default;
-}
-
-.run-thought div {
-  margin-top: 4px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  user-select: text;
 }
 
 .run-error {
