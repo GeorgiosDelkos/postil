@@ -387,11 +387,12 @@ tray stays short however long the run (board 12 on the design canvas, chosen by 
   Stop.
 - **Top to bottom:** an open permission request (inline: it needs an answer now), the plan
   (progress bar and the step it is at), one card per note sent (its status, or the agent's line
-  about it; it opens the note detail), the steps (one card per tool call, thought or answered
-  request; a finished run shows its last five until Show all), and the agent's reply (three
-  lines).
-- **The detail dialog** shows a step whole (its command, diffs and output; the arrow keys or
-  ‹ › move to the steps beside it), the whole reply, or every plan step. It is drawn again only
+  about it; it opens the note detail), one card for the steps (how many, and the latest; it
+  opens the list of every step, asked by the owner on 2026-11-23), and the agent's reply (one
+  line).
+- **The detail dialog** shows the list of steps, a step whole (its command, diffs and output;
+  the arrow keys or ‹ › move to the steps beside it, and All steps goes back to the list), the
+  whole reply, or every plan step. It is drawn again only
   when what it shows changes, so it keeps its scroll while the run streams.
 
 ### Agents

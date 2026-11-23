@@ -22,10 +22,6 @@ import {
 import { statusIcon } from "./note-dialog.js";
 import { noteStatus, planProgress } from "./status.js";
 
-// A finished run shows this many of its last steps until "Show all" (docs/design.md, "The
-// Run tab"). Arbitrary: enough to see how the run ended.
-const STEPS_SHOWN = 5;
-
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
 function el(tag, className, text) {
@@ -61,10 +57,8 @@ export function runPanel({
   // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
   let views = new Map();
   let drawnRun = null;
-  // Whether the engineer asked for every step of a finished run.
-  let allSteps = false;
-  // What the detail dialog shows while open: `{ kind: "step", key }`, `{ kind: "reply" }` or
-  // `{ kind: "plan" }`; and what it was drawn from, to draw it again only when that changes.
+  // What the detail dialog shows while open: `{ kind: "steps" }`, `{ kind: "step", key }`,
+  // `{ kind: "reply" }` or `{ kind: "plan" }`; and what it was drawn from, to draw it again only when that changes.
   let detail = null;
   let detailDrawn = null;
   detailEl.addEventListener("close", () => {
@@ -178,7 +172,6 @@ export function runPanel({
       drawnRun = run?.id ?? null;
       follow = true;
       forceAt = null;
-      allSteps = false;
       if (detailEl.open) detailEl.close();
     }
     renderStatus();
@@ -188,7 +181,7 @@ export function runPanel({
       return;
     }
     // Top to bottom: what needs the engineer, the plan, each note's result, the steps, and the
-    // agent's reply, each a card of a line or two that opens the detail dialog (docs/design.md,
+    // agent's reply, each a card of one line that opens the detail dialog (docs/design.md,
     // "The Run tab").
     const { plan, items } = foldRun(run.entries);
     const live = isLive(run);
@@ -204,12 +197,11 @@ export function runPanel({
     const cards = run.notes.map((id) => noteCard(id));
     wanted.push(["notes", JSON.stringify(cards), () => notesView(cards)]);
 
+    // The steps are one card, the latest step: the list and each step are in the dialog.
     if (steps.length) {
-      const cut = !live && !allSteps && steps.length > STEPS_SHOWN + 1;
-      wanted.push(["steps", JSON.stringify([steps.length, cut]), () => stepsLabel(steps.length, cut)]);
-      for (const { item, key } of cut ? steps.slice(-STEPS_SHOWN) : steps) {
-        wanted.push([key, signature(item, live), () => stepCard(item, key)]);
-      }
+      const last = steps.at(-1);
+      const sig = JSON.stringify([steps.length, last.key, signature(last.item, live)]);
+      wanted.push(["steps", sig, () => stepsCard(steps.length, last)]);
     }
     if (messages.length) {
       const text = messages.map((message) => message.text.trim()).join("\n\n");
@@ -370,19 +362,12 @@ export function runPanel({
     return view;
   }
 
-  function stepsLabel(count, cut) {
-    const label = el("div", "run-label run-steps-label");
-    label.append(el("span", "", count === 1 ? "Step" : `Steps · ${count}`));
-    if (cut) {
-      const more = el("button", "run-more", "Show all");
-      more.type = "button";
-      more.addEventListener("click", () => {
-        allSteps = true;
-        render();
-      });
-      label.append(more);
-    }
-    return label;
+  // The steps' card: how many, and the latest, which opens the list of them all.
+  function stepsCard(count, last) {
+    const view = el("section", "run-steps");
+    view.append(el("div", "run-label", count === 1 ? "Step" : `Steps · ${count}`));
+    view.append(stepCard(last.item, () => openDetail({ kind: "steps" })));
+    return view;
   }
 
   // A card: a button of one line (or a few, for the reply) that opens the detail dialog.
@@ -421,8 +406,8 @@ export function runPanel({
     return view;
   }
 
-  function stepCard(item, key) {
-    const open = () => openDetail({ kind: "step", key });
+  // `open` runs on a click: the step's own detail, or for the steps' card the list.
+  function stepCard(item, open) {
     switch (item.type) {
       case "tool": {
         const row = toolRow(item, isLive(run));
@@ -463,6 +448,11 @@ export function runPanel({
     detailDrawn = null;
     drawDetail();
     if (!detailEl.open) detailEl.showModal();
+    // The list opens at its end: the latest step is the one being watched.
+    if (what.kind === "steps") {
+      const body = detailEl.querySelector(".note-dialog-body");
+      body.scrollTop = body.scrollHeight;
+    }
   }
 
   // Draws the dialog again when what it shows changed: a step's state or output, the reply's
@@ -473,7 +463,10 @@ export function runPanel({
     const steps = stepsOf(items);
     let stamp;
     let draw;
-    if (detail.kind === "step") {
+    if (detail.kind === "steps") {
+      stamp = ["steps", JSON.stringify(steps.map(({ item, key }) => [key, signature(item, isLive(run))]))];
+      draw = () => stepsDetail(steps);
+    } else if (detail.kind === "step") {
       const index = steps.findIndex((step) => step.key === detail.key);
       if (index < 0) return;
       const { item } = steps[index];
@@ -518,9 +511,21 @@ export function runPanel({
     return head;
   }
 
+  // Every step, one card each, the latest last; a card opens that step.
+  function stepsDetail(steps) {
+    const body = el("div", "note-dialog-body run-steps-list");
+    for (const { item, key } of steps) body.append(stepCard(item, () => openDetail({ kind: "step", key })));
+    const live = isLive(run);
+    return [detailHeader(null, `Steps · ${steps.length}`, `${run.id} · ${run.agent}${live ? " · under way" : ""}`), body];
+  }
+
   function stepDetail(item, index, count) {
     const body = el("div", "note-dialog-body");
     const nav = el("div", "run-detail-nav");
+    const all = el("button", "button", "‹ All steps");
+    all.type = "button";
+    all.addEventListener("click", () => openDetail({ kind: "steps" }));
+    nav.append(all);
     const previous = el("button", "button", "‹");
     previous.type = "button";
     previous.setAttribute("aria-label", "The step before");
