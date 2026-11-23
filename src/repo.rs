@@ -158,9 +158,9 @@ impl Repo {
     /// changes view").
     ///
     /// The tree is written through an index of Postil's own, `<git dir>/postil-snapshot.index`
-    /// beside the real one, so the engineer's index, branch and stash are left as they are. It is kept between
-    /// snapshots: git hashes again only the files whose stat data changed since the last one,
-    /// untracked files included. The first snapshot starts from a copy of the real index, so
+    /// beside the real one, so the engineer's index, branch and stash are left as they are. It
+    /// is kept between snapshots: git hashes again only the files whose stat data changed since
+    /// the last one, untracked files included. The first snapshot starts from a copy of the real index, so
     /// only untracked files are hashed in full then. `git add` runs the repository's clean
     /// filters (git-lfs copies a changed file into `.git/lfs`). The tree and its blobs are
     /// objects no ref holds, so `git gc` may prune them once they are older than its prune
