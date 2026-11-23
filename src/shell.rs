@@ -1383,6 +1383,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::InvalidSettings(_) => StatusCode::BAD_REQUEST,
                 Error::NoteTextChanged { .. }
                 | Error::NoProject
+                | Error::ReviewLocked { .. }
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
                 | Error::TurnRunning
@@ -1740,7 +1741,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(reply.contains("cannot write"), "{reply}");
-        assert!(reply.contains("the note was not saved"), "{reply}");
+        assert!(reply.contains("the change was not saved"), "{reply}");
         assert_eq!(
             fs::read_dir(dir).unwrap().count(),
             0,
@@ -2191,6 +2192,41 @@ mod tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, (1..=20).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn a_change_gives_up_on_a_lock_another_process_keeps_and_names_it() {
+        let repo = TempRepo::new("notes-stuck-lock");
+        repo.write("a.txt", "x\n");
+        let lock_file = repo.root.join(".git/postil/review.lock");
+        fs::create_dir_all(lock_file.parent().unwrap()).unwrap();
+        // A lock on a file of its own, as another process's would be: `flock` locks belong to
+        // the open file, so this one conflicts with the request's in the same process.
+        let held = fs::File::create(&lock_file).unwrap();
+        held.lock().unwrap();
+
+        // On its own thread, so a request that waits forever fails this test instead of
+        // hanging it.
+        let (sender, replies) = mpsc::channel();
+        let root = repo.root.clone();
+        std::thread::spawn(move || {
+            let site = Site::new(None, None, no_agents(), quiet());
+            site.open(Repo::open(&root).unwrap());
+            drop(sender.send(post(&site, NOTES, &new_note("a.txt", 1, 1, "x", "Hi."))));
+        });
+        let (status, reply) = replies
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the request gives up on a held lock instead of waiting for it");
+        drop(held);
+
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        // git names the git directory with links resolved (`/tmp` is `/private/tmp` on macOS).
+        let expected = format!(
+            "another process held {} for 2 s, so the change was not saved",
+            lock_file.canonicalize().unwrap().display()
+        );
+        assert!(reply.starts_with(&expected), "{reply}");
+        assert!(!repo.root.join(".git/postil/review.json").exists());
     }
 
     #[test]
