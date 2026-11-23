@@ -63,6 +63,11 @@ const file = `${process.cwd()}/src/a.rs`;
 
 async function prompt(id, params) {
   prompts += 1;
+  // Refuses its first prompt before doing anything, as an agent at its rate limit does, and
+  // answers the ones after it.
+  if (scenario === "refuse-first" && prompts === 1) {
+    return send({ id, error: { code: -32603, message: "model overloaded" } });
+  }
   const blocks = params.prompt.map((block) => (block.type === "text" ? block.text : block.uri));
   say(`got ${blocks.join(" | ")}`);
   say(`prompt ${prompts}`);
@@ -82,7 +87,15 @@ async function prompt(id, params) {
         status: "pending",
         locations: [{ path: file, line: 3 }],
       });
-      update({ sessionUpdate: "tool_call", toolCallId: "t2", title: "New tool", kind: "teleport" });
+      // A kind newer than the schema, and null lists: the call still shows.
+      update({
+        sessionUpdate: "tool_call",
+        toolCallId: "t2",
+        title: "New tool",
+        kind: "teleport",
+        content: null,
+        locations: null,
+      });
       const answer = await permission("t1");
       say(`chose ${answer.result.outcome.optionId}`);
       update({
@@ -121,6 +134,9 @@ async function prompt(id, params) {
       say(`bad permission answered ${fs.error?.code}`);
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "odd-error":
+      // An error object without a code, as JSON-RPC requires one.
+      return send({ id, error: { message: "no code here" } });
     case "refuse-prompt":
       return send({ id, error: { code: -32603, message: "model overloaded" } });
     case "exit-mid-turn":

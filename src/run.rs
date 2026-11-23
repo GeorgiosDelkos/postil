@@ -13,9 +13,9 @@
 //! # Stopping
 //!
 //! Stop asks the agent to cancel the turn (`session/cancel`). An agent that is still
-//! starting is killed instead, and the run ends at once: a start can take minutes. Asked a
-//! second time, Stop kills an agent that did not stop, so a hung agent never holds the
-//! working tree.
+//! starting is killed instead, and the run ends at once: a start can take minutes. Asked
+//! again from [`FORCE_AFTER`] on, Stop kills an agent that did not stop, so a hung agent never
+//! holds the working tree; a second Stop sooner is the same request.
 //!
 //! # The run log
 //!
@@ -49,7 +49,7 @@ use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,15 @@ use crate::repo::Repo;
 /// the hint to run the agent in a terminal (an agent waiting for a browser sign-in never
 /// answers). Stop ends the wait sooner.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long after the first Stop a second one kills the agent. Arbitrary: longer than a double
+/// click or a second Escape, short enough that a hung agent is not waited on.
+const FORCE_AFTER: Duration = Duration::from_secs(3);
+
+/// How long a send waits for the run lock before it reports another window's run
+/// ([`take_run_lock`]). Arbitrary: far longer than a fork-to-exec window, short enough that a
+/// refused send answers at once.
+const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
 /// The run log's format version, in its header line.
 const LOG_VERSION: u32 = 1;
@@ -94,18 +103,43 @@ pub(crate) struct Runner {
 /// What a runner holds now.
 #[derive(Debug, Default)]
 struct Slot {
-    /// The agent kept between runs.
-    agent: Option<(AgentChoice, Agent)>,
-    /// Stops the agent being started, while its session is being opened.
-    starting: Option<Stopper>,
-    /// The number of the agent started last. An agent's events and its start carry the
-    /// number it was started with: when it differs, the agent was replaced, stopped, or its
-    /// run cancelled, and what it reports is dropped.
+    agent: Held,
+    /// Counts the agents this runner let go. An agent's events and its start carry the number
+    /// it was started with: when it differs, the agent was replaced, stopped, or its run
+    /// cancelled, and what it reports is dropped.
     generation: u64,
     /// This window's latest run.
     run: Option<Arc<Run>>,
     /// Set when the project closed: an agent that finishes starting afterwards is stopped.
     closed: bool,
+}
+
+/// The runner's agent: none, one starting, or one ready and kept between runs.
+#[derive(Debug, Default)]
+enum Held {
+    #[default]
+    None,
+    /// Being started on the start thread. The stopper is there once its process runs.
+    Starting(Option<Stopper>),
+    /// Its session is open; it is kept for the next run while it is the one chosen.
+    Ready(AgentChoice, Agent),
+}
+
+impl Slot {
+    /// Lets the agent go: a starting one is stopped, a ready one dropped (which stops it), and
+    /// anything either would still report is dropped.
+    fn release(&mut self) -> Held {
+        if let Held::Starting(Some(stopper)) = &self.agent {
+            stopper.stop();
+        }
+        self.generation += 1;
+        std::mem::take(&mut self.agent)
+    }
+
+    /// Whether an agent started as number `generation` was let go meanwhile.
+    fn let_go(&self, generation: u64) -> bool {
+        self.closed || self.generation != generation
+    }
 }
 
 /// A send that waits for its agent to start.
@@ -160,24 +194,27 @@ impl Runner {
         )?);
         slot.run = Some(Arc::clone(&run));
 
-        let kept = slot
-            .agent
-            .as_ref()
-            .filter(|(kept, live)| *kept == agent && live.is_alive());
-        if let Some((_, live)) = kept {
-            self.begin(live, &run, ids, &prompt);
-        } else {
-            // Dropping the agent kept from the last run stops it.
-            slot.agent = None;
-            slot.generation += 1;
-            let pending = Pending {
-                agent,
-                run,
-                ids: ids.to_vec(),
-                prompt,
-                generation: slot.generation,
-            };
-            self.start(pending);
+        match &slot.agent {
+            Held::Ready(kept, live) if *kept == agent && live.is_alive() => {
+                self.begin(live, &run, ids, &prompt);
+            }
+            _ => {
+                // Releasing the agent kept from the last run stops it.
+                let replaced = slot.release();
+                slot.agent = Held::Starting(None);
+                let pending = Pending {
+                    agent,
+                    run,
+                    ids: ids.to_vec(),
+                    prompt,
+                    generation: slot.generation,
+                };
+                self.start(pending);
+                drop(slot);
+                drop(replaced);
+                (self.notify)();
+                return Ok(());
+            }
         }
         drop(slot);
         (self.notify)();
@@ -199,46 +236,53 @@ impl Runner {
             .ok_or_else(|| Error::BadRequest("no run is under way".to_owned()))?;
         let (started, asked) = {
             let state = run.state();
-            (state.started, state.cancel_requested)
+            (state.started, state.cancel_asked)
         };
+        let mut released = Held::None;
         let mut result = Ok(());
-        if !started {
-            // The agent is still starting: it is stopped, and its start finds it replaced.
-            slot.generation += 1;
-            if let Some(starting) = slot.starting.take() {
-                starting.stop();
+        match asked {
+            _ if !started => {
+                // The agent is still starting: it is stopped, and the run ends now.
+                released = slot.release();
+                run.record(Entry::CancelRequested);
+                run.record(Entry::Ended {
+                    reason: StopReason::Cancelled,
+                });
             }
-            run.record(Entry::CancelRequested);
-            run.record(Entry::Ended {
-                reason: StopReason::Cancelled,
-            });
-        } else if asked {
-            // Asked twice: the agent did not stop when asked, so it is ended, and its exit is
-            // not reported over this.
-            slot.generation += 1;
-            slot.agent = None;
-            run.record(Entry::Failed {
-                error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
-            });
-        } else {
-            run.record(Entry::CancelRequested);
-            if let Some((_, agent)) = &slot.agent {
-                // The requests this answered `cancelled` on the wire are closed in the log too,
-                // including one whose event is still on its way.
-                match agent.cancel() {
-                    Ok(numbers) => {
-                        for request in numbers {
-                            run.record(Entry::Answer {
-                                request,
-                                option: None,
-                            });
+            // A second Stop soon after the first is the same request (a double click, a
+            // second Escape), not a force.
+            Some(at) if at.elapsed() < FORCE_AFTER => {}
+            Some(_) => {
+                // The agent did not stop when asked, so it is ended, and its exit is not
+                // reported over this.
+                released = slot.release();
+                run.record(Entry::Failed {
+                    error: "stopped: the agent did not stop when asked, so Postil ended it"
+                        .to_owned(),
+                });
+            }
+            None => {
+                run.state().cancel_asked = Some(Instant::now());
+                run.record(Entry::CancelRequested);
+                if let Held::Ready(_, agent) = &slot.agent {
+                    // The requests this answered `cancelled` on the wire are closed in the log
+                    // too, including one whose event is still on its way.
+                    match agent.cancel() {
+                        Ok(numbers) => {
+                            for request in numbers {
+                                run.record(Entry::Answer {
+                                    request,
+                                    option: None,
+                                });
+                            }
                         }
+                        Err(error) => result = Err(error),
                     }
-                    Err(error) => result = Err(error),
                 }
             }
         }
         drop(slot);
+        drop(released);
         (self.notify)();
         result
     }
@@ -252,7 +296,7 @@ impl Runner {
     /// [`Agent::answer_permission`].
     pub(crate) fn answer(&self, request: usize, option: &str) -> Result<()> {
         let slot = self.slot();
-        let (Some(run), Some((_, agent))) = (&slot.run, &slot.agent) else {
+        let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
             return Err(Error::NoSuchPermission);
         };
         if !run.state().is_open(request) {
@@ -288,24 +332,25 @@ impl Runner {
     /// Stops the agent, running or starting, and ignores anything it would still report: the
     /// project is closing, or the app quits.
     pub(crate) fn close(&self) {
-        let mut slot = self.slot();
-        slot.closed = true;
-        slot.agent = None;
-        if let Some(starting) = slot.starting.take() {
-            starting.stop();
-        }
+        let released = {
+            let mut slot = self.slot();
+            slot.closed = true;
+            slot.release()
+        };
+        drop(released);
     }
 
     fn slot(&self) -> MutexGuard<'_, Slot> {
         lock(&self.slot)
     }
 
-    /// Starts the agent on its own thread, then sends the prompt, unless the run was
-    /// cancelled or the project closed meanwhile.
+    /// Starts the agent on its own thread, then sends the prompt, unless the agent was let go
+    /// meanwhile (the run cancelled, the project closed).
     fn start(self: &Arc<Self>, pending: Pending) {
         let runner = Arc::clone(self);
         let run = Arc::clone(&pending.run);
         let start = move || {
+            let generation = pending.generation;
             let failed = |error: &Error| {
                 pending.run.record(Entry::Failed {
                     error: error_chain(error),
@@ -314,6 +359,9 @@ impl Runner {
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.
             let search_path = runner.agents.wait();
+            if runner.slot().let_go(generation) {
+                return;
+            }
             let launch = Launch {
                 command: &pending.agent.command,
                 cwd: runner.repo.root(),
@@ -322,38 +370,45 @@ impl Runner {
             };
             // Weak: the runner owns the agent, whose reader thread owns this callback.
             let events = Arc::downgrade(&runner);
-            let generation = pending.generation;
             let spawned = Agent::spawn(&launch, move |event| on_event(&events, generation, event));
             let starting = match spawned {
                 Ok(starting) => starting,
                 Err(error) => {
-                    failed(&error);
+                    let mut slot = runner.slot();
+                    if !slot.let_go(generation) {
+                        slot.agent = Held::None;
+                        failed(&error);
+                    }
+                    drop(slot);
                     return (runner.notify)();
                 }
             };
 
-            // Stoppable from here on; a cancel or close that came first wins.
+            // Stoppable from here on; a cancel or close that came first wins, and dropping
+            // `starting` stops it.
             {
                 let mut slot = runner.slot();
-                if slot.closed || slot.generation != generation {
+                if slot.let_go(generation) {
                     return;
                 }
-                slot.starting = Some(starting.stopper());
+                slot.agent = Held::Starting(Some(starting.stopper()));
             }
             let opened = starting.open_session();
 
             let mut slot = runner.slot();
-            if slot.generation != generation || slot.closed {
-                // Cancelled or closed while starting: the run already says so, and the agent,
-                // if it started after all, is dropped here, which stops it.
+            if slot.let_go(generation) {
+                // The run already says why; an agent that started after all is dropped here,
+                // which stops it.
                 return;
             }
-            slot.starting = None;
             match opened {
-                Err(error) => failed(&error),
+                Err(error) => {
+                    slot.agent = Held::None;
+                    failed(&error);
+                }
                 Ok(agent) => {
                     runner.begin(&agent, &pending.run, &pending.ids, &pending.prompt);
-                    slot.agent = Some((pending.agent, agent));
+                    slot.agent = Held::Ready(pending.agent, agent);
                 }
             }
             drop(slot);
@@ -369,8 +424,10 @@ impl Runner {
         }
     }
 
-    /// Sends the prompt to a running agent and marks the notes sent.
+    /// Sends the prompt to a running agent. Its notes are marked sent once the agent shows it
+    /// took the turn ([`Run::record_event`]).
     fn begin(&self, agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt) {
+        run.state().unmarked = Some(ids.to_vec());
         let blocks = prompt_blocks(prompt, self.repo.root());
         if let Err(error) = agent.prompt(&blocks) {
             return run.record(Entry::Failed {
@@ -378,14 +435,32 @@ impl Runner {
             });
         }
         run.record(Entry::Started);
-        // The prompt is out: a note that cannot be marked would be sent again by mistake
-        // later, so the run says so.
+    }
+
+    /// Marks the notes `ids` sent in `run`. A note that cannot be marked would be sent again
+    /// by mistake later, so the run says so.
+    fn mark_sent(&self, run: &Run, ids: &[String]) {
         let id = run.state().header.id.clone();
         if let Err(error) = notes::mark_sent(&self.repo, ids, &id) {
             run.state().problem.get_or_insert(format!(
                 "the notes were sent but could not be marked sent: {}",
                 error_chain(&error)
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Runner {
+    /// Moves the run's first Stop back by [`FORCE_AFTER`], so a test can force a stop without
+    /// waiting that long.
+    pub(crate) fn backdate_stop(&self) {
+        if let Some(run) = &self.slot().run {
+            let mut state = run.state();
+            state.cancel_asked = state.cancel_asked.map(|at| {
+                at.checked_sub(FORCE_AFTER)
+                    .expect("the clock runs past 3 s")
+            });
         }
     }
 }
@@ -400,25 +475,36 @@ impl fmt::Debug for Runner {
 }
 
 /// An agent's event, on its reader thread: recorded in the current run unless the agent
-/// was replaced or stopped, or the project closed.
+/// was let go. An agent that exited, or whose turn failed, is let go: the next send starts a
+/// fresh one, since a failed turn can mean a broken session (an adapter whose backend died,
+/// a sign-in that expired), and a lost conversation costs less than a stuck one.
 fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
     };
-    let run = {
+    let (run, released) = {
         let mut slot = runner.slot();
-        if slot.closed || slot.generation != generation {
+        if slot.let_go(generation) {
             return;
         }
-        if matches!(event, Event::Exited { .. }) {
-            // The next send starts the agent again.
-            slot.agent = None;
-        }
-        slot.run.clone()
+        let ends_agent = matches!(
+            event,
+            Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
+        );
+        let released = if ends_agent {
+            slot.release()
+        } else {
+            Held::None
+        };
+        (slot.run.clone(), released)
     };
-    if let Some(run) = run {
-        run.record_event(event, runner.repo.root());
+    if let Some(run) = run
+        && let Some(ids) = run.record_event(event, runner.repo.root())
+    {
+        runner.mark_sent(&run, &ids);
     }
+    // Dropped outside the lock: dropping an agent waits for its process to be reaped.
+    drop(released);
     (runner.notify)();
 }
 
@@ -440,6 +526,10 @@ struct RunState {
     // Kept as each entry is recorded, so a status needs no scan of the entries.
     started: bool,
     cancel_requested: bool,
+    /// When this process asked the agent to stop, for [`FORCE_AFTER`]. Not logged.
+    cancel_asked: Option<Instant>,
+    /// The notes sent, until the agent shows it took the turn; then they are marked sent.
+    unmarked: Option<Vec<String>>,
     end: Option<Status>,
     requested: BTreeSet<usize>,
     answered: BTreeSet<usize>,
@@ -623,16 +713,13 @@ impl Run {
             .truncate(false)
             .open(&active_path)
             .map_err(error(&active_path))?;
-        match active.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(Error::RunElsewhere),
-            Err(TryLockError::Error(source)) => {
-                return Err(Error::WriteRun {
-                    path: active_path,
-                    source,
-                });
-            }
-        }
+        take_run_lock(&active).map_err(|source| match source {
+            TryLockError::WouldBlock => Error::RunElsewhere,
+            TryLockError::Error(source) => Error::WriteRun {
+                path: active_path,
+                source,
+            },
+        })?;
 
         let mut number = highest_run(dir).map_err(error(dir))? + 1;
         // Creating the file claims the id; another window may have claimed it first.
@@ -682,6 +769,10 @@ impl Run {
         let mut skipped = None;
         for number in numbers {
             let file = dir.join(format!("R{number}.jsonl"));
+            // Empty: another window created it a moment ago and is writing its header.
+            if fs::metadata(&file).is_ok_and(|meta| meta.len() == 0) {
+                continue;
+            }
             match Self::read(&file) {
                 Ok(run) => {
                     if let Some(skipped) = skipped {
@@ -771,13 +862,12 @@ impl Run {
         state.entries.push(entry);
     }
 
-    /// Records an agent's event.
-    fn record_event(&self, event: Event, root: &Path) {
+    /// Records an agent's event, and returns the notes to mark sent now: the first sign that
+    /// the agent took the turn (an update, a permission request, or a stop) releases them. A
+    /// turn that fails at once, as when the agent refuses the prompt, leaves them open.
+    fn record_event(&self, event: Event, root: &Path) -> Option<Vec<String>> {
         let entry = match event {
-            Event::Update(update) => match entry_of(update, root) {
-                Some(entry) => entry,
-                None => return,
-            },
+            Event::Update(update) => entry_of(update, root)?,
             Event::Permission(request) => Entry::Permission {
                 request: request.number,
                 tool_call: request.tool_call.tool_call_id,
@@ -799,7 +889,14 @@ impl Run {
                 error: Error::AgentExited { stderr }.to_string(),
             },
         };
+        let took_turn = !matches!(entry, Entry::Failed { .. } | Entry::Unreadable { .. });
+        let live = self.state().live();
         self.record(entry);
+        if took_turn && live {
+            self.state().unmarked.take()
+        } else {
+            None
+        }
     }
 
     fn view(&self, after: usize) -> RunView {
@@ -840,6 +937,8 @@ impl RunState {
             active,
             started: false,
             cancel_requested: false,
+            cancel_asked: None,
+            unmarked: None,
             end: None,
             requested: BTreeSet::new(),
             answered: BTreeSet::new(),
@@ -906,6 +1005,25 @@ impl RunState {
             return Status::Waiting;
         }
         Status::Running
+    }
+}
+
+/// Takes the exclusive lock on `runs/active.lock`, or reports that another window holds it.
+///
+/// A `flock` lock belongs to the open file, and a process this app forks (git, an agent)
+/// holds a copy of every open file from its fork until its exec closes them. A lock released
+/// a moment ago can so look held for microseconds, which a send right after a run ends hit in
+/// the tests. The lock is therefore tried for up to [`LOCK_PATIENCE`]; a window that really
+/// runs an agent holds it far longer.
+fn take_run_lock(active: &File) -> std::result::Result<(), TryLockError> {
+    let deadline = Instant::now() + LOCK_PATIENCE;
+    loop {
+        match active.try_lock() {
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
     }
 }
 

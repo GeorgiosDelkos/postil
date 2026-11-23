@@ -299,7 +299,8 @@ Built in `src/run.rs`, with the API the page calls:
 | `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
 
 - **The agent is kept between runs**, with its session, until a send names another agent or
-  command, the project closes, or the agent exits; the next send then starts it again. The
+  command, the project closes, the agent exits, or a turn fails (its session may be broken);
+  the next send then starts it again. The
   owner chose this on 2026-11-23 over a fresh agent per send, so milestone 4's follow-up notes
   reach the same conversation.
 - **One run at a time** per working tree: a send during a run is refused (409), and a live
@@ -307,8 +308,9 @@ Built in `src/run.rs`, with the API the page calls:
   tree is refused too.
 - **Stop** asks the agent to cancel (`session/cancel`), and answers its open permission
   requests `cancelled`, as well as any that arrive until the turn ends. An agent that is
-  still starting is killed instead, and the run ends at once. A second Stop kills an agent
-  that did not stop, so a hung agent never holds the working tree.
+  still starting is killed instead, and the run ends at once. A second Stop from 3 s after
+  the first kills an agent that did not stop, so a hung agent never holds the working tree;
+  sooner, it is the same request (a double click).
 - **Permission requests** are numbered by `acp::Agent`, which keeps the only table of open
   ones; the log records each request and its answer by that number.
 - **Starting** happens on a thread of its own, because it can take minutes. Each start-up
@@ -322,8 +324,9 @@ Built in `src/run.rs`, with the API the page calls:
   app quit during it, or another window runs it). Lines are decoded one by one, so a torn
   write spoils only its line, which is reported; an unreadable newer log is skipped and
   named. Nothing is synced: a crash costs at most the last lines.
-- **Notes** are marked sent, with the run's id, once the agent has the prompt. A run that
-  fails to start leaves them open. `review.json` is version 2 for this field, `state`,
+- **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
+  first update, a permission request, or a stop. A run that fails to start, or whose prompt
+  the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
   always an object: `{"kind": "open"}` or `{"kind": "sent", "run": "R3"}`. Version 1 files
   read with every note open.
 - **The page** is told about changes by a script call (`window.postil.runChanged()`) and

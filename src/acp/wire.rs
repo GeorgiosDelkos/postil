@@ -5,11 +5,13 @@
 //!
 //! Only the fields the app uses are declared, and unknown fields are ignored, because agents
 //! add their own (Grok puts its model list in `_meta`). The schema marks most of what the app
-//! reads as "default on error", so an enum the app does not know reads as its `Other` variant
-//! instead of failing the whole message: a newer agent's tool kind must not hide its tool
-//! call.
+//! reads as "default on error", so the app reads leniently where a message would otherwise be
+//! lost: an enum value it does not know reads as `Other` (a newer agent's tool kind must not
+//! hide its tool call), a `null` list or kind reads as its default, and an error object reads
+//! whatever code and message it has. A value of another type (a number for a title) still
+//! makes the message unreadable, and the run says so.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// The ACP version this client speaks. Version 2 has been a draft since 2026-07-20 and
@@ -61,14 +63,39 @@ pub(crate) struct Incoming {
     #[serde(default)]
     pub(crate) params: Value,
     pub(crate) result: Option<Value>,
-    pub(crate) error: Option<RpcError>,
+    /// Read leniently by [`RpcError::from_value`]: a malformed error must still answer its
+    /// request, or the caller would wait for a reply that has come.
+    pub(crate) error: Option<Value>,
 }
 
 /// A JSON-RPC error object.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct RpcError {
     pub(crate) code: i64,
     pub(crate) message: String,
+}
+
+impl RpcError {
+    /// An error object as an agent sent it: its `code` (0 when missing) and its `message`
+    /// (the whole object when missing).
+    pub(crate) fn from_value(error: &Value) -> Self {
+        Self {
+            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_owned),
+        }
+    }
+}
+
+/// Reads `null` as the default, as a missing field already reads with `#[serde(default)]`.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// JSON-RPC's code for a method the receiver does not implement.
@@ -197,7 +224,7 @@ pub(crate) enum SessionUpdate {
     ToolCall(ToolCall),
     ToolCallUpdate(ToolCallUpdate),
     Plan {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         entries: Vec<PlanEntry>,
     },
     /// The echo of the prompt, the command list, mode and usage changes, and kinds added
@@ -216,13 +243,13 @@ pub(crate) enum SessionUpdate {
 pub(crate) struct ToolCall {
     pub(crate) tool_call_id: String,
     pub(crate) title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub(crate) kind: ToolKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub(crate) status: ToolCallStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub(crate) content: Vec<ToolCallContent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub(crate) locations: Vec<Location>,
 }
 

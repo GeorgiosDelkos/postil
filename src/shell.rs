@@ -911,7 +911,7 @@ impl Site {
             "/api/run/cancel" if post => json_or_error(
                 self.runner()
                     .and_then(|runner| runner.cancel())
-                    .and_then(|()| self.run_view(0)),
+                    .map(|()| b"{}".to_vec()),
             ),
             "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
             "/api/run/cancel" | "/api/run/permission" => {
@@ -929,20 +929,20 @@ impl Site {
             .ok_or(Error::NoProject)
     }
 
-    /// The latest run with its entries from number `after` on, or `null` when the project
-    /// has none: the reply to `GET /api/run`, and to every request that changes the run.
+    /// The reply to `GET /api/run`: the latest run with its entries from number `after` on, or
+    /// `null` when the project has none.
     fn run_view(&self, after: usize) -> Result<Vec<u8>> {
         Ok(to_json(&self.runner()?.view(after)?))
     }
 
-    /// The reply to `POST /api/run`: sends the notes in the body to the agent, and returns
-    /// the new run.
+    /// The reply to `POST /api/run`: sends the notes in the body to the agent, and answers
+    /// `{}`. The page fetches the run (`GET /api/run`), as after every change.
     fn send_run(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: SendRun = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
         let agent = self.agent_choice(request.agent)?;
         self.runner()?.send(agent, &request.notes)?;
-        self.run_view(0)
+        Ok(b"{}".to_vec())
     }
 
     /// The reply to `GET /api/run/preview?notes=N1,N2`.
@@ -957,7 +957,7 @@ impl Site {
         let answer: AnswerPermission = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
         self.runner()?.answer(answer.request, &answer.option)?;
-        self.run_view(0)
+        Ok(b"{}".to_vec())
     }
 
     /// The agent called `name`, or the settings' agent, with its command. It must be turned
@@ -1619,6 +1619,16 @@ mod tests {
                     note.replace(r#""body":"b""#, r#""body":"b","stat":"open""#)
                 ),
                 "unknown field `stat`".to_owned(),
+            ),
+            (
+                &*format!(
+                    r#"{{"version": 2, "notes": [{}]}}"#,
+                    note.replace(
+                        r#""body":"b""#,
+                        r#""body":"b","state":{"kind":"open","run":"R1"}"#
+                    )
+                ),
+                "unknown field `run`".to_owned(),
             ),
         ];
         for (contents, expected) in cases {
@@ -3060,9 +3070,8 @@ mod tests {
     }
 
     fn header(id: &str) -> String {
-        format!(
-            r#"{{"version":1,"id":"{id}","agent":"Fake","notes":["N1"],"prompt":"p","startedAt":1}}"#
-        )
+        let fields = r#""agent":"Fake","notes":["N1"],"prompt":"p","startedAt":1"#;
+        format!(r#"{{"version":1,"id":"{id}",{fields}}}"#)
     }
 
     #[test]
@@ -3110,8 +3119,16 @@ mod tests {
         fs::write(runs.join("R2.jsonl"), format!("{}\n", header("R2"))).unwrap();
         let site = repo.site();
 
+        // Empty: another window is about to write its header, so it is skipped quietly.
+        fs::write(runs.join("R3.jsonl"), "").unwrap();
+        let run = get_json(&site, RUN);
+        assert_eq!(
+            (run["id"].as_str(), run["problem"].as_str()),
+            (Some("R2"), None)
+        );
+
         for (newest, why) in [
-            ("", "its first line is not a run header"),
+            ("\n", "its first line is not a run header"),
             ("not a header\n", "its first line is not a run header"),
             (
                 r#"{"version":2,"id":"R3","newField":1}"#,
@@ -3248,6 +3265,76 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_prompt_leaves_the_notes_open_and_the_next_send_starts_a_fresh_agent() {
+        let repo = TempRepo::new("run-refused");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "refuse-first");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let failed = wait_for(&site, &nudges, "failed");
+        let last = failed["entries"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            last["error"],
+            "the agent refused session/prompt: model overloaded (-32603)"
+        );
+        assert_eq!(
+            states(&site),
+            [serde_json::json!({ "kind": "open" })],
+            "the agent never took the turn"
+        );
+
+        // The failed turn let the agent go (its session may be broken): a fresh one refuses
+        // its first prompt again, where the kept one would have answered.
+        send(&site, &["N1"]);
+        let again = wait_for(&site, &nudges, "failed");
+        assert_eq!(again["id"], "R2");
+    }
+
+    #[test]
+    fn notes_that_cannot_be_marked_sent_are_named_on_the_run() {
+        let repo = TempRepo::new("run-unmarked");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+
+        // The runs directory stays writable; the review file's directory does not.
+        let postil = repo.root.join(".git/postil");
+        fs::set_permissions(&postil, fs::Permissions::from_mode(0o555)).unwrap();
+        send(&site, &["N1"]);
+        let run = wait_for(&site, &nudges, "ended");
+        fs::set_permissions(&postil, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(run["id"], "R2");
+        let problem = run["problem"].as_str().unwrap();
+        assert!(problem.contains("could not be marked sent"), "{problem}");
+        assert_eq!(
+            states(&site),
+            [serde_json::json!({ "kind": "sent", "run": "R1" })]
+        );
+    }
+
+    #[test]
+    fn a_quick_second_stop_is_the_same_request() {
+        let repo = TempRepo::new("run-double-stop");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "cancel");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "waiting");
+        let cancel = format!("{RUN}/cancel");
+        assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+        assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+        let ended = wait_for(&site, &nudges, "ended");
+        let last = ended["entries"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["reason"], "cancelled", "the agent stopped on its own");
+    }
+    #[test]
     fn a_second_stop_ends_an_agent_that_does_not_stop() {
         let repo = TempRepo::new("run-hang");
         repo.write("a.txt", "a\n");
@@ -3258,7 +3345,14 @@ mod tests {
         let cancel = format!("{RUN}/cancel");
         assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
         assert_eq!(get_json(&site, RUN)["status"], "cancelling");
+        assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+        assert_eq!(
+            get_json(&site, RUN)["status"],
+            "cancelling",
+            "a second Stop at once is the same request"
+        );
 
+        site.runner().unwrap().backdate_stop();
         assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
         let failed = get_json(&site, RUN);
         assert_eq!(failed["status"], "failed");
@@ -3304,6 +3398,7 @@ mod tests {
         // Once the first window's run ends, the second may run.
         let cancel = format!("{RUN}/cancel");
         post(&first, &cancel, "");
+        first.runner().unwrap().backdate_stop();
         post(&first, &cancel, "");
         let (status, body) = send(&second, &["N1"]);
         assert_eq!(status, StatusCode::OK, "{body}");

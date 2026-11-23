@@ -115,7 +115,7 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
         snippet: new.snippet,
         body: body.to_owned(),
         anchor: Anchor::Found,
-        state: NoteState::Open,
+        state: NoteState::Open {},
     });
     review.save(&file)?;
     Ok(review)
@@ -282,12 +282,14 @@ struct Note {
 /// Where a note is in the loop. Kept apart from [`Anchor`] (module docs). Always an object
 /// with a `kind` (`{"kind": "open"}`, `{"kind": "sent", "run": "R1"}`), so a script reads
 /// one shape whatever the state.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// Each variant has braces: `deny_unknown_fields` checks only struct variants, so a unit
+/// `Open` would accept `{"kind": "open", "typo": 1}`.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 enum NoteState {
-    /// Not sent yet, or sent in a run that did not start.
-    #[default]
-    Open,
+    /// Not sent yet, or sent in a run the agent never took up.
+    Open {},
     /// Sent to the agent in the run with this id (`R1`).
     Sent { run: String },
 }
@@ -515,6 +517,12 @@ impl fmt::Debug for NewNote {
             .field("path", &self.path)
             .field("lines", &self.lines)
             .finish_non_exhaustive()
+    }
+}
+
+impl Default for NoteState {
+    fn default() -> Self {
+        Self::Open {}
     }
 }
 

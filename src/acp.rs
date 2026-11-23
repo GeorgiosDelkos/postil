@@ -23,8 +23,9 @@
 //! released.
 //!
 //! Dropping the [`Agent`] marks it closed and kills its process group; the reader then
-//! delivers no more events, and the threads end as the pipes close. A [`Starting`](connection::Starting) agent,
-//! whose session is not open yet, is stopped from another thread by its [`Stopper`].
+//! delivers no more events, and the threads end as the pipes close. An agent whose session
+//! is not open yet ([`connection::Starting`]) is stopped from another thread by its
+//! [`Stopper`].
 //!
 //! # Permission requests
 //!

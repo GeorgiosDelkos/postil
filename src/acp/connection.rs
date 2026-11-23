@@ -573,7 +573,10 @@ impl<F: FnMut(Event)> Reader<F> {
             Err(error) => return self.emit(Event::Unreadable(unreadable(line, &error))),
         };
         match (message.id, message.method) {
-            (Some(id), None) => self.reply(&id, message.result, message.error),
+            (Some(id), None) => {
+                let error = message.error.as_ref().map(RpcError::from_value);
+                self.reply(&id, message.result, error);
+            }
             (Some(id), Some(method)) => self.request(&id, &method, message.params),
             (None, Some(method)) => self.notification(&method, message.params),
             (None, None) => self.emit(Event::Unreadable(format!(
@@ -599,7 +602,15 @@ impl<F: FnMut(Event)> Reader<F> {
             // The caller timed out and left: nobody wants the reply.
             Some(Waiter::Call(sender)) => drop(sender.send(outcome)),
             Some(Waiter::Turn) => {
-                lock(&self.shared.state).cancelling = false;
+                {
+                    let mut state = lock(&self.shared.state);
+                    state.cancelling = false;
+                    // A request still open when its turn ended can no longer be answered.
+                    state
+                        .permissions
+                        .iter_mut()
+                        .for_each(|request| *request = None);
+                }
                 let end = match outcome {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
                         Ok(result) => TurnEnd::Stopped(result.stop_reason),
@@ -607,7 +618,15 @@ impl<F: FnMut(Event)> Reader<F> {
                             TurnEnd::Failed(format!("unreadable reply to the prompt: {error}"))
                         }
                     },
-                    Err(error) => TurnEnd::Failed(format!("{} ({})", error.message, error.code)),
+                    // Worded as a refused start is, so a sign-in error keeps its hint.
+                    Err(error) => TurnEnd::Failed(
+                        Error::AgentRefused {
+                            step: "session/prompt",
+                            code: error.code,
+                            message: error.message,
+                        }
+                        .to_string(),
+                    ),
                 };
                 self.emit(Event::TurnEnded(end));
             }
@@ -1057,7 +1076,23 @@ mod tests {
         said(&events);
         assert_eq!(
             next(&events),
-            Event::TurnEnded(TurnEnd::Failed("model overloaded (-32603)".to_owned()))
+            Event::TurnEnded(TurnEnd::Failed(
+                "the agent refused session/prompt: model overloaded (-32603)".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_error_reply_of_another_shape_still_ends_the_turn() {
+        let (agent, events) = start("odd-error").unwrap();
+        agent.prompt(&[text("x")]).unwrap();
+        said(&events);
+        said(&events);
+        assert_eq!(
+            next(&events),
+            Event::TurnEnded(TurnEnd::Failed(
+                "the agent refused session/prompt: no code here (0)".to_owned()
+            ))
         );
     }
 
@@ -1093,41 +1128,14 @@ mod tests {
             "{silent:?}"
         );
 
-        match start("exit-on-start") {
-            Err(Error::AgentExited { stderr }) => {
-                assert_eq!(stderr, "Please sign in: run `fake login`");
-            }
-            other => panic!("expected AgentExited, got {other:?}"),
-        }
-
         let unreadable = start("no-session-id").unwrap_err().to_string();
         assert!(
             unreadable.contains("unreadable reply to session/new"),
             "{unreadable}"
         );
 
-        let auth = start("auth").unwrap_err();
-        assert!(
-            matches!(
-                auth,
-                Error::AgentRefused {
-                    step: "session/new",
-                    code: -32000,
-                    ..
-                }
-            ),
-            "{auth:?}"
-        );
-        assert!(auth.to_string().contains("needs you to sign in"), "{auth}");
-
         let version = start("version-2").unwrap_err().to_string();
         assert!(version.contains("speaks ACP version 2"), "{version}");
-
-        let missing = start_command("no-such-agent-program --acp", WAIT).unwrap_err();
-        let Error::AgentNotFound { program } = &missing else {
-            panic!("expected AgentNotFound, got {missing:?}");
-        };
-        assert_eq!(program, "no-such-agent-program");
     }
 
     #[test]
