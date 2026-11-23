@@ -113,7 +113,7 @@ export function runPanel({
   // engineer has chosen or typed.
   let asking = null;
   // The follow-up box of the thread shown, kept across redraws for the same reason:
-  // `{ root, form, update(latest) }`.
+  // `{ root, form, update(latest), hold(action) }`.
   let following = null;
   // What the dialog writes in place while the stamp it was drawn from holds: the text the
   // agent streams, and the time. Each writes what is now known of its run.
@@ -739,14 +739,29 @@ export function runPanel({
       form.append(input, actions);
       let target = latest;
       let sending = false;
+      // Why the draft kept the page from ending (`hold`), until the engineer types again.
+      let held = "";
       const update = (next) => {
         target = next;
         const busy = isLive(run);
         input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
         button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
         button.disabled = busy || sending;
-        why.textContent = busy ? "Wait for the run under way, or stop it." : "";
+        why.textContent = busy ? "Wait for the run under way, or stop it." : held;
+        why.classList.toggle("failed", !busy && held !== "");
       };
+      const hold = (action) => {
+        if (!input.value.trim()) return false;
+        held = `Send or clear this follow-up before ${action}.`;
+        update(target);
+        input.focus();
+        return true;
+      };
+      input.addEventListener("input", () => {
+        if (!held) return;
+        held = "";
+        update(target);
+      });
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         const text = input.value.trim();
@@ -770,10 +785,16 @@ export function runPanel({
           form.requestSubmit();
         }
       });
-      following = { root: root.id, form, update };
+      following = { root: root.id, form, update, hold };
     }
     following.update(latest);
     return section("Follow up", following.form);
+  }
+
+  // When the run dialog holds a follow-up being written, says so beside it, focuses it, and
+  // returns true: what would end the page (`action`, "quitting") waits for the engineer.
+  function holdDraft(action) {
+    return following?.hold(action) ?? false;
   }
 
   // Every run read so far, to find a run's reviews among them.
@@ -1056,6 +1077,7 @@ export function runPanel({
     knownViews,
     startReview,
     answerQuestion,
+    holdDraft,
     forget,
     reload,
     run: () => run,

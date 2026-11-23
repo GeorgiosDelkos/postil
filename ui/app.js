@@ -1763,9 +1763,12 @@ window.addEventListener("keydown", (event) => {
 // A draft note lives only in the page, so anything that would end the page (quitting,
 // switching projects) first sends the engineer back to it. Returns whether there is one.
 function guardDraft(action) {
+  // A draft in an open dialog (a note's text being edited, a follow-up) keeps its dialog,
+  // which says why.
+  if (noteDetail.holdDraft(action) || runs.holdDraft(action)) return true;
   if (!state.composer?.text.trim()) return false;
-  // The note must be in view to be saved or discarded.
-  if (settingsEl.open) settingsEl.close();
+  // The note must be in view to be saved or discarded: a dialog over it would make it inert.
+  for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   hideWelcome();
   const label = state.composer.node.querySelector(".composer-label");
   label.textContent = `Save or discard this note before ${action}.`;

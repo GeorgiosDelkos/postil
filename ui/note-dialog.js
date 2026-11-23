@@ -149,8 +149,8 @@ export function noteDialog(
   // The open question's form, kept while it stays open: a redraw must not drop what the
   // engineer has chosen or typed.
   let asking = null;
-  // The editor of the note's text while it is open, `{ id, form }`, kept across redraws for
-  // the same reason.
+  // The editor of the note's text while it is open, `{ id, form, hold(action) }`, kept across
+  // redraws for the same reason.
   let editing = null;
   // What the dialog was drawn from (`noteDialogKey`): drawn again only when this changes.
   let drawn = null;
@@ -288,8 +288,9 @@ export function noteDialog(
     const save = el("button", "button primary");
     save.type = "submit";
     save.append("Save", el("kbd", "", "⌘↵"));
+    const why = el("span", "note-dialog-why");
     const actions = el("div", "note-edit-actions");
-    actions.append(cancel, save);
+    actions.append(why, cancel, save);
     form.append(input, actions);
     const stop = () => {
       editing = null;
@@ -319,10 +320,25 @@ export function noteDialog(
         stop();
       }
     });
-    editing = { id: note.id, form };
+    // A changed text is a draft: `holdDraft` keeps it from being lost.
+    const hold = (action) => {
+      const text = input.value.trim();
+      if (!text || text === note.body) return false;
+      why.textContent = `Save or cancel this edit before ${action}.`;
+      why.classList.add("failed");
+      input.focus();
+      return true;
+    };
+    editing = { id: note.id, form, hold };
     drawn = null;
     draw();
     input.focus();
+  }
+
+  // When the note's text is being edited and changed, says so in the editor, focuses it, and
+  // returns true: what would end the page (`action`, "quitting") waits for the engineer.
+  function holdDraft(action) {
+    return editing?.hold(action) ?? false;
   }
 
   function said(note, run) {
@@ -469,7 +485,7 @@ export function noteDialog(
     return button;
   }
 
-  return { open, draw, isOpen: () => dialogEl.open };
+  return { open, draw, holdDraft, isOpen: () => dialogEl.open };
 }
 
 function section(label, content) {
