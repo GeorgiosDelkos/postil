@@ -185,6 +185,17 @@ The Rust tests run end to end: they drive the app's HTTP routes against real git
 in temporary directories and a fake ACP agent (`tests/fake-agent.mjs`) over real pipes. One
 test runs a real agent when `POSTIL_REAL_AGENT` is set.
 
+The page's end-to-end tests (`tests/e2e/page.test.js`) click through the page in Playwright's
+WebKit while a run streams, against real sites served over HTTP on localhost by
+`src/site/tests/page_e2e.rs`. They catch clicks lost to a node the page replaced while it drew
+the run again, which the page's unit tests cannot. They need Playwright and its WebKit build,
+installed once into `tests/e2e/`, the one place in the repository with npm packages:
+
+```sh
+(cd tests/e2e && npm ci --ignore-scripts && npx --no-install playwright-core install webkit)
+cargo test --locked page_end_to_end -- --ignored
+```
+
 Before a pull request is marked ready, run mutation testing over its changes and kill or
 explain each surviving mutant:
 
