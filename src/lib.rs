@@ -2,8 +2,11 @@
 //!
 //! The design and its reasons are in `docs/design.md`. In short: this Rust process owns the
 //! data and a page in the system webview draws it. The page is compiled into the binary and
-//! talks to this process over a private URL scheme. What is built so far is tracked in the
-//! design's "Milestones" section.
+//! talks to this process over a private URL scheme.
+//!
+//! Built so far (milestones 0 to 2, and the core of 3): the window, the file list with its
+//! fuzzy finder, the highlighted code view, notes on line ranges, stored in the git directory
+//! and anchored by their text, and runs that send notes to a coding agent over ACP.
 
 mod acp;
 mod agents;

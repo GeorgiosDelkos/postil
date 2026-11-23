@@ -28,9 +28,9 @@ pub(crate) fn choose_folder() -> Option<PathBuf> {
     Some(PathBuf::from(url.path()?.to_string()))
 }
 
-/// No dialog off macOS yet: Postil ships on macOS first (docs/design.md, decision 3). Returns
-/// `None`, as a cancelled dialog does. Projects still open from the welcome screen's recent
-/// list, from a folder dropped on the window, or from a folder given on the command line.
+/// No dialog off macOS yet: Postil ships on macOS first (docs/design.md, decision 3). The
+/// welcome screen still opens projects from the recent list, a dropped folder, or the
+/// command line.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn choose_folder() -> Option<PathBuf> {
     None
