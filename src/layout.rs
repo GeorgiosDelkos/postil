@@ -6,6 +6,9 @@
 //! it. A file a newer Postil wrote reads as the default and is never replaced. It is kept apart
 //! from `settings.json` on purpose: a divider dragged while the settings dialog is open must not
 //! make the dialog's next save conflict with the settings file's revision (`settings.rs`).
+//!
+//! Windows do not share widths live: each draws what it loaded, and the last one to save
+//! decides what the next window opens with.
 
 use std::fs;
 use std::ops::RangeInclusive;
@@ -29,15 +32,15 @@ pub(crate) const SIDEBAR: RangeInclusive<u32> = 180..=480;
 pub(crate) const TRAY: RangeInclusive<u32> = 280..=720;
 
 /// The pane widths. The code pane takes what is left of the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Layout {
     /// The file list's width in CSS px, kept while it is folded so unfolding restores it.
-    pub(crate) sidebar: u32,
+    sidebar: u32,
     /// The tray's width in CSS px.
-    pub(crate) tray: u32,
+    tray: u32,
     /// Whether the file list is folded to a rail.
-    pub(crate) files_folded: bool,
+    files_folded: bool,
 }
 
 impl Default for Layout {
@@ -53,7 +56,7 @@ impl Default for Layout {
 
 impl Layout {
     /// Checks the widths against [`SIDEBAR`] and [`TRAY`]; the error says which is out.
-    pub(crate) fn check(&self) -> std::result::Result<(), String> {
+    fn check(&self) -> std::result::Result<(), String> {
         let within = |name: &str, width: u32, range: &RangeInclusive<u32>| {
             if range.contains(&width) {
                 Ok(())
@@ -120,14 +123,14 @@ pub(crate) fn load(file: &Path) -> Layout {
 ///
 /// [`Error::BadRequest`] when a width is out of range; [`Error::WriteLayout`] when the file
 /// cannot be written.
-pub(crate) fn save(file: &Path, layout: Layout) -> Result<()> {
+pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
     layout.check().map_err(Error::BadRequest)?;
     if matches!(stored(file), Stored::Newer) {
         return Ok(());
     }
     let stored = LayoutFile {
         version: VERSION,
-        layout,
+        layout: Layout { ..*layout },
     };
     let mut json = serde_json::to_vec_pretty(&stored).expect("numbers and a flag always serialize");
     json.push(b'\n');
@@ -155,7 +158,7 @@ mod tests {
             tray: 460,
             files_folded: true,
         };
-        save(&file, layout).unwrap();
+        save(&file, &layout).unwrap();
         assert_eq!(load(&file), layout);
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         assert_eq!(
@@ -179,14 +182,14 @@ mod tests {
             (248, 279, "tray"),
             (248, 721, "tray"),
         ] {
-            match save(&file, with(sidebar, tray)) {
+            match save(&file, &with(sidebar, tray)) {
                 Err(Error::BadRequest(problem)) => assert!(problem.contains(words), "{problem}"),
                 other => panic!("{sidebar}/{tray}: expected BadRequest, got {other:?}"),
             }
         }
         assert!(!file.exists(), "nothing refused was written");
-        save(&file, with(180, 280)).unwrap();
-        save(&file, with(480, 720)).unwrap();
+        save(&file, &with(180, 280)).unwrap();
+        save(&file, &with(480, 720)).unwrap();
         assert_eq!(load(&file), with(480, 720));
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }
@@ -209,8 +212,20 @@ mod tests {
             sidebar: 200,
             ..Layout::default()
         };
-        save(&file, layout).unwrap();
+        save(&file, &layout).unwrap();
         assert_eq!(load(&file), layout);
+        drop(fs::remove_dir_all(file.parent().unwrap()));
+    }
+
+    #[test]
+    fn a_layout_that_cannot_be_written_is_a_write_layout_error() {
+        let file = temp_file("unwritable");
+        // The path is a directory, so the write over it fails.
+        fs::create_dir_all(&file).unwrap();
+        match save(&file, &Layout::default()) {
+            Err(Error::WriteLayout { path, .. }) => assert_eq!(path, file),
+            other => panic!("expected WriteLayout, got {other:?}"),
+        }
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
@@ -221,7 +236,7 @@ mod tests {
         let newer = r#"{"version": 2, "panes": [248, 600, 320]}"#;
         fs::write(&file, newer).unwrap();
         assert_eq!(load(&file), Layout::default());
-        save(&file, Layout::default()).unwrap();
+        save(&file, &Layout::default()).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), newer);
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }

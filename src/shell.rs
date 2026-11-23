@@ -975,14 +975,14 @@ impl Site {
         })
     }
 
-    /// The reply to `PUT /api/layout`: saves the widths in the body and answers as
-    /// `GET /api/layout`.
+    /// The reply to `PUT /api/layout`: saves the widths in the body and answers `{}`; the
+    /// page already holds what it sent.
     fn save_layout(&self, body: &[u8]) -> Result<Vec<u8>> {
         let layout: Layout = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable layout: {error}")))?;
         let file = self.layout_file.as_deref().ok_or(Error::NoHome)?;
-        layout::save(file, layout)?;
-        Ok(self.layout())
+        layout::save(file, &layout)?;
+        Ok(b"{}".to_vec())
     }
 
     /// The open project's runner.
