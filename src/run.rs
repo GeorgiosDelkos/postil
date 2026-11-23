@@ -341,12 +341,8 @@ impl Runner {
             id: id.to_owned(),
             problem: problem.to_owned(),
         };
-        // Written back and compared, so `R07` or `R+7` cannot name the log of `R7`, nor a path.
-        let number = id
-            .strip_prefix('R')
-            .and_then(|digits| digits.parse::<u64>().ok())
-            .filter(|number| format!("R{number}") == id)
-            .ok_or_else(|| no_such("a run id is R and a number"))?;
+        let number = run_number(id)
+            .ok_or_else(|| Error::BadRequest(format!("run id {id:?}: expected R and a number")))?;
 
         let live = self.slot().run.clone();
         if let Some(run) = live.filter(|run| run.state().header.id == id) {
@@ -377,28 +373,38 @@ impl Runner {
             .collect())
     }
 
-    /// Deletes the log of every run none of whose notes is among `notes`, the notes left after
-    /// a delete: a run goes with its last note, and an id freed by a delete cannot attach an
-    /// old run to a new note. This window's live run is kept; it goes at a later delete once
-    /// over. A run another window is running loses its log the same way; that window keeps
-    /// writing to the deleted file, and its run shows nowhere once it ends.
+    /// Deletes the log of every run none of whose notes is left: a run goes with its last
+    /// note, and an id freed by a delete cannot attach an old run to a new note. This window's
+    /// live run is kept; it goes at a later delete once over. A run another window is running
+    /// loses its log the same way; that window keeps writing to the deleted file, and its run
+    /// shows nowhere once it ends.
+    ///
+    /// The notes are read after the logs are listed. A log is created only once its notes are
+    /// saved (`send` reads them for the prompt first), so every listed log's notes are seen:
+    /// another window's new note, even one given a freed id, keeps its new run.
     ///
     /// # Errors
     ///
-    /// [`Error::ReadRun`] when the runs directory cannot be listed, [`Error::WriteRun`] when a
-    /// log cannot be removed. Logs before the failing one are removed.
-    pub(crate) fn delete_runs_without(&self, notes: &[String]) -> Result<()> {
+    /// [`Error::ReadRun`] when the runs directory cannot be listed, as [`notes::ids`] for the
+    /// review file, [`Error::WriteRun`] when a log cannot be removed. Some logs may be removed
+    /// by then; the rest are tried again at the next delete.
+    pub(crate) fn delete_runs_without_notes(&self) -> Result<()> {
         let dir = self.repo.runs_dir();
         let numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
             path: dir.clone(),
             source,
         })?;
-        let mut slot = self.slot();
-        let live = slot
-            .run
-            .as_ref()
-            .filter(|run| run.state().live())
-            .map(|run| run.state().header.id.clone());
+        let left = notes::ids(&self.repo)?;
+        // Read once: the slot is not held while logs are read, so the agent's events, which
+        // need it, are never kept waiting on the disk.
+        let live = {
+            let slot = self.slot();
+            slot.run
+                .as_ref()
+                .filter(|run| run.state().live())
+                .map(|run| run.state().header.id.clone())
+        };
+        let mut deleted = Vec::new();
         for number in numbers {
             let id = format!("R{number}");
             if live.as_deref() == Some(id.as_str()) {
@@ -407,26 +413,25 @@ impl Runner {
             let file = dir.join(format!("{id}.jsonl"));
             // A log that cannot be read names no notes this check can see: it is left alone,
             // and the panel says what is wrong with it.
-            let Ok(run) = Run::read(&file) else { continue };
-            if run
-                .state()
-                .header
-                .notes
-                .iter()
-                .any(|note| notes.contains(note))
-            {
+            let Ok(header) = read_header(&file) else {
+                continue;
+            };
+            if header.notes.iter().any(|note| left.contains(note)) {
                 continue;
             }
             fs::remove_file(&file).map_err(|source| Error::WriteRun { path: file, source })?;
+            deleted.push(id);
+        }
+        {
+            let mut slot = self.slot();
             if slot
                 .run
                 .as_ref()
-                .is_some_and(|run| run.state().header.id == id)
+                .is_some_and(|run| deleted.contains(&run.state().header.id))
             {
                 slot.run = None;
             }
         }
-        drop(slot);
         (self.notify)();
         Ok(())
     }
@@ -901,18 +906,7 @@ impl Run {
     fn read(file: &Path) -> std::result::Result<Self, String> {
         let bytes = fs::read(file).map_err(|error| format!("it cannot be read ({error})"))?;
         let mut lines = bytes.split(|&byte| byte == b'\n');
-        let first = lines.next().unwrap_or_default();
-        // The version is read on its own first: a newer header would otherwise fail on its
-        // first new field, with a message that hides the real reason.
-        let VersionOnly { version } = serde_json::from_slice(first)
-            .map_err(|error| format!("its first line is not a run header ({error})"))?;
-        if version != LOG_VERSION {
-            return Err(format!(
-                "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
-            ));
-        }
-        let header: Header = serde_json::from_slice(first)
-            .map_err(|error| format!("its first line is not a run header ({error})"))?;
+        let header = parse_header(lines.next().unwrap_or_default())?;
 
         let mut state = RunState::new(header, None, None);
         for (index, line) in lines.enumerate() {
@@ -1149,12 +1143,45 @@ fn run_numbers(dir: &Path) -> io::Result<Vec<u64>> {
         let name = entry?.file_name();
         let number = name
             .to_str()
-            .and_then(|name| name.strip_prefix('R'))
             .and_then(|name| name.strip_suffix(".jsonl"))
-            .and_then(|digits| digits.parse::<u64>().ok());
+            .and_then(run_number);
         numbers.extend(number);
     }
     Ok(numbers)
+}
+
+/// The number of the run id `R7`. Written back and compared, so `R07` or `R+7` is no id: it
+/// would name another log than its own, or none.
+fn run_number(id: &str) -> Option<u64> {
+    let number = id.strip_prefix('R')?.parse::<u64>().ok()?;
+    (format!("R{number}") == id).then_some(number)
+}
+
+/// A run log's first line, its header. The version is read on its own first: a newer header
+/// would otherwise fail on its first new field, with a message that hides the real reason.
+fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
+    let VersionOnly { version } = serde_json::from_slice(first)
+        .map_err(|error| format!("its first line is not a run header ({error})"))?;
+    if version != LOG_VERSION {
+        return Err(format!(
+            "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
+        ));
+    }
+    serde_json::from_slice(first)
+        .map_err(|error| format!("its first line is not a run header ({error})"))
+}
+
+/// The header of the run log `file`, its first line only: a long run's log is not read whole.
+fn read_header(file: &Path) -> std::result::Result<Header, String> {
+    let mut first = Vec::new();
+    File::open(file)
+        .map(io::BufReader::new)
+        .and_then(|mut reader| io::BufRead::read_until(&mut reader, b'\n', &mut first))
+        .map_err(|error| format!("it cannot be read ({error})"))?;
+    if first.last() == Some(&b'\n') {
+        first.pop();
+    }
+    parse_header(&first)
 }
 
 /// The highest run number among the logs in `dir`; 0 when there is none.

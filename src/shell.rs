@@ -929,7 +929,7 @@ impl Site {
         let review = notes::delete(&*self.repo()?, id)?;
         // A run goes with its last note (docs/design.md, "Runs"). The note is deleted by now:
         // a log that cannot be removed is reported, and tried again at the next delete.
-        self.runner()?.delete_runs_without(&review.ids())?;
+        self.runner()?.delete_runs_without_notes()?;
         Ok(to_json(&review))
     }
 
@@ -2740,6 +2740,7 @@ mod tests {
     // Runs (run.rs), against the fake ACP agent in tests/fake-agent.mjs.
 
     const RUN: &str = "postil://localhost/api/run";
+    const RUNS: &str = "postil://localhost/api/runs";
 
     /// Long enough for Node to start on a loaded machine; a test that waits this long has
     /// failed (it bounds a hang and times nothing).
@@ -3066,17 +3067,22 @@ mod tests {
         let (other, _) = run_site(&repo, "plain");
         assert_eq!(get_json(&other, &format!("{RUN}?id=R1")), first);
 
-        for (id, words) in [
-            ("R3", "no such run log"),
-            ("R01", "a run id is R and a number"),
-            ("R+1", "a run id is R and a number"),
-            ("..%2FR1", "a run id is R and a number"),
-            ("", "a run id is R and a number"),
-        ] {
+        let (status, body) = get(&site, &format!("{RUN}?id=R3"));
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no such run log"), "{body}");
+        for id in ["R01", "R+1", "..%2FR1", ""] {
             let (status, body) = get(&site, &format!("{RUN}?id={id}"));
-            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
-            assert!(body.contains(words), "{id}: {body}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {body}");
+            assert!(body.contains("expected R and a number"), "{id}: {body}");
         }
+
+        // A file named like a log but not by its own id is no run: listing it as R1 would name
+        // another log.
+        fs::write(repo.root.join(".git/postil/runs/R01.jsonl"), "").unwrap();
+        assert_eq!(
+            get_json(&site, RUNS)["runs"],
+            serde_json::json!(["R2", "R1"])
+        );
     }
 
     #[test]
@@ -3096,7 +3102,7 @@ mod tests {
         let (status, body) = delete(&site, &format!("{NOTES}?id=N1"));
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(log("R1").exists(), "R1 still has N2");
-        let runs = || get_json(&site, &format!("{RUN}s"))["runs"].clone();
+        let runs = || get_json(&site, RUNS)["runs"].clone();
         assert_eq!(runs(), serde_json::json!(["R2", "R1"]), "newest first");
 
         delete(&site, &format!("{NOTES}?id=N3"));
