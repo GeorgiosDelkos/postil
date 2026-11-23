@@ -1425,7 +1425,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::mpsc;
@@ -4115,20 +4115,19 @@ mod tests {
         let tree = serde_json::json!(site.repo().unwrap().snapshot().unwrap());
 
         // A tracked, ignored file deleted but not staged stays in the real index only: the
-        // snapshot index is not copied again for it (`copy_index` renames a new file in).
+        // snapshot index is not copied again for it.
         repo.write(".gitignore", "gen.lock\n");
         repo.write("gen.lock", "x\n");
         repo.git(&["add", "--force", "gen.lock"]);
-        let snapshot_index = repo.root.join(".git/postil-snapshot.index");
-        site.repo().unwrap().snapshot().unwrap();
+        let open = site.repo().unwrap();
+        open.snapshot().unwrap();
         fs::remove_file(repo.root.join("gen.lock")).unwrap();
-        site.repo().unwrap().snapshot().unwrap();
-        let inode = |path: &Path| fs::metadata(path).unwrap().ino();
-        let kept = inode(&snapshot_index);
-        site.repo().unwrap().snapshot().unwrap();
+        open.snapshot().unwrap();
+        let copies = open.index_copies();
+        open.snapshot().unwrap();
         assert_eq!(
-            inode(&snapshot_index),
-            kept,
+            open.index_copies(),
+            copies,
             "copied again for a deleted file"
         );
 
