@@ -384,7 +384,7 @@ export function statusLine(run) {
   }
 }
 
-// A run's status as a status icon's kind (note-dialog.js, `statusIcon`).
+// A run's status as a status icon's kind (dom.js, `statusIcon`).
 export function iconKind(run) {
   const { tone } = statusLine(run);
   const kinds = { busy: "working", attention: "needs", done: "addressed", failed: "failed" };

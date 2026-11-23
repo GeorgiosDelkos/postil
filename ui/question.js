@@ -1,6 +1,6 @@
 // An agent's question as a form (ACP form elicitation): the fields its JSON Schema describes,
 // and the reply's content from what the engineer chose. Plain functions, kept apart from the
-// document so `node --test` runs them; note-dialog.js draws the form.
+// document so `node --test` runs them; question-form.js draws the form.
 //
 // The schema is an object whose properties are the fields. Claude's adapter asks with one
 // single-select field per question (`question_0`, a string with `oneOf` choices) followed by

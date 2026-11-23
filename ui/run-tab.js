@@ -186,8 +186,10 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
     const { text, tone } = statusLine(run);
     header.title.title = `${run.id} · ${run.agent} · ${text}`;
     const time = el("span", "run-time");
+    // Reads the store on each tick, not `run`: a sync replaces the run before it draws again.
     const tick = () => {
-      if (isLive(run)) time.textContent = ` · ${elapsed(Date.now() / 1000 - run.startedAt)}`;
+      const now = store.run();
+      if (isLive(now)) time.textContent = ` · ${elapsed(Date.now() / 1000 - now.startedAt)}`;
     };
     tick();
     const word = el("strong", `run-word ${tone}`, statusWord(run));

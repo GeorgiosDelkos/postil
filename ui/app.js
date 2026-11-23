@@ -267,7 +267,11 @@ async function editNote(note, body) {
     return false;
   }
   state.notes = (await response.json()).notes;
-  redrawNotes();
+  // Not the file list: a new text changes no count, and a rebuild would move the tree's tab
+  // stop back to the open file.
+  indexNotes();
+  tray.render();
+  code.redecorate();
   return true;
 }
 

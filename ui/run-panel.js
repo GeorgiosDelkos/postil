@@ -32,6 +32,7 @@ export function runPanel({
   reviewers,
   showChanges,
 }) {
+  // `tab` is built below: the store draws only after a fetch, never while it is built.
   const store = runStore({ render: () => tab.render(), onChange, onLoaded, onError });
   const dialog = runDialog({
     store,

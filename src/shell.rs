@@ -201,7 +201,7 @@ const LIGHT_CANVAS: (u8, u8, u8, u8) = (0xf4, 0xf4, 0xf1, 0xff);
 pub struct BenchReport {
     /// From the start of [`bench()`] to the page reporting that the file is painted.
     pub launch_to_paint: Duration,
-    /// The page's own measurements, as the JSON object `ui/app.js` builds in `runBench`.
+    /// The page's own measurements, as the JSON object `ui/bench.js` builds in `runBench`.
     pub page: String,
 }
 
@@ -255,7 +255,7 @@ enum AppEvent {
 }
 
 impl AppEvent {
-    /// Reads a message as `ui/app.js` posts it.
+    /// Reads a message as the page (`ui/`) posts it.
     fn parse(body: &str) -> Option<Self> {
         match body {
             "drag" => Some(Self::DragWindow),

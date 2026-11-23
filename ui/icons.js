@@ -1,5 +1,5 @@
 // Which icon a row of the file tree shows: the id of a symbol in icons.svg (Material Icon
-// Theme, see the comment at the top of that file). Plain functions of a name; app.js draws.
+// Theme, see the comment at the top of that file). Plain functions of a name; file-list.js draws.
 
 // Folders with an icon of their own, by name in lower case. Every other folder is plain.
 const FOLDERS = new Map([
