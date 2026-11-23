@@ -68,6 +68,21 @@ pub(crate) fn current(repo: &Repo) -> Result<Review> {
     Ok(review)
 }
 
+/// The ids of the notes, written `N1`, read from the review file as it is: no note is placed
+/// in its file, so no source file is read.
+///
+/// # Errors
+///
+/// As [`current`] for reading the review file.
+pub(crate) fn ids(repo: &Repo) -> Result<Vec<String>> {
+    let review = Review::load(&repo.review_file())?;
+    Ok(review
+        .notes
+        .iter()
+        .map(|note| note.id.to_string())
+        .collect())
+}
+
 /// Adds a note and saves the review file with every note at its current place, then returns
 /// all notes.
 ///

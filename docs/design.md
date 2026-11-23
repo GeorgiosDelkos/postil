@@ -155,6 +155,7 @@ schedule three tasks.
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables. |
 | `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel's drawing. |
+| `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 
 ### Data structures
 
@@ -304,6 +305,8 @@ Built in `src/run.rs`, with the API the page calls:
 | `GET /api/run/preview?notes=N1,N2` | The prompt's text, exactly as the agent receives it. |
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
 | `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
+| `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
+| `GET /api/runs` | The ids of the runs on disk, newest first. |
 | `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered. |
 | `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
 
@@ -338,11 +341,62 @@ Built in `src/run.rs`, with the API the page calls:
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
   always an object: `{"kind": "open"}` or `{"kind": "sent", "run": "R3"}`. Version 1 files
   read with every note open.
+- **A run goes with its last note.** Deleting a note deletes the log of every run none of
+  whose notes is left (asked by the owner on 2026-11-23). A run with other notes keeps its log;
+  this window's live run keeps it until a delete after it ends. Run numbers are never given
+  again: the highest one used is kept in `runs/active.lock`, so a page that read R5 never
+  takes a new run for it. Note ids still can be (a deleted highest note's number is given
+  again): a run that keeps other notes lists the new note under the old id, and shows the
+  old reply's line for it. Never reusing note ids needs the next id in `review.json`, a new
+  format version; not done yet.
 - **The page** is told about changes by a script call (`window.postil.runChanged()`) and
   fetches the entries it has not seen. Calls are coalesced: none is queued while one is
   pending, since an agent streams its reply in many small parts.
 - Closing the project or quitting kills the agent's process group (`npx` leaves `node`
   running), a starting agent's too. A run cut short this way reads as unfinished.
+
+### Notes and their status
+
+The tray shows each note with where it is in the loop, worked out in the page
+(`ui/status.js`) from the note's sent mark and its run: the live run from the run panel, any
+other read once by id (`GET /api/run?id=R2`) and kept, since a finished run does not change.
+One source of run state, the log, so the Rust process has no second summary to keep in step.
+
+- **Statuses:** Open; Starting, Working (or Stopping) and Needs you while its run is live;
+  then Addressed when the agent's reply has a line for the note (`N3: ...`, which the prompt
+  asks for), No word when it has none, Stopped, Failed, or Unfinished. A note whose turn the
+  agent refused is open again. The tray groups them: in the live run, open, and done, newest
+  run first.
+- **The note detail** (`ui/note-dialog.js`) opens from a card: the note, its lines, what the
+  agent said about it, and the run's history for it (tool calls on its file, plan steps that
+  name it). Show in code closes it and scrolls to the note.
+- **Sending one note:** the arrow on a card, or Send in the detail, sends that note alone to
+  the default agent at once and stays on the notes; Shift-click opens the send step with only
+  it ticked. Decided with the owner on 2026-11-23. A run that starts no longer takes the tray
+  to the Run tab unless it came from the send step; one that needs the engineer still does.
+
+### Cards and dialogs
+
+Every list in the tray is made of small cards: a status, a place, an id, and the note in two
+lines at most, so the engineer scans and moves fast. Everything else (what the agent said, its
+diffs and output, the whole reply) is in the dialog a card opens. The owner set this for every
+view on 2026-11-23.
+
+### The Run tab
+
+The Run tab (`ui/run-panel.js`) lists the runs, newest first, one card each: the status's
+icon, the run id, the agent, the notes sent, and the status (`GET /api/runs` gives the ids).
+A card opens the run's dialog, which holds everything about it: the plan, one card per note
+(it opens the note's detail), one card per step (it opens the step whole: its command, diffs
+and output, with the arrow keys or ‹ › to move between steps and the run's id to go back),
+and the agent's whole reply. Nothing of a run but its card is in the tab: the owner asked on
+2026-11-23 for the steps and the reply to live in each run's dialog. An open permission
+request is the one exception, above the runs, as it needs an answer now. The tray header
+shows the latest run's status, its time and Stop while it runs.
+
+Older runs are read once each by id and kept in the panel, which the notes' statuses read
+too (`byId`): a finished run does not change. The dialog is drawn again only when what it
+shows changes, so it keeps its scroll while the run streams.
 
 ### Agents
 
@@ -532,12 +586,12 @@ retired; the measured numbers above are the baseline to not regress.
    Built (section "Runs" has the core). `Cmd-Shift-Enter`, or Send under the notes, opens
    the send step: the open notes whose lines are still there are ticked, the code pane shows
    the prompt exactly as the agent receives it, and the agent can be changed for this send.
-   `Cmd-Shift-Enter` again sends. The tray's Run tab then shows the run, as in mockup "Run":
-   the plan, one row per tool call (its diff opens under it), permission cards answered with
-   `a`, `Shift-a` or `r`, and the agent's messages, drawn from a small Markdown subset
-   (built as elements, never parsed as HTML). `Esc` stops the run. The run takes the front
-   when it starts and when it needs the engineer, and the foot of the sidebar shows the
-   agent's state. The open file and the notes are read again when the run moves on and when
+   `Cmd-Shift-Enter` again sends. The tray's Run tab then lists the runs, each opening a
+   dialog with its plan, notes, steps and reply (section "The Run tab"); permission requests
+   are answered with `a`, `Shift-a` or `r`, and the agent's messages are drawn from a small
+   Markdown subset (built as elements, never parsed as HTML). `Esc` stops the run. A run
+   sent from the send step takes the front, and so does one that needs the engineer; the
+   foot of the sidebar shows the agent's state. The open file and the notes are read again when the run moves on and when
    an edit finishes. Not built: the follow-up field under the run (milestone 4).
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
 5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at

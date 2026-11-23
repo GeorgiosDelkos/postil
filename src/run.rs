@@ -32,9 +32,11 @@
 //! is not written again, so a torn line can only be the last one, and the run says the log
 //! is incomplete.
 //!
-//! The app never rewrites a log, and reads one only to show the latest run after a restart.
-//! A log with no end is shown as unfinished: the app quit or the project was closed while
-//! it ran, or another window is running it.
+//! The app never rewrites a log. It reads logs to show runs, and deletes one with the last of
+//! its notes (`Runner::delete_runs_without_notes`). `runs/active.lock` also holds the highest
+//! run number ever given, so a deleted run's number is not given again unless a crash loses
+//! the counter (`last_run`). A log with no end is shown as unfinished: the app quit or the
+//! project was closed while it ran, or another window is running it.
 //!
 //! # Threads and locks
 //!
@@ -46,7 +48,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -329,6 +331,114 @@ impl Runner {
         }
     }
 
+    /// The run `id` (`R2`), with all its entries: this window's run when it is that one, else
+    /// the run as its log on disk has it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when `id` is not of the form `R<number>`; [`Error::NoSuchRun`]
+    /// when its log is missing or cannot be read.
+    pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
+        let no_such = |problem: &str| Error::NoSuchRun {
+            id: id.to_owned(),
+            problem: problem.to_owned(),
+        };
+        let number = run_number(id)
+            .ok_or_else(|| Error::BadRequest(format!("run id {id:?}: expected R and a number")))?;
+
+        let own = self.slot().run.clone();
+        if let Some(run) = own.filter(|run| run.state().header.id == id) {
+            return Ok(run.view(0));
+        }
+        let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
+        if !file.exists() {
+            return Err(no_such("there is no such run log"));
+        }
+        Run::read(&file)
+            .map(|run| run.view(0))
+            .map_err(|problem| no_such(&problem))
+    }
+
+    /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadRun`] when the runs directory cannot be listed.
+    pub(crate) fn ids(&self) -> Result<Vec<String>> {
+        let dir = self.repo.runs_dir();
+        let mut numbers =
+            run_numbers(&dir).map_err(|source| Error::ReadRun { path: dir, source })?;
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(numbers
+            .into_iter()
+            .map(|number| format!("R{number}"))
+            .collect())
+    }
+
+    /// Deletes the log of every run none of whose notes is left: a run goes with its last
+    /// note (docs/design.md, "Runs"). This window's
+    /// live run is kept; it goes at a later delete once over. A run another window is running
+    /// loses its log the same way; that window keeps writing to the deleted file, and once
+    /// the run ends it shows there as the latest run until the project is reopened, and in no
+    /// list.
+    ///
+    /// The notes are read after the logs are listed. A log is created only once its notes are
+    /// saved (`send` reads them for the prompt first), so every listed log's notes are seen:
+    /// another window's new note, even one given a freed id, keeps its new run.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadRun`] when the runs directory cannot be listed, as [`notes::ids`] for the
+    /// review file, [`Error::WriteRun`] when a log cannot be removed. Some logs may be removed
+    /// by then; the rest are tried again at the next delete.
+    pub(crate) fn delete_runs_without_notes(&self) -> Result<()> {
+        let dir = self.repo.runs_dir();
+        let numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
+            path: dir.clone(),
+            source,
+        })?;
+        let left = notes::ids(&self.repo)?;
+        // Read once: the slot is not held while logs are read, so the agent's events, which
+        // need it, are never kept waiting on the disk.
+        let live = {
+            let slot = self.slot();
+            slot.run
+                .as_ref()
+                .filter(|run| run.state().live())
+                .map(|run| run.state().header.id.clone())
+        };
+        let mut deleted = Vec::new();
+        for number in numbers {
+            let id = format!("R{number}");
+            if live.as_deref() == Some(id.as_str()) {
+                continue;
+            }
+            let file = dir.join(format!("{id}.jsonl"));
+            // A log that cannot be read names no notes this check can see: it is left alone,
+            // and the panel says what is wrong with it.
+            let Ok(header) = read_header(&file) else {
+                continue;
+            };
+            if header.notes.iter().any(|note| left.contains(note)) {
+                continue;
+            }
+            fs::remove_file(&file).map_err(|source| Error::WriteRun { path: file, source })?;
+            deleted.push(id);
+        }
+        {
+            let mut slot = self.slot();
+            if slot
+                .run
+                .as_ref()
+                .is_some_and(|run| deleted.contains(&run.state().header.id))
+            {
+                slot.run = None;
+            }
+        }
+        (self.notify)();
+        Ok(())
+    }
+
     /// Stops the agent, running or starting, and ignores anything it would still report: the
     /// project is closing, or the app quits.
     pub(crate) fn close(&self) {
@@ -520,7 +630,7 @@ struct RunState {
     log: Option<File>,
     /// The exclusive lock on `runs/active.lock`, held from the run's creation until it ends:
     /// whether it is held is whether the run is live (`RunState::live`). A log read from disk
-    /// has none.
+    /// has none. The file's text is the highest run number given (`last_run`).
     active: Option<File>,
     // Kept as each entry is recorded, so a status needs no scan of the entries.
     started: bool,
@@ -710,8 +820,9 @@ impl Run {
         };
         fs::create_dir_all(dir).map_err(error(dir))?;
         let active_path = dir.join("active.lock");
-        let active = File::options()
+        let mut active = File::options()
             .create(true)
+            .read(true)
             .write(true)
             .truncate(false)
             .open(&active_path)
@@ -719,12 +830,15 @@ impl Run {
         take_run_lock(&active).map_err(|source| match source {
             TryLockError::WouldBlock => Error::RunElsewhere,
             TryLockError::Error(source) => Error::WriteRun {
-                path: active_path,
+                path: active_path.clone(),
                 source,
             },
         })?;
 
-        let mut number = highest_run(dir).map_err(error(dir))? + 1;
+        // A deleted run's number is not given again (`last_run`): a page that read the old R5
+        // would show a new R5 as the old one.
+        let used = last_run(&mut active).map_err(error(&active_path))?;
+        let mut number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
         // Creating the file claims the id; another window may have claimed it first.
         let (file, mut log) = loop {
             let file = dir.join(format!("R{number}.jsonl"));
@@ -748,6 +862,13 @@ impl Run {
             // A log without its header would be skipped as unreadable on every restart.
             drop(fs::remove_file(&file));
             return Err(Error::WriteRun { path: file, source });
+        }
+        if let Err(source) = record_last_run(&mut active, number) {
+            drop(fs::remove_file(&file));
+            return Err(Error::WriteRun {
+                path: active_path,
+                source,
+            });
         }
         Ok(Self {
             file,
@@ -799,18 +920,7 @@ impl Run {
     fn read(file: &Path) -> std::result::Result<Self, String> {
         let bytes = fs::read(file).map_err(|error| format!("it cannot be read ({error})"))?;
         let mut lines = bytes.split(|&byte| byte == b'\n');
-        let first = lines.next().unwrap_or_default();
-        // The version is read on its own first: a newer header would otherwise fail on its
-        // first new field, with a message that hides the real reason.
-        let VersionOnly { version } = serde_json::from_slice(first)
-            .map_err(|error| format!("its first line is not a run header ({error})"))?;
-        if version != LOG_VERSION {
-            return Err(format!(
-                "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
-            ));
-        }
-        let header: Header = serde_json::from_slice(first)
-            .map_err(|error| format!("its first line is not a run header ({error})"))?;
+        let header = parse_header(lines.next().unwrap_or_default())?;
 
         let mut state = RunState::new(header, None, None);
         for (index, line) in lines.enumerate() {
@@ -1047,17 +1157,76 @@ fn run_numbers(dir: &Path) -> io::Result<Vec<u64>> {
         let name = entry?.file_name();
         let number = name
             .to_str()
-            .and_then(|name| name.strip_prefix('R'))
             .and_then(|name| name.strip_suffix(".jsonl"))
-            .and_then(|digits| digits.parse::<u64>().ok());
+            .and_then(run_number);
         numbers.extend(number);
     }
     Ok(numbers)
 }
 
+/// The number of the run id `R7`. Written back and compared, so `R07` or `R+7` is no id: it
+/// would name another log than its own, or none.
+fn run_number(id: &str) -> Option<u64> {
+    let number = id.strip_prefix('R')?.parse::<u64>().ok()?;
+    (format!("R{number}") == id).then_some(number)
+}
+
+/// A run log's first line, its header. The version is read on its own first: a newer header
+/// would otherwise fail on its first new field, with a message that hides the real reason.
+fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
+    let VersionOnly { version } = serde_json::from_slice(first)
+        .map_err(|error| format!("its first line is not a run header ({error})"))?;
+    if version != LOG_VERSION {
+        return Err(format!(
+            "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
+        ));
+    }
+    serde_json::from_slice(first)
+        .map_err(|error| format!("its first line is not a run header ({error})"))
+}
+
+/// The header of the run log `file`, its first line only: a long run's log is not read whole.
+fn read_header(file: &Path) -> std::result::Result<Header, String> {
+    let mut first = Vec::new();
+    File::open(file)
+        .map(BufReader::new)
+        .and_then(|mut reader| reader.read_until(b'\n', &mut first))
+        .map_err(|error| format!("it cannot be read ({error})"))?;
+    // The line keeps its newline: JSON allows whitespace after the value.
+    parse_header(&first)
+}
+
 /// The highest run number among the logs in `dir`; 0 when there is none.
 fn highest_run(dir: &Path) -> io::Result<u64> {
     Ok(run_numbers(dir)?.into_iter().max().unwrap_or(0))
+}
+
+/// The highest run number ever given, kept as text in `runs/active.lock`, the file every new
+/// run locks: logs are deleted with their notes, so the highest log left can be lower. 0 when
+/// the file is new or holds no number (a build before this one left it empty, or a crash tore
+/// the write). A crash can also leave an older, lower number. Either way the highest log left
+/// then decides, and a deleted run above it can get its number again.
+fn last_run(active: &mut File) -> io::Result<u64> {
+    // Read as bytes: damage that is not UTF-8 is no number too, not an error that would stop
+    // every run before `record_last_run` repairs the file.
+    let mut bytes = Vec::new();
+    active.seek(SeekFrom::Start(0))?;
+    active.read_to_end(&mut bytes)?;
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0))
+}
+
+/// Records `number` as the highest run number given. The caller holds the file's lock.
+/// Written over the old text, then cut to its length: a truncate first and a crash would
+/// leave the file empty, and without the cut a damaged tail would stay and never parse
+/// again. Not synced, like the logs.
+fn record_last_run(active: &mut File, number: u64) -> io::Result<()> {
+    let text = number.to_string();
+    active.seek(SeekFrom::Start(0))?;
+    active.write_all(text.as_bytes())?;
+    active.set_len(text.len() as u64)
 }
 
 /// A session update as a log entry; `None` for what the run panel does not show.

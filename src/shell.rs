@@ -52,6 +52,8 @@ const SETTINGS_DIALOG_JS: &str = include_str!("../ui/settings-dialog.js");
 const RUN_JS: &str = include_str!("../ui/run.js");
 const RUN_PANEL_JS: &str = include_str!("../ui/run-panel.js");
 const PANES_JS: &str = include_str!("../ui/panes.js");
+const STATUS_JS: &str = include_str!("../ui/status.js");
+const NOTE_DIALOG_JS: &str = include_str!("../ui/note-dialog.js");
 const ICONS_SVG: &str = include_str!("../ui/icons.svg");
 const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
 const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
@@ -768,6 +770,10 @@ impl Site {
             "/run.js" => reply(StatusCode::OK, "text/javascript", RUN_JS.as_bytes()),
             "/panes.js" => reply(StatusCode::OK, "text/javascript", PANES_JS.as_bytes()),
             "/run-panel.js" => reply(StatusCode::OK, "text/javascript", RUN_PANEL_JS.as_bytes()),
+            "/status.js" => reply(StatusCode::OK, "text/javascript", STATUS_JS.as_bytes()),
+            "/note-dialog.js" => {
+                reply(StatusCode::OK, "text/javascript", NOTE_DIALOG_JS.as_bytes())
+            }
             "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
@@ -800,6 +806,14 @@ impl Site {
                     "text/plain",
                     &b"GET the settings or PUT new ones"[..],
                 ),
+            },
+            "/api/runs" => match *request.method() {
+                Method::GET => json_or_error(
+                    self.runner()
+                        .and_then(|runner| runner.ids())
+                        .map(|ids| to_json(&serde_json::json!({ "runs": ids }))),
+                ),
+                _ => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
             },
             "/api/run" | "/api/run/preview" | "/api/run/cancel" | "/api/run/permission" => {
                 self.respond_run(request)
@@ -913,6 +927,9 @@ impl Site {
     /// other notes.
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
         let review = notes::delete(&*self.repo()?, id)?;
+        // A run goes with its last note (docs/design.md, "Runs"). The note is deleted by now:
+        // a log that cannot be removed is reported, and tried again at the next delete.
+        self.runner()?.delete_runs_without_notes()?;
         Ok(to_json(&review))
     }
 
@@ -922,14 +939,13 @@ impl Site {
         let post = *request.method() == Method::POST;
         match uri.path() {
             "/api/run" => match *request.method() {
-                Method::GET => json_or_error(
-                    after_of(uri.query().unwrap_or("")).and_then(|after| self.run_view(after)),
-                ),
+                Method::GET => json_or_error(self.run_view(uri.query().unwrap_or(""))),
                 Method::POST => json_or_error(self.send_run(request.body())),
                 _ => reply(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "text/plain",
-                    &b"GET the latest run (?after=<entries seen>) or POST a new one"[..],
+                    &b"GET the latest run (?after=<entries seen>) or one run (?id=R1), \
+                       or POST a new one"[..],
                 ),
             },
             "/api/run/preview" if *request.method() != Method::GET => reply(
@@ -992,10 +1008,14 @@ impl Site {
             .ok_or(Error::NoProject)
     }
 
-    /// The reply to `GET /api/run`: the latest run with its entries from number `after` on, or
-    /// `null` when the project has none.
-    fn run_view(&self, after: usize) -> Result<Vec<u8>> {
-        Ok(to_json(&self.runner()?.view(after)?))
+    /// The reply to `GET /api/run`: with `?id=R2`, that run whole; else the latest run with its
+    /// entries from number `?after=` on, or `null` when the project has none.
+    fn run_view(&self, query: &str) -> Result<Vec<u8>> {
+        let runner = self.runner()?;
+        match query_value(query, "id") {
+            Some(id) => Ok(to_json(&runner.view_of(&id)?)),
+            None => Ok(to_json(&runner.view(after_of(query)?)?)),
+        }
     }
 
     /// The reply to `POST /api/run`: sends the notes in the body to the agent, and answers
@@ -1161,7 +1181,9 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsChanged
                 | Error::TurnRunning
                 | Error::RunElsewhere => StatusCode::CONFLICT,
-                Error::NoSuchNote { .. } | Error::NoSuchPermission => StatusCode::NOT_FOUND,
+                Error::NoSuchNote { .. } | Error::NoSuchPermission | Error::NoSuchRun { .. } => {
+                    StatusCode::NOT_FOUND
+                }
                 // The agent, the server behind this one, failed.
                 Error::AgentNotFound { .. }
                 | Error::StartAgent { .. }
@@ -2718,6 +2740,7 @@ mod tests {
     // Runs (run.rs), against the fake ACP agent in tests/fake-agent.mjs.
 
     const RUN: &str = "postil://localhost/api/run";
+    const RUNS: &str = "postil://localhost/api/runs";
 
     /// Long enough for Node to start on a loaded machine; a test that waits this long has
     /// failed (it bounds a hang and times nothing).
@@ -3013,6 +3036,126 @@ mod tests {
             kinds(&third).contains(&"message:prompt 1".to_owned()),
             "{third}"
         );
+    }
+
+    #[test]
+    fn any_run_can_be_read_by_its_id_in_this_window_and_from_disk_in_another() {
+        let repo = TempRepo::new("run-by-id");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        send(&site, &["N2"]);
+        let second = wait_for(&site, &nudges, "ended");
+
+        let first = get_json(&site, &format!("{RUN}?id=R1"));
+        assert_eq!(first["id"], "R1");
+        assert_eq!(first["notes"], serde_json::json!(["N1"]));
+        assert!(
+            kinds(&first).contains(&"message:prompt 1".to_owned()),
+            "{first}"
+        );
+        assert_eq!(
+            get_json(&site, &format!("{RUN}?id=R2")),
+            second,
+            "this window's run, whole"
+        );
+
+        // Another window has run nothing: it reads the logs.
+        let (other, _) = run_site(&repo, "plain");
+        assert_eq!(get_json(&other, &format!("{RUN}?id=R1")), first);
+
+        let (status, body) = get(&site, &format!("{RUN}?id=R3"));
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no such run log"), "{body}");
+        for id in ["R01", "R+1", "..%2FR1", ""] {
+            let (status, body) = get(&site, &format!("{RUN}?id={id}"));
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {body}");
+            assert!(body.contains("expected R and a number"), "{id}: {body}");
+        }
+
+        // A file named like a log but not by its own id is no run: listing it as R1 would name
+        // another log.
+        fs::write(repo.root.join(".git/postil/runs/R01.jsonl"), "").unwrap();
+        assert_eq!(
+            get_json(&site, RUNS)["runs"],
+            serde_json::json!(["R2", "R1"])
+        );
+    }
+
+    #[test]
+    fn a_run_is_deleted_with_its_last_note() {
+        let repo = TempRepo::new("run-delete");
+        repo.write("a.txt", "a\nb\nc\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        for (line, body) in [(1, "one"), (2, "two"), (3, "three")] {
+            post_note(&site, "a.txt", line, line, body);
+        }
+        send(&site, &["N1", "N2"]);
+        wait_for(&site, &nudges, "ended");
+        send(&site, &["N3"]);
+        wait_for(&site, &nudges, "ended");
+        let log = |id: &str| repo.root.join(format!(".git/postil/runs/{id}.jsonl"));
+
+        let (status, body) = delete(&site, &format!("{NOTES}?id=N1"));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(log("R1").exists(), "R1 still has N2");
+        let runs = || get_json(&site, RUNS)["runs"].clone();
+        assert_eq!(runs(), serde_json::json!(["R2", "R1"]), "newest first");
+
+        delete(&site, &format!("{NOTES}?id=N3"));
+        assert!(!log("R2").exists(), "R2's only note is gone");
+        assert_eq!(
+            get_json(&site, RUN)["id"],
+            "R1",
+            "the latest run left is shown"
+        );
+        assert_eq!(get(&site, &format!("{RUN}?id=R2")).0, StatusCode::NOT_FOUND);
+        assert_eq!(runs(), serde_json::json!(["R1"]));
+
+        // R2's number is not given again: a page that read R2 would take the new run for it.
+        send(&site, &["N2"]);
+        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R3");
+        assert_eq!(runs(), serde_json::json!(["R3", "R1"]));
+
+        // A log that cannot be read is left alone: its notes cannot be checked.
+        fs::write(log("R8"), "not a run log\n").unwrap();
+        delete(&site, &format!("{NOTES}?id=N2"));
+        assert!(!log("R1").exists());
+        assert!(log("R8").exists(), "an unreadable log is kept");
+        assert_eq!(
+            get_json(&site, RUN),
+            serde_json::Value::Null,
+            "no run is left"
+        );
+        assert_eq!(runs(), serde_json::json!(["R8"]));
+    }
+
+    #[test]
+    fn a_live_run_is_kept_when_its_note_is_deleted_and_goes_at_the_next_delete() {
+        let repo = TempRepo::new("run-delete-live");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "hang");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "running");
+        let log = repo.root.join(".git/postil/runs/R1.jsonl");
+
+        delete(&site, &format!("{NOTES}?id=N1"));
+        assert!(log.exists(), "the live run keeps its log");
+        assert_eq!(get_json(&site, RUN)["status"], "running");
+
+        // Stopped twice, the second time forced, the run ends; the next delete takes it.
+        let cancel = format!("{RUN}/cancel");
+        post(&site, &cancel, "");
+        site.runner().unwrap().backdate_stop();
+        post(&site, &cancel, "");
+        wait_for(&site, &nudges, "failed");
+        delete(&site, &format!("{NOTES}?id=N2"));
+        assert!(!log.exists());
     }
 
     #[test]
@@ -3533,6 +3676,29 @@ mod tests {
         post_note(&site, "a.txt", 1, 1, "one");
         send(&site, &["N1"]);
         assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R10");
+    }
+
+    #[test]
+    fn a_damaged_run_counter_is_repaired_by_the_next_run() {
+        // A crash leaves a zero-filled tail; damage from outside can leave bytes that are not
+        // UTF-8. Neither parses, so both read as no number.
+        for (case, damage) in [("zeros", &b"5\0\0"[..]), ("not-utf8", b"5\0\xff")] {
+            let repo = TempRepo::new(&format!("run-counter-{case}"));
+            repo.write("a.txt", "a\nb\n");
+            let runs = repo.root.join(".git/postil/runs");
+            fs::create_dir_all(&runs).unwrap();
+            fs::write(runs.join("active.lock"), damage).unwrap();
+            let (site, nudges) = run_site(&repo, "plain");
+            post_note(&site, "a.txt", 1, 1, "one");
+            post_note(&site, "a.txt", 2, 2, "two");
+            send(&site, &["N1"]);
+            assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R1", "{case}");
+
+            // R1 goes with N1; its number must not come back, which needs the counter readable.
+            delete(&site, &format!("{NOTES}?id=N1"));
+            send(&site, &["N2"]);
+            assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R2", "{case}");
+        }
     }
 
     #[test]

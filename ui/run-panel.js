@@ -1,9 +1,13 @@
-// The run panel: the tray's Run tab and the agent status at the foot of the sidebar. It
-// fetches the latest run from `api/run` and draws it; ui/run.js has the rules.
+// The run panel: the tray's Run tab and the agent status at the foot of the sidebar. The tab
+// lists the runs, one small card each, newest first; a card opens the run's dialog, which
+// holds everything about it: its plan, its notes, every step, and the agent's reply
+// (docs/design.md, "The Run tab"). ui/run.js has the rules.
 //
-// The Rust process calls `window.postil.runChanged()` whenever the run changes; the panel
-// then fetches the entries it has not seen. Fetches never overlap: a change that arrives
-// during one is fetched right after it.
+// The panel follows the latest run: the Rust process calls `window.postil.runChanged()`
+// whenever it changes, and the panel fetches the entries it has not seen. Fetches never
+// overlap: a change that arrives during one is fetched right after it. Older runs are read
+// once each, by id, and kept: a finished run does not change. The page's notes read their
+// runs through the same store (`byId`).
 
 import {
   elapsed,
@@ -19,6 +23,10 @@ import {
   toolRow,
   underWay,
 } from "./run.js";
+import { statusIcon } from "./note-dialog.js";
+import { noteStatus, planProgress } from "./status.js";
+
+const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -27,32 +35,73 @@ function el(tag, className, text) {
   return node;
 }
 
+// A run's status as a status icon's kind (note-dialog.js, `statusIcon`).
+function iconKind(run) {
+  const { tone } = statusLine(run);
+  return { busy: "working", attention: "needs", done: "addressed", failed: "failed" }[tone] ?? "stopped";
+}
+
+// A run's status in a word or two: statusLine's text, short enough for a card.
+function statusWord(run) {
+  return run.status === "unfinished" ? "Unfinished" : statusLine(run).text;
+}
+
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
-// sidebar's agent status. `onChange(run, previous)` is called after every fetch that
-// changed the run, so the page can follow it (switch tabs, re-read files).
-export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
+// sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous)` is
+// called after every fetch that changed the latest run, so the page can follow it (switch
+// tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
+// by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
+// file in the code pane.
+export function runPanel({
+  panelEl,
+  headerEl,
+  statusEl,
+  detailEl,
+  onChange,
+  onLoaded,
+  onError,
+  noteOf,
+  openNote,
+  openFile,
+}) {
+  // The latest run, followed as it changes.
   let run = null;
   let fetching = false;
   let again = false;
+  // How long to wait before fetching again after a failed fetch: doubled each failure.
+  let retryIn = 1000;
+  // Every run's id, newest first (`api/runs`), read again when the latest run changes or a
+  // run may have been deleted (`reload`).
+  let ids = [];
+  let listStale = true;
+  // Older runs by id; the ids asked for and not answered yet; and why a run could not be read,
+  // by id (an unreadable or newer log). None is asked again until `reload` or `forget`.
+  const others = new Map();
+  const asked = new Set();
+  const failed = new Map();
+
   let clock = null;
   // When Stop starts to end the agent, by this page's clock; null unless it is stopping.
   let forceAt = null;
-  // The drawn items by key, each with the signature it was drawn from: an item whose
-  // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
+  // The drawn cards by key, each with the signature it was drawn from: a card whose
+  // signature is unchanged keeps its node.
   let views = new Map();
   let drawnRun = null;
-  // Whether the panel follows the end of the run: true until the engineer scrolls up, and
-  // again once they scroll back to the end. Scrolling up is read as any move above where
-  // `reveal` last put the panel, not as a distance from the end: a slow trackpad scroll moves
-  // a few px at a time, and a render between two of its events would scroll it back down.
-  let follow = true;
-  let revealedTop = 0;
-  // How long to wait before fetching again after a failed fetch: doubled each failure.
-  let retryIn = 1000;
-  panelEl.addEventListener("scroll", () => {
-    if (panelEl.clientHeight === 0) return;
-    if (atEnd()) follow = true;
-    else if (panelEl.scrollTop < revealedTop) follow = false;
+
+  // What the dialog shows while open: `{ kind: "run", id }` or `{ kind: "step", id, key }`;
+  // and what it was drawn from, to draw it again only when that changes.
+  let detail = null;
+  let detailDrawn = null;
+  detailEl.addEventListener("close", () => {
+    detail = null;
+    detailDrawn = null;
+  });
+  detailEl.addEventListener("keydown", (event) => {
+    if (detail?.kind !== "step" || event.metaKey || event.altKey || event.ctrlKey) return;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      moveStep(event.key === "ArrowLeft" ? -1 : 1);
+    }
   });
 
   async function fetchRun() {
@@ -69,6 +118,18 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     return whole.json();
   }
 
+  async function fetchIds() {
+    // Cleared before the request: a `reload` while it is in flight marks the list stale
+    // again, and the next sync reads it again.
+    listStale = false;
+    const response = await fetch("api/runs");
+    if (!response.ok) {
+      listStale = true;
+      throw new Error(await response.text());
+    }
+    ids = (await response.json()).runs;
+  }
+
   async function sync() {
     if (fetching) {
       again = true;
@@ -80,8 +141,9 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
         again = false;
         const previous = run;
         const next = await fetchRun();
-        if (next === null && previous === null) continue;
+        if (next === null && previous === null && !listStale) continue;
         run = next;
+        if (listStale || previous?.id !== run?.id) await fetchIds();
         render();
         onChange(run, previous);
       } while (again);
@@ -95,6 +157,52 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     } finally {
       fetching = false;
     }
+  }
+
+  // The run `id`: the latest, or an older one once read; null until then, and a read is
+  // started. Each id is asked for once until `forget` or `reload`: asking again on every draw
+  // would fetch it in a loop.
+  function byId(id) {
+    if (run?.id === id) return run;
+    const known = others.get(id);
+    if (known || asked.has(id)) return known ?? null;
+    asked.add(id);
+    fetch(`api/run?id=${encodeURIComponent(id)}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        others.set(id, await response.json());
+        render();
+        onLoaded();
+      })
+      // The run's card says why, and its notes say "Sent in R2": the tray stays usable.
+      .catch((error) => {
+        failed.set(id, String(error.message ?? error));
+        render();
+      });
+    return null;
+  }
+
+  // Drops the older runs that may still change, and reads the list again: the page's
+  // refresh, when another window may have moved on. Only an ended or failed run is final; a
+  // run another window is running reads from its log as unfinished.
+  function forget() {
+    for (const [id, view] of others) {
+      if (view.status === "ended" || view.status === "failed") continue;
+      others.delete(id);
+      asked.delete(id);
+    }
+    for (const id of failed.keys()) asked.delete(id);
+    failed.clear();
+    listStale = true;
+  }
+
+  // Drops every run read, after a note's delete may have deleted runs, and fetches again.
+  function reload() {
+    others.clear();
+    asked.clear();
+    failed.clear();
+    listStale = true;
+    return sync();
   }
 
   async function post(route, body) {
@@ -135,81 +243,79 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     return true;
   }
 
+  // ---- The tab: one card per run ----------------------------------------------------------
+
   function render() {
     if (drawnRun !== (run?.id ?? null)) {
-      views = new Map();
       drawnRun = run?.id ?? null;
-      follow = true;
       forceAt = null;
     }
     renderStatus();
     renderHeader();
-    if (!run) {
+    const list = ids.length ? ids : run ? [run.id] : [];
+    if (list.length === 0) {
+      views = new Map();
       panelEl.replaceChildren(el("div", "empty", "No run yet. Send notes to an agent to start one."));
+      closeIfGone(list);
       return;
     }
-    const { plan, items } = foldRun(run.entries);
-    const live = isLive(run);
     const wanted = [];
-    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), null, () => planView(plan)]);
-    items.forEach((item, index) => {
-      wanted.push([itemKey(item, index), signature(item, live), item.output, (open) => itemView(item, open)]);
-    });
-    if (run.problem) wanted.push(["problem", run.problem, null, () => el("div", "run-notice", run.problem)]);
-    if (wanted.length === 0) {
-      wanted.push(["empty", statusLine(run).text, null, () => el("div", "empty", statusLine(run).text)]);
+    // A permission request needs an answer now, so it shows above the runs.
+    if (isLive(run)) {
+      for (const item of foldRun(run.entries).items) {
+        if (item.type !== "permission" || item.answer !== undefined) continue;
+        wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
+      }
+    }
+    const label = list.length === 1 ? "Run" : `Runs · ${list.length}`;
+    wanted.push(["label", label, () => el("div", "run-label", label)]);
+    for (const id of list) {
+      const view = byId(id);
+      const sig = view
+        ? JSON.stringify([view.status, view.agent, view.notes, statusWord(view)])
+        : (failed.get(id) ?? "loading");
+      wanted.push([`run:${id}`, sig, () => runCard(id, view)]);
     }
 
     const next = new Map();
-    // `data` is the object the signature leaves out, compared by identity: a tool's output,
-    // which an update replaces whole and entries keep from one fetch to the next.
-    const nodes = wanted.map(([key, sig, data, build]) => {
+    const nodes = wanted.map(([key, sig, build]) => {
       const drawn = views.get(key);
-      const same = drawn?.sig === sig && drawn.data === data;
-      // A redrawn tool opens, filled at once, as the one it replaces was.
-      const node = same ? drawn.node : build(drawn?.node.open === true);
-      next.set(key, { sig, data, node });
+      const node = drawn?.sig === sig ? drawn.node : build();
+      next.set(key, { sig, node });
       return node;
     });
     views = next;
-    // Only nodes out of place move; the rest, the top of a long run, are left untouched.
+    // Only nodes out of place move.
     nodes.forEach((node, index) => {
       if (panelEl.childNodes[index] !== node) panelEl.insertBefore(node, panelEl.childNodes[index] ?? null);
     });
     while (panelEl.childNodes.length > nodes.length) panelEl.lastChild.remove();
-    reveal();
+    closeIfGone(list);
+    drawDetail();
   }
 
-  // Scrolls to the end while the panel follows it. Measured only while the panel shows: a
-  // hidden panel has no height, and would read as both at the end and scrolled to the top.
-  function reveal() {
-    if (!follow || panelEl.clientHeight === 0) return;
-    panelEl.scrollTop = panelEl.scrollHeight;
-    revealedTop = panelEl.scrollTop;
-  }
-
-  function atEnd() {
-    return panelEl.scrollHeight - panelEl.scrollTop - panelEl.clientHeight < 24;
-  }
-
-  function itemKey(item, index) {
-    if (item.type === "tool") return `tool:${item.id}`;
-    if (item.type === "permission") return `permission:${item.request}`;
-    return `${item.type}:${index}`;
-  }
-
-  // What an item's node is drawn from: when this is unchanged, so is the node.
-  function signature(item, live) {
-    switch (item.type) {
-      case "tool":
-        // `live` only changes how a call still under way is drawn, so a run's end leaves the
-        // finished ones, and any text selected in them, alone.
-        return JSON.stringify([item.title, item.tool, item.status, item.places, underWay(item) && live]);
-      case "permission":
-        return JSON.stringify([item.title, item.answer ?? "open"]);
-      default:
-        return item.text;
+  // A run's card: its status, id, agent and notes, in one line.
+  function runCard(id, view) {
+    const button = el("button", "run-card run-entry");
+    button.type = "button";
+    if (!view) {
+      button.disabled = true;
+      const problem = failed.get(id);
+      button.append(statusIcon(problem ? "failed" : "stopped"), el("span", "run-id", id));
+      button.append(el("span", "run-card-text", problem ? `Cannot be shown: ${problem}` : "Loading…"));
+      if (problem) button.title = problem;
+      return button;
     }
+    button.append(
+      statusIcon(iconKind(view)),
+      el("span", "run-id", view.id),
+      el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}`),
+      el("span", `run-entry-status ${statusLine(view).tone}`, statusWord(view)),
+      el("span", "run-chevron", "›"),
+    );
+    button.title = `${view.id} · ${view.agent} · ${statusLine(view).text}`;
+    button.addEventListener("click", () => openDetail({ kind: "run", id }));
+    return button;
   }
 
   function renderStatus() {
@@ -221,6 +327,7 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     statusEl.replaceChildren(dot, el("span", "status-text", `${run.agent} · ${text}`));
   }
 
+  // The tray header: the latest run's status and, while it runs, its time and Stop.
   function renderHeader() {
     clearInterval(clock);
     clock = null;
@@ -228,13 +335,15 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       headerEl.replaceChildren();
       return;
     }
+    const { text, tone } = statusLine(run);
+    const title = el("span", "run-title");
+    title.title = `${run.id} · ${run.agent} · ${text}`;
     const time = el("span", "run-time");
     const tick = () => {
-      time.textContent = elapsed(Date.now() / 1000 - run.startedAt);
+      if (isLive(run)) time.textContent = ` · ${elapsed(Date.now() / 1000 - run.startedAt)}`;
     };
     tick();
-    const title = el("span", "run-title");
-    title.append(el("strong", "", run.agent), " · ", time);
+    title.append(statusIcon(iconKind(run)), el("strong", `run-word ${tone}`, statusWord(run)), time);
     const parts = [title];
     if (!isLive(run) || run.status !== "cancelling") forceAt = null;
     if (isLive(run)) {
@@ -256,47 +365,257 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       }, 1000);
       button.addEventListener("click", stop);
       parts.push(button);
-    } else {
-      const { text, tone } = statusLine(run);
-      time.textContent = run.id;
-      parts.push(el("span", `run-end ${tone}`, text));
     }
     headerEl.replaceChildren(...parts);
   }
 
-  function planView(plan) {
-    const view = el("section", "run-plan");
-    view.append(el("div", "run-label", "Plan"));
-    for (const step of plan) {
-      const row = el("div", `plan-step ${step.status}`);
-      const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
-      mark.setAttribute("aria-hidden", "true");
-      row.append(mark, el("span", "", step.content));
-      view.append(row);
+  // ---- The dialog: a run whole, or one of its steps -----------------------------------------
+
+  function openDetail(what) {
+    detail = what;
+    detailDrawn = null;
+    drawDetail();
+    if (!detailEl.open) {
+      detailEl.showModal();
+      detailEl.focus();
     }
-    return view;
   }
 
-  // `open`: an expandable item is drawn open, as the node it replaces was.
-  function itemView(item, open) {
-    switch (item.type) {
-      case "message":
-        return markdownView(item.text);
-      case "thought": {
-        const details = el("details", "run-thought");
-        details.append(el("summary", "", "Thinking"), el("div", "", item.text.trim()));
-        details.open = open;
-        return details;
+  // A run deleted while its dialog is open closes the dialog.
+  function closeIfGone(list) {
+    if (detail && !list.includes(detail.id)) detailEl.close();
+  }
+
+  // The run's steps in order, each with its key: every item but the agent's messages and an
+  // open permission request, which shows above the runs.
+  function stepsOf(items) {
+    return items
+      .map((item, index) => ({ item, key: itemKey(item, index) }))
+      .filter(({ item }) => item.type !== "message" && !(item.type === "permission" && item.answer === undefined));
+  }
+
+  function itemKey(item, index) {
+    if (item.type === "tool") return `tool:${item.id}`;
+    if (item.type === "permission") return `permission:${item.request}`;
+    return `${item.type}:${index}`;
+  }
+
+  // Draws the dialog again when what it shows changed, and keeps its scroll otherwise, while
+  // the run streams.
+  function drawDetail() {
+    if (!detail) return;
+    const view = byId(detail.id);
+    if (!view) return;
+    const steps = stepsOf(foldRun(view.entries).items);
+    let stamp;
+    let draw;
+    if (detail.kind === "run") {
+      const notes = view.notes.map((id) => noteLine(id, view));
+      stamp = [`run:${view.id}`, view.status, view.total, JSON.stringify(notes)];
+      draw = () => runDetail(view, steps, notes);
+    } else {
+      const index = steps.findIndex((step) => step.key === detail.key);
+      if (index < 0) return;
+      const { item } = steps[index];
+      stamp = [`${view.id}:${detail.key}`, item.status, item.output, item.text, item.answer, isLive(view)];
+      draw = () => stepDetail(view, item, index, steps.length);
+    }
+    if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) return;
+    detailDrawn = stamp;
+    const scroll = detailEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
+    const same = detailEl.dataset.shown === stamp[0];
+    detailEl.dataset.shown = stamp[0];
+    detailEl.replaceChildren(...draw());
+    const body = detailEl.querySelector(".note-dialog-body");
+    if (body && same) body.scrollTop = scroll;
+  }
+
+  function moveStep(by) {
+    const view = byId(detail.id);
+    if (!view) return;
+    const steps = stepsOf(foldRun(view.entries).items);
+    const next = steps[steps.findIndex((step) => step.key === detail.key) + by];
+    if (next) openDetail({ kind: "step", id: detail.id, key: next.key });
+  }
+
+  function detailHeader(icon, title, extra, actions = []) {
+    const head = el("header", "note-dialog-header");
+    const heading = el("h2", "note-dialog-title", title);
+    heading.id = "run-detail-title";
+    const close = el("button", "button", "esc");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close");
+    close.addEventListener("click", () => detailEl.close());
+    const right = el("span", "note-dialog-actions");
+    right.append(...actions, close);
+    head.append(...(icon ? [icon] : []), heading, el("span", "note-dialog-where", extra), right);
+    return head;
+  }
+
+  function section(label, ...content) {
+    const part = el("section", "note-dialog-section");
+    part.append(el("div", "note-dialog-label", label), ...content);
+    return part;
+  }
+
+  // A note sent in the run: its status in this run, its place and id.
+  function noteLine(id, view) {
+    const note = noteOf(id);
+    if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle" };
+    const { start, end } = note.lines;
+    const where = `${note.path.split("/").at(-1)}:${start === end ? start : `${start}-${end}`}`;
+    return { id, where, ...noteStatus(note, view) };
+  }
+
+  // The run whole: its plan, its notes, every step, and the agent's reply.
+  function runDetail(view, steps, notes) {
+    const live = isLive(view);
+    const body = el("div", "note-dialog-body");
+    const { plan, items } = foldRun(view.entries);
+
+    if (plan?.length) {
+      const progress = planProgress(view);
+      const rows = el("div", "run-plan-rows");
+      for (const step of plan) {
+        const row = el("div", `plan-step ${step.status}`);
+        const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
+        mark.setAttribute("aria-hidden", "true");
+        row.append(mark, el("span", "", step.content));
+        rows.append(row);
       }
-      case "tool":
-        return toolView(item, open);
-      case "permission":
-        return permissionView(item);
+      body.append(section(`Plan · ${progress.done} of ${progress.total}`, rows));
+    }
+
+    const noteCards = el("div", "run-cards");
+    for (const card of notes) {
+      const button = el("button", `run-card ${card.kind}`);
+      button.type = "button";
+      button.append(
+        statusIcon(card.kind),
+        el("span", `run-card-text run-note-status ${card.tone}`, card.label),
+        el("span", "run-note-where", card.where),
+        el("span", "note-id", card.id),
+      );
+      button.disabled = card.label === "Deleted";
+      button.addEventListener("click", () => {
+        detailEl.close();
+        openNote(card.id);
+      });
+      noteCards.append(button);
+    }
+    body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+
+    if (steps.length) {
+      const stepCards = el("div", "run-cards");
+      for (const { item, key } of steps) {
+        stepCards.append(stepCard(view, item, () => openDetail({ kind: "step", id: view.id, key })));
+      }
+      body.append(section(`Steps · ${steps.length}`, stepCards));
+    }
+
+    const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
+    if (text) body.append(section(live ? `${view.agent} is writing` : `${view.agent}'s reply`, markdownView(text)));
+    if (view.problem) body.append(el("div", "run-notice", view.problem));
+
+    const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const when = live ? elapsed(Date.now() / 1000 - view.startedAt) : `started ${started}`;
+    return [
+      detailHeader(statusIcon(iconKind(view)), `${view.id} · ${view.agent}`, `${statusWord(view)} · ${when}`),
+      body,
+    ];
+  }
+
+  // A step's card: what it did and how it went, in one line.
+  function stepCard(view, item, open) {
+    const card = (parts) => {
+      const button = el("button", "run-card step");
+      button.type = "button";
+      button.append(...parts, el("span", "run-chevron", "›"));
+      button.addEventListener("click", open);
+      return button;
+    };
+    switch (item.type) {
+      case "tool": {
+        const row = toolRow(item, isLive(view));
+        const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
+        const state = row.running ? statusIcon("working") : el("span", `tool-state${tone}`, row.state);
+        const node = card([el("span", "tool-verb", row.verb), el("span", "run-card-text tool-target", row.target), state]);
+        node.title = item.title;
+        return node;
+      }
+      case "thought":
+        return card([
+          el("span", "tool-verb", "think"),
+          el("span", "run-card-text run-thought-preview", item.text.trim().replace(/\s+/g, " ")),
+        ]);
+      case "permission": {
+        const chosen = item.options.find((option) => option.id === item.answer);
+        return card([
+          el("span", "tool-verb", "ask"),
+          el("span", "run-card-text", item.title),
+          el("span", "tool-state", chosen ? chosen.name : "cancelled"),
+        ]);
+      }
       case "error":
         return el("div", "run-error", item.text);
       default:
         return el("div", "run-notice", item.text);
     }
+  }
+
+  function stepDetail(view, item, index, count) {
+    const body = el("div", "note-dialog-body");
+    const nav = el("div", "run-detail-nav");
+    const back = el("button", "button", `‹ ${view.id}`);
+    back.type = "button";
+    back.setAttribute("aria-label", `Back to ${view.id}`);
+    back.addEventListener("click", () => openDetail({ kind: "run", id: view.id }));
+    const previous = el("button", "button", "‹");
+    previous.type = "button";
+    previous.setAttribute("aria-label", "The step before");
+    previous.disabled = index === 0;
+    previous.addEventListener("click", () => moveStep(-1));
+    const following = el("button", "button", "›");
+    following.type = "button";
+    following.setAttribute("aria-label", "The step after");
+    following.disabled = index === count - 1;
+    following.addEventListener("click", () => moveStep(1));
+    nav.append(back, el("span", "", `Step ${index + 1} of ${count} · ← → to move`), previous, following);
+    body.append(nav);
+
+    if (item.type === "thought") {
+      body.append(el("div", "run-detail-text", item.text.trim()));
+      return [detailHeader(null, "Thinking", view.id), body];
+    }
+    if (item.type === "permission") {
+      const chosen = item.options.find((option) => option.id === item.answer);
+      body.append(el("div", "run-detail-text", `Answered: ${chosen ? chosen.name : "cancelled"}`));
+      return [detailHeader(null, item.title, view.id), body];
+    }
+    const row = toolRow(item, isLive(view));
+    const kind = item.status === "failed" ? "failed" : row.running ? "working" : "addressed";
+    const actions = [];
+    const path = item.places[0]?.path ?? item.output.find((part) => part.type === "diff")?.path;
+    if (path) {
+      const show = el("button", "button", "Open file");
+      show.type = "button";
+      show.addEventListener("click", () => {
+        detailEl.close();
+        openFile(path);
+      });
+      actions.push(show);
+    }
+    // A command's title is the command; a file tool's only repeats the header.
+    const onFile = ["read", "edit", "delete", "move"].includes(item.tool);
+    if (!onFile) body.append(el("pre", "run-detail-command", item.title));
+    for (const part of item.output) {
+      if (part.type === "diff") body.append(section(part.path, diffView(part)));
+      else body.append(el("pre", "tool-output", part.text));
+    }
+    if (item.output.length === 0) {
+      body.append(el("div", "run-detail-text muted", row.running ? "Under way…" : "No output."));
+    }
+    return [detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions), body];
   }
 
   // The agent's Markdown as elements, built node by node: its text is never parsed as HTML.
@@ -322,43 +641,6 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     return node;
   }
 
-  // `open`: the tool is drawn open, with its output, as the node it replaces was.
-  function toolView(tool, open) {
-    const row = toolRow(tool, isLive(run));
-    const diffs = tool.output.filter((part) => part.type === "diff");
-    const texts = tool.output.filter((part) => part.type === "text");
-    const line = el("div", `tool-line${row.running ? " running" : ""}`);
-    line.append(el("span", "tool-verb", row.verb), el("span", "tool-target", row.target));
-    const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
-    const state = el("span", `tool-state${tone}`, row.state);
-    line.append(state);
-    if (diffs.length === 0 && texts.length === 0) {
-      line.title = tool.title;
-      return line;
-    }
-    // A call with output opens to show it: its diffs, or what it printed. They are built when
-    // first opened: a run can carry many large diffs nobody opens.
-    const details = el("details", "tool");
-    const summary = el("summary");
-    summary.append(line);
-    details.append(summary);
-    let built = false;
-    const fill = () => {
-      if (built) return;
-      built = true;
-      for (const diff of diffs) details.append(diffView(diff));
-      for (const text of texts) details.append(el("pre", "tool-output", text.text));
-    };
-    details.addEventListener("toggle", () => {
-      if (details.open) fill();
-    });
-    if (open) {
-      fill();
-      details.open = true;
-    }
-    return details;
-  }
-
   function diffView(diff) {
     const view = el("pre", "tool-diff");
     const marks = { same: "  ", del: "- ", add: "+ " };
@@ -369,17 +651,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   }
 
   function permissionView(request) {
-    const open = request.answer === undefined;
-    const card = el("div", `permission${open ? " open" : ""}`);
-    card.append(
-      el("div", "permission-label", open ? "Permission needed" : "Permission"),
-      el("div", "permission-title", request.title),
-    );
-    if (!open) {
-      const chosen = request.options.find((option) => option.id === request.answer);
-      card.append(el("div", "permission-answer", chosen ? chosen.name : "Cancelled"));
-      return card;
-    }
+    const card = el("div", "permission open");
+    card.append(el("div", "permission-label", "Permission needed"), el("div", "permission-title", request.title));
     const keys = permissionKeys(request.options);
     const buttons = el("div", "permission-actions");
     for (const option of request.options) {
@@ -400,9 +673,10 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     sync,
     stop,
     keydown,
+    byId,
+    forget,
+    reload,
     run: () => run,
     live: () => isLive(run),
-    render,
-    reveal,
   };
 }
