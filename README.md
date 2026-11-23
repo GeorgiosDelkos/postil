@@ -89,6 +89,13 @@ scripts/bundle.sh
 open target/release/Postil.app
 ```
 
+To build it and install it in `/Applications` (or `~/Applications` when `/Applications` is not
+writable), moving an older copy to the Trash:
+
+```sh
+scripts/install.sh
+```
+
 ## Agents
 
 Postil talks to any agent that speaks ACP over stdio. It detects these on the `PATH` and lists
@@ -112,6 +119,7 @@ own: if a run fails at start, run the agent's command in a terminal once.
 | -------------------- | --------------------------------------------------------- |
 | `Cmd-O`              | Open a folder                                             |
 | `Cmd-P`              | Find a file                                               |
+| `Cmd-\`              | Focus mode: the code alone, centered                      |
 | `c`                  | Write a note on the selected lines                        |
 | `Cmd-Enter`          | Save a note; in a dialog, send it or save the edit        |
 | `Cmd-Shift-Enter`    | Open the send step; press again to send                   |
@@ -184,6 +192,7 @@ Read it before a change of any size.
 | `ui/`                  | The page: plain HTML, CSS and JavaScript modules, no build step    |
 | `tests/`               | The fake ACP agent and the command-line and page tests             |
 | `scripts/bundle.sh`    | Builds `Postil.app`                                                |
+| `scripts/install.sh`   | Builds `Postil.app` and installs it in `/Applications`             |
 
 ## License
 

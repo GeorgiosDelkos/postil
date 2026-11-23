@@ -79,8 +79,9 @@ Rules for this app:
 - **Code is the largest and brightest thing on screen.** Chrome text is dimmer than code text.
 - **Two themes at launch:** Graphite (dark, default) and Paper (light). Each is a small palette
   of named colors, as in Herdr; a third theme is a new palette, not new code.
-- **Focus mode.** `Cmd-\` hides both side panes. The code column centers at a readable width and
-  a single pill in the corner carries the note count and the send action.
+- **Focus mode.** `Cmd-\` (View > Focus Mode) hides both side panes. The code column centers at a
+  readable width (at most 1100 px) and a single pill in the corner carries the open notes'
+  count and Send, which leaves focus mode for the send step. Built in milestone 5.
 - **Fonts are bundled** (Geist, Geist Mono; SIL Open Font License). Bundling skips the system
   font scan at startup and makes the app look the same on every machine.
 
@@ -716,7 +717,10 @@ retired; the measured numbers above are the baseline to not regress.
    their actions; and `scripts/bundle.sh`, which wraps the release binary in `Postil.app` with the icon (a white
    P on black, drawn by `assets/make-icon.swift`). The Dock, Finder and Cmd-Tab show the icon
    only for the bundle, since macOS reads it from `Info.plist`; `cargo run` shows the generic
-   one. Not yet: signing, notarizing, or installing into `/Applications`.
+   one. `scripts/install.sh` builds the bundle and installs it in `/Applications` (or
+   `~/Applications` when that is not writable), moving an older copy to the Trash. Focus mode
+   is built. Not yet: signing and notarizing, which need the owner's Apple Developer ID, and
+   motion.
 
 ## Testing
 

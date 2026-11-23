@@ -17,16 +17,18 @@ pub(crate) enum Command {
     CloseWindow,
     Settings,
     Quit,
+    FocusMode,
 }
 
 impl Command {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
         Self::CloseWindow,
         Self::Settings,
         Self::Quit,
+        Self::FocusMode,
     ];
 
     /// The menu item's id, which is also the name `window.postil.menu` takes in `ui/app.js`.
@@ -38,6 +40,7 @@ impl Command {
             Self::CloseWindow => "close-window",
             Self::Settings => "settings",
             Self::Quit => "quit",
+            Self::FocusMode => "focus-mode",
         }
     }
 
@@ -117,7 +120,15 @@ fn build() -> muda::Result<Menu> {
             &PredefinedMenuItem::select_all(None),
         ],
     )?;
-    let view = Submenu::with_items("View", true, &[&PredefinedMenuItem::fullscreen(None)])?;
+    let view = Submenu::with_items(
+        "View",
+        true,
+        &[
+            &Command::FocusMode.item("Focus Mode", command(Code::Backslash)),
+            &separator(),
+            &PredefinedMenuItem::fullscreen(None),
+        ],
+    )?;
     let window = Submenu::with_items(
         "Window",
         true,
