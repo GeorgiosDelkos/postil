@@ -2216,6 +2216,41 @@ mod tests {
         assert_eq!(info["bench"], serde_json::Value::Null);
     }
 
+    #[test]
+    fn repo_leaves_out_repositories_inside_it_untracked_or_submodules() {
+        let repo = TempRepo::new("list-nested");
+        repo.write("a.txt", "a\n");
+        repo.git(&["init", "--quiet", "nested"]);
+        repo.write("nested/n.txt", "n\n");
+        // A submodule as the index records it: a gitlink, mode 160000, naming a commit of the
+        // other repository (any id will do; nothing here reads it).
+        fs::create_dir(repo.root.join("sub")).unwrap();
+        let gitlink = format!("160000,{},sub", "1".repeat(40));
+        repo.git(&["update-index", "--add", "--cacheinfo", &gitlink]);
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["a.txt"]));
+    }
+
+    #[test]
+    fn a_repository_whose_path_holds_a_newline_opens() {
+        let probe = std::env::temp_dir().join(format!("postil-{}-probe\n", std::process::id()));
+        if let Err(error) = fs::create_dir(&probe) {
+            eprintln!("skipped: this filesystem refuses a newline in a name ({error})");
+            return;
+        }
+        fs::remove_dir(&probe).unwrap();
+        let repo = TempRepo::new("line\nbreak");
+        repo.write("src/a.rs", "fn a() {}\n");
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["src/a.rs"]));
+        let name = format!("postil-{}-line\nbreak", std::process::id());
+        assert_eq!(info["name"], name);
+    }
+
     /// A plain folder in the temporary directory, outside any repository.
     fn plain_folder(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("postil-{}-plain-{name}", std::process::id()));

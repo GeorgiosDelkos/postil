@@ -4,8 +4,10 @@
 //! working tree and the diffs between them, and `git` already knows the ignore rules.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,10 +52,10 @@ impl Repo {
                 path: dir.to_owned(),
             });
         }
-        // git prints one line per option, in the order asked.
-        let args = ["rev-parse", "--show-toplevel", "--absolute-git-dir"];
-        let paths = match git(dir, &args) {
-            Ok(paths) => paths,
+        // One option per call: git ends each path with a newline, which a path can also hold,
+        // so two paths in one output could not be told apart.
+        let root = match rev_parse_path(dir, "--show-toplevel") {
+            Ok(root) => root,
             // `git` runs in the C locale (see `git`), so this message is stable. A folder
             // that has a `.git` of its own is a broken repository (a linked worktree whose
             // git directory is gone, say), not a plain folder: `git init` there would be
@@ -72,18 +74,10 @@ impl Repo {
             }
             Err(error) => return Err(error),
         };
-        let mut paths = paths.lines();
-        let (Some(root), Some(git_dir)) = (paths.next(), paths.next()) else {
-            return Err(Error::Git {
-                command: args.join(" "),
-                // git exited successfully and wrote nothing to stderr; this field then says
-                // what was wrong with its output instead.
-                stderr: "(no error output, but fewer than two lines on stdout)".to_owned(),
-            });
-        };
+        let git_dir = rev_parse_path(dir, "--absolute-git-dir")?;
         Ok(Self {
-            root: PathBuf::from(root),
-            git_dir: PathBuf::from(git_dir),
+            root,
+            git_dir,
             snapshotting: Mutex::new(()),
             #[cfg(test)]
             copies: AtomicU64::new(0),
@@ -146,19 +140,38 @@ impl Repo {
     }
 
     /// Every tracked file and every untracked file that is not ignored, sorted, relative to
-    /// the root.
+    /// the root. Repositories inside the working tree are left out, a submodule as well as an
+    /// untracked one: they are directories, not files to open, and their files are not this
+    /// repository's.
     pub(crate) fn files(&self) -> Result<Vec<String>> {
-        let listing = git(
+        let tracked_args = ["ls-files", "-z", "--stage"];
+        let tracked = git(&self.root, &tracked_args)?;
+        let mut files = Vec::new();
+        for entry in tracked.split_terminator('\0') {
+            // `<mode> <object> <stage>\t<path>`; a submodule is mode 160000, a gitlink.
+            let Some((fields, path)) = entry.split_once('\t') else {
+                return Err(Error::Git {
+                    command: tracked_args.join(" "),
+                    // git exited successfully and wrote nothing to stderr; this field then
+                    // says what was wrong with its output instead.
+                    stderr: format!("(no error output, but an entry without a tab: {entry:?})"),
+                });
+            };
+            if !fields.starts_with("160000 ") {
+                files.push(path.to_owned());
+            }
+        }
+        let untracked = git(
             &self.root,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
+            &["ls-files", "-z", "--others", "--exclude-standard"],
         )?;
-        let mut files: Vec<String> = listing.split_terminator('\0').map(str::to_owned).collect();
+        // git lists an untracked repository as its directory, with a trailing slash.
+        files.extend(
+            untracked
+                .split_terminator('\0')
+                .filter(|path| !path.ends_with('/'))
+                .map(str::to_owned),
+        );
         files.sort_unstable();
         // During a merge conflict git lists a conflicted path once per stage.
         files.dedup();
@@ -345,9 +358,32 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     run_git(dir, None, args)
 }
 
+/// Runs `git rev-parse <option>` in `dir` and returns the one path it prints, byte for byte:
+/// a path may hold a newline, or bytes that are not UTF-8.
+fn rev_parse_path(dir: &Path, option: &str) -> Result<PathBuf> {
+    let mut path = run_git_bytes(dir, None, &["rev-parse", option])?;
+    // git ends the path with one newline; any other newline is part of the path.
+    if path.pop() != Some(b'\n') || path.is_empty() {
+        return Err(Error::Git {
+            command: format!("rev-parse {option}"),
+            // git exited successfully and wrote nothing to stderr; this field then says what
+            // was wrong with its output instead.
+            stderr: "(no error output, but no path on stdout)".to_owned(),
+        });
+    }
+    Ok(PathBuf::from(OsString::from_vec(path)))
+}
+
 /// Runs `git` in `dir`, with `index` as its index file when given, and returns what it
 /// printed.
 fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+    // A file name that is not UTF-8 is shown with replacement characters and then fails to
+    // open. Accepted: the page and its JSON are UTF-8, so such a name cannot round-trip.
+    run_git_bytes(dir, index, args).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// [`run_git`], returning the bytes git printed.
+fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -374,7 +410,5 @@ fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
         });
     }
 
-    // A file name that is not UTF-8 is shown with replacement characters and then fails to
-    // open. Accepted: the page and its JSON are UTF-8, so such a name cannot round-trip.
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
