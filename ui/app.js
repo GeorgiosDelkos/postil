@@ -295,7 +295,9 @@ function showFile(path, reply, { keepView }) {
   }
 
   indexNotes();
-  renderHeader(path);
+  // The changes view holds the header while it is open over the file; a refresh of the file
+  // under it (on focus, or as a run moves on) leaves the header alone.
+  if (!changes.isOpen()) renderHeader(path);
   revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });

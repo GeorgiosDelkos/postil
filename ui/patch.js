@@ -24,8 +24,8 @@ export function parsePatch(patch) {
       if (line.startsWith("new file mode")) file.status = "added";
       else if (line.startsWith("deleted file mode")) file.status = "deleted";
       else if (line.startsWith("Binary files ")) file.binary = true;
-      else if (line.startsWith("+++ b/")) file.path = line.slice("+++ b/".length);
-      else if (line.startsWith("--- a/") && file.status === "deleted") file.path = line.slice("--- a/".length);
+      else if (line.startsWith("+++ ") && line !== "+++ /dev/null") file.path = sidePath(line.slice(4), "b/");
+      else if (line.startsWith("--- ") && file.status === "deleted") file.path = sidePath(line.slice(4), "a/");
     }
     const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
     if (header) {
@@ -52,11 +52,54 @@ export function parsePatch(patch) {
 }
 
 // The path a `diff --git a/x b/x` line names: its second half. Renames are off (`--no-renames`),
-// so both halves name the same file; a path with spaces keeps them.
+// so both halves name the same file; a path with spaces keeps them. A path git quotes (one
+// with a control character, a quote or a backslash: src/repo.rs turns quoting of other bytes
+// off) is quoted in both halves.
 function pathOf(line) {
-  const rest = line.slice("diff --git a/".length);
-  const half = (rest.length - " b/".length) / 2;
-  return rest.slice(half + " b/".length);
+  const rest = line.slice("diff --git ".length);
+  if (rest.startsWith('"')) {
+    const second = rest.slice(quotedEnd(rest) + 1).trimStart();
+    return sidePath(second, "b/");
+  }
+  const half = (rest.length - " ".length) / 2;
+  return rest.slice(half + " ".length + "b/".length);
+}
+
+// A side's path from `a/x`, `b/x` or a quoted `"b/x"`, without its prefix.
+function sidePath(text, prefix) {
+  const path = unquote(text);
+  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+}
+
+// The index just past the closing quote of the quoted string `text` starts with.
+function quotedEnd(text) {
+  let index = 1;
+  while (index < text.length && text[index] !== '"') index += text[index] === "\\" ? 2 : 1;
+  return index;
+}
+
+// A path as git quotes it: in double quotes, with C escapes and octal bytes of UTF-8. Text
+// that does not start with a quote is returned as it is.
+export function unquote(text) {
+  if (!text.startsWith('"')) return text;
+  const escapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 };
+  const bytes = [];
+  const encoder = new TextEncoder();
+  const end = quotedEnd(text);
+  for (let index = 1; index < end; index += 1) {
+    const char = text[index];
+    if (char !== "\\") {
+      bytes.push(...encoder.encode(char));
+      continue;
+    }
+    index += 1;
+    const next = text[index];
+    if (/[0-7]/.test(next)) {
+      bytes.push(Number.parseInt(text.slice(index, index + 3), 8));
+      index += 2;
+    } else bytes.push(escapes[next] ?? next.charCodeAt(0));
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
 }
 
 // Where each of `notes` shows in `file`'s hunks: a map from the new-side line a note's lines

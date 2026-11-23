@@ -4078,7 +4078,7 @@ mod tests {
         let log = header("R5").replace(r#""version":1"#, r#""version":4"#);
         fs::write(
             runs.join("R5.jsonl"),
-            format!("{log}\n{{\"kind\":\"snapshot\",\"tree\":{tree}}}\n"),
+            format!("{log}\n{{\"kind\":\"snapshot\",\"point\":\"before\",\"tree\":{tree}}}\n"),
         )
         .unwrap();
         repo.write("a.txt", "now\n");
@@ -4090,17 +4090,30 @@ mod tests {
 
         let old = header("R4").replace(r#""version":1"#, r#""version":3"#);
         fs::write(runs.join("R4.jsonl"), format!("{old}\n")).unwrap();
-        // A tree id is passed to git, so one edited into an option is refused.
+        let blank = header("R7").replace(r#""version":1"#, r#""version":4"#);
+        fs::write(
+            runs.join("R7.jsonl"),
+            format!("{blank}\n{{\"kind\":\"snapshot\",\"point\":\"before\",\"tree\":\"\"}}\n"),
+        )
+        .unwrap();
+        // A tree id is passed to git, so one edited into an option is refused, and so is none.
         let edited = header("R6").replace(r#""version":1"#, r#""version":4"#);
         fs::write(
             runs.join("R6.jsonl"),
-            format!("{edited}\n{{\"kind\":\"snapshot\",\"tree\":\"--output=x\"}}\n"),
+            format!(
+                "{edited}\n{{\"kind\":\"snapshot\",\"point\":\"before\",\"tree\":\"--output=x\"}}\n"
+            ),
         )
         .unwrap();
         for (query, status, why) in [
             ("from=R4", StatusCode::BAD_REQUEST, "R4 has no snapshot"),
             (
                 "from=R6",
+                StatusCode::BAD_REQUEST,
+                "expected a git object id",
+            ),
+            (
+                "from=R7",
                 StatusCode::BAD_REQUEST,
                 "expected a git object id",
             ),
@@ -4118,6 +4131,34 @@ mod tests {
         }
         let (status, _) = post(&site, &format!("{RUN}/changes?from=R1"), "");
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_taken_is_the_run_s_problem_and_the_run_goes_on() {
+        let repo = TempRepo::new("run-no-snapshot");
+        repo.write("a.txt", "a\n");
+        repo.git(&["add", "a.txt"]);
+        let index = repo.root.join(".git/index");
+        // The first snapshot starts from a copy of the real index, which cannot be read.
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let ended = wait_for(&site, &nudges, "ended");
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+        let problem = ended["problem"].as_str().unwrap_or_default();
+        assert!(
+            problem.contains("no snapshot of the files was taken"),
+            "{ended}"
+        );
+        assert!(problem.contains("postil-snapshot.index"), "{problem}");
+        assert!(
+            kinds(&ended).contains(&"message:prompt 1".to_owned()),
+            "{ended}"
+        );
+        let (status, body) = get(&site, &format!("{RUN}/changes?from=R1"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("R1 has no snapshot from before it"), "{body}");
     }
 
     #[test]
@@ -4584,6 +4625,9 @@ mod tests {
             .clone();
         let error = last["error"].as_str().unwrap();
         assert!(error.contains("did not stop when asked"), "{error}");
+        // Its exit is not reported, so the forced stop takes the snapshot after it.
+        let changes = get_json(&site, &format!("{RUN}/changes?from=R1"));
+        assert!(changes["after"].is_string(), "{changes}");
 
         // The working tree is free again, with a new agent: its first prompt.
         let (status, body) = send(&site, &["N1"]);

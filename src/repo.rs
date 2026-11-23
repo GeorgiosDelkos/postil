@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, Result};
 
@@ -19,6 +19,9 @@ pub(crate) struct Repo {
     /// This working tree's git directory: `.git`, or `.git/worktrees/<name>` for a linked
     /// worktree, so each worktree keeps its own notes.
     git_dir: PathBuf,
+    /// Held while a snapshot writes its index ([`Repo::snapshot`]): a run's snapshot and the
+    /// changes view's may come at once.
+    snapshotting: Mutex<()>,
 }
 
 impl Repo {
@@ -75,6 +78,7 @@ impl Repo {
         Ok(Self {
             root: PathBuf::from(root),
             git_dir: PathBuf::from(git_dir),
+            snapshotting: Mutex::new(()),
         })
     }
 
@@ -153,44 +157,48 @@ impl Repo {
     /// after it, and the changes view shows the diff between them (docs/design.md, "The
     /// changes view").
     ///
-    /// The tree is written through a temporary index, a copy of the real one so git can skip
-    /// files whose stat data did not change: the engineer's index, branch and stash are left
-    /// as they are. The tree and its blobs are objects no ref holds, so `git gc` may prune
-    /// them once they are older than its prune period (two weeks by default).
+    /// The tree is written through an index of Postil's own, `<git dir>/postil-snapshot.index`
+    /// beside the real one, so the engineer's index, branch and stash are left as they are. It is kept between
+    /// snapshots: git hashes again only the files whose stat data changed since the last one,
+    /// untracked files included. The first snapshot starts from a copy of the real index, so
+    /// only untracked files are hashed in full then. `git add` runs the repository's clean
+    /// filters (git-lfs copies a changed file into `.git/lfs`). The tree and its blobs are
+    /// objects no ref holds, so `git gc` may prune them once they are older than its prune
+    /// period (two weeks by default). Two windows snapshotting one working tree at the same
+    /// moment meet on git's lock of that index, and the second fails.
     ///
     /// # Errors
     ///
-    /// [`Error::WriteSnapshot`] when the temporary index cannot be made, and the git errors.
+    /// [`Error::WriteSnapshot`] when the index cannot be made, and the git errors.
     pub(crate) fn snapshot(&self) -> Result<String> {
-        // Each snapshot has an index of its own: two windows, or two runs' snapshots, may
-        // overlap. It lives in the system's temporary directory, not the git directory, so a
-        // snapshot needs no write access there beyond the objects git adds.
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let index = std::env::temp_dir().join(format!(
-            "postil-snapshot-{}-{}.index",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let _writing = self
+            .snapshotting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let index = self.git_dir.join("postil-snapshot.index");
         let failed = |source| Error::WriteSnapshot {
             path: index.clone(),
             source,
         };
-        match fs::copy(self.git_dir.join("index"), &index) {
-            Ok(_) => {}
-            // A repository with nothing staged yet has no index: git starts an empty one.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(failed(error)),
+        if !index.exists() {
+            match fs::copy(self.git_dir.join("index"), &index) {
+                Ok(_) => {}
+                // A repository with nothing staged yet has no index: git starts an empty one.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(failed(error)),
+            }
         }
-        let tree = run_git(&self.root, Some(&index), &["add", "--all"])
-            .and_then(|_| run_git(&self.root, Some(&index), &["write-tree"]));
-        // A leftover index is only a stray file; the snapshot is what matters.
-        drop(fs::remove_file(&index));
-        Ok(tree?.trim_end().to_owned())
+        run_git(&self.root, Some(&index), &["add", "--all"])?;
+        let tree = run_git(&self.root, Some(&index), &["write-tree"])?;
+        Ok(tree.trim_end().to_owned())
     }
 
     /// The changes from snapshot `before` to snapshot `after` ([`Repo::snapshot`]), as
     /// `git diff` prints them: a unified diff with three lines of context, renames shown as a
-    /// removal and an addition.
+    /// removal and an addition, paths after `a/` and `b/`. The options and settings given
+    /// fix the format whatever the engineer's git config says (`ui/patch.js` reads it):
+    /// prefixes, quoting only of paths with control characters, quotes or backslashes, blank
+    /// context lines kept, and no textconv drivers, whose text would not match the files.
     ///
     /// # Errors
     ///
@@ -199,7 +207,7 @@ impl Repo {
     /// `git gc` pruned.
     pub(crate) fn diff(&self, before: &str, after: &str) -> Result<String> {
         for id in [before, after] {
-            if id.len() < 4 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(Error::BadRequest(format!(
                     "snapshot {id:?}: expected a git object id"
                 )));
@@ -208,11 +216,18 @@ impl Repo {
         git(
             &self.root,
             &[
+                "-c",
+                "core.quotePath=false",
+                "-c",
+                "diff.suppressBlankEmpty=false",
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--no-renames",
                 "--unified=3",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 before,
                 after,
             ],

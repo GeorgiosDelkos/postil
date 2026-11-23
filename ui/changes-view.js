@@ -7,6 +7,11 @@
 
 import { notesByLine, parsePatch } from "./patch.js";
 
+// How many lines of one file are drawn before the rest waits for a click. Arbitrary: a few
+// screens of a review, well below the thousands a regenerated lockfile brings, each of which
+// is four elements.
+const LINES_SHOWN = 400;
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -69,7 +74,7 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     viewEl.replaceChildren(...parts);
   }
 
-  function fileView(file, all) {
+  function fileView(file, all, limit = LINES_SHOWN) {
     const part = el("section", "changes-file");
     const head = el("header", "changes-file-head");
     const status = { added: "new", deleted: "deleted", modified: "" }[file.status];
@@ -83,9 +88,14 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     }
     const placed = notesByLine(file, all);
     const rows = el("div", "changes-rows");
+    let drawn = 0;
+    const total = file.hunks.reduce((sum, hunk) => sum + hunk.lines.length, 0);
     for (const hunk of file.hunks) {
+      if (drawn >= limit) break;
       rows.append(el("div", "changes-hunk", hunk.header));
       for (const line of hunk.lines) {
+        if (drawn >= limit) break;
+        drawn += 1;
         rows.append(lineRow(file, line));
         if (line.new !== null && placed.has(line.new)) {
           const cards = el("div", "changes-notes");
@@ -95,6 +105,12 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
       }
     }
     part.append(rows);
+    if (drawn < total) {
+      const more = el("button", "button changes-more", `Show the other ${total - drawn} lines`);
+      more.type = "button";
+      more.addEventListener("click", () => part.replaceWith(fileView(file, all, Infinity)));
+      part.append(more);
+    }
     return part;
   }
 

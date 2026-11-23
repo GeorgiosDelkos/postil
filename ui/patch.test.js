@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { notesByLine, parsePatch } from "./patch.js";
+import { notesByLine, parsePatch, unquote } from "./patch.js";
 
 // As `git diff --no-color --no-renames --unified=3` printed it for two snapshots.
 const patch = `diff --git a/a.txt b/a.txt
@@ -54,6 +54,34 @@ test("a patch reads as files with their status, counts and numbered lines", () =
   assert.deepEqual(files[1].hunks[0].lines, [{ kind: "add", old: null, new: 1, text: "new" }], "the no-newline marker is not a line");
   assert.equal(files[3].hunks.length, 0);
   assert.deepEqual(parsePatch(""), []);
+});
+
+test("quoted paths are read back, and a second hunk numbers its lines from its header", () => {
+  const quoted = [
+    'diff --git "a/tab\\there.txt" "b/tab\\there.txt"',
+    "index 1..2 100644",
+    '--- "a/tab\\there.txt"',
+    '+++ "b/tab\\there.txt"',
+    "@@ -1,2 +1,2 @@",
+    " one",
+    "-two",
+    "+zwei",
+    "@@ -40,2 +40,3 @@ fn later() {",
+    " forty",
+    "+inserted",
+    " forty-one",
+    'diff --git "a/caf\\303\\251 \\"x\\".png" "b/caf\\303\\251 \\"x\\".png"',
+    "Binary files differ",
+    "",
+  ].join("\n");
+  const files = parsePatch(quoted);
+  assert.deepEqual(files.map((file) => file.path), ["tab\there.txt", 'café "x".png']);
+  assert.deepEqual(
+    files[0].hunks[1].lines.map((line) => [line.kind, line.old, line.new]),
+    [["context", 40, 40], ["add", null, 41], ["context", 41, 42]],
+  );
+  assert.equal(unquote("plain/path.rs"), "plain/path.rs");
+  assert.equal(unquote('"a\\\\b\\nc"'), "a\\b\nc");
 });
 
 test("a note shows at the changed line its lines end on, and only there", () => {

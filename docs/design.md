@@ -454,25 +454,33 @@ thread, changed (`ui/changes-view.js`, `GET /api/run/changes?from=R1&to=R3`). De
 owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per file.
 
 - **Snapshots.** Postil takes one before each run (before the agent gets the prompt) and one as
-  its turn ends, and logs each as a `snapshot` entry with the tree's id (`Repo::snapshot`, run
-  log version 4). A snapshot is every tracked file and every untracked file that is not
-  ignored, written as a tree through a temporary index: a copy of the real one, in the
-  system's temporary directory, so git skips the files whose stat data did not change. The
-  engineer's index, branch and stash are left alone. A snapshot that cannot be taken is the
-  run's problem, and the run goes on without a changes view.
+  its turn ends, and logs each as a `snapshot` entry with its point (`before`, `after`) and the
+  tree's id (`Repo::snapshot`, run log version 4). A proposing reviewer, which may not edit,
+  takes none. A snapshot is every tracked file and every untracked file that is not ignored,
+  written as a tree through Postil's own index, `<git dir>/postil-snapshot.index`, kept between
+  snapshots; the first starts from a copy of the real index. The engineer's index, branch and
+  stash are left alone. A snapshot that cannot be taken is the run's problem, and the run goes
+  on without a changes view.
 - **What it costs.** A snapshot runs `git add --all` and `git write-tree`, under the runner's
-  lock before the run and on the agent's reader thread after it: tens of milliseconds on a
-  medium repository, where only changed files are hashed. The trees and blobs are objects no
-  ref holds, so `git gc` may prune them after its prune period (two weeks by default); the
-  view then reports git's error.
+  lock before the run (so on the window's thread, which waits) and on the agent's reader
+  thread after it. git hashes only the files whose stat data changed since the last snapshot:
+  tens of milliseconds on a medium repository. The first snapshot of a working tree hashes
+  every untracked file in full, which a reviewer measured at 3.5 s with a 200 MB untracked
+  file. `git add` runs the repository's clean filters, so git-lfs copies each changed file
+  into `.git/lfs`. The trees and blobs are objects no ref holds, so `git gc` may prune them
+  after its prune period (two weeks by default); the view then reports git's error.
 - **The diff** is `git diff` between the snapshot before the first run and the one after the
-  last, renames shown as a removal and an addition. A run with no snapshot after it (under
-  way, or forced to stop) is compared with the files as they are now, and the view says so.
-  Runs logged before snapshots have no Changes button.
+  last, renames shown as a removal and an addition. Its options fix the format whatever the
+  engineer's git config says (prefixes, path quoting, blank context lines, no textconv). A
+  run with no snapshot after it (under way, ended before the agent took the turn, or its
+  snapshot failed) is compared with the files as they are now, and the view says so. A forced
+  stop takes the snapshot after the agent is killed. Runs logged before snapshots have no
+  Changes button.
 - **The view** shows each file with its hunks and line numbers on both sides, and each note
   beside the changed line its lines end on. A click on a line number of the new side opens
   that file at that line with the composer: the next note goes on the change itself, and a
-  follow-up sends it. Esc, the header's esc, or opening a file gives the pane back.
+  follow-up sends it. A file draws its first 400 lines, and the rest on a click. Esc, the
+  header's esc, or opening a file gives the pane back.
 
 ### Cards and dialogs
 

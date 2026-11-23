@@ -3040,3 +3040,7 @@ button.changes-number:focus-visible {
   padding: 1px 8px;
   font-size: 11.5px;
 }
+
+.changes-more {
+  margin: 8px 12px 10px;
+}

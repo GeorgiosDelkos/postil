@@ -330,8 +330,8 @@ impl fmt::Display for Error {
             ),
             Self::WriteSnapshot { path, .. } => write!(
                 f,
-                "cannot take a snapshot of the working tree through {} (check that the \
-                 temporary directory is writable)",
+                "cannot take a snapshot of the working tree through {} (check that the git \
+                 directory is writable)",
                 path.display()
             ),
             Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
