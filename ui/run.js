@@ -123,6 +123,23 @@ export function openPermission(items) {
 // Which key answers with which option: `a` allows once, `A` (Shift-a) always, `r` rejects.
 // "Always" is offered only when the agent offers it (docs/design.md, "ACP integration"); a
 // reject falls back to "reject always" when the agent offers no plain reject.
+// Whether the agent has not yet reported a tool call finished.
+export function underWay(tool) {
+  return tool.status === "pending" || tool.status === "in_progress";
+}
+
+// The permission key a keydown means: "a", "A" (Shift-a) or "r", or null. The character
+// decides, so every keyboard layout answers with the keys the buttons show, but its case does
+// not: with Caps Lock on, `a` types "A", which must not allow always; only Shift does. A held
+// key answers once.
+export function permissionKey(event) {
+  if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return null;
+  const key = event.key.toLowerCase();
+  if (key === "a") return event.shiftKey ? "A" : "a";
+  if (key === "r" && !event.shiftKey) return "r";
+  return null;
+}
+
 export function permissionKeys(options) {
   const first = (kind) => options.find((option) => option.kind === kind)?.id;
   const keys = new Map();
@@ -170,7 +187,7 @@ export function toolRow(tool, live) {
     const stats = diffStats(tool.output);
     state = stats ? `+${stats.added} -${stats.removed}` : "done";
   } else state = live ? "" : "unfinished";
-  const running = live && (tool.status === "pending" || tool.status === "in_progress");
+  const running = live && underWay(tool);
   return { verb, target, state, running };
 }
 

@@ -10,6 +10,7 @@ import {
   isLive,
   inline,
   keyFor,
+  permissionKey,
   markdownBlocks,
   openPermission,
   permissionKeys,
@@ -361,4 +362,18 @@ test("a one-line change in a large file is one line, and too many edits count as
     diffStats([{ type: "diff", path: "a", oldText: big.join("\n"), newText: other.join("\n") }]),
     { added: 2001, removed: 2001 },
   );
+});
+
+test("a permission key is read from the character, with only Shift making it upper case", () => {
+  const press = (key, more = {}) => permissionKey({ key, shiftKey: false, repeat: false, ...more });
+  assert.equal(press("a"), "a");
+  assert.equal(press("A", { shiftKey: true }), "A");
+  assert.equal(press("A"), "a", "Caps Lock alone does not allow always");
+  assert.equal(press("r"), "r");
+  assert.equal(press("R", { shiftKey: true }), null, "Shift-r answers nothing");
+  assert.equal(press("a", { repeat: true }), null, "a held key answers once");
+  assert.equal(press("a", { metaKey: true }), null, "a shortcut is not an answer");
+  // On AZERTY the key labelled A sends code KeyQ and key "a": it answers as its label says.
+  assert.equal(press("a", { code: "KeyQ" }), "a");
+  assert.equal(press("q", { code: "KeyA" }), null);
 });

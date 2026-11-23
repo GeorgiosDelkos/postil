@@ -13,9 +13,11 @@ import {
   markdownBlocks,
   openPermission,
   partLines,
+  permissionKey,
   permissionKeys,
   statusLine,
   toolRow,
+  underWay,
 } from "./run.js";
 
 function el(tag, className, text) {
@@ -39,10 +41,18 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
   let views = new Map();
   let drawnRun = null;
-  // Whether the panel follows the end of the run: true until the engineer scrolls up.
+  // Whether the panel follows the end of the run: true until the engineer scrolls up, and
+  // again once they scroll back to the end. Scrolling up is read as any move above where
+  // `reveal` last put the panel, not as a distance from the end: a slow trackpad scroll moves
+  // a few px at a time, and a render between two of its events would scroll it back down.
   let follow = true;
+  let revealedTop = 0;
+  // How long to wait before fetching again after a failed fetch: doubled each failure.
+  let retryIn = 1000;
   panelEl.addEventListener("scroll", () => {
-    if (panelEl.clientHeight > 0) follow = atEnd();
+    if (panelEl.clientHeight === 0) return;
+    if (atEnd()) follow = true;
+    else if (panelEl.scrollTop < revealedTop) follow = false;
   });
 
   async function fetchRun() {
@@ -75,10 +85,13 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
         render();
         onChange(run, previous);
       } while (again);
+      retryIn = 1000;
     } catch (error) {
       onError(String(error.message ?? error));
-      // A change that arrived during the failed fetch is fetched once more.
-      if (again) setTimeout(sync, 1000);
+      // The nudge behind the failed fetch may have been the run's last, so the fetch is
+      // tried again, less often each time it fails.
+      setTimeout(sync, retryIn);
+      retryIn = Math.min(retryIn * 2, 30000);
     } finally {
       fetching = false;
     }
@@ -108,15 +121,13 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     );
   }
 
-  // `a`, Shift-`a` and `r` answer the open permission request. Returns whether the key was
-  // used. The physical key decides, not the character: with Caps Lock on, `a` types "A",
-  // which must not allow always. A held key answers once.
+  // `a`, Shift-`a` and `r` answer the open permission request (`permissionKey`). Returns
+  // whether the key was used.
   function keydown(event) {
-    if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return false;
+    const key = permissionKey(event);
+    if (!key) return false;
     const request = run && openPermission(foldRun(run.entries).items);
     if (!request) return false;
-    const key = { KeyA: event.shiftKey ? "A" : "a", KeyR: event.shiftKey ? null : "r" }[event.code];
-    if (!key) return false;
     const option = permissionKeys(request.options).get(key);
     if (option === undefined) return false;
     event.preventDefault();
@@ -125,38 +136,39 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   }
 
   function render() {
+    if (drawnRun !== (run?.id ?? null)) {
+      views = new Map();
+      drawnRun = run?.id ?? null;
+      follow = true;
+      forceAt = null;
+    }
     renderStatus();
     renderHeader();
     if (!run) {
       panelEl.replaceChildren(el("div", "empty", "No run yet. Send notes to an agent to start one."));
       return;
     }
-    if (drawnRun !== run.id) {
-      views = new Map();
-      drawnRun = run.id;
-      follow = true;
-    }
     const { plan, items } = foldRun(run.entries);
     const live = isLive(run);
     const wanted = [];
-    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), () => planView(plan)]);
+    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), null, () => planView(plan)]);
     items.forEach((item, index) => {
-      wanted.push([itemKey(item, index), signature(item, live), () => itemView(item)]);
+      wanted.push([itemKey(item, index), signature(item, live), item.output, (open) => itemView(item, open)]);
     });
-    if (run.problem) wanted.push(["problem", run.problem, () => el("div", "run-notice", run.problem)]);
+    if (run.problem) wanted.push(["problem", run.problem, null, () => el("div", "run-notice", run.problem)]);
     if (wanted.length === 0) {
-      wanted.push(["empty", statusLine(run).text, () => el("div", "empty", statusLine(run).text)]);
+      wanted.push(["empty", statusLine(run).text, null, () => el("div", "empty", statusLine(run).text)]);
     }
 
     const next = new Map();
-    const nodes = wanted.map(([key, sig, build]) => {
+    // `data` is the object the signature leaves out, compared by identity: a tool's output,
+    // which an update replaces whole and entries keep from one fetch to the next.
+    const nodes = wanted.map(([key, sig, data, build]) => {
       const drawn = views.get(key);
-      const node = drawn?.sig === sig ? drawn.node : build();
-      // A redrawn details element opens as the one it replaces was.
-      if (drawn && drawn.node !== node && drawn.node.open && node.tagName === "DETAILS") {
-        node.open = true;
-      }
-      next.set(key, { sig, node });
+      const same = drawn?.sig === sig && drawn.data === data;
+      // A redrawn tool opens, filled at once, as the one it replaces was.
+      const node = same ? drawn.node : build(drawn?.node.open === true);
+      next.set(key, { sig, data, node });
       return node;
     });
     views = next;
@@ -171,7 +183,9 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   // Scrolls to the end while the panel follows it. Measured only while the panel shows: a
   // hidden panel has no height, and would read as both at the end and scrolled to the top.
   function reveal() {
-    if (follow && panelEl.clientHeight > 0) panelEl.scrollTop = panelEl.scrollHeight;
+    if (!follow || panelEl.clientHeight === 0) return;
+    panelEl.scrollTop = panelEl.scrollHeight;
+    revealedTop = panelEl.scrollTop;
   }
 
   function atEnd() {
@@ -188,7 +202,9 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   function signature(item, live) {
     switch (item.type) {
       case "tool":
-        return JSON.stringify([item.title, item.tool, item.status, item.places, item.output.length, live]);
+        // `live` only changes how a call still under way is drawn, so a run's end leaves the
+        // finished ones, and any text selected in them, alone.
+        return JSON.stringify([item.title, item.tool, item.status, item.places, underWay(item) && live]);
       case "permission":
         return JSON.stringify([item.title, item.answer ?? "open"]);
       default:
@@ -220,12 +236,12 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     const title = el("span", "run-title");
     title.append(el("strong", "", run.agent), " · ", time);
     const parts = [title];
+    if (!isLive(run) || run.status !== "cancelling") forceAt = null;
     if (isLive(run)) {
       const stopping = run.status === "cancelling";
       // The Rust process says how long until it would force the agent, so a reloaded page
       // offers Force stop as soon as the process would act on it.
-      if (!stopping) forceAt = null;
-      else forceAt ??= Date.now() + (run.forceIn ?? 0);
+      if (stopping) forceAt ??= Date.now() + (run.forceIn ?? 0);
       const button = el("button", "button stop");
       button.type = "button";
       const label = () => {
@@ -261,17 +277,19 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     return view;
   }
 
-  function itemView(item) {
+  // `open`: an expandable item is drawn open, as the node it replaces was.
+  function itemView(item, open) {
     switch (item.type) {
       case "message":
         return markdownView(item.text);
       case "thought": {
         const details = el("details", "run-thought");
         details.append(el("summary", "", "Thinking"), el("div", "", item.text.trim()));
+        details.open = open;
         return details;
       }
       case "tool":
-        return toolView(item);
+        return toolView(item, open);
       case "permission":
         return permissionView(item);
       case "error":
@@ -304,7 +322,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     return node;
   }
 
-  function toolView(tool) {
+  // `open`: the tool is drawn open, with its output, as the node it replaces was.
+  function toolView(tool, open) {
     const row = toolRow(tool, isLive(run));
     const diffs = tool.output.filter((part) => part.type === "diff");
     const texts = tool.output.filter((part) => part.type === "text");
@@ -324,12 +343,19 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     summary.append(line);
     details.append(summary);
     let built = false;
-    details.addEventListener("toggle", () => {
-      if (!details.open || built) return;
+    const fill = () => {
+      if (built) return;
       built = true;
       for (const diff of diffs) details.append(diffView(diff));
       for (const text of texts) details.append(el("pre", "tool-output", text.text));
+    };
+    details.addEventListener("toggle", () => {
+      if (details.open) fill();
     });
+    if (open) {
+      fill();
+      details.open = true;
+    }
     return details;
   }
 

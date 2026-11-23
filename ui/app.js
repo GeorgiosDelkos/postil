@@ -840,15 +840,24 @@ async function saveNote(composer) {
 }
 
 // The reply to `api/notes`: { ok, body }, the body the notes or the reason they failed.
+// Every notes reply is numbered as it is asked for, and one older than a reply already shown
+// is dropped: a run's updates read the notes again and again, and an older file must not be
+// painted over a newer one.
+let notesAsked = 0;
+let notesShown = 0;
+
 async function fetchNotes() {
+  const number = ++notesAsked;
   const response = await fetch("api/notes");
   const body = response.ok ? (await response.json()).notes : await response.text();
-  return { ok: response.ok, body };
+  return { ok: response.ok, body, number };
 }
 
 // Takes a reply of `fetchNotes`. A failure (an unreadable review file) is shown in the tray,
 // and the notes drawn so far stay.
 function applyNotes(reply) {
+  if (reply.number < notesShown) return false;
+  notesShown = reply.number;
   if (reply.ok) state.notes = reply.body;
   else notesEl.replaceChildren(el("div", "empty", reply.body));
   return reply.ok;
@@ -1006,8 +1015,6 @@ function deleteButton(item, note) {
 }
 
 async function deleteNote(note) {
-  // A deleted note leaves the send it was ticked in.
-  state.send?.ticked.delete(note.id);
   const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
     method: "DELETE",
   });
@@ -1229,9 +1236,13 @@ function followRun(run, previous) {
   // (docs/design.md, "Working with the repository").
   if (!fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run))) {
     refresh().catch((error) => showToast(String(error)));
-  } else if (run.notes.some((id) => state.notes.find((note) => note.id === id && isOpen(note)))) {
+  } else if (
+    !run.problem &&
+    run.notes.some((id) => state.notes.find((note) => note.id === id && isOpen(note)))
+  ) {
     // Its notes are marked sent once the agent takes the turn, which is no status change and
-    // no edit: read them until they show it.
+    // no edit: read them until they show it. A run whose notes could not be marked says so
+    // in `problem`, and they are not read on every update after that.
     loadNotes().catch((error) => showToast(String(error)));
   }
   renderSendBar();
