@@ -5,13 +5,17 @@ import {
   agentSaid,
   fileStats,
   groupNotes,
+  noteDialogKey,
   noteHistory,
   noteStatus,
   planProgress,
   runStatus,
+  replyText,
+  reviewKey,
   reviewOf,
   latestOfThreads,
   runOf,
+  threadKey,
   threadOf,
 } from "./status.js";
 
@@ -198,4 +202,62 @@ test("a run's latest review: its stages, findings, and the judge's verdict on ea
 
   const unreadable = stage("R6", 1, 1, "ended", [{ kind: "findings", findings: [], problem: "no block" }]);
   assert.deepEqual(reviewOf("R1", [unreadable]).problems, ["R6: no block"]);
+});
+
+// `total` is set as the Rust process sets it (src/run.rs, `RunView`): a key that read it
+// would change on every entry.
+const streaming = (id, status, entries, extra = {}) => ({
+  ...run(id, status, entries, ["N1"]),
+  agent: "Claude",
+  total: entries.length,
+  ...extra,
+});
+
+test("the note dialog keeps its key while its run streams what the dialog does not show", () => {
+  const note = sent("N1", "R1");
+  const shown = [true, "Claude", ["Codex"], true];
+  const key = (entries, status = "running", review = null) =>
+    noteDialogKey(note, streaming("R1", status, entries), review, shown);
+  const start = [said("Looking at it")];
+  const drawn = key(start);
+  assert.equal(key([...start, said(" and more")]), drawn, "a token of the reply");
+  assert.equal(key([...start, { kind: "thought", text: "hm" }]), drawn, "a thought");
+  assert.equal(key([...start, tool("t1", "read", "b.rs")]), drawn, "a tool call on another file");
+  assert.notEqual(key([...start, tool("t1", "edit", "a.rs")]), drawn, "its file's history grows");
+  assert.notEqual(key([...start, said("\nN1: fixed")]), drawn, "the agent's line about it");
+  assert.notEqual(key(start, "waiting"), drawn, "the run's status");
+
+  const stage = (entries) =>
+    streaming("R2", "running", entries, { review: { of: "R1", reviewer: 1, reviewers: 1 } });
+  const reviewed = (entries) => key(start, "running", reviewOf("R1", [stage(entries)]));
+  assert.equal(reviewed([said("reading")]), reviewed([said("reading"), said(" on")]), "a reviewer's token");
+});
+
+test("a judge writing its line changes the verdict's word only for the run dialog", () => {
+  const stage = (id, reviewer, entries) =>
+    streaming(id, "running", entries, { review: { of: "R1", reviewer, reviewers: 2 } });
+  const finding = { id: "F1", note: "N1", path: "a.rs", line: 1, text: "too short", fix: null };
+  const proposer = { ...stage("R2", 1, [{ kind: "findings", findings: [finding], problem: null }]), status: "ended" };
+  const review = (line) => reviewOf("R1", [proposer, stage("R3", 2, [said(line)])]);
+  const writing = review("F1: accepted - bec");
+  const more = review("F1: accepted - because it");
+  assert.deepEqual(reviewKey(more), reviewKey(writing), "the run dialog shows only the word");
+  assert.notDeepEqual(reviewKey(review("F1: rejected - no")), reviewKey(writing), "a new word");
+  const noteKey = (judged) => noteDialogKey(sent("N1", "R1"), streaming("R1", "ended", []), judged, []);
+  assert.notEqual(noteKey(more), noteKey(writing), "the note dialog shows the judge's line");
+});
+
+test("the run dialog keeps its key while the agent streams its reply and thoughts", () => {
+  const thought = (text) => ({ kind: "thought", text });
+  const edit = tool("t1", "edit", "a.rs", [], "in_progress");
+  const start = [thought("Reading"), edit, said("Done")];
+  const key = (entries, status = "running") => threadKey([streaming("R1", status, entries)]);
+  const drawn = key(start);
+  assert.equal(key([...start, said(" with it")]), drawn, "a token of the reply");
+  assert.equal(key([thought("Reading a.rs"), edit, said("Done")]), drawn, "a token of a thought");
+  assert.notEqual(key([...start, { ...edit, status: "completed" }]), drawn, "a step's card changes");
+  assert.notEqual(key([...start, thought("Then")]), drawn, "a new step");
+  assert.notEqual(key(start, "cancelling"), drawn, "the run's status");
+  assert.notEqual(key([thought("Reading"), edit]), key([thought("Reading"), edit, said("Done")]), "the reply shows");
+  assert.equal(replyText(streaming("R1", "ended", start)), "Done");
 });

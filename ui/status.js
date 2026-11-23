@@ -3,7 +3,7 @@
 // view (`GET api/run`, src/run.rs `RunView`), kept apart from the document so `node --test`
 // runs them.
 
-import { diffStats, foldRun, isLive, isOpen, isResolved, sentIn, toolRow } from "./run.js";
+import { diffStats, foldRun, isLive, isOpen, isResolved, openQuestion, sentIn, statusLine, toolRow } from "./run.js";
 
 // The run a note's status comes from, or null: the run it was marked sent in, else the live
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
@@ -242,4 +242,105 @@ export function reviewOf(id, views) {
     view.entries.filter((entry) => entry.kind === "findings" && entry.problem).map((entry) => `${view.id}: ${entry.problem}`),
   );
   return { stages: chain, reviewers, findings, problems };
+}
+
+// Why a failed run failed, from its log, or null.
+export function runFailure(run) {
+  return run.entries.findLast((entry) => entry.kind === "failed")?.error ?? null;
+}
+
+// What the run and note dialogs show of a review (`reviewOf`), as plain data to compare:
+// each stage's status and each finding with its verdict's word. A stage's entries are left
+// out, and so is the judge's line (the verdict's text), which grows with every token while
+// the judge writes it: a reviewer that streams leaves the dialogs alone until something shown
+// changes. The note dialog, which shows the judge's line, adds it for its own findings.
+export function reviewKey(review) {
+  if (!review) return null;
+  return [
+    review.stages.map((stage) => [stage.id, stage.agent, stage.review.reviewer, stage.status, statusLine(stage)]),
+    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [id, note, text, fix, path, line, verdict.word]),
+    review.problems,
+  ];
+}
+
+// The agent's reply in a run: its messages, joined.
+export function replyText(run) {
+  return foldRun(run.entries)
+    .items.filter((item) => item.type === "message")
+    .map((item) => item.text.trim())
+    .join("\n\n");
+}
+
+// What the run dialog shows of a thread (`threadOf`), as one string, but for the text the
+// agent streams: its replies and thoughts, which the dialog writes in place. The dialog is
+// built again only when this changes, so while the agent writes its step cards, Changes and
+// Review keep their clicks and its follow-up box keeps the focus.
+export function threadKey(thread) {
+  return JSON.stringify(thread.map(turnShown));
+}
+
+function turnShown(turn) {
+  const live = isLive(turn);
+  const { plan, items } = foldRun(turn.entries);
+  return [
+    turn.id,
+    turn.agent,
+    turn.status,
+    statusLine(turn),
+    turn.startedAt,
+    turn.problem ?? null,
+    turn.review ?? null,
+    turn.followUp ?? null,
+    turn.prompt === turn.followUp?.text,
+    plan,
+    items.map((item) => itemShown(item, live)),
+    // Whether the reply shows at all: its text is written in place.
+    replyText(turn) !== "",
+    turn.entries.some((entry) => entry.kind === "snapshot"),
+  ];
+}
+
+// What a step card shows of an item, its streamed text left out. A tool's output is not on
+// its card, and can be large.
+function itemShown(item, live) {
+  switch (item.type) {
+    case "message":
+    case "thought":
+      return [item.type];
+    case "tool":
+      return [item.id, item.title, toolRow(item, live)];
+    default:
+      return item;
+  }
+}
+
+// What the note dialog shows, as one string: the dialog is drawn again only when it changes.
+// A run's entries come many a second while the agent writes, and most change nothing the
+// dialog shows; drawing it again on each would scroll it, take its focus, drop a click whose
+// press and release land on two nodes, and reset the two-click Delete. `review` is the run's
+// review (`reviewOf`); `shown` is the rest the dialog shows that the note and run do not hold
+// (whether it can be sent, the agent, the reviewers, whether a run is under way).
+export function noteDialogKey(note, run, review, shown) {
+  if (!run) return JSON.stringify([note, shown]);
+  const question = isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
+  return JSON.stringify([
+    note,
+    shown,
+    run.id,
+    run.agent,
+    run.status,
+    run.notes,
+    run.problem ?? null,
+    runFailure(run),
+    statusLine(run),
+    runStatus(note, run),
+    agentSaid(run, note.id),
+    question?.request ?? null,
+    // A finished tool call's diffs do not change, so their count and size stand for them.
+    fileDiffs(note, run).length,
+    fileStats(note, run),
+    noteHistory(note, run),
+    reviewKey(review),
+    review?.findings.filter((finding) => finding.note === note.id).map((finding) => finding.verdict.text) ?? null,
+  ]);
 }

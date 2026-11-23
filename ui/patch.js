@@ -87,9 +87,12 @@ export function unquote(text) {
   const encoder = new TextEncoder();
   const end = quotedEnd(text);
   for (let index = 1; index < end; index += 1) {
-    const char = text[index];
-    if (char !== "\\") {
+    if (text[index] !== "\\") {
+      // A whole code point: a character outside the BMP is two code units, and encoding each
+      // half alone gives two U+FFFD.
+      const char = String.fromCodePoint(text.codePointAt(index));
       bytes.push(...encoder.encode(char));
+      index += char.length - 1;
       continue;
     }
     index += 1;
