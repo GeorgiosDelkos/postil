@@ -2373,4 +2373,30 @@ mod tests {
         );
         assert!(!shown.contains("secret"), "{shown}");
     }
+
+    #[test]
+    fn a_snapshot_point_is_recorded_once_and_only_while_the_run_is_live() {
+        let dir = std::env::temp_dir().join(format!("postil-run-snap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
+        let points = |run: &Run| {
+            run.state()
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, Entry::Snapshot { .. }))
+                .count()
+        };
+        // A forced stop and the agent's last event may both end a run: one snapshot after.
+        run.record_snapshot(Point::After, "a1".to_owned());
+        run.record_snapshot(Point::After, "a2".to_owned());
+        assert_eq!(points(&run), 1);
+        assert_eq!(run.state().snapshot(Point::After), Some("a1"));
+        run.record(Entry::Ended {
+            reason: StopReason::EndTurn,
+        });
+        run.record_snapshot(Point::Before, "b".to_owned());
+        assert_eq!(points(&run), 1, "an ended run takes no snapshot");
+        drop(run);
+        drop(fs::remove_dir_all(&dir));
+    }
 }
