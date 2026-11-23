@@ -31,3 +31,16 @@ updates:
           - "minor"
         patterns:
           - "*"
+  # Playwright for the page's end-to-end tests (tests/e2e/). Its version picks the WebKit build
+  # the tests run in, so an update is a PR of its own that CI runs in the new WebKit.
+  - package-ecosystem: npm
+    directory: /tests/e2e
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      e2e-bump:
+        applies-to: version-updates
+        patterns:
+          - "*"

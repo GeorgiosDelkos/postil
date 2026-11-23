@@ -34,3 +34,28 @@ jobs:
         run: rustup toolchain install
       - name: cargo test --locked
         run: cargo test --locked --all-features
+  # The page's end-to-end tests (tests/e2e/, src/site/tests/page_e2e.rs): the page in
+  # Playwright's WebKit against real sites and the fake agent. A job of its own, because it
+  # downloads a browser that the other tests do not need. Playwright's version comes from
+  # tests/e2e/package-lock.json, and `install` fetches the WebKit build that version pins.
+  page-e2e:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-latest
+    name: macos / page e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # tag=v7.1.0
+        with:
+          node-version: "26.13.0"
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: npm ci
+        run: npm ci --ignore-scripts
+        working-directory: tests/e2e
+      - name: Install WebKit
+        run: npx --no-install playwright-core install webkit
+        working-directory: tests/e2e
+      - name: cargo test page_end_to_end
+        run: cargo test --locked page_end_to_end -- --ignored
