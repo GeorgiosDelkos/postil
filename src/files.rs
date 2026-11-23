@@ -20,8 +20,9 @@ use crate::error::{Error, Result};
 /// creates that file, and its directory when that is missing too. An error through a link
 /// names the file it points at, since that is the directory that must be writable. The new
 /// file takes the old one's permissions, from its creation, so a `0600` file stays private;
-/// a new file gets the default mode (`0666` less the umask). The owner is not copied: the
-/// process can only create files it owns.
+/// a new file gets the default mode (`0666` less the umask). Neither the owner nor the group
+/// is copied: the process can only create files it owns, and on macOS a new file takes its
+/// directory's group, so the group bits of a `0640` file then apply to that group.
 ///
 /// A failure before the rename leaves the old file. After the rename the directory is synced,
 /// so the rename survives a power loss, and so is its parent, so a directory just created
@@ -42,11 +43,12 @@ pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
     written.map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", real.display())))
 }
 
+/// The number in the next temporary file's name, so every call in this process uses a name of
+/// its own. A unique name only: nothing is ordered by it.
+static WRITES: AtomicU64 = AtomicU64::new(0);
+
 /// [`write_atomically`] for a `file` that is not a link.
 fn replace(file: &Path, bytes: &[u8]) -> io::Result<()> {
-    // A unique name only: nothing is ordered by it.
-    static WRITES: AtomicU64 = AtomicU64::new(0);
-
     let invalid = |problem| io::Error::new(io::ErrorKind::InvalidInput, problem);
     let dir = file
         .parent()
@@ -67,20 +69,28 @@ fn replace(file: &Path, bytes: &[u8]) -> io::Result<()> {
         .as_ref()
         .map_or(0o666, |permissions| permissions.mode() & 0o7777);
 
-    let temporary = dir.join(format!(
-        "{}.{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id(),
-        WRITES.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        // `create_new`: a leftover temporary of a crashed process with the same pid is never
-        // reused with its own mode.
-        let mut out = File::options()
+    // Creating the temporary claims its name. A leftover of a crashed process that had this
+    // pid holds a name already, so the next one is taken: the leftover is never reused with
+    // its own mode, and never fails the write.
+    let (temporary, mut out) = loop {
+        let temporary = dir.join(format!(
+            "{}.{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed)
+        ));
+        let created = File::options()
             .write(true)
             .create_new(true)
             .mode(mode)
-            .open(&temporary)?;
+            .open(&temporary);
+        match created {
+            Ok(out) => break (temporary, out),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let written = (|| {
         // The umask narrowed the mode above; this restores the old file's exact bits.
         if let Some(permissions) = permissions {
             out.set_permissions(permissions)?;
@@ -242,6 +252,24 @@ mod tests {
 
         assert!(error.to_string().contains("symbolic links"), "{error}");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "only the two links");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leftover_temporaries_with_this_pid_do_not_fail_the_write() {
+        let dir = temp_dir("leftover");
+        let file = dir.join("settings.json");
+        // Leftovers of a crashed process that had this pid, under the next names this process
+        // would use. Tests run in parallel and also take numbers, so a stretch ahead is taken.
+        let next = WRITES.load(Ordering::Relaxed);
+        for number in next..next + 64 {
+            let name = format!("settings.json.{}.{number}.tmp", std::process::id());
+            fs::write(dir.join(name), b"stale").unwrap();
+        }
+
+        write_atomically(&file, b"new").unwrap();
+
+        assert_eq!(fs::read(&file).unwrap(), b"new");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
