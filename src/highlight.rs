@@ -14,6 +14,11 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent};
 
 use crate::error::{Error, Result};
 
+/// The largest text [`Highlighter::lines`] colors, in bytes: 2 MB, the owner's choice
+/// (2026-11-23). A larger file comes back as plain lines: tree-sitter parses the whole text
+/// with no way to stop it, and the file is not worth seconds of a busy request thread.
+const MAX_HIGHLIGHTED: usize = 2_000_000;
+
 /// A run of text and the CSS class the page gives it. The class is empty for plain text.
 pub(crate) type Token<'a> = (&'static str, &'a str);
 
@@ -229,11 +234,14 @@ impl Highlighter {
     }
 
     /// Splits `text` into lines of tokens. `path` picks the grammar by extension; a file with
-    /// no known grammar comes back as plain lines.
+    /// no known grammar, or over [`MAX_HIGHLIGHTED`] bytes, comes back as plain lines.
     pub(crate) fn lines<'a>(&self, path: &str, text: &'a str) -> Result<Vec<Vec<Token<'a>>>> {
         let mut lines = Lines::new(text);
 
-        if let Some(configuration) = self.configuration(path) {
+        let grammar = self
+            .configuration(path)
+            .filter(|_| text.len() <= MAX_HIGHLIGHTED);
+        if let Some(configuration) = grammar {
             let mut highlighter = tree_sitter_highlight::Highlighter::new();
             let events = highlighter
                 .highlight(configuration, text.as_bytes(), None, None, |_| None)
@@ -449,6 +457,24 @@ mod tests {
 
         let plain = highlighter.lines("main.txt", text).unwrap();
         assert_eq!(plain[1], [("", "fn main() { let s = \"hi\"; }")]);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_comes_back_plain_and_one_at_it_colored() {
+        let highlighter = Highlighter::new();
+        // Exactly the limit: lines of `fn a() {}`, padded with slashes when the limit is not a
+        // whole number of them.
+        let line = "fn a() {}\n";
+        let mut text = line.repeat(MAX_HIGHLIGHTED / line.len());
+        text.push_str(&"/".repeat(MAX_HIGHLIGHTED - text.len()));
+        assert_eq!(text.len(), MAX_HIGHLIGHTED);
+
+        let at = highlighter.lines("big.rs", &text).unwrap();
+        assert_eq!(at[0][0], ("k", "fn"), "at the limit the file is colored");
+
+        text.push('/');
+        let over = highlighter.lines("big.rs", &text).unwrap();
+        assert_eq!(over[0], [("", "fn a() {}")], "over it, plain");
     }
 
     #[test]

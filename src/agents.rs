@@ -70,8 +70,8 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The search path, found on a background thread. Asking the login shell takes up to a
-/// second (more with a slow start-up file), and the URL scheme handler that serves the
-/// settings runs on the main thread, which must not wait for it.
+/// second (more with a slow start-up file), and the thread that serves the settings answers
+/// every page request one at a time, so none should wait behind it.
 ///
 /// The first scan starts when the path is first asked for, so a launch that never opens the
 /// settings never runs the engineer's start-up files; another starts on every
