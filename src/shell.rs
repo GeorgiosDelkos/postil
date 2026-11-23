@@ -2258,7 +2258,8 @@ mod tests {
         let root = repo.root.clone();
         std::thread::spawn(move || {
             let site = Site::new(None, None, no_agents(), quiet());
-            site.open(Repo::open(&root).unwrap());
+            site.open(Repo::open(&root).unwrap(), LiveRun::Stop)
+                .unwrap();
             drop(sender.send(post(&site, NOTES, &new_note("a.txt", 1, 1, "x", "Hi."))));
         });
         let (status, reply) = replies
