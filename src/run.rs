@@ -436,8 +436,9 @@ impl Runner {
     ///
     /// [`Error::TurnRunning`] while a run of this window is under way, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
-    /// reviewers, for a run that is itself a review, or for a follow-up; as [`Runner::view_of`] for the
-    /// reviewed run; and [`Error::WriteRun`] when the first stage's log cannot be created.
+    /// reviewers, for a run that is itself a review, or for a follow-up; as
+    /// [`Runner::view_of`] for the reviewed run; and [`Error::WriteRun`] when the first
+    /// stage's log cannot be created.
     pub(crate) fn review(self: &Arc<Self>, of: &str, reviewers: Vec<AgentChoice>) -> Result<()> {
         if reviewers.is_empty() {
             return Err(Error::BadRequest(
