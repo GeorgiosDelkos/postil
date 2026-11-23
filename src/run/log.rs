@@ -970,6 +970,7 @@ fn json_line<T: Serialize>(value: &T) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn debug_output_names_the_run_but_never_shows_its_prompt() {
         let dir = std::env::temp_dir().join(format!("postil-run-debug-{}", std::process::id()));

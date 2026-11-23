@@ -10,14 +10,14 @@
 //! (docs/design.md, "Not in scope"). A live run holds an exclusive lock on
 //! `runs/active.lock`, so another window on the same working tree cannot start one either.
 //!
+//! The run log, a run's record in memory and on disk, is in [`log`].
+//!
 //! # Stopping
 //!
 //! Stop asks the agent to cancel the turn (`session/cancel`). An agent that is still
 //! starting is killed instead, and the run ends at once: a start can take minutes. Asked
 //! again from [`FORCE_AFTER`] on, Stop kills an agent that did not stop, so a hung agent never
 //! holds the working tree; a second Stop sooner is the same request.
-//!
-//! The run log, a run's record in memory and on disk, is in [`log`].
 //!
 //! # Threads and locks
 //!

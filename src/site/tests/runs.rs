@@ -1,4 +1,5 @@
-//! Runs (run.rs), against the fake ACP agent in tests/fake-agent.mjs.
+//! Runs (`run.rs`, `run/log.rs`) through `/api/run*`, against the fake ACP agent in
+//! `tests/fake-agent.mjs`.
 
 use super::*;
 

@@ -437,7 +437,7 @@ export function elapsed(seconds) {
 
 // The prompt's lines, each with its kind for coloring: a note's heading (`[N1] path:3`), a
 // quoted line of code, the line that says the code moved, or text. The format is
-// src/run.rs, `prompt_text`.
+// src/notes.rs, `prompt`.
 export function promptLines(text) {
   return text
     .replace(/\n$/, "")
