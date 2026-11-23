@@ -166,9 +166,9 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
 
 /// Marks the note `id` resolved, saves, and returns all notes. A resolved note keeps the run
 /// it was sent in, so its dialog still shows what that run did. Only [`reopen`] takes a note
-/// out of this state: [`prompt`] refuses it, and [`mark_sent`] only records its run. Resolving a resolved
-/// note leaves its state as it is, but saves all the same, as every write does: with every
-/// note at its current place, and the file at this version.
+/// out of this state: [`prompt`] refuses it, and [`mark_sent`] only records its run.
+/// Resolving a resolved note leaves its state as it is, but saves all the same, as every
+/// write does: with every note at its current place, and the file at this version.
 ///
 /// # Errors
 ///
