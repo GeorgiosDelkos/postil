@@ -41,7 +41,8 @@
 //! # Threads and locks
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
-//! and an agent's start on a thread of its own. Two locks, always taken in this order: the
+//! an agent's start on a thread of its own, and a review's next stage on one more
+//! (`review-next`, [`Runner::advance`]). Two locks, always taken in this order: the
 //! runner's [`Slot`], then a run's state. The page is told about every change through
 //! `notify`, and fetches what it has not seen.
 
@@ -107,6 +108,17 @@ pub(crate) struct Runner {
     slot: Mutex<Slot>,
 }
 
+impl fmt::Debug for Chain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chain")
+            .field("stage", &self.stage)
+            .field("reviewers", &self.reviewers)
+            .field("work", &self.work)
+            .field("findings", &self.findings.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// What a runner holds now.
 #[derive(Debug, Default)]
 struct Slot {
@@ -120,13 +132,14 @@ struct Slot {
     /// Set when the project closed: an agent that finishes starting afterwards is stopped.
     closed: bool,
     /// The review under way, while its stages run one after another; cleared when a stage
-    /// does not end well, when the engineer stops it, and by a send.
+    /// does not end well or reports edits it may not make, when the engineer stops it, by a
+    /// send, when the project closes, and when the last stage ends; `advance` takes it to
+    /// start the next stage.
     chain: Option<Chain>,
 }
 
 /// A review under way (`review.rs`): the stage now running, the reviewers, what they review,
-/// and the findings proposed so far.
-#[derive(Debug)]
+/// and the findings proposed so far. Its `Debug` counts the findings: their text quotes code.
 struct Chain {
     stage: Stage,
     reviewers: Vec<AgentChoice>,
@@ -271,12 +284,12 @@ impl Runner {
                 "no reviewers are set: add them in Settings".to_owned(),
             ));
         }
-        let reviewed = self.reviewed(of)?;
+        let reviewed = self.run_by_id(of)?;
         let mut slot = self.slot();
         if slot.run.as_ref().is_some_and(|run| run.state().live()) {
             return Err(Error::TurnRunning);
         }
-        let (header, work, files) = {
+        let (notes, work, files) = {
             let state = reviewed.state();
             if state.header.review.is_some() {
                 return Err(Error::BadRequest(format!("{of} is itself a review")));
@@ -298,7 +311,7 @@ impl Runner {
             },
             reviewers,
             work,
-            notes: header,
+            notes,
             files,
             findings: Vec::new(),
         };
@@ -310,7 +323,7 @@ impl Runner {
     }
 
     /// The run `of`, this window's when it is that one, else read from its log.
-    fn reviewed(&self, of: &str) -> Result<Arc<Run>> {
+    fn run_by_id(&self, of: &str) -> Result<Arc<Run>> {
         let number = run_number(of)
             .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
         let own = self.slot().run.clone();
@@ -547,7 +560,7 @@ impl Runner {
     /// [`Error::BadRequest`] when `id` is not of the form `R<number>`; [`Error::NoSuchRun`]
     /// when its log is missing or cannot be read.
     pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
-        Ok(self.reviewed(id)?.view(0))
+        Ok(self.run_by_id(id)?.view(0))
     }
 
     /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.
@@ -902,11 +915,11 @@ fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> O
 
 /// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
 /// proposer's findings are read from its reply (numbered after the `found` before it) and
-/// logged. Returns them for the next stage; `None` when the review stops here, because a
-/// proposer changed files.
+/// logged. Returns them for the next stage; `None` when the review ends here: this was the
+/// judge, or a proposer changed files.
 fn end_stage(run: &Run, stage: &Stage, found: usize) -> Option<Vec<Finding>> {
     if stage.judges() {
-        return Some(Vec::new());
+        return None;
     }
     let reply = run.state().reply();
     let (findings, problem) = match review::findings_in(&reply, found + 1) {

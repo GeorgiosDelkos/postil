@@ -3456,13 +3456,12 @@ mod tests {
             serde_json::json!(["N1"]),
             "the reviewed run's notes"
         );
-        let kinds_of = |run: &serde_json::Value| kinds(run);
         assert!(
-            kinds_of(&proposer).contains(&"message:edit no".to_owned()),
+            kinds(&proposer).contains(&"message:edit no".to_owned()),
             "a proposer cannot edit: {proposer}"
         );
         assert!(
-            kinds_of(&proposer).contains(&"message:read once".to_owned()),
+            kinds(&proposer).contains(&"message:read once".to_owned()),
             "a proposer can read: {proposer}"
         );
         let findings = first_of_kind(&proposer, "findings");
@@ -3472,10 +3471,10 @@ mod tests {
 
         assert_eq!(judge["review"]["reviewer"], 2);
         assert!(
-            kinds_of(&judge).contains(&"message:judged: saw F1".to_owned()),
+            kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
             "the judge is given the findings: {judge}"
         );
-        assert!(kinds_of(&judge).contains(&"message:F1: accepted - said more".to_owned()));
+        assert!(kinds(&judge).contains(&"message:F1: accepted - said more".to_owned()));
         assert_eq!(
             states(&site),
             [serde_json::json!({ "kind": "sent", "run": "R1" })],
@@ -3545,6 +3544,7 @@ mod tests {
     #[test]
     fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
         for (scenario, problem) in [
+            // Nothing readable is no finding, so the judge has nothing to judge.
             ("reviewer-silent", Some("no ```json block")),
             ("refuse-prompt", None),
             ("reviewer-edits", Some("reviewer 1 changed files")),

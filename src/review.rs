@@ -9,7 +9,7 @@
 //! This module holds what a stage is, the prompts, and the reading of findings. The runner
 //! (`run.rs`) starts each stage as a run of its own, in order.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,8 +47,8 @@ pub(crate) struct Finding {
 }
 
 /// What is reviewed: the run's prompt (the notes as the agent got them), its reply, and the
-/// diffs its edits made, in order.
-#[derive(Debug)]
+/// diffs its edits made, in order. Its `Debug` shows sizes and paths only, never the text:
+/// notes and code stay out of debug output, as for a run.
 pub(crate) struct Work {
     pub(crate) prompt: String,
     pub(crate) reply: String,
@@ -61,6 +61,19 @@ pub(crate) struct Diff {
     pub(crate) path: String,
     pub(crate) before: Option<String>,
     pub(crate) after: String,
+}
+
+impl fmt::Debug for Work {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Work")
+            .field("prompt_len", &self.prompt.len())
+            .field("reply_len", &self.reply.len())
+            .field(
+                "diffs",
+                &self.diffs.iter().map(|diff| &diff.path).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 /// The prompt of a proposing reviewer.
@@ -198,6 +211,15 @@ mod tests {
                 before: Some("    one();\n".to_owned()),
                 after: "    two();\n".to_owned(),
             }],
+        }
+    }
+
+    #[test]
+    fn debug_output_shows_the_work_s_sizes_and_paths_never_its_text() {
+        let shown = format!("{:?}", work());
+        assert!(shown.contains("src/a.rs"), "{shown}");
+        for secret in ["rename one", "renamed one to two", "two();"] {
+            assert!(!shown.contains(secret), "{shown}");
         }
     }
 
