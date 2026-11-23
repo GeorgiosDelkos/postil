@@ -5374,8 +5374,9 @@ mod tests {
         );
         let ahead = Instant::now() + Duration::from_secs(60);
         assert_eq!(waiting(Some(ahead)), ControlFlow::WaitUntil(ahead));
-        let past = Instant::now() - Duration::from_secs(1);
-        assert_eq!(waiting(Some(past)), ControlFlow::Exit);
+        // A deadline of now has passed: the clock `waiting` reads is at or after it.
+        let now = Instant::now();
+        assert_eq!(waiting(Some(now)), ControlFlow::Exit);
     }
 
     #[test]
