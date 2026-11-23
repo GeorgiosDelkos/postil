@@ -181,12 +181,6 @@ kbd {
   padding: 4px 16px 12px;
 }
 
-.repo-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
 .repo-branch {
   font: 11.5px "Geist Mono", monospace;
   color: var(--text-muted);
@@ -829,8 +823,6 @@ body.welcome-mode > .pane {
 
 .welcome-actions .button {
   height: 34px;
-  display: inline-flex;
-  align-items: center;
   gap: 10px;
 }
 
@@ -1775,9 +1767,6 @@ button.repo-name:hover {
 .button.stop {
   flex: none;
   height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
   padding: 0 10px;
   font-size: 12px;
 }
@@ -2060,12 +2049,6 @@ button.repo-name:hover {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-}
-
-.permission-actions .button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 .permission-actions kbd {
