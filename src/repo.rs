@@ -142,14 +142,17 @@ impl Repo {
     /// Every tracked file and every untracked file that is not ignored, sorted, relative to
     /// the root. Repositories inside the working tree are left out, a submodule as well as an
     /// untracked one: they are directories, not files to open, and their files are not this
-    /// repository's. So are tracked files outside a sparse checkout, which are not on disk.
+    /// repository's. So are tracked files git keeps off the disk, those outside a sparse
+    /// checkout.
     pub(crate) fn files(&self) -> Result<Vec<String>> {
         let tracked_args = ["ls-files", "-z", "--stage", "-t"];
         let tracked = git(&self.root, &tracked_args)?;
         let mut files = Vec::new();
         for entry in tracked.split_terminator('\0') {
             // `<tag> <mode> <object> <stage>\t<path>`. A submodule is mode 160000, a gitlink.
-            // Tag `S` is a file outside a sparse checkout's cone: tracked, but not on disk.
+            // Tag `S` is skip-worktree: a file outside a sparse checkout, which is not on
+            // disk, or one hidden from `git status` by `update-index --skip-worktree`, which
+            // is. Only `S` entries cost a look at the disk.
             let Some((fields, path)) = entry.split_once('\t') else {
                 return Err(Error::Git {
                     command: tracked_args.join(" "),
@@ -160,7 +163,8 @@ impl Repo {
             };
             let mut fields = fields.split(' ');
             let (tag, mode) = (fields.next(), fields.next());
-            if tag != Some("S") && mode != Some("160000") {
+            let gone = tag == Some("S") && fs::symlink_metadata(self.root.join(path)).is_err();
+            if !gone && mode != Some("160000") {
                 files.push(path.to_owned());
             }
         }

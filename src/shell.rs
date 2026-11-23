@@ -2287,6 +2287,22 @@ mod tests {
     }
 
     #[test]
+    fn repo_keeps_a_skip_worktree_file_that_is_on_disk() {
+        // Not in a sparse checkout: there git ignores a skip-worktree bit set by hand.
+        let repo = TempRepo::new("list-skip-worktree");
+        repo.write("src/local.toml", "key = 1\n");
+        repo.git(&["add", "."]);
+        let identity = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        repo.git(&[&identity[..], &["commit", "--quiet", "-m", "one"]].concat());
+        // Hidden from `git status`, as people do with a config file they edit locally.
+        repo.git(&["update-index", "--skip-worktree", "src/local.toml"]);
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["src/local.toml"]));
+    }
+
+    #[test]
     fn a_repository_whose_path_holds_a_newline_opens() {
         let probe = std::env::temp_dir().join(format!("postil-{}-probe\n", std::process::id()));
         if let Err(error) = fs::create_dir(&probe) {
