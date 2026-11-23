@@ -16,6 +16,7 @@ import {
   keyFor,
   markdownBlocks,
   openPermission,
+  openQuestion,
   partLines,
   permissionKey,
   permissionKeys,
@@ -23,7 +24,7 @@ import {
   toolRow,
   underWay,
 } from "./run.js";
-import { statusIcon } from "./note-dialog.js";
+import { questionForm, statusIcon } from "./note-dialog.js";
 import { noteStatus, planProgress } from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
@@ -92,9 +93,13 @@ export function runPanel({
   // and what it was drawn from, to draw it again only when that changes.
   let detail = null;
   let detailDrawn = null;
+  // The open question's form, kept while it stays open: a redraw must not drop what the
+  // engineer has chosen or typed.
+  let asking = null;
   detailEl.addEventListener("close", () => {
     detail = null;
     detailDrawn = null;
+    asking = null;
   });
   detailEl.addEventListener("keydown", (event) => {
     if (detail?.kind !== "step" || event.metaKey || event.altKey || event.ctrlKey) return;
@@ -223,6 +228,11 @@ export function runPanel({
     return forceAt !== null && Date.now() >= forceAt;
   }
 
+  // Answers the run's open question with the form's values, or `null` to skip it.
+  function answerQuestion(request, content) {
+    return post("api/run/question", { request, content }).catch((error) => onError(error.message));
+  }
+
   function answer(request, option) {
     return post("api/run/permission", { request: request.request, option }).catch((error) =>
       onError(error.message),
@@ -260,9 +270,16 @@ export function runPanel({
       return;
     }
     const wanted = [];
-    // A permission request needs an answer now, so it shows above the runs.
+    // What needs an answer now shows above the runs: a question, as a card that opens the
+    // run's dialog where it is answered, and a permission request Postil could not answer.
     if (isLive(run)) {
-      for (const item of foldRun(run.entries).items) {
+      const items = foldRun(run.entries).items;
+      const question = openQuestion(items);
+      if (question) {
+        const key = `question:${run.id}:${question.request}`;
+        wanted.push([key, question.message, () => needsYouCard(run, question)]);
+      }
+      for (const item of items) {
         if (item.type !== "permission" || item.answer !== undefined) continue;
         wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
       }
@@ -292,6 +309,20 @@ export function runPanel({
     while (panelEl.childNodes.length > nodes.length) panelEl.lastChild.remove();
     closeIfGone(list);
     drawDetail();
+  }
+
+  // The card of a question waiting for the engineer: it opens the run's dialog.
+  function needsYouCard(view, question) {
+    const button = el("button", "run-card needs");
+    button.type = "button";
+    button.append(
+      statusIcon("needs"),
+      el("span", "run-card-text", `${view.agent} has a question: ${question.message}`),
+      el("span", "run-id", view.id),
+      el("span", "run-chevron", "›"),
+    );
+    button.addEventListener("click", () => openDetail({ kind: "run", id: view.id }));
+    return button;
   }
 
   // A run's card: its status, id, agent and notes, in one line.
@@ -391,7 +422,11 @@ export function runPanel({
   function stepsOf(items) {
     return items
       .map((item, index) => ({ item, key: itemKey(item, index) }))
-      .filter(({ item }) => item.type !== "message" && !(item.type === "permission" && item.answer === undefined));
+      .filter(
+        ({ item }) =>
+          item.type !== "message" &&
+          !((item.type === "permission" || item.type === "question") && item.answer === undefined),
+      );
   }
 
   function itemKey(item, index) {
@@ -467,11 +502,21 @@ export function runPanel({
     return { id, where, ...noteStatus(note, view) };
   }
 
-  // The run whole: its plan, its notes, every step, and the agent's reply.
+  // The run whole: its question if it asks one, its plan, its notes, every step, and the
+  // agent's reply.
   function runDetail(view, steps, notes) {
     const live = isLive(view);
     const body = el("div", "note-dialog-body");
     const { plan, items } = foldRun(view.entries);
+
+    const question = live ? openQuestion(items) : null;
+    if (question) {
+      if (asking?.request !== question.request) {
+        const form = questionForm(question, view.agent, (content) => answerQuestion(question.request, content));
+        asking = { request: question.request, form };
+      }
+      body.append(asking.form);
+    } else asking = null;
 
     if (plan?.length) {
       const progress = planProgress(view);
@@ -551,11 +596,17 @@ export function runPanel({
       case "permission": {
         const chosen = item.options.find((option) => option.id === item.answer);
         return card([
-          el("span", "tool-verb", "ask"),
+          el("span", "tool-verb", "allow"),
           el("span", "run-card-text", item.title),
           el("span", "tool-state", chosen ? chosen.name : "cancelled"),
         ]);
       }
+      case "question":
+        return card([
+          el("span", "tool-verb", "ask"),
+          el("span", "run-card-text", item.message),
+          el("span", "tool-state", questionState(item)),
+        ]);
       case "error":
         return el("div", "run-error", item.text);
       default:
@@ -592,6 +643,19 @@ export function runPanel({
       body.append(el("div", "run-detail-text", `Answered: ${chosen ? chosen.name : "cancelled"}`));
       return [detailHeader(null, item.title, view.id), body];
     }
+    if (item.type === "question") {
+      body.append(el("div", "run-detail-text", item.message));
+      const content = item.answer?.content;
+      const answered = content ? Object.entries(content) : [];
+      if (answered.length) {
+        const list = el("dl", "question-answers");
+        for (const [key, value] of answered) {
+          list.append(el("dt", "", key), el("dd", "", Array.isArray(value) ? value.join(", ") : String(value)));
+        }
+        body.append(section("Your answer", list));
+      } else body.append(el("div", "run-detail-text muted", questionState(item)));
+      return [detailHeader(null, "Question", `${view.id} · ${questionState(item)}`), body];
+    }
     const row = toolRow(item, isLive(view));
     const kind = item.status === "failed" ? "failed" : row.running ? "working" : "addressed";
     const actions = [];
@@ -616,6 +680,12 @@ export function runPanel({
       body.append(el("div", "run-detail-text muted", row.running ? "Under way…" : "No output."));
     }
     return [detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions), body];
+  }
+
+  // How a closed question ended: answered, skipped, or closed with no answer.
+  function questionState(item) {
+    if (item.answer === null) return "closed";
+    return item.answer?.content ? "answered" : "skipped";
   }
 
   // The agent's Markdown as elements, built node by node: its text is never parsed as HTML.
@@ -674,6 +744,7 @@ export function runPanel({
     stop,
     keydown,
     byId,
+    answerQuestion,
     forget,
     reload,
     run: () => run,

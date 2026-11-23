@@ -109,10 +109,30 @@ function foldEntries(entries) {
         items.push(request);
         break;
       }
+      case "question": {
+        // Numbered with the permission requests (src/acp.rs, "Permission requests").
+        const question = {
+          type: "question",
+          request: entry.request,
+          message: entry.message,
+          fields: entry.fields,
+          // `undefined` while open; then `{ content }`, the form's values or `null` for a
+          // skip, or `null` when closed unanswered (the run stopped, or the agent withdrew it).
+          answer: early.get(entry.request),
+        };
+        permissions.set(entry.request, question);
+        items.push(question);
+        break;
+      }
       case "answer": {
         const request = permissions.get(entry.request);
         if (request) request.answer = entry.option;
         else early.set(entry.request, entry.option);
+        break;
+      }
+      case "reply": {
+        const question = permissions.get(entry.request);
+        if (question) question.answer = { content: entry.content };
         break;
       }
       case "unreadable":
@@ -127,6 +147,11 @@ function foldEntries(entries) {
     }
   }
   return { plan, items };
+}
+
+// The open question, if any: the one the engineer is asked to answer.
+export function openQuestion(items) {
+  return items.findLast((item) => item.type === "question" && item.answer === undefined) ?? null;
 }
 
 // The open permission request, if any: the one the keys answer.

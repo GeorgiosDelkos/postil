@@ -2,7 +2,8 @@
 // a card's click (docs/design.md, "Notes and their status"). It is drawn from the note and its
 // run (status.js), and drawn again when either changes while it is open.
 
-import { isLive, partLines, statusLine } from "./run.js";
+import { questionContent, questionFields } from "./question.js";
+import { isLive, openQuestion, foldRun, partLines, statusLine } from "./run.js";
 import { agentSaid, fileDiffs, fileStats, noteHistory, noteStatus } from "./status.js";
 
 function el(tag, className, text) {
@@ -20,13 +21,103 @@ export function statusIcon(kind) {
   return icon;
 }
 
+// The agent's open question as a form (board 9 on the design canvas): its message, a field
+// per form field, Skip and Send answer (Cmd-Enter). `answer(content)` sends the reply: the
+// form's values, or `null` to skip. Shared by the note and run dialogs.
+export function questionForm(question, agent, answer) {
+  const fields = questionFields(question.fields);
+  const values = {};
+  const form = el("form", "question");
+  form.append(el("div", "question-label", `${agent} has a question`), el("div", "question-message", question.message));
+  fields.forEach((field, index) => form.append(fieldView(field, index, values)));
+  const actions = el("div", "question-actions");
+  const skip = el("button", "button", `Skip, let ${agent} decide`);
+  skip.type = "button";
+  const send = el("button", "button primary");
+  send.type = "submit";
+  send.append("Send answer", el("kbd", "", "⌘↵"));
+  actions.append(skip, el("span", "spacer"), send);
+  form.append(actions);
+  // Sent once: the buttons stay disabled while the reply is on its way, and the run's next
+  // draw replaces the form.
+  const reply = (content) => {
+    skip.disabled = true;
+    send.disabled = true;
+    answer(content);
+  };
+  skip.addEventListener("click", () => reply(null));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    reply(questionContent(fields, values));
+  });
+  form.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && event.metaKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      form.requestSubmit();
+    }
+  });
+  return form;
+}
+
+// One field of a question's form; what the engineer enters goes into `values` by key.
+function fieldView(field, index, values) {
+  const part = el("fieldset", `question-field ${field.kind}`);
+  part.append(el("legend", "question-title", field.title));
+  if (field.description) part.append(el("div", "question-description", field.description));
+  const name = `question-${index}`;
+  if (field.kind === "one" || field.kind === "many" || field.kind === "yesno") {
+    const options =
+      field.kind === "yesno"
+        ? [{ value: true, title: "Yes", description: "" }, { value: false, title: "No", description: "" }]
+        : field.options;
+    const chosen = new Set();
+    for (const option of options) {
+      const choice = el("label", "question-choice");
+      const input = el("input");
+      input.type = field.kind === "many" ? "checkbox" : "radio";
+      input.name = name;
+      input.addEventListener("change", () => {
+        if (field.kind === "many") {
+          if (input.checked) chosen.add(option.value);
+          else chosen.delete(option.value);
+          values[field.key] = [...chosen];
+        } else values[field.key] = option.value;
+      });
+      const text = el("span", "question-choice-text");
+      text.append(el("span", "question-choice-title", option.title));
+      if (option.description) text.append(el("span", "question-choice-description", option.description));
+      choice.append(input, text);
+      part.append(choice);
+    }
+    return part;
+  }
+  const input = field.kind === "text" ? el("textarea") : el("input");
+  if (field.kind === "text") input.rows = 2;
+  else input.type = "number";
+  input.className = "question-input";
+  input.setAttribute("aria-label", field.title);
+  input.addEventListener("input", () => {
+    values[field.key] = input.value;
+  });
+  part.append(input);
+  return part;
+}
+
 // `dialogEl` is the `<dialog>`. `find(id)` gives `{ note, run }` for a note id, or null once
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
-// ticked), `remove(note)`, and `showRun()`. `agent()` names the agent Send sends to, the
+// ticked), `remove(note)`, `showRun()`, and `answerQuestion(request, content)` for the run's
+// open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set.
-export function noteDialog(dialogEl, { find, canSend, agent, showInCode, send, remove, showRun }) {
+export function noteDialog(
+  dialogEl,
+  { find, canSend, agent, showInCode, send, remove, showRun, answerQuestion },
+) {
   let shownId = null;
+  // The open question's form, kept while it stays open: a redraw must not drop what the
+  // engineer has chosen or typed.
+  let asking = null;
   // What the dialog was drawn from: drawn again only when this changes, so a run's every
   // token leaves the dialog, its scroll and its focus alone.
   let drawn = null;
@@ -34,6 +125,7 @@ export function noteDialog(dialogEl, { find, canSend, agent, showInCode, send, r
   dialogEl.addEventListener("close", () => {
     shownId = null;
     drawn = null;
+    asking = null;
   });
   dialogEl.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && event.metaKey) {
@@ -91,6 +183,15 @@ export function noteDialog(dialogEl, { find, canSend, agent, showInCode, send, r
 
   function body(note, run) {
     const main = el("div", "note-dialog-body");
+    // The agent's question comes first: it is why a note needs the engineer (board 9).
+    const question = run && isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
+    if (question) {
+      if (asking?.request !== question.request) {
+        const form = questionForm(question, run.agent, (content) => answerQuestion(question.request, content));
+        asking = { request: question.request, form };
+      }
+      main.append(asking.form);
+    } else asking = null;
     main.append(section("Your note", el("div", "note-dialog-note", note.body)));
 
     const lost = note.anchor === "lost";
@@ -118,13 +219,16 @@ export function noteDialog(dialogEl, { find, canSend, agent, showInCode, send, r
     const words = {
       starting: `${run.agent} is starting.`,
       working: `${run.agent} is working on it. Its line comes when the run ends.`,
-      needs: `${run.agent} is waiting for you in the run.`,
+      needs: openQuestion(foldRun(run.entries).items)
+        ? `${run.agent} is waiting for your answer above.`
+        : `${run.agent} is waiting for you in the run.`,
       silent: `Nothing: the run ended without a line for ${note.id}.`,
       stopped: "Nothing: the run was stopped before the agent wrote its summary.",
       failed: run.problem ?? failure(run) ?? "The run failed.",
     }[noteStatus(note, run).kind];
     const text = el("div", "note-dialog-said muted", words ?? "");
-    if (run.status === "waiting") {
+    // A permission request with no allow option waits in the run, not here.
+    if (run.status === "waiting" && !openQuestion(foldRun(run.entries).items)) {
       const go = el("button", "button note-dialog-run", "Open the run");
       go.type = "button";
       go.addEventListener("click", () => {

@@ -2703,3 +2703,131 @@ body.resizing * {
   flex-direction: column;
   gap: 6px;
 }
+
+/* An agent's question (board 9 on the design canvas): its message, one block per field, and
+   Skip or Send answer. Shown at the top of the note's and the run's dialog. */
+.question {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  background: var(--raised);
+  border: 1px solid var(--attention-border);
+  border-radius: 10px;
+}
+
+.question-label {
+  font-size: 11.5px;
+  color: var(--attention);
+}
+
+.question-message {
+  font-size: 14.5px;
+  line-height: 21px;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+
+.question-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.question-title {
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.question-description {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+}
+
+.question-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.question-choice:has(input:checked) {
+  border-color: var(--accent);
+}
+
+.question-choice input {
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+}
+
+.question-choice-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.question-choice-title {
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.question-choice-description {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+}
+
+.question-input {
+  padding: 6px 8px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  resize: vertical;
+}
+
+.question-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.question-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.question-actions .spacer {
+  flex: 1;
+}
+
+.question-answers {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.question-answers dt {
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.question-answers dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

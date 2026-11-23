@@ -41,22 +41,80 @@ use crate::repo::Repo;
 use crate::run::{AgentChoice, Notify, Runner};
 use crate::settings::{self, Settings};
 
-const INDEX_HTML: &str = include_str!("../ui/index.html");
-const APP_CSS: &str = include_str!("../ui/app.css");
-const APP_JS: &str = include_str!("../ui/app.js");
-const FUZZY_JS: &str = include_str!("../ui/fuzzy.js");
-const TREE_JS: &str = include_str!("../ui/tree.js");
-const ICONS_JS: &str = include_str!("../ui/icons.js");
-const SETTINGS_JS: &str = include_str!("../ui/settings.js");
-const SETTINGS_DIALOG_JS: &str = include_str!("../ui/settings-dialog.js");
-const RUN_JS: &str = include_str!("../ui/run.js");
-const RUN_PANEL_JS: &str = include_str!("../ui/run-panel.js");
-const PANES_JS: &str = include_str!("../ui/panes.js");
-const STATUS_JS: &str = include_str!("../ui/status.js");
-const NOTE_DIALOG_JS: &str = include_str!("../ui/note-dialog.js");
-const ICONS_SVG: &str = include_str!("../ui/icons.svg");
-const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
-const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
+/// The page's files, served at these paths with these types: compiled into the binary as
+/// they are, so the app needs no files beside it. A module the page imports must be listed
+/// here (`every_page_module_is_served` checks).
+const PAGE: &[(&str, &str, &[u8])] = &[
+    ("/", "text/html", include_bytes!("../ui/index.html")),
+    ("/app.css", "text/css", include_bytes!("../ui/app.css")),
+    ("/app.js", "text/javascript", include_bytes!("../ui/app.js")),
+    (
+        "/fuzzy.js",
+        "text/javascript",
+        include_bytes!("../ui/fuzzy.js"),
+    ),
+    (
+        "/tree.js",
+        "text/javascript",
+        include_bytes!("../ui/tree.js"),
+    ),
+    (
+        "/icons.js",
+        "text/javascript",
+        include_bytes!("../ui/icons.js"),
+    ),
+    (
+        "/settings.js",
+        "text/javascript",
+        include_bytes!("../ui/settings.js"),
+    ),
+    (
+        "/settings-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/settings-dialog.js"),
+    ),
+    ("/run.js", "text/javascript", include_bytes!("../ui/run.js")),
+    (
+        "/run-panel.js",
+        "text/javascript",
+        include_bytes!("../ui/run-panel.js"),
+    ),
+    (
+        "/panes.js",
+        "text/javascript",
+        include_bytes!("../ui/panes.js"),
+    ),
+    (
+        "/status.js",
+        "text/javascript",
+        include_bytes!("../ui/status.js"),
+    ),
+    (
+        "/note-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/note-dialog.js"),
+    ),
+    (
+        "/question.js",
+        "text/javascript",
+        include_bytes!("../ui/question.js"),
+    ),
+    (
+        "/icons.svg",
+        "image/svg+xml",
+        include_bytes!("../ui/icons.svg"),
+    ),
+    (
+        "/fonts/Geist-Variable.woff2",
+        "font/woff2",
+        include_bytes!("../ui/fonts/Geist-Variable.woff2"),
+    ),
+    (
+        "/fonts/GeistMono-Variable.woff2",
+        "font/woff2",
+        include_bytes!("../ui/fonts/GeistMono-Variable.woff2"),
+    ),
+];
 
 /// The settings' file name in the configuration directory.
 const SETTINGS_FILE: &str = "settings.json";
@@ -764,29 +822,10 @@ impl Site {
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
         let uri = request.uri();
         let post = *request.method() == Method::POST;
+        if let Some(&(_, kind, body)) = PAGE.iter().find(|(path, ..)| *path == uri.path()) {
+            return reply(StatusCode::OK, kind, body);
+        }
         match uri.path() {
-            "/" => reply(StatusCode::OK, "text/html", INDEX_HTML.as_bytes()),
-            "/app.css" => reply(StatusCode::OK, "text/css", APP_CSS.as_bytes()),
-            "/app.js" => reply(StatusCode::OK, "text/javascript", APP_JS.as_bytes()),
-            "/fuzzy.js" => reply(StatusCode::OK, "text/javascript", FUZZY_JS.as_bytes()),
-            "/tree.js" => reply(StatusCode::OK, "text/javascript", TREE_JS.as_bytes()),
-            "/icons.js" => reply(StatusCode::OK, "text/javascript", ICONS_JS.as_bytes()),
-            "/settings.js" => reply(StatusCode::OK, "text/javascript", SETTINGS_JS.as_bytes()),
-            "/settings-dialog.js" => reply(
-                StatusCode::OK,
-                "text/javascript",
-                SETTINGS_DIALOG_JS.as_bytes(),
-            ),
-            "/run.js" => reply(StatusCode::OK, "text/javascript", RUN_JS.as_bytes()),
-            "/panes.js" => reply(StatusCode::OK, "text/javascript", PANES_JS.as_bytes()),
-            "/run-panel.js" => reply(StatusCode::OK, "text/javascript", RUN_PANEL_JS.as_bytes()),
-            "/status.js" => reply(StatusCode::OK, "text/javascript", STATUS_JS.as_bytes()),
-            "/note-dialog.js" => {
-                reply(StatusCode::OK, "text/javascript", NOTE_DIALOG_JS.as_bytes())
-            }
-            "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
-            "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
-            "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
             "/api/repo" => json_or_error(self.repo_info()),
             "/api/recent" => json_or_error(Ok(self.recent())),
             "/api/open" if post => json_or_error(self.open_folder(request.body(), Repo::open)),
@@ -1291,6 +1330,11 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    // The page's files, as the tests that check its links and colours read them.
+    const INDEX_HTML: &str = include_str!("../ui/index.html");
+    const APP_JS: &str = include_str!("../ui/app.js");
+    const APP_CSS: &str = include_str!("../ui/app.css");
 
     /// A real git working tree in the temporary directory, removed on drop.
     struct TempRepo {
