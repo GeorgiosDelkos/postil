@@ -41,12 +41,13 @@
 //!
 //! # Threads and locks
 //!
-//! Requests from the page run on the main thread, the agent's events on its reader thread,
-//! and an agent's start on a thread of its own. A review's next stage starts on the reader
-//! thread of the stage that ended ([`Runner::advance`]). Three locks, always taken in this
-//! order: the runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`],
-//! which takes no other), then a run's state; no snapshot is taken under a run's state. The
-//! page is told about every change through `notify`, and fetches what it has not seen.
+//! Requests from the page run on one request thread (`shell.rs`), the agent's events on its
+//! reader thread, and an agent's start on a thread of its own. A review's next stage starts
+//! on the reader thread of the stage that ended ([`Runner::advance`]). Three locks, always
+//! taken in this order: the runner's [`Slot`], the repository's snapshot lock (inside
+//! [`Repo::snapshot`], which takes no other), then a run's state; no snapshot is taken under
+//! a run's state. The page is told about every change through `notify`, and fetches what it
+//! has not seen.
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -922,7 +923,7 @@ impl Runner {
         if let Some(run) = run {
             // As a forced Stop does: the agent's exit is not reported, so the snapshot after
             // the run is taken here, or its changes view would stay empty. It runs `git add`
-            // on the closing thread, the main one when the app quits. Both calls do nothing
+            // on the request thread, quitting included. Both calls do nothing
             // for a run that already ended.
             self.record_end_snapshot(&run);
             run.record(Entry::Failed {

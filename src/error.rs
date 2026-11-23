@@ -32,12 +32,21 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// A file is too large to show: over 20 MB, the limit in `repo.rs`.
+    FileTooLarge {
+        /// The file's path on disk.
+        path: PathBuf,
+        /// Its size, in bytes, as far as it was read.
+        bytes: u64,
+    },
     /// The syntax highlighter failed on a file.
     Highlight(tree_sitter_highlight::Error),
     /// The operating system refused to create the window.
     Window(tao::error::OsError),
     /// The system webview could not be created.
     Webview(wry::Error),
+    /// The thread that answers the page's requests could not be started.
+    SpawnWorker(io::Error),
     /// The window was closed before the benchmark page reported its measurements.
     BenchInterrupted,
     /// The page sent a request this process cannot read; the text says why.
@@ -241,9 +250,17 @@ impl fmt::Display for Error {
                 write!(f, "not a relative path inside the repository: {path}")
             }
             Self::Read { path, .. } => write!(f, "cannot read {} as text", path.display()),
+            Self::FileTooLarge { path, bytes } => write!(
+                f,
+                "{} is {} MB, too large to show (the limit is {} MB)",
+                path.display(),
+                bytes.div_ceil(1_000_000),
+                crate::repo::MAX_READ / 1_000_000
+            ),
             Self::Highlight(_) => write!(f, "cannot highlight the file"),
             Self::Window(_) => write!(f, "cannot create the window"),
             Self::Webview(_) => write!(f, "cannot create the webview"),
+            Self::SpawnWorker(_) => write!(f, "cannot start the thread that answers the page"),
             Self::BenchInterrupted => write!(f, "window closed before the benchmark finished"),
             Self::BadRequest(problem) => write!(f, "{problem}"),
             Self::NoSuchNote { id } => write!(f, "there is no note {id}"),
@@ -406,6 +423,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SpawnGit(source)
+            | Self::SpawnWorker(source)
             | Self::Read { source, .. }
             | Self::ReadReview { source, .. }
             | Self::WriteReview { source, .. }
@@ -423,6 +441,7 @@ impl std::error::Error for Error {
             Self::Webview(source) => Some(source),
             Self::Git { .. }
             | Self::OutsideRepository { .. }
+            | Self::FileTooLarge { .. }
             | Self::BenchInterrupted
             | Self::BadRequest(_)
             | Self::NoSuchNote { .. }

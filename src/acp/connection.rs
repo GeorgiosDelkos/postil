@@ -395,7 +395,7 @@ struct Process {
     /// the moment the drop starts reaping it.
     group: Arc<Mutex<Option<u32>>>,
     /// Lines for the writer thread to send. A channel rather than a locked `ChildStdin`, so a
-    /// caller on the main thread never blocks on an agent that stopped reading.
+    /// caller on the request thread never blocks on an agent that stopped reading.
     outbox: Sender<String>,
     shared: Arc<Shared>,
 }

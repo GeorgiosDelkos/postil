@@ -5,8 +5,8 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, Result};
+
+/// The largest file [`Repo::read`] reads, in bytes: 20 MB, the owner's choice (2026-11-23).
+/// Larger files are refused rather than shown: the page holds every line of the open file,
+/// and a file of hundreds of megabytes is held several times over (the text, its tokens,
+/// their JSON) while the request thread works on it.
+pub(crate) const MAX_READ: u64 = 20_000_000;
 
 /// A git working tree on disk.
 #[derive(Debug)]
@@ -325,6 +331,12 @@ impl Repo {
 
     /// Reads one file as text. `file` is a path relative to the root, as [`Repo::files`]
     /// returns it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutsideRepository`] for a path that leaves the root, [`Error::FileTooLarge`]
+    /// above [`MAX_READ`] bytes, and [`Error::Read`] when the file cannot be read as UTF-8
+    /// text.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
         // The path comes from the page. Only plain components are allowed, so the path itself
         // cannot climb above the root (`..`) or be absolute. A symlink inside the tree is
@@ -339,7 +351,21 @@ impl Repo {
         }
 
         let path = self.root.join(file);
-        fs::read_to_string(&path).map_err(|source| Error::Read { path, source })
+        // One byte past the limit is read, so a file that grew past it since it was listed
+        // is still refused, and memory stays bounded whatever its size.
+        let mut text = String::new();
+        let read = File::open(&path)
+            .and_then(|opened| opened.take(MAX_READ + 1).read_to_string(&mut text));
+        match read {
+            Ok(bytes) if bytes as u64 > MAX_READ => {
+                // The size on disk says how far past the limit it is; the bytes read are a
+                // floor when the file cannot be measured.
+                let bytes = fs::metadata(&path).map_or(MAX_READ + 1, |metadata| metadata.len());
+                Err(Error::FileTooLarge { path, bytes })
+            }
+            Ok(_) => Ok(text),
+            Err(source) => Err(Error::Read { path, source }),
+        }
     }
 }
 

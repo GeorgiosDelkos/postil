@@ -13,8 +13,10 @@ use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::{self, SendError, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +27,7 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode, Uri};
-use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
+use wry::{DragDropEvent, PageLoadEvent, RequestAsyncResponder, WebView, WebViewBuilder};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::dialog;
@@ -149,8 +151,8 @@ pub struct BenchReport {
 ///
 /// # Errors
 ///
-/// Fails when `dir` is not inside a git working tree, when the home directory is unknown,
-/// or when the window or the webview cannot be created.
+/// Fails when `dir` is not inside a git working tree, or when the window, the webview or the
+/// thread that answers the page cannot be created.
 pub fn run(dir: Option<&Path>) -> Result<()> {
     serve(dir, None).map(|_| ())
 }
@@ -167,8 +169,8 @@ pub fn bench(dir: &Path, file: &str) -> Result<BenchReport> {
     serve(Some(dir), Some(file))?.ok_or(Error::BenchInterrupted)
 }
 
-/// What reaches the event loop: the page's messages (through `window.ipc.postMessage`) and
-/// folders dropped on the window.
+/// What reaches the event loop: the page's messages (through `window.ipc.postMessage`),
+/// folders dropped on the window, menu commands, and a nudge when a run changed.
 #[derive(Debug)]
 enum AppEvent {
     /// The pointer went down on the window's drag strip.
@@ -240,7 +242,7 @@ fn start_site(dir: Option<&Path>, bench: Option<&str>, notify: Notify) -> Result
 fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
     let started = Instant::now();
     let mut event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
-    let run_proxy = Mutex::new(event_loop.create_proxy());
+    let run_proxy = event_loop.create_proxy();
     // Set from a nudge until the page is told: an agent streams its reply in many small
     // parts, and the page fetches everything new at once, so one call covers them all.
     let nudged = Arc::new(AtomicBool::new(false));
@@ -252,10 +254,11 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         // swap that read `true` came before the store, and the fetch after it.
         if !nudged.swap(true, Ordering::SeqCst) {
             // Fails only once the event loop is gone, when no page is left to tell.
-            drop(lock(&run_proxy).send_event(AppEvent::RunChanged));
+            drop(run_proxy.send_event(AppEvent::RunChanged));
         }
     });
     let (site, settings) = start_site(dir, bench, notify)?;
+    let (requests, worker) = spawn_site_worker(site)?;
 
     let window = build_window(&event_loop, settings.theme)?;
 
@@ -273,7 +276,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     };
 
     let committed = Rc::new(Cell::new(false));
-    let webview = build_webview(&event_loop, &window, site, Rc::clone(&committed))?;
+    let webview = build_webview(&event_loop, &window, requests, Rc::clone(&committed))?;
 
     let page = Page {
         webview: &webview,
@@ -351,10 +354,42 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         }
     });
 
-    // The webview draws into the window, so it goes first.
+    // The webview draws into the window, so it goes first. It holds the only sender of
+    // requests, so the worker then finishes the request it is on and stops.
     drop(webview);
     drop(window);
+    // The site is dropped on the worker, and its drop stops the agent of a run under way.
+    // Waiting for it keeps the process alive until that agent is gone. A worker that
+    // panicked has printed why; there is nothing more to do about it here.
+    drop(worker.join());
     Ok(report)
+}
+
+/// A request from the page and the way to answer it, as wry hands them over.
+type Asked = (Request<Vec<u8>>, RequestAsyncResponder);
+
+/// Starts the thread that answers the page's requests: it owns `site`, answers each request
+/// in the order it arrives, and drops `site` once every sender is gone.
+///
+/// wry calls the URL scheme handler on the main thread, and answering there would stop the
+/// window (input, redraws, Stop) for as long as git, a file read or highlighting takes, so
+/// the handler only queues the request. One thread rather than one per request: the page
+/// relies on order (`api/open`, then `api/repo`), and requests answered one at a time never
+/// contend for `Site`'s lock. The queue is unbounded: its sender is the page's fetches, a
+/// handful at a time, and a bounded queue that filled up would block the main thread.
+/// WebKit's scheme task may be answered from any thread (wry's `RequestAsyncResponder`
+/// exists for that).
+fn spawn_site_worker(site: Site) -> Result<(Sender<Asked>, JoinHandle<()>)> {
+    let (sender, asked) = mpsc::channel::<Asked>();
+    let worker = thread::Builder::new()
+        .name("page-requests".to_owned())
+        .spawn(move || {
+            for (request, responder) in asked {
+                responder.respond(site.respond(&request));
+            }
+        })
+        .map_err(Error::SpawnWorker)?;
+    Ok((sender, worker))
 }
 
 /// Which drags over the window are the app's. A drag that carries files is: the webview
@@ -419,12 +454,13 @@ fn offer_folder(webview: &WebView, folder: &Path) {
     drop(webview.evaluate_script(&format!("window.postil?.openFolder({path})")));
 }
 
-/// The webview that shows the page in `window`, served by `site`. It sets `committed` once
-/// the page's first navigation commits (see [`Page`]).
+/// The webview that shows the page in `window`, its requests sent to `requests` (see
+/// [`spawn_site_worker`]). It sets `committed` once the page's first navigation commits (see
+/// [`Page`]).
 fn build_webview(
     event_loop: &EventLoop<AppEvent>,
     window: &Window,
-    site: Site,
+    requests: Sender<Asked>,
     committed: Rc<Cell<bool>>,
 ) -> Result<WebView> {
     let page_proxy = event_loop.create_proxy();
@@ -432,8 +468,17 @@ fn build_webview(
     let file_drag = RefCell::new(FileDrag::default());
     WebViewBuilder::new()
         .with_background_color(canvas_color(window.theme()))
-        .with_custom_protocol("postil".to_owned(), move |_webview, request| {
-            site.respond(&request)
+        .with_asynchronous_custom_protocol("postil".to_owned(), move |_webview, request, answer| {
+            // Fails only when the worker is gone, which it is only after a panic: the request
+            // is then answered here, so the page shows an error instead of waiting forever.
+            if let Err(SendError((_, answer))) = requests.send((request, answer)) {
+                let problem = "the thread that answers the page stopped; restart Postil";
+                answer.respond(reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "text/plain",
+                    problem.as_bytes(),
+                ));
+            }
         })
         .with_ipc_handler(move |message| {
             let event = AppEvent::parse(message.body());
@@ -596,14 +641,14 @@ fn build_window(event_loop: &EventLoop<AppEvent>, theme: settings::Theme) -> Res
 
 /// Everything the page can ask for.
 ///
-/// The URL scheme handler must be `Send + Sync`, so the open project sits behind a mutex.
-/// The lock is held only to replace the project or clone it out, never across a `git` call
-/// or a file read, and the project is replaced whole, so the state is valid after any panic.
-/// wry calls the handler on the main thread, one request at a time, so the lock is never
-/// contended; it is there for the bound.
+/// One thread owns it and answers the requests one at a time ([`spawn_site_worker`]). The open
+/// project still sits behind a mutex, which is never contended: requests take `&self`, and a
+/// `Mutex` keeps `Site` `Send` as the worker needs. The lock is held only to replace the
+/// project or clone it out, never across a `git` call or a file read, and the project is
+/// replaced whole, so the state is valid after any panic.
 struct Site {
     /// The open project, if any.
-    project: Mutex<Option<Project>>,
+    project: RefCell<Option<Project>>,
     highlighter: Highlighter,
     /// The file the benchmark opens, when this is a benchmark run.
     bench: Option<String>,
@@ -802,18 +847,13 @@ struct FileView<'a> {
 
 type Reply = Response<Cow<'static, [u8]>>;
 
-/// Locks one of `Site`'s mutexes. Poisoning is ignored: every value is replaced whole, so a
-/// panic elsewhere cannot leave one half-written.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-// The webview owns the site and drops it when the window closes. A runner whose agent is
-// still starting is also held by its start thread, so dropping the project alone would not
-// stop that agent: the site stops it here, and quitting leaves no agent behind.
+// The request thread owns the site and drops it once the webview is gone, and `serve` waits
+// for that. A runner whose agent is still starting is also held by its start thread, so
+// dropping the project alone would not stop that agent: the site stops it here, and quitting
+// leaves no agent behind.
 impl Drop for Site {
     fn drop(&mut self) {
-        if let Some(project) = lock(&self.project).take() {
+        if let Some(project) = self.project.borrow_mut().take() {
             project.runner.close();
         }
     }
@@ -824,7 +864,7 @@ impl Site {
     /// list and the settings off).
     fn new(config: Option<&Path>, bench: Option<&str>, agents: Scanner, notify: Notify) -> Self {
         Self {
-            project: Mutex::new(None),
+            project: RefCell::new(None),
             highlighter: Highlighter::new(),
             bench: bench.map(str::to_owned),
             recent_file: config.map(|dir| dir.join("recent.json")),
@@ -837,7 +877,8 @@ impl Site {
 
     /// The open project's repository.
     fn repo(&self) -> Result<Arc<Repo>> {
-        lock(&self.project)
+        self.project
+            .borrow()
             .as_ref()
             .map(|project| Arc::clone(&project.repo))
             .ok_or(Error::NoProject)
@@ -850,17 +891,17 @@ impl Site {
     /// the kept agent: the page only reloads. Opening another one stops the open project's
     /// agent, and `live` says whether to do that during a run (decided with the owner on
     /// 2026-11-23: the page asks first). No page request starts a run between the check and
-    /// the switch, because requests are answered one at a time (`respond` runs on the main
-    /// thread); a review's next stage, which starts without one, counts as under way
-    /// ([`Runner::busy`]). Takes the runner's slot lock under the project's; nothing takes
-    /// them the other way round.
+    /// the switch, because requests are answered one at a time, on one thread
+    /// ([`spawn_site_worker`]); a review's next stage, which starts without one, counts as
+    /// under way ([`Runner::busy`]). Takes the runner's slot lock while it borrows the
+    /// project; the runner never reaches back into the site.
     ///
     /// # Errors
     ///
     /// [`Error::RunInOpenProject`] when `live` is [`LiveRun::Refuse`], `repo` is another
     /// project, and the open project has a run or a review under way.
     fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
-        let mut project = lock(&self.project);
+        let mut project = self.project.borrow_mut();
         let open = project.as_ref();
         let same = open.is_some_and(|open| open.repo.root() == repo.root());
         if !same && matches!(live, LiveRun::Refuse) && open.is_some_and(|open| open.runner.busy()) {
@@ -987,7 +1028,7 @@ impl Site {
 
     /// The open project, or `null`: the page then shows the welcome screen.
     fn repo_info(&self) -> Result<Vec<u8>> {
-        let Some(Project { repo, warning, .. }) = lock(&self.project).clone() else {
+        let Some(Project { repo, warning, .. }) = self.project.borrow().clone() else {
             return Ok(b"null".to_vec());
         };
         let info = RepoInfo {
@@ -1003,8 +1044,8 @@ impl Site {
 
     fn recent(&self) -> Vec<u8> {
         let listed = self.recent_file.as_deref().map(recent::list);
-        // `exists` checks each folder on the main thread. A folder on a network volume that is
-        // gone can make that slow; accepted, as ten checks on local disks take microseconds.
+        // `exists` checks each folder on the request thread. A folder on a network volume that
+        // is gone can make that slow; accepted, as ten checks on local disks take microseconds.
         let projects: Vec<RecentProject> = listed
             .unwrap_or_default()
             .into_iter()
@@ -1207,7 +1248,8 @@ impl Site {
 
     /// The open project's runner.
     fn runner(&self) -> Result<Arc<Runner>> {
-        lock(&self.project)
+        self.project
+            .borrow()
             .as_ref()
             .map(|project| Arc::clone(&project.runner))
             .ok_or(Error::NoProject)
@@ -1444,14 +1486,18 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AgentExited { .. }
                 | Error::AgentRefused { .. }
                 | Error::AgentProtocol(_) => StatusCode::BAD_GATEWAY,
-                // The page tells this one apart: it offers to make the folder a repository.
-                Error::NotARepository { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+                // Well-formed requests for what cannot be done. The page tells a missing
+                // repository apart: it offers to make the folder one.
+                Error::NotARepository { .. } | Error::FileTooLarge { .. } => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }
                 | Error::Highlight(_)
                 | Error::Window(_)
                 | Error::Webview(_)
+                | Error::SpawnWorker(_)
                 | Error::BenchInterrupted
                 | Error::ReadReview { .. }
                 | Error::ParseReview { .. }
@@ -1522,7 +1568,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::mpsc;
+    use std::sync::Mutex;
     use std::time::Instant;
 
     use super::*;
@@ -2646,6 +2692,26 @@ mod tests {
     }
 
     #[test]
+    fn a_file_over_the_read_limit_is_refused_with_its_size_and_one_at_it_is_shown() {
+        let repo = TempRepo::new("file-too-large");
+        let limit = usize::try_from(crate::repo::MAX_READ).expect("20 MB fits a usize");
+        repo.write("at.txt", &"x".repeat(limit));
+        repo.write("over.txt", &"x".repeat(limit + 1));
+        let site = repo.site();
+
+        let (status, body) = get(&site, "postil://localhost/api/file?path=at.txt");
+        assert_eq!(status, StatusCode::OK, "at the limit the file is shown");
+        assert!(body.starts_with(r#"{"path":"at.txt""#), "{}", &body[..40]);
+
+        let (status, body) = get(&site, "postil://localhost/api/file?path=over.txt");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.contains("over.txt is 21 MB, too large to show"),
+            "{body}"
+        );
+    }
+
+    #[test]
     fn file_outside_the_repository_is_refused() {
         let repo = TempRepo::new("outside");
         let site = repo.site();
@@ -3124,7 +3190,7 @@ mod tests {
             Some(&repo.config()),
             None,
             Scanner::new(move || {
-                let mut scans = lock(&counter);
+                let mut scans = counter.lock().unwrap();
                 *scans += 1;
                 if *scans == 1 {
                     first_path.clone()
@@ -3178,14 +3244,14 @@ mod tests {
             .map(|agent| &agent["found"])
             .collect();
         assert!(found.iter().all(|found| found.is_null()), "{rescanned}");
-        assert_eq!(*lock(&scans), 2);
+        assert_eq!(*scans.lock().unwrap(), 2);
 
         // Reset and rescan change state, so they take POST only.
         for route in ["api/settings/reset", "api/agents/rescan"] {
             let (status, _) = get(&site, &format!("postil://localhost/{route}"));
             assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{route}");
         }
-        assert_eq!(*lock(&scans), 2, "a refused rescan does not scan");
+        assert_eq!(*scans.lock().unwrap(), 2, "a refused rescan does not scan");
         assert_eq!(
             get_json(&site, SETTINGS)["settings"],
             custom_settings(),
