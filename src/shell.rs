@@ -145,7 +145,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         drop(closed.send_event(AppEvent::SiteClosed));
     })?;
 
-    let window = build_window(&event_loop, settings.theme)?;
+    let window = build_window(&event_loop, settings.theme())?;
 
     // The menu bar lives as long as this function, which is as long as the app.
     #[cfg(target_os = "macos")]

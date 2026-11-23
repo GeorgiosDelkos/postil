@@ -30,14 +30,23 @@ pub(crate) const SIDEBAR: RangeInclusive<u32> = 200..=480;
 /// window.
 pub(crate) const TRAY: RangeInclusive<u32> = 280..=720;
 
-/// The pane widths. The code pane takes what is left of the window.
-#[derive(Debug, Serialize, Deserialize)]
+/// The pane widths, each within its range: made only from a [`RawLayout`] that passes the
+/// check, or as the default, so a width out of range never reaches the file or the page. The
+/// code pane takes what is left of the window.
+#[derive(Debug, Serialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Layout {
-    /// The file list's width in CSS px.
+    /// The file list's width in CSS px, within [`SIDEBAR`].
     sidebar: u32,
-    /// The tray's width in CSS px.
+    /// The tray's width in CSS px, within [`TRAY`].
+    tray: u32,
+}
+
+/// The pane widths as the page sends them, before they are checked.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawLayout {
+    sidebar: u32,
     tray: u32,
 }
 
@@ -51,9 +60,11 @@ impl Default for Layout {
     }
 }
 
-impl Layout {
-    /// Checks the widths against [`SIDEBAR`] and [`TRAY`]; the error says which is out.
-    fn check(&self) -> std::result::Result<(), String> {
+impl TryFrom<RawLayout> for Layout {
+    /// Which width is out of its range, in words for the page.
+    type Error = String;
+
+    fn try_from(raw: RawLayout) -> std::result::Result<Self, Self::Error> {
         let within = |name: &str, width: u32, range: &RangeInclusive<u32>| {
             if range.contains(&width) {
                 Ok(())
@@ -65,8 +76,10 @@ impl Layout {
                 ))
             }
         };
-        within("file list", self.sidebar, &SIDEBAR)?;
-        within("tray", self.tray, &TRAY)
+        let RawLayout { sidebar, tray } = raw;
+        within("file list", sidebar, &SIDEBAR)?;
+        within("tray", tray, &TRAY)?;
+        Ok(Self { sidebar, tray })
     }
 }
 
@@ -80,17 +93,11 @@ struct LayoutFile {
 
 /// The layout in `file`, or the default when there is none this build can use (module docs).
 pub(crate) fn load(file: &Path) -> Layout {
-    let layout = match load_versioned::<LayoutFile>(file, VERSION) {
-        Stored::Current(stored) => Layout {
-            sidebar: stored.sidebar,
-            tray: stored.tray,
-        },
-        Stored::Newer | Stored::Nothing => return Layout::default(),
-    };
-    if layout.check().is_ok() {
-        layout
-    } else {
-        Layout::default()
+    match load_versioned::<LayoutFile>(file, VERSION) {
+        Stored::Current(LayoutFile { sidebar, tray, .. }) => {
+            Layout::try_from(RawLayout { sidebar, tray }).unwrap_or_default()
+        }
+        Stored::Newer | Stored::Nothing => Layout::default(),
     }
 }
 
@@ -98,10 +105,8 @@ pub(crate) fn load(file: &Path) -> Layout {
 ///
 /// # Errors
 ///
-/// [`Error::BadRequest`] when a width is out of range; [`Error::WriteLayout`] when the file
-/// cannot be written.
+/// [`Error::WriteLayout`] when the file cannot be written.
 pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
-    layout.check().map_err(Error::BadRequest)?;
     if matches!(load_versioned::<LayoutFile>(file, VERSION), Stored::Newer) {
         return Ok(());
     }
@@ -131,10 +136,11 @@ mod tests {
     #[test]
     fn a_saved_layout_is_read_back_and_the_file_is_readable_json() {
         let file = temp_file("round");
-        let layout = Layout {
+        let layout = Layout::try_from(RawLayout {
             sidebar: 300,
             tray: 460,
-        };
+        })
+        .unwrap();
         save(&file, &layout).unwrap();
         assert_eq!(load(&file), layout);
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
@@ -148,22 +154,27 @@ mod tests {
     #[test]
     fn widths_outside_their_range_are_refused_and_their_limits_allowed() {
         let file = temp_file("range");
-        let with = |sidebar, tray| Layout { sidebar, tray };
-        for (sidebar, tray, words) in [
-            (199, 320, "file list"),
-            (481, 320, "file list"),
-            (248, 279, "tray"),
-            (248, 721, "tray"),
+        let with = |sidebar, tray| Layout::try_from(RawLayout { sidebar, tray });
+        for (sidebar, tray, expected) in [
+            (
+                199,
+                320,
+                "the file list is 199 px wide, outside 200 to 480 px",
+            ),
+            (
+                481,
+                320,
+                "the file list is 481 px wide, outside 200 to 480 px",
+            ),
+            (248, 279, "the tray is 279 px wide, outside 280 to 720 px"),
+            (248, 721, "the tray is 721 px wide, outside 280 to 720 px"),
         ] {
-            match save(&file, &with(sidebar, tray)) {
-                Err(Error::BadRequest(problem)) => assert!(problem.contains(words), "{problem}"),
-                other => panic!("{sidebar}/{tray}: expected BadRequest, got {other:?}"),
-            }
+            assert_eq!(with(sidebar, tray), Err(expected.to_owned()));
         }
-        assert!(!file.exists(), "nothing refused was written");
-        save(&file, &with(200, 280)).unwrap();
-        save(&file, &with(480, 720)).unwrap();
-        assert_eq!(load(&file), with(480, 720));
+        save(&file, &with(200, 280).unwrap()).unwrap();
+        assert_eq!(load(&file), with(200, 280).unwrap());
+        save(&file, &with(480, 720).unwrap()).unwrap();
+        assert_eq!(load(&file), with(480, 720).unwrap());
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
@@ -181,10 +192,11 @@ mod tests {
             fs::write(&file, contents).unwrap();
             assert_eq!(load(&file), Layout::default(), "{contents}");
         }
-        let layout = Layout {
+        let layout = Layout::try_from(RawLayout {
             sidebar: 200,
-            ..Layout::default()
-        };
+            tray: 320,
+        })
+        .unwrap();
         save(&file, &layout).unwrap();
         assert_eq!(load(&file), layout);
         drop(fs::remove_dir_all(file.parent().unwrap()));

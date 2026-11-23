@@ -19,12 +19,12 @@ use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{Highlighter, Token};
-use crate::layout::{self, Layout};
+use crate::layout::{self, Layout, RawLayout};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
 use crate::run::{Notify, Runner};
-use crate::settings::{self, Settings};
+use crate::settings::{self, RawSettings, Settings};
 
 /// The page's files, served at these paths with these types: compiled into the binary as
 /// they are, so the app needs no files beside it. A module the page imports must be listed
@@ -220,7 +220,7 @@ fn startup_repo(
     if let Some(dir) = dir {
         return Repo::open(dir).map(Some);
     }
-    if !settings.reopen_last_project {
+    if !settings.reopen_last_project() {
         return Ok(None);
     }
     let recent = recent_file.map_or_else(Vec::new, recent::list);
@@ -310,7 +310,7 @@ struct SettingsView<'a> {
 struct SaveSettings {
     /// The revision of the settings file the change started from.
     revision: String,
-    settings: Settings,
+    settings: RawSettings,
 }
 
 /// An agent as the settings dialog lists it.
@@ -814,9 +814,12 @@ impl Site {
     /// The reply to `PUT /api/layout`: saves the widths in the body and answers `{}`; the
     /// page already holds what it sent.
     fn save_layout(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let layout: Layout = serde_json::from_slice(body)
+        let layout: RawLayout = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable layout: {error}")))?;
         let file = self.layout_file.as_deref().ok_or(Error::NoHome)?;
+        // Checked here, not by serde: a serde error would carry a line and column and the
+        // "unreadable layout" prefix, and the page shows this message as it is.
+        let layout = Layout::try_from(layout).map_err(Error::BadRequest)?;
         layout::save(file, &layout)?;
         Ok(b"{}".to_vec())
     }
@@ -886,7 +889,7 @@ impl Site {
         // Loaded once, so every reviewer is checked against the same revision of the file.
         let settings = self.current_settings();
         let reviewers = settings
-            .reviewers
+            .reviewers()
             .iter()
             .map(|name| settings.chosen_agent(name))
             .collect::<Result<Vec<_>>>()?;
@@ -961,7 +964,9 @@ impl Site {
         let request: SaveSettings = serde_json::from_slice(body)
             .map_err(|error| Error::InvalidSettings(format!("unreadable request: {error}")))?;
         let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
-        settings::save(file, &request.settings, &request.revision)?;
+        // Checked here, not by serde, for the same reason as `save_layout`.
+        let settings = Settings::try_from(request.settings).map_err(Error::InvalidSettings)?;
+        settings::save(file, &settings, &request.revision)?;
         Ok(self.settings())
     }
 
@@ -999,7 +1004,7 @@ fn agent_views<'a>(settings: &'a Settings, search_path: &OsStr) -> Vec<AgentView
         built_in: true,
         found: found(Some(agent.program)),
     });
-    let custom = settings.custom_agents.iter().map(|agent| AgentView {
+    let custom = settings.custom_agents().iter().map(|agent| AgentView {
         name: &agent.name,
         command: &agent.command,
         built_in: false,

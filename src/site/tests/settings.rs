@@ -61,6 +61,23 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
 }
 
 #[test]
+fn a_refused_save_names_the_broken_rule_and_nothing_else() {
+    let repo = TempRepo::new("settings-refused-message");
+    let site = repo.empty_site();
+    let mut settings = custom_settings();
+    settings["tabWidth"] = 3.into();
+
+    let (status, reply) = save(&site, &settings.to_string());
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The whole message, as the dialog shows it: no serde position, no "unreadable" prefix.
+    assert_eq!(
+        reply,
+        "cannot save the settings: the tab width must be 2, 4 or 8, not 3"
+    );
+}
+
+#[test]
 fn settings_that_break_a_rule_are_refused_and_nothing_is_written() {
     let repo = TempRepo::new("settings-refused");
     let site = repo.empty_site();
@@ -461,6 +478,10 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         (300.into(), 460.into())
     );
 
+    // The whole message, as the page shows it: no serde position, no "unreadable" prefix.
+    let (status, reply) = put(&site, LAYOUT, r#"{"sidebar": 248, "tray": 900}"#);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply, "the tray is 900 px wide, outside 280 to 720 px");
     for (body, words) in [
         (r#"{"sidebar": 100, "tray": 320}"#, "outside 200 to 480"),
         (r#"{"sidebar": 248}"#, "unreadable layout"),
@@ -479,6 +500,26 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         "a refused layout changes nothing"
     );
     assert_eq!(post(&site, LAYOUT, "{}").0, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[test]
+fn a_hand_edited_layout_with_a_width_out_of_range_reads_as_the_defaults() {
+    let repo = TempRepo::new("layout-hand-edit");
+    let site = repo.empty_site();
+    fs::create_dir_all(repo.config()).unwrap();
+    fs::write(
+        repo.config().join("layout.json"),
+        r#"{"version": 1, "sidebar": 10, "tray": 460}"#,
+    )
+    .unwrap();
+
+    let layout = get_json(&site, LAYOUT);
+
+    assert_eq!(
+        (layout["sidebar"].clone(), layout["tray"].clone()),
+        (248.into(), 320.into()),
+        "both widths are the defaults, not only the one out of range"
+    );
 }
 
 #[test]
