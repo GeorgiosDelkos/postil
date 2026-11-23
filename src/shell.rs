@@ -4956,6 +4956,35 @@ mod tests {
     }
 
     #[test]
+    fn a_line_over_the_limit_is_reported_and_the_run_goes_on() {
+        let repo = TempRepo::new("run-long-line");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "long-line");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let run = wait_for_run(&site, &nudges, "R1");
+        assert_eq!(run["status"], "ended", "{}", run["status"]);
+        let problem = first_of_kind(&run, "unreadable")["problem"].clone();
+        assert!(
+            problem
+                .as_str()
+                .unwrap()
+                .starts_with("a line longer than 1048576 bytes, skipped: xxx"),
+            "{problem}"
+        );
+        let kinds = kinds(&run);
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == "unreadable").count(),
+            1,
+            "the rest of the long line is skipped, not read as a line: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"message:after the long line".to_owned()),
+            "the line after it is read whole"
+        );
+    }
+
+    #[test]
     fn a_kept_agent_that_exited_is_started_again() {
         let repo = TempRepo::new("run-dead-kept");
         repo.write("a.txt", "a\n");

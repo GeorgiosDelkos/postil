@@ -291,6 +291,12 @@ async function prompt(id, params) {
       say(`bad permission answered ${fs.error?.code}`);
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "long-line":
+      // 1.5 MiB with no newline until the end: over the line limit the tests build with
+      // (`LINE_LIMIT` in src/acp/connection.rs), and so is a message.
+      process.stdout.write(`${"x".repeat(3 << 19)}\n`);
+      say("after the long line");
+      return send({ id, result: { stopReason: "end_turn" } });
     case "odd-error":
       // An error object without a code, though JSON-RPC requires one.
       return send({ id, error: { message: "no code here" } });

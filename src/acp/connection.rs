@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -35,6 +35,13 @@ const STDERR_TAIL: usize = 4096;
 /// the pipe open would otherwise hold the reader forever. Arbitrary: a process that exits
 /// closes both pipes within microseconds.
 const STDERR_GRACE: Duration = Duration::from_secs(1);
+
+/// The longest line of the agent's output that is read, in bytes, newline included; a longer
+/// one is skipped and reported, so an agent that never ends a line cannot grow the app's
+/// memory without bound. Arbitrary: far above a message that carries a source file's whole
+/// diff, before and after. Tests use a smaller one, to cross it cheaply; the logic does not
+/// depend on the value.
+const LINE_LIMIT: usize = if cfg!(test) { 1 << 20 } else { 64 << 20 };
 
 /// What starts an agent.
 #[derive(Debug)]
@@ -607,11 +614,27 @@ impl<F: FnMut(Event)> Reader<F> {
     fn run(mut self, stdout: impl Read, stderr_closed: &Receiver<()>) {
         let mut stdout = BufReader::new(stdout);
         let mut line = Vec::new();
+        // `read_until` and `skip_until` retry a read that a signal interrupted, so an error
+        // here is a real one, and ends the agent's output as its end does.
+        let limit = u64::try_from(LINE_LIMIT).expect("the line limit fits in u64");
         loop {
             line.clear();
-            match stdout.read_until(b'\n', &mut line) {
+            match (&mut stdout).take(limit).read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
+            }
+            // Cut off at the limit before its newline. A line of exactly the limit at the end
+            // of the output, with no newline, reads as too long too: no agent ends that way.
+            if line.len() == LINE_LIMIT && line.last() != Some(&b'\n') {
+                let start = String::from_utf8_lossy(&line[..LINE_LIMIT.min(1024)]).into_owned();
+                if stdout.skip_until(b'\n').is_err() {
+                    break;
+                }
+                self.emit(Event::Unreadable(format!(
+                    "a line longer than {LINE_LIMIT} bytes, skipped: {}",
+                    excerpt(&start)
+                )));
+                continue;
             }
             // Invalid UTF-8 cannot be JSON; the lossy text still names the line in the error.
             let text = String::from_utf8_lossy(&line);
@@ -893,7 +916,15 @@ fn write_lines(mut stdin: ChildStdin, lines: &Receiver<String>) {
 /// from blocking on a full pipe.
 fn keep_tail(mut stderr: impl Read, tail: &Mutex<Vec<u8>>) {
     let mut buffer = [0; 4096];
-    while let Ok(read @ 1..) = stderr.read(&mut buffer) {
+    loop {
+        let read = match stderr.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => read,
+            // A signal cut the read short: stopping here would leave the pipe unread, and an
+            // agent that fills it blocks.
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
         let mut tail = lock(tail);
         tail.extend_from_slice(&buffer[..read]);
         let excess = tail.len().saturating_sub(STDERR_TAIL);
@@ -1330,6 +1361,28 @@ mod tests {
         let kept = tail.into_inner().unwrap();
         assert_eq!(kept.len(), STDERR_TAIL);
         assert!(kept.ends_with(b"the end"));
+    }
+
+    #[test]
+    fn standard_error_is_read_on_after_a_read_a_signal_interrupted() {
+        // A signal on a real pipe cannot be timed into a read, so the read is made to fail.
+        let interrupted = std::io::Error::from(ErrorKind::Interrupted);
+        let stderr = Read::chain(
+            Read::chain(&b"before "[..], InterruptedOnce(Some(interrupted))),
+            &b"after"[..],
+        );
+        let tail = Mutex::new(Vec::new());
+        keep_tail(stderr, &tail);
+        assert_eq!(tail.into_inner().unwrap(), b"before after");
+    }
+
+    /// A reader whose first read fails with its error, and whose later reads end the input.
+    struct InterruptedOnce(Option<std::io::Error>);
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.0.take().map_or(Ok(0), Err)
+        }
     }
 
     #[test]
