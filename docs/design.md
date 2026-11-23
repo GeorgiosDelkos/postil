@@ -727,7 +727,10 @@ retired; the measured numbers above are the baseline to not regress.
    hardened runtime (one exception: Apple Events, which agents Postil starts send as Postil) and
    notarizes and staples it, from a Developer ID certificate and a notarytool keychain profile
    holding an App Store Connect API key, both named in environment variables, so no credential
-   is in the repository; `scripts/install.sh` runs it when they are set. Not yet: a published release.
+   is in the repository; `scripts/install.sh` runs it when they are set.
+   `.github/workflows/release.yml` does the same in CI from a `v*` tag, with the secrets of
+   the `release` environment that GeorgiosDelkos/vigil's release uses, and publishes a zip of
+   the app (Apple Silicon only, the runner's architecture).
 
 ## Testing
 

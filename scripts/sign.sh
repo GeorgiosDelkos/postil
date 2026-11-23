@@ -12,6 +12,8 @@
 #                          API key with `xcrun notarytool store-credentials NAME --key
 #                          AuthKey_XXXX.p8 --key-id ID --issuer ISSUER`; the key then lives in
 #                          the keychain, and the .p8 file can go. Without it, it signs only.
+#   POSTIL_NOTARY_KEYCHAIN the keychain that holds that profile, when it is not the default
+#                          one: the release workflow keeps its own for one run.
 set -euo pipefail
 
 usage="usage: scripts/sign.sh [APP]"
@@ -60,12 +62,15 @@ if [[ -z "${POSTIL_NOTARY_PROFILE:-}" ]]; then
   exit 0
 fi
 
+profile=(--keychain-profile "$POSTIL_NOTARY_PROFILE")
+if [[ -n "${POSTIL_NOTARY_KEYCHAIN:-}" ]]; then
+  profile+=(--keychain "$POSTIL_NOTARY_KEYCHAIN")
+fi
 work="$(mktemp -d)"
 trap 'trash "$work"' EXIT
 # notarytool takes a zip, a disk image or a package, not a bare bundle.
 ditto -c -k --keepParent "$app" "$work/Postil.zip"
-xcrun notarytool submit "$work/Postil.zip" \
-  --keychain-profile "$POSTIL_NOTARY_PROFILE" \
+xcrun notarytool submit "$work/Postil.zip" "${profile[@]}" \
   --wait --output-format json >"$work/submission.json"
 # notarytool can exit 0 with a rejected submission, so its status is read, and on a rejection
 # Apple's log says why.
@@ -73,7 +78,7 @@ status="$(plutil -extract status raw -o - "$work/submission.json")"
 if [[ "$status" != "Accepted" ]]; then
   id="$(plutil -extract id raw -o - "$work/submission.json")"
   echo "notarization $id: $status" >&2
-  xcrun notarytool log "$id" --keychain-profile "$POSTIL_NOTARY_PROFILE" >&2
+  xcrun notarytool log "$id" "${profile[@]}" >&2
   exit 1
 fi
 # Stapling puts the notarization ticket in the bundle, so Gatekeeper accepts it offline too.
