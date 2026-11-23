@@ -3680,22 +3680,25 @@ mod tests {
 
     #[test]
     fn a_damaged_run_counter_is_repaired_by_the_next_run() {
-        let repo = TempRepo::new("run-counter");
-        repo.write("a.txt", "a\nb\n");
-        let runs = repo.root.join(".git/postil/runs");
-        fs::create_dir_all(&runs).unwrap();
-        // A tail a crash left, not even UTF-8, which never parses: it reads as no number.
-        fs::write(runs.join("active.lock"), b"5\0\xff").unwrap();
-        let (site, nudges) = run_site(&repo, "plain");
-        post_note(&site, "a.txt", 1, 1, "one");
-        post_note(&site, "a.txt", 2, 2, "two");
-        send(&site, &["N1"]);
-        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R1");
+        // A crash leaves a zero-filled tail; damage from outside can leave bytes that are not
+        // UTF-8. Neither parses, so both read as no number.
+        for (case, damage) in [("zeros", &b"5\0\0"[..]), ("not-utf8", b"5\0\xff")] {
+            let repo = TempRepo::new(&format!("run-counter-{case}"));
+            repo.write("a.txt", "a\nb\n");
+            let runs = repo.root.join(".git/postil/runs");
+            fs::create_dir_all(&runs).unwrap();
+            fs::write(runs.join("active.lock"), damage).unwrap();
+            let (site, nudges) = run_site(&repo, "plain");
+            post_note(&site, "a.txt", 1, 1, "one");
+            post_note(&site, "a.txt", 2, 2, "two");
+            send(&site, &["N1"]);
+            assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R1", "{case}");
 
-        // R1 goes with N1; its number must not come back, which needs the counter readable.
-        delete(&site, &format!("{NOTES}?id=N1"));
-        send(&site, &["N2"]);
-        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R2");
+            // R1 goes with N1; its number must not come back, which needs the counter readable.
+            delete(&site, &format!("{NOTES}?id=N1"));
+            send(&site, &["N2"]);
+            assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R2", "{case}");
+        }
     }
 
     #[test]
