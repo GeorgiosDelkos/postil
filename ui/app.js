@@ -288,6 +288,8 @@ async function openFile(path) {
     return false;
   }
   changes.close();
+  // The send step's prompt covers the code pane: the file opened takes its place.
+  closeSend();
   state.composer = null;
   state.wanted = path;
   const reply = await fetchFile(path);
@@ -319,9 +321,9 @@ function showFile(path, reply, { keepView }) {
   }
 
   indexNotes();
-  // The changes view holds the header while it is open over the file; a refresh of the file
-  // under it (on focus, or as a run moves on) leaves the header alone.
-  if (!changes.isOpen()) renderHeader(path);
+  // The changes view and the send step's prompt hold the header while they are open over the
+  // file; a refresh of the file under them (on focus, or as a run moves on) leaves it alone.
+  if (!changes.isOpen() && !state.send) renderHeader(path);
   if (shouldReveal(previous, path, { keepView })) revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
