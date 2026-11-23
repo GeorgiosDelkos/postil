@@ -187,7 +187,7 @@ pub enum Error {
     },
     /// The open folders of the file list could not be saved.
     WriteFolders {
-        /// `folders.json`, or its directory.
+        /// `folders.json`.
         path: PathBuf,
         /// The underlying I/O error.
         source: io::Error,

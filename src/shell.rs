@@ -1858,8 +1858,10 @@ mod tests {
         post_note(&site, "a.txt", 1, 1, "one");
         post_note(&site, "a.txt", 2, 2, "two");
         let file = site.repo().unwrap().review_file();
-        // A resolved note stays resolved: an edit changes the text alone.
-        post(&site, &format!("{NOTES}/resolve?id=N2"), "");
+        assert_eq!(
+            post(&site, &format!("{NOTES}/resolve?id=N2"), "").0,
+            StatusCode::OK
+        );
 
         let (status, body) = patch(
             &site,
@@ -1877,7 +1879,8 @@ mod tests {
         assert_eq!(bodies, ["one", "second"], "trimmed, and only N2");
         assert_eq!(
             review["notes"][1]["state"],
-            serde_json::json!({ "kind": "resolved" })
+            serde_json::json!({ "kind": "resolved" }),
+            "an edit changes the text alone"
         );
         assert_eq!(
             anchors(&review)[1],

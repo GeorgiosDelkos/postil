@@ -1,4 +1,5 @@
-//! Writing the app's own files: the notes, the recent projects, and the settings.
+//! Writing the app's own files: the notes, the recent projects, the settings, the layout and
+//! the open folders.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -19,8 +20,8 @@ use crate::error::{Error, Result};
 /// that happened (a note saved twice).
 ///
 /// At most one call per `file` may run at a time in one process; callers serialise
-/// (`notes` holds `review.lock`; `recent`, `settings` and `layout` run only on the main
-/// thread: from `serve` before the event loop starts, then in the URL scheme handler, which wry
+/// (`notes` holds `review.lock`; `recent`, `settings`, `layout` and `folders` run only on the
+/// main thread: from `serve` before the event loop starts, then in the URL scheme handler, which wry
 /// calls on that thread). Separate processes use separate temporary files. A crash between
 /// creating the temporary and the rename leaves it behind; readers ignore it.
 pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
