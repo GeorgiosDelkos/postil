@@ -158,14 +158,14 @@ export function noteDialog(dialogEl, { find, canSend, showInCode, send, remove, 
     button.type = "button";
     button.disabled = !sendable;
     button.append(run && !isLive(run) && agent ? `Send again to ${agent}` : "Send", el("kbd", "", "⌘↵"));
-    button.title = sendable
-      ? "Sends this note alone to the default agent. Shift-click shows the prompt first."
-      : "A run is under way, or the note's lines are no longer in the file.";
+    button.title = "Sends this note alone to the default agent. Shift-click shows the prompt first.";
     button.addEventListener("click", (event) => {
       dialogEl.close();
       send(note, { review: event.shiftKey });
     });
-    foot.append(remove, el("span", "spacer"), button);
+    // A disabled button says why beside it, not only in a tooltip.
+    const why = sendable ? "" : "Wait for the run under way, or stop it.";
+    foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), button);
     return foot;
   }
 

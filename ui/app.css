@@ -2691,3 +2691,8 @@ body.resizing * {
 .note-dialog-footer .spacer {
   flex: 1;
 }
+
+.note-dialog-why {
+  font-size: 12px;
+  color: var(--text-muted);
+}

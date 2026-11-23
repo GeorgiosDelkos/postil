@@ -1049,14 +1049,15 @@ function cardOf(note) {
     outdated: note.anchor === "lost",
     status,
     foot,
-    sendable: canSendAlone(note, status),
+    sendable: canSendAlone(),
   };
 }
 
-// Whether the arrow on a card sends its note now: no run under way, the note not in one, and
-// its lines still in the file.
-function canSendAlone(note, status = noteStatus(note, runFor(note))) {
-  return !runs.live() && note.anchor === "found" && !["starting", "working", "needs"].includes(status.kind);
+// Whether the arrow on a card sends its note now: no run under way. A note whose lines moved
+// can be sent too: the prompt quotes the lines as they were (src/notes.rs, `prompt`), and an
+// agent's edit is the usual reason they moved.
+function canSendAlone() {
+  return !runs.live();
 }
 
 function groupHeader(left, right) {
@@ -1213,7 +1214,7 @@ const noteDetail = noteDialog(noteDialogEl, {
     const note = state.notes.find((candidate) => candidate.id === id);
     return note ? { note, run: runFor(note) } : null;
   },
-  canSend: (note) => canSendAlone(note),
+  canSend: () => canSendAlone(),
   showInCode: showNote,
   send: sendAlone,
   remove: deleteNote,
