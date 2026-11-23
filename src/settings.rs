@@ -297,7 +297,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
 /// Writes `settings` to `file`, if the file is still at `revision`: the one the change
 /// started from. Another window, or a hand edit, may have changed it since, and saving the
 /// whole settings over that would drop the other change without a word. The check and the
-/// write are not one step: within a process saves run on the main thread one at a time, but
+/// write are not one step: within a process saves run on the request thread one at a time, but
 /// two Postil processes saving in the same instant can both pass it, and the later wins.
 ///
 /// # Errors
