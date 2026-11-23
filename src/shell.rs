@@ -4120,14 +4120,19 @@ mod tests {
         repo.write("gen.lock", "x\n");
         repo.git(&["add", "--force", "gen.lock"]);
         let open = site.repo().unwrap();
-        open.snapshot().unwrap();
-        fs::remove_file(repo.root.join("gen.lock")).unwrap();
-        open.snapshot().unwrap();
         let copies = open.index_copies();
         open.snapshot().unwrap();
         assert_eq!(
             open.index_copies(),
-            copies,
+            copies + 1,
+            "a force-added ignored file copies the index"
+        );
+        fs::remove_file(repo.root.join("gen.lock")).unwrap();
+        open.snapshot().unwrap();
+        open.snapshot().unwrap();
+        assert_eq!(
+            open.index_copies(),
+            copies + 1,
             "copied again for a deleted file"
         );
 

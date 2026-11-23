@@ -24,7 +24,7 @@ pub(crate) struct Repo {
     /// Held while a snapshot writes its index ([`Repo::snapshot`]): a run's snapshot and the
     /// changes view's may come at once.
     snapshotting: Mutex<()>,
-    /// How many times the snapshot index was copied from the real one, for tests: git
+    /// How many times a copy of the real index was started, for tests: git
     /// replaces the index file on every write, so nothing on disk tells a copy apart.
     #[cfg(test)]
     copies: AtomicU64,
@@ -320,7 +320,7 @@ impl Repo {
 
 #[cfg(test)]
 impl Repo {
-    /// How many times [`Repo::snapshot`] copied the real index.
+    /// How many times [`Repo::snapshot`] started copying the real index.
     pub(crate) fn index_copies(&self) -> u64 {
         self.copies.load(Ordering::Relaxed)
     }
