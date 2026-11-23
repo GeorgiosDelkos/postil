@@ -2270,6 +2270,23 @@ mod tests {
     }
 
     #[test]
+    fn repo_leaves_out_files_outside_a_sparse_checkout() {
+        let repo = TempRepo::new("list-sparse");
+        fs::create_dir(repo.root.join("away")).unwrap();
+        repo.write("src/kept.rs", "fn kept() {}\n");
+        repo.write("away/gone.rs", "fn gone() {}\n");
+        repo.git(&["add", "."]);
+        let identity = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        repo.git(&[&identity[..], &["commit", "--quiet", "-m", "both"]].concat());
+        // `away/gone.rs` stays in the index but leaves the disk.
+        repo.git(&["sparse-checkout", "set", "src"]);
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["src/kept.rs"]));
+    }
+
+    #[test]
     fn a_repository_whose_path_holds_a_newline_opens() {
         let probe = std::env::temp_dir().join(format!("postil-{}-probe\n", std::process::id()));
         if let Err(error) = fs::create_dir(&probe) {

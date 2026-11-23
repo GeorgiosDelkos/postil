@@ -142,13 +142,14 @@ impl Repo {
     /// Every tracked file and every untracked file that is not ignored, sorted, relative to
     /// the root. Repositories inside the working tree are left out, a submodule as well as an
     /// untracked one: they are directories, not files to open, and their files are not this
-    /// repository's.
+    /// repository's. So are tracked files outside a sparse checkout, which are not on disk.
     pub(crate) fn files(&self) -> Result<Vec<String>> {
-        let tracked_args = ["ls-files", "-z", "--stage"];
+        let tracked_args = ["ls-files", "-z", "--stage", "-t"];
         let tracked = git(&self.root, &tracked_args)?;
         let mut files = Vec::new();
         for entry in tracked.split_terminator('\0') {
-            // `<mode> <object> <stage>\t<path>`; a submodule is mode 160000, a gitlink.
+            // `<tag> <mode> <object> <stage>\t<path>`. A submodule is mode 160000, a gitlink.
+            // Tag `S` is a file outside a sparse checkout's cone: tracked, but not on disk.
             let Some((fields, path)) = entry.split_once('\t') else {
                 return Err(Error::Git {
                     command: tracked_args.join(" "),
@@ -157,7 +158,9 @@ impl Repo {
                     stderr: format!("(no error output, but an entry without a tab: {entry:?})"),
                 });
             };
-            if !fields.starts_with("160000 ") {
+            let mut fields = fields.split(' ');
+            let (tag, mode) = (fields.next(), fields.next());
+            if tag != Some("S") && mode != Some("160000") {
                 files.push(path.to_owned());
             }
         }
