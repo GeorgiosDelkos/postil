@@ -28,9 +28,10 @@
 //! then each read relocates from the older lines.
 //!
 //! Each writer holds an exclusive lock on `review.lock` beside the file from its read to its
-//! rename, so two app windows on one working tree cannot drop each other's changes. A script
-//! that edits `review.json` without taking that lock can still lose an edit made during a
-//! write, a window of milliseconds.
+//! rename, so two app windows on one working tree cannot drop each other's changes. A writer
+//! waits for the lock only so long, then fails naming the lock file, so a process that keeps
+//! it does not freeze the window. A script that edits `review.json` without taking that lock
+//! can still lose an edit made during a write, a window of milliseconds.
 //!
 //! The format has a version. Every field added is a new version: a build refuses fields it
 //! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
@@ -40,9 +41,11 @@
 //! file version 3.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
@@ -95,7 +98,7 @@ pub(crate) fn ids(repo: &Repo) -> Result<Vec<String>> {
 /// As [`current`]; the error of reading the note's file; [`Error::InvalidNote`] for a blank
 /// body or a snippet that does not span `new.lines`; [`Error::NoteTextChanged`] when the
 /// shown text cannot be placed in the file any more; [`Error::WriteReview`] when the lock or
-/// the file cannot be written.
+/// the file cannot be written; [`Error::ReviewLocked`] when another process holds the lock.
 pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
     let file = repo.review_file();
     let body = new.body.trim();
@@ -147,8 +150,8 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
 /// # Errors
 ///
 /// [`Error::BadRequest`] when `id` is not a note id, [`Error::NoSuchNote`] when no note has
-/// it, as [`current`] for reading the file, and [`Error::WriteReview`] when the lock or the
-/// file cannot be written.
+/// it, as [`current`] for reading the file, [`Error::WriteReview`] when the lock or the file
+/// cannot be written, and [`Error::ReviewLocked`] when another process holds the lock.
 pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
     let wanted = NoteId::parse(id)
         .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
@@ -302,7 +305,7 @@ pub(crate) struct Prompt {
 ///
 /// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, or holds
 /// something that is not a note id; [`Error::WriteReview`] when the lock or the file
-/// cannot be written.
+/// cannot be written; [`Error::ReviewLocked`] when another process holds the lock.
 pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<()> {
     let wanted = parse_ids(ids)?;
     let file = repo.review_file();
@@ -562,8 +565,18 @@ fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
     others.find(|&range| range == last)
 }
 
-/// Takes the exclusive lock on `review.lock` beside the review file, waiting for another
-/// window's add to finish. The lock is released when the returned file is dropped.
+/// How long a change waits for another process to release `review.lock`. A writer holds it
+/// while it reads, relocates and writes the file, milliseconds; arbitrary, far above that and
+/// short enough that a stuck process shows as an error rather than a hung window.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// How often a change waiting for `review.lock` tries again. Arbitrary: small against
+/// [`LOCK_WAIT`], and rare enough that waiting costs no noticeable CPU.
+const LOCK_RETRY: Duration = Duration::from_millis(20);
+
+/// Takes the exclusive lock on `review.lock` beside the review file, waiting up to
+/// [`LOCK_WAIT`] for another window's change to finish. The lock is released when the
+/// returned file is dropped. Blocks the calling thread while it waits.
 fn lock(review_file: &Path) -> Result<File> {
     let path = review_file.with_extension("lock");
     let error = |source| Error::WriteReview {
@@ -581,8 +594,22 @@ fn lock(review_file: &Path) -> Result<File> {
         .truncate(false)
         .open(&path)
         .map_err(error)?;
-    file.lock().map_err(error)?;
-    Ok(file)
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::ReviewLocked {
+                    path,
+                    seconds: LOCK_WAIT.as_secs(),
+                });
+            }
+            Err(TryLockError::Error(source)) => return Err(error(source)),
+        }
+    }
 }
 
 // Debug output shows ids, paths, and anchors, never note text: notes can quote code that is

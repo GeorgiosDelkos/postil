@@ -138,7 +138,7 @@ const LIGHT_CANVAS: (u8, u8, u8, u8) = (0xf4, 0xf4, 0xf1, 0xff);
 /// What the benchmark measured.
 #[derive(Debug)]
 pub struct BenchReport {
-    /// From the start of [`bench`] to the page reporting that the file is painted.
+    /// From the start of [`bench()`] to the page reporting that the file is painted.
     pub launch_to_paint: Duration,
     /// The page's own measurements, as the JSON object `ui/app.js` builds in `runBench`.
     pub page: String,
@@ -1428,6 +1428,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::InvalidSettings(_) => StatusCode::BAD_REQUEST,
                 Error::NoteTextChanged { .. }
                 | Error::NoProject
+                | Error::ReviewLocked { .. }
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
                 | Error::TurnRunning
@@ -1787,7 +1788,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(reply.contains("cannot write"), "{reply}");
-        assert!(reply.contains("the note was not saved"), "{reply}");
+        assert!(reply.contains("the change was not saved"), "{reply}");
         assert_eq!(
             fs::read_dir(dir).unwrap().count(),
             0,
@@ -2241,6 +2242,41 @@ mod tests {
     }
 
     #[test]
+    fn a_change_gives_up_on_a_lock_another_process_keeps_and_names_it() {
+        let repo = TempRepo::new("notes-stuck-lock");
+        repo.write("a.txt", "x\n");
+        let lock_file = repo.root.join(".git/postil/review.lock");
+        fs::create_dir_all(lock_file.parent().unwrap()).unwrap();
+        // A lock on a file of its own, as another process's would be: `flock` locks belong to
+        // the open file, so this one conflicts with the request's in the same process.
+        let held = fs::File::create(&lock_file).unwrap();
+        held.lock().unwrap();
+
+        // On its own thread, so a request that waits forever fails this test instead of
+        // hanging it.
+        let (sender, replies) = mpsc::channel();
+        let root = repo.root.clone();
+        std::thread::spawn(move || {
+            let site = Site::new(None, None, no_agents(), quiet());
+            site.open(Repo::open(&root).unwrap());
+            drop(sender.send(post(&site, NOTES, &new_note("a.txt", 1, 1, "x", "Hi."))));
+        });
+        let (status, reply) = replies
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a reply within 60 s: the request thread panicked, or it waited on the lock");
+        drop(held);
+
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        // git names the git directory with links resolved (`/tmp` is `/private/tmp` on macOS).
+        let expected = format!(
+            "another writer held {} for 2 s, so the change was not saved",
+            lock_file.canonicalize().unwrap().display()
+        );
+        assert!(reply.starts_with(&expected), "{reply}");
+        assert!(!repo.root.join(".git/postil/review.json").exists());
+    }
+
+    #[test]
     fn repo_lists_tracked_and_untracked_files_but_not_ignored_ones() {
         let repo = TempRepo::new("list");
         repo.write("src/tracked.rs", "fn a() {}\n");
@@ -2261,6 +2297,74 @@ mod tests {
             serde_json::json!([".gitignore", "src/tracked.rs", "untracked.txt"])
         );
         assert_eq!(info["bench"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn repo_leaves_out_repositories_inside_it_untracked_or_submodules() {
+        let repo = TempRepo::new("list-nested");
+        repo.write("a.txt", "a\n");
+        repo.git(&["init", "--quiet", "nested"]);
+        repo.write("nested/n.txt", "n\n");
+        // A submodule as the index records it: a gitlink, mode 160000, naming a commit of the
+        // other repository (any id will do; nothing here reads it).
+        fs::create_dir(repo.root.join("sub")).unwrap();
+        let gitlink = format!("160000,{},sub", "1".repeat(40));
+        repo.git(&["update-index", "--add", "--cacheinfo", &gitlink]);
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["a.txt"]));
+    }
+
+    #[test]
+    fn repo_leaves_out_files_outside_a_sparse_checkout() {
+        let repo = TempRepo::new("list-sparse");
+        fs::create_dir(repo.root.join("away")).unwrap();
+        repo.write("src/kept.rs", "fn kept() {}\n");
+        repo.write("away/gone.rs", "fn gone() {}\n");
+        repo.git(&["add", "."]);
+        let identity = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        repo.git(&[&identity[..], &["commit", "--quiet", "-m", "both"]].concat());
+        // `away/gone.rs` stays in the index but leaves the disk.
+        repo.git(&["sparse-checkout", "set", "src"]);
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["src/kept.rs"]));
+    }
+
+    #[test]
+    fn repo_keeps_a_skip_worktree_file_that_is_on_disk() {
+        // Not in a sparse checkout: there git ignores a skip-worktree bit set by hand.
+        let repo = TempRepo::new("list-skip-worktree");
+        repo.write("src/local.toml", "key = 1\n");
+        repo.git(&["add", "."]);
+        let identity = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        repo.git(&[&identity[..], &["commit", "--quiet", "-m", "one"]].concat());
+        // Hidden from `git status`, as people do with a config file they edit locally.
+        repo.git(&["update-index", "--skip-worktree", "src/local.toml"]);
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["src/local.toml"]));
+    }
+
+    #[test]
+    fn a_repository_whose_path_holds_a_newline_opens() {
+        let probe = std::env::temp_dir().join(format!("postil-{}-probe\n", std::process::id()));
+        if let Err(error) = fs::create_dir(&probe) {
+            eprintln!("skipped: this filesystem refuses a newline in a name ({error})");
+            return;
+        }
+        fs::remove_dir(&probe).unwrap();
+        let repo = TempRepo::new("line\nbreak");
+        repo.write("src/a.rs", "fn a() {}\n");
+
+        let info = get_json(&repo.site(), "postil://localhost/api/repo");
+
+        assert_eq!(info["files"], serde_json::json!(["src/a.rs"]));
+        let name = format!("postil-{}-line\nbreak", std::process::id());
+        assert_eq!(info["name"], name);
     }
 
     /// A plain folder in the temporary directory, outside any repository.
@@ -2828,6 +2932,10 @@ mod tests {
                 "cannot hold quotes",
             ),
             (
+                with("customAgents", agent("Local", "./bin/agent --acp")),
+                "must be a name on the search path or an absolute path, not ./bin/agent",
+            ),
+            (
                 with("enabledAgents", serde_json::json!(["Nobody"])),
                 "no agent called \"Nobody\"",
             ),
@@ -2876,6 +2984,11 @@ mod tests {
             let (status, reply) = save(&site, &at_limits.to_string());
             assert_eq!(status, StatusCode::OK, "{reply}");
         }
+        // So is a program named by an absolute path.
+        let mut absolute = custom_settings();
+        absolute["customAgents"][0]["command"] = "/opt/agents/local --acp".into();
+        let (status, reply) = save(&site, &absolute.to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
     }
 
     #[test]
@@ -3110,6 +3223,34 @@ mod tests {
         fs::set_permissions(blocked.config(), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
         assert!(reply.contains("the settings were not saved"), "{reply}");
+    }
+
+    #[test]
+    fn a_linked_settings_file_keeps_its_link_and_its_mode() {
+        let repo = TempRepo::new("settings-linked");
+        let real = repo.root.join(".git/dotfiles/settings.json");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "{\"version\": 1, \"settings\": {}}\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        // Relative, as `ln -s` in a dotfiles setup often makes it: resolved from the link's
+        // directory, not from the process's.
+        let link = repo.config().join("settings.json");
+        fs::create_dir_all(repo.config()).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &link).unwrap();
+
+        let (status, reply) = save(&repo.empty_site(), &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
+
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("../dotfiles/settings.json"),
+            "the link is still a link, to the same place"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(stored["settings"], custom_settings());
+        let mode = fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the file is as private as before");
     }
 
     #[test]

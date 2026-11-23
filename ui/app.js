@@ -11,11 +11,11 @@ import { changesView } from "./changes-view.js";
 import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
 import { noteDialog, statusIcon } from "./note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { foldRun, isLive, isOpen, isResolved, promptLines, sendable, sentIn } from "./run.js";
+import { escapeAction, foldRun, isLive, isOpen, isResolved, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, reviewOf, runOf } from "./status.js";
-import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
+import { ancestors, buildTree, folderCounts, shouldReveal, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -288,6 +288,8 @@ async function openFile(path) {
     return false;
   }
   changes.close();
+  // The send step's prompt covers the code pane: the file opened takes its place.
+  closeSend();
   state.composer = null;
   state.wanted = path;
   const reply = await fetchFile(path);
@@ -319,10 +321,10 @@ function showFile(path, reply, { keepView }) {
   }
 
   indexNotes();
-  // The changes view holds the header while it is open over the file; a refresh of the file
-  // under it (on focus, or as a run moves on) leaves the header alone.
-  if (!changes.isOpen()) renderHeader(path);
-  revealFile(previous, path);
+  // The changes view and the send step's prompt hold the header while they are open over the
+  // file; a refresh of the file under them (on focus, or as a run moves on) leaves it alone.
+  if (!changes.isOpen() && !state.send) renderHeader(path);
+  if (shouldReveal(previous, path, { keepView })) revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
 }
@@ -1727,18 +1729,23 @@ window.addEventListener("keydown", (event) => {
   const typing = event.target.matches("input, textarea");
   // `a`, Shift-`a` and `r` answer a permission request while the run shows; focus mode hides it.
   if (!typing && !state.composer && state.tab === "run" && !inFocus() && runs.keydown(event)) return;
-  // Escape leaves focus mode first: what it would stop or close cannot be seen there.
-  if (event.key === "Escape" && inFocus() && !state.composer) {
-    leaveFocus();
-    return;
-  }
   if (event.key === "Escape") {
-    if (state.composer) closeComposer({ save: false });
-    else if (state.send) closeSend();
-    else if (state.selection) {
+    const action = escapeAction({
+      focusMode: inFocus(),
+      composer: Boolean(state.composer),
+      send: Boolean(state.send),
+      changes: changes.isOpen(),
+      selection: Boolean(state.selection),
+      live: runs.live(),
+    });
+    if (action === "leave-focus") leaveFocus();
+    else if (action === "close-composer") closeComposer({ save: false });
+    else if (action === "close-send") closeSend();
+    else if (action === "close-changes") changes.close();
+    else if (action === "clear-selection") {
       state.selection = null;
       redecorateRows();
-    } else if (runs.live()) runs.stop();
+    } else if (action === "stop") runs.stop();
   } else if (state.send) {
     // The code is covered by the prompt: no key acts on it.
   } else if (event.key === "c" && event.metaKey && !typing && state.file && state.selection) {
@@ -1756,9 +1763,12 @@ window.addEventListener("keydown", (event) => {
 // A draft note lives only in the page, so anything that would end the page (quitting,
 // switching projects) first sends the engineer back to it. Returns whether there is one.
 function guardDraft(action) {
+  // A draft in an open dialog (a note's text being edited, a follow-up) keeps its dialog,
+  // which says why.
+  if (noteDetail.holdDraft(action) || runs.holdDraft(action)) return true;
   if (!state.composer?.text.trim()) return false;
-  // The note must be in view to be saved or discarded.
-  if (settingsEl.open) settingsEl.close();
+  // The note must be in view to be saved or discarded: a dialog over it would make it inert.
+  for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   hideWelcome();
   const label = state.composer.node.querySelector(".composer-label");
   label.textContent = `Save or discard this note before ${action}.`;

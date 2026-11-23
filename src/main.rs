@@ -1,6 +1,7 @@
 //! The `postil` command: opens the review window, on a repository or on the welcome screen.
 
 use std::error::Error as _;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -19,21 +20,27 @@ struct Args {
     bench: Option<String>,
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+/// Reads the arguments as the system gives them: a directory may be any bytes, and only the
+/// bench file, which the page receives as JSON, must be UTF-8.
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
     let mut dir = None;
     let mut bench = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        let shown = arg.to_string_lossy();
         if arg == "--bench" {
             let file = args.next().ok_or("--bench needs a file")?;
+            let file = file.into_string().map_err(|file| {
+                format!("--bench needs a UTF-8 file name, not {}", file.display())
+            })?;
             if bench.replace(file).is_some() {
                 return Err("--bench given twice".to_owned());
             }
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown option {arg}"));
+        } else if shown.starts_with('-') {
+            return Err(format!("unknown option {shown}"));
         } else if dir.replace(PathBuf::from(&arg)).is_some() {
-            return Err(format!("unexpected second directory {arg}"));
+            return Err(format!("unexpected second directory {shown}"));
         }
     }
 
@@ -46,7 +53,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     reason = "main is the command's one output function: usage, bench report, errors"
 )]
 fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1)) {
+    let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(problem) => {
             eprintln!("postil: {problem}\n{USAGE}");
@@ -86,7 +93,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Args, String> {
-        parse_args(args.iter().map(|arg| (*arg).to_owned()))
+        parse_args(args.iter().map(OsString::from))
     }
 
     #[test]

@@ -84,6 +84,11 @@ test("quoted paths are read back, and a second hunk numbers its lines from its h
   assert.equal(unquote('"a\\\\b\\nc"'), "a\\b\nc");
 });
 
+test("a character outside the BMP in a quoted path is read whole, not as two halves", () => {
+  // git leaves it unescaped with core.quotePath off, and quotes the path for its tab.
+  assert.equal(unquote('"notes/\u{1F600}\\tdraft.md"'), "notes/\u{1F600}\tdraft.md");
+});
+
 test("a note shows at the changed line its lines end on, and only there", () => {
   const [file] = parsePatch(patch);
   const note = (id, path, end) => ({ id, path, lines: { start: end, end } });

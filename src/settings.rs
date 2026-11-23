@@ -11,7 +11,8 @@
 //! The rules ([`Settings::check`]):
 //! - the code font size is 11 to 20 px and the tab width 2, 4 or 8;
 //! - a custom agent has a name of 1 to 40 characters, unlike any other agent's name
-//!   whatever the case, built-in ones included, and a command of plain words (no quotes);
+//!   whatever the case, built-in ones included, and a command of plain words (no quotes)
+//!   whose program is a name on the search path or an absolute path;
 //! - the enabled agents are known agents, each once;
 //! - the agent notes are sent to, and every reviewer, is an enabled agent. A reviewer may be
 //!   listed more than once: each entry is one independent review.
@@ -121,8 +122,16 @@ impl Settings {
             {
                 return Err(format!("there is already an agent called {name:?}"));
             }
-            if agents::program_of(&agent.command).is_none() {
+            let Some(program) = agents::program_of(&agent.command) else {
                 return Err(format!("the agent {name:?} needs a command"));
+            };
+            // A relative path would be looked up from Postil's working directory (`/` when
+            // started from the Finder) but run from the project's, so it names two files.
+            if program.contains('/') && !program.starts_with('/') {
+                return Err(format!(
+                    "the program of {name:?} must be a name on the search path or an absolute \
+                     path, not {program}"
+                ));
             }
             if agent.command.contains(['"', '\'', '\\']) {
                 return Err(format!(

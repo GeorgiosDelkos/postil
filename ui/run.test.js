@@ -6,6 +6,7 @@ import {
   diffLines,
   diffStats,
   elapsed,
+  escapeAction,
   foldRun,
   isLive,
   inline,
@@ -18,6 +19,7 @@ import {
   sendable,
   sentIn,
   statusLine,
+  stopKey,
   toolRow,
 } from "./run.js";
 
@@ -241,6 +243,36 @@ test("the status line says where the run is and whether it needs the engineer", 
   assert.equal(isLive(run("cancelling")), true);
   assert.equal(isLive(run("ended")), false);
   assert.equal(isLive(null), false);
+});
+
+test("Stop is built once per live run, not on every update or status change of it", () => {
+  const r1 = (status, entries = []) => ({ ...run(status, entries), id: "R1" });
+  const drawn = stopKey(r1("running"));
+  const message = { kind: "message", text: "more", message: null };
+  assert.equal(stopKey(r1("running", [message, message])), drawn, "a streamed entry keeps it");
+  assert.equal(stopKey(r1("cancelling")), drawn, "Stopping keeps it, to offer Force stop");
+  assert.equal(stopKey(r1("waiting")), drawn);
+  assert.equal(stopKey(r1("ended")), null, "an ended run has no Stop");
+  assert.notEqual(stopKey({ ...run("running"), id: "R2" }), drawn, "the next run gets its own");
+  assert.equal(stopKey(null), null);
+});
+
+test("Escape closes the nearest thing on screen, and stops the run only when nothing is left", () => {
+  const none = { focusMode: false, composer: false, send: false, changes: false, selection: false, live: false };
+  const cases = [
+    [{ live: true, changes: true }, "close-changes", "the changes view before the run"],
+    [{ live: true, changes: true, selection: true }, "close-changes", "it covers the selection"],
+    [{ live: true, focusMode: true }, "leave-focus", "focus mode hides what would stop"],
+    [{ focusMode: true, composer: true }, "close-composer", "a draft closes even in focus mode"],
+    [{ composer: true, send: true, live: true }, "close-composer", ""],
+    [{ send: true, changes: true, live: true }, "close-send", ""],
+    [{ selection: true, live: true }, "clear-selection", ""],
+    [{ live: true }, "stop", ""],
+    [{}, null, "nothing to do"],
+  ];
+  for (const [page, action, why] of cases) {
+    assert.equal(escapeAction({ ...none, ...page }), action, `${JSON.stringify(page)}: ${why}`);
+  }
 });
 
 test("elapsed time reads as minutes, then hours", () => {

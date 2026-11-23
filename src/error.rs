@@ -110,6 +110,14 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// Another writer (a window, a run, a script) held the review file's lock for as long as a
+    /// change waits for it.
+    ReviewLocked {
+        /// The lock file's path.
+        path: PathBuf,
+        /// How long the change waited, in seconds.
+        seconds: u64,
+    },
     /// The page sent settings that break a rule (`settings.rs`); the text says which.
     InvalidSettings(String),
     /// The settings file on disk cannot be used, so saving over it is refused until it is
@@ -279,7 +287,13 @@ impl fmt::Display for Error {
             ),
             Self::WriteReview { path, .. } => write!(
                 f,
-                "cannot write {} (check that its directory is writable; the note was not saved)",
+                "cannot write {} (check that its directory is writable; the change was not saved)",
+                path.display()
+            ),
+            Self::ReviewLocked { path, seconds } => write!(
+                f,
+                "another writer held {} for {seconds} s, so the change was not saved (try \
+                 again; `lsof` on that file names the process)",
                 path.display()
             ),
             Self::InvalidSettings(problem) => write!(f, "cannot save the settings: {problem}"),
@@ -420,6 +434,7 @@ impl std::error::Error for Error {
             | Self::InvalidNote(_)
             | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. }
+            | Self::ReviewLocked { .. }
             | Self::InvalidSettings(_)
             | Self::SettingsLocked(_)
             | Self::SettingsChanged
