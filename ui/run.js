@@ -375,6 +375,14 @@ export function isLive(run) {
   return ["starting", "running", "waiting", "cancelling"].includes(run?.status);
 }
 
+// Which Stop button the tray header shows: the live run's id, or null when there is none.
+// The button is built again only when this changes, not on every update of the run: a press
+// and a release on two different nodes is no click, so a Stop rebuilt as the agent writes
+// would miss the engineer's click.
+export function stopKey(run) {
+  return isLive(run) ? run.id : null;
+}
+
 // Seconds as `m:ss`, or `h:mm:ss` from an hour on.
 export function elapsed(seconds) {
   const s = Math.max(0, Math.floor(seconds));

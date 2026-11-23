@@ -18,6 +18,7 @@ import {
   sendable,
   sentIn,
   statusLine,
+  stopKey,
   toolRow,
 } from "./run.js";
 
@@ -241,6 +242,18 @@ test("the status line says where the run is and whether it needs the engineer", 
   assert.equal(isLive(run("cancelling")), true);
   assert.equal(isLive(run("ended")), false);
   assert.equal(isLive(null), false);
+});
+
+test("Stop is built once per live run, not on every update or status change of it", () => {
+  const r1 = (status, entries = []) => ({ ...run(status, entries), id: "R1" });
+  const drawn = stopKey(r1("running"));
+  const message = { kind: "message", text: "more", message: null };
+  assert.equal(stopKey(r1("running", [message, message])), drawn, "a streamed entry keeps it");
+  assert.equal(stopKey(r1("cancelling")), drawn, "Stopping keeps it, to offer Force stop");
+  assert.equal(stopKey(r1("waiting")), drawn);
+  assert.equal(stopKey(r1("ended")), null, "an ended run has no Stop");
+  assert.notEqual(stopKey({ ...run("running"), id: "R2" }), drawn, "the next run gets its own");
+  assert.equal(stopKey(null), null);
 });
 
 test("elapsed time reads as minutes, then hours", () => {

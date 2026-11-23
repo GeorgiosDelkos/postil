@@ -22,6 +22,7 @@ import {
   permissionKey,
   permissionKeys,
   statusLine,
+  stopKey,
   toolRow,
   underWay,
 } from "./run.js";
@@ -86,6 +87,8 @@ export function runPanel({
   const failed = new Map();
 
   let clock = null;
+  // The tray header's nodes, `{ key, title, stop }`, built by `renderHeader`.
+  let header = null;
   // When Stop starts to end the agent, by this page's clock; null unless it is stopping.
   let forceAt = null;
   // The drawn cards by key, each with the signature it was drawn from: a card whose
@@ -380,46 +383,60 @@ export function runPanel({
     statusEl.replaceChildren(dot, el("span", "status-text", `${run.agent} · ${text}`));
   }
 
-  // The tray header: the latest run's status and, while it runs, its time and Stop.
+  // The tray header: the latest run's status and, while it runs, its time and Stop. Its
+  // nodes are kept while `stopKey` stays the same and changed in place, so Stop takes a
+  // click while the run streams.
   function renderHeader() {
     clearInterval(clock);
     clock = null;
     if (!run) {
+      header = null;
       headerEl.replaceChildren();
       return;
     }
+    const key = stopKey(run);
+    if (!header || header.key !== key) {
+      header = { key, title: el("span", "run-title"), stop: key === null ? null : stopButton() };
+      headerEl.replaceChildren(header.title, ...(header.stop ? [header.stop.button] : []));
+    }
     const { text, tone } = statusLine(run);
-    const title = el("span", "run-title");
-    title.title = `${run.id} · ${run.agent} · ${text}`;
+    header.title.title = `${run.id} · ${run.agent} · ${text}`;
     const time = el("span", "run-time");
     const tick = () => {
       if (isLive(run)) time.textContent = ` · ${elapsed(Date.now() / 1000 - run.startedAt)}`;
     };
     tick();
-    title.append(statusIcon(iconKind(run)), el("strong", `run-word ${tone}`, statusWord(run)), time);
-    const parts = [title];
-    if (!isLive(run) || run.status !== "cancelling") forceAt = null;
-    if (isLive(run)) {
+    header.title.replaceChildren(statusIcon(iconKind(run)), el("strong", `run-word ${tone}`, statusWord(run)), time);
+    const stopping = isLive(run) && run.status === "cancelling";
+    if (!stopping) forceAt = null;
+    // The Rust process says how long until it would force the agent, so a reloaded page
+    // offers Force stop as soon as the process would act on it.
+    else forceAt ??= Date.now() + (run.forceIn ?? 0);
+    const { stop: button } = header;
+    if (!button) return;
+    button.label();
+    clock = setInterval(() => {
+      tick();
+      button.label();
+    }, 1000);
+  }
+
+  // The header's Stop, for the live run: `label()` sets its word and whether it can be
+  // pressed, in place and only when they differ, so the node under the pointer stays.
+  function stopButton() {
+    const button = el("button", "button stop");
+    button.type = "button";
+    const word = document.createTextNode("Stop");
+    button.append(word, el("kbd", "", "esc"));
+    button.addEventListener("click", stop);
+    const label = () => {
       const stopping = run.status === "cancelling";
-      // The Rust process says how long until it would force the agent, so a reloaded page
-      // offers Force stop as soon as the process would act on it.
-      if (stopping) forceAt ??= Date.now() + (run.forceIn ?? 0);
-      const button = el("button", "button stop");
-      button.type = "button";
-      const label = () => {
-        const force = stopping && forceable();
-        button.disabled = stopping && !force;
-        button.replaceChildren(force ? "Force stop" : "Stop", el("kbd", "", "esc"));
-      };
-      label();
-      clock = setInterval(() => {
-        tick();
-        label();
-      }, 1000);
-      button.addEventListener("click", stop);
-      parts.push(button);
-    }
-    headerEl.replaceChildren(...parts);
+      const force = stopping && forceable();
+      button.disabled = stopping && !force;
+      const text = force ? "Force stop" : "Stop";
+      if (word.data !== text) word.data = text;
+    };
+    return { button, label };
   }
 
   // ---- The dialog: a run whole, or one of its steps -----------------------------------------
