@@ -293,8 +293,10 @@ async function prompt(id, params) {
       return send({ id, result: { stopReason: "end_turn" } });
     }
     case "long-line":
-      // 1.5 MiB with no newline until the end: over the line limit the tests build with
-      // (`LINE_LIMIT` in src/acp/connection.rs), and so is a message.
+      // A line of exactly the line limit the tests build with (`LINE_LIMIT` in
+      // src/acp/connection.rs, 1 MiB), newline included, which is read whole; then 1.5 MiB
+      // with no newline until the end, which is over it; then a message.
+      process.stdout.write(`${"y".repeat((1 << 20) - 1)}\n`);
       process.stdout.write(`${"x".repeat(3 << 19)}\n`);
       say("after the long line");
       return send({ id, result: { stopReason: "end_turn" } });

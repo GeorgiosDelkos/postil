@@ -5017,20 +5017,27 @@ mod tests {
         send(&site, &["N1"]);
         let run = wait_for_run(&site, &nudges, "R1");
         assert_eq!(run["status"], "ended", "{}", run["status"]);
-        let problem = first_of_kind(&run, "unreadable")["problem"].clone();
+        let problems: Vec<String> = entries(&run)
+            .iter()
+            .filter(|entry| entry["kind"] == "unreadable")
+            .map(|entry| entry["problem"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            problems.len(),
+            2,
+            "the rest of the long line is skipped, not read as a line: {problems:?}"
+        );
         assert!(
-            problem
-                .as_str()
-                .unwrap()
-                .starts_with("a line longer than 1048576 bytes, skipped: xxx"),
-            "{problem}"
+            problems[0].starts_with("a line that is not JSON-RPC"),
+            "a line of exactly the limit is read whole: {}",
+            &problems[0][..80]
+        );
+        assert!(
+            problems[1].starts_with("a line longer than 1048576 bytes, skipped: xxx"),
+            "{}",
+            &problems[1][..80]
         );
         let kinds = kinds(&run);
-        assert_eq!(
-            kinds.iter().filter(|kind| *kind == "unreadable").count(),
-            1,
-            "the rest of the long line is skipped, not read as a line: {kinds:?}"
-        );
         assert!(
             kinds.contains(&"message:after the long line".to_owned()),
             "the line after it is read whole"

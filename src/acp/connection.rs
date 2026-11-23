@@ -1366,22 +1366,32 @@ mod tests {
     }
 
     #[test]
-    fn standard_error_is_read_on_after_a_read_a_signal_interrupted() {
+    fn standard_error_is_read_on_after_an_interrupted_read_but_not_after_a_failed_one() {
         // A signal on a real pipe cannot be timed into a read, so the read is made to fail.
         let interrupted = std::io::Error::from(ErrorKind::Interrupted);
         let stderr = Read::chain(
-            Read::chain(&b"before "[..], InterruptedOnce(Some(interrupted))),
+            Read::chain(&b"before "[..], FailsOnce(Some(interrupted))),
             &b"after"[..],
         );
         let tail = Mutex::new(Vec::new());
         keep_tail(stderr, &tail);
         assert_eq!(tail.into_inner().unwrap(), b"before after");
+
+        // Any other error ends the reading: retrying it could spin forever on a broken pipe.
+        let broken = std::io::Error::from(ErrorKind::BrokenPipe);
+        let stderr = Read::chain(
+            Read::chain(&b"before "[..], FailsOnce(Some(broken))),
+            &b"after"[..],
+        );
+        let tail = Mutex::new(Vec::new());
+        keep_tail(stderr, &tail);
+        assert_eq!(tail.into_inner().unwrap(), b"before ");
     }
 
     /// A reader whose first read fails with its error, and whose later reads end the input.
-    struct InterruptedOnce(Option<std::io::Error>);
+    struct FailsOnce(Option<std::io::Error>);
 
-    impl Read for InterruptedOnce {
+    impl Read for FailsOnce {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             self.0.take().map_or(Ok(0), Err)
         }
