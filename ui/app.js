@@ -7,6 +7,8 @@
 
 import { rank } from "./fuzzy.js";
 import { fileIcon, folderIcon } from "./icons.js";
+import { runPanel } from "./run-panel.js";
+import { foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
@@ -70,6 +72,13 @@ const state = {
   switching: false,
   // The rendered window of lines: [first, last).
   rendered: { first: 0, last: 0 },
+  // The settings in effect (`applySettings`), for the agent notes are sent to.
+  settings: null,
+  // The send step while it is open: the ids of the notes ticked, and the agent chosen for
+  // this send. The code pane then shows the prompt instead of the file.
+  send: null,
+  // Which of the tray's tabs shows: "notes" or "run".
+  tab: "notes",
 };
 
 function el(tag, className, text) {
@@ -886,7 +895,8 @@ function buildComposer(composer) {
     measureComposer(node);
   });
   textarea.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && event.metaKey) closeComposer({ save: true });
+    // Cmd-Shift-Enter is Send, which the window's handler answers.
+    if (event.key === "Enter" && event.metaKey && !event.shiftKey) closeComposer({ save: true });
   });
 
   node.querySelector("[data-action=save]").addEventListener("click", () => {
@@ -913,7 +923,12 @@ function measureComposer(node) {
 
 function renderNotes() {
   const count = state.notes.length;
-  $("note-count").textContent = count === 1 ? "1 note" : `${count} notes`;
+  $("note-count").textContent = state.send
+    ? `${state.send.ticked.size} of ${count} selected`
+    : count === 1
+      ? "1 note"
+      : `${count} notes`;
+  renderSendBar();
   if (count === 0) {
     const empty = el("div", "empty", "Select lines, then press ");
     empty.append(el("kbd", "", "c"), " to write a note.");
@@ -928,16 +943,42 @@ function renderNotes() {
     const { start, end } = note.lines;
     const lines = start === end ? start : `${start}-${end}`;
     const where = el("div", "note-where");
-    const id = outdated ? `${note.id} · outdated` : note.id;
-    where.append(el("span", "", `${note.path}:${lines}`), el("span", "note-id", id));
+    const run = sentIn(note);
+    const marks = [note.id, outdated ? "outdated" : null, run ? `sent in ${run}` : null];
+    where.append(
+      el("span", "", `${note.path}:${lines}`),
+      el("span", "note-id", marks.filter(Boolean).join(" · ")),
+    );
     card.append(where, el("div", "note-body", note.body));
-    card.addEventListener("click", () => showNote(note));
+    // In the send step the code pane shows the prompt, so a card toggles its note instead.
+    card.addEventListener("click", () => {
+      if (state.send) toggleTick(note.id);
+      else showNote(note);
+    });
 
-    const item = el("div", "note-item");
+    const item = el("div", run ? "note-item sent" : "note-item");
+    if (state.send) item.append(tickBox(note));
     item.append(card, deleteButton(item, note));
     return item;
   });
   notesEl.replaceChildren(...items);
+}
+
+// The checkbox that puts a note in the send, or takes it out.
+function tickBox(note) {
+  const box = el("input", "note-tick");
+  box.type = "checkbox";
+  box.checked = state.send.ticked.has(note.id);
+  box.setAttribute("aria-label", `Send note ${note.id}`);
+  box.addEventListener("change", () => toggleTick(note.id));
+  return box;
+}
+
+function toggleTick(id) {
+  if (state.send.ticked.has(id)) state.send.ticked.delete(id);
+  else state.send.ticked.add(id);
+  renderNotes();
+  showPrompt();
 }
 
 // The ×  on a note card. A note is the engineer's writing, so deleting takes two clicks: the
@@ -983,6 +1024,208 @@ async function showNote(note) {
   // A third of the way down reads better than the very top edge.
   const top = lineTop(note.lines.start - 1) - codeEl.clientHeight / 3;
   codeEl.scrollTo({ top, behavior: "smooth" });
+}
+
+// ---- Send and run ---------------------------------------------------------------------
+//
+// Sending (docs/design.md, "The loop", step 5): Cmd-Shift-Enter or the Send button opens the
+// send step. The tray's notes get checkboxes, the open ones ticked (run.js, `sendable`),
+// and the code pane shows the prompt exactly as the agent will receive it. Cmd-Shift-Enter
+// again, or Send, sends; Escape closes the step. The run then shows in the tray's Run tab
+// (run-panel.js), which takes the front whenever the agent needs the engineer.
+
+const previewEl = $("prompt-preview");
+const sendBarEl = $("send-bar");
+
+const runs = runPanel({
+  panelEl: $("run"),
+  headerEl: $("run-header"),
+  statusEl: $("agent-status"),
+  onChange: followRun,
+  onError: showToast,
+});
+
+// The agent of this send, or the settings' agent.
+function chosenAgent() {
+  return state.send?.agent ?? state.settings?.agent ?? null;
+}
+
+// The notes ticked for the send, in the tray's order, which is the prompt's order.
+function tickedIds() {
+  return state.notes.filter((note) => state.send.ticked.has(note.id)).map((note) => note.id);
+}
+
+function renderSendBar() {
+  const open = state.notes.filter(isOpen).length;
+  const shown =
+    state.projectOpen && state.tab === "notes" && !runs.live() && (state.send !== null || open > 0);
+  sendBarEl.hidden = !shown;
+  if (!shown) return;
+
+  const picker = $("agent-picker");
+  picker.hidden = !state.send;
+  picker.replaceChildren(chosenAgent() ?? "Choose an agent", el("span", "chevron", "▴"));
+  const button = $("send-button");
+  const count = state.send ? state.send.ticked.size : open;
+  const noun = count === 1 ? "1 note" : `${count} notes`;
+  button.replaceChildren(state.send ? `Send ${noun}` : `Send ${noun}…`, el("kbd", "", "⌘⇧↵"));
+  button.disabled = Boolean(state.send) && (count === 0 || !chosenAgent() || state.send.sending);
+}
+
+function openSend() {
+  if (runs.live()) {
+    showToast("The agent is still working on the last run: wait for it, or stop it.");
+    return;
+  }
+  // The prompt covers the code, and with it a note being written.
+  if (guardDraft("sending")) return;
+  if (state.composer) closeComposer({ save: false });
+  closeMenu();
+  state.send = { ticked: new Set(sendable(state.notes)), agent: null, sending: false };
+  showTab("notes");
+  renderNotes();
+  showPrompt();
+}
+
+function closeSend() {
+  if (!state.send) return;
+  state.send = null;
+  previewEl.hidden = true;
+  if (state.file) renderHeader(state.file.path);
+  else {
+    $("crumbs").replaceChildren();
+    $("file-meta").textContent = "";
+  }
+  renderNotes();
+}
+
+// Shows the prompt of the ticked notes in the code pane, as the Rust process builds it.
+let promptRequest = 0;
+async function showPrompt() {
+  if (!state.send) return;
+  const ids = tickedIds();
+  const request = ++promptRequest;
+  $("crumbs").replaceChildren(el("b", "", "What the agent receives"));
+  previewEl.hidden = false;
+  if (ids.length === 0) {
+    $("file-meta").textContent = "";
+    previewEl.replaceChildren(el("div", "empty", "Tick the notes to send."));
+    return;
+  }
+  const response = await fetch(`api/run/preview?notes=${ids.join(",")}`);
+  const reply = response.ok ? await response.json() : await response.text();
+  // A later tick, or the step closed, while this was in flight.
+  if (request !== promptRequest || !state.send) return;
+  if (!response.ok) {
+    previewEl.replaceChildren(el("div", "empty", reply));
+    return;
+  }
+
+  const files = [...new Set(state.notes.filter((n) => state.send.ticked.has(n.id)).map((n) => n.path))];
+  const notes = ids.length === 1 ? "1 note" : `${ids.length} notes`;
+  $("file-meta").textContent = `${notes} · ${files.length === 1 ? "1 file" : `${files.length} files`}`;
+  const text = el("pre", "prompt-text");
+  for (const line of promptLines(reply.prompt)) {
+    text.append(el("span", `prompt-${line.kind}`, `${line.text}\n`));
+  }
+  const links = el("div", "prompt-links");
+  links.append(el("span", "prompt-links-label", "Linked files"));
+  for (const path of files) links.append(el("span", "prompt-link", path));
+  previewEl.replaceChildren(text, links);
+}
+
+async function sendNotes() {
+  const agent = chosenAgent();
+  if (!state.send || state.send.sending || state.send.ticked.size === 0 || !agent) return;
+  state.send.sending = true;
+  renderSendBar();
+  const response = await fetch("api/run", {
+    method: "POST",
+    body: JSON.stringify({ notes: tickedIds(), agent }),
+  });
+  if (!response.ok) {
+    showToast(await response.text());
+    if (state.send) state.send.sending = false;
+    renderSendBar();
+    return;
+  }
+  closeSend();
+  showTab("run");
+  await runs.sync();
+}
+
+$("send-button").addEventListener("click", () => {
+  if (state.send) sendNotes();
+  else openSend();
+});
+
+// The agents turned on in the settings, to send this one run to; the settings' agent is the
+// default.
+$("agent-picker").addEventListener("click", (event) => {
+  const { left, top } = event.currentTarget.getBoundingClientRect();
+  const agents = state.settings?.enabledAgents ?? [];
+  const actions = agents.map((name) => ({
+    label: name,
+    detail: name === state.settings.agent ? "default" : "",
+    key: name === chosenAgent() ? "✓" : "",
+    run: () => {
+      if (!state.send) return;
+      state.send.agent = name;
+      renderSendBar();
+    },
+  }));
+  actions.push({
+    label: agents.length === 0 ? "Turn on an agent in Settings…" : "Agents in Settings…",
+    separated: agents.length > 0,
+    run: () => settings.open(),
+  });
+  openMenu(left, top, actions);
+});
+
+function showTab(tab) {
+  state.tab = tab;
+  const run = tab === "run";
+  if (run) closeSend();
+  $("tab-notes").setAttribute("aria-selected", String(!run));
+  $("tab-run").setAttribute("aria-selected", String(run));
+  notesEl.hidden = run;
+  $("run").hidden = !run;
+  $("note-count").hidden = run;
+  $("run-header").hidden = !run;
+  renderSendBar();
+}
+
+$("tab-notes").addEventListener("click", () => showTab("notes"));
+$("tab-run").addEventListener("click", () => showTab("run"));
+$("agent-status").addEventListener("click", () => showTab("run"));
+
+// File edits the run has finished, to tell when the open file may have changed.
+function editsDone(run) {
+  return foldRun(run.entries).items.filter(
+    (item) =>
+      item.type === "tool" && item.status === "completed" && ["edit", "delete", "move"].includes(item.tool),
+  ).length;
+}
+
+// Called after every change to the run.
+function followRun(run, previous) {
+  $("tab-run").hidden = run === null;
+  if (run === null) {
+    if (state.tab === "run") showTab("notes");
+    return;
+  }
+  const fresh = previous?.id !== run.id;
+  // A run that starts, and a run that needs the engineer, come to the front.
+  if ((fresh && isLive(run)) || (run.status === "waiting" && previous?.status !== "waiting")) {
+    showTab("run");
+  }
+  // The agent edits files, and the notes are marked sent once it has the prompt: both are
+  // read again when the run moves on and when an edit finishes. There is no file watcher
+  // (docs/design.md, "Working with the repository").
+  if (!fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run))) {
+    refresh().catch((error) => showToast(String(error)));
+  }
+  renderSendBar();
 }
 
 // ---- Input ----------------------------------------------------------------------------
@@ -1083,13 +1326,25 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (event.key === "Enter" && event.metaKey && event.shiftKey) {
+    event.preventDefault();
+    if (state.send) sendNotes();
+    else if (state.projectOpen) openSend();
+    return;
+  }
+
   const typing = event.target.matches("input, textarea");
+  // `a`, Shift-`a` and `r` answer a permission request while the run shows.
+  if (!typing && !state.composer && state.tab === "run" && runs.keydown(event)) return;
   if (event.key === "Escape") {
     if (state.composer) closeComposer({ save: false });
+    else if (state.send) closeSend();
     else if (state.selection) {
       state.selection = null;
       redecorateRows();
-    }
+    } else if (runs.live()) runs.stop();
+  } else if (state.send) {
+    // The code is covered by the prompt: no key acts on it.
   } else if (event.key === "c" && event.metaKey && !typing && state.file && state.selection) {
     // With text selected, the browser copies and the `copy` handler fixes the text. Lines
     // chosen in the gutter have no text selection, so the whole lines are copied here.
@@ -1249,6 +1504,8 @@ window.postil = {
     else if (command === "settings") settings.open();
     else if (command === "close-window" || command === "quit") quit();
   },
+  // The run changed (src/run.rs); fetch what is new.
+  runChanged: () => runs.sync(),
 };
 
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
@@ -1350,6 +1607,7 @@ const settingsEl = $("settings");
 let appliedTheme = null;
 
 function applySettings(settings) {
+  state.settings = settings;
   const metrics = codeMetrics(settings.codeFontSize);
   const root = document.documentElement.style;
   root.setProperty("--code-font-size", `${metrics.fontSize}px`);
@@ -1375,6 +1633,7 @@ function applySettings(settings) {
     window.ipc.postMessage(`theme:${settings.theme}`);
   }
   appliedTheme = settings.theme;
+  renderSendBar();
 }
 
 const settings = settingsDialog(settingsEl, { apply: applySettings });
@@ -1400,6 +1659,8 @@ async function start() {
   showRepo(repo);
   renderFiles();
   await loadNotes();
+  // The latest run, this session's or one from before a restart.
+  await runs.sync();
 
   if (state.repo.bench) await runBench(state.repo.bench);
 }
