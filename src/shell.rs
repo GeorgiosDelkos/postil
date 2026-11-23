@@ -3933,15 +3933,18 @@ mod tests {
             fs::write(runs.join(format!("{file}.jsonl")), format!("{log}\n")).unwrap();
         };
         // R2 follows itself; R3 and R4 follow each other; R6.jsonl names itself R7, so a
-        // check of the header's id would let it follow R6 again and again.
+        // check of the header's id would let it follow R6 again and again; R8 follows an id
+        // that is not one.
         follows("R2", "R2", "R2");
         follows("R3", "R3", "R4");
         follows("R4", "R4", "R3");
         follows("R6", "R7", "R6");
+        follows("R8", "R8", "R08");
         for (of, problem) in [
             ("R2", "R2: it follows R2"),
             ("R4", "R3: it follows R4"),
             ("R6", "R6: it follows R6"),
+            ("R8", "R8: it follows R08"),
         ] {
             let body = serde_json::json!({ "of": of, "text": "more" }).to_string();
             let (status, reply) = post(&site, &format!("{RUN}/follow"), &body);
