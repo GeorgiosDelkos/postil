@@ -340,7 +340,7 @@ export function runDialog({
   function followUpBox(root, latest) {
     if (following?.root !== root.id) {
       const form = el("form", "follow-up");
-      const input = el("textarea", "follow-up-input");
+      const input = el("textarea", "field follow-up-input");
       input.rows = 3;
       input.setAttribute("aria-label", "Follow-up");
       const why = el("span", "note-dialog-why");

@@ -181,7 +181,7 @@ export function noteDialog(
 
   function startEditing(note) {
     const form = el("form", "note-edit");
-    const input = el("textarea", "note-edit-input");
+    const input = el("textarea", "field note-edit-input");
     input.value = note.body;
     input.rows = 3;
     input.setAttribute("aria-label", `The text of ${note.id}`);

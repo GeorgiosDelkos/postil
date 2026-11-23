@@ -405,7 +405,7 @@ export function settingsDialog(dialogEl, { apply }) {
     const node = el("form", "agent-form");
     const field = (label, key, value, placeholder) => {
       const wrap = el("label", "agent-field");
-      const input = el("input");
+      const input = el("input", "field");
       input.type = "text";
       input.value = value;
       input.placeholder = placeholder;
