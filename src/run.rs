@@ -1203,11 +1203,13 @@ fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> O
         request.tool_call.kind,
         Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think)
     );
-    let option = if read_only && !reads {
-        reject_option(&request.options)
+    // Once, else always. With neither offered the request waits for the engineer.
+    let kinds = if read_only && !reads {
+        [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
     } else {
-        allow_option(&request.options)
-    }?;
+        [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+    };
+    let option = first_option(&request.options, kinds)?;
     agent.answer_permission(request.number, &option).ok()?;
     Some(Entry::Answer {
         request: request.number,
@@ -1257,19 +1259,10 @@ fn end_stage(run: &Run, stage: &Stage, found: usize) -> Option<Vec<Finding>> {
     (!edited).then_some(findings)
 }
 
-/// The option that rejects a permission request: once, else always. `None` when the agent
-/// offers neither; the request then waits for the engineer.
-fn reject_option(options: &[PermissionOption]) -> Option<String> {
-    [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
-        .into_iter()
-        .find_map(|kind| options.iter().find(|option| option.kind == kind))
-        .map(|option| option.option_id.clone())
-}
-
-/// The option that allows a permission request: once, else always. `None` when the agent
-/// offers neither; the request then waits for the engineer, as before auto-allow.
-fn allow_option(options: &[PermissionOption]) -> Option<String> {
-    [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+/// The id of the first of `options` of the first kind in `kinds` that has one; `None` when
+/// none of `options` is of any of them.
+fn first_option(options: &[PermissionOption], kinds: [PermissionKind; 2]) -> Option<String> {
+    kinds
         .into_iter()
         .find_map(|kind| options.iter().find(|option| option.kind == kind))
         .map(|option| option.option_id.clone())
