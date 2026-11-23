@@ -190,6 +190,9 @@ kbd {
 .repo-branch {
   font: 11.5px "Geist Mono", monospace;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .filter {

@@ -1251,6 +1251,13 @@ async function loadLayout() {
   const { defaults, limits, ...layout } = await response.json();
   panes.defaults = defaults;
   panes.limits = limits;
+  for (const [id, [min, max]] of [
+    ["divider-files", limits.sidebar],
+    ["divider-tray", limits.tray],
+  ]) {
+    $(id).setAttribute("aria-valuemin", String(min));
+    $(id).setAttribute("aria-valuemax", String(max));
+  }
   setLayout(layout, { save: false });
 }
 
@@ -1285,6 +1292,13 @@ for (const [id, divider] of [
   ["divider-tray", "tray"],
 ]) {
   const el = $(id);
+  const stop = () => {
+    if (panes.dragging !== divider) return;
+    panes.dragging = null;
+    el.classList.remove("active");
+    document.body.classList.remove("resizing");
+    setLayout(panes.layout, { save: true });
+  };
   el.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || !panes.layout) return;
     event.preventDefault();
@@ -1295,32 +1309,28 @@ for (const [id, divider] of [
   });
   el.addEventListener("pointermove", (event) => {
     if (panes.dragging !== divider) return;
+    // A release outside the window can arrive without a pointerup here.
+    if ((event.buttons & 1) === 0) return stop();
     const next =
       divider === "files"
-        ? dragFiles(panes.layout, panes.limits, event.clientX)
+        ? dragFiles(panes.layout, panes.limits, event.clientX, innerWidth)
         : dragTray(panes.layout, panes.limits, event.clientX, innerWidth);
     setLayout(next, { save: false });
   });
-  const stop = () => {
-    if (panes.dragging !== divider) return;
-    panes.dragging = null;
-    el.classList.remove("active");
-    document.body.classList.remove("resizing");
-    setLayout(panes.layout, { save: true });
-  };
-  el.addEventListener("pointerup", stop);
-  el.addEventListener("pointercancel", stop);
+  // Fires after pointerup and pointercancel, and also when the capture is lost without either:
+  // a dialog opened with Cmd-, mid-drag makes the divider inert.
+  el.addEventListener("lostpointercapture", stop);
   el.addEventListener("dblclick", () => {
     if (panes.layout) setLayout(reset(panes.layout, panes.defaults, divider), { save: true });
   });
   el.addEventListener("keydown", (event) => {
     if (!panes.layout || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
-    // The divider handles its keys; the window's (`c`, Escape) must not act behind it.
+    // The arrows move the divider and nothing else; the window's other keys still work here.
     event.preventDefault();
     event.stopPropagation();
     const size = event.shiftKey ? BIG_STEP : STEP;
     const delta = event.key === "ArrowRight" ? size : -size;
-    setLayout(step(panes.layout, panes.limits, divider, delta), { save: true });
+    setLayout(step(panes.layout, panes.limits, divider, delta, innerWidth), { save: true });
   });
 }
 

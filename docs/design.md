@@ -72,9 +72,10 @@ Rules for this app:
   dragging the divider in the gap beside them, or with the arrow keys on a focused divider;
   a double-click resets one. The file list does not fold: at 200 px its foot still shows the
   Settings button whole, and the owner asked on 2026-11-23 for no narrower list. The code pane
-  keeps at least 420 px: in a narrow window the tray gives way first, then the file list. The widths are kept per Mac in `~/.config/postil/layout.json`,
-  chosen by the owner on 2026-11-23 over per project; like `recent.json` it is a
-  convenience, so a file that cannot be used counts as the defaults.
+  keeps at least 420 px: in a narrow window the tray gives way first, then the file list. The
+  widths are kept per Mac in `~/.config/postil/layout.json`, chosen by the owner on 2026-11-23
+  over per project; like `recent.json` it is a convenience, so a file that cannot be used
+  counts as the defaults.
 - **Code is the largest and brightest thing on screen.** Chrome text is dimmer than code text.
 - **Two themes at launch:** Graphite (dark, default) and Paper (light). Each is a small palette
   of named colors, as in Herdr; a third theme is a new palette, not new code.

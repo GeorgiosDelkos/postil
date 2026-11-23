@@ -129,7 +129,8 @@ pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
         version: VERSION,
         layout: Layout { ..*layout },
     };
-    let mut json = serde_json::to_vec_pretty(&stored).expect("numbers and a flag always serialize");
+    let mut json =
+        serde_json::to_vec_pretty(&stored).expect("a version and two numbers always serialize");
     json.push(b'\n');
     write_atomically(file, &json).map_err(|source| Error::WriteLayout {
         path: file.to_owned(),
@@ -169,7 +170,7 @@ mod tests {
         let file = temp_file("range");
         let with = |sidebar, tray| Layout { sidebar, tray };
         for (sidebar, tray, words) in [
-            (179, 320, "file list"),
+            (199, 320, "file list"),
             (481, 320, "file list"),
             (248, 279, "tray"),
             (248, 721, "tray"),

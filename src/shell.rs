@@ -543,7 +543,7 @@ struct Site {
     /// `recent_file`, turns them off: the defaults apply and saving fails.
     settings_file: Option<PathBuf>,
     /// Where the pane widths are kept (`layout.rs`); `None`, for the same reason as
-    /// `recent_file`, keeps them for this run of the app only.
+    /// `recent_file`, keeps them in each window only, until it closes.
     layout_file: Option<PathBuf>,
     /// Where agents' programs are looked for, found in the background.
     agents: Scanner,

@@ -272,7 +272,7 @@ impl fmt::Display for Error {
             ),
             Self::WriteLayout { path, .. } => write!(
                 f,
-                "cannot save the pane widths to {} (they apply until Postil quits)",
+                "cannot save the pane widths to {} (they apply in this window only)",
                 path.display()
             ),
             Self::AgentNotFound { program } => write!(
