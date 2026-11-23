@@ -10,9 +10,10 @@
 # workflow_dispatch is the dry run: the same build, signing, notarization and checks, and no
 # release.
 #
-# Secrets live only in the GitHub Environment `release` (required reviewer: the owner; deployment
-# policy: branch main and tags v*), never at repository level, and each reaches only the steps
-# that use it:
+# Secrets live only in the GitHub Environment `release` of this repository (required reviewer:
+# the owner; deployment policy: branch main and tags v*; set up on 2026-11-23, as vigil's), never
+# at repository level, and each reaches only the steps that use it. Environments belong to one
+# repository, so the values are entered here again from the original files:
 #
 #   APPLE_CERTIFICATE           base64 of the Developer ID Application .p12
 #   APPLE_CERTIFICATE_PASSWORD  its password
@@ -86,6 +87,11 @@ jobs:
             exit 1
           fi
 
+      # Before any secret is in a keychain: the build runs every dependency's build scripts and
+      # proc macros, which must not find a Developer ID they could sign with.
+      - name: Build the app bundle
+        run: scripts/bundle.sh
+
       # A keychain of this run's own holds the certificate and the notary profile, so nothing
       # lands in the runner's login keychain; the last step deletes it.
       - name: Import the certificate and the notary key into a keychain of this run
@@ -98,30 +104,30 @@ jobs:
         run: |
           set -euo pipefail
           keychain="${RUNNER_TEMP}/release.keychain-db"
+          certificate="${RUNNER_TEMP}/certificate.p12"
+          key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
+          # Gone on every way out of this step, a failed import included.
+          trap 'rm -f "${certificate}" "${key}"' EXIT
           keychain_password="$(uuidgen)"
           security create-keychain -p "${keychain_password}" "${keychain}"
-          security set-keychain-settings -lut 3600 "${keychain}"
+          # Named at once, so the last step deletes the keychain even if this step fails.
+          echo "POSTIL_NOTARY_KEYCHAIN=${keychain}" >> "${GITHUB_ENV}"
+          # Locks after 90 minutes unused, the job's limit: never during notarization's wait.
+          security set-keychain-settings -lut 5400 "${keychain}"
           security unlock-keychain -p "${keychain_password}" "${keychain}"
           umask 077
-          printf '%s' "${APPLE_CERTIFICATE}" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
-          security import "${RUNNER_TEMP}/certificate.p12" -k "${keychain}" \
+          printf '%s' "${APPLE_CERTIFICATE}" | base64 --decode > "${certificate}"
+          security import "${certificate}" -k "${keychain}" \
             -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
-          rm "${RUNNER_TEMP}/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "${keychain_password}" "${keychain}" > /dev/null
           # codesign finds the identity only in a keychain on the search list.
           existing="$(security list-keychains -d user | tr -d '"' | xargs)"
           # shellcheck disable=SC2086 # the existing keychains are one word each, by design
           security list-keychains -d user -s "${keychain}" ${existing}
-          key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s\n' "${APPLE_API_KEY_P8}" > "${key}"
           xcrun notarytool store-credentials postil --key "${key}" --key-id "${APPLE_API_KEY}" \
             --issuer "${APPLE_API_ISSUER}" --keychain "${keychain}"
-          rm "${key}"
-          echo "POSTIL_NOTARY_KEYCHAIN=${keychain}" >> "${GITHUB_ENV}"
-
-      - name: Build the app bundle
-        run: scripts/bundle.sh
 
       - name: Sign, notarize and staple
         env:
@@ -160,9 +166,20 @@ jobs:
           set -euo pipefail
           zip="Postil-${RELEASE_TAG}-macos-arm64.zip"
           ditto -c -k --keepParent "${APP}" "${zip}"
-          gh release create "${RELEASE_TAG}" "${zip}" --repo "${GITHUB_REPOSITORY}" \
-            --draft --title "Postil ${RELEASE_TAG}" \
-            --notes "Unzip, and move Postil to Applications. For Apple Silicon Macs; signed and notarized."
+          # A re-run after a failed publish finds its own draft and replaces the zip on it; a
+          # release already published is never replaced.
+          if draft="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "${draft}" != "true" ]; then
+              echo "::error::release ${RELEASE_TAG} is already published"
+              exit 1
+            fi
+            gh release upload "${RELEASE_TAG}" "${zip}" --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${zip}" --repo "${GITHUB_REPOSITORY}" \
+              --draft --title "Postil ${RELEASE_TAG}" \
+              --notes "Unzip, and move Postil to Applications. For Apple Silicon Macs; signed and notarized."
+          fi
           gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
 
       - name: Delete the keychain of this run
