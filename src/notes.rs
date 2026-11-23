@@ -153,18 +153,7 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
 /// it, as [`current`] for reading the file, [`Error::WriteReview`] when the lock or the file
 /// cannot be written, and [`Error::ReviewLocked`] when another process holds the lock.
 pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
-    let wanted = NoteId::parse(id)
-        .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
-    let file = repo.review_file();
-    let _lock = lock(&file)?;
-    let mut review = current(repo)?;
-    let before = review.notes.len();
-    review.notes.retain(|note| note.id != wanted);
-    if review.notes.len() == before {
-        return Err(Error::NoSuchNote { id: id.to_owned() });
-    }
-    review.save(&file)?;
-    Ok(review)
+    change_notes(repo, id, |notes, index| drop(notes.remove(index)))
 }
 
 /// Marks the note `id` resolved, saves, and returns all notes. A resolved note keeps the run
@@ -220,17 +209,28 @@ pub(crate) fn edit(repo: &Repo, id: &str, body: &str) -> Result<Review> {
 
 /// Changes note `id` with `change` and saves, under the lock.
 fn change_note(repo: &Repo, id: &str, change: impl FnOnce(&mut Note)) -> Result<Review> {
+    change_notes(repo, id, |notes, index| change(&mut notes[index]))
+}
+
+/// Changes the notes with `change`, given the index of note `id` among them, and saves, under
+/// the lock. Ids are unique ([`Review::load`] refuses a file that repeats one), so the index
+/// is the only note with that id.
+fn change_notes(
+    repo: &Repo,
+    id: &str,
+    change: impl FnOnce(&mut Vec<Note>, usize),
+) -> Result<Review> {
     let wanted = NoteId::parse(id)
         .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
     let file = repo.review_file();
     let _lock = lock(&file)?;
     let mut review = current(repo)?;
-    let note = review
+    let index = review
         .notes
-        .iter_mut()
-        .find(|note| note.id == wanted)
+        .iter()
+        .position(|note| note.id == wanted)
         .ok_or_else(|| Error::NoSuchNote { id: id.to_owned() })?;
-    change(note);
+    change(&mut review.notes, index);
     review.save(&file)?;
     Ok(review)
 }
