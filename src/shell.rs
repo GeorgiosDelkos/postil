@@ -48,6 +48,8 @@ const TREE_JS: &str = include_str!("../ui/tree.js");
 const ICONS_JS: &str = include_str!("../ui/icons.js");
 const SETTINGS_JS: &str = include_str!("../ui/settings.js");
 const SETTINGS_DIALOG_JS: &str = include_str!("../ui/settings-dialog.js");
+const RUN_JS: &str = include_str!("../ui/run.js");
+const RUN_PANEL_JS: &str = include_str!("../ui/run-panel.js");
 const ICONS_SVG: &str = include_str!("../ui/icons.svg");
 const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
 const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
@@ -740,6 +742,8 @@ impl Site {
                 "text/javascript",
                 SETTINGS_DIALOG_JS.as_bytes(),
             ),
+            "/run.js" => reply(StatusCode::OK, "text/javascript", RUN_JS.as_bytes()),
+            "/run-panel.js" => reply(StatusCode::OK, "text/javascript", RUN_PANEL_JS.as_bytes()),
             "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
