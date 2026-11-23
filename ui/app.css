@@ -337,11 +337,6 @@ kbd {
   font-size: 12.5px;
 }
 
-.pane-title {
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
 .crumbs {
   color: var(--text-muted);
   white-space: nowrap;
@@ -1011,7 +1006,6 @@ button.repo-name:hover {
   box-shadow: var(--shadow);
   color: var(--text-strong);
 }
-
 
 /* Settings: the button at the foot of the sidebar, and the dialog it opens. */
 
@@ -1778,20 +1772,6 @@ button.repo-name:hover {
   font: 11.5px "Geist Mono", monospace;
 }
 
-.run-end {
-  flex: none;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.run-end.done {
-  color: var(--added);
-}
-
-.run-end.failed {
-  color: var(--removed);
-}
-
 .button.stop {
   flex: none;
   height: 26px;
@@ -1902,9 +1882,6 @@ button.repo-name:hover {
   color: var(--removed);
 }
 
-
-
-
 .run-detail-nav {
   display: flex;
   align-items: center;
@@ -1978,18 +1955,6 @@ button.repo-name:hover {
   color: var(--note);
 }
 
-.tool-line {
-  height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 8px;
-  border-radius: 6px;
-  font: 11.5px "Geist Mono", monospace;
-  font-variant-ligatures: none;
-  color: var(--text-soft);
-}
-
 .tool-verb {
   flex: none;
   width: 44px;
@@ -2014,15 +1979,6 @@ button.repo-name:hover {
 }
 
 .tool-state.unfinished {
-  color: var(--text-muted);
-}
-
-.tool-line.running .tool-target {
-  color: var(--text-strong);
-}
-
-.tool-line.running .tool-state::after {
-  content: "…";
   color: var(--text-muted);
 }
 
@@ -2098,11 +2054,6 @@ button.repo-name:hover {
   color: var(--text-strong);
   overflow-wrap: anywhere;
   user-select: text;
-}
-
-.permission-answer {
-  font-size: 12px;
-  color: var(--text-soft);
 }
 
 .permission-actions {
