@@ -39,7 +39,7 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install
       - name: cargo install cargo-deny
-        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # tag=v2.85.4
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # tag=v2.90.5
         with:
           tool: cargo-deny
       - name: cargo deny check
