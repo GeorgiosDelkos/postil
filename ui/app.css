@@ -946,10 +946,22 @@ button.repo-name:hover {
   position: relative;
 }
 
+/* A card's actions (the arrow, and ×) sit in its bottom-right corner, in a row the card keeps
+   free for them, so they never cover its status, place or id. A card with a foot line shares
+   that row: the line stops short of them. */
+.note-item > .note:not(:has(.note-foot)) {
+  padding-bottom: 36px;
+}
+
+.note-foot {
+  min-height: 22px;
+  padding-right: 64px;
+}
+
 .note-delete {
   position: absolute;
-  top: 6px;
-  right: 6px;
+  bottom: 8px;
+  right: 8px;
   height: 22px;
   min-width: 22px;
   padding: 0 6px;
@@ -2456,8 +2468,8 @@ body.resizing * {
 
 .note-send {
   position: absolute;
-  top: 6px;
-  right: 34px;
+  bottom: 8px;
+  right: 36px;
   height: 22px;
   min-width: 22px;
   padding: 0 6px;
