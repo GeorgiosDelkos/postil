@@ -567,7 +567,8 @@ fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
 
 /// How long a change waits for another process to release `review.lock`. A writer holds it
 /// while it reads, relocates and writes the file, milliseconds; arbitrary, far above that and
-/// short enough that a stuck process shows as an error rather than a hung window.
+/// short enough that a stuck process shows as an error rather than as page requests that
+/// never answer.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// How often a change waiting for `review.lock` tries again. Arbitrary: small against

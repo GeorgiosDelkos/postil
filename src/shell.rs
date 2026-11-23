@@ -28,7 +28,7 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode, Uri};
-use wry::{DragDropEvent, PageLoadEvent, RequestAsyncResponder, WebView, WebViewBuilder};
+use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::dialog;
@@ -263,7 +263,11 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     let (site, settings) = start_site(dir, bench, notify)?;
     // A failure before the event loop runs returns without waiting for the request thread to
     // drop the site: no page has started a run yet, so there is no agent to stop.
-    let jobs = spawn_site_worker(site, event_loop.create_proxy())?;
+    let closed = event_loop.create_proxy();
+    let jobs = spawn_site_worker(site, move || {
+        // Fails only once the event loop is gone, when nobody waits for it.
+        drop(closed.send_event(AppEvent::SiteClosed));
+    })?;
 
     let window = build_window(&event_loop, settings.theme)?;
 
@@ -298,7 +302,12 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 event: WindowEvent::CloseRequested,
                 ..
             } => ask_page(&page, "close-window", Unanswered::Quit),
-            Event::UserEvent(AppEvent::Quit) => close_site(&jobs, control_flow),
+            Event::UserEvent(AppEvent::Quit) => {
+                // Gone from the screen at once: closing the site can take a while (a slow git
+                // call queued ahead of it, the snapshot after a live run).
+                window.set_visible(false);
+                close_site(&jobs, control_flow);
+            }
             Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
             // The system switched between light and dark while the window follows it.
             Event::WindowEvent {
@@ -368,16 +377,20 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     Ok(report)
 }
 
+/// How the request thread hands an answer back: to wry's responder in the app, to a channel
+/// in the tests.
+type Answer = Box<dyn FnOnce(Reply) + Send>;
+
 /// What the request thread is asked to do ([`spawn_site_worker`]).
 #[expect(
     clippy::large_enum_variant,
-    reason = "the queue holds a handful of jobs and one Close; boxing every request would cost more"
+    reason = "a handful of jobs is queued at a time; boxing would save a few hundred bytes"
 )]
 enum Job {
-    /// Answer a request from the page, as wry hands it over.
-    Answer(Request<Vec<u8>>, RequestAsyncResponder),
-    /// Drop the site, which stops the agent of a run under way, then send
-    /// [`AppEvent::SiteClosed`]. Later requests get 503.
+    /// Answer a request from the page.
+    Answer(Request<Vec<u8>>, Answer),
+    /// Drop the site, which stops the agent of a run under way, then say so. Later requests
+    /// get 503.
     Close,
 }
 
@@ -395,20 +408,22 @@ impl fmt::Debug for Job {
 
 /// Starts the thread that answers the page's requests and returns the way to send it jobs.
 /// It owns `site` and does each job in the order it arrives; on [`Job::Close`] it drops the
-/// site and tells `closed`.
+/// site, then calls `closed`.
 ///
 /// wry calls the URL scheme handler on the main thread, and answering there would stop the
 /// window (input, redraws, Stop) for as long as git, a file read or highlighting takes, so
-/// the handler only queues the request. One thread rather than one per request: the page
-/// relies on order (`api/open`, then `api/repo`), and one at a time, `Site` needs no lock.
-/// The queue is unbounded: its sender is the page's fetches, a handful at a time, and a
-/// bounded queue that filled up would block the main thread.
+/// the handler only queues the request. One thread rather than one per request: requests
+/// answered one at a time need no lock on `Site` (its project is a `RefCell`), `open` can
+/// check for a live run and switch projects with nothing in between, and a request the page
+/// sent first (a folder save) lands before a later one (an open). The queue is unbounded: its
+/// sender is the page's fetches, a handful at a time, and a bounded queue that filled up
+/// would block the main thread.
 ///
 /// An answer may come from any thread (wry's `RequestAsyncResponder` exists for that), but
 /// WebKit delivers it on the main thread's run loop and waits for that. So the main thread
 /// must never wait for this one while its run loop is stopped: the site is closed by a job
-/// while the event loop still runs, and the event loop exits on [`AppEvent::SiteClosed`].
-fn spawn_site_worker(site: Site, closed: EventLoopProxy<AppEvent>) -> Result<Sender<Job>> {
+/// while the event loop still runs, and the event loop exits once `closed` tells it.
+fn spawn_site_worker(site: Site, closed: impl Fn() + Send + 'static) -> Result<Sender<Job>> {
     let (sender, jobs) = mpsc::channel::<Job>();
     thread::Builder::new()
         .name("page-requests".to_owned())
@@ -416,21 +431,17 @@ fn spawn_site_worker(site: Site, closed: EventLoopProxy<AppEvent>) -> Result<Sen
             let mut site = Some(site);
             for job in jobs {
                 match job {
-                    Job::Answer(request, responder) => {
-                        let answer = match &site {
-                            Some(site) => site.respond(&request),
-                            None => reply(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "text/plain",
-                                &b"Postil is closing"[..],
-                            ),
-                        };
-                        responder.respond(answer);
-                    }
+                    Job::Answer(request, answer) => answer(match &site {
+                        Some(site) => site.respond(&request),
+                        None => reply(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "text/plain",
+                            &b"Postil is closing"[..],
+                        ),
+                    }),
                     Job::Close => {
                         drop(site.take());
-                        // Fails only once the event loop is gone, when nobody waits for it.
-                        drop(closed.send_event(AppEvent::SiteClosed));
+                        closed();
                     }
                 }
             }
@@ -525,12 +536,20 @@ fn build_webview(
     WebViewBuilder::new()
         .with_background_color(canvas_color(window.theme()))
         .with_asynchronous_custom_protocol("postil".to_owned(), move |_webview, request, answer| {
-            // Fails only when the worker is gone, which it is only after a panic: the request
-            // is then answered here, so the page shows an error instead of waiting forever.
+            // The page's own files are static bytes, answered here (owner decision D1): a page
+            // reload is never queued behind a slow request.
+            if let Some(asset) = page_asset(request.uri().path()) {
+                answer.respond(asset);
+                return;
+            }
+            let answer: Answer = Box::new(move |reply| answer.respond(reply));
+            // Fails only when the request thread is gone, which in a debug build means it
+            // panicked (a release build aborts on a panic): the request is then answered here,
+            // so the page shows an error instead of waiting forever.
             if let Err(SendError(Job::Answer(_, answer))) = jobs.send(Job::Answer(request, answer))
             {
                 let problem = "the thread that answers the page stopped; restart Postil";
-                answer.respond(reply(
+                answer(reply(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "text/plain",
                     problem.as_bytes(),
@@ -996,8 +1015,8 @@ impl Site {
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
         let uri = request.uri();
         let post = *request.method() == Method::POST;
-        if let Some(&(_, kind, body)) = PAGE.iter().find(|(path, ..)| *path == uri.path()) {
-            return reply(StatusCode::OK, kind, body);
+        if let Some(asset) = page_asset(uri.path()) {
+            return asset;
         }
         match uri.path() {
             "/api/repo" => json_or_error(self.repo_info()),
@@ -1570,6 +1589,13 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
             reply(status, "text/plain", error_chain(&error).into_bytes())
         }
     }
+}
+
+/// The page's own file at `path` (`PAGE`), if it is one.
+fn page_asset(path: &str) -> Option<Reply> {
+    PAGE.iter()
+        .find(|(served, ..)| *served == path)
+        .map(|&(_, kind, body)| reply(StatusCode::OK, kind, body))
 }
 
 fn reply(
@@ -5311,6 +5337,54 @@ mod tests {
         assert!(
             kinds.contains(&"message:after the long line".to_owned()),
             "the line after it is read whole"
+        );
+    }
+
+    #[test]
+    fn the_request_thread_answers_in_order_then_closes_the_site_before_saying_so() {
+        let repo = TempRepo::new("worker-close");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "ask");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "waiting");
+
+        let (closed_sender, closed) = mpsc::channel();
+        let jobs =
+            spawn_site_worker(site, move || closed_sender.send(()).unwrap_or_default()).unwrap();
+        let (answer_sender, answers) = mpsc::channel();
+        let ask = |uri: &str, tag: &'static str| {
+            let answers = answer_sender.clone();
+            let request = Request::builder().uri(uri).body(Vec::new()).unwrap();
+            let answer: Answer =
+                Box::new(move |reply| answers.send((tag, reply.status())).unwrap());
+            jobs.send(Job::Answer(request, answer)).unwrap();
+        };
+        ask("postil://localhost/api/repo", "first");
+        ask("postil://localhost/api/notes", "second");
+        jobs.send(Job::Close).unwrap();
+        ask("postil://localhost/api/repo", "after");
+
+        closed
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the request thread says it closed the site");
+        // Said only once the site is gone: the live run has already ended, stopped.
+        let log = fs::read_to_string(repo.root.join(".git/postil/runs/R1.jsonl")).unwrap();
+        let end = log.lines().last().unwrap();
+        assert!(
+            end.contains("Postil closed the project while it ran"),
+            "{end}"
+        );
+        let answered: Vec<_> = (0..3)
+            .map(|_| answers.recv_timeout(Duration::from_secs(60)).unwrap())
+            .collect();
+        assert_eq!(
+            answered,
+            [
+                ("first", StatusCode::OK),
+                ("second", StatusCode::OK),
+                ("after", StatusCode::SERVICE_UNAVAILABLE),
+            ]
         );
     }
 
