@@ -206,9 +206,10 @@ Read it before a change of any size.
 | Path                   | What it is                                                         |
 | ---------------------- | ------------------------------------------------------------------ |
 | `src/main.rs`          | The `postil` command                                               |
-| `src/shell.rs`         | The window, the webview, and the HTTP routes the page calls        |
+| `src/shell.rs`         | The window, the webview, and the thread that answers the page      |
+| `src/site.rs`, `src/site/` | The HTTP routes the page calls, and their tests                |
 | `src/acp.rs`, `src/acp/` | The ACP client: starting an agent, prompts, permissions, questions |
-| `src/run.rs`           | Runs: sending notes, the run log, follow-ups, snapshots            |
+| `src/run.rs`, `src/run/` | Runs: sending notes, the run log, follow-ups, snapshots          |
 | `src/review.rs`        | Review chains: prompts and findings                                |
 | `src/notes.rs`         | Notes and `review.json`                                            |
 | `src/repo.rs`          | git: the file list, snapshots, diffs                               |

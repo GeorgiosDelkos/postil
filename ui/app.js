@@ -275,7 +275,7 @@ async function editNote(note, body) {
   return true;
 }
 
-// Resolves or reopens a note (`action` is the route's last part, src/shell.rs), and draws
+// Resolves or reopens a note (`action` is the route's last part, src/site.rs), and draws
 // the notes the reply holds.
 async function changeNote(action, note) {
   const response = await fetch(`api/notes/${action}?id=${encodeURIComponent(note.id)}`, {

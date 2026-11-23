@@ -1,6 +1,6 @@
 // What each note's card and detail show of the run it went to: its status, what the agent
 // said about it, and the steps of the run that concern it. Plain functions of a note and a run
-// view (`GET api/run`, src/run.rs `RunView`), kept apart from the document so `node --test`
+// view (`GET api/run`, src/run/log.rs `RunView`), kept apart from the document so `node --test`
 // runs them.
 
 import {

@@ -1,5 +1,5 @@
 // The rules of the send step and the run panel, apart from the document so `node --test`
-// runs them. A run comes from `GET api/run` (src/run.rs, `RunView`): its entries are the
+// runs them. A run comes from `GET api/run` (src/run/log.rs, `RunView`): its entries are the
 // lines of its log, append-only, and the panel folds them into what it shows.
 
 // The notes ticked when the send step opens: the open ones whose lines are still in their
@@ -48,7 +48,7 @@ function foldEntries(entries) {
   const items = [];
   const tools = new Map();
   const permissions = new Map();
-  // A cancel can log a request's answer before the request itself (src/run.rs).
+  // A cancel can log a request's answer before the request itself (src/run/log.rs).
   const early = new Map();
 
   // A part joins the item before it when both are of one type and one message: the agent's
@@ -437,7 +437,7 @@ export function elapsed(seconds) {
 
 // The prompt's lines, each with its kind for coloring: a note's heading (`[N1] path:3`), a
 // quoted line of code, the line that says the code moved, or text. The format is
-// src/run.rs, `prompt_text`.
+// src/notes.rs, `prompt`.
 export function promptLines(text) {
   return text
     .replace(/\n$/, "")

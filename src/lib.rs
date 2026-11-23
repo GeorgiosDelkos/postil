@@ -22,6 +22,7 @@ mod review;
 mod run;
 mod settings;
 mod shell;
+mod site;
 
 pub use crate::error::Error;
 pub use crate::shell::{BenchReport, bench, run};
