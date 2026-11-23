@@ -802,7 +802,7 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         Event::TurnEnded(TurnEnd::Stopped(StopReason::EndTurn))
     );
     let ends_turn = matches!(event, Event::TurnEnded(_) | Event::Exited { .. });
-    let (run, released, answer, stage) = {
+    let (run, released, answer, next) = {
         let mut slot = runner.slot();
         if slot.let_go(generation) {
             return;
@@ -847,27 +847,20 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         } else {
             Held::None
         };
-        let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
-        (
-            slot.run.clone(),
-            released,
-            answer,
-            stage.map(|stage| (stage, found)),
-        )
+        let run = slot.run.clone();
+        // Decided under the lock, before the stage's end is logged: a reader that sees the end
+        // sees the decision, and no Stop or new review can replace the chain meanwhile. Only
+        // starting the next stage waits for a thread of its own.
+        let next = match (&stage, &run) {
+            (Some(stage), Some(run)) if ended_well => decide(&mut slot, run, stage),
+            _ => None,
+        };
+        (run, released, answer, next)
     };
-    let mut next = None;
-    if let Some(run) = run {
-        // A proposer's findings are read from its reply as its turn ends, and logged before
-        // the end, while the run still takes entries.
-        // Whether the review goes on is decided here, before the stage's end is logged: a
-        // reader that sees the end sees the decision. Only starting the next stage waits for
-        // a thread of its own.
-        if ended_well && let Some((stage, found)) = &stage {
-            next = decide(&runner, &run, stage, *found);
-        }
-        if let Some(ids) = run.record_event(event, answer, runner.repo.root()) {
-            runner.mark_sent(&run, &ids);
-        }
+    if let Some(run) = run
+        && let Some(ids) = run.record_event(event, answer, runner.repo.root())
+    {
+        runner.mark_sent(&run, &ids);
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
@@ -891,20 +884,11 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
 
 /// Ends review stage `stage` of `run`, whose turn ended well, and decides whether the review
 /// goes on: the id of the ended run when the next stage is to start, else `None`, the chain
-/// then cleared.
-fn decide(runner: &Runner, run: &Arc<Run>, stage: &Stage, found: usize) -> Option<String> {
+/// then cleared. A proposer's findings are logged here, before the end, while the run still
+/// takes entries.
+fn decide(slot: &mut Slot, run: &Run, stage: &Stage) -> Option<String> {
+    let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
     let findings = end_stage(run, stage, found);
-    let mut slot = runner.slot();
-    // The lock was let go for `end_stage`: a forced Stop and a new review may have replaced
-    // this run and its chain since, and that chain is not this one to change. A stage check
-    // would not do: a new review of the same run is at the same stage.
-    if !slot
-        .run
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, run))
-    {
-        return None;
-    }
     let goes = match (findings, slot.chain.as_mut()) {
         (Some(findings), Some(chain)) => goes_on(chain, findings),
         _ => false,
