@@ -261,9 +261,9 @@ impl Agent {
 
     /// Asks the agent to stop the turn, and answers every open request `cancelled` (a
     /// permission request) or `cancel` (a question), as the protocol requires; so is every
-    /// request that arrives until the turn ends. The turn still ends with [`Event::TurnEnded`], normally
-    /// [`StopReason::Cancelled`]. Returns the numbers of the requests it answered, which may
-    /// include one whose [`Event::Permission`] is still on its way.
+    /// request that arrives until the turn ends. The turn still ends with
+    /// [`Event::TurnEnded`], normally [`StopReason::Cancelled`]. Returns the numbers of the
+    /// requests it answered, which may include one whose event is still on its way.
     ///
     /// # Errors
     ///
