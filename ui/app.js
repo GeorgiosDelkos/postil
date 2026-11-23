@@ -130,7 +130,7 @@ const tray = notesTray({
   deleteNote,
   openSettings: () => settings.open(),
   beforeSend,
-  renderHeader: (path) => code.renderHeader(path),
+  restoreHeader: () => code.restoreHeader(),
 });
 
 // What a run changed, over the open file; Esc, or opening a file, gives the pane back.
@@ -150,13 +150,7 @@ const changes = changesView({
     if (await code.openFile(path)) code.openComposer({ start: line - 1, end: line - 1 });
   },
   onError: showToast,
-  onClose: () => {
-    if (state.file) code.renderHeader(state.file.path);
-    else {
-      $("crumbs").replaceChildren();
-      $("file-meta").textContent = "";
-    }
-  },
+  onClose: () => code.restoreHeader(),
 });
 
 const noteDetail = noteDialog($("note-dialog"), {
@@ -218,7 +212,11 @@ function applyNotes(reply) {
 }
 
 async function loadNotes() {
-  if (!applyNotes(await fetchNotes())) return;
+  if (applyNotes(await fetchNotes())) redrawNotes();
+}
+
+// Draws again everything that shows the notes, after `state.notes` changed.
+function redrawNotes() {
   indexNotes();
   tray.render();
   files.render();
@@ -252,10 +250,7 @@ async function deleteNote(note) {
     await loadNotes();
   } else {
     state.notes = (await response.json()).notes;
-    indexNotes();
-    tray.render();
-    files.render();
-    code.redecorate();
+    redrawNotes();
   }
   await runs.reload();
 }
@@ -272,9 +267,7 @@ async function editNote(note, body) {
     return false;
   }
   state.notes = (await response.json()).notes;
-  indexNotes();
-  tray.render();
-  code.redecorate();
+  redrawNotes();
   return true;
 }
 
@@ -290,10 +283,7 @@ async function changeNote(action, note) {
     return;
   }
   state.notes = (await response.json()).notes;
-  indexNotes();
-  tray.render();
-  files.render();
-  code.redecorate();
+  redrawNotes();
 }
 
 // ---- Send and run -------------------------------------------------------------------------

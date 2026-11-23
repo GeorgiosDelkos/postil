@@ -132,6 +132,11 @@ const PAGE: &[(&str, &str, &[u8])] = &[
     ),
     ("/dom.js", "text/javascript", include_bytes!("../ui/dom.js")),
     (
+        "/dialog-parts.js",
+        "text/javascript",
+        include_bytes!("../ui/dialog-parts.js"),
+    ),
+    (
         "/bench.js",
         "text/javascript",
         include_bytes!("../ui/bench.js"),

@@ -2,9 +2,10 @@
 // a card's click (docs/design.md, "Notes and their status"). It is drawn from the note and its
 // run (status.js), and drawn again when either changes while it is open.
 
-import { statusIcon } from "./dom.js";
-import { questionForm } from "./question-form.js";
-import { isLive, isResolved, openQuestion, foldRun, partLines, statusLine } from "./run.js";
+import { diffView, reviewSection } from "./dialog-parts.js";
+import { actOnSecondClick, el, statusIcon } from "./dom.js";
+import { keptQuestion } from "./question-form.js";
+import { foldRun, isLive, isResolved, openQuestion, statusLine } from "./run.js";
 import {
   agentSaid,
   fileDiffs,
@@ -15,13 +16,6 @@ import {
   runFailure,
   runStatus,
 } from "./status.js";
-
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 // `dialogEl` is the `<dialog>`. `find(id)` gives `{ note, run }` for a note id, or null once
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
@@ -141,16 +135,8 @@ export function noteDialog(
   function body(note, run) {
     const main = el("div", "note-dialog-body");
     // The agent's question comes first: it is why a note needs the engineer (board 9).
-    const question = run && isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
-    if (question) {
-      // Keyed by run too: each agent numbers its requests from 0.
-      const key = `${run.id}:${question.request}`;
-      if (asking?.key !== key) {
-        const form = questionForm(question, run.agent, (content) => answerQuestion(question.request, content));
-        asking = { key, form };
-      }
-      main.append(asking.form);
-    } else asking = null;
+    asking = keptQuestion(asking, run, answerQuestion);
+    if (asking) main.append(asking.form);
     main.append(noteSection(note));
 
     const lost = note.anchor === "lost";
@@ -281,25 +267,17 @@ export function noteDialog(
     const review = reviewOf(run.id);
     const names = reviewers();
     const mine = review ? review.findings.filter((finding) => finding.note === note.id) : [];
-    const part = el("section", "note-dialog-section");
-    const label = el("div", "note-dialog-label");
-    label.append(el("span", "", review ? `Review of ${run.id} · ${mine.length} about ${note.id}` : `Review of ${run.id}`));
-    const button = el("button", "button", review ? "Review again" : "Review");
-    button.type = "button";
-    button.disabled = live() || names.length === 0;
-    button.title = names.length ? `Reviewers in order: ${names.join(", ")}` : "Add reviewers in Settings first";
-    button.addEventListener("click", () => {
-      // Once: a second click would only be refused, as a run is then under way.
-      button.disabled = true;
-      startReview(run.id);
+    const title = review
+      ? `Review of ${run.id} · ${mine.length} about ${note.id}`
+      : `Review of ${run.id}`;
+    const part = reviewSection(title, {
+      reviewed: Boolean(review),
+      names,
+      busy: live(),
+      start: () => startReview(run.id),
+      hintClass: "note-dialog-said muted",
     });
-    label.append(button);
-    part.append(label);
-    if (!review) {
-      const hint = names.length ? `Not reviewed yet. Reviewers: ${names.join(", ")}.` : "Not reviewed yet. Add reviewers in Settings.";
-      part.append(el("div", "note-dialog-said muted", hint));
-      return part;
-    }
+    if (!review) return part;
     if (mine.length === 0) {
       part.append(el("div", "note-dialog-said muted", `No finding about ${note.id}; ${review.findings.length} about the run.`));
       return part;
@@ -357,18 +335,17 @@ export function noteDialog(
   function deleteButton(note) {
     const button = el("button", "button note-dialog-delete", "Delete note");
     button.type = "button";
-    button.addEventListener("click", () => {
-      if (button.dataset.confirming) {
+    actOnSecondClick(button, {
+      arm: () => {
+        button.textContent = "Click again to delete";
+      },
+      disarm: () => {
+        button.textContent = "Delete note";
+      },
+      act: () => {
         dialogEl.close();
         remove(note);
-        return;
-      }
-      button.dataset.confirming = "1";
-      button.textContent = "Click again to delete";
-    });
-    button.addEventListener("blur", () => {
-      delete button.dataset.confirming;
-      button.textContent = "Delete note";
+      },
     });
     return button;
   }
@@ -384,15 +361,10 @@ function section(label, content) {
   return part;
 }
 
-// Diffs as lines marked removed, added or unchanged (run.js `partLines`), one block each.
+// Diffs, one block each.
 function diffsView(diffs) {
   const view = el("div", "note-dialog-diffs");
-  const marks = { same: "  ", del: "- ", add: "+ " };
-  for (const diff of diffs) {
-    const block = el("pre", "tool-diff");
-    for (const line of partLines(diff)) block.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
-    view.append(block);
-  }
+  for (const diff of diffs) view.append(diffView(diff));
   return view;
 }
 

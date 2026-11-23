@@ -3,6 +3,21 @@
 
 import { el } from "./dom.js";
 import { questionContent, questionFields } from "./question.js";
+import { foldRun, isLive, openQuestion } from "./run.js";
+
+// The open question of `run`, while it is live, as `{ key, form }`; null when it asks none.
+// `kept` is what the dialog's last draw got from here: while the question stays the same, its
+// form is the same node, so a redraw does not drop what the engineer has chosen or typed.
+// `answer(request, content)` sends the reply. The key holds the run's id: each agent numbers
+// its requests from 0, and a thread's runs can have different agents.
+export function keptQuestion(kept, run, answer) {
+  const question = isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
+  if (!question) return null;
+  const key = `${run.id}:${question.request}`;
+  if (kept?.key === key) return kept;
+  const form = questionForm(question, run.agent, (content) => answer(question.request, content));
+  return { key, form };
+}
 
 // The agent's open question as a form (board 9 on the design canvas): its message, a field
 // per form field, Skip and Send answer (Cmd-Enter). `answer(content)` sends the reply: the

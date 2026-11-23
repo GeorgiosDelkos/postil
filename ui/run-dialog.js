@@ -3,16 +3,15 @@
 // its review's findings. ui/run.js has the rules. A run's follow-ups are part of its dialog,
 // which ends with the box that sends the next one.
 
+import { diffView, reviewSection } from "./dialog-parts.js";
 import { el, statusIcon } from "./dom.js";
-import { questionForm } from "./question-form.js";
+import { keptQuestion } from "./question-form.js";
 import {
   elapsed,
   foldRun,
   iconKind,
   isLive,
   markdownBlocks,
-  openQuestion,
-  partLines,
   statusLine,
   statusWord,
   toolRow,
@@ -189,17 +188,8 @@ export function runDialog({
     const { plan } = foldRun(view.entries);
 
     // The thread's question, from whichever of its runs is under way: the latest.
-    const question = isLive(latest) ? openQuestion(foldRun(latest.entries).items) : null;
-    if (question) {
-      // Keyed by run too: each agent numbers its requests from 0, and a thread's runs can
-      // have different agents.
-      const key = `${latest.id}:${question.request}`;
-      if (asking?.key !== key) {
-        const form = questionForm(question, latest.agent, (content) => store.answerQuestion(question.request, content));
-        asking = { key, form };
-      }
-      body.append(asking.form);
-    } else asking = null;
+    asking = keptQuestion(asking, latest, store.answerQuestion);
+    if (asking) body.append(asking.form);
 
     if (plan?.length) {
       const progress = planProgress(view);
@@ -233,20 +223,14 @@ export function runDialog({
     }
     body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
 
-    if (steps.length) {
-      const stepCards = el("div", "run-cards");
-      for (const step of steps) {
-        stepCards.append(stepCard(view, step, () => openDetail({ kind: "step", id: view.id, key: step.key })));
-      }
-      body.append(section(`Steps · ${steps.length}`, stepCards));
-    }
+    if (steps.length) body.append(stepsSection(view, steps));
 
     const reply = replyPart(view);
     if (reply) body.append(reply);
     if (view.problem) body.append(el("div", "run-notice", view.problem));
     for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
     if (!view.review) {
-      body.append(reviewSection(view, review));
+      body.append(reviewPart(view, review));
       body.append(followUpBox(view, latest));
     }
 
@@ -303,17 +287,21 @@ export function runDialog({
     }
     parts.push(asked);
     const steps = stepsOf(turn);
-    if (steps.length) {
-      const cards = el("div", "run-cards");
-      for (const step of steps) {
-        cards.append(stepCard(turn, step, () => openDetail({ kind: "step", id: turn.id, key: step.key })));
-      }
-      parts.push(section(`Steps · ${steps.length}`, cards));
-    }
+    if (steps.length) parts.push(stepsSection(turn, steps));
     const reply = replyPart(turn);
     if (reply) parts.push(reply);
     if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
     return parts;
+  }
+
+  // The cards of `steps`, some of `stepsOf(view)`, each opening its step.
+  function stepsSection(view, steps) {
+    const cards = el("div", "run-cards");
+    for (const step of steps) {
+      const open = () => openDetail({ kind: "step", id: view.id, key: step.key });
+      cards.append(stepCard(view, step, open));
+    }
+    return section(`Steps · ${steps.length}`, cards);
   }
 
   // The box that sends a follow-up to the thread's latest run, `latest`. One node per thread,
@@ -397,34 +385,15 @@ export function runDialog({
 
   // The run's review: the Review button, a card per reviewer of the latest review, and a
   // card per finding with its verdict (docs/design.md, "Reviews").
-  function reviewSection(view, review) {
-    const names = reviewers();
-    const part = el("section", "note-dialog-section");
-    const label = el("div", "note-dialog-label");
-    label.append(el("span", "", review ? `Review · ${review.findings.length} found` : "Review"));
-    const button = el("button", "button", review ? "Review again" : "Review");
-    button.type = "button";
-    button.disabled = isLive(store.run()) || isLive(view) || names.length === 0;
-    button.title = names.length
-      ? `Reviewers in order: ${names.join(", ")}`
-      : "Add reviewers in Settings first";
-    button.addEventListener("click", () => {
-      // Once: a second click would only be refused, as a run is then under way.
-      button.disabled = true;
-      store.startReview(view.id);
+  function reviewPart(view, review) {
+    const part = reviewSection(review ? `Review · ${review.findings.length} found` : "Review", {
+      reviewed: Boolean(review),
+      names: reviewers(),
+      busy: isLive(store.run()) || isLive(view),
+      start: () => store.startReview(view.id),
+      hintClass: "run-detail-text muted",
     });
-    label.append(button);
-    part.append(label);
-    if (!review) {
-      part.append(
-        el(
-          "div",
-          "run-detail-text muted",
-          names.length ? `Not reviewed yet. Reviewers: ${names.join(", ")}.` : "Not reviewed yet. Add reviewers in Settings.",
-        ),
-      );
-      return part;
-    }
+    if (!review) return part;
     const cards = el("div", "run-cards");
     for (const stage of review.stages) {
       const judges = review.reviewers > 1 && stage.review.reviewer === review.reviewers;
@@ -656,13 +625,4 @@ function inlineView(tag, parts) {
     node.append(wrap ? el(wrap, "", part.text) : part.text);
   }
   return node;
-}
-
-function diffView(diff) {
-  const view = el("pre", "tool-diff");
-  const marks = { same: "  ", del: "- ", add: "+ " };
-  for (const line of partLines(diff)) {
-    view.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
-  }
-  return view;
 }

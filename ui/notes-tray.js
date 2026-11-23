@@ -7,7 +7,7 @@
 // again, or Send, sends; Escape closes the step. The run then shows in the tray's Run tab
 // (run-panel.js), which takes the front whenever the agent needs the engineer.
 
-import { $, el, showToast, statusIcon } from "./dom.js";
+import { $, actOnSecondClick, el, showToast, statusIcon } from "./dom.js";
 import { isLive, isOpen, isResolved, promptLines, sendable } from "./run.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
@@ -18,7 +18,7 @@ import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 // - `deleteNote(note)` deletes a note;
 // - `openSettings()` opens the settings;
 // - `beforeSend()` clears the way for the send step, and returns false when it cannot open;
-// - `renderHeader(path)` gives the code pane's header back to the file at `path`.
+// - `restoreHeader()` gives the code pane's header back to the open file.
 export function notesTray({
   state,
   notesEl,
@@ -29,7 +29,7 @@ export function notesTray({
   deleteNote,
   openSettings,
   beforeSend,
-  renderHeader,
+  restoreHeader,
 }) {
   const previewEl = $("prompt-preview");
   const sendBarEl = $("send-bar");
@@ -211,20 +211,18 @@ export function notesTray({
     const button = el("button", "note-delete", "×");
     button.type = "button";
     button.setAttribute("aria-label", `Delete note ${note.id}`);
-    const reset = () => {
-      item.classList.remove("confirming");
-      button.textContent = "×";
-    };
-    button.addEventListener("click", () => {
-      if (item.classList.contains("confirming")) {
-        deleteNote(note);
-        return;
-      }
-      item.classList.add("confirming");
-      button.textContent = "Delete";
+    actOnSecondClick(button, {
+      area: item,
+      arm: () => {
+        item.classList.add("confirming");
+        button.textContent = "Delete";
+      },
+      disarm: () => {
+        item.classList.remove("confirming");
+        button.textContent = "×";
+      },
+      act: () => deleteNote(note),
     });
-    item.addEventListener("mouseleave", reset);
-    button.addEventListener("blur", reset);
     return button;
   }
 
@@ -291,11 +289,7 @@ export function notesTray({
     if (!state.send) return;
     state.send = null;
     previewEl.hidden = true;
-    if (state.file) renderHeader(state.file.path);
-    else {
-      $("crumbs").replaceChildren();
-      $("file-meta").textContent = "";
-    }
+    restoreHeader();
     renderNotes();
   }
 

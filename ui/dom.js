@@ -22,6 +22,28 @@ export function icon(id) {
   return svg;
 }
 
+// Makes `button` act on its second click only, as deleting what the engineer wrote does. The
+// first click calls `arm()`, which shows that the next click acts; the second calls `act()`.
+// The button losing the focus, or the pointer leaving `area` when one is given, calls
+// `disarm()` and starts over.
+export function actOnSecondClick(button, { area = null, arm, disarm, act }) {
+  let armed = false;
+  const reset = () => {
+    armed = false;
+    disarm();
+  };
+  button.addEventListener("click", () => {
+    if (armed) {
+      act();
+      return;
+    }
+    armed = true;
+    arm();
+  });
+  button.addEventListener("blur", reset);
+  area?.addEventListener("mouseleave", reset);
+}
+
 // The status icon of a card or a dialog: its shape is CSS (`.status-icon.<kind>`).
 export function statusIcon(kind) {
   const glyph = { needs: "!", addressed: "✓", resolved: "✓", silent: "–", failed: "×" }[kind] ?? "";

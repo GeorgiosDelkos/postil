@@ -6,6 +6,7 @@
 // costs nothing noticeable, and one drawing function is easier to keep right than updates by
 // hand. The control that had the focus gets it back by its `data-key`.
 
+import { el } from "./dom.js";
 import {
   addReviewer,
   agentRows,
@@ -20,13 +21,6 @@ import {
 // How long the dialog waits before asking again while the agent scan runs. Arbitrary: short
 // enough that the list appears as soon as the scan ends, long enough not to busy the process.
 const SCAN_POLL_MS = 250;
-
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 function button(text, key, onClick, className = "button") {
   const node = el("button", className, text);

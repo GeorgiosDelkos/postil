@@ -109,6 +109,16 @@ export function codeView({
     $("file-meta").textContent = state.file ? `${state.file.lines.length} lines` : "";
   }
 
+  // Gives the pane's header back to the open file when a view over it closes; clears it when
+  // no file is open.
+  function restoreHeader() {
+    if (state.file) renderHeader(state.file.path);
+    else {
+      $("crumbs").replaceChildren();
+      $("file-meta").textContent = "";
+    }
+  }
+
   async function showNote(note) {
     if (state.file?.path !== note.path && !(await openFile(note.path))) return;
     // A third of the way down reads better than the very top edge.
@@ -558,11 +568,10 @@ export function codeView({
   // so a file changed on disk meanwhile cannot attach the note to other text. Returns the
   // reason on failure, or null.
   async function saveNote(composer) {
-    const shown = state.file.lines.slice(composer.start, composer.end + 1);
     const request = {
       path: state.file.path,
       lines: { start: composer.start + 1, end: composer.end + 1 },
-      snippet: shown.map((tokens) => tokens.map(([, text]) => text).join("")).join("\n"),
+      snippet: linesText(composer),
       body: composer.text,
     };
     const response = await fetch("api/notes", { method: "POST", body: JSON.stringify(request) });
@@ -643,7 +652,7 @@ export function codeView({
     fetchFile,
     openFile,
     showFile,
-    renderHeader,
+    restoreHeader,
     showNote,
     lineCount,
     render: renderCode,
