@@ -174,9 +174,8 @@ impl Repo {
     /// hashes the untracked files in full once. A snapshot index git cannot read is copied
     /// again at once; one that fails `git add` or `write-tree` is removed, so the next snapshot
     /// starts afresh. `git add` runs the repository's clean filters (git-lfs copies a changed
-    /// file into `.git/lfs`). The tree and
-    /// its blobs are objects no ref holds, so `git gc` may prune them once they are older than
-    /// its prune period (two weeks by default).
+    /// file into `.git/lfs`). The tree and its blobs are objects no ref holds, so `git gc` may
+    /// prune them once they are older than its prune period (two weeks by default).
     ///
     /// # Errors
     ///
@@ -230,9 +229,12 @@ impl Repo {
     }
 
     /// Whether the snapshot index `index` must start again from the real one: the files that
-    /// are tracked and ignored differ between them. `git add --all` never adds an ignored file
-    /// (one force-added since the copy), and goes on updating one an index already has (one
-    /// taken out of git and ignored). An index git cannot read must start again too.
+    /// are tracked, ignored and still on disk differ between them. `git add --all` never adds
+    /// an ignored file (one force-added since the copy), and goes on updating one an index
+    /// already has (one taken out of git and ignored). A deleted file is left out: `git add
+    /// --all` drops it from ours, while the real index keeps it until the deletion is staged,
+    /// so counting it would copy the index again on every snapshot. An index git cannot read
+    /// must start again too.
     fn ignored_differ(&self, index: &Path) -> bool {
         let args = [
             "ls-files",
@@ -243,18 +245,13 @@ impl Repo {
         ];
         let listed = |index: Option<&Path>| -> Option<HashSet<String>> {
             let list = run_git(&self.root, index, &args).ok()?;
-            // During a merge conflict a path is listed once per stage. A path gone from disk
-            // is dropped from ours by `git add --all` but stays in the real index until the
-            // deletion is staged; counting it would copy the index again on every snapshot.
-            Some(
-                list.split_terminator('\0')
-                    .filter(|path| self.root.join(path).symlink_metadata().is_ok())
-                    .map(str::to_owned)
-                    .collect(),
-            )
+            // During a merge conflict a path is listed once per stage.
+            Some(list.split_terminator('\0').map(str::to_owned).collect())
         };
         match (listed(Some(index)), listed(None)) {
-            (Some(ours), Some(real)) => ours != real,
+            (Some(ours), Some(real)) => ours
+                .symmetric_difference(&real)
+                .any(|path| self.root.join(path).symlink_metadata().is_ok()),
             // The real index unreadable: the copy then says why.
             _ => true,
         }
