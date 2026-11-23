@@ -175,13 +175,6 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
-    /// A run log is not in the expected format; the text says how.
-    InvalidRun {
-        /// The log.
-        path: PathBuf,
-        /// What is wrong.
-        problem: String,
-    },
     /// A prompt was sent while the agent's previous turn is still running.
     TurnRunning,
     /// A run was asked for while another window runs one on the same working tree.
@@ -308,9 +301,6 @@ impl fmt::Display for Error {
                 path.display()
             ),
             Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
-            Self::InvalidRun { path, problem } => {
-                write!(f, "cannot show the run log {}: {problem}", path.display())
-            }
             Self::TurnRunning => write!(
                 f,
                 "the agent is still working on the last prompt (wait for it, or cancel it)"
@@ -377,7 +367,6 @@ impl std::error::Error for Error {
             | Self::AgentExited { .. }
             | Self::AgentRefused { .. }
             | Self::AgentProtocol(_)
-            | Self::InvalidRun { .. }
             | Self::TurnRunning
             | Self::RunElsewhere
             | Self::NoSuchPermission => None,

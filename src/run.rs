@@ -33,8 +33,8 @@
 //! is incomplete.
 //!
 //! The app never rewrites a log, and reads one only to show the latest run after a restart.
-//! A log with no end is shown as unfinished: the app quit while it ran, or another window
-//! is running it.
+//! A log with no end is shown as unfinished: the app quit or the project was closed while
+//! it ran, or another window is running it.
 //!
 //! # Threads and locks
 //!
@@ -148,7 +148,7 @@ impl Runner {
     /// [`Error::WriteRun`] when the run log cannot be created.
     pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
         let mut slot = self.slot();
-        if slot.run.as_ref().is_some_and(|run| run.state().live) {
+        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
             return Err(Error::TurnRunning);
         }
         let prompt = notes::prompt(&self.repo, ids)?;
@@ -195,7 +195,7 @@ impl Runner {
         let run = slot
             .run
             .clone()
-            .filter(|run| run.state().live)
+            .filter(|run| run.state().live())
             .ok_or_else(|| Error::BadRequest("no run is under way".to_owned()))?;
         let (started, asked) = {
             let state = run.state();
@@ -243,8 +243,8 @@ impl Runner {
         result
     }
 
-    /// Answers the run's permission request `request` (its number in the log) with the
-    /// option `option`.
+    /// Answers the run's permission request `request` (its number, as the log gives it) with
+    /// the option `option`.
     ///
     /// # Errors
     ///
@@ -431,11 +431,11 @@ pub(crate) struct Run {
 struct RunState {
     header: Header,
     entries: Vec<Entry>,
-    /// Whether this process runs it and it has not ended. A log read from disk is not live.
-    live: bool,
     /// The log, open for appending while live; `None` after it ended or a write failed.
     log: Option<File>,
-    /// The exclusive lock on `runs/active.lock`, held while live (module docs).
+    /// The exclusive lock on `runs/active.lock`, held from the run's creation until it ends:
+    /// whether it is held is whether the run is live (`RunState::live`). A log read from disk
+    /// has none.
     active: Option<File>,
     // Kept as each entry is recorded, so a status needs no scan of the entries.
     started: bool,
@@ -470,6 +470,7 @@ struct Header {
 struct VersionOnly {
     version: u32,
 }
+
 /// One thing that happened in a run: a line of its log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -480,8 +481,13 @@ struct VersionOnly {
 pub(crate) enum Entry {
     /// The agent is up and has the prompt.
     Started,
-    /// Part of the agent's reply; consecutive parts form one message.
-    Message { text: String },
+    /// Part of the agent's reply. Consecutive parts with the same `message` (the agent's
+    /// message id, when it sends one) form one message.
+    Message {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// Part of the agent's reasoning.
     Thought { text: String },
     /// A tool call began.
@@ -504,7 +510,8 @@ pub(crate) enum Entry {
     },
     /// The agent's plan, whole: each one replaces the last.
     Plan { steps: Vec<Step> },
-    /// The agent asks to make a tool call. `request` is its number among the run's requests.
+    /// The agent asks to make a tool call. `request` is the agent's number for it, counting
+    /// on across the turns of a kept agent (`acp`, "Permission requests").
     Permission {
         request: usize,
         tool_call: String,
@@ -578,8 +585,8 @@ pub(crate) enum Status {
     Cancelling,
     Ended,
     Failed,
-    /// The log has no end and this process does not run it: the app quit while it ran, or
-    /// another window is running it.
+    /// The log has no end and this process does not run it: the app quit or the project was
+    /// closed while it ran, or another window is running it.
     Unfinished,
 }
 
@@ -647,7 +654,11 @@ impl Run {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
         };
-        log.write_all(&json_line(&header)).map_err(error(&file))?;
+        if let Err(source) = log.write_all(&json_line(&header)) {
+            // A log without its header would be skipped as unreadable on every restart.
+            drop(fs::remove_file(&file));
+            return Err(Error::WriteRun { path: file, source });
+        }
         Ok(Self {
             file,
             state: Mutex::new(RunState::new(header, Some(log), Some(active))),
@@ -708,7 +719,6 @@ impl Run {
             .map_err(|error| format!("its first line is not a run header ({error})"))?;
 
         let mut state = RunState::new(header, None, None);
-        state.live = false;
         for (index, line) in lines.enumerate() {
             if line.is_empty() {
                 continue;
@@ -744,7 +754,7 @@ impl Run {
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     fn record(&self, entry: Entry) {
         let mut state = self.state();
-        if !state.live {
+        if !state.live() {
             return;
         }
         if let Some(log) = &mut state.log
@@ -826,7 +836,6 @@ impl RunState {
         Self {
             header,
             entries: Vec::new(),
-            live: true,
             log,
             active,
             started: false,
@@ -836,6 +845,11 @@ impl RunState {
             answered: BTreeSet::new(),
             problem: None,
         }
+    }
+
+    /// Whether this process runs the run and it has not ended.
+    fn live(&self) -> bool {
+        self.active.is_some()
     }
 
     /// Keeps the fields that sum up the entries current with one more.
@@ -855,7 +869,6 @@ impl RunState {
                 } else {
                     Status::Failed
                 });
-                self.live = false;
                 self.log = None;
                 // Another window may start a run now.
                 self.active = None;
@@ -880,7 +893,7 @@ impl RunState {
         if let Some(end) = self.end {
             return end;
         }
-        if !self.live {
+        if !self.live() {
             return Status::Unfinished;
         }
         if !self.started {
@@ -920,12 +933,17 @@ fn run_numbers(dir: &Path) -> io::Result<Vec<u64>> {
 fn highest_run(dir: &Path) -> io::Result<u64> {
     Ok(run_numbers(dir)?.into_iter().max().unwrap_or(0))
 }
+
 /// A session update as a log entry; `None` for what the run panel does not show.
 fn entry_of(update: SessionUpdate, root: &Path) -> Option<Entry> {
     let entry = match update {
         SessionUpdate::AgentMessageChunk {
             content: ContentBlock::Text { text },
-        } => Entry::Message { text },
+            message_id,
+        } => Entry::Message {
+            text,
+            message: message_id,
+        },
         SessionUpdate::AgentThoughtChunk {
             content: ContentBlock::Text { text },
         } => Entry::Thought { text },
@@ -1039,4 +1057,42 @@ fn json_line<T: Serialize>(value: &T) -> Vec<u8> {
 /// is a push or an assignment that a panic cannot leave half done.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn after_a_failed_write_the_log_is_not_written_again_and_the_run_says_so() {
+        let dir = std::env::temp_dir().join(format!("postil-run-log-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p").unwrap();
+        let written = fs::read(&run.file).unwrap();
+        // A log that refuses writes, as a full disk would.
+        run.state().log = Some(File::open(&run.file).unwrap());
+
+        run.record(Entry::Started);
+        run.record(Entry::Thought {
+            text: "x".to_owned(),
+        });
+        let state = run.state();
+        assert!(state.log.is_none(), "dropped after the first failure");
+        assert!(
+            state
+                .problem
+                .as_deref()
+                .unwrap()
+                .contains("could not be written")
+        );
+        assert_eq!(state.entries.len(), 2, "the run itself goes on");
+        assert!(state.live());
+        assert_eq!(
+            fs::read(&run.file).unwrap(),
+            written,
+            "nothing was appended"
+        );
+        drop(state);
+        drop(fs::remove_dir_all(&dir));
+    }
 }

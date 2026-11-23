@@ -194,8 +194,7 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
     Ok(Prompt { text, files })
 }
 
-/// A prompt built from notes.
-#[derive(Debug)]
+/// A prompt built from notes. Its `Debug` output leaves out the text, as for [`Note`].
 pub(crate) struct Prompt {
     /// The text the agent receives.
     pub(crate) text: String,
@@ -498,6 +497,15 @@ impl fmt::Debug for Note {
             .field("anchor", &self.anchor)
             .field("state", &self.state)
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Prompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prompt")
+            .field("len", &self.text.len())
+            .field("files", &self.files)
+            .finish()
     }
 }
 

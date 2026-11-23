@@ -627,7 +627,8 @@ struct SendRun {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerPermission {
-    /// The request's number in the run.
+    /// The request's number, as the run's log gives it (the agent's, counting on across the
+    /// turns of a kept agent).
     request: usize,
     /// The id of the option chosen, one the agent offered.
     option: String,
@@ -1122,7 +1123,6 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }
                 | Error::ReadRun { .. }
-                | Error::InvalidRun { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
@@ -2737,6 +2737,28 @@ mod tests {
         format!("file://{}/{path}", root.display())
     }
 
+    /// The run's first entry of `kind`.
+    fn first_of_kind(run: &serde_json::Value, kind: &str) -> serde_json::Value {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == kind)
+            .unwrap()
+            .clone()
+    }
+
+    /// The message ids of the run's message entries.
+    fn message_ids(run: &serde_json::Value) -> Vec<&str> {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "message")
+            .map(|entry| entry["message"].as_str().unwrap())
+            .collect()
+    }
+
     #[test]
     fn sent_notes_reach_the_agent_and_every_step_of_the_run_is_kept_on_disk() {
         let repo = TempRepo::new("run-turn");
@@ -2786,13 +2808,7 @@ mod tests {
             "only the notes sent are marked, with their run"
         );
 
-        let permission = waiting["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["kind"] == "permission")
-            .unwrap()
-            .clone();
+        let permission = first_of_kind(&waiting, "permission");
         assert_eq!(permission["toolCall"], "t1");
         let wrong = serde_json::json!({ "request": permission["request"], "option": "sure" });
         let (status, body) = post(&site, &format!("{RUN}/permission"), &wrong.to_string());
@@ -2821,6 +2837,12 @@ mod tests {
                 "plan",
                 "ended",
             ]
+        );
+        let ids = message_ids(&ended);
+        assert_eq!(
+            ids,
+            ["m1", "m2", "m3", "m4"],
+            "each part keeps its message's id"
         );
         let update = &ended["entries"][kinds.iter().position(|kind| kind == "toolUpdate").unwrap()];
         assert_eq!(
@@ -3067,6 +3089,17 @@ mod tests {
         );
         let problem = run["problem"].as_str().unwrap();
         assert!(problem.contains("line 4 of"), "{problem}");
+
+        // ext4 and XFS can extend a file with zeros after a crash.
+        let mut log = format!("{}\n{{\"kind\":\"started\"}}\n", header("R3")).into_bytes();
+        log.extend_from_slice(&[0; 64]);
+        fs::write(runs.join("R3.jsonl"), log).unwrap();
+        let run = get_json(&site, RUN);
+        assert_eq!(run["entries"], serde_json::json!([{ "kind": "started" }]));
+        assert!(
+            run["problem"].as_str().unwrap().contains("line 3 of"),
+            "{run}"
+        );
     }
 
     #[test]
@@ -3280,12 +3313,16 @@ mod tests {
     fn a_kept_agent_that_exited_is_started_again() {
         let repo = TempRepo::new("run-dead-kept");
         repo.write("a.txt", "a\n");
-        let (site, nudges) = run_site(&repo, "exit-after-turn");
+        let pid_file = repo.root.join(".git/agent.pid");
+        let (site, nudges) = run_site(&repo, "plain");
+        let command = format!("{} {}", fake_agent("exit-after-turn"), pid_file.display());
+        set_agents(&site, &[("Fake", &command)], "Fake");
         post_note(&site, "a.txt", 1, 1, "one");
         send(&site, &["N1"]);
         wait_for(&site, &nudges, "ended");
-        // Its exit is read on the reader thread; the next nudge is that, or comes after it.
-        nudges.recv_timeout(WAIT).unwrap();
+        // The exited agent is reaped when the runner drops it on its exit event, so once it
+        // is gone the runner holds no agent.
+        wait_for_exit(&pid_file);
 
         send(&site, &["N1"]);
         let second = wait_for(&site, &nudges, "ended");
@@ -3295,6 +3332,7 @@ mod tests {
             "a new process: {second}"
         );
     }
+
     #[test]
     fn run_ids_continue_after_the_highest_log_on_disk() {
         let repo = TempRepo::new("run-ids");

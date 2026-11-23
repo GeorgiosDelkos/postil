@@ -205,7 +205,9 @@ impl Starting {
 }
 
 impl Agent {
-    /// Whether the agent's process still runs. A kept agent that exited is started again.
+    /// Whether the agent is still there: false once the reader has seen its output end, which
+    /// is up to [`STDERR_GRACE`] after the process exits. A kept agent that is not alive is
+    /// started again; a send in that short window fails with the exit instead.
     pub(crate) fn is_alive(&self) -> bool {
         !self.process.state().gone
     }
@@ -227,6 +229,7 @@ impl Agent {
             {
                 return Err(Error::TurnRunning);
             }
+            state.cancelling = false;
             state.register(Waiter::Turn)
         };
         let id = id.ok_or_else(|| self.process.exited())?;
@@ -249,7 +252,12 @@ impl Agent {
     pub(crate) fn cancel(&self) -> Result<Vec<usize>> {
         let open: Vec<(usize, Value)> = {
             let mut state = self.process.state();
-            state.cancelling = true;
+            // Only while a turn runs: a cancel that comes just after the turn ended must not
+            // make the next turn answer its requests `cancelled`.
+            state.cancelling = state
+                .waiters
+                .values()
+                .any(|waiter| matches!(waiter, Waiter::Turn));
             state
                 .permissions
                 .iter_mut()
@@ -827,6 +835,7 @@ mod tests {
         match next(events) {
             Event::Update(SessionUpdate::AgentMessageChunk {
                 content: ContentBlock::Text { text },
+                ..
             }) => text,
             other => panic!("expected a message, got {other:?}"),
         }
@@ -944,6 +953,31 @@ mod tests {
             "prompt 2",
             "the same process, so the same session"
         );
+    }
+
+    #[test]
+    fn a_cancel_after_the_turn_ended_leaves_the_next_turn_s_requests_alone() {
+        let (agent, events) = start("turn").unwrap();
+        agent.prompt(&[text("x")]).unwrap();
+        loop {
+            match next(&events) {
+                Event::Permission(request) => {
+                    agent.answer_permission(request.number, "once").unwrap();
+                }
+                Event::TurnEnded(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(agent.cancel().unwrap(), Vec::<usize>::new());
+
+        agent.prompt(&[text("y")]).unwrap();
+        let request = loop {
+            if let Event::Permission(request) = next(&events) {
+                break request;
+            }
+        };
+        assert_eq!(request.number, 1, "numbers count on across turns");
+        agent.answer_permission(request.number, "once").unwrap();
     }
 
     #[test]
@@ -1218,6 +1252,7 @@ mod tests {
             match events.recv_timeout(Duration::from_secs(300)).unwrap() {
                 Event::Update(SessionUpdate::AgentMessageChunk {
                     content: ContentBlock::Text { text },
+                    ..
                 }) => reply.push_str(&text),
                 Event::TurnEnded(end) => break end,
                 Event::Exited { stderr } => panic!("the agent exited: {stderr}"),

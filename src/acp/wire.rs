@@ -184,8 +184,12 @@ pub(crate) struct UpdateParams {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub(crate) enum SessionUpdate {
+    #[serde(rename_all = "camelCase")]
     AgentMessageChunk {
         content: ContentBlock,
+        /// Which message the part belongs to: the agent's id, when it sends one. Claude's
+        /// adapter does (seen 2026-11-23); without it, parts in a row are one message.
+        message_id: Option<String>,
     },
     AgentThoughtChunk {
         content: ContentBlock,

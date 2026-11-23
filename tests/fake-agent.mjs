@@ -15,7 +15,12 @@ const [scenario, ...extra] = process.argv.slice(2);
 
 const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 const update = (update) => send({ method: "session/update", params: { sessionId: "S1", update } });
-const say = (text) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+// Each call is a message of its own, with an id as Claude's adapter sends.
+let messages = 0;
+const say = (text) => {
+  messages += 1;
+  update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text }, messageId: `m${messages}` });
+};
 
 // Replies from the app to the agent's own requests, by id.
 const answers = new Map();
@@ -126,8 +131,10 @@ async function prompt(id, params) {
   }
 }
 
-// The silent agent says who it is, so a test can check that stopping it killed it.
-if (scenario === "silent" && extra[0]) writeFileSync(extra[0], String(process.pid));
+// These agents say who they are, so a test can check that they are gone.
+if (["silent", "exit-after-turn"].includes(scenario) && extra[0]) {
+  writeFileSync(extra[0], String(process.pid));
+}
 
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
