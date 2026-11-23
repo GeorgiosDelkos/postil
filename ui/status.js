@@ -3,7 +3,7 @@
 // view (`GET api/run`, src/run.rs `RunView`), kept apart from the document so `node --test`
 // runs them.
 
-import { diffStats, foldRun, isLive, isOpen, isResolved, sentIn, toolRow } from "./run.js";
+import { diffStats, foldRun, isLive, isOpen, isResolved, openQuestion, sentIn, statusLine, toolRow } from "./run.js";
 
 // The run a note's status comes from, or null: the run it was marked sent in, else the live
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
@@ -242,4 +242,51 @@ export function reviewOf(id, views) {
     view.entries.filter((entry) => entry.kind === "findings" && entry.problem).map((entry) => `${view.id}: ${entry.problem}`),
   );
   return { stages: chain, reviewers, findings, problems };
+}
+
+// Why a failed run failed, from its log, or null.
+export function runFailure(run) {
+  return run.entries.findLast((entry) => entry.kind === "failed")?.error ?? null;
+}
+
+// What the run and note dialogs show of a review (`reviewOf`), as plain data to compare:
+// each stage's status and each finding with its verdict. A stage's entries are left out, so
+// a reviewer that streams leaves the dialogs alone until something shown changes.
+export function reviewKey(review) {
+  if (!review) return null;
+  return [
+    review.stages.map((stage) => [stage.id, stage.agent, stage.review.reviewer, stage.status, statusLine(stage)]),
+    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [id, note, text, fix, path, line, verdict]),
+    review.problems,
+  ];
+}
+
+// What the note dialog shows, as one string: the dialog is drawn again only when it changes.
+// A run's entries come many a second while the agent writes, and most change nothing the
+// dialog shows; drawing it again on each would scroll it, take its focus, drop a click whose
+// press and release land on two nodes, and reset the two-click Delete. `review` is the run's
+// review (`reviewOf`); `shown` is the rest the dialog shows that the note and run do not hold
+// (whether it can be sent, the agent, the reviewers, whether a run is under way).
+export function noteDialogKey(note, run, review, shown) {
+  if (!run) return JSON.stringify([note, shown]);
+  const question = isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
+  return JSON.stringify([
+    note,
+    shown,
+    run.id,
+    run.agent,
+    run.status,
+    run.notes,
+    run.problem ?? null,
+    runFailure(run),
+    statusLine(run),
+    runStatus(note, run),
+    agentSaid(run, note.id),
+    question?.request ?? null,
+    // A finished tool call's diffs do not change, so their count and size stand for them.
+    fileDiffs(note, run).length,
+    fileStats(note, run),
+    noteHistory(note, run),
+    reviewKey(review),
+  ]);
 }

@@ -5,6 +5,7 @@ import {
   agentSaid,
   fileStats,
   groupNotes,
+  noteDialogKey,
   noteHistory,
   noteStatus,
   planProgress,
@@ -198,4 +199,33 @@ test("a run's latest review: its stages, findings, and the judge's verdict on ea
 
   const unreadable = stage("R6", 1, 1, "ended", [{ kind: "findings", findings: [], problem: "no block" }]);
   assert.deepEqual(reviewOf("R1", [unreadable]).problems, ["R6: no block"]);
+});
+
+// `total` is set as the Rust process sets it (src/run.rs, `RunView`): a key that read it
+// would change on every entry.
+const streaming = (id, status, entries, extra = {}) => ({
+  ...run(id, status, entries, ["N1"]),
+  agent: "Claude",
+  total: entries.length,
+  ...extra,
+});
+
+test("the note dialog keeps its key while its run streams what the dialog does not show", () => {
+  const note = sent("N1", "R1");
+  const shown = [true, "Claude", ["Codex"], true];
+  const key = (entries, status = "running", review = null) =>
+    noteDialogKey(note, streaming("R1", status, entries), review, shown);
+  const start = [said("Looking at it")];
+  const drawn = key(start);
+  assert.equal(key([...start, said(" and more")]), drawn, "a token of the reply");
+  assert.equal(key([...start, { kind: "thought", text: "hm" }]), drawn, "a thought");
+  assert.equal(key([...start, tool("t1", "read", "b.rs")]), drawn, "a tool call on another file");
+  assert.notEqual(key([...start, tool("t1", "edit", "a.rs")]), drawn, "its file's history grows");
+  assert.notEqual(key([...start, said("\nN1: fixed")]), drawn, "the agent's line about it");
+  assert.notEqual(key(start, "waiting"), drawn, "the run's status");
+
+  const stage = (entries) =>
+    streaming("R2", "running", entries, { review: { of: "R1", reviewer: 1, reviewers: 1 } });
+  const reviewed = (entries) => key(start, "running", reviewOf("R1", [stage(entries)]));
+  assert.equal(reviewed([said("reading")]), reviewed([said("reading"), said(" on")]), "a reviewer's token");
 });
