@@ -370,6 +370,18 @@ export function statusLine(run) {
   }
 }
 
+// A run's status as a status icon's kind (note-dialog.js, `statusIcon`).
+export function iconKind(run) {
+  const { tone } = statusLine(run);
+  const kinds = { busy: "working", attention: "needs", done: "addressed", failed: "failed" };
+  return kinds[tone] ?? "stopped";
+}
+
+// A run's status in a word or two: statusLine's text, short enough for a card.
+export function statusWord(run) {
+  return run.status === "unfinished" ? "Unfinished" : statusLine(run).text;
+}
+
 // Whether the run is still going: it can be stopped, and no other can start.
 export function isLive(run) {
   return ["starting", "running", "waiting", "cancelling"].includes(run?.status);

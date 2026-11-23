@@ -91,6 +91,21 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/run-panel.js"),
     ),
     (
+        "/run-store.js",
+        "text/javascript",
+        include_bytes!("../ui/run-store.js"),
+    ),
+    (
+        "/run-tab.js",
+        "text/javascript",
+        include_bytes!("../ui/run-tab.js"),
+    ),
+    (
+        "/run-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/run-dialog.js"),
+    ),
+    (
         "/panes.js",
         "text/javascript",
         include_bytes!("../ui/panes.js"),

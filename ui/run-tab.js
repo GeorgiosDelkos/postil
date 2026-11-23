@@ -1,0 +1,251 @@
+// The tray's Run tab, its header, and the agent status at the foot of the sidebar. The tab
+// lists the runs, one small card each, newest first; a card opens the run's dialog
+// (run-dialog.js). What needs an answer now shows above the runs.
+
+import { el } from "./dom.js";
+import { statusIcon } from "./note-dialog.js";
+import {
+  elapsed,
+  foldRun,
+  iconKind,
+  isLive,
+  keyFor,
+  openQuestion,
+  permissionKeys,
+  statusLine,
+  statusWord,
+  stopKey,
+} from "./run.js";
+import { latestOfThreads } from "./status.js";
+
+// `store` holds the runs (run-store.js) and `dialog` is the run dialog (run-dialog.js).
+// `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
+// sidebar's agent status.
+export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) {
+  let clock = null;
+  // The tray header's nodes, `{ key, title, stop }`, built by `renderHeader`.
+  let header = null;
+  // When Stop starts to end the agent, by this page's clock; null unless it is stopping.
+  let forceAt = null;
+  // The drawn cards by key, each with the signature it was drawn from: a card whose
+  // signature is unchanged keeps its node.
+  let views = new Map();
+  let drawnRun = null;
+
+  // Stop asks the agent to stop. Once the Rust process would force it (forceAt), Stop ends it
+  // (src/run.rs, "Stopping"); sooner, the Rust process takes it as the same request.
+  function stop() {
+    const run = store.run();
+    if (!isLive(run)) return Promise.resolve();
+    if (run.status === "cancelling" && !forceable()) return Promise.resolve();
+    return store.post("api/run/cancel").catch((error) => onError(error.message));
+  }
+
+  function forceable() {
+    return forceAt !== null && Date.now() >= forceAt;
+  }
+
+  function render() {
+    const run = store.run();
+    if (drawnRun !== (run?.id ?? null)) {
+      drawnRun = run?.id ?? null;
+      forceAt = null;
+    }
+    renderStatus();
+    renderHeader();
+    const ids = store.ids();
+    const list = ids.length ? ids : run ? [run.id] : [];
+    if (list.length === 0) {
+      views = new Map();
+      const empty = "No run yet. Send notes to an agent to start one.";
+      panelEl.replaceChildren(el("div", "empty", empty));
+      dialog.closeIfGone(list);
+      return;
+    }
+    const wanted = [];
+    // What needs an answer now shows above the runs: a question, as a card that opens the
+    // run's dialog where it is answered, and a permission request Postil could not answer.
+    if (isLive(run)) {
+      const items = foldRun(run.entries).items;
+      const question = openQuestion(items);
+      if (question) {
+        const key = `question:${run.id}:${question.request}`;
+        wanted.push([key, question.message, () => needsYouCard(run, question)]);
+      }
+      for (const item of items) {
+        if (item.type !== "permission" || item.answer !== undefined) continue;
+        wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
+      }
+    }
+    // Reviewers' runs show inside the run they review, and follow-ups inside the run they
+    // follow, not here.
+    const shown = list.filter((id) => !store.byId(id)?.review && !store.byId(id)?.followUp);
+    const label = shown.length === 1 ? "Run" : `Runs · ${shown.length}`;
+    wanted.push(["label", label, () => el("div", "run-label", label)]);
+    const latests = latestOfThreads(store.knownViews());
+    for (const id of shown) {
+      const view = store.byId(id);
+      const latest = view ? (latests.get(id) ?? view) : null;
+      const sig = view
+        ? JSON.stringify([latest.id, latest.status, view.agent, view.notes, statusWord(latest)])
+        : (store.failure(id) ?? "loading");
+      wanted.push([`run:${id}`, sig, () => runCard(id, view, latest)]);
+    }
+
+    const next = new Map();
+    const nodes = wanted.map(([key, sig, build]) => {
+      const drawn = views.get(key);
+      const node = drawn?.sig === sig ? drawn.node : build();
+      next.set(key, { sig, node });
+      return node;
+    });
+    views = next;
+    // Only nodes out of place move.
+    nodes.forEach((node, index) => {
+      if (panelEl.childNodes[index] !== node) {
+        panelEl.insertBefore(node, panelEl.childNodes[index] ?? null);
+      }
+    });
+    while (panelEl.childNodes.length > nodes.length) panelEl.lastChild.remove();
+    dialog.closeIfGone(list);
+    dialog.draw();
+  }
+
+  // The card of a question waiting for the engineer: it opens the run's dialog.
+  function needsYouCard(view, question) {
+    const button = el("button", "run-card needs");
+    button.type = "button";
+    button.append(
+      statusIcon("needs"),
+      el("span", "run-card-text", `${view.agent} has a question: ${question.message}`),
+      el("span", "run-id", view.id),
+      el("span", "run-chevron", "›"),
+    );
+    button.addEventListener("click", () => dialog.open({ kind: "run", id: view.id }));
+    return button;
+  }
+
+  // A run's card: its status, id, agent and notes, in one line. The status is its thread's
+  // latest run's, `latest`: the run itself, or its last follow-up.
+  function runCard(id, view, latest) {
+    const button = el("button", "run-card run-entry");
+    button.type = "button";
+    if (!view) {
+      button.disabled = true;
+      const problem = store.failure(id);
+      button.append(statusIcon(problem ? "failed" : "stopped"), el("span", "run-id", id));
+      const text = problem ? `Cannot be shown: ${problem}` : "Loading…";
+      button.append(el("span", "run-card-text", text));
+      if (problem) button.title = problem;
+      return button;
+    }
+    const more = latest.id === view.id ? "" : ` · +${latest.id}`;
+    button.append(
+      statusIcon(iconKind(latest)),
+      el("span", "run-id", view.id),
+      el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`),
+      el("span", `run-entry-status ${statusLine(latest).tone}`, statusWord(latest)),
+      el("span", "run-chevron", "›"),
+    );
+    button.title = `${latest.id} · ${view.agent} · ${statusLine(latest).text}`;
+    button.addEventListener("click", () => dialog.open({ kind: "run", id }));
+    return button;
+  }
+
+  // The sidebar's agent status. It is a button (it shows the Run tab), so its children change
+  // only when what they say changes, not on every update of the run.
+  function renderStatus() {
+    const run = store.run();
+    statusEl.hidden = !run;
+    if (!run) return;
+    const { text, tone } = statusLine(run);
+    const shown = JSON.stringify([run.agent, text, tone]);
+    if (statusEl.dataset.shown === shown) return;
+    statusEl.dataset.shown = shown;
+    const dot = el("span", `status-dot ${tone}`);
+    dot.setAttribute("aria-hidden", "true");
+    statusEl.replaceChildren(dot, el("span", "status-text", `${run.agent} · ${text}`));
+  }
+
+  // The tray header: the latest run's status and, while it runs, its time and Stop. Its
+  // nodes are kept while `stopKey` stays the same and changed in place, so Stop takes a
+  // click while the run streams.
+  function renderHeader() {
+    const run = store.run();
+    clearInterval(clock);
+    clock = null;
+    if (!run) {
+      header = null;
+      headerEl.replaceChildren();
+      return;
+    }
+    const key = stopKey(run);
+    if (!header || header.key !== key) {
+      header = { key, title: el("span", "run-title"), stop: key === null ? null : stopButton() };
+      headerEl.replaceChildren(header.title, ...(header.stop ? [header.stop.button] : []));
+    }
+    const { text, tone } = statusLine(run);
+    header.title.title = `${run.id} · ${run.agent} · ${text}`;
+    const time = el("span", "run-time");
+    const tick = () => {
+      if (isLive(run)) time.textContent = ` · ${elapsed(Date.now() / 1000 - run.startedAt)}`;
+    };
+    tick();
+    const word = el("strong", `run-word ${tone}`, statusWord(run));
+    header.title.replaceChildren(statusIcon(iconKind(run)), word, time);
+    const stopping = isLive(run) && run.status === "cancelling";
+    if (!stopping) forceAt = null;
+    // The Rust process says how long until it would force the agent, so a reloaded page
+    // offers Force stop as soon as the process would act on it.
+    else forceAt ??= Date.now() + (run.forceIn ?? 0);
+    const { stop: button } = header;
+    if (!button) return;
+    button.label();
+    clock = setInterval(() => {
+      tick();
+      button.label();
+    }, 1000);
+  }
+
+  // The header's Stop, for the live run: `label()` sets its word and whether it can be
+  // pressed, in place and only when they differ, so the node under the pointer stays.
+  function stopButton() {
+    const button = el("button", "button stop");
+    button.type = "button";
+    const word = document.createTextNode("Stop");
+    button.append(word, el("kbd", "", "esc"));
+    button.addEventListener("click", stop);
+    const label = () => {
+      const stopping = store.run().status === "cancelling";
+      const force = stopping && forceable();
+      button.disabled = stopping && !force;
+      const text = force ? "Force stop" : "Stop";
+      if (word.data !== text) word.data = text;
+    };
+    return { button, label };
+  }
+
+  function permissionView(request) {
+    const card = el("div", "permission open");
+    card.append(
+      el("div", "permission-label", "Permission needed"),
+      el("div", "permission-title", request.title),
+    );
+    const keys = permissionKeys(request.options);
+    const buttons = el("div", "permission-actions");
+    for (const option of request.options) {
+      const primary = option.kind === "allow_once";
+      const button = el("button", primary ? "button primary" : "button");
+      button.type = "button";
+      button.append(option.name);
+      const key = keyFor(keys, option.id);
+      if (key) button.append(el("kbd", "", key));
+      button.addEventListener("click", () => store.answer(request, option.id));
+      buttons.append(button);
+    }
+    card.append(buttons);
+    return card;
+  }
+
+  return { render, stop };
+}
