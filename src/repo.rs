@@ -162,11 +162,11 @@ impl Repo {
     /// The tree is written through an index of Postil's own, `<git dir>/postil-snapshot.index`
     /// beside the real one, so the engineer's index, branch and stash are left as they are. It
     /// is kept between snapshots, so git hashes again only the files whose stat data changed
-    /// since the last one, untracked files included; the first snapshot starts from a copy of
-    /// the real index, and hashes the untracked files in full. Before each snapshot it drops
-    /// the files that are ignored and that the real index no longer tracks (taken out of git
-    /// and added to `.gitignore`), which `git add --all` would otherwise go on adding. One that
-    /// git cannot use is removed, and the next snapshot starts afresh. `git add` runs the
+    /// since the last one, untracked files included. It starts from a copy of the real index,
+    /// and again whenever the two track different ignored files (one force-added, or one taken
+    /// out of git and added to `.gitignore`), which `git add --all` cannot reconcile; each copy
+    /// hashes the untracked files in full once. One that git cannot use is removed, and the
+    /// next snapshot starts afresh. `git add` runs the
     /// repository's clean filters (git-lfs copies a changed file into `.git/lfs`). The tree and
     /// its blobs are objects no ref holds, so `git gc` may prune them once they are older than
     /// its prune period (two weeks by default).
@@ -181,12 +181,10 @@ impl Repo {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let index = self.git_dir.join("postil-snapshot.index");
-        if !index.exists() {
+        if !index.exists() || self.ignored_differ(&index) {
             self.copy_index(&index)?;
         }
-        let tree = self
-            .forget_ignored(&index)
-            .and_then(|()| run_git(&self.root, Some(&index), &["add", "--all"]))
+        let tree = run_git(&self.root, Some(&index), &["add", "--all"])
             .and_then(|_| run_git(&self.root, Some(&index), &["write-tree"]));
         if tree.is_err() {
             // An index git cannot use would fail every later snapshot too.
@@ -222,37 +220,28 @@ impl Repo {
         })
     }
 
-    /// Drops from the snapshot index `index` the files that are ignored and that the real
-    /// index does not track: `git add --all` adds no ignored file, but goes on updating one an
-    /// index already has.
-    fn forget_ignored(&self, index: &Path) -> Result<()> {
-        let ignored = run_git(
-            &self.root,
-            Some(index),
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--ignored",
-                "--exclude-standard",
-            ],
-        )?;
-        if ignored.is_empty() {
-            return Ok(());
+    /// Whether the snapshot index `index` must start again from the real one: the files that
+    /// are tracked and ignored differ between them. `git add --all` never adds an ignored file
+    /// (one force-added since the copy), and goes on updating one an index already has (one
+    /// taken out of git and ignored). An index git cannot read must start again too.
+    fn ignored_differ(&self, index: &Path) -> bool {
+        let args = [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--ignored",
+            "--exclude-standard",
+        ];
+        let listed = |index: Option<&Path>| -> Option<HashSet<String>> {
+            let list = run_git(&self.root, index, &args).ok()?;
+            // During a merge conflict a path is listed once per stage.
+            Some(list.split_terminator('\0').map(str::to_owned).collect())
+        };
+        match (listed(Some(index)), listed(None)) {
+            (Some(ours), Some(real)) => ours != real,
+            // The real index unreadable: the copy then says why.
+            _ => true,
         }
-        let tracked = git(&self.root, &["ls-files", "-z", "--cached"])?;
-        let tracked: HashSet<&str> = tracked.split_terminator('\0').collect();
-        let gone: Vec<&str> = ignored
-            .split_terminator('\0')
-            .filter(|path| !tracked.contains(path))
-            .collect();
-        if gone.is_empty() {
-            return Ok(());
-        }
-        // `update-index` takes paths as they are, never as patterns.
-        let mut args = vec!["update-index", "--force-remove", "--"];
-        args.extend(gone);
-        run_git(&self.root, Some(index), &args).map(drop)
     }
 
     /// The changes from snapshot `before` to snapshot `after` ([`Repo::snapshot`]), as

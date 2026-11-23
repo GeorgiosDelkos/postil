@@ -4051,10 +4051,13 @@ mod tests {
             assert!(patch.contains(part), "{part:?} in {patch}");
         }
 
-        // The engineer takes a file out of git and ignores it: snapshots stop following it.
+        // The engineer takes a file out of git and ignores it: snapshots stop following it. And
+        // force-adds an ignored one: snapshots follow it from then on.
         repo.git(&["rm", "--cached", "--quiet", "secret.txt"]);
-        repo.write(".gitignore", "secret.txt\n");
+        repo.write(".gitignore", "secret.txt\nforced.txt\n");
         repo.write("secret.txt", "two\n");
+        repo.write("forced.txt", "kept\n");
+        repo.git(&["add", "--force", "forced.txt"]);
 
         // A follow-up writes again: R1 to R2 is the whole thread, R2 alone its own change.
         let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
@@ -4083,6 +4086,10 @@ mod tests {
             !second.contains("+two"),
             "an ignored file left untracked: {second}"
         );
+        assert!(
+            thread.contains("+++ b/forced.txt"),
+            "a force-added file: {thread}"
+        );
 
         // Snapshots go through an index of their own: the engineer's staged files are the same.
         let staged = Command::new("git")
@@ -4091,7 +4098,10 @@ mod tests {
             .args(["diff", "--cached", "--name-only"])
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&staged.stdout), "a.txt\n");
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a.txt\nforced.txt\n"
+        );
     }
 
     #[test]
@@ -4190,22 +4200,22 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("R1 has no snapshot from before it"), "{body}");
 
-        // An index git cannot read fails one snapshot, and is removed: the next starts afresh.
+        // Postil's own index torn: it is copied again from the real one at once.
         let ours = repo.root.join(".git/postil-snapshot.index");
         fs::write(&ours, "torn").unwrap();
         send(&site, &["N1"]);
-        let torn = wait_for_run(&site, &nudges, "R2");
-        assert!(
-            torn["problem"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("no snapshot"),
-            "{torn}"
-        );
-        assert!(!ours.exists(), "the torn index is gone");
+        let healed = wait_for_run(&site, &nudges, "R2");
+        assert_eq!(snapshot_points(&healed), ["before", "after"], "{healed}");
+
+        // The real index torn: its copy cannot be used, so the snapshot fails and the copy is
+        // removed rather than failing every snapshot after it.
+        fs::remove_file(&ours).unwrap();
+        fs::write(&index, "torn").unwrap();
         send(&site, &["N1"]);
-        let next = wait_for_run(&site, &nudges, "R3");
-        assert_eq!(snapshot_points(&next), ["before", "after"], "{next}");
+        let torn = wait_for_run(&site, &nudges, "R3");
+        let problem = torn["problem"].as_str().unwrap_or_default();
+        assert!(problem.contains("no snapshot"), "{torn}");
+        assert!(!ours.exists(), "the unusable copy is gone");
     }
 
     #[test]
