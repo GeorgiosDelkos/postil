@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use wry::http::{Method, Request, Response, StatusCode, Uri};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::error::{Error, Result, error_chain};
+use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{Highlighter, Token};
 use crate::layout::{self, Layout};
@@ -172,7 +173,60 @@ const PAGE: &[(&str, &str, &[u8])] = &[
 ];
 
 /// The settings' file name in the configuration directory.
-pub(crate) const SETTINGS_FILE: &str = "settings.json";
+const SETTINGS_FILE: &str = "settings.json";
+
+/// The site the page talks to, with the start-up project open (see [`startup_repo`]), and
+/// the settings the window starts with.
+pub(crate) fn start_site(
+    dir: Option<&Path>,
+    bench: Option<&str>,
+    notify: Notify,
+) -> Result<(Site, Settings)> {
+    // Without a configuration directory the recent list and the settings are off, which the
+    // page says: both are conveniences, so they never stop the app from starting.
+    let config = config_dir().ok();
+    let settings = config.as_ref().map_or_else(Settings::default, |dir| {
+        settings::load(&dir.join(SETTINGS_FILE)).settings
+    });
+    // A benchmark measures the window, so it does not spend a core asking the login shell.
+    let agents = match bench {
+        Some(_) => Scanner::new(OsString::new),
+        None => Scanner::new(agents::search_path),
+    };
+    let site = Site::new(config.as_deref(), bench, agents, notify);
+    if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
+        site.open(repo, LiveRun::Stop)?;
+    }
+    // A benchmark of a file that cannot be read would time an empty pane and report it as a
+    // result. Fail here instead, before the window opens.
+    if let Some(file) = bench {
+        site.repo()?.read(file)?;
+    }
+    Ok((site, settings))
+}
+
+/// The project to open at start: the one containing `dir` when given, else the most recent
+/// project when the settings ask for it and it still opens, else none (the welcome screen).
+///
+/// # Errors
+///
+/// As [`Repo::open`], for `dir` only: a recent project that no longer opens is skipped, and
+/// the welcome screen lists it as missing.
+fn startup_repo(
+    dir: Option<&Path>,
+    settings: &Settings,
+    recent_file: Option<&Path>,
+) -> Result<Option<Repo>> {
+    if let Some(dir) = dir {
+        return Repo::open(dir).map(Some);
+    }
+    if !settings.reopen_last_project {
+        return Ok(None);
+    }
+    let recent = recent_file.map_or_else(Vec::new, recent::list);
+    let last = recent.first();
+    Ok(last.and_then(|root| Repo::open(Path::new(root)).ok()))
+}
 
 /// Everything the page can ask for.
 ///
@@ -188,7 +242,7 @@ pub(crate) struct Site {
     /// Where the recent projects are listed (`recent.rs`); `None` when the configuration
     /// directory is unknown, which turns the list off. `config_dir` fails only with
     /// `Error::NoHome`, which is the reason `open` gives for a `None` here.
-    pub(crate) recent_file: Option<PathBuf>,
+    recent_file: Option<PathBuf>,
     /// Where the settings are kept (`settings.rs`); `None`, for the same reason as
     /// `recent_file`, turns them off: the defaults apply and saving fails.
     settings_file: Option<PathBuf>,
@@ -364,7 +418,7 @@ struct FolderRequest {
 
 /// What opening another project does while the open one has a run under way.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum LiveRun {
+enum LiveRun {
     /// Refuses to open it, so the page can ask first.
     Refuse,
     /// Stops the run.
@@ -396,12 +450,7 @@ impl Drop for Site {
 impl Site {
     /// A site with no project open, keeping its files in `config` (`None` turns the recent
     /// list and the settings off).
-    pub(crate) fn new(
-        config: Option<&Path>,
-        bench: Option<&str>,
-        agents: Scanner,
-        notify: Notify,
-    ) -> Self {
+    fn new(config: Option<&Path>, bench: Option<&str>, agents: Scanner, notify: Notify) -> Self {
         Self {
             project: RefCell::new(None),
             highlighter: Highlighter::new(),
@@ -415,7 +464,7 @@ impl Site {
     }
 
     /// The open project's repository.
-    pub(crate) fn repo(&self) -> Result<Arc<Repo>> {
+    fn repo(&self) -> Result<Arc<Repo>> {
         self.project
             .borrow()
             .as_ref()
@@ -439,7 +488,7 @@ impl Site {
     ///
     /// [`Error::RunInOpenProject`] when `live` is [`LiveRun::Refuse`], `repo` is another
     /// project, and the open project has a run or a review under way.
-    pub(crate) fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
+    fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
         let mut project = self.project.borrow_mut();
         let open = project.as_ref();
         let same = open.is_some_and(|open| open.repo.root() == repo.root());

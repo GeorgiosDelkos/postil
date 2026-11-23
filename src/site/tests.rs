@@ -67,7 +67,7 @@ impl TempRepo {
 
     /// The configuration directory of this repository's sites: inside its git directory,
     /// where no file listing sees it and the drop below removes it.
-    pub(crate) fn config(&self) -> PathBuf {
+    fn config(&self) -> PathBuf {
         self.root.join(".git/test-config")
     }
 }
@@ -166,7 +166,7 @@ fn open_request(path: &Path) -> String {
 
 /// The root as git reports it, which resolves symbolic links such as /var to
 /// /private/var on macOS.
-pub(crate) fn site_root(dir: &Path) -> String {
+fn site_root(dir: &Path) -> String {
     Repo::open(dir).unwrap().root().to_str().unwrap().to_owned()
 }
 

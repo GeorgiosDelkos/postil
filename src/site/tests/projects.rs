@@ -294,3 +294,38 @@ fn repo_is_found_from_a_subdirectory() {
     assert_eq!(info["files"], serde_json::json!(["src/a.rs"]));
     assert_eq!(info["bench"], "src/a.rs");
 }
+
+#[test]
+fn the_last_project_reopens_only_when_the_settings_ask_and_it_still_opens() {
+    let repo = TempRepo::new("settings-reopen");
+    let other = TempRepo::new("settings-reopen-other");
+    let recent = repo.config().join("recent.json");
+    recent::record(&recent, Path::new(&site_root(&other.root))).unwrap();
+    let reopen = Settings {
+        reopen_last_project: true,
+        ..Settings::default()
+    };
+    let root = |found: Option<Repo>| found.map(|repo| repo.root().to_owned());
+
+    let opened = startup_repo(None, &reopen, Some(&recent)).unwrap();
+    assert_eq!(root(opened), Some(PathBuf::from(site_root(&other.root))));
+    let off = startup_repo(None, &Settings::default(), Some(&recent)).unwrap();
+    assert_eq!(root(off), None, "off by default");
+    let given = startup_repo(Some(&repo.root), &reopen, Some(&recent)).unwrap();
+    assert_eq!(
+        root(given),
+        Some(PathBuf::from(site_root(&repo.root))),
+        "a folder on the command line wins"
+    );
+    assert_eq!(root(startup_repo(None, &reopen, None).unwrap()), None);
+
+    let other_root = other.root.clone();
+    drop(other);
+    assert!(!other_root.exists());
+    let gone = startup_repo(None, &reopen, Some(&recent)).unwrap();
+    assert_eq!(
+        root(gone),
+        None,
+        "a project that is gone shows the welcome screen"
+    );
+}

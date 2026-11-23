@@ -10,7 +10,6 @@
 //! project replaces the current one and the page reloads.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,17 +27,13 @@ use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::{Request, StatusCode};
 use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
 
-use crate::agents::{self, Scanner};
 use crate::dialog;
 use crate::error::{Error, Result};
-use crate::files::config_dir;
 #[cfg(target_os = "macos")]
 use crate::menu::Command;
-use crate::recent;
-use crate::repo::Repo;
 use crate::run::Notify;
-use crate::settings::{self, Settings};
-use crate::site::{LiveRun, Reply, SETTINGS_FILE, Site, page_asset, reply};
+use crate::settings;
+use crate::site::{Reply, Site, page_asset, reply, start_site};
 
 /// The `--canvas` colors of `ui/app.css`, painted behind the page so the window does not
 /// flash white before the first frame.
@@ -121,32 +116,6 @@ impl AppEvent {
                 .map(|report| Self::BenchDone(report.to_owned())),
         }
     }
-}
-
-/// The site the page talks to, with the start-up project open (see [`startup_repo`]), and
-/// the settings the window starts with.
-fn start_site(dir: Option<&Path>, bench: Option<&str>, notify: Notify) -> Result<(Site, Settings)> {
-    // Without a configuration directory the recent list and the settings are off, which the
-    // page says: both are conveniences, so they never stop the app from starting.
-    let config = config_dir().ok();
-    let settings = config.as_ref().map_or_else(Settings::default, |dir| {
-        settings::load(&dir.join(SETTINGS_FILE)).settings
-    });
-    // A benchmark measures the window, so it does not spend a core asking the login shell.
-    let agents = match bench {
-        Some(_) => Scanner::new(OsString::new),
-        None => Scanner::new(agents::search_path),
-    };
-    let site = Site::new(config.as_deref(), bench, agents, notify);
-    if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
-        site.open(repo, LiveRun::Stop)?;
-    }
-    // A benchmark of a file that cannot be read would time an empty pane and report it as a
-    // result. Fail here instead, before the window opens.
-    if let Some(file) = bench {
-        site.repo()?.read(file)?;
-    }
-    Ok((site, settings))
 }
 
 fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
@@ -560,29 +529,6 @@ fn build_webview(
         .map_err(Error::Webview)
 }
 
-/// The project to open at start: the one containing `dir` when given, else the most recent
-/// project when the settings ask for it and it still opens, else none (the welcome screen).
-///
-/// # Errors
-///
-/// As [`Repo::open`], for `dir` only: a recent project that no longer opens is skipped, and
-/// the welcome screen lists it as missing.
-fn startup_repo(
-    dir: Option<&Path>,
-    settings: &Settings,
-    recent_file: Option<&Path>,
-) -> Result<Option<Repo>> {
-    if let Some(dir) = dir {
-        return Repo::open(dir).map(Some);
-    }
-    if !settings.reopen_last_project {
-        return Ok(None);
-    }
-    let recent = recent_file.map_or_else(Vec::new, recent::list);
-    let last = recent.first();
-    Ok(last.and_then(|root| Repo::open(Path::new(root)).ok()))
-}
-
 /// What to do when the page does not carry out a command it was asked to.
 #[derive(Debug, Clone, Copy)]
 enum Unanswered {
@@ -685,7 +631,7 @@ mod tests {
 
     use super::*;
     use crate::site::tests::{
-        APP_CSS, TempRepo, plain_folder, post_note, run_site, send, site_root, wait_for,
+        APP_CSS, TempRepo, plain_folder, post_note, run_site, send, wait_for,
     };
 
     fn drag(paths: &[&Path]) -> Vec<PathBuf> {
@@ -781,41 +727,6 @@ mod tests {
             };
             assert_eq!(serde_json::to_value(parsed).unwrap(), name);
         }
-    }
-
-    #[test]
-    fn the_last_project_reopens_only_when_the_settings_ask_and_it_still_opens() {
-        let repo = TempRepo::new("settings-reopen");
-        let other = TempRepo::new("settings-reopen-other");
-        let recent = repo.config().join("recent.json");
-        recent::record(&recent, Path::new(&site_root(&other.root))).unwrap();
-        let reopen = Settings {
-            reopen_last_project: true,
-            ..Settings::default()
-        };
-        let root = |found: Option<Repo>| found.map(|repo| repo.root().to_owned());
-
-        let opened = startup_repo(None, &reopen, Some(&recent)).unwrap();
-        assert_eq!(root(opened), Some(PathBuf::from(site_root(&other.root))));
-        let off = startup_repo(None, &Settings::default(), Some(&recent)).unwrap();
-        assert_eq!(root(off), None, "off by default");
-        let given = startup_repo(Some(&repo.root), &reopen, Some(&recent)).unwrap();
-        assert_eq!(
-            root(given),
-            Some(PathBuf::from(site_root(&repo.root))),
-            "a folder on the command line wins"
-        );
-        assert_eq!(root(startup_repo(None, &reopen, None).unwrap()), None);
-
-        let other_root = other.root.clone();
-        drop(other);
-        assert!(!other_root.exists());
-        let gone = startup_repo(None, &reopen, Some(&recent)).unwrap();
-        assert_eq!(
-            root(gone),
-            None,
-            "a project that is gone shows the welcome screen"
-        );
     }
 
     #[test]
