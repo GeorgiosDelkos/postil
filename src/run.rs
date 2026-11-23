@@ -127,9 +127,10 @@ enum Held {
 }
 
 impl Slot {
-    /// Lets the agent go: a starting one is stopped, and anything either would still report is
-    /// dropped. The caller drops the returned agent after releasing the slot's lock, which
-    /// stops a ready one.
+    /// Lets the agent go: a starting one is stopped here, under the caller's lock (that waits
+    /// for `/bin/kill`, milliseconds), and anything either would still report is dropped. The
+    /// caller drops the returned agent after releasing the slot's lock, which stops a ready
+    /// one.
     #[must_use = "drop the released agent after the slot's lock: dropping it waits for its process"]
     fn release(&mut self) -> Held {
         if let Held::Starting(stopper) = &self.agent {
@@ -393,8 +394,10 @@ impl Runner {
 
             let mut slot = runner.slot();
             if slot.let_go(generation) {
-                // The run already says why; an agent that started after all is dropped here,
-                // which stops it.
+                // The run already says why. An agent that started after all is stopped by
+                // dropping it, after the lock: dropping it waits for its process.
+                drop(slot);
+                drop(opened);
                 return;
             }
             match opened {
@@ -519,8 +522,7 @@ struct RunState {
     /// whether it is held is whether the run is live (`RunState::live`). A log read from disk
     /// has none.
     active: Option<File>,
-    // Kept as each entry is recorded, so a status needs no scan of the entries. Requests and
-    // answers are sets: a cancel can log a request's answer before the request itself.
+    // Kept as each entry is recorded, so a status needs no scan of the entries.
     started: bool,
     cancel_requested: bool,
     /// When this process asked the agent to stop, for [`FORCE_AFTER`]. Not logged.
@@ -528,6 +530,7 @@ struct RunState {
     /// The notes sent, until the agent shows it took the turn; then they are marked sent.
     unmarked: Option<Vec<String>>,
     end: Option<Status>,
+    // Sets: a cancel can log a request's answer before the request itself.
     requested: BTreeSet<usize>,
     answered: BTreeSet<usize>,
     /// Why the log is incomplete, or the notes were not marked sent.
@@ -860,8 +863,8 @@ impl Run {
     }
 
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
-    /// the agent took the turn (an update, a permission request, or a stop) releases them. A
-    /// turn that fails at once, as when the agent refuses the prompt, leaves them open.
+    /// the agent took the turn (an update, a permission request, or a stop other than a
+    /// refusal) releases them. A turn that fails or is refused at once leaves them open.
     fn record_event(&self, event: Event, root: &Path) -> Option<Vec<String>> {
         let entry = match event {
             Event::Update(update) => entry_of(update, root)?,
