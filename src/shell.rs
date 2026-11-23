@@ -2216,13 +2216,13 @@ mod tests {
         });
         let (status, reply) = replies
             .recv_timeout(Duration::from_secs(60))
-            .expect("the request gives up on a held lock instead of waiting for it");
+            .expect("a reply within 60 s: the request thread panicked, or it waited on the lock");
         drop(held);
 
         assert_eq!(status, StatusCode::CONFLICT, "{reply}");
         // git names the git directory with links resolved (`/tmp` is `/private/tmp` on macOS).
         let expected = format!(
-            "another process held {} for 2 s, so the change was not saved",
+            "another writer held {} for 2 s, so the change was not saved",
             lock_file.canonicalize().unwrap().display()
         );
         assert!(reply.starts_with(&expected), "{reply}");

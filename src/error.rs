@@ -110,7 +110,8 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
-    /// Another process held the review file's lock for as long as a change waits for it.
+    /// Another writer (a window, a run, a script) held the review file's lock for as long as a
+    /// change waits for it.
     ReviewLocked {
         /// The lock file's path.
         path: PathBuf,
@@ -288,7 +289,7 @@ impl fmt::Display for Error {
             ),
             Self::ReviewLocked { path, seconds } => write!(
                 f,
-                "another process held {} for {seconds} s, so the change was not saved (try \
+                "another writer held {} for {seconds} s, so the change was not saved (try \
                  again; `lsof` on that file names the process)",
                 path.display()
             ),

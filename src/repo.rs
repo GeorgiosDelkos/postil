@@ -368,7 +368,7 @@ fn rev_parse_path(dir: &Path, option: &str) -> Result<PathBuf> {
             command: format!("rev-parse {option}"),
             // git exited successfully and wrote nothing to stderr; this field then says what
             // was wrong with its output instead.
-            stderr: "(no error output, but no path on stdout)".to_owned(),
+            stderr: "(no error output, and stdout is not one path ending in a newline)".to_owned(),
         });
     }
     Ok(PathBuf::from(OsString::from_vec(path)))
