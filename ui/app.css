@@ -3099,12 +3099,22 @@ body.focus-mode > .code-pane {
   width: min(100%, 1100px);
 }
 
+body.focus-mode .focus-pill {
+  display: inline-flex;
+}
+
+/* Room under the last lines, so the pill covers none of them. */
+body.focus-mode .code {
+  padding-bottom: 56px;
+}
+
+/* Shown only in focus mode. */
 .focus-pill {
+  display: none;
   position: absolute;
   right: 16px;
   bottom: 16px;
   z-index: 3;
-  display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 6px 12px;

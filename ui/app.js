@@ -1323,8 +1323,7 @@ function renderSendBar() {
 // Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
 function openSend(ids = sendable(state.notes)) {
   // The send step lives in the tray, which focus mode hides.
-  document.body.classList.remove("focus-mode");
-  renderFocusPill();
+  leaveFocus();
   if (runs.live()) {
     showToast("The agent is still working on the last run: wait for it, or stop it.");
     return;
@@ -1487,7 +1486,11 @@ function followRun(run, previous) {
   const fresh = previous?.id !== run.id;
   // A run that needs the engineer comes to the front. One that starts does not: the send
   // step shows it (`sendNotes`), and a note sent alone from its card is followed on the card.
-  if (run.status === "waiting" && previous?.status !== "waiting") showTab("run");
+  if (run.status === "waiting" && previous?.status !== "waiting") {
+    // Focus mode hides the tray, where the request is: it gives way.
+    leaveFocus();
+    showTab("run");
+  }
   // The agent edits files, and the notes are marked sent once it has the prompt: both are
   // read again when the run moves on and when an edit finishes. There is no file watcher
   // (docs/design.md, "Working with the repository").
@@ -1722,8 +1725,13 @@ window.addEventListener("keydown", (event) => {
   }
 
   const typing = event.target.matches("input, textarea");
-  // `a`, Shift-`a` and `r` answer a permission request while the run shows.
-  if (!typing && !state.composer && state.tab === "run" && runs.keydown(event)) return;
+  // `a`, Shift-`a` and `r` answer a permission request while the run shows; focus mode hides it.
+  if (!typing && !state.composer && state.tab === "run" && !inFocus() && runs.keydown(event)) return;
+  // Escape leaves focus mode first: what it would stop or close cannot be seen there.
+  if (event.key === "Escape" && inFocus() && !state.composer) {
+    leaveFocus();
+    return;
+  }
   if (event.key === "Escape") {
     if (state.composer) closeComposer({ save: false });
     else if (state.send) closeSend();
@@ -1906,10 +1914,27 @@ window.postil = {
 // the code column centers at a readable width. A pill in the corner keeps the open notes'
 // count and Send, which leaves focus mode for the send step. Nothing to focus on the welcome
 // screen.
+// The pill shows only in focus mode, by CSS: no code path can leave it behind. Every way out
+// goes through `leaveFocus`.
 function toggleFocus() {
   if (!welcomeEl.hidden) return;
-  document.body.classList.toggle("focus-mode");
-  renderFocusPill();
+  if (inFocus()) {
+    leaveFocus();
+    return;
+  }
+  // The send step's ticks live in the tray, which focus mode hides: it closes first.
+  closeSend();
+  document.body.classList.add("focus-mode");
+  // A control in a hidden pane would keep the keys.
+  codeEl.focus();
+}
+
+function leaveFocus() {
+  document.body.classList.remove("focus-mode");
+}
+
+function inFocus() {
+  return document.body.classList.contains("focus-mode");
 }
 
 $("focus-pill").addEventListener("click", () => openSend());
@@ -1917,7 +1942,6 @@ $("focus-pill").addEventListener("click", () => openSend());
 function renderFocusPill() {
   const pill = $("focus-pill");
   const open = state.notes.filter(isOpen).length;
-  pill.hidden = !document.body.classList.contains("focus-mode");
   pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
   if (open > 0 && !runs.live()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
   pill.disabled = open === 0 || runs.live();
@@ -1926,6 +1950,8 @@ function renderFocusPill() {
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
 function goToFile() {
   if (!welcomeEl.hidden) return;
+  // The filter is in the file list, which focus mode hides.
+  leaveFocus();
   filterEl.focus();
   filterEl.select();
 }
@@ -1971,7 +1997,7 @@ function showWelcomeError(text, folderToInit) {
 }
 
 function showWelcome() {
-  document.body.classList.remove("focus-mode");
+  leaveFocus();
   document.body.classList.add("welcome-mode");
   welcomeEl.hidden = false;
   const back = $("welcome-back");
