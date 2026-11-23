@@ -118,17 +118,6 @@ pub(crate) struct Runner {
     next_stage_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
-impl fmt::Debug for Chain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Chain")
-            .field("stage", &self.stage)
-            .field("reviewers", &self.reviewers)
-            .field("work", &self.work)
-            .field("findings", &self.findings.len())
-            .finish_non_exhaustive()
-    }
-}
-
 /// What a runner holds now.
 #[derive(Debug, Default)]
 struct Slot {
@@ -162,6 +151,17 @@ struct Chain {
     /// The files the reviewed run changed, linked in each reviewer's prompt.
     files: Vec<String>,
     findings: Vec<Finding>,
+}
+
+impl fmt::Debug for Chain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chain")
+            .field("stage", &self.stage)
+            .field("reviewers", &self.reviewers)
+            .field("work", &self.work)
+            .field("findings", &self.findings.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The runner's agent: none, one starting, or one ready and kept between runs.
