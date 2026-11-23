@@ -194,89 +194,22 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     let committed = Rc::new(Cell::new(false));
     let webview = build_webview(&event_loop, &window, jobs.clone(), Rc::clone(&committed))?;
 
-    let page = Page {
-        webview: &webview,
-        committed: &committed,
-        quit: event_loop.create_proxy(),
+    let mut app = App {
+        page: Page {
+            webview: &webview,
+            committed: &committed,
+            quit: event_loop.create_proxy(),
+        },
+        window: &window,
+        jobs: &jobs,
+        unnudge: &unnudge,
+        started,
+        quit_by: None,
+        launch_to_paint: None,
+        report: None,
     };
-    let mut launch_to_paint = None;
-    let mut report = None;
-    // Set by the first quit: the event loop exits by then even if the site never closes.
-    let mut quit_by: Option<Instant> = None;
-    event_loop.run_return(|event, _, control_flow| {
-        *control_flow = waiting(quit_by);
-        match event {
-            // The close button does what Close Window does, so a draft note stops it too.
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => ask_page(&page, "close-window", Unanswered::Quit),
-            Event::UserEvent(AppEvent::Quit) => {
-                // Gone from the screen at once: closing the site can take a while (a slow git
-                // call queued ahead of it, the snapshot after a live run).
-                window.set_visible(false);
-                close_site(&jobs, &mut quit_by, control_flow);
-            }
-            Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
-            // The system switched between light and dark while the window follows it.
-            Event::WindowEvent {
-                event: WindowEvent::ThemeChanged(theme),
-                ..
-            } => drop(webview.set_background_color(canvas_color(theme))),
-            Event::UserEvent(AppEvent::DragWindow) => {
-                // Fails when the pointer button is already up again: there is then nothing
-                // to drag.
-                drop(window.drag_window());
-            }
-            Event::UserEvent(AppEvent::ChooseFolder) => {
-                if let Some(folder) = dialog::choose_folder() {
-                    offer_folder(&webview, &folder);
-                }
-            }
-            Event::UserEvent(AppEvent::Dropped(path)) => offer_folder(&webview, &path),
-            Event::UserEvent(AppEvent::SetTheme(theme)) => {
-                window.set_theme(window_theme(theme));
-                // Behind the page, seen where it has not painted yet, such as during a resize.
-                // Fails only when the webview is being torn down.
-                drop(webview.set_background_color(canvas_color(window.theme())));
-            }
-            #[cfg(target_os = "macos")]
-            Event::UserEvent(AppEvent::Menu(command)) => {
-                // The app must stay closable whatever state the page is in. The cost: an
-                // exception in the page's draft guard quits and loses the draft, accepted over
-                // a window that cannot be closed.
-                let unanswered = match command {
-                    Command::CloseWindow | Command::Quit => Unanswered::Quit,
-                    Command::OpenFolder
-                    | Command::SwitchProject
-                    | Command::GoToFile
-                    | Command::Settings
-                    | Command::FocusMode => Unanswered::Ignore,
-                };
-                ask_page(&page, command.id(), unanswered);
-            }
-            Event::UserEvent(AppEvent::RunChanged) => {
-                // Cleared before the page is told, so a change during its fetch nudges again.
-                unnudge.store(false, Ordering::SeqCst);
-                // A page that has not loaded yet fetches the run when it starts. Fails only
-                // when the webview is being torn down.
-                drop(webview.evaluate_script("window.postil?.runChanged?.()"));
-            }
-            Event::UserEvent(AppEvent::BenchPainted) => {
-                launch_to_paint = Some(started.elapsed());
-            }
-            Event::UserEvent(AppEvent::BenchDone(page)) => {
-                report = Some(BenchReport {
-                    // The page posts `bench-painted` before `bench:`; if it somehow did
-                    // not, the time until now is the honest upper bound.
-                    launch_to_paint: launch_to_paint.unwrap_or_else(|| started.elapsed()),
-                    page,
-                });
-                close_site(&jobs, &mut quit_by, control_flow);
-            }
-            _ => {}
-        }
-    });
+    event_loop.run_return(|event, _, control_flow| on_event(&mut app, event, control_flow));
+    let report = app.report;
 
     // The webview draws into the window, so it goes first. The request thread is not joined:
     // it has closed the site, or the quit deadline passed (`QUIT_WAIT`) with the site still
@@ -285,6 +218,106 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     drop(webview);
     drop(window);
     Ok(report)
+}
+
+/// What the event loop's handler ([`on_event`]) reads and changes while the window is open.
+struct App<'a> {
+    page: Page<'a>,
+    window: &'a Window,
+    jobs: &'a Sender<Job>,
+    /// Set by the notifier when a run changed, until the page is told (see `serve`).
+    unnudge: &'a AtomicBool,
+    /// When `serve` started, for the benchmark's launch-to-paint time.
+    started: Instant,
+    /// Set by the first quit: the event loop exits by then even if the site never closes.
+    quit_by: Option<Instant>,
+    launch_to_paint: Option<Duration>,
+    /// The benchmark's report, once the page sent it.
+    report: Option<BenchReport>,
+}
+
+/// Handles one event of the event loop.
+fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut ControlFlow) {
+    *control_flow = waiting(app.quit_by);
+    match event {
+        // The close button does what Close Window does, so a draft note stops it too.
+        Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } => ask_page(&app.page, "close-window", Unanswered::Quit),
+        Event::UserEvent(AppEvent::Quit) => {
+            // Gone from the screen at once: closing the site can take a while (a slow git
+            // call queued ahead of it, the snapshot after a live run).
+            app.window.set_visible(false);
+            close_site(app.jobs, &mut app.quit_by, control_flow);
+        }
+        Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
+        // The system switched between light and dark while the window follows it.
+        Event::WindowEvent {
+            event: WindowEvent::ThemeChanged(theme),
+            ..
+        } => drop(app.page.webview.set_background_color(canvas_color(theme))),
+        Event::UserEvent(AppEvent::DragWindow) => {
+            // Fails when the pointer button is already up again: there is then nothing
+            // to drag.
+            drop(app.window.drag_window());
+        }
+        Event::UserEvent(AppEvent::ChooseFolder) => {
+            if let Some(folder) = dialog::choose_folder() {
+                offer_folder(app.page.webview, &folder);
+            }
+        }
+        Event::UserEvent(AppEvent::Dropped(path)) => offer_folder(app.page.webview, &path),
+        Event::UserEvent(AppEvent::SetTheme(theme)) => {
+            app.window.set_theme(window_theme(theme));
+            // Behind the page, seen where it has not painted yet, such as during a resize.
+            // Fails only when the webview is being torn down.
+            drop(
+                app.page
+                    .webview
+                    .set_background_color(canvas_color(app.window.theme())),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        Event::UserEvent(AppEvent::Menu(command)) => {
+            // The app must stay closable whatever state the page is in. The cost: an
+            // exception in the page's draft guard quits and loses the draft, accepted over
+            // a window that cannot be closed.
+            let unanswered = match command {
+                Command::CloseWindow | Command::Quit => Unanswered::Quit,
+                Command::OpenFolder
+                | Command::SwitchProject
+                | Command::GoToFile
+                | Command::Settings
+                | Command::FocusMode => Unanswered::Ignore,
+            };
+            ask_page(&app.page, command.id(), unanswered);
+        }
+        Event::UserEvent(AppEvent::RunChanged) => {
+            // Cleared before the page is told, so a change during its fetch nudges again.
+            app.unnudge.store(false, Ordering::SeqCst);
+            // A page that has not loaded yet fetches the run when it starts. Fails only
+            // when the webview is being torn down.
+            drop(
+                app.page
+                    .webview
+                    .evaluate_script("window.postil?.runChanged?.()"),
+            );
+        }
+        Event::UserEvent(AppEvent::BenchPainted) => {
+            app.launch_to_paint = Some(app.started.elapsed());
+        }
+        Event::UserEvent(AppEvent::BenchDone(page)) => {
+            app.report = Some(BenchReport {
+                // The page posts `bench-painted` before `bench:`; if it somehow did
+                // not, the time until now is the honest upper bound.
+                launch_to_paint: app.launch_to_paint.unwrap_or_else(|| app.started.elapsed()),
+                page,
+            });
+            close_site(app.jobs, &mut app.quit_by, control_flow);
+        }
+        _ => {}
+    }
 }
 
 /// How the request thread hands an answer back: to wry's responder in the app, to a channel
