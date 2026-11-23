@@ -302,30 +302,43 @@ Built in `src/run.rs`, with the API the page calls:
   command, the project closes, or the agent exits; the next send then starts it again. The
   owner chose this on 2026-11-23 over a fresh agent per send, so milestone 4's follow-up notes
   reach the same conversation.
-- **One run at a time** per project: a send during a run is refused (409).
+- **One run at a time** per working tree: a send during a run is refused (409), and a live
+  run holds an exclusive lock on `runs/active.lock`, so another window on the same working
+  tree is refused too.
+- **Stop** asks the agent to cancel (`session/cancel`), and answers its open permission
+  requests `cancelled`, as well as any that arrive until the turn ends. An agent that is
+  still starting is killed instead, and the run ends at once. A second Stop kills an agent
+  that did not stop, so a hung agent never holds the working tree.
+- **Permission requests** are numbered by `acp::Agent`, which keeps the only table of open
+  ones; the log records each request and its answer by that number.
 - **Starting** happens on a thread of its own, because it can take minutes. Each start-up
-  step (`initialize`, `session/new`) may take 120 seconds. Gemini 0.40.1, not signed in,
+  step (`initialize`, `session/new`) may take 120 seconds, and Stop ends the wait. Gemini 0.40.1, not signed in,
   never answers `initialize` (it waits for a browser sign-in), checked 2026-11-23; the run
   then fails with the hint to run the agent in a terminal.
 - **The log** is `<git dir>/postil/runs/R<n>.jsonl`: a header line (agent, notes, prompt,
   start time), then one line per entry, appended as it happens. The owner chose on 2026-11-23
   to keep runs on disk. Creating the file claims the id, so two windows never share one. After
-  a restart the newest log is shown; one without an end reads as interrupted, and an
-  unreadable line (a torn write) is reported while the rest is shown.
+  a restart the newest readable log is shown; one without an end reads as unfinished (the
+  app quit during it, or another window runs it). Lines are decoded one by one, so a torn
+  write spoils only its line, which is reported; an unreadable newer log is skipped and
+  named. Nothing is synced: a crash costs at most the last lines.
 - **Notes** are marked sent, with the run's id, once the agent has the prompt. A run that
-  fails to start leaves them open. `review.json` is version 2 for this field; version 1 files
+  fails to start leaves them open. `review.json` is version 2 for this field, `state`,
+  always an object: `{"kind": "open"}` or `{"kind": "sent", "run": "R3"}`. Version 1 files
   read with every note open.
-- **The page** is told about every change by a script call (`window.postil.runChanged()`)
-  and fetches the entries it has not seen.
+- **The page** is told about changes by a script call (`window.postil.runChanged()`) and
+  fetches the entries it has not seen. Calls are coalesced: none is queued while one is
+  pending, since an agent streams its reply in many small parts.
 - Closing the project or quitting kills the agent's process group (`npx` leaves `node`
-  running). A run cut short this way reads as interrupted.
+  running), a starting agent's too. A run cut short this way reads as unfinished.
 
 ### Agents
 
 An agent is a name and the command that starts it as an ACP server. Postil ships a catalog
 (`src/agents.rs`, `BUILT_IN`) and finds which of them are installed; the engineer adds others
 in the settings. Each catalog command is confirmed end to end with a real prompt by the test
-`a_real_agent_answers_a_prompt` (`POSTIL_REAL_AGENT='<command>' cargo test real_agent`):
+`a_real_agent_answers_a_prompt` (`POSTIL_REAL_AGENT='<command>' cargo test real_agent --
+--ignored`):
 Claude and Grok passed on 2026-11-23; Codex and OpenCode are not installed on the development
 Mac; Gemini needs a sign-in first.
 

@@ -3,9 +3,19 @@
 //! A [`Runner`] belongs to the open project. It keeps the agent it started alive between
 //! runs, with its session, so a later prompt reaches the same conversation; the owner chose
 //! this over a fresh agent per send on 2026-11-23, for milestone 4's follow-up notes. The
-//! agent is replaced when a send names another agent, and stopped when the project closes.
-//! One run at a time: two agents writing one working tree conflict (docs/design.md, "Not in
-//! scope").
+//! agent is replaced when a send names another agent or it exited, and stopped when the
+//! project closes or the app quits.
+//!
+//! One run at a time per working tree: two agents writing one working tree conflict
+//! (docs/design.md, "Not in scope"). A live run holds an exclusive lock on
+//! `runs/active.lock`, so another window on the same working tree cannot start one either.
+//!
+//! # Stopping
+//!
+//! Stop asks the agent to cancel the turn (`session/cancel`). An agent that is still
+//! starting is killed instead, and the run ends at once: a start can take minutes. Asked a
+//! second time, Stop kills an agent that did not stop, so a hung agent never holds the
+//! working tree.
 //!
 //! # The run log
 //!
@@ -16,19 +26,26 @@
 //! folds them into the call. A run id is claimed by creating its file, so two windows on one
 //! working tree never share one.
 //!
+//! Each entry is one `write` to a file opened for appending, and nothing is synced: the log
+//! is a record for the engineer, and a crash costs at most its last lines, while syncing on
+//! every streamed message part would cost a disk flush each. After a failed write the log
+//! is not written again, so a torn line can only be the last one, and the run says the log
+//! is incomplete.
+//!
 //! The app never rewrites a log, and reads one only to show the latest run after a restart.
-//! A run whose log has no end is shown as interrupted: the app quit while it ran.
+//! A log with no end is shown as unfinished: the app quit while it ran, or another window
+//! is running it.
 //!
 //! # Threads and locks
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
-//! and an agent's start on a thread of its own, because a start can take minutes (an agent
-//! that waits for a sign-in). Two locks, always taken in this order: the runner's [`Slot`],
-//! then a run's state. The page is told about every change through `notify`, and fetches
-//! what it has not seen.
+//! and an agent's start on a thread of its own. Two locks, always taken in this order: the
+//! runner's [`Slot`], then a run's state. The page is told about every change through
+//! `notify`, and fetches what it has not seen.
 
-use std::ffi::OsString;
-use std::fs::{self, File};
+use std::collections::BTreeSet;
+use std::fmt;
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -37,19 +54,19 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::{
-    Agent, ContentBlock, Event, Launch, Location, PermissionKind, PlanEntryStatus, RequestId,
-    SessionUpdate, StopReason, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
+    Agent, ContentBlock, Event, Launch, Location, PermissionKind, PlanEntryStatus, SessionUpdate,
+    StopReason, Stopper, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::agents::Scanner;
 use crate::error::{Error, Result, error_chain};
-use crate::notes::{self, Anchor, Note};
+use crate::notes::{self, Prompt};
 use crate::repo::Repo;
 
 /// How long an agent may take to start, and then to open a session. Claude's adapter took
 /// 4.3 s to open a session with npx's cache warm (2026-11-23); a first `npx` run downloads
 /// the adapter, which takes tens of seconds on a slow link. Past this, the run fails with
 /// the hint to run the agent in a terminal (an agent waiting for a browser sign-in never
-/// answers).
+/// answers). Stop ends the wait sooner.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The run log's format version, in its header line.
@@ -79,13 +96,26 @@ pub(crate) struct Runner {
 struct Slot {
     /// The agent kept between runs.
     agent: Option<(AgentChoice, Agent)>,
-    /// The number of the agent started last. An agent's events carry the number it was
-    /// started with, so the late events of a replaced agent are dropped.
+    /// Stops the agent being started, while its session is being opened.
+    starting: Option<Stopper>,
+    /// The number of the agent started last. An agent's events and its start carry the
+    /// number it was started with: when it differs, the agent was replaced, stopped, or its
+    /// run cancelled, and what it reports is dropped.
     generation: u64,
     /// This window's latest run.
     run: Option<Arc<Run>>,
     /// Set when the project closed: an agent that finishes starting afterwards is stopped.
     closed: bool,
+}
+
+/// A send that waits for its agent to start.
+#[derive(Debug)]
+struct Pending {
+    agent: AgentChoice,
+    run: Arc<Run>,
+    ids: Vec<String>,
+    prompt: Prompt,
+    generation: u64,
 }
 
 impl Runner {
@@ -102,80 +132,115 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// As [`notes::select`].
+    /// As [`notes::prompt`].
     pub(crate) fn preview(&self, ids: &[String]) -> Result<String> {
-        let notes = notes::select(&self.repo, ids)?;
-        Ok(prompt_text(&notes))
+        Ok(notes::prompt(&self.repo, ids)?.text)
     }
 
     /// Starts a run: sends the notes `ids` to `agent`, starting the agent first unless it is
-    /// the one kept from the last run. Returns at once; the run reports its progress through
-    /// its log.
+    /// the one kept from the last run and still alive. Returns at once; the run reports its
+    /// progress through its log.
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run is under way; as [`notes::select`]; and
+    /// [`Error::TurnRunning`] while a run of this window is under way, and
+    /// [`Error::RunElsewhere`] while another window's is; as [`notes::prompt`]; and
     /// [`Error::WriteRun`] when the run log cannot be created.
     pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
         let mut slot = self.slot();
-        if slot.run.as_ref().is_some_and(|run| run.state().is_live()) {
+        if slot.run.as_ref().is_some_and(|run| run.state().live) {
             return Err(Error::TurnRunning);
         }
-        let notes = notes::select(&self.repo, ids)?;
-        let prompt = Prompt {
-            text: prompt_text(&notes),
-            ids: ids.to_vec(),
-            files: files_of(&notes),
-        };
-        let header = Header {
-            version: LOG_VERSION,
-            id: String::new(),
-            agent: agent.name.clone(),
-            notes: prompt.ids.clone(),
-            prompt: prompt.text.clone(),
-            started_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs()),
-        };
-        let run = Arc::new(Run::create(&self.repo.runs_dir(), header)?);
+        let prompt = notes::prompt(&self.repo, ids)?;
+        let run = Arc::new(Run::create(
+            &self.repo.runs_dir(),
+            &agent.name,
+            ids,
+            &prompt.text,
+        )?);
         slot.run = Some(Arc::clone(&run));
 
-        match &slot.agent {
-            Some((kept, live)) if *kept == agent => self.begin(live, &run, &prompt),
-            _ => {
-                // Dropping the agent kept from the last run stops it.
-                slot.agent = None;
-                slot.generation += 1;
-                self.start(agent, &run, prompt, slot.generation);
-            }
+        let kept = slot
+            .agent
+            .as_ref()
+            .filter(|(kept, live)| *kept == agent && live.is_alive());
+        if let Some((_, live)) = kept {
+            self.begin(live, &run, ids, &prompt);
+        } else {
+            // Dropping the agent kept from the last run stops it.
+            slot.agent = None;
+            slot.generation += 1;
+            let pending = Pending {
+                agent,
+                run,
+                ids: ids.to_vec(),
+                prompt,
+                generation: slot.generation,
+            };
+            self.start(pending);
         }
         drop(slot);
         (self.notify)();
         Ok(())
     }
 
-    /// Asks the agent to stop the run. A run whose agent is still starting ends as soon as
-    /// the agent is up.
+    /// Stops the run (module docs, "Stopping").
     ///
     /// # Errors
     ///
     /// [`Error::BadRequest`] when no run is under way; [`Error::AgentExited`] when the agent
     /// is gone (its exit then ends the run).
     pub(crate) fn cancel(&self) -> Result<()> {
-        let slot = self.slot();
+        let mut slot = self.slot();
         let run = slot
             .run
-            .as_ref()
-            .filter(|run| run.state().is_live())
+            .clone()
+            .filter(|run| run.state().live)
             .ok_or_else(|| Error::BadRequest("no run is under way".to_owned()))?;
-        let started = run.request_cancel();
-        let cancelled = match (&slot.agent, started) {
-            (Some((_, agent)), true) => agent.cancel(),
-            _ => Ok(()),
+        let (started, asked) = {
+            let state = run.state();
+            (state.started, state.cancel_requested)
         };
+        let mut result = Ok(());
+        if !started {
+            // The agent is still starting: it is stopped, and its start finds it replaced.
+            slot.generation += 1;
+            if let Some(starting) = slot.starting.take() {
+                starting.stop();
+            }
+            run.record(Entry::CancelRequested);
+            run.record(Entry::Ended {
+                reason: StopReason::Cancelled,
+            });
+        } else if asked {
+            // Asked twice: the agent did not stop when asked, so it is ended, and its exit is
+            // not reported over this.
+            slot.generation += 1;
+            slot.agent = None;
+            run.record(Entry::Failed {
+                error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
+            });
+        } else {
+            run.record(Entry::CancelRequested);
+            if let Some((_, agent)) = &slot.agent {
+                // The requests this answered `cancelled` on the wire are closed in the log too,
+                // including one whose event is still on its way.
+                match agent.cancel() {
+                    Ok(numbers) => {
+                        for request in numbers {
+                            run.record(Entry::Answer {
+                                request,
+                                option: None,
+                            });
+                        }
+                    }
+                    Err(error) => result = Err(error),
+                }
+            }
+        }
         drop(slot);
         (self.notify)();
-        cancelled
+        result
     }
 
     /// Answers the run's permission request `request` (its number in the log) with the
@@ -183,29 +248,35 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when that request is not open; as
+    /// [`Error::NoSuchPermission`] when that request is not open in this run; as
     /// [`Agent::answer_permission`].
     pub(crate) fn answer(&self, request: usize, option: &str) -> Result<()> {
         let slot = self.slot();
         let (Some(run), Some((_, agent))) = (&slot.run, &slot.agent) else {
             return Err(Error::NoSuchPermission);
         };
-        let id = run.open_permission(request)?;
-        // The agent checks the option against what it offered; only an accepted answer
-        // closes the request, so a refused one can be answered again.
-        agent.answer_permission(&id, option)?;
-        run.answered(request, option);
+        if !run.state().is_open(request) {
+            return Err(Error::NoSuchPermission);
+        }
+        // The agent checks the option against what it offered; only an accepted answer is
+        // logged, so a refused one can be made again.
+        agent.answer_permission(request, option)?;
+        run.record(Entry::Answer {
+            request,
+            option: Some(option.to_owned()),
+        });
         drop(slot);
         (self.notify)();
         Ok(())
     }
 
     /// The latest run, with the entries from number `after` on: this window's run, or the
-    /// newest log on disk when this window has run nothing yet. `None` when there is no run.
+    /// newest readable log on disk when this window has run nothing yet. `None` when there is
+    /// no run.
     ///
     /// # Errors
     ///
-    /// [`Error::ReadRun`] when the newest log on disk cannot be read.
+    /// [`Error::ReadRun`] when the runs directory cannot be listed.
     pub(crate) fn view(&self, after: usize) -> Result<Option<RunView>> {
         let run = self.slot().run.clone();
         match run {
@@ -214,60 +285,75 @@ impl Runner {
         }
     }
 
-    /// Stops the agent and ignores anything it would still report: the project is closing.
+    /// Stops the agent, running or starting, and ignores anything it would still report: the
+    /// project is closing, or the app quits.
     pub(crate) fn close(&self) {
         let mut slot = self.slot();
         slot.closed = true;
         slot.agent = None;
+        if let Some(starting) = slot.starting.take() {
+            starting.stop();
+        }
     }
 
     fn slot(&self) -> MutexGuard<'_, Slot> {
         lock(&self.slot)
     }
 
-    /// Starts `agent` on its own thread, then sends the prompt, unless the project closed or
-    /// the run was cancelled meanwhile.
-    fn start(
-        self: &Arc<Self>,
-        agent: AgentChoice,
-        run: &Arc<Run>,
-        prompt: Prompt,
-        generation: u64,
-    ) {
+    /// Starts the agent on its own thread, then sends the prompt, unless the run was
+    /// cancelled or the project closed meanwhile.
+    fn start(self: &Arc<Self>, pending: Pending) {
         let runner = Arc::clone(self);
-        let starting = Arc::clone(run);
+        let run = Arc::clone(&pending.run);
         let start = move || {
-            let search_path: OsString = runner.agents.wait();
-            // Weak: the runner owns the agent, whose reader thread owns this callback.
-            let events = Arc::downgrade(&runner);
+            let failed = |error: &Error| {
+                pending.run.record(Entry::Failed {
+                    error: error_chain(error),
+                });
+            };
+            // Blocks until the login shell has said where programs are, a few seconds at most
+            // and only once per app.
+            let search_path = runner.agents.wait();
             let launch = Launch {
-                command: &agent.command,
+                command: &pending.agent.command,
                 cwd: runner.repo.root(),
                 search_path: &search_path,
                 timeout: START_TIMEOUT,
             };
-            let started = Agent::start(&launch, move |event| on_event(&events, generation, event));
+            // Weak: the runner owns the agent, whose reader thread owns this callback.
+            let events = Arc::downgrade(&runner);
+            let generation = pending.generation;
+            let spawned = Agent::spawn(&launch, move |event| on_event(&events, generation, event));
+            let starting = match spawned {
+                Ok(starting) => starting,
+                Err(error) => {
+                    failed(&error);
+                    return (runner.notify)();
+                }
+            };
+
+            // Stoppable from here on; a cancel or close that came first wins.
+            {
+                let mut slot = runner.slot();
+                if slot.closed || slot.generation != generation {
+                    return;
+                }
+                slot.starting = Some(starting.stopper());
+            }
+            let opened = starting.open_session();
 
             let mut slot = runner.slot();
-            match started {
-                Err(error) => starting.record(Entry::Failed {
-                    error: error_chain(&error),
-                }),
-                Ok(live) if slot.closed || slot.generation != generation => {
-                    drop(live);
-                    starting.record(Entry::Failed {
-                        error: "the project was closed before the agent started".to_owned(),
-                    });
-                }
-                Ok(live) => {
-                    if starting.state().cancel_requested {
-                        starting.record(Entry::Ended {
-                            reason: StopReason::Cancelled,
-                        });
-                    } else {
-                        runner.begin(&live, &starting, &prompt);
-                    }
-                    slot.agent = Some((agent, live));
+            if slot.generation != generation || slot.closed {
+                // Cancelled or closed while starting: the run already says so, and the agent,
+                // if it started after all, is dropped here, which stops it.
+                return;
+            }
+            slot.starting = None;
+            match opened {
+                Err(error) => failed(&error),
+                Ok(agent) => {
+                    runner.begin(&agent, &pending.run, &pending.ids, &pending.prompt);
+                    slot.agent = Some((pending.agent, agent));
                 }
             }
             drop(slot);
@@ -284,7 +370,7 @@ impl Runner {
     }
 
     /// Sends the prompt to a running agent and marks the notes sent.
-    fn begin(&self, agent: &Agent, run: &Run, prompt: &Prompt) {
+    fn begin(&self, agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt) {
         let blocks = prompt_blocks(prompt, self.repo.root());
         if let Err(error) = agent.prompt(&blocks) {
             return run.record(Entry::Failed {
@@ -294,8 +380,9 @@ impl Runner {
         run.record(Entry::Started);
         // The prompt is out: a note that cannot be marked would be sent again by mistake
         // later, so the run says so.
-        if let Err(error) = notes::mark_sent(&self.repo, &prompt.ids, &run.id()) {
-            run.set_problem(format!(
+        let id = run.state().header.id.clone();
+        if let Err(error) = notes::mark_sent(&self.repo, ids, &id) {
+            run.state().problem.get_or_insert(format!(
                 "the notes were sent but could not be marked sent: {}",
                 error_chain(&error)
             ));
@@ -303,8 +390,8 @@ impl Runner {
     }
 }
 
-impl std::fmt::Debug for Runner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Runner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runner")
             .field("root", &self.repo.root())
             .field("slot", &*self.slot())
@@ -313,7 +400,7 @@ impl std::fmt::Debug for Runner {
 }
 
 /// An agent's event, on its reader thread: recorded in the current run unless the agent
-/// was replaced or the project closed.
+/// was replaced or stopped, or the project closed.
 fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
@@ -335,39 +422,33 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     (runner.notify)();
 }
 
-/// The notes of a run, as sent.
-#[derive(Debug)]
-struct Prompt {
-    text: String,
-    ids: Vec<String>,
-    /// The notes' files, each once, in the order of the notes.
-    files: Vec<String>,
-}
-
 /// One run and its log.
-#[derive(Debug)]
 pub(crate) struct Run {
     file: PathBuf,
     state: Mutex<RunState>,
 }
 
-#[derive(Debug)]
 struct RunState {
     header: Header,
     entries: Vec<Entry>,
-    /// The agent's id of each permission request, by its number in the log; `None` once it
-    /// is answered.
-    permissions: Vec<Option<RequestId>>,
-    /// The open log while this process runs the run; `None` once it ended, and for a log
-    /// read from disk.
+    /// Whether this process runs it and it has not ended. A log read from disk is not live.
+    live: bool,
+    /// The log, open for appending while live; `None` after it ended or a write failed.
     log: Option<File>,
+    /// The exclusive lock on `runs/active.lock`, held while live (module docs).
+    active: Option<File>,
+    // Kept as each entry is recorded, so a status needs no scan of the entries.
+    started: bool,
     cancel_requested: bool,
-    /// Why the log could not be written in full, or the notes not marked sent.
+    end: Option<Status>,
+    requested: BTreeSet<usize>,
+    answered: BTreeSet<usize>,
+    /// Why the log is incomplete, or the notes were not marked sent.
     problem: Option<String>,
 }
 
 /// The first line of a run log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Header {
     version: u32,
@@ -383,6 +464,12 @@ struct Header {
     started_at: u64,
 }
 
+/// The one field of a header that every log version has. Unknown fields are ignored here on
+/// purpose.
+#[derive(Deserialize)]
+struct VersionOnly {
+    version: u32,
+}
 /// One thing that happened in a run: a line of its log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -491,8 +578,9 @@ pub(crate) enum Status {
     Cancelling,
     Ended,
     Failed,
-    /// The log has no end: the app quit while the run went on.
-    Interrupted,
+    /// The log has no end and this process does not run it: the app quit while it ran, or
+    /// another window is running it.
+    Unfinished,
 }
 
 /// A run as the page gets it.
@@ -513,72 +601,127 @@ pub(crate) struct RunView {
 }
 
 impl Run {
-    /// Creates the log for a new run in `dir`, with the next free id, and writes its header.
-    fn create(dir: &Path, mut header: Header) -> Result<Self> {
-        let error = |source| Error::WriteRun {
-            path: dir.to_owned(),
-            source,
+    /// Creates the log for a new run in `dir`, with the next free id, takes the working
+    /// tree's run lock, and writes the header.
+    fn create(dir: &Path, agent: &str, notes: &[String], prompt: &str) -> Result<Self> {
+        let error = |path: &Path| {
+            let path = path.to_owned();
+            move |source| Error::WriteRun { path, source }
         };
-        fs::create_dir_all(dir).map_err(error)?;
-        let mut number = highest_run(dir).map_err(error)? + 1;
+        fs::create_dir_all(dir).map_err(error(dir))?;
+        let active_path = dir.join("active.lock");
+        let active = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&active_path)
+            .map_err(error(&active_path))?;
+        match active.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(Error::RunElsewhere),
+            Err(TryLockError::Error(source)) => {
+                return Err(Error::WriteRun {
+                    path: active_path,
+                    source,
+                });
+            }
+        }
+
+        let mut number = highest_run(dir).map_err(error(dir))? + 1;
         // Creating the file claims the id; another window may have claimed it first.
         let (file, mut log) = loop {
             let file = dir.join(format!("R{number}.jsonl"));
             match File::options().append(true).create_new(true).open(&file) {
                 Ok(log) => break (file, log),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => number += 1,
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => number += 1,
                 Err(source) => return Err(Error::WriteRun { path: file, source }),
             }
         };
-        header.id = format!("R{number}");
-        log.write_all(&json_line(&header))
-            .map_err(|source| Error::WriteRun {
-                path: file.clone(),
-                source,
-            })?;
+        let header = Header {
+            version: LOG_VERSION,
+            id: format!("R{number}"),
+            agent: agent.to_owned(),
+            notes: notes.to_vec(),
+            prompt: prompt.to_owned(),
+            started_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+        };
+        log.write_all(&json_line(&header)).map_err(error(&file))?;
         Ok(Self {
             file,
-            state: Mutex::new(RunState {
-                header,
-                entries: Vec::new(),
-                permissions: Vec::new(),
-                log: Some(log),
-                cancel_requested: false,
-                problem: None,
-            }),
+            state: Mutex::new(RunState::new(header, Some(log), Some(active))),
         })
     }
 
-    /// The newest run log in `dir`, read as a finished run; `None` when there is none.
+    /// The newest readable run log in `dir`, read as a run this process does not run; `None`
+    /// when there is none. A newer log that cannot be read is skipped, and the run shown says
+    /// why.
     fn latest(dir: &Path) -> Result<Option<Self>> {
-        let error = |path: &Path, source| Error::ReadRun {
-            path: path.to_owned(),
-            source,
+        let mut numbers = match run_numbers(dir) {
+            Ok(numbers) => numbers,
+            Err(source) => {
+                return Err(Error::ReadRun {
+                    path: dir.to_owned(),
+                    source,
+                });
+            }
         };
-        let number = match highest_run(dir) {
-            Ok(0) => return Ok(None),
-            Ok(number) => number,
-            Err(source) => return Err(error(dir, source)),
-        };
-        let file = dir.join(format!("R{number}.jsonl"));
-        let text = fs::read_to_string(&file).map_err(|source| error(&file, source))?;
-        let mut lines = text.lines();
-        let header: Header = lines
-            .next()
-            .and_then(|line| serde_json::from_str(line).ok())
-            .ok_or_else(|| Error::InvalidRun {
-                path: file.clone(),
-                problem: "its first line is not a run header".to_owned(),
-            })?;
-        let mut entries = Vec::new();
-        let mut problem = None;
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        let mut skipped = None;
+        for number in numbers {
+            let file = dir.join(format!("R{number}.jsonl"));
+            match Self::read(&file) {
+                Ok(run) => {
+                    if let Some(skipped) = skipped {
+                        run.state().problem.get_or_insert(skipped);
+                    }
+                    return Ok(Some(run));
+                }
+                Err(problem) => {
+                    skipped.get_or_insert(format!(
+                        "{} is not shown: {problem} (move it aside to hide this)",
+                        file.display()
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reads a run log. Its lines are decoded lossily, so a character torn by a crash spoils
+    /// one line, not the log. The error says why the header cannot be read.
+    fn read(file: &Path) -> std::result::Result<Self, String> {
+        let bytes = fs::read(file).map_err(|error| format!("it cannot be read ({error})"))?;
+        let mut lines = bytes.split(|&byte| byte == b'\n');
+        let first = lines.next().unwrap_or_default();
+        // The version is read on its own first: a newer header would otherwise fail on its
+        // first new field, with a message that hides the real reason.
+        let VersionOnly { version } = serde_json::from_slice(first)
+            .map_err(|error| format!("its first line is not a run header ({error})"))?;
+        if version != LOG_VERSION {
+            return Err(format!(
+                "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
+            ));
+        }
+        let header: Header = serde_json::from_slice(first)
+            .map_err(|error| format!("its first line is not a run header ({error})"))?;
+
+        let mut state = RunState::new(header, None, None);
+        state.live = false;
         for (index, line) in lines.enumerate() {
-            match serde_json::from_str(line) {
-                Ok(entry) => entries.push(entry),
-                // A torn last line, from a crash mid-write, or a newer build's entry kind: the
-                // rest of the run is still worth showing.
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Entry>(&String::from_utf8_lossy(line)) {
+                Ok(entry) => {
+                    state.apply(&entry);
+                    state.entries.push(entry);
+                }
+                // A torn last line, or a newer build's entry kind: the rest of the run is still
+                // worth showing.
                 Err(error) => {
-                    problem.get_or_insert_with(|| {
+                    state.problem.get_or_insert_with(|| {
                         format!(
                             "line {} of {} is unreadable: {error}",
                             index + 2,
@@ -588,50 +731,33 @@ impl Run {
                 }
             }
         }
-        Ok(Some(Self {
-            file,
-            state: Mutex::new(RunState {
-                header,
-                entries,
-                permissions: Vec::new(),
-                log: None,
-                cancel_requested: false,
-                problem,
-            }),
-        }))
+        Ok(Self {
+            file: file.to_owned(),
+            state: Mutex::new(state),
+        })
     }
 
     fn state(&self) -> MutexGuard<'_, RunState> {
         lock(&self.state)
     }
 
-    fn id(&self) -> String {
-        self.state().header.id.clone()
-    }
-
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     fn record(&self, entry: Entry) {
         let mut state = self.state();
-        let Some(log) = &mut state.log else {
+        if !state.live {
             return;
-        };
-        // One write per line, to a file opened for appending, so a crash leaves at most the
-        // last line torn, which `latest` skips.
-        let appended = log.write_all(&json_line(&entry));
-        if matches!(entry, Entry::Ended { .. } | Entry::Failed { .. }) {
+        }
+        if let Some(log) = &mut state.log
+            && let Err(error) = log.write_all(&json_line(&entry))
+        {
             state.log = None;
-            // An open request can no longer be answered; the agent forgets it with the turn.
-            state.permissions.iter_mut().for_each(|id| *id = None);
+            state.problem.get_or_insert(format!(
+                "the run log {} could not be written, so this run will not be shown whole \
+                 after a restart: {error}",
+                self.file.display()
+            ));
         }
-        if let Err(error) = appended {
-            state.problem.get_or_insert_with(|| {
-                format!(
-                    "the run log {} could not be written, so this run will not be shown after \
-                     a restart: {error}",
-                    self.file.display()
-                )
-            });
-        }
+        state.apply(&entry);
         state.entries.push(entry);
     }
 
@@ -642,29 +768,20 @@ impl Run {
                 Some(entry) => entry,
                 None => return,
             },
-            Event::Permission(request) => {
-                let mut state = self.state();
-                if !state.is_live() {
-                    return;
-                }
-                let number = state.permissions.len();
-                state.permissions.push(Some(request.id));
-                drop(state);
-                Entry::Permission {
-                    request: number,
-                    tool_call: request.tool_call.tool_call_id,
-                    title: request.tool_call.title,
-                    options: request
-                        .options
-                        .into_iter()
-                        .map(|option| Choice {
-                            id: option.option_id,
-                            name: option.name,
-                            kind: option.kind,
-                        })
-                        .collect(),
-                }
-            }
+            Event::Permission(request) => Entry::Permission {
+                request: request.number,
+                tool_call: request.tool_call.tool_call_id,
+                title: request.tool_call.title,
+                options: request
+                    .options
+                    .into_iter()
+                    .map(|option| Choice {
+                        id: option.option_id,
+                        name: option.name,
+                        kind: option.kind,
+                    })
+                    .collect(),
+            },
             Event::TurnEnded(TurnEnd::Stopped(reason)) => Entry::Ended { reason },
             Event::TurnEnded(TurnEnd::Failed(error)) => Entry::Failed { error },
             Event::Unreadable(problem) => Entry::Unreadable { problem },
@@ -673,55 +790,6 @@ impl Run {
             },
         };
         self.record(entry);
-    }
-
-    /// Marks the run cancelled and answers its open permission requests in the log (the
-    /// agent's [`Agent::cancel`] answers them on the wire). Returns whether the agent has the
-    /// prompt, and so needs to be told.
-    fn request_cancel(&self) -> bool {
-        let mut state = self.state();
-        state.cancel_requested = true;
-        let open: Vec<usize> = state
-            .permissions
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(number, id)| id.take().map(|_| number))
-            .collect();
-        let started = state.entries.contains(&Entry::Started);
-        drop(state);
-        self.record(Entry::CancelRequested);
-        for request in open {
-            self.record(Entry::Answer {
-                request,
-                option: None,
-            });
-        }
-        started
-    }
-
-    /// The agent's id of the open permission request `request`.
-    fn open_permission(&self, request: usize) -> Result<RequestId> {
-        self.state()
-            .permissions
-            .get(request)
-            .cloned()
-            .flatten()
-            .ok_or(Error::NoSuchPermission)
-    }
-
-    /// Closes the permission request `request`, answered with `option`.
-    fn answered(&self, request: usize, option: &str) {
-        if let Some(id) = self.state().permissions.get_mut(request) {
-            *id = None;
-        }
-        self.record(Entry::Answer {
-            request,
-            option: Some(option.to_owned()),
-        });
-    }
-
-    fn set_problem(&self, problem: String) {
-        self.state().problem.get_or_insert(problem);
     }
 
     fn view(&self, after: usize) -> RunView {
@@ -740,44 +808,102 @@ impl Run {
     }
 }
 
+// Debug output names the run and its state, never its prompt or entries: they quote note
+// bodies and code, which `notes.rs` keeps out of Debug output too.
+impl fmt::Debug for Run {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state();
+        f.debug_struct("Run")
+            .field("id", &state.header.id)
+            .field("entries", &state.entries.len())
+            .field("status", &state.status())
+            .finish_non_exhaustive()
+    }
+}
+
 impl RunState {
-    fn is_live(&self) -> bool {
-        self.log.is_some()
+    fn new(header: Header, log: Option<File>, active: Option<File>) -> Self {
+        Self {
+            header,
+            entries: Vec::new(),
+            live: true,
+            log,
+            active,
+            started: false,
+            cancel_requested: false,
+            end: None,
+            requested: BTreeSet::new(),
+            answered: BTreeSet::new(),
+            problem: None,
+        }
+    }
+
+    /// Keeps the fields that sum up the entries current with one more.
+    fn apply(&mut self, entry: &Entry) {
+        match entry {
+            Entry::Started => self.started = true,
+            Entry::CancelRequested => self.cancel_requested = true,
+            Entry::Permission { request, .. } => {
+                self.requested.insert(*request);
+            }
+            Entry::Answer { request, .. } => {
+                self.answered.insert(*request);
+            }
+            Entry::Ended { .. } | Entry::Failed { .. } => {
+                self.end = Some(if matches!(entry, Entry::Ended { .. }) {
+                    Status::Ended
+                } else {
+                    Status::Failed
+                });
+                self.live = false;
+                self.log = None;
+                // Another window may start a run now.
+                self.active = None;
+            }
+            Entry::Message { .. }
+            | Entry::Thought { .. }
+            | Entry::Tool { .. }
+            | Entry::ToolUpdate { .. }
+            | Entry::Plan { .. }
+            | Entry::Unreadable { .. } => {}
+        }
+    }
+
+    /// Whether the permission request `request` was logged and not answered. An answer can
+    /// be logged before its request (a cancel answers one whose event is on its way), so
+    /// the two are kept as sets.
+    fn is_open(&self, request: usize) -> bool {
+        self.requested.contains(&request) && !self.answered.contains(&request)
     }
 
     fn status(&self) -> Status {
-        let last_end = self.entries.iter().rev().find_map(|entry| match entry {
-            Entry::Ended { .. } => Some(Status::Ended),
-            Entry::Failed { .. } => Some(Status::Failed),
-            _ => None,
-        });
-        if let Some(status) = last_end {
-            return status;
+        if let Some(end) = self.end {
+            return end;
         }
-        if !self.is_live() {
-            return Status::Interrupted;
+        if !self.live {
+            return Status::Unfinished;
         }
-        if !self.entries.contains(&Entry::Started) {
+        if !self.started {
             return Status::Starting;
         }
         if self.cancel_requested {
             return Status::Cancelling;
         }
-        if self.permissions.iter().any(Option::is_some) {
+        if self.requested.difference(&self.answered).next().is_some() {
             return Status::Waiting;
         }
         Status::Running
     }
 }
 
-/// The highest run number among the logs in `dir`; 0 when there is none, or no `dir`.
-fn highest_run(dir: &Path) -> io::Result<u64> {
+/// The numbers of the run logs in `dir`; none when there is no `dir`.
+fn run_numbers(dir: &Path) -> io::Result<Vec<u64>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut highest = 0;
+    let mut numbers = Vec::new();
     for entry in entries {
         let name = entry?.file_name();
         let number = name
@@ -785,11 +911,15 @@ fn highest_run(dir: &Path) -> io::Result<u64> {
             .and_then(|name| name.strip_prefix('R'))
             .and_then(|name| name.strip_suffix(".jsonl"))
             .and_then(|digits| digits.parse::<u64>().ok());
-        highest = highest.max(number.unwrap_or(0));
+        numbers.extend(number);
     }
-    Ok(highest)
+    Ok(numbers)
 }
 
+/// The highest run number among the logs in `dir`; 0 when there is none.
+fn highest_run(dir: &Path) -> io::Result<u64> {
+    Ok(run_numbers(dir)?.into_iter().max().unwrap_or(0))
+}
 /// A session update as a log entry; `None` for what the run panel does not show.
 fn entry_of(update: SessionUpdate, root: &Path) -> Option<Entry> {
     let entry = match update {
@@ -869,44 +999,6 @@ fn relative(path: &str, root: &Path) -> String {
         |_| path.to_owned(),
         |inside| inside.to_string_lossy().into_owned(),
     )
-}
-
-/// The prompt's text, in the format of docs/design.md, "The prompt". The quoted snippet
-/// travels with each note because line numbers go stale the moment the agent edits a file.
-fn prompt_text(notes: &[Note]) -> String {
-    let mut text = String::from(
-        "These are review notes an engineer wrote while reading this repository.\n\
-         Address every note. Change nothing the notes do not ask for.\n\
-         When you finish, list each note id with one line on what you did.\n",
-    );
-    for note in notes {
-        let lines = if note.lines.start == note.lines.end {
-            note.lines.start.to_string()
-        } else {
-            format!("{}-{}", note.lines.start, note.lines.end)
-        };
-        text.push_str(&format!("\n[{}] {}:{lines}\n", note.id, note.path));
-        if note.anchor == Anchor::Lost {
-            text.push_str("(These lines are no longer in the file; they were:)\n");
-        }
-        for line in note.snippet.split('\n') {
-            text.push_str(&format!("> {line}\n"));
-        }
-        text.push_str(note.body.trim_end());
-        text.push('\n');
-    }
-    text
-}
-
-/// The notes' files, each once, in note order.
-fn files_of(notes: &[Note]) -> Vec<String> {
-    let mut files: Vec<String> = Vec::new();
-    for note in notes {
-        if !files.contains(&note.path) {
-            files.push(note.path.clone());
-        }
-    }
-    files
 }
 
 /// The prompt as ACP content: the text, then a link to each file with notes. Every agent

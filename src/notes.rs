@@ -148,36 +148,69 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
     Ok(review)
 }
 
-/// The notes `ids` name, in that order, placed where their snippets are now.
+/// The prompt that sends the notes `ids` to an agent, in that order (docs/design.md, "The
+/// prompt"): an introduction, then each note's heading, its quoted snippet and its body. The
+/// quoted snippet travels with each note because line numbers go stale the moment the agent
+/// edits a file.
 ///
 /// # Errors
 ///
 /// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, or holds
 /// something that is not a note id; [`Error::NoSuchNote`] when no note has one of them.
-pub(crate) fn select(repo: &Repo, ids: &[String]) -> Result<Vec<Note>> {
+pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
     let wanted = parse_ids(ids)?;
-    let mut review = current(repo)?;
-    wanted
-        .iter()
-        .map(|id| {
-            let index = review
-                .notes
-                .iter()
-                .position(|note| note.id == *id)
-                .ok_or_else(|| Error::NoSuchNote { id: id.to_string() })?;
-            Ok(review.notes.swap_remove(index))
-        })
-        .collect()
+    let review = current(repo)?;
+    let mut text = String::from(
+        "These are review notes an engineer wrote while reading this repository.\n\
+         Address every note. Change nothing the notes do not ask for.\n\
+         When you finish, list each note id with one line on what you did.\n",
+    );
+    let mut files: Vec<String> = Vec::new();
+    for id in &wanted {
+        let note = review
+            .notes
+            .iter()
+            .find(|note| note.id == *id)
+            .ok_or_else(|| Error::NoSuchNote { id: id.to_string() })?;
+        let LineRange { start, end } = note.lines;
+        let lines = if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        };
+        text.push_str(&format!("\n[{}] {}:{lines}\n", note.id, note.path));
+        if note.anchor == Anchor::Lost {
+            text.push_str("(These lines are no longer in the file; they were:)\n");
+        }
+        for line in note.snippet.split('\n') {
+            text.push_str(&format!("> {line}\n"));
+        }
+        text.push_str(note.body.trim_end());
+        text.push('\n');
+        if !files.contains(&note.path) {
+            files.push(note.path.clone());
+        }
+    }
+    Ok(Prompt { text, files })
 }
 
-/// Marks the notes `ids` sent in `run`, saves, and returns all notes. A note deleted
-/// meanwhile is skipped: the run it went to is under way, and the engineer removed it.
+/// A prompt built from notes.
+#[derive(Debug)]
+pub(crate) struct Prompt {
+    /// The text the agent receives.
+    pub(crate) text: String,
+    /// The notes' files, relative to the repository root, each once, in note order.
+    pub(crate) files: Vec<String>,
+}
+
+/// Marks the notes `ids` sent in `run` and saves. A note deleted meanwhile is skipped: the
+/// run it went to is under way, and the engineer removed it.
 ///
 /// # Errors
 ///
-/// As [`current`]; [`Error::BadRequest`] as for [`select`]; [`Error::WriteReview`] when
+/// As [`current`]; [`Error::BadRequest`] as for [`prompt`]; [`Error::WriteReview`] when
 /// the lock or the file cannot be written.
-pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<Review> {
+pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<()> {
     let wanted = parse_ids(ids)?;
     let file = repo.review_file();
     let _lock = lock(&file)?;
@@ -189,8 +222,7 @@ pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<Review
             };
         }
     }
-    review.save(&file)?;
-    Ok(review)
+    review.save(&file)
 }
 
 /// Reads note ids as the page sends them: at least one, none twice.
@@ -229,29 +261,31 @@ struct VersionOnly {
 /// A note the engineer wrote on a line range.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Note {
-    pub(crate) id: NoteId,
+struct Note {
+    id: NoteId,
     /// Relative to the repository root.
-    pub(crate) path: String,
+    path: String,
     /// Where the snippet was found last.
-    pub(crate) lines: LineRange,
+    lines: LineRange,
     /// The text of the lines when the note was written, without line endings, joined with
     /// `\n`.
-    pub(crate) snippet: String,
-    pub(crate) body: String,
+    snippet: String,
+    body: String,
     /// Recomputed on every read, so a note written by hand may leave it out.
     #[serde(default)]
-    pub(crate) anchor: Anchor,
+    anchor: Anchor,
     /// Absent in version 1, where every note is open; a note written by hand may leave it
     /// out too.
     #[serde(default)]
-    pub(crate) state: NoteState,
+    state: NoteState,
 }
 
-/// Where a note is in the loop. Kept apart from [`Anchor`] (module docs).
+/// Where a note is in the loop. Kept apart from [`Anchor`] (module docs). Always an object
+/// with a `kind` (`{"kind": "open"}`, `{"kind": "sent", "run": "R1"}`), so a script reads
+/// one shape whatever the state.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum NoteState {
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum NoteState {
     /// Not sent yet, or sent in a run that did not start.
     #[default]
     Open,
@@ -273,7 +307,7 @@ pub(crate) struct NewNote {
 
 /// A note's number, written `N1`, `N2`: shown in the page and sent to the agent.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct NoteId(u32);
+struct NoteId(u32);
 
 impl NoteId {
     /// Reads `N` and a positive number, as `Display` writes it.
@@ -289,9 +323,9 @@ impl NoteId {
 /// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawLineRange")]
-pub(crate) struct LineRange {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
+struct LineRange {
+    start: usize,
+    end: usize,
 }
 
 /// A [`LineRange`] before its bounds are checked.
@@ -305,7 +339,7 @@ struct RawLineRange {
 /// Whether a note's snippet is still in its file.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Anchor {
+enum Anchor {
     /// The snippet is in the file, at `lines`.
     #[default]
     Found,

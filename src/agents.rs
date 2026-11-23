@@ -481,7 +481,6 @@ mod tests {
         }
     }
 
-    /// Waits for the scanner's current scan, for at most five seconds.
     #[test]
     fn a_rescan_shows_its_own_result_even_when_an_older_scan_finishes_later() {
         // The first scan to run takes the gate, says so on `entered`, waits for `release`,

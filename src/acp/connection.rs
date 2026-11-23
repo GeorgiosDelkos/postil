@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -16,10 +16,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::acp::wire::{
-    self, ClientCapabilities, ContentBlock, FsCapabilities, Incoming, InitializeParams,
-    InitializeResult, NewSessionParams, NewSessionResult, Notification, Outcome, PermissionOption,
-    PermissionOutcome, PermissionParams, PermissionResult, PromptParams, PromptResult, Request,
-    Response, RpcError, SessionParams, SessionUpdate, StopReason, ToolCallUpdate, UpdateParams,
+    self, CancelParams, ClientCapabilities, ContentBlock, FsCapabilities, Incoming,
+    InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, Notification, Outcome,
+    PermissionOption, PermissionOutcome, PermissionParams, PermissionResult, PromptParams,
+    PromptResult, Request, Response, RpcError, SessionUpdate, StopReason, ToolCallUpdate,
+    UpdateParams,
 };
 use crate::agents;
 use crate::error::{Error, Result};
@@ -71,14 +72,12 @@ pub(crate) enum Event {
 /// A permission request: the tool call the agent wants to make and the answers it offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PermissionRequest {
-    pub(crate) id: RequestId,
+    /// The request's number: 0 for the agent's first, counting on across turns. The agent's
+    /// own request id stays inside [`Agent`], which keeps the only table of open requests.
+    pub(crate) number: usize,
     pub(crate) tool_call: ToolCallUpdate,
     pub(crate) options: Vec<PermissionOption>,
 }
-
-/// The id of a request the agent sent: a number or a string, chosen by the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RequestId(Value);
 
 /// How a turn ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +85,33 @@ pub(crate) enum TurnEnd {
     Stopped(StopReason),
     /// The agent answered the prompt with an error, or with a reply the app cannot read.
     Failed(String),
+}
+
+/// An agent whose process runs and whose session is not open yet. Opening the session can
+/// take minutes (an agent waiting for a browser sign-in never answers), so it is a step of
+/// its own, which a [`Stopper`] can cut short from another thread.
+#[derive(Debug)]
+pub(crate) struct Starting {
+    process: Process,
+    cwd: PathBuf,
+    timeout: Duration,
+}
+
+/// Kills a starting agent's process group from another thread; its [`Starting::open_session`]
+/// then fails with [`Error::AgentExited`]. Stopping an agent that is gone does nothing.
+#[derive(Debug, Clone)]
+pub(crate) struct Stopper {
+    group: Arc<Mutex<Option<u32>>>,
+}
+
+impl Stopper {
+    pub(crate) fn stop(&self) {
+        // Signalled under the lock that [`Process`]'s drop takes before it reaps the process,
+        // so the group id cannot have been reused by then.
+        if let Some(leader) = *lock(&self.group) {
+            agents::kill_group(leader);
+        }
+    }
 }
 
 /// A running agent with one session open in the repository.
@@ -99,27 +125,45 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    /// Starts the agent, introduces the app (`initialize`), and opens a session in
-    /// `launch.cwd` (`session/new`). Blocks until both are answered, up to `launch.timeout`
-    /// each.
+    /// Starts the agent's process. Its session is opened by [`Starting::open_session`].
     ///
     /// `on_event` receives every [`Event`] from the start of the session on, on the agent's
     /// reader thread, so it must not block for long: the agent's messages wait behind it.
     ///
     /// # Errors
     ///
-    /// [`Error::AgentNotFound`] or [`Error::StartAgent`] when the process cannot be started;
-    /// [`Error::AgentSilent`] when a step is not answered in time (an agent that waits for a
-    /// sign-in in a browser does this); [`Error::AgentExited`] when the process ends first;
-    /// [`Error::AgentRefused`] when the agent answers with an error;
-    /// [`Error::AgentProtocol`] when it speaks another version or replies in a shape the app
-    /// cannot read.
-    pub(crate) fn start(
+    /// [`Error::AgentNotFound`] or [`Error::StartAgent`] when the process cannot be started.
+    pub(crate) fn spawn(
         launch: &Launch<'_>,
         on_event: impl FnMut(Event) + Send + 'static,
-    ) -> Result<Self> {
-        let process = Process::spawn(launch, on_event)?;
+    ) -> Result<Starting> {
+        Ok(Starting {
+            process: Process::spawn(launch, on_event)?,
+            cwd: launch.cwd.to_owned(),
+            timeout: launch.timeout,
+        })
+    }
+}
 
+impl Starting {
+    /// The handle that stops this agent from another thread.
+    pub(crate) fn stopper(&self) -> Stopper {
+        Stopper {
+            group: Arc::clone(&self.process.group),
+        }
+    }
+
+    /// Introduces the app (`initialize`) and opens a session in the repository
+    /// (`session/new`). Blocks until both are answered, up to the launch's timeout each.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AgentSilent`] when a step is not answered in time (an agent that waits for a
+    /// sign-in in a browser does this); [`Error::AgentExited`] when the process ends first,
+    /// or is stopped; [`Error::AgentRefused`] when the agent answers with an error;
+    /// [`Error::AgentProtocol`] when it speaks another version or replies in a shape the app
+    /// cannot read.
+    pub(crate) fn open_session(self) -> Result<Agent> {
         let initialize = InitializeParams {
             protocol_version: wire::PROTOCOL_VERSION,
             client_capabilities: ClientCapabilities {
@@ -130,7 +174,8 @@ impl Agent {
                 terminal: false,
             },
         };
-        let reply: InitializeResult = process.call("initialize", &initialize, launch.timeout)?;
+        let process = self.process;
+        let reply: InitializeResult = process.call("initialize", &initialize, self.timeout)?;
         // The agent answers with the version it will speak; another version is one this
         // client cannot follow.
         if reply.protocol_version != wire::PROTOCOL_VERSION {
@@ -141,21 +186,28 @@ impl Agent {
             )));
         }
 
-        let cwd = launch.cwd.to_str().ok_or_else(|| {
+        let cwd = self.cwd.to_str().ok_or_else(|| {
             Error::AgentProtocol(format!(
                 "the repository path {} is not UTF-8, which ACP cannot carry",
-                launch.cwd.display()
+                self.cwd.display()
             ))
         })?;
         let session = NewSessionParams {
             cwd,
             mcp_servers: [],
         };
-        let reply: NewSessionResult = process.call("session/new", &session, launch.timeout)?;
-        Ok(Self {
+        let reply: NewSessionResult = process.call("session/new", &session, self.timeout)?;
+        Ok(Agent {
             process,
             session: reply.session_id,
         })
+    }
+}
+
+impl Agent {
+    /// Whether the agent's process still runs. A kept agent that exited is started again.
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.process.state().gone
     }
 
     /// Sends a prompt and returns at once. The turn's progress arrives as [`Event`]s and its
@@ -186,66 +238,75 @@ impl Agent {
     }
 
     /// Asks the agent to stop the turn, and answers every open permission request
-    /// `cancelled`, as the protocol requires. The turn still ends with
-    /// [`Event::TurnEnded`], normally [`StopReason::Cancelled`].
+    /// `cancelled`, as the protocol requires; so is every request that arrives until the turn
+    /// ends. The turn still ends with [`Event::TurnEnded`], normally
+    /// [`StopReason::Cancelled`]. Returns the numbers of the requests it answered, which may
+    /// include one whose [`Event::Permission`] is still on its way.
     ///
     /// # Errors
     ///
     /// [`Error::AgentExited`] when the process is gone.
-    pub(crate) fn cancel(&self) -> Result<()> {
-        let open = std::mem::take(&mut self.process.state().permissions);
-        let params = SessionParams {
+    pub(crate) fn cancel(&self) -> Result<Vec<usize>> {
+        let open: Vec<(usize, Value)> = {
+            let mut state = self.process.state();
+            state.cancelling = true;
+            state
+                .permissions
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(number, request)| request.take().map(|(id, _)| (number, id)))
+                .collect()
+        };
+        let params = CancelParams {
             session_id: &self.session,
         };
         self.process
             .send(&notification("session/cancel", &params))?;
-        for (id, _) in &open {
+        for (_, id) in &open {
             let result = PermissionResult {
                 outcome: PermissionOutcome::Cancelled,
             };
-            self.process
-                .send(&response(&id.0, Outcome::Result(result)))?;
+            self.process.send(&response(id, Outcome::Result(result)))?;
         }
-        Ok(())
+        Ok(open.into_iter().map(|(number, _)| number).collect())
     }
 
-    /// Answers the permission request `id` with the option `option_id`, one the agent
-    /// offered.
+    /// Answers the permission request numbered `number` with the option `option_id`, one the
+    /// agent offered.
     ///
     /// # Errors
     ///
     /// [`Error::NoSuchPermission`] when no such request is open (it was answered, or
     /// cancelled); [`Error::BadRequest`] when the agent did not offer `option_id`, and the
     /// request stays open; [`Error::AgentExited`] when the process is gone.
-    pub(crate) fn answer_permission(&self, id: &RequestId, option_id: &str) -> Result<()> {
-        {
+    pub(crate) fn answer_permission(&self, number: usize, option_id: &str) -> Result<()> {
+        let id = {
             let mut state = self.process.state();
-            let index = state
+            let request = state
                 .permissions
-                .iter()
-                .position(|(open, _)| open == id)
+                .get_mut(number)
                 .ok_or(Error::NoSuchPermission)?;
-            if !state.permissions[index]
-                .1
-                .iter()
-                .any(|offered| offered == option_id)
-            {
+            let (_, offered) = request.as_ref().ok_or(Error::NoSuchPermission)?;
+            if !offered.iter().any(|offered| offered == option_id) {
                 return Err(Error::BadRequest(format!(
                     "the agent did not offer the answer {option_id:?}"
                 )));
             }
-            state.permissions.remove(index);
-        }
+            request.take().expect("checked to be open above").0
+        };
         let result = PermissionResult {
             outcome: PermissionOutcome::Selected { option_id },
         };
-        self.process.send(&response(&id.0, Outcome::Result(result)))
+        self.process.send(&response(&id, Outcome::Result(result)))
     }
 }
 
 /// The agent's process and what the threads around it share.
 struct Process {
     child: Child,
+    /// The process group's id while the process is not reaped, for [`Stopper`]; `None` from
+    /// the moment the drop starts reaping it.
+    group: Arc<Mutex<Option<u32>>>,
     /// Lines for the writer thread to send. A channel rather than a locked `ChildStdin`, so a
     /// caller on the main thread never blocks on an agent that stopped reading.
     outbox: Sender<String>,
@@ -268,8 +329,12 @@ struct State {
     next_id: u64,
     /// Who waits for the reply to each request the app sent.
     waiters: HashMap<u64, Waiter>,
-    /// The agent's open permission requests, each with the option ids it offered.
-    permissions: Vec<(RequestId, Vec<String>)>,
+    /// The agent's permission requests by number: its id for each and the option ids it
+    /// offered while open, `None` once answered.
+    permissions: Vec<Option<(Value, Vec<String>)>>,
+    /// Set by [`Agent::cancel`] until the turn ends: requests that arrive meanwhile are
+    /// answered `cancelled` at once.
+    cancelling: bool,
     /// Set when the [`Agent`] is dropped: the reader then delivers no more events.
     closed: bool,
     /// Set when the agent's output ended: every call fails from then on. Checked here, not
@@ -359,6 +424,7 @@ impl Process {
                 spawn_thread("acp-reader", move || reader.run(stdout, &stderr_closed))
             });
         let process = Self {
+            group: Arc::new(Mutex::new(Some(child.id()))),
             child,
             outbox,
             shared,
@@ -428,6 +494,11 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         self.state().closed = true;
+        // From here no [`Stopper`] signals the group: the process is about to be reaped.
+        lock(&self.group).take();
+        // This blocks the caller (the main thread, under the runner's lock) only as long as
+        // `/bin/kill` runs and the killed process takes to be reaped: milliseconds, since
+        // SIGKILL cannot be caught.
         agents::kill_group(self.child.id());
         // Fails when the group's kill already took the agent, or it had exited: both fine.
         drop(self.child.kill());
@@ -476,7 +547,10 @@ impl<F: FnMut(Event)> Reader<F> {
             state.gone = true;
             // Dropping the waiters wakes every blocked caller with "exited".
             state.waiters.clear();
-            state.permissions.clear();
+            state
+                .permissions
+                .iter_mut()
+                .for_each(|request| *request = None);
             state.closed
         };
         if !closed {
@@ -492,7 +566,7 @@ impl<F: FnMut(Event)> Reader<F> {
         };
         match (message.id, message.method) {
             (Some(id), None) => self.reply(&id, message.result, message.error),
-            (Some(id), Some(method)) => self.request(id, &method, message.params),
+            (Some(id), Some(method)) => self.request(&id, &method, message.params),
             (None, Some(method)) => self.notification(&method, message.params),
             (None, None) => self.emit(Event::Unreadable(format!(
                 "a message with neither an id nor a method: {}",
@@ -517,6 +591,7 @@ impl<F: FnMut(Event)> Reader<F> {
             // The caller timed out and left: nobody wants the reply.
             Some(Waiter::Call(sender)) => drop(sender.send(outcome)),
             Some(Waiter::Turn) => {
+                lock(&self.shared.state).cancelling = false;
                 let end = match outcome {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
                         Ok(result) => TurnEnd::Stopped(result.stop_reason),
@@ -535,13 +610,13 @@ impl<F: FnMut(Event)> Reader<F> {
 
     /// A request from the agent. The app serves only permission requests; it advertised no
     /// file or terminal capability, so any other method is answered "not found".
-    fn request(&mut self, id: Value, method: &str, params: Value) {
+    fn request(&mut self, id: &Value, method: &str, params: Value) {
         if method != "session/request_permission" {
             let error = RpcError {
                 code: wire::METHOD_NOT_FOUND,
                 message: format!("Postil does not serve {method}"),
             };
-            return self.answer(&id, error);
+            return self.answer(id, error);
         }
         let params: PermissionParams = match serde_json::from_value(params) {
             Ok(params) => params,
@@ -551,21 +626,34 @@ impl<F: FnMut(Event)> Reader<F> {
                     code: wire::INVALID_PARAMS,
                     message: problem.clone(),
                 };
-                self.answer(&id, rpc);
+                self.answer(id, rpc);
                 return self.emit(Event::Unreadable(problem));
             }
         };
-        let id = RequestId(id);
         let offered = params
             .options
             .iter()
             .map(|option| option.option_id.clone())
             .collect();
-        lock(&self.shared.state)
-            .permissions
-            .push((id.clone(), offered));
+        let number = {
+            let mut state = lock(&self.shared.state);
+            if state.cancelling {
+                None
+            } else {
+                state.permissions.push(Some((id.clone(), offered)));
+                Some(state.permissions.len() - 1)
+            }
+        };
+        let Some(number) = number else {
+            // The turn is being cancelled: the request crossed the cancel on the wire.
+            let result = PermissionResult {
+                outcome: PermissionOutcome::Cancelled,
+            };
+            self.outbox.send(response(id, Outcome::Result(result))).ok();
+            return;
+        };
         self.emit(Event::Permission(PermissionRequest {
-            id,
+            number,
             tool_call: params.tool_call,
             options: params.options,
         }));
@@ -694,7 +782,7 @@ mod tests {
     };
 
     /// Long enough for Node to start on a loaded machine; a test that waits this long has
-    /// failed (CON-20: it bounds a hang, it times nothing).
+    /// failed (it bounds a hang, it times nothing).
     const WAIT: Duration = Duration::from_secs(20);
 
     fn fake_agent() -> PathBuf {
@@ -724,7 +812,7 @@ mod tests {
             search_path: &search_path,
             timeout,
         };
-        let agent = Agent::start(&launch, move |event| drop(sender.send(event)))?;
+        let agent = Agent::spawn(&launch, move |event| drop(sender.send(event)))?.open_session()?;
         Ok((agent, events))
     }
 
@@ -811,11 +899,11 @@ mod tests {
                 PermissionKind::RejectOnce
             ]
         );
-        agent.answer_permission(&request.id, "always").unwrap();
+        agent.answer_permission(request.number, "always").unwrap();
         assert_eq!(said(&events), "chose always");
         assert!(
             matches!(
-                agent.answer_permission(&request.id, "once"),
+                agent.answer_permission(request.number, "once"),
                 Err(Error::NoSuchPermission)
             ),
             "a request is answered once"
@@ -868,10 +956,10 @@ mod tests {
             }
         };
         assert!(matches!(
-            agent.answer_permission(&request.id, "yes please"),
+            agent.answer_permission(request.number, "yes please"),
             Err(Error::BadRequest(_))
         ));
-        agent.answer_permission(&request.id, "no").unwrap();
+        agent.answer_permission(request.number, "no").unwrap();
         assert_eq!(said(&events), "chose no");
     }
 
@@ -889,14 +977,16 @@ mod tests {
             matches!(agent.prompt(&[text("y")]), Err(Error::TurnRunning)),
             "one turn at a time"
         );
-        agent.cancel().unwrap();
+        assert_eq!(agent.cancel().unwrap(), [request.number]);
         assert_eq!(said(&events), "permission cancelled");
+        // Asked while the cancel is under way: answered at once, and never an event.
+        assert_eq!(said(&events), "late permission cancelled");
         assert_eq!(
             next(&events),
             Event::TurnEnded(TurnEnd::Stopped(StopReason::Cancelled))
         );
         assert!(matches!(
-            agent.answer_permission(&request.id, "once"),
+            agent.answer_permission(request.number, "once"),
             Err(Error::NoSuchPermission)
         ));
     }
@@ -976,6 +1066,12 @@ mod tests {
             other => panic!("expected AgentExited, got {other:?}"),
         }
 
+        let unreadable = start("no-session-id").unwrap_err().to_string();
+        assert!(
+            unreadable.contains("unreadable reply to session/new"),
+            "{unreadable}"
+        );
+
         let auth = start("auth").unwrap_err();
         assert!(
             matches!(
@@ -994,10 +1090,10 @@ mod tests {
         assert!(version.contains("speaks ACP version 2"), "{version}");
 
         let missing = start_command("no-such-agent-program --acp", WAIT).unwrap_err();
-        assert!(
-            matches!(&missing, Error::AgentNotFound { program } if program == "no-such-agent-program"),
-            "{missing:?}"
-        );
+        let Error::AgentNotFound { program } = &missing else {
+            panic!("expected AgentNotFound, got {missing:?}");
+        };
+        assert_eq!(program, "no-such-agent-program");
     }
 
     #[test]
@@ -1044,15 +1140,73 @@ mod tests {
         assert_eq!(excerpt("  short \n"), "short");
     }
 
-    /// A real agent answers a prompt over a real session. Runs only when
-    /// `POSTIL_REAL_AGENT` holds an agent's command (one of `agents::BUILT_IN`), because it
-    /// needs the agent installed and signed in, and spends a turn of its model:
-    /// `POSTIL_REAL_AGENT='grok agent stdio' cargo test real_agent -- --nocapture`.
     #[test]
-    fn a_real_agent_answers_a_prompt() {
-        let Ok(command) = std::env::var("POSTIL_REAL_AGENT") else {
-            return;
+    fn a_starting_agent_can_be_stopped_from_another_thread() {
+        let pid_file = std::env::temp_dir().join(format!("postil-silent-{}", std::process::id()));
+        let search_path = std::env::var_os("PATH").expect("PATH is set");
+        let command = format!("{} {}", command("silent"), pid_file.display());
+        let launch = Launch {
+            command: &command,
+            cwd: Path::new(env!("CARGO_MANIFEST_DIR")),
+            search_path: &search_path,
+            // Far longer than the test: only the stop can end the wait.
+            timeout: Duration::from_secs(600),
         };
+        let starting = Agent::spawn(&launch, |_| {}).unwrap();
+        let stopper = starting.stopper();
+        let opening = thread::spawn(move || starting.open_session());
+
+        // The agent writes its pid once it runs; then it never answers.
+        let deadline = std::time::Instant::now() + WAIT;
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && !pid.is_empty()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent never started"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(std::fs::remove_file(&pid_file));
+        stopper.stop();
+        assert!(matches!(
+            opening.join().unwrap(),
+            Err(Error::AgentExited { .. })
+        ));
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the stopped agent is gone");
+        stopper.stop();
+    }
+
+    #[test]
+    fn an_agent_that_exited_is_not_alive() {
+        let (agent, events) = start("exit-after-turn").unwrap();
+        assert!(agent.is_alive());
+        agent.prompt(&[text("x")]).unwrap();
+        loop {
+            if let Event::Exited { .. } = next(&events) {
+                break;
+            }
+        }
+        assert!(!agent.is_alive());
+    }
+
+    /// A real agent answers a prompt over a real session. Ignored unless asked for, with
+    /// `POSTIL_REAL_AGENT` holding an agent's command (one of `agents::BUILT_IN`), because it
+    /// needs the agent installed and signed in, and spends a turn of its model:
+    /// `POSTIL_REAL_AGENT='grok agent stdio' cargo test real_agent -- --ignored`.
+    #[test]
+    #[ignore = "needs a signed-in agent's command in POSTIL_REAL_AGENT"]
+    fn a_real_agent_answers_a_prompt() {
+        let command = std::env::var("POSTIL_REAL_AGENT").expect("POSTIL_REAL_AGENT is set");
         let (agent, events) = start_command(&command, Duration::from_secs(120)).unwrap();
         agent
             .prompt(&[text(

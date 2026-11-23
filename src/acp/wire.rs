@@ -150,10 +150,10 @@ pub(crate) enum StopReason {
     Other,
 }
 
-/// `session/cancel` params, and the session a `session/update` names.
-#[derive(Debug, Serialize, Deserialize)]
+/// `session/cancel` params.
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionParams<'a> {
+pub(crate) struct CancelParams<'a> {
     pub(crate) session_id: &'a str,
 }
 

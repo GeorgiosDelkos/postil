@@ -96,8 +96,17 @@ async function prompt(id, params) {
       const answer = permission("t1");
       await onCancel;
       say(`permission ${(await answer).result.outcome.outcome}`);
+      // A request that crosses the cancel on the wire is answered too.
+      const late = await permission("t2");
+      say(`late permission ${late.result.outcome.outcome}`);
       return send({ id, result: { stopReason: "cancelled" } });
     }
+    case "hang":
+      // Never ends the turn, and ignores the cancel.
+      return;
+    case "exit-after-turn":
+      send({ id, result: { stopReason: "end_turn" } });
+      return process.exit(0);
     case "garbage": {
       process.stdout.write("not json\n");
       send({ result: {} });
@@ -117,6 +126,9 @@ async function prompt(id, params) {
   }
 }
 
+// The silent agent says who it is, so a test can check that stopping it killed it.
+if (scenario === "silent" && extra[0]) writeFileSync(extra[0], String(process.pid));
+
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === undefined) {
@@ -125,12 +137,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   switch (message.method) {
     case "initialize":
       if (scenario === "silent") return;
+      if (scenario === "no-session-id") return initialize(message.id);
       if (scenario === "exit-on-start") {
         process.stderr.write("Please sign in: run `fake login`\n");
         return process.exit(3);
       }
       return initialize(message.id);
     case "session/new":
+      if (scenario === "no-session-id") return send({ id: message.id, result: {} });
       if (scenario === "auth") {
         return send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
       }
