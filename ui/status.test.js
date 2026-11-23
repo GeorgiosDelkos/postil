@@ -267,7 +267,7 @@ test("a run's latest review: its stages, findings, and the judge's verdict on ea
   assert.deepEqual(reviewOf("R1", [unreadable]).problems, ["R6: no block"]);
 });
 
-// `total` is set as the Rust process sets it (src/run.rs, `RunView`): a key that read it
+// `total` is set as the Rust process sets it (src/run/log.rs, `RunView`): a key that read it
 // would change on every entry.
 const streaming = (id, status, entries, extra = {}) => ({
   ...run(id, status, entries, ["N1"]),

@@ -141,7 +141,8 @@ schedule three tasks.
 | File | Holds |
 |---|---|
 | `src/main.rs` | Argument parsing; calls the library. |
-| `src/shell.rs` | The window, the webview, the URL scheme handler, the event loop. |
+| `src/shell.rs` | The window, the webview, the event loop, and the request thread that answers the page. |
+| `src/site.rs` | The API the page calls over the URL scheme (`Site`), and the page's own files. |
 | `src/app.rs` | `App` state and `App::update(Event)`. No drawing, no I/O: testable headless. |
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
@@ -155,7 +156,8 @@ schedule three tasks.
 | `scripts/bundle.sh` | Builds `target/release/Postil.app` with the icon from `assets/`. |
 | `src/acp/wire.rs` | Serde types for the ACP messages the app sends and receives. |
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
-| `src/run.rs` | Runs: the prompt, the run log, the agent kept between runs. |
+| `src/run.rs` | Runs: the prompt, the agent kept between runs. |
+| `src/run/log.rs` | The run log: a run in memory and its file on disk. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
 | `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
@@ -318,7 +320,7 @@ edits the file.
 
 ### Runs
 
-Built in `src/run.rs`, with the API the page calls:
+Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/site.rs`):
 
 | Route | Does |
 |---|---|
