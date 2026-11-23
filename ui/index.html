@@ -21,6 +21,7 @@
   </div>
   <div class="files" id="files"></div>
   <div class="sidebar-footer">
+    <button type="button" class="agent-status" id="agent-status" title="Show the run" hidden></button>
     <button type="button" class="settings-button" id="open-settings" title="Settings (⌘,)">
       <svg class="settings-glyph" viewBox="0 0 16 16" aria-hidden="true">
         <path d="M2 4.5h6M12 4.5h2M2 8h1.5M7.5 8H14M2 11.5h8M14 11.5h0"/>
@@ -43,16 +44,26 @@
     <div class="code-rows" id="code-rows"></div>
     <div class="empty" id="code-empty">Pick a file on the left.</div>
   </div>
+  <div class="prompt-preview" id="prompt-preview" tabindex="0" hidden></div>
 </main>
 
 <aside class="pane tray" aria-label="Review">
   <header class="pane-header" data-drag>
-    <div class="pane-title">Review</div>
+    <div class="tray-tabs" role="tablist" aria-label="Tray">
+      <button type="button" role="tab" class="tray-tab" id="tab-notes" aria-selected="true" aria-controls="notes">Review</button>
+      <button type="button" role="tab" class="tray-tab" id="tab-run" aria-selected="false" aria-controls="run" hidden>Run</button>
+    </div>
     <div class="meta" id="note-count">0 notes</div>
+    <div class="run-header" id="run-header" hidden></div>
   </header>
-  <div class="notes" id="notes">
+  <div class="notes" id="notes" role="tabpanel" aria-labelledby="tab-notes">
     <div class="empty">Select lines, then press <kbd>c</kbd> to write a note.</div>
   </div>
+  <div class="run" id="run" role="tabpanel" aria-labelledby="tab-run" hidden></div>
+  <footer class="send-bar" id="send-bar" hidden>
+    <button type="button" class="button agent-picker" id="agent-picker" aria-haspopup="menu"></button>
+    <button type="button" class="button primary send" id="send-button"></button>
+  </footer>
 </aside>
 
 <section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>

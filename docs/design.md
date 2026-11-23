@@ -1,8 +1,7 @@
 # Postil: design plan
 
 Status: 2026-11-23. The UI layer is decided (a system webview through wry, core in Rust).
-Milestones 0, 1, and 2 are built; milestone 3's core (the ACP client, runs and their API) is
-built, and its page is next. Section "Decisions" lists what is settled and what is still
+Milestones 0 to 3 are built. Section "Decisions" lists what is settled and what is still
 assumed.
 
 Mockups: https://claude.ai/code/artifact/68e1a720-a3d5-4d71-92d4-9acd76ea9d5e (private to the
@@ -146,6 +145,7 @@ schedule three tasks.
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables. |
 | `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
+| `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel's drawing. |
 
 ### Data structures
 
@@ -520,6 +520,16 @@ retired; the measured numbers above are the baseline to not regress.
    that line, as in GitHub's and GitLab's diff views. Not built: editing a note's text in the
    app (edit `review.json` by hand for now).
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
+   Built (section "Runs" has the core). `Cmd-Shift-Enter`, or Send under the notes, opens
+   the send step: the open notes whose lines are still there are ticked, the code pane shows
+   the prompt exactly as the agent receives it, and the agent can be changed for this send.
+   `Cmd-Shift-Enter` again sends. The tray's Run tab then shows the run, as in mockup "Run":
+   the plan, one row per tool call (its diff opens under it), permission cards answered with
+   `a`, `Shift-a` or `r`, and the agent's messages, drawn from a small Markdown subset
+   (built as elements, never parsed as HTML). `Esc` stops the run. The run takes the front
+   when it starts and when it needs the engineer, and the foot of the sidebar shows the
+   agent's state. The open file and the notes are read again when the run moves on and when
+   an edit finishes. Not built: the follow-up field under the run (milestone 4).
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
 5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at
    the owner's request (2026-11-22): the settings dialog and file, with agent detection,
@@ -544,7 +554,8 @@ retired; the measured numbers above are the baseline to not regress.
 - **App logic** is tested through `App::update` with no window: select lines, write a note, send,
   receive updates, resolve.
 - **Note anchoring** gets property tests: insert or delete lines above, inside, and below a note.
-- **The page's logic** that does not touch the document (fuzzy ranking) lives in its own module
+- **The page's logic** that does not touch the document (fuzzy ranking, the settings' rules,
+  folding a run's log, diffs, the Markdown subset) lives in its own modules
   with tests beside it, run by Node's built-in runner: `node --test ui/`. `cargo test` runs them
   too, through `tests/page_logic.rs`, so Node must be installed to run the suite.
 - **The page's look and input handling** are checked by eye. Pixel tests are not planned for
