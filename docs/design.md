@@ -220,8 +220,10 @@ As built in milestone 2 (`src/notes.rs`):
   `state` defaulting to `open`. Milestone 4's resolved state is version 3.
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
-  that run, or open when it was never sent. The tray lists resolved notes last, and the send
-  step does not tick them.
+  that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
+  naming a resolved note is refused (400), and a run that takes its turn after the note was
+  resolved leaves it resolved. The tray lists resolved notes last, and the page offers no send
+  for them.
 - **Placing a note:** it stays where its snippet still is, or moves to the only other copy of
   the snippet; with several copies and none at its last lines its anchor is lost. The nearest
   copy is not taken: short lines such as `}` repeat, and the nearest is often the wrong one.
@@ -232,8 +234,9 @@ As built in milestone 2 (`src/notes.rs`):
   with 409 and the draft stays in the composer.
 - The Rust process keeps no copy. Every `api/notes` request reads the file and places every
   note. Only a change (add, delete, resolve, reopen, marking sent) writes the file, with every
-  note at its current place; reading never writes, so the refresh on focus cannot overwrite a hand edit. A file that does not parse, has
-  another version, or repeats an id is reported with its path and never overwritten.
+  note at its current place; reading never writes, so the refresh on focus cannot overwrite a
+  hand edit. A file that does not parse, has another version, or repeats an id is reported
+  with its path and never overwritten.
 - An add holds an exclusive lock on `<git dir>/postil/review.lock` from its read to its rename,
   so two app windows on one working tree keep each other's notes. A script that edits
   `review.json` without that lock can lose an edit made during an add.

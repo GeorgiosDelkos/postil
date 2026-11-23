@@ -345,7 +345,11 @@ export function noteDialog(
       send(note, { review: event.shiftKey });
     });
     // A disabled button says why beside it, not only in a tooltip.
-    const why = sendable ? "" : "Wait for the run under way, or stop it.";
+    const why = sendable
+      ? ""
+      : isResolved(note)
+        ? "Reopen it to send it again."
+        : "Wait for the run under way, or stop it.";
     foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), resolveButton(note), button);
     return foot;
   }

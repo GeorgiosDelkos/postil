@@ -165,8 +165,10 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
 }
 
 /// Marks the note `id` resolved, saves, and returns all notes. A resolved note keeps the run
-/// it was sent in, so its dialog still shows what that run did. Resolving a resolved note
-/// changes nothing.
+/// it was sent in, so its dialog still shows what that run did. Only [`reopen`] takes a note
+/// out of this state: [`prompt`] refuses it and [`mark_sent`] leaves it. Resolving a resolved
+/// note leaves its state as it is, but saves all the same, as every write does: with every
+/// note at its current place, and the file at this version.
 ///
 /// # Errors
 ///
@@ -180,7 +182,8 @@ pub(crate) fn resolve(repo: &Repo, id: &str) -> Result<Review> {
 }
 
 /// Reopens the resolved note `id`, saves, and returns all notes: it is sent again in the run
-/// it was resolved after, or open when it was never sent. Any other note is left as it is.
+/// it was resolved after, or open when it was never sent. Any other note keeps its state; the
+/// file is saved all the same, as for [`resolve`].
 ///
 /// # Errors
 ///
@@ -221,8 +224,9 @@ fn change_state(
 ///
 /// # Errors
 ///
-/// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, or holds
-/// something that is not a note id; [`Error::NoSuchNote`] when no note has one of them.
+/// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, holds
+/// something that is not a note id, or names a resolved note (reopen it first);
+/// [`Error::NoSuchNote`] when no note has one of them.
 pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
     let wanted = parse_ids(ids)?;
     let review = current(repo)?;
@@ -238,6 +242,11 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
             .iter()
             .find(|note| note.id == *id)
             .ok_or_else(|| Error::NoSuchNote { id: id.to_string() })?;
+        if matches!(note.state, NoteState::Resolved { .. }) {
+            return Err(Error::BadRequest(format!(
+                "note {id} is resolved: reopen it to send it"
+            )));
+        }
         let LineRange { start, end } = note.lines;
         let lines = if start == end {
             start.to_string()
@@ -268,8 +277,9 @@ pub(crate) struct Prompt {
     pub(crate) files: Vec<String>,
 }
 
-/// Marks the notes `ids` sent in `run` and saves. A note deleted meanwhile is skipped: the
-/// run it went to is under way, and the engineer removed it.
+/// Marks the notes `ids` sent in `run` and saves. A note deleted or resolved meanwhile is
+/// skipped: the run it went to is under way, and the engineer's word on it is later than the
+/// send. The mark comes when the agent takes the turn, which can be seconds after the send.
 ///
 /// # Errors
 ///
@@ -281,7 +291,7 @@ pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<()> {
     let _lock = lock(&file)?;
     let mut review = current(repo)?;
     for note in &mut review.notes {
-        if wanted.contains(&note.id) {
+        if wanted.contains(&note.id) && !matches!(note.state, NoteState::Resolved { .. }) {
             note.state = NoteState::Sent {
                 run: run.to_owned(),
             };

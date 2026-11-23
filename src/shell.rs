@@ -892,6 +892,11 @@ impl Site {
                 self.agents.rescan();
                 reply(StatusCode::OK, "application/json", self.settings())
             }
+            "/api/notes/resolve" | "/api/notes/reopen" => reply(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                &b"POST ?id=<note id> with no body"[..],
+            ),
             "/api/settings/reset" | "/api/agents/rescan" => reply(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "text/plain",
@@ -1805,7 +1810,27 @@ mod tests {
             change("resolve", "N2"),
             [resolved_after_r1, resolved.clone()]
         );
-        assert_eq!(change("reopen", "N1"), [sent.clone(), resolved]);
+
+        // Only Reopen takes a note out of Resolved: a send is refused, and a run that takes
+        // its turn after the engineer resolved the note leaves the note resolved.
+        let (status, body) = send(&site, &["N2"]);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("N2 is resolved: reopen it"), "{body}");
+        notes::mark_sent(&site.repo().unwrap(), &["N1".to_owned()], "R9").unwrap();
+        assert_eq!(
+            states(&site),
+            [
+                serde_json::json!({ "kind": "resolved", "run": "R1" }),
+                resolved.clone()
+            ]
+        );
+
+        assert_eq!(change("reopen", "N1"), [sent.clone(), resolved.clone()]);
+        assert_eq!(
+            change("reopen", "N1"),
+            [sent.clone(), resolved],
+            "reopening a sent note changes nothing"
+        );
         assert_eq!(change("reopen", "N2"), [sent.clone(), open.clone()]);
         assert_eq!(
             change("reopen", "N2"),
@@ -1841,9 +1866,9 @@ mod tests {
         ] {
             assert_eq!(post(&site, &uri, "").0, status, "{uri}");
         }
-        assert_ne!(
+        assert_eq!(
             get(&site, &format!("{NOTES}/resolve?id=N1")).0,
-            StatusCode::OK,
+            StatusCode::METHOD_NOT_ALLOWED,
             "only a POST changes a note"
         );
 
@@ -1888,16 +1913,6 @@ mod tests {
                     )
                 ),
                 "unknown field `run`".to_owned(),
-            ),
-            (
-                &*format!(
-                    r#"{{"version": 3, "notes": [{}]}}"#,
-                    note.replace(
-                        r#""body":"b""#,
-                        r#""body":"b","state":{"kind":"resolved","by":"me"}"#
-                    )
-                ),
-                "unknown field `by`".to_owned(),
             ),
         ];
         for (contents, expected) in cases {

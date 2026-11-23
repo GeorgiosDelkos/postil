@@ -10,7 +10,7 @@ import { fileIcon, folderIcon } from "./icons.js";
 import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
 import { noteDialog, statusIcon } from "./note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
+import { foldRun, isLive, isOpen, isResolved, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, reviewOf, runOf } from "./status.js";
@@ -956,7 +956,8 @@ function renderNotes() {
   }
   if (state.send) {
     drawnNotes = null;
-    notesEl.replaceChildren(...state.notes.map(sendItem));
+    // A resolved note is sent only once reopened (src/notes.rs, `resolve`).
+    notesEl.replaceChildren(...state.notes.filter((note) => !isResolved(note)).map(sendItem));
     return;
   }
 
@@ -1018,7 +1019,7 @@ function cardOf(note) {
     body: note.body,
     outdated: note.anchor === "lost",
     status,
-    sendable: canSendAlone(),
+    sendable: canSendAlone() && !isResolved(note),
   };
 }
 
@@ -1195,7 +1196,7 @@ const noteDetail = noteDialog(noteDialogEl, {
     const note = state.notes.find((candidate) => candidate.id === id);
     return note ? { note, run: runFor(note) } : null;
   },
-  canSend: () => canSendAlone(),
+  canSend: (note) => canSendAlone() && !isResolved(note),
   agent: () => state.settings?.agent ?? null,
   showInCode: showNote,
   send: sendAlone,
