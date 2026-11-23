@@ -1,6 +1,7 @@
 /* The look of the app. Two palettes as custom properties: Graphite (dark, the default) and
    Paper (light), chosen by the system appearance. Every color in the rules below is a
-   variable, so a third theme is a new block of variables and nothing else. */
+   variable, so a third theme is a new block of variables and nothing else (ui/app-css.test.js
+   checks it). */
 
 @font-face {
   font-family: "Geist";
@@ -34,7 +35,17 @@
   --hover: #23262d;
   --border: #272a31;
   --border-strong: #3a4352;
+  /* Shadows: of a panel (the composer, dialogs, the toast), of the right-click menu, of a
+     small floating control (the focus pill), and of the switch's knob. */
   --shadow: 0 10px 30px rgb(0 0 0 / 35%);
+  --shadow-menu:
+    0 0 0 0.5px rgb(0 0 0 / 25%),
+    0 12px 32px rgb(0 0 0 / 30%);
+  --shadow-small: 0 4px 14px rgb(0 0 0 / 25%);
+  --knob-shadow: 0 1px 2px rgb(0 0 0 / 30%);
+  /* What dims the page behind a dialog. */
+  --scrim: rgb(0 0 0 / 35%);
+  --knob: #ffffff;
 
   --text: #d4d6db;
   --text-strong: #e6e7ea;
@@ -44,6 +55,8 @@
 
   --accent: #9db4d6;
   --accent-text: #12151a;
+  /* A line drawn over the accent fill: a key hint's border, the split button's divider. */
+  --line-on-accent: rgb(0 0 0 / 25%);
   --selection: rgb(157 180 214 / 11%);
   --note: #e2c08d;
   --note-wash: rgb(226 192 141 / 7%);
@@ -90,7 +103,16 @@
     --hover: #e4e4df;
     --border: #e2e2dd;
     --border-strong: #c9c9c2;
+    /* Paper's shadows and scrim take --shadow's warm grey at a lower strength than
+       Graphite's black, which is heavy on a light page. */
     --shadow: 0 10px 30px rgb(30 30 20 / 14%);
+    --shadow-menu:
+      0 0 0 0.5px rgb(30 30 20 / 16%),
+      0 12px 32px rgb(30 30 20 / 16%);
+    --shadow-small: 0 4px 14px rgb(30 30 20 / 12%);
+    --knob-shadow: 0 1px 2px rgb(30 30 20 / 25%);
+    --scrim: rgb(30 30 20 / 18%);
+    --knob: #ffffff;
 
     --text: #25272c;
     --text-strong: #111214;
@@ -100,6 +122,8 @@
 
     --accent: #2f5fa8;
     --accent-text: #ffffff;
+    /* Paper's accent is dark, so the line over it is light, as its text is. */
+    --line-on-accent: rgb(255 255 255 / 35%);
     --selection: rgb(47 95 168 / 10%);
     --note: #855600;
     --note-wash: rgb(160 110 10 / 8%);
@@ -719,9 +743,7 @@ kbd {
   -webkit-backdrop-filter: blur(24px) saturate(1.6);
   border: 0.5px solid var(--border-strong);
   border-radius: 10px;
-  box-shadow:
-    0 0 0 0.5px rgb(0 0 0 / 25%),
-    0 12px 32px rgb(0 0 0 / 30%);
+  box-shadow: var(--shadow-menu);
 }
 
 .menu-item {
@@ -1088,7 +1110,7 @@ button.repo-name:hover {
 }
 
 .settings::backdrop {
-  background: rgb(0 0 0 / 30%);
+  background: var(--scrim);
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
 }
@@ -1330,9 +1352,9 @@ button.repo-name:hover {
   left: 2px;
   width: 16px;
   height: 16px;
-  background: #ffffff;
+  background: var(--knob);
   border-radius: 50%;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 30%);
+  box-shadow: var(--knob-shadow);
   transition: transform 120ms ease;
 }
 
@@ -1627,7 +1649,7 @@ button.repo-name:hover {
 }
 
 .send-bar .send kbd {
-  border-color: rgb(0 0 0 / 25%);
+  border-color: var(--line-on-accent);
   color: inherit;
   font-weight: 400;
 }
@@ -1636,7 +1658,7 @@ button.repo-name:hover {
   flex: none;
   width: 34px;
   padding: 0;
-  border-left-color: rgb(0 0 0 / 25%);
+  border-left-color: var(--line-on-accent);
   border-radius: 0 7px 7px 0;
 }
 
@@ -2351,7 +2373,7 @@ body.resizing * {
 }
 
 .note-dialog::backdrop {
-  background: rgb(0 0 0 / 35%);
+  background: var(--scrim);
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
 }
@@ -3002,7 +3024,7 @@ body.focus-mode .code {
   color: var(--text);
   font: inherit;
   font-size: 12.5px;
-  box-shadow: 0 4px 14px rgb(0 0 0 / 25%);
+  box-shadow: var(--shadow-small);
   cursor: pointer;
 }
 
