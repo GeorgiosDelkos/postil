@@ -306,6 +306,7 @@ Built in `src/run.rs`, with the API the page calls:
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
 | `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
 | `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
+| `GET /api/runs` | The ids of the runs on disk, newest first. |
 | `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered. |
 | `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
 
@@ -379,21 +380,19 @@ view on 2026-11-23.
 
 ### The Run tab
 
-The Run tab (`ui/run-panel.js`) is a column of small cards, each opening a dialog, so the
-tray stays short however long the run (board 12 on the design canvas, chosen by the owner on
-2026-11-23 over a long scrolling transcript):
+The Run tab (`ui/run-panel.js`) lists the runs, newest first, one card each: the status's
+icon, the run id, the agent, the notes sent, and the status (`GET /api/runs` gives the ids).
+A card opens the run's dialog, which holds everything about it: the plan, one card per note
+(it opens the note's detail), one card per step (it opens the step whole: its command, diffs
+and output, with the arrow keys or ‹ › to move between steps and the run's id to go back),
+and the agent's whole reply. Nothing of a run but its card is in the tab: the owner asked on
+2026-11-23 for the steps and the reply to live in each run's dialog. An open permission
+request is the one exception, above the runs, as it needs an answer now. The tray header
+shows the latest run's status, its time and Stop while it runs.
 
-- **Header:** the status's icon and word, the run id, the agent, and while live its time and
-  Stop.
-- **Top to bottom:** an open permission request (inline: it needs an answer now), the plan
-  (progress bar and the step it is at), one card per note sent (its status, or the agent's line
-  about it; it opens the note detail), one card for the steps (how many, and the latest; it
-  opens the list of every step, asked by the owner on 2026-11-23), and the agent's reply (one
-  line).
-- **The detail dialog** shows the list of steps, a step whole (its command, diffs and output;
-  the arrow keys or ‹ › move to the steps beside it, and All steps goes back to the list), the
-  whole reply, or every plan step. It is drawn again only
-  when what it shows changes, so it keeps its scroll while the run streams.
+Older runs are read once each by id and kept in the panel, which the notes' statuses read
+too (`byId`): a finished run does not change. The dialog is drawn again only when what it
+shows changes, so it keeps its scroll while the run streams.
 
 ### Agents
 

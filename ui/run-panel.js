@@ -1,9 +1,13 @@
-// The run panel: the tray's Run tab and the agent status at the foot of the sidebar. It
-// fetches the latest run from `api/run` and draws it; ui/run.js has the rules.
+// The run panel: the tray's Run tab and the agent status at the foot of the sidebar. The tab
+// lists the runs, one small card each, newest first; a card opens the run's dialog, which
+// holds everything about it: its plan, its notes, every step, and the agent's reply
+// (docs/design.md, "The Run tab"). ui/run.js has the rules.
 //
-// The Rust process calls `window.postil.runChanged()` whenever the run changes; the panel
-// then fetches the entries it has not seen. Fetches never overlap: a change that arrives
-// during one is fetched right after it.
+// The panel follows the latest run: the Rust process calls `window.postil.runChanged()`
+// whenever it changes, and the panel fetches the entries it has not seen. Fetches never
+// overlap: a change that arrives during one is fetched right after it. Older runs are read
+// once each, by id, and kept: a finished run does not change. The page's notes read their
+// runs through the same store (`byId`).
 
 import {
   elapsed,
@@ -31,34 +35,60 @@ function el(tag, className, text) {
   return node;
 }
 
-// `noteOf(id)` gives a note by id, or null once it is deleted; `openNote(id)` opens its
-// detail. `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
-// sidebar's agent status. `onChange(run, previous)` is called after every fetch that
-// changed the run, so the page can follow it (switch tabs, re-read files).
-// `detailEl` is the `<dialog>` a card opens; `openFile(path)` shows a file in the code pane.
+// A run's status as a status icon's kind (note-dialog.js, `statusIcon`).
+function iconKind(run) {
+  const { tone } = statusLine(run);
+  return { busy: "working", attention: "needs", done: "addressed", failed: "failed" }[tone] ?? "stopped";
+}
+
+// A run's status in a word or two: statusLine's text, short enough for a card.
+function statusWord(run) {
+  return run.status === "unfinished" ? "Unfinished" : statusLine(run).text;
+}
+
+// `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
+// sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous)` is
+// called after every fetch that changed the latest run, so the page can follow it (switch
+// tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
+// by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
+// file in the code pane.
 export function runPanel({
   panelEl,
   headerEl,
   statusEl,
   detailEl,
   onChange,
+  onLoaded,
   onError,
   noteOf,
   openNote,
   openFile,
 }) {
+  // The latest run, followed as it changes.
   let run = null;
   let fetching = false;
   let again = false;
+  // How long to wait before fetching again after a failed fetch: doubled each failure.
+  let retryIn = 1000;
+  // Every run's id, newest first (`api/runs`), read again when the latest run changes or a
+  // run may have been deleted (`reload`).
+  let ids = [];
+  let listStale = true;
+  // Older runs by id, and the ids asked for and not answered yet, or that failed: not asked
+  // again until `reload` or `forget`.
+  const others = new Map();
+  const asked = new Set();
+
   let clock = null;
   // When Stop starts to end the agent, by this page's clock; null unless it is stopping.
   let forceAt = null;
-  // The drawn items by key, each with the signature it was drawn from: an item whose
-  // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
+  // The drawn cards by key, each with the signature it was drawn from: a card whose
+  // signature is unchanged keeps its node.
   let views = new Map();
   let drawnRun = null;
-  // What the detail dialog shows while open: `{ kind: "steps" }`, `{ kind: "step", key }`,
-  // `{ kind: "reply" }` or `{ kind: "plan" }`; and what it was drawn from, to draw it again only when that changes.
+
+  // What the dialog shows while open: `{ kind: "run", id }` or `{ kind: "step", id, key }`;
+  // and what it was drawn from, to draw it again only when that changes.
   let detail = null;
   let detailDrawn = null;
   detailEl.addEventListener("close", () => {
@@ -71,19 +101,6 @@ export function runPanel({
       event.preventDefault();
       moveStep(event.key === "ArrowLeft" ? -1 : 1);
     }
-  });
-  // Whether the panel follows the end of the run: true until the engineer scrolls up, and
-  // again once they scroll back to the end. Scrolling up is read as any move above where
-  // `reveal` last put the panel, not as a distance from the end: a slow trackpad scroll moves
-  // a few px at a time, and a render between two of its events would scroll it back down.
-  let follow = true;
-  let revealedTop = 0;
-  // How long to wait before fetching again after a failed fetch: doubled each failure.
-  let retryIn = 1000;
-  panelEl.addEventListener("scroll", () => {
-    if (panelEl.clientHeight === 0) return;
-    if (atEnd()) follow = true;
-    else if (panelEl.scrollTop < revealedTop) follow = false;
   });
 
   async function fetchRun() {
@@ -100,6 +117,13 @@ export function runPanel({
     return whole.json();
   }
 
+  async function fetchIds() {
+    const response = await fetch("api/runs");
+    if (!response.ok) throw new Error(await response.text());
+    ids = (await response.json()).runs;
+    listStale = false;
+  }
+
   async function sync() {
     if (fetching) {
       again = true;
@@ -111,8 +135,9 @@ export function runPanel({
         again = false;
         const previous = run;
         const next = await fetchRun();
-        if (next === null && previous === null) continue;
+        if (next === null && previous === null && !listStale) continue;
         run = next;
+        if (listStale || previous?.id !== run?.id) await fetchIds();
         render();
         onChange(run, previous);
       } while (again);
@@ -126,6 +151,45 @@ export function runPanel({
     } finally {
       fetching = false;
     }
+  }
+
+  // The run `id`: the latest, or an older one once read; null until then, and a read is
+  // started. A run that comes back still going (another window's) is kept until `forget`:
+  // asking again on every draw would fetch it in a loop.
+  function byId(id) {
+    if (run?.id === id) return run;
+    const known = others.get(id);
+    if (known || asked.has(id)) return known ?? null;
+    asked.add(id);
+    fetch(`api/run?id=${encodeURIComponent(id)}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        others.set(id, await response.json());
+        render();
+        onLoaded();
+      })
+      // The run's card stays "loading" and its notes say "Sent in R2": the tray stays usable.
+      .catch((error) => console.warn(`run ${id}:`, error));
+    return null;
+  }
+
+  // Drops the older runs read while still going, and reads the list again: the page's
+  // refresh, when another window may have moved on.
+  function forget() {
+    for (const [id, view] of others) {
+      if (!isLive(view)) continue;
+      others.delete(id);
+      asked.delete(id);
+    }
+    listStale = true;
+  }
+
+  // Drops every run read, after a note's delete may have deleted runs, and fetches again.
+  function reload() {
+    others.clear();
+    asked.clear();
+    listStale = true;
+    return sync();
   }
 
   async function post(route, body) {
@@ -166,55 +230,36 @@ export function runPanel({
     return true;
   }
 
+  // ---- The tab: one card per run ----------------------------------------------------------
+
   function render() {
     if (drawnRun !== (run?.id ?? null)) {
-      views = new Map();
       drawnRun = run?.id ?? null;
-      follow = true;
       forceAt = null;
-      if (detailEl.open) detailEl.close();
     }
     renderStatus();
     renderHeader();
-    if (!run) {
+    const list = ids.length ? ids : run ? [run.id] : [];
+    if (list.length === 0) {
+      views = new Map();
       panelEl.replaceChildren(el("div", "empty", "No run yet. Send notes to an agent to start one."));
+      closeIfGone(list);
       return;
     }
-    // Top to bottom: what needs the engineer, the plan, each note's result, the steps, and the
-    // agent's reply, each a card of one line that opens the detail dialog (docs/design.md,
-    // "The Run tab").
-    const { plan, items } = foldRun(run.entries);
-    const live = isLive(run);
-    const asking = items.filter((item) => item.type === "permission" && item.answer === undefined);
-    const steps = stepsOf(items);
-    const messages = items.filter((item) => item.type === "message");
     const wanted = [];
-    // Which run this is, and its agent: the tray header has room only for the status.
-    const started = new Date(run.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const about = `${run.id} · ${run.agent} · started ${started}`;
-    wanted.push(["about", about, () => el("div", "run-about", about)]);
-
-    for (const item of asking) {
-      wanted.push([itemKey(item, items.indexOf(item)), signature(item, live), () => permissionView(item)]);
+    // A permission request needs an answer now, so it shows above the runs.
+    if (isLive(run)) {
+      for (const item of foldRun(run.entries).items) {
+        if (item.type !== "permission" || item.answer !== undefined) continue;
+        wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
+      }
     }
-    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), () => planCard(plan)]);
-
-    const cards = run.notes.map((id) => noteCard(id));
-    wanted.push(["notes", JSON.stringify(cards), () => notesView(cards)]);
-
-    // The steps are one card, the latest step: the list and each step are in the dialog.
-    if (steps.length) {
-      const last = steps.at(-1);
-      const sig = JSON.stringify([steps.length, last.key, signature(last.item, live)]);
-      wanted.push(["steps", sig, () => stepsCard(steps.length, last)]);
-    }
-    if (messages.length) {
-      const text = messages.map((message) => message.text.trim()).join("\n\n");
-      wanted.push(["reply", JSON.stringify([text, live]), () => replyCard(text, live)]);
-    }
-    if (run.problem) wanted.push(["problem", run.problem, () => el("div", "run-notice", run.problem)]);
-    if (wanted.length === 0) {
-      wanted.push(["empty", statusLine(run).text, () => el("div", "empty", statusLine(run).text)]);
+    const label = list.length === 1 ? "Run" : `Runs · ${list.length}`;
+    wanted.push(["label", label, () => el("div", "run-label", label)]);
+    for (const id of list) {
+      const view = byId(id);
+      const sig = view ? JSON.stringify([view.status, view.agent, view.notes, statusWord(view)]) : "loading";
+      wanted.push([`run:${id}`, sig, () => runCard(id, view)]);
     }
 
     const next = new Map();
@@ -225,53 +270,34 @@ export function runPanel({
       return node;
     });
     views = next;
-    // Only nodes out of place move; the rest, the top of a long run, are left untouched.
+    // Only nodes out of place move.
     nodes.forEach((node, index) => {
       if (panelEl.childNodes[index] !== node) panelEl.insertBefore(node, panelEl.childNodes[index] ?? null);
     });
     while (panelEl.childNodes.length > nodes.length) panelEl.lastChild.remove();
-    reveal();
+    closeIfGone(list);
     drawDetail();
   }
 
-  // The run's steps in order, each with its key: every item but the agent's messages and an
-  // open permission request, which shows above.
-  function stepsOf(items) {
-    return items
-      .map((item, index) => ({ item, key: itemKey(item, index) }))
-      .filter(({ item }) => item.type !== "message" && !(item.type === "permission" && item.answer === undefined));
-  }
-
-  // Scrolls to the end while the panel follows it. Measured only while the panel shows: a
-  // hidden panel has no height, and would read as both at the end and scrolled to the top.
-  function reveal() {
-    if (!follow || panelEl.clientHeight === 0) return;
-    panelEl.scrollTop = panelEl.scrollHeight;
-    revealedTop = panelEl.scrollTop;
-  }
-
-  function atEnd() {
-    return panelEl.scrollHeight - panelEl.scrollTop - panelEl.clientHeight < 24;
-  }
-
-  function itemKey(item, index) {
-    if (item.type === "tool") return `tool:${item.id}`;
-    if (item.type === "permission") return `permission:${item.request}`;
-    return `${item.type}:${index}`;
-  }
-
-  // What an item's node is drawn from: when this is unchanged, so is the node.
-  function signature(item, live) {
-    switch (item.type) {
-      case "tool":
-        // `live` only changes how a call still under way is drawn, so a run's end leaves the
-        // finished ones alone.
-        return JSON.stringify(toolRow(item, live && underWay(item)));
-      case "permission":
-        return JSON.stringify([item.title, item.answer ?? "open"]);
-      default:
-        return item.text;
+  // A run's card: its status, id, agent and notes, in one line.
+  function runCard(id, view) {
+    const button = el("button", "run-card run-entry");
+    button.type = "button";
+    if (!view) {
+      button.disabled = true;
+      button.append(statusIcon("stopped"), el("span", "run-id", id), el("span", "run-card-text", "Loading…"));
+      return button;
     }
+    button.append(
+      statusIcon(iconKind(view)),
+      el("span", "run-id", view.id),
+      el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}`),
+      el("span", `run-entry-status ${statusLine(view).tone}`, statusWord(view)),
+      el("span", "run-chevron", "›"),
+    );
+    button.title = `${view.id} · ${view.agent} · ${statusLine(view).text}`;
+    button.addEventListener("click", () => openDetail({ kind: "run", id }));
+    return button;
   }
 
   function renderStatus() {
@@ -283,6 +309,7 @@ export function runPanel({
     statusEl.replaceChildren(dot, el("span", "status-text", `${run.agent} · ${text}`));
   }
 
+  // The tray header: the latest run's status and, while it runs, its time and Stop.
   function renderHeader() {
     clearInterval(clock);
     clock = null;
@@ -290,22 +317,15 @@ export function runPanel({
       headerEl.replaceChildren();
       return;
     }
-    // The status's icon and word, then the run, its agent and, while it runs, its time.
     const { text, tone } = statusLine(run);
-    const word = run.status === "unfinished" ? "Unfinished" : text;
-    const kind = { busy: "working", attention: "needs", done: "addressed", failed: "failed" }[tone];
     const title = el("span", "run-title");
-    title.title = text;
+    title.title = `${run.id} · ${run.agent} · ${text}`;
     const time = el("span", "run-time");
     const tick = () => {
       if (isLive(run)) time.textContent = ` · ${elapsed(Date.now() / 1000 - run.startedAt)}`;
     };
     tick();
-    title.append(
-      statusIcon(kind ?? "stopped"),
-      el("strong", `run-word ${tone}`, word),
-      time,
-    );
+    title.append(statusIcon(iconKind(run)), el("strong", `run-word ${tone}`, statusWord(run)), time);
     const parts = [title];
     if (!isLive(run) || run.status !== "cancelling") forceAt = null;
     if (isLive(run)) {
@@ -331,121 +351,7 @@ export function runPanel({
     headerEl.replaceChildren(...parts);
   }
 
-  // A note sent in the run: its status in this run and the agent's line about it.
-  function noteCard(id) {
-    const note = noteOf(id);
-    if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle" };
-    const { start, end } = note.lines;
-    const where = `${note.path.split("/").at(-1)}:${start === end ? start : `${start}-${end}`}`;
-    const status = noteStatus(note, run);
-    return { id, where, ...status };
-  }
-
-  function notesView(cards) {
-    const view = el("section", "run-notes");
-    const addressed = cards.filter((card) => card.kind === "addressed").length;
-    const label = el("div", "run-label");
-    label.append(
-      el("span", "", cards.length === 1 ? "Note" : `Notes · ${cards.length}`),
-      el("span", "", addressed ? `${addressed} addressed` : ""),
-    );
-    view.append(label);
-    for (const card of cards) {
-      const button = el("button", `run-card ${card.kind}`);
-      button.type = "button";
-      // Its status only: what the agent said is in the note's detail.
-      button.append(
-        statusIcon(card.kind),
-        el("span", `run-card-text run-note-status ${card.tone}`, card.label),
-        el("span", "run-note-where", card.where),
-        el("span", "note-id", card.id),
-      );
-      button.addEventListener("click", () => openNote(card.id));
-      view.append(button);
-    }
-    return view;
-  }
-
-  // The steps' card: how many, and the latest, which opens the list of them all.
-  function stepsCard(count, last) {
-    const view = el("section", "run-steps");
-    view.append(el("div", "run-label", count === 1 ? "Step" : `Steps · ${count}`));
-    view.append(stepCard(last.item, () => openDetail({ kind: "steps" })));
-    return view;
-  }
-
-  // A card: a button of one line (or a few, for the reply) that opens the detail dialog.
-  function card(className, parts, open) {
-    const button = el("button", `run-card ${className}`);
-    button.type = "button";
-    button.append(...parts, el("span", "run-chevron", "›"));
-    button.addEventListener("click", open);
-    return button;
-  }
-
-  function replyCard(text, live) {
-    const view = el("section", "run-reply");
-    view.append(el("div", "run-label", live ? `${run.agent} is writing` : `${run.agent}'s reply`));
-    const preview = el("span", "run-card-text run-reply-preview", text.replace(/\s+/g, " "));
-    view.append(card("reply", [preview], () => openDetail({ kind: "reply" })));
-    return view;
-  }
-
-  function planCard(plan) {
-    const view = el("section", "run-plan");
-    const progress = planProgress(run);
-    view.append(el("div", "run-label", `Plan · ${progress.done} of ${progress.total}`));
-    const bar = el("span", "run-progress");
-    const fill = el("span", "run-progress-fill");
-    fill.style.width = `${(100 * progress.done) / progress.total}%`;
-    bar.append(fill);
-    // The step under way, else the next to do, else the last: what the plan is at.
-    const at =
-      plan.find((step) => step.status === "in_progress") ??
-      plan.find((step) => step.status === "pending") ??
-      plan.at(-1);
-    const body = el("span", "run-plan-body");
-    body.append(bar, el("span", "run-card-text", at.content));
-    view.append(card("plan", [body], () => openDetail({ kind: "plan" })));
-    return view;
-  }
-
-  // `open` runs on a click: the step's own detail, or for the steps' card the list.
-  function stepCard(item, open) {
-    switch (item.type) {
-      case "tool": {
-        const row = toolRow(item, isLive(run));
-        const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
-        const state = row.running ? statusIcon("working") : el("span", `tool-state${tone}`, row.state);
-        const node = card(`step${row.running ? " running" : ""}`, [
-          el("span", "tool-verb", row.verb),
-          el("span", "run-card-text tool-target", row.target),
-          state,
-        ], open);
-        node.title = item.title;
-        return node;
-      }
-      case "thought":
-        return card("step", [
-          el("span", "tool-verb", "think"),
-          el("span", "run-card-text run-thought-preview", item.text.trim().replace(/\s+/g, " ")),
-        ], open);
-      case "permission": {
-        const chosen = item.options.find((option) => option.id === item.answer);
-        return card("step", [
-          el("span", "tool-verb", "ask"),
-          el("span", "run-card-text", item.title),
-          el("span", "tool-state", chosen ? chosen.name : "cancelled"),
-        ], open);
-      }
-      case "error":
-        return el("div", "run-error", item.text);
-      default:
-        return el("div", "run-notice", item.text);
-    }
-  }
-
-  // ---- The detail dialog --------------------------------------------------------------
+  // ---- The dialog: a run whole, or one of its steps -----------------------------------------
 
   function openDetail(what) {
     detail = what;
@@ -455,53 +361,63 @@ export function runPanel({
       detailEl.showModal();
       detailEl.focus();
     }
-    // The list opens at its end: the latest step is the one being watched.
-    if (what.kind === "steps") {
-      const body = detailEl.querySelector(".note-dialog-body");
-      body.scrollTop = body.scrollHeight;
-    }
   }
 
-  // Draws the dialog again when what it shows changed: a step's state or output, the reply's
-  // text, the plan. Its scroll is kept otherwise, while the run streams.
+  // A run deleted while its dialog is open closes the dialog.
+  function closeIfGone(list) {
+    if (detail && !list.includes(detail.id)) detailEl.close();
+  }
+
+  // The run's steps in order, each with its key: every item but the agent's messages and an
+  // open permission request, which shows above the runs.
+  function stepsOf(items) {
+    return items
+      .map((item, index) => ({ item, key: itemKey(item, index) }))
+      .filter(({ item }) => item.type !== "message" && !(item.type === "permission" && item.answer === undefined));
+  }
+
+  function itemKey(item, index) {
+    if (item.type === "tool") return `tool:${item.id}`;
+    if (item.type === "permission") return `permission:${item.request}`;
+    return `${item.type}:${index}`;
+  }
+
+  // Draws the dialog again when what it shows changed, and keeps its scroll otherwise, while
+  // the run streams.
   function drawDetail() {
-    if (!detail || !run) return;
-    const { plan, items } = foldRun(run.entries);
-    const steps = stepsOf(items);
+    if (!detail) return;
+    const view = byId(detail.id);
+    if (!view) return;
+    const steps = stepsOf(foldRun(view.entries).items);
     let stamp;
     let draw;
-    if (detail.kind === "steps") {
-      stamp = ["steps", JSON.stringify(steps.map(({ item, key }) => [key, signature(item, isLive(run))]))];
-      draw = () => stepsDetail(steps);
-    } else if (detail.kind === "step") {
+    if (detail.kind === "run") {
+      const notes = view.notes.map((id) => noteLine(id, view));
+      stamp = [`run:${view.id}`, view.status, view.total, JSON.stringify(notes)];
+      draw = () => runDetail(view, steps, notes);
+    } else {
       const index = steps.findIndex((step) => step.key === detail.key);
       if (index < 0) return;
       const { item } = steps[index];
-      stamp = [detail.key, item.status, item.output, item.text, item.answer, isLive(run)];
-      draw = () => stepDetail(item, index, steps.length);
-    } else if (detail.kind === "reply") {
-      const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
-      stamp = ["reply", text];
-      draw = () => replyDetail(text);
-    } else {
-      stamp = ["plan", JSON.stringify(plan)];
-      draw = () => planDetail(plan ?? []);
+      stamp = [`${view.id}:${detail.key}`, item.status, item.output, item.text, item.answer, isLive(view)];
+      draw = () => stepDetail(view, item, index, steps.length);
     }
     if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) return;
     detailDrawn = stamp;
     const scroll = detailEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
-    const sameItem = detailEl.dataset.shown === stamp[0];
+    const same = detailEl.dataset.shown === stamp[0];
     detailEl.dataset.shown = stamp[0];
     detailEl.replaceChildren(...draw());
     const body = detailEl.querySelector(".note-dialog-body");
-    if (body && sameItem) body.scrollTop = scroll;
+    if (body && same) body.scrollTop = scroll;
   }
 
   function moveStep(by) {
-    const steps = stepsOf(foldRun(run.entries).items);
-    const index = steps.findIndex((step) => step.key === detail.key);
-    const next = steps[index + by];
-    if (next) openDetail({ kind: "step", key: next.key });
+    const view = byId(detail.id);
+    if (!view) return;
+    const steps = stepsOf(foldRun(view.entries).items);
+    const next = steps[steps.findIndex((step) => step.key === detail.key) + by];
+    if (next) openDetail({ kind: "step", id: detail.id, key: next.key });
   }
 
   function detailHeader(icon, title, extra, actions = []) {
@@ -518,21 +434,124 @@ export function runPanel({
     return head;
   }
 
-  // Every step, one card each, the latest last; a card opens that step.
-  function stepsDetail(steps) {
-    const body = el("div", "note-dialog-body run-steps-list");
-    for (const { item, key } of steps) body.append(stepCard(item, () => openDetail({ kind: "step", key })));
-    const live = isLive(run);
-    return [detailHeader(null, `Steps · ${steps.length}`, `${run.id} · ${run.agent}${live ? " · under way" : ""}`), body];
+  function section(label, ...content) {
+    const part = el("section", "note-dialog-section");
+    part.append(el("div", "note-dialog-label", label), ...content);
+    return part;
   }
 
-  function stepDetail(item, index, count) {
+  // A note sent in the run: its status in this run, its place and id.
+  function noteLine(id, view) {
+    const note = noteOf(id);
+    if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle" };
+    const { start, end } = note.lines;
+    const where = `${note.path.split("/").at(-1)}:${start === end ? start : `${start}-${end}`}`;
+    return { id, where, ...noteStatus(note, view) };
+  }
+
+  // The run whole: its plan, its notes, every step, and the agent's reply.
+  function runDetail(view, steps, notes) {
+    const live = isLive(view);
+    const body = el("div", "note-dialog-body");
+    const { plan, items } = foldRun(view.entries);
+
+    if (plan?.length) {
+      const progress = planProgress(view);
+      const rows = el("div", "run-plan-rows");
+      for (const step of plan) {
+        const row = el("div", `plan-step ${step.status}`);
+        const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
+        mark.setAttribute("aria-hidden", "true");
+        row.append(mark, el("span", "", step.content));
+        rows.append(row);
+      }
+      body.append(section(`Plan · ${progress.done} of ${progress.total}`, rows));
+    }
+
+    const noteCards = el("div", "run-cards");
+    for (const card of notes) {
+      const button = el("button", `run-card ${card.kind}`);
+      button.type = "button";
+      button.append(
+        statusIcon(card.kind),
+        el("span", `run-card-text run-note-status ${card.tone}`, card.label),
+        el("span", "run-note-where", card.where),
+        el("span", "note-id", card.id),
+      );
+      button.disabled = card.label === "Deleted";
+      button.addEventListener("click", () => {
+        detailEl.close();
+        openNote(card.id);
+      });
+      noteCards.append(button);
+    }
+    body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+
+    if (steps.length) {
+      const stepCards = el("div", "run-cards");
+      for (const { item, key } of steps) {
+        stepCards.append(stepCard(view, item, () => openDetail({ kind: "step", id: view.id, key })));
+      }
+      body.append(section(`Steps · ${steps.length}`, stepCards));
+    }
+
+    const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
+    if (text) body.append(section(live ? `${view.agent} is writing` : `${view.agent}'s reply`, markdownView(text)));
+    if (view.problem) body.append(el("div", "run-notice", view.problem));
+
+    const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const when = live ? elapsed(Date.now() / 1000 - view.startedAt) : `started ${started}`;
+    return [
+      detailHeader(statusIcon(iconKind(view)), `${view.id} · ${view.agent}`, `${statusWord(view)} · ${when}`),
+      body,
+    ];
+  }
+
+  // A step's card: what it did and how it went, in one line.
+  function stepCard(view, item, open) {
+    const card = (parts) => {
+      const button = el("button", "run-card step");
+      button.type = "button";
+      button.append(...parts, el("span", "run-chevron", "›"));
+      button.addEventListener("click", open);
+      return button;
+    };
+    switch (item.type) {
+      case "tool": {
+        const row = toolRow(item, isLive(view));
+        const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
+        const state = row.running ? statusIcon("working") : el("span", `tool-state${tone}`, row.state);
+        const node = card([el("span", "tool-verb", row.verb), el("span", "run-card-text tool-target", row.target), state]);
+        node.title = item.title;
+        return node;
+      }
+      case "thought":
+        return card([
+          el("span", "tool-verb", "think"),
+          el("span", "run-card-text run-thought-preview", item.text.trim().replace(/\s+/g, " ")),
+        ]);
+      case "permission": {
+        const chosen = item.options.find((option) => option.id === item.answer);
+        return card([
+          el("span", "tool-verb", "ask"),
+          el("span", "run-card-text", item.title),
+          el("span", "tool-state", chosen ? chosen.name : "cancelled"),
+        ]);
+      }
+      case "error":
+        return el("div", "run-error", item.text);
+      default:
+        return el("div", "run-notice", item.text);
+    }
+  }
+
+  function stepDetail(view, item, index, count) {
     const body = el("div", "note-dialog-body");
     const nav = el("div", "run-detail-nav");
-    const all = el("button", "button", "‹ All steps");
-    all.type = "button";
-    all.addEventListener("click", () => openDetail({ kind: "steps" }));
-    nav.append(all);
+    const back = el("button", "button", `‹ ${view.id}`);
+    back.type = "button";
+    back.setAttribute("aria-label", `Back to ${view.id}`);
+    back.addEventListener("click", () => openDetail({ kind: "run", id: view.id }));
     const previous = el("button", "button", "‹");
     previous.type = "button";
     previous.setAttribute("aria-label", "The step before");
@@ -543,19 +562,19 @@ export function runPanel({
     following.setAttribute("aria-label", "The step after");
     following.disabled = index === count - 1;
     following.addEventListener("click", () => moveStep(1));
-    nav.append(el("span", "", `Step ${index + 1} of ${count} · ← → to move`), previous, following);
+    nav.append(back, el("span", "", `Step ${index + 1} of ${count} · ← → to move`), previous, following);
     body.append(nav);
 
     if (item.type === "thought") {
       body.append(el("div", "run-detail-text", item.text.trim()));
-      return [detailHeader(null, "Thinking", run.id), body];
+      return [detailHeader(null, "Thinking", view.id), body];
     }
     if (item.type === "permission") {
       const chosen = item.options.find((option) => option.id === item.answer);
       body.append(el("div", "run-detail-text", `Answered: ${chosen ? chosen.name : "cancelled"}`));
-      return [detailHeader(null, item.title, run.id), body];
+      return [detailHeader(null, item.title, view.id), body];
     }
-    const row = toolRow(item, isLive(run));
+    const row = toolRow(item, isLive(view));
     const kind = item.status === "failed" ? "failed" : row.running ? "working" : "addressed";
     const actions = [];
     const path = item.places[0]?.path ?? item.output.find((part) => part.type === "diff")?.path;
@@ -572,36 +591,13 @@ export function runPanel({
     const onFile = ["read", "edit", "delete", "move"].includes(item.tool);
     if (!onFile) body.append(el("pre", "run-detail-command", item.title));
     for (const part of item.output) {
-      if (part.type === "diff") {
-        // Each diff under its file's name, close to it.
-        const block = el("section", "note-dialog-section");
-        block.append(el("div", "note-dialog-label", part.path), diffView(part));
-        body.append(block);
-      } else body.append(el("pre", "tool-output", part.text));
+      if (part.type === "diff") body.append(section(part.path, diffView(part)));
+      else body.append(el("pre", "tool-output", part.text));
     }
     if (item.output.length === 0) {
       body.append(el("div", "run-detail-text muted", row.running ? "Under way…" : "No output."));
     }
     return [detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions), body];
-  }
-
-  function replyDetail(text) {
-    const body = el("div", "note-dialog-body");
-    body.append(markdownView(text));
-    return [detailHeader(null, isLive(run) ? `${run.agent} is writing` : `${run.agent}'s reply`, run.id), body];
-  }
-
-  function planDetail(plan) {
-    const body = el("div", "note-dialog-body");
-    for (const step of plan) {
-      const row = el("div", `plan-step ${step.status}`);
-      const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
-      mark.setAttribute("aria-hidden", "true");
-      row.append(mark, el("span", "", step.content));
-      body.append(row);
-    }
-    const progress = planProgress(run);
-    return [detailHeader(null, "Plan", progress ? `${progress.done} of ${progress.total} done` : ""), body];
   }
 
   // The agent's Markdown as elements, built node by node: its text is never parsed as HTML.
@@ -637,17 +633,8 @@ export function runPanel({
   }
 
   function permissionView(request) {
-    const open = request.answer === undefined;
-    const card = el("div", `permission${open ? " open" : ""}`);
-    card.append(
-      el("div", "permission-label", open ? "Permission needed" : "Permission"),
-      el("div", "permission-title", request.title),
-    );
-    if (!open) {
-      const chosen = request.options.find((option) => option.id === request.answer);
-      card.append(el("div", "permission-answer", chosen ? chosen.name : "Cancelled"));
-      return card;
-    }
+    const card = el("div", "permission open");
+    card.append(el("div", "permission-label", "Permission needed"), el("div", "permission-title", request.title));
     const keys = permissionKeys(request.options);
     const buttons = el("div", "permission-actions");
     for (const option of request.options) {
@@ -668,9 +655,10 @@ export function runPanel({
     sync,
     stop,
     keydown,
+    byId,
+    forget,
+    reload,
     run: () => run,
     live: () => isLive(run),
-    render,
-    reveal,
   };
 }

@@ -82,11 +82,6 @@ const state = {
   send: null,
   // Which of the tray's tabs shows: "notes" or "run".
   tab: "notes",
-  // The runs notes were sent in, by id, read once each (`GET api/run?id=R1`): only runs that
-  // are over are kept, and they do not change. The live run is the run panel's.
-  runCache: new Map(),
-  // Run ids asked for and not answered yet, or that could not be read: not asked again.
-  runsAsked: new Set(),
 };
 
 function el(tag, className, text) {
@@ -952,7 +947,6 @@ function renderNotes() {
       : `${count} notes`;
   renderSendBar();
   noteDetail.draw();
-  fetchRuns();
   if (count === 0) {
     drawnNotes = null;
     const empty = el("div", "empty", "Select lines, then press ");
@@ -1001,31 +995,7 @@ function renderNotes() {
 
 // The run a note's status comes from, or null (status.js, `runOf`).
 function runFor(note) {
-  return runOf(note, state.runCache, runs.run());
-}
-
-// Reads the runs the notes were sent in that are not known yet, then draws them.
-function fetchRuns() {
-  const live = runs.run();
-  const wanted = new Set(
-    state.notes
-      .map(sentIn)
-      .filter((id) => id !== null && id !== live?.id && !state.runCache.has(id) && !state.runsAsked.has(id)),
-  );
-  for (const id of wanted) {
-    state.runsAsked.add(id);
-    fetch(`api/run?id=${encodeURIComponent(id)}`)
-      .then(async (response) => {
-        if (!response.ok) throw new Error(await response.text());
-        const run = await response.json();
-        // Kept even while still going (another window's run): asking again on every draw
-        // would fetch it in a loop. `refresh` drops the ones still going, to be read again.
-        state.runCache.set(id, run);
-        renderNotes();
-      })
-      // The card says "Sent in R2" and the detail shows no history: the tray stays usable.
-      .catch((error) => console.warn(`run ${id}:`, error));
-  }
+  return runOf(note, { get: (id) => runs.byId(id) }, runs.run());
 }
 
 // Everything a note's card shows, as plain data: two cards with equal data look the same. A card
@@ -1149,8 +1119,6 @@ async function deleteNote(note) {
   const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
     method: "DELETE",
   });
-  state.runCache.clear();
-  state.runsAsked.clear();
   if (!response.ok) {
     // A run log that could not be removed: the note may be gone all the same.
     showToast(await response.text());
@@ -1162,7 +1130,7 @@ async function deleteNote(note) {
     renderFiles();
     redecorateRows();
   }
-  await runs.sync();
+  await runs.reload();
 }
 
 async function showNote(note) {
@@ -1189,6 +1157,8 @@ const runs = runPanel({
   statusEl: $("agent-status"),
   detailEl: $("run-detail"),
   onChange: followRun,
+  // An older run was read: the notes sent in it show its status.
+  onLoaded: () => renderNotes(),
   onError: showToast,
   noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
   openNote: (id) => noteDetail.open(id),
@@ -1378,8 +1348,6 @@ function showTab(tab) {
   $("note-count").hidden = run;
   $("run-header").hidden = !run;
   renderSendBar();
-  // Measured only now that the panel shows: a run that comes to the front opens at its end.
-  if (run) runs.reveal();
 }
 
 $("tab-notes").addEventListener("click", () => showTab("notes"));
@@ -1687,11 +1655,7 @@ async function refresh() {
   // A project being opened replaces this page: what a refresh drew would be thrown away,
   // and its requests would already reach the new project.
   if (state.switching) return;
-  for (const [id, run] of state.runCache) {
-    if (!isLive(run)) continue;
-    state.runCache.delete(id);
-    state.runsAsked.delete(id);
-  }
+  runs.forget();
   // The welcome screen is what is on screen, whether or not a project is open behind it.
   if (!welcomeEl.hidden) {
     await loadRecent();

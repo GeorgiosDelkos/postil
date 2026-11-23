@@ -807,6 +807,14 @@ impl Site {
                     &b"GET the settings or PUT new ones"[..],
                 ),
             },
+            "/api/runs" => match *request.method() {
+                Method::GET => json_or_error(
+                    self.runner()
+                        .and_then(|runner| runner.ids())
+                        .map(|ids| to_json(&serde_json::json!({ "runs": ids }))),
+                ),
+                _ => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
+            },
             "/api/run" | "/api/run/preview" | "/api/run/cancel" | "/api/run/permission" => {
                 self.respond_run(request)
             }
@@ -3088,6 +3096,8 @@ mod tests {
         let (status, body) = delete(&site, &format!("{NOTES}?id=N1"));
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(log("R1").exists(), "R1 still has N2");
+        let runs = || get_json(&site, &format!("{RUN}s"))["runs"].clone();
+        assert_eq!(runs(), serde_json::json!(["R2", "R1"]), "newest first");
 
         delete(&site, &format!("{NOTES}?id=N3"));
         assert!(!log("R2").exists(), "R2's only note is gone");
@@ -3097,6 +3107,7 @@ mod tests {
             "the latest run left is shown"
         );
         assert_eq!(get(&site, &format!("{RUN}?id=R2")).0, StatusCode::NOT_FOUND);
+        assert_eq!(runs(), serde_json::json!(["R1"]));
 
         delete(&site, &format!("{NOTES}?id=N2"));
         assert!(!log("R1").exists());
@@ -3105,6 +3116,7 @@ mod tests {
             serde_json::Value::Null,
             "no run is left"
         );
+        assert_eq!(runs(), serde_json::json!([]));
     }
 
     #[test]

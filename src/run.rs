@@ -361,6 +361,22 @@ impl Runner {
             .map_err(|problem| no_such(&problem))
     }
 
+    /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadRun`] when the runs directory cannot be listed.
+    pub(crate) fn ids(&self) -> Result<Vec<String>> {
+        let dir = self.repo.runs_dir();
+        let mut numbers =
+            run_numbers(&dir).map_err(|source| Error::ReadRun { path: dir, source })?;
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(numbers
+            .into_iter()
+            .map(|number| format!("R{number}"))
+            .collect())
+    }
+
     /// Deletes the log of every run none of whose notes is among `notes`, the notes left after
     /// a delete: a run goes with its last note, and an id freed by a delete cannot attach an
     /// old run to a new note. This window's live run is kept; it goes at a later delete once
