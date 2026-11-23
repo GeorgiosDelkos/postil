@@ -275,8 +275,9 @@ async function prompt(id, params) {
       // test cannot learn from the pid: an exited agent stays a zombie until it is reaped.
       // The agent's pid, not the grandchild's first `ppid`: the agent may be gone by the time
       // the grandchild runs.
+      const exited = JSON.stringify(`${extra[0]}.exited`);
       const watch = `setInterval(() => {
-          if (process.ppid !== ${process.pid}) require("node:fs").writeFileSync(${JSON.stringify(`${extra[0]}.exited`)}, "exited");
+          if (process.ppid !== ${process.pid}) require("node:fs").writeFileSync(${exited}, "x");
         }, 10);`;
       spawn(process.execPath, ["-e", watch], { stdio: ["ignore", "ignore", "inherit"] });
       send({ id, result: { stopReason: "end_turn" } });
