@@ -50,7 +50,8 @@ pub(crate) fn load_versioned<T: DeserializeOwned>(file: &Path, version: u32) -> 
 ///
 /// # Errors
 ///
-/// When `json` is not a JSON object with a `version` that is a `u32`.
+/// When `json` is neither an object with a `version` that is a `u32` nor an array whose first
+/// element is one (serde's derive accepts both).
 pub(crate) fn version_of(json: &[u8]) -> serde_json::Result<u32> {
     // The name shows in serde's message for a value that is not an object ("expected struct
     // VersionOnly"), which the page shows for a broken review file or run log: renaming it
@@ -69,7 +70,8 @@ pub(crate) fn version_of(json: &[u8]) -> serde_json::Result<u32> {
 /// As [`write_atomically`].
 pub(crate) fn save_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
     let mut json = serde_json::to_vec_pretty(value).expect(
-        "the app's files are structs of strings, numbers and lists, which always serialize",
+        "serde_json fails only on a map key that is not a string or a failing Serialize impl, \
+         and the app's files have neither",
     );
     json.push(b'\n');
     write_atomically(file, &json)

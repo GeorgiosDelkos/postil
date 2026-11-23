@@ -519,12 +519,12 @@ impl Site {
     /// 405 with what the route takes.
     pub(crate) fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
         let uri = request.uri();
-        let query = uri.query().unwrap_or("");
-        let body = request.body();
         if let Some(asset) = page_asset(uri.path()) {
             return asset;
         }
         let method = request.method();
+        let query = uri.query().unwrap_or("");
+        let body = request.body();
         match uri.path() {
             "/api/repo" => match *method {
                 Method::GET => json_or_error(self.repo_info()),
