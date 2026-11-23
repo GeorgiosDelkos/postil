@@ -23,7 +23,7 @@ use crate::layout::{self, Layout};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
-use crate::run::{AgentChoice, Notify, Runner};
+use crate::run::{Notify, Runner};
 use crate::settings::{self, Settings};
 
 /// The page's files, served at these paths with these types: compiled into the binary as
@@ -854,7 +854,11 @@ impl Site {
     fn send_run(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: SendRun = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
-        let agent = self.agent_choice(request.agent)?;
+        let settings = self.current_settings();
+        let agent = match &request.agent {
+            Some(name) => settings.chosen_agent(name)?,
+            None => settings.default_agent()?,
+        };
         self.runner()?.send(agent, &request.notes)?;
         Ok(b"{}".to_vec())
     }
@@ -879,14 +883,12 @@ impl Site {
     fn review_run(&self, body: &[u8]) -> Result<Vec<u8>> {
         let review: ReviewRun = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
-        let names = self
-            .settings_file
-            .as_deref()
-            .map_or_else(Settings::default, |file| settings::load(file).settings)
-            .reviewers;
-        let reviewers = names
-            .into_iter()
-            .map(|name| self.agent_choice(Some(name)))
+        // Loaded once, so every reviewer is checked against the same revision of the file.
+        let settings = self.current_settings();
+        let reviewers = settings
+            .reviewers
+            .iter()
+            .map(|name| settings.chosen_agent(name))
             .collect::<Result<Vec<_>>>()?;
         self.runner()?.review(&review.of, reviewers)?;
         Ok(b"{}".to_vec())
@@ -898,7 +900,9 @@ impl Site {
         let follow: FollowRun = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
         let runner = self.runner()?;
-        let agent = self.agent_choice(Some(runner.agent_of(&follow.of)?))?;
+        let agent = self
+            .current_settings()
+            .chosen_agent(&runner.agent_of(&follow.of)?)?;
         runner.follow_up(&follow.of, agent, &follow.text)?;
         Ok(b"{}".to_vec())
     }
@@ -911,36 +915,12 @@ impl Site {
         Ok(b"{}".to_vec())
     }
 
-    /// The agent called `name`, or the settings' agent, with its command. It must be turned
-    /// on in the settings.
-    fn agent_choice(&self, name: Option<String>) -> Result<AgentChoice> {
-        let settings = self
-            .settings_file
+    /// The settings in effect: the file's, or the defaults when it cannot be used or there is
+    /// no configuration directory. Reads the file each time.
+    fn current_settings(&self) -> Settings {
+        self.settings_file
             .as_deref()
-            .map_or_else(Settings::default, |file| settings::load(file).settings);
-        let name = name.or(settings.agent).ok_or_else(|| {
-            Error::BadRequest("choose the agent notes are sent to in Settings".to_owned())
-        })?;
-        if !settings.enabled_agents.contains(&name) {
-            return Err(Error::BadRequest(format!(
-                "turn {name} on in Settings before sending to it"
-            )));
-        }
-        let built_in = BUILT_IN
-            .iter()
-            .find(|agent| agent.name == name)
-            .map(|agent| agent.command.to_owned());
-        let custom = || {
-            settings
-                .custom_agents
-                .into_iter()
-                .find(|agent| agent.name == name)
-                .map(|agent| agent.command)
-        };
-        let command = built_in
-            .or_else(custom)
-            .ok_or_else(|| Error::BadRequest(format!("there is no agent called {name}")))?;
-        Ok(AgentChoice { name, command })
+            .map_or_else(Settings::default, |file| settings::load(file).settings)
     }
 
     /// The reply to `GET /api/settings`, and to every request that changes them: the

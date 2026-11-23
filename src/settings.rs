@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::agents::{self, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
+use crate::run::AgentChoice;
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -100,6 +101,48 @@ impl Settings {
         }
         self.check_custom_agents()?;
         self.check_choices()
+    }
+
+    /// The agent notes are sent to, with its command.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when none is chosen, and as [`Settings::chosen_agent`].
+    pub(crate) fn default_agent(&self) -> Result<AgentChoice> {
+        let name = self.agent.as_deref().ok_or_else(|| {
+            Error::BadRequest("choose the agent notes are sent to in Settings".to_owned())
+        })?;
+        self.chosen_agent(name)
+    }
+
+    /// The agent called `name`, with its command.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when it is not enabled, or there is no agent of that name.
+    pub(crate) fn chosen_agent(&self, name: &str) -> Result<AgentChoice> {
+        if !self.enabled_agents.iter().any(|enabled| enabled == name) {
+            return Err(Error::BadRequest(format!(
+                "turn {name} on in Settings before sending to it"
+            )));
+        }
+        let built_in = BUILT_IN
+            .iter()
+            .find(|agent| agent.name == name)
+            .map(|agent| agent.command);
+        let custom = || {
+            self.custom_agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .map(|agent| agent.command.as_str())
+        };
+        let command = built_in
+            .or_else(custom)
+            .ok_or_else(|| Error::BadRequest(format!("there is no agent called {name}")))?;
+        Ok(AgentChoice {
+            name: name.to_owned(),
+            command: command.to_owned(),
+        })
     }
 
     fn check_custom_agents(&self) -> std::result::Result<(), String> {
