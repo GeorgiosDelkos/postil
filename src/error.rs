@@ -125,6 +125,13 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The pane widths could not be saved.
+    WriteLayout {
+        /// The layout file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
     /// An agent's program is not on the search path.
     AgentNotFound {
         /// The program as the agent's command names it.
@@ -263,6 +270,11 @@ impl fmt::Display for Error {
                  saved)",
                 path.display()
             ),
+            Self::WriteLayout { path, .. } => write!(
+                f,
+                "cannot save the pane widths to {} (they apply until Postil quits)",
+                path.display()
+            ),
             Self::AgentNotFound { program } => write!(
                 f,
                 "cannot find the agent's program {program} (install it, or change the agent's \
@@ -341,6 +353,7 @@ impl std::error::Error for Error {
             | Self::WriteSettings { source, .. }
             | Self::StartAgent { source, .. }
             | Self::WriteRun { source, .. }
+            | Self::WriteLayout { source, .. }
             | Self::ReadRun { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
             Self::Highlight(source) => Some(source),

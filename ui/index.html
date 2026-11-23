@@ -10,6 +10,10 @@
 
 <nav class="sidebar" aria-label="Files">
   <div class="drag-strip" data-drag></div>
+  <div class="rail" data-drag>
+    <button type="button" class="rail-button" id="unfold-files" aria-label="Show the file list" title="Show the file list (⌘B)">›</button>
+    <span class="rail-name" id="rail-name"></span>
+  </div>
   <div class="repo" data-drag>
     <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
     <div class="repo-branch" id="repo-branch"></div>
@@ -65,6 +69,9 @@
     <button type="button" class="button primary send" id="send-button"></button>
   </footer>
 </aside>
+
+<div class="divider" id="divider-files" role="separator" aria-orientation="vertical" aria-label="File list width" aria-controls="files" tabindex="0" title="Drag to resize · double-click to reset"></div>
+<div class="divider" id="divider-tray" role="separator" aria-orientation="vertical" aria-label="Tray width" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
 <section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>
   <div class="drag-strip" data-drag></div>

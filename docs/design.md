@@ -68,6 +68,14 @@ Rules for this app:
   reserved for notes. Red appears only when the agent needs the engineer.
 - **Cards on a canvas.** Three rounded panes with hairline borders and 8 px gaps. No toolbars, no
   icon rows, no status bar full of counters.
+- **Resizable panes.** The file list (180 to 480 px) and the tray (280 to 720 px) are sized by
+  dragging the divider in the gap beside them, or with the arrow keys on a focused divider;
+  a double-click resets one. Dragged below its minimum, the file list folds to a 76 px rail
+  (as wide as the window buttons over it), and `Cmd-B` (View > Show or Hide File List) folds
+  or unfolds it. The code pane keeps at least 420 px: in a narrow window the tray gives way
+  first, then the file list. The widths are kept per Mac in `~/.config/postil/layout.json`,
+  chosen by the owner on 2026-11-23 over per project; like `recent.json` it is a
+  convenience, so a file that cannot be used counts as the defaults.
 - **Code is the largest and brightest thing on screen.** Chrome text is dimmer than code text.
 - **Two themes at launch:** Graphite (dark, default) and Paper (light). Each is a small palette
   of named colors, as in Herdr; a third theme is a new palette, not new code.
@@ -133,6 +141,7 @@ schedule three tasks.
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
+| `src/layout.rs`, `ui/panes.js` | The pane widths, `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
 | `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |

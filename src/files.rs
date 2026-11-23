@@ -58,7 +58,8 @@ pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// The app's configuration directory: `$XDG_CONFIG_HOME/postil` when that variable holds an
-/// absolute path, else `~/.config/postil`, which holds `recent.json` and `settings.json`.
+/// absolute path, else `~/.config/postil`, which holds `recent.json`, `settings.json` and
+/// `layout.json`.
 ///
 /// # Errors
 ///

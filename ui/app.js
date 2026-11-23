@@ -7,6 +7,7 @@
 
 import { rank } from "./fuzzy.js";
 import { fileIcon, folderIcon } from "./icons.js";
+import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
 import { runPanel } from "./run-panel.js";
 import { foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
@@ -1228,6 +1229,113 @@ function followRun(run, previous) {
   renderSendBar();
 }
 
+// ---- Panes ----------------------------------------------------------------------------
+//
+// The file list and the tray are resized by the dividers beside them, and the file list folds
+// to a rail (⌘B). The widths are kept per Mac in layout.json (src/layout.rs); ui/panes.js has
+// the rules. Until the kept widths arrive, app.css's defaults stand.
+
+const sidebarEl = document.querySelector(".sidebar");
+const panes = {
+  // As `api/layout` gives them: { sidebar, tray, filesFolded }, the defaults, and the limits.
+  layout: null,
+  defaults: null,
+  limits: null,
+  // The divider being dragged: "files" or "tray".
+  dragging: null,
+  saveTimer: 0,
+};
+
+async function loadLayout() {
+  const response = await fetch("api/layout");
+  if (!response.ok) return;
+  const { defaults, limits, ...layout } = await response.json();
+  panes.defaults = defaults;
+  panes.limits = limits;
+  setLayout(layout, { save: false });
+}
+
+// Draws `layout`, fitted to the window, and saves it unless asked not to. Saving waits for a
+// moment of quiet, so holding an arrow key writes the file once.
+function setLayout(layout, { save }) {
+  panes.layout = layout;
+  drawLayout();
+  if (!save) return;
+  clearTimeout(panes.saveTimer);
+  panes.saveTimer = setTimeout(saveLayout, 300);
+}
+
+function drawLayout() {
+  if (!panes.layout) return;
+  const { sidebar, tray } = fit(panes.layout, panes.limits, innerWidth);
+  const root = document.documentElement.style;
+  root.setProperty("--sidebar-width", `${sidebar}px`);
+  root.setProperty("--tray-width", `${tray}px`);
+  sidebarEl.classList.toggle("folded", panes.layout.filesFolded);
+  $("divider-files").setAttribute("aria-valuenow", String(sidebar));
+  $("divider-tray").setAttribute("aria-valuenow", String(tray));
+}
+
+async function saveLayout() {
+  const response = await fetch("api/layout", { method: "PUT", body: JSON.stringify(panes.layout) });
+  // The widths still apply in this window; the toast says they will not be kept.
+  if (!response.ok) showToast(await response.text());
+}
+
+function toggleFiles() {
+  if (!panes.layout || !welcomeEl.hidden) return;
+  setLayout({ ...panes.layout, filesFolded: !panes.layout.filesFolded }, { save: true });
+}
+
+for (const [id, divider] of [
+  ["divider-files", "files"],
+  ["divider-tray", "tray"],
+]) {
+  const el = $(id);
+  el.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || !panes.layout) return;
+    event.preventDefault();
+    el.setPointerCapture(event.pointerId);
+    panes.dragging = divider;
+    el.classList.add("active");
+    document.body.classList.add("resizing");
+  });
+  el.addEventListener("pointermove", (event) => {
+    if (panes.dragging !== divider) return;
+    const next =
+      divider === "files"
+        ? dragFiles(panes.layout, panes.limits, event.clientX)
+        : dragTray(panes.layout, panes.limits, event.clientX, innerWidth);
+    setLayout(next, { save: false });
+  });
+  const stop = () => {
+    if (panes.dragging !== divider) return;
+    panes.dragging = null;
+    el.classList.remove("active");
+    document.body.classList.remove("resizing");
+    setLayout(panes.layout, { save: true });
+  };
+  el.addEventListener("pointerup", stop);
+  el.addEventListener("pointercancel", stop);
+  el.addEventListener("dblclick", () => {
+    if (panes.layout) setLayout(reset(panes.layout, panes.defaults, divider), { save: true });
+  });
+  el.addEventListener("keydown", (event) => {
+    if (!panes.layout || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+    // The divider handles its keys; the window's (`c`, Escape) must not act behind it.
+    event.preventDefault();
+    event.stopPropagation();
+    const size = event.shiftKey ? BIG_STEP : STEP;
+    const delta = event.key === "ArrowRight" ? size : -size;
+    setLayout(step(panes.layout, panes.limits, divider, delta), { save: true });
+  });
+}
+
+$("unfold-files").addEventListener("click", toggleFiles);
+// The kept widths are fitted to the window again whenever it changes size; that is drawing,
+// not a change of layout, so nothing is saved.
+window.addEventListener("resize", drawLayout);
+
 // ---- Input ----------------------------------------------------------------------------
 
 let renderQueued = false;
@@ -1468,6 +1576,7 @@ function showRepo(repo) {
   state.repo = repo;
   state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
+  $("rail-name").textContent = repo.branch ? `${repo.name} · ${repo.branch}` : repo.name;
   $("repo-name").title = `${repo.root}\nSwitch project (⇧⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
   // Set once by the Rust process when the recent projects could not be updated. It does
@@ -1501,6 +1610,7 @@ window.postil = {
     if (command === "open-folder") chooseFolder();
     else if (command === "switch-project") showWelcome();
     else if (command === "go-to-file") goToFile();
+    else if (command === "toggle-files") toggleFiles();
     else if (command === "settings") settings.open();
     else if (command === "close-window" || command === "quit") quit();
   },
@@ -1511,6 +1621,8 @@ window.postil = {
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
 function goToFile() {
   if (!welcomeEl.hidden) return;
+  // The filter is in the file list, so a folded list unfolds.
+  if (panes.layout?.filesFolded) toggleFiles();
   filterEl.focus();
   filterEl.select();
 }
@@ -1644,7 +1756,7 @@ async function start() {
   loadIcons();
   // Before the first file is drawn, so it is drawn once at the right size. The defaults in
   // app.css stand when the settings cannot be read; the dialog says why when opened.
-  await settings.load().catch(() => {});
+  await Promise.all([settings.load().catch(() => {}), loadLayout().catch(() => {})]);
   const response = await fetch("api/repo");
   if (!response.ok) {
     codeEmptyEl.textContent = await response.text();
