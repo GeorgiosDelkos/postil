@@ -116,6 +116,11 @@ export POSTIL_NOTARY_PROFILE=postil
 
 Without `POSTIL_NOTARY_PROFILE` it signs only.
 
+Releases are built in CI: pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` runs
+`.github/workflows/release.yml`, which signs and notarizes the app with the secrets of the
+repository's `release` environment and publishes a zip of it. Running the workflow by hand is a
+dry run with no release.
+
 ## Agents
 
 Postil talks to any agent that speaks ACP over stdio. It detects these on the `PATH` and lists
