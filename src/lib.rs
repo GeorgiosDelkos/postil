@@ -14,6 +14,7 @@ mod dialog;
 mod error;
 mod files;
 mod highlight;
+mod layout;
 #[cfg(target_os = "macos")]
 mod menu;
 mod notes;
