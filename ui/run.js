@@ -165,9 +165,6 @@ export function openPermission(items) {
   return items.findLast((item) => item.type === "permission" && item.answer === undefined) ?? null;
 }
 
-// Which key answers with which option: `a` allows once, `A` (Shift-a) always, `r` rejects.
-// "Always" is offered only when the agent offers it (docs/design.md, "ACP integration"); a
-// reject falls back to "reject always" when the agent offers no plain reject.
 // Whether the agent has not yet reported a tool call finished.
 export function underWay(tool) {
   return tool.status === "pending" || tool.status === "in_progress";
@@ -185,6 +182,9 @@ export function permissionKey(event) {
   return null;
 }
 
+// Which key answers with which option: `a` allows once, `A` (Shift-a) always, `r` rejects.
+// "Always" is offered only when the agent offers it (docs/design.md, "ACP integration"); a
+// reject falls back to "reject always" when the agent offers no plain reject.
 export function permissionKeys(options) {
   const first = (kind) => options.find((option) => option.kind === kind)?.id;
   const keys = new Map();
