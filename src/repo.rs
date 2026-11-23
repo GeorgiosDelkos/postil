@@ -368,7 +368,7 @@ impl Repo {
             }
             Ok(_) => String::from_utf8(bytes).map_err(|error| Error::Read {
                 path,
-                source: io::Error::new(io::ErrorKind::InvalidData, error),
+                source: io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()),
             }),
             Err(source) => Err(Error::Read { path, source }),
         }

@@ -371,9 +371,10 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         }
     });
 
-    // The webview draws into the window, so it goes first. The request thread is not
-    // joined: it has closed the site, and a late request it may be answering would wait for
-    // this thread's run loop, which has stopped. The process ending stops it.
+    // The webview draws into the window, so it goes first. The request thread is not joined:
+    // it has closed the site, or the quit deadline passed (`QUIT_WAIT`) with the site still
+    // open, and a request it may be on would wait for this thread's run loop, which has
+    // stopped. The process ending stops it.
     drop(webview);
     drop(window);
     Ok(report)
@@ -559,8 +560,8 @@ fn build_webview(
     WebViewBuilder::new()
         .with_background_color(canvas_color(window.theme()))
         .with_asynchronous_custom_protocol("postil".to_owned(), move |_webview, request, answer| {
-            // The page's own files are static bytes, answered here (owner decision D1): a page
-            // reload is never queued behind a slow request.
+            // The page's own files are static bytes, answered here (owner decision D1 in
+            // docs/review-2026-11-23.md): a page reload is never queued behind a slow request.
             if let Some(asset) = page_asset(request.uri().path()) {
                 answer.respond(asset);
                 return;
@@ -944,10 +945,11 @@ struct FileView<'a> {
 
 type Reply = Response<Cow<'static, [u8]>>;
 
-// The request thread drops the site on `Job::Close`, while the event loop still runs, and the
-// event loop exits only on `AppEvent::SiteClosed`. A runner whose agent is still starting is
-// also held by its start thread, so dropping the project alone would not stop that agent: the
-// site stops it here, and quitting leaves no agent behind.
+// The request thread drops the site on `Job::Close`, while the event loop still runs. The
+// event loop exits on `AppEvent::SiteClosed`, or at `QUIT_WAIT` without it. A runner whose
+// agent is still starting is also held by its start thread, so dropping the project alone
+// would not stop that agent: the site stops it here, so a quit that closes the site in time
+// leaves no agent behind.
 impl Drop for Site {
     fn drop(&mut self) {
         if let Some(project) = self.project.borrow_mut().take() {
@@ -5361,6 +5363,19 @@ mod tests {
             kinds.contains(&"message:after the long line".to_owned()),
             "the line after it is read whole"
         );
+    }
+
+    #[test]
+    fn the_event_loop_waits_until_the_quit_deadline_and_exits_past_it() {
+        assert_eq!(
+            waiting(None),
+            ControlFlow::Wait,
+            "not quitting: wait for events"
+        );
+        let ahead = Instant::now() + Duration::from_secs(60);
+        assert_eq!(waiting(Some(ahead)), ControlFlow::WaitUntil(ahead));
+        let past = Instant::now() - Duration::from_secs(1);
+        assert_eq!(waiting(Some(past)), ControlFlow::Exit);
     }
 
     #[test]
