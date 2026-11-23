@@ -10,6 +10,7 @@ import {
   planProgress,
   runStatus,
   reviewOf,
+  latestOfThreads,
   runOf,
   threadOf,
 } from "./status.js";
@@ -59,6 +60,12 @@ test("a thread is its run of notes and the follow-ups after it, in order", () =>
   assert.deepEqual(ids("R2"), ["R2"]);
   assert.deepEqual(ids("R7"), ["R7"], "its earlier run not read yet");
   assert.deepEqual(ids("R9"), []);
+  const latest = latestOfThreads(views);
+  assert.deepEqual(
+    Object.fromEntries([...latest].map(([root, view]) => [root, view.id])),
+    { R1: "R5", R2: "R2", R7: "R7" },
+    "each thread's latest run, reviews left out",
+  );
 
   const live = follow("R3", "R1", "running");
   live.notes = ["N1"];

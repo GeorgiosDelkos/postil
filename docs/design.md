@@ -434,6 +434,9 @@ work (`POST /api/run/follow {of, text}`, `Runner::follow_up`). Decided with the 
   review or another send replaced it, or Postil restarted) a fresh agent gets the thread's
   earlier prompts and replies first, then the words, with the edited files linked; the
   follow-up's dialog says so.
+- **A thread does not fork.** A follow-up of a run another run already follows is refused
+  (400, naming the run to follow up instead): two windows, or a stale page, would otherwise
+  make two threads that each leave the other's work out of a fresh agent's prompt.
 - **A follow-up carries its thread's notes** and marks none sent: it goes with them when the
   last is deleted, and a note's status shows the follow-up only while it runs.
 - **The header** holds `followUp: {of, text}`, the run it follows and the engineer's words, so
@@ -441,7 +444,8 @@ work (`POST /api/run/follow {of, text}`, `Runner::follow_up`). Decided with the 
   version 3 for it; older logs read as before.
 - **One card per thread.** The Run tab lists the run of notes, with the status of the thread's
   latest run; the dialog shows that run, then each follow-up (the words, the steps, the
-  reply), its Review section, and the box. Review still reviews the first run's work.
+  reply), its Review section, and the box. Review reviews the first run's work, and a review
+  of a follow-up is refused, as the page would have nowhere to show it.
 
 ### Cards and dialogs
 

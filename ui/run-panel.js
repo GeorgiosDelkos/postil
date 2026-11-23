@@ -26,7 +26,7 @@ import {
   underWay,
 } from "./run.js";
 import { questionForm, statusIcon } from "./note-dialog.js";
-import { noteStatus, planProgress, reviewOf, threadOf } from "./status.js";
+import { latestOfThreads, noteStatus, planProgress, reviewOf, threadOf } from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
@@ -302,10 +302,10 @@ export function runPanel({
     const shown = list.filter((id) => !byId(id)?.review && !byId(id)?.followUp);
     const label = shown.length === 1 ? "Run" : `Runs · ${shown.length}`;
     wanted.push(["label", label, () => el("div", "run-label", label)]);
-    const known = knownViews();
+    const latests = latestOfThreads(knownViews());
     for (const id of shown) {
       const view = byId(id);
-      const latest = view ? threadOf(id, known).at(-1) : null;
+      const latest = view ? (latests.get(id) ?? view) : null;
       const sig = view
         ? JSON.stringify([latest.id, latest.status, view.agent, view.notes, statusWord(latest)])
         : (failed.get(id) ?? "loading");
@@ -564,9 +564,12 @@ export function runPanel({
     // The thread's question, from whichever of its runs is under way: the latest.
     const question = isLive(latest) ? openQuestion(foldRun(latest.entries).items) : null;
     if (question) {
-      if (asking?.request !== question.request) {
+      // Keyed by run too: each agent numbers its requests from 0, and a thread's runs can
+      // have different agents.
+      const key = `${latest.id}:${question.request}`;
+      if (asking?.key !== key) {
         const form = questionForm(question, latest.agent, (content) => answerQuestion(question.request, content));
-        asking = { request: question.request, form };
+        asking = { key, form };
       }
       body.append(asking.form);
     } else asking = null;

@@ -154,22 +154,42 @@ export function groupNotes(notes, statusOf) {
 // `follow_up`). A follow-up whose earlier run is not read yet starts a thread of its own
 // until it is.
 export function threadOf(id, views) {
-  const byId = new Map(views.map((view) => [view.id, view]));
-  const rootOf = (view) => {
-    let at = view;
-    for (let seen = 0; at?.followUp && seen < views.length; seen += 1) {
-      const before = byId.get(at.followUp.of);
-      if (!before) break;
-      at = before;
-    }
-    return at.id;
-  };
-  const start = byId.get(id);
-  if (!start) return [];
-  const root = rootOf(start);
-  const number = (view) => Number(view.id.slice(1));
-  return views.filter((view) => !view.review && rootOf(view) === root).sort((a, b) => number(a) - number(b));
+  const roots = rootsOf(views);
+  const root = roots.get(id);
+  if (root === undefined) return [];
+  return views.filter((view) => !view.review && roots.get(view.id) === root).sort((a, b) => runNumber(a) - runNumber(b));
 }
+
+// Each thread's latest run among `views`, by the id of the run it started from. The Run tab
+// reads it once per draw, rather than `threadOf` once per card.
+export function latestOfThreads(views) {
+  const roots = rootsOf(views);
+  const latest = new Map();
+  for (const view of views) {
+    if (view.review) continue;
+    const root = roots.get(view.id);
+    const known = latest.get(root);
+    if (!known || runNumber(view) > runNumber(known)) latest.set(root, view);
+  }
+  return latest;
+}
+
+// The id of the run each of `views` started its thread from, by id. A follow-up names an
+// older run, so each walk ends; the count only stops a log edited into a loop.
+function rootsOf(views) {
+  const byId = new Map(views.map((view) => [view.id, view]));
+  const roots = new Map();
+  for (const view of views) {
+    let at = view;
+    for (let seen = 0; at.followUp && byId.has(at.followUp.of) && seen < views.length; seen += 1) {
+      at = byId.get(at.followUp.of);
+    }
+    roots.set(view.id, at.id);
+  }
+  return roots;
+}
+
+const runNumber = (view) => Number(view.id.slice(1));
 
 // The latest review of run `id` among `views` (every run read so far; src/review.rs): its
 // stages, reviewer 1 first, and each finding with the judge's verdict. Null when the run was

@@ -80,10 +80,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// when from [`RunView`]'s `force_in`.
 const FORCE_AFTER: Duration = Duration::from_secs(3);
 
-/// The most runs a thread of follow-ups is read through. Arbitrary, far above any real thread:
-/// it only stops a hand-edited log whose follow-ups loop.
-const MAX_THREAD: usize = 1000;
-
 /// How long a send waits for the run lock before it reports another window's run
 /// ([`take_run_lock`]). Arbitrary: far longer than a fork-to-exec window, short enough that a
 /// refused send answers at once.
@@ -280,14 +276,18 @@ impl Runner {
     /// follows it (docs/design.md, "Follow-ups"). It goes to the same conversation when the
     /// kept agent is `agent` and ran `of`, this window's latest run. Otherwise a fresh agent
     /// gets the thread's earlier prompts and replies before the text. The run carries `of`'s
-    /// notes, so it goes with them, and marks none sent.
+    /// notes, so it goes with them, and marks none sent. A thread does not fork: `of` must be
+    /// its latest run. Reads the log of every run in the thread and the header of every newer
+    /// run, and may wait for the run lock as [`Runner::send`] does.
     ///
     /// # Errors
     ///
     /// [`Error::TurnRunning`] while a run of this window is under way, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] for a blank
-    /// text or a run that is a review; as [`Runner::view_of`] for `of` and the runs it
-    /// follows; and [`Error::WriteRun`] when the run log cannot be created.
+    /// text, a run that is a review, or a run another run already follows; as
+    /// [`Runner::view_of`] for `of` and the runs it follows, and [`Error::NoSuchRun`] when one
+    /// follows a run that is not older; [`Error::ReadRun`] when the runs directory cannot be
+    /// listed; and [`Error::WriteRun`] when the run log cannot be created.
     pub(crate) fn follow_up(
         self: &Arc<Self>,
         of: &str,
@@ -311,8 +311,12 @@ impl Runner {
             }
             state.header.notes.clone()
         };
-        // Takes each run's state lock in turn, so it runs after `followed`'s is let go.
-        let files = edited_files(&thread);
+        // Two follow-ups of one run would make two threads that each leave the other out.
+        if let Some(next) = self.followed_by(of)? {
+            return Err(Error::BadRequest(format!(
+                "{next} already follows {of}: follow up {next}"
+            )));
+        }
         let mut slot = self.slot();
         if slot.run.as_ref().is_some_and(|run| run.state().live()) {
             return Err(Error::TurnRunning);
@@ -325,13 +329,20 @@ impl Runner {
             .run
             .as_ref()
             .is_some_and(|run| Arc::ptr_eq(run, followed));
-        let prompt = Prompt {
-            text: if same_conversation {
-                text.to_owned()
-            } else {
-                fresh_follow_up(&thread, text)
-            },
-            files: if same_conversation { Vec::new() } else { files },
+        let prompt = if same_conversation {
+            Prompt {
+                text: text.to_owned(),
+                files: Vec::new(),
+            }
+        } else {
+            let diffs: Vec<Diff> = thread
+                .iter()
+                .flat_map(|run| run.state().work().diffs)
+                .collect();
+            Prompt {
+                text: fresh_follow_up(&thread, text),
+                files: edited_files(&diffs),
+            }
         };
         let run = Arc::new(Run::create(
             &self.repo.runs_dir(),
@@ -374,26 +385,50 @@ impl Runner {
     fn thread(&self, of: &str) -> Result<Vec<Arc<Run>>> {
         let mut thread = vec![self.run_by_id(of)?];
         loop {
-            let before = thread
-                .last()
-                .expect("the thread starts with one run")
-                .state()
-                .header
-                .follow_up
-                .as_ref()
-                .map(|follow_up| follow_up.of.clone());
+            let (id, before) = {
+                let state = thread
+                    .last()
+                    .expect("the thread starts with one run")
+                    .state();
+                let before = state
+                    .header
+                    .follow_up
+                    .as_ref()
+                    .map(|follow_up| follow_up.of.clone());
+                (state.header.id.clone(), before)
+            };
             let Some(before) = before else { break };
-            // Run numbers only grow, so a follow-up names an older run and the walk ends; the
-            // check guards against a log edited by hand into a loop.
-            if thread.len() > MAX_THREAD {
-                return Err(Error::BadRequest(format!(
-                    "the thread of {of} is longer than {MAX_THREAD} runs"
-                )));
+            // A follow-up is created after the run it follows, so it names an older run and the
+            // walk ends. A log edited by hand could say otherwise.
+            if run_number(&before) >= run_number(&id) {
+                return Err(Error::NoSuchRun {
+                    id,
+                    problem: format!("it follows {before}, which is not an older run"),
+                });
             }
             thread.push(self.run_by_id(&before)?);
         }
         thread.reverse();
         Ok(thread)
+    }
+
+    /// The run that already follows run `of`, if any, read from the headers of the newer
+    /// logs. A log that cannot be read is passed over: it follows nothing the page can show.
+    fn followed_by(&self, of: &str) -> Result<Option<String>> {
+        let number = run_number(of)
+            .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
+        let dir = self.repo.runs_dir();
+        let numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(numbers
+            .into_iter()
+            .filter(|newer| *newer > number)
+            .find_map(|newer| {
+                let header = read_header(&dir.join(format!("R{newer}.jsonl"))).ok()?;
+                (header.follow_up?.of == of).then_some(header.id)
+            }))
     }
 
     /// Starts a review of run `of` by `reviewers`, in order (`review.rs`): each stage is a run
@@ -421,13 +456,16 @@ impl Runner {
             if state.header.review.is_some() {
                 return Err(Error::BadRequest(format!("{of} is itself a review")));
             }
-            let work = state.work();
-            let mut files: Vec<String> = Vec::new();
-            for diff in &work.diffs {
-                if !files.contains(&diff.path) {
-                    files.push(diff.path.clone());
-                }
+            // A review reviews the run of notes a thread started from (docs/design.md,
+            // "Follow-ups"); the page shows it there.
+            if let Some(follow_up) = &state.header.follow_up {
+                return Err(Error::BadRequest(format!(
+                    "{of} is a follow-up of {}: review the run its thread started from",
+                    follow_up.of
+                )));
             }
+            let work = state.work();
+            let files = edited_files(&work.diffs);
             (state.header.notes.clone(), work, files)
         };
         let chain = Chain {
@@ -1184,7 +1222,7 @@ enum Origin {
 
 /// A follow-up run's link to its thread: `of` is the run it follows, `text` what the engineer
 /// wrote. The prompt holds more when a fresh agent had to be told the thread first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FollowUp {
     of: String,
@@ -1842,8 +1880,13 @@ fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
             "it is version {version}, and this build of Postil reads versions 1 to {LOG_VERSION}"
         ));
     }
-    serde_json::from_slice(first)
-        .map_err(|error| format!("its first line is not a run header ({error})"))
+    let header: Header = serde_json::from_slice(first)
+        .map_err(|error| format!("its first line is not a run header ({error})"))?;
+    // `Origin` makes the two exclusive when Postil writes a header; this holds a hand edit to it.
+    if header.review.is_some() && header.follow_up.is_some() {
+        return Err("its header is both a review and a follow-up".to_owned());
+    }
+    Ok(header)
 }
 
 /// The header of the run log `file`, its first line only: a long run's log is not read whole.
@@ -2005,14 +2048,12 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     prompt
 }
 
-/// The files the thread's runs edited, each once, in the order first edited.
-fn edited_files(thread: &[Arc<Run>]) -> Vec<String> {
+/// The files `diffs` edit, each once, in the order first edited.
+fn edited_files(diffs: &[Diff]) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
-    for run in thread {
-        for diff in run.state().work().diffs {
-            if !files.contains(&diff.path) {
-                files.push(diff.path);
-            }
+    for diff in diffs {
+        if !files.contains(&diff.path) {
+            files.push(diff.path.clone());
         }
     }
     files
