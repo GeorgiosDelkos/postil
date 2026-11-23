@@ -68,6 +68,8 @@ async function prompt(id, params) {
   if (scenario === "refuse-first" && prompts === 1) {
     return send({ id, error: { code: -32603, message: "model overloaded" } });
   }
+  // The model declines the work before doing any.
+  if (scenario === "refusal") return send({ id, result: { stopReason: "refusal" } });
   const blocks = params.prompt.map((block) => (block.type === "text" ? block.text : block.uri));
   say(`got ${blocks.join(" | ")}`);
   say(`prompt ${prompts}`);
@@ -135,7 +137,7 @@ async function prompt(id, params) {
       return send({ id, result: { stopReason: "end_turn" } });
     }
     case "odd-error":
-      // An error object without a code, as JSON-RPC requires one.
+      // An error object without a code, though JSON-RPC requires one.
       return send({ id, error: { message: "no code here" } });
     case "refuse-prompt":
       return send({ id, error: { code: -32603, message: "model overloaded" } });

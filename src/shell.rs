@@ -3320,20 +3320,18 @@ mod tests {
     }
 
     #[test]
-    fn a_quick_second_stop_is_the_same_request() {
-        let repo = TempRepo::new("run-double-stop");
+    fn a_refusal_before_any_work_leaves_the_notes_open() {
+        let repo = TempRepo::new("run-refusal");
         repo.write("a.txt", "a\n");
-        let (site, nudges) = run_site(&repo, "cancel");
+        let (site, nudges) = run_site(&repo, "refusal");
         post_note(&site, "a.txt", 1, 1, "one");
         send(&site, &["N1"]);
-        wait_for(&site, &nudges, "waiting");
-        let cancel = format!("{RUN}/cancel");
-        assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
-        assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
         let ended = wait_for(&site, &nudges, "ended");
         let last = ended["entries"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(last["reason"], "cancelled", "the agent stopped on its own");
+        assert_eq!(last["reason"], "refusal");
+        assert_eq!(states(&site), [serde_json::json!({ "kind": "open" })]);
     }
+
     #[test]
     fn a_second_stop_ends_an_agent_that_does_not_stop() {
         let repo = TempRepo::new("run-hang");

@@ -504,9 +504,9 @@ impl Drop for Process {
         self.state().closed = true;
         // From here no [`Stopper`] signals the group: the process is about to be reaped.
         lock(&self.group).take();
-        // This blocks the caller (the main thread, under the runner's lock) only as long as
-        // `/bin/kill` runs and the killed process takes to be reaped: milliseconds, since
-        // SIGKILL cannot be caught.
+        // This blocks the caller (the runner drops agents after releasing its lock, on the main,
+        // start or reader thread) only as long as `/bin/kill` runs and the killed process takes
+        // to be reaped: milliseconds, since SIGKILL cannot be caught.
         agents::kill_group(self.child.id());
         // Fails when the group's kill already took the agent, or it had exited: both fine.
         drop(self.child.kill());

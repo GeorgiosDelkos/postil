@@ -70,7 +70,8 @@ use crate::repo::Repo;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long after the first Stop a second one kills the agent. Arbitrary: longer than a double
-/// click or a second Escape, short enough that a hung agent is not waited on.
+/// click or a second Escape, short enough that a hung agent is not waited on. The page keeps a
+/// copy, `FORCE_AFTER_MS` in ui/run-panel.js, to offer Force stop from then on.
 const FORCE_AFTER: Duration = Duration::from_secs(3);
 
 /// How long a send waits for the run lock before it reports another window's run
@@ -119,17 +120,19 @@ struct Slot {
 enum Held {
     #[default]
     None,
-    /// Being started on the start thread. The stopper is there once its process runs.
-    Starting(Option<Stopper>),
+    /// Its process runs and its session is being opened, on the start thread.
+    Starting(Stopper),
     /// Its session is open; it is kept for the next run while it is the one chosen.
     Ready(AgentChoice, Agent),
 }
 
 impl Slot {
-    /// Lets the agent go: a starting one is stopped, a ready one dropped (which stops it), and
-    /// anything either would still report is dropped.
+    /// Lets the agent go: a starting one is stopped, and anything either would still report is
+    /// dropped. The caller drops the returned agent after releasing the slot's lock, which
+    /// stops a ready one.
+    #[must_use = "drop the released agent after the slot's lock: dropping it waits for its process"]
     fn release(&mut self) -> Held {
-        if let Held::Starting(Some(stopper)) = &self.agent {
+        if let Held::Starting(stopper) = &self.agent {
             stopper.stop();
         }
         self.generation += 1;
@@ -172,8 +175,9 @@ impl Runner {
     }
 
     /// Starts a run: sends the notes `ids` to `agent`, starting the agent first unless it is
-    /// the one kept from the last run and still alive. Returns at once; the run reports its
-    /// progress through its log.
+    /// the one kept from the last run and still alive. Returns at once, except while another
+    /// window's run holds the run lock: then it waits up to [`LOCK_PATIENCE`] under the
+    /// runner's lock before it refuses. The run reports its progress through its log.
     ///
     /// # Errors
     ///
@@ -194,14 +198,14 @@ impl Runner {
         )?);
         slot.run = Some(Arc::clone(&run));
 
-        match &slot.agent {
+        let replaced = match &slot.agent {
             Held::Ready(kept, live) if *kept == agent && live.is_alive() => {
                 self.begin(live, &run, ids, &prompt);
+                Held::None
             }
             _ => {
-                // Releasing the agent kept from the last run stops it.
+                // The agent kept from the last run, if any, is stopped when this is dropped.
                 let replaced = slot.release();
-                slot.agent = Held::Starting(None);
                 let pending = Pending {
                     agent,
                     run,
@@ -210,13 +214,11 @@ impl Runner {
                     generation: slot.generation,
                 };
                 self.start(pending);
-                drop(slot);
-                drop(replaced);
-                (self.notify)();
-                return Ok(());
+                replaced
             }
-        }
+        };
         drop(slot);
+        drop(replaced);
         (self.notify)();
         Ok(())
     }
@@ -240,8 +242,8 @@ impl Runner {
         };
         let mut released = Held::None;
         let mut result = Ok(());
-        match asked {
-            _ if !started => {
+        match (started, asked) {
+            (false, _) => {
                 // The agent is still starting: it is stopped, and the run ends now.
                 released = slot.release();
                 run.record(Entry::CancelRequested);
@@ -251,8 +253,8 @@ impl Runner {
             }
             // A second Stop soon after the first is the same request (a double click, a
             // second Escape), not a force.
-            Some(at) if at.elapsed() < FORCE_AFTER => {}
-            Some(_) => {
+            (true, Some(at)) if at.elapsed() < FORCE_AFTER => {}
+            (true, Some(_)) => {
                 // The agent did not stop when asked, so it is ended, and its exit is not
                 // reported over this.
                 released = slot.release();
@@ -261,7 +263,7 @@ impl Runner {
                         .to_owned(),
                 });
             }
-            None => {
+            (true, None) => {
                 run.state().cancel_asked = Some(Instant::now());
                 run.record(Entry::CancelRequested);
                 if let Held::Ready(_, agent) = &slot.agent {
@@ -374,12 +376,9 @@ impl Runner {
             let starting = match spawned {
                 Ok(starting) => starting,
                 Err(error) => {
-                    let mut slot = runner.slot();
-                    if !slot.let_go(generation) {
-                        slot.agent = Held::None;
+                    if !runner.slot().let_go(generation) {
                         failed(&error);
                     }
-                    drop(slot);
                     return (runner.notify)();
                 }
             };
@@ -391,7 +390,7 @@ impl Runner {
                 if slot.let_go(generation) {
                     return;
                 }
-                slot.agent = Held::Starting(Some(starting.stopper()));
+                slot.agent = Held::Starting(starting.stopper());
             }
             let opened = starting.open_session();
 
@@ -459,7 +458,7 @@ impl Runner {
             let mut state = run.state();
             state.cancel_asked = state.cancel_asked.map(|at| {
                 at.checked_sub(FORCE_AFTER)
-                    .expect("the clock runs past 3 s")
+                    .expect("the monotonic clock has run longer than FORCE_AFTER")
             });
         }
     }
@@ -889,7 +888,15 @@ impl Run {
                 error: Error::AgentExited { stderr }.to_string(),
             },
         };
-        let took_turn = !matches!(entry, Entry::Failed { .. } | Entry::Unreadable { .. });
+        // A refusal is the model declining the work: its notes stay open, as for an error.
+        let took_turn = !matches!(
+            entry,
+            Entry::Failed { .. }
+                | Entry::Unreadable { .. }
+                | Entry::Ended {
+                    reason: StopReason::Refusal
+                }
+        );
         let live = self.state().live();
         self.record(entry);
         if took_turn && live {
