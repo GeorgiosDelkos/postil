@@ -11,6 +11,7 @@ import {
   runStatus,
   reviewOf,
   runOf,
+  threadOf,
 } from "./status.js";
 
 const open = (id, path = "a.rs") => ({ id, path, state: { kind: "open" } });
@@ -40,6 +41,29 @@ test("a note's run is the one it was sent in, or the live run carrying it", () =
   assert.equal(runOf(open("N3"), runs, r2), null, "not in the run");
   assert.equal(runOf(open("N2"), runs, run("R2", "ended", [], ["N2"])), null, "a refused turn");
   assert.equal(runOf(sent("N1", "R9"), runs, r2), null, "not read yet");
+});
+
+test("a thread is its run of notes and the follow-ups after it, in order", () => {
+  const follow = (id, of, status = "ended") => ({ ...run(id, status), followUp: { of, text: "more" } });
+  const views = [
+    follow("R5", "R3"),
+    run("R1", "ended"),
+    follow("R3", "R1"),
+    { ...run("R4", "ended"), review: { of: "R3", reviewer: 1, reviewers: 1 } },
+    run("R2", "ended"),
+    follow("R7", "R6"),
+  ];
+  const ids = (id) => threadOf(id, views).map((view) => view.id);
+  assert.deepEqual(ids("R1"), ["R1", "R3", "R5"]);
+  assert.deepEqual(ids("R5"), ["R1", "R3", "R5"], "from any run of it");
+  assert.deepEqual(ids("R2"), ["R2"]);
+  assert.deepEqual(ids("R7"), ["R7"], "its earlier run not read yet");
+  assert.deepEqual(ids("R9"), []);
+
+  const live = follow("R3", "R1", "running");
+  live.notes = ["N1"];
+  assert.equal(runOf(sent("N1", "R1"), new Map(), live), live, "a follow-up under way shows on its notes");
+  assert.equal(runOf(sent("N2", "R1"), new Map(), live), null);
 });
 
 test("a note's status follows its run", () => {

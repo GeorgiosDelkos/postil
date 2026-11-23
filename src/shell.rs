@@ -726,6 +726,16 @@ struct ReviewRun {
     of: String,
 }
 
+/// The body of `POST /api/run/follow`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FollowRun {
+    /// The run to follow up, the latest of its thread: `R3`.
+    of: String,
+    /// What the engineer asks.
+    text: String,
+}
+
 /// The body of `POST /api/run/question`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1052,7 +1062,12 @@ impl Site {
             "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
             "/api/run/question" if post => json_or_error(self.answer_question(request.body())),
             "/api/run/review" if post => json_or_error(self.review_run(request.body())),
-            "/api/run/cancel" | "/api/run/permission" | "/api/run/question" | "/api/run/review" => {
+            "/api/run/follow" if post => json_or_error(self.follow_up(request.body())),
+            "/api/run/cancel"
+            | "/api/run/permission"
+            | "/api/run/question"
+            | "/api/run/review"
+            | "/api/run/follow" => {
                 reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
             }
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
@@ -1143,6 +1158,17 @@ impl Site {
             .map(|name| self.agent_choice(Some(name)))
             .collect::<Result<Vec<_>>>()?;
         self.runner()?.review(&review.of, reviewers)?;
+        Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `POST /api/run/follow`: sends the engineer's follow-up to the agent that
+    /// ran the run it follows, and answers `{}`.
+    fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let follow: FollowRun = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let runner = self.runner()?;
+        let agent = self.agent_choice(Some(runner.agent_of(&follow.of)?))?;
+        runner.follow_up(&follow.of, agent, &follow.text)?;
         Ok(b"{}".to_vec())
     }
 
@@ -3756,6 +3782,107 @@ mod tests {
     }
 
     #[test]
+    fn a_follow_up_goes_to_the_same_conversation_or_tells_a_fresh_agent_the_thread() {
+        let repo = TempRepo::new("run-follow");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        let follow = |of: &str, text: &str| {
+            let body = serde_json::json!({ "of": of, "text": text }).to_string();
+            post(&site, &format!("{RUN}/follow"), &body)
+        };
+
+        let (status, body) = follow("R1", "  and more  ");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let second = wait_for_run(&site, &nudges, "R2");
+        assert_eq!(
+            second["followUp"],
+            serde_json::json!({ "of": "R1", "text": "and more" })
+        );
+        assert_eq!(
+            second["notes"],
+            serde_json::json!(["N1"]),
+            "its thread's notes"
+        );
+        assert_eq!(
+            kinds(&second)[1..3],
+            ["message:got and more", "message:prompt 2"],
+            "the kept agent's second prompt, the engineer's words alone: {second}"
+        );
+        assert_eq!(
+            states(&site),
+            [serde_json::json!({ "kind": "sent", "run": "R1" })],
+            "a follow-up marks no note sent"
+        );
+
+        // A review replaces the kept agent, so the next follow-up starts a fresh one and
+        // tells it the thread.
+        set_reviewers(&site, "plain", &[("Reviewer", "reviewer-silent")]);
+        let body = serde_json::json!({ "of": "R2" }).to_string();
+        assert_eq!(
+            post(&site, &format!("{RUN}/review"), &body).0,
+            StatusCode::OK
+        );
+        wait_for_run(&site, &nudges, "R3");
+        let (status, body) = follow("R2", "again");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let fresh = wait_for_run(&site, &nudges, "R4");
+        let got = kinds(&fresh)
+            .into_iter()
+            .find(|kind| kind.starts_with("message:got "))
+            .unwrap();
+        for part in [
+            "its conversation is gone",
+            "R1 was asked:\n\nThese are review notes",
+            "R2 was asked:\n\nand more\n\nIt answered:\n\ngot and more\n\nprompt 2",
+            "The engineer now asks:\n\nagain",
+        ] {
+            assert!(got.contains(part), "{part:?} in {got}");
+        }
+        assert!(
+            kinds(&fresh).contains(&"message:prompt 1".to_owned()),
+            "{fresh}"
+        );
+        assert_eq!(
+            fresh["followUp"]["text"], "again",
+            "the engineer's words, not the prompt"
+        );
+
+        for (body, status, why) in [
+            (
+                r#"{"of": "R4", "text": "  "}"#,
+                StatusCode::BAD_REQUEST,
+                "has no text",
+            ),
+            (
+                r#"{"of": "R3", "text": "x"}"#,
+                StatusCode::BAD_REQUEST,
+                "R3 is a review",
+            ),
+            (r#"{"of": "R9", "text": "x"}"#, StatusCode::NOT_FOUND, "R9"),
+            (
+                r#"{"of": "R4"}"#,
+                StatusCode::BAD_REQUEST,
+                "unreadable request",
+            ),
+        ] {
+            let (got, reply) = post(&site, &format!("{RUN}/follow"), body);
+            assert_eq!(got, status, "{body}: {reply}");
+            assert!(reply.contains(why), "{body}: {reply}");
+        }
+        assert_eq!(
+            get(&site, &format!("{RUN}/follow")).0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            get_json(&site, RUNS)["runs"],
+            serde_json::json!(["R4", "R3", "R2", "R1"])
+        );
+    }
+
+    #[test]
     fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
         let repo = TempRepo::new("run-cancel");
         repo.write("a.txt", "a\n");
@@ -3950,8 +4077,8 @@ mod tests {
             ("\n", "its first line is not a run header"),
             ("not a header\n", "its first line is not a run header"),
             (
-                r#"{"version":3,"id":"R3","newField":1}"#,
-                "it is version 3, and this build of Postil reads versions 1 to 2",
+                r#"{"version":4,"id":"R3","newField":1}"#,
+                "it is version 4, and this build of Postil reads versions 1 to 3",
             ),
         ] {
             fs::write(runs.join("R3.jsonl"), newest).unwrap();

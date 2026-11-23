@@ -422,6 +422,27 @@ owner on 2026-11-23:
   reviewer's run) and a card per finding with its verdict (it opens the finding whole), and a
   note's dialog shows the findings about that note, in full.
 
+### Follow-ups
+
+A run's dialog ends with a box for a follow-up: what the engineer asks next about the run's
+work (`POST /api/run/follow {of, text}`, `Runner::follow_up`). Decided with the owner on
+2026-11-23: a follow-up is a new run, threaded under the run it follows.
+
+- **The same conversation when it still exists.** The follow-up goes to the agent that ran the
+  thread's latest run. When the kept agent is that agent and ran that run, it gets the
+  engineer's words alone, as the next prompt of its session. Otherwise (the agent exited, a
+  review or another send replaced it, or Postil restarted) a fresh agent gets the thread's
+  earlier prompts and replies first, then the words, with the edited files linked; the
+  follow-up's dialog says so.
+- **A follow-up carries its thread's notes** and marks none sent: it goes with them when the
+  last is deleted, and a note's status shows the follow-up only while it runs.
+- **The header** holds `followUp: {of, text}`, the run it follows and the engineer's words, so
+  the dialog shows the words and not the longer prompt a fresh agent got. The run log is
+  version 3 for it; older logs read as before.
+- **One card per thread.** The Run tab lists the run of notes, with the status of the thread's
+  latest run; the dialog shows that run, then each follow-up (the words, the steps, the
+  reply), its Review section, and the box. Review still reviews the first run's work.
+
 ### Cards and dialogs
 
 Every list in the tray is made of small cards: a status, a place, an id, and the note in two
@@ -639,12 +660,12 @@ retired; the measured numbers above are the baseline to not regress.
    Markdown subset (built as elements, never parsed as HTML). `Esc` stops the run. A run
    sent from the send step takes the front, and so does one that needs the engineer; the
    foot of the sidebar shows the agent's state. The open file and the notes are read again when the run moves on and when
-   an edit finishes. Not built: the follow-up field under the run (milestone 4).
+   an edit finishes. The follow-up box came in milestone 4.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
-   Built: resolving notes, from the note's dialog (Resolve, Reopen). Planned with the owner on
-   2026-11-23: follow-ups are new runs sent to the same conversation and threaded under the
-   first run's card; snapshots are git trees written through a temporary index before and after
-   each run; the changes view is a unified diff per file with notes beside their lines.
+   Built: resolving notes, from the note's dialog (Resolve, Reopen), and follow-ups (section
+   "Follow-ups"). Planned with the owner on 2026-11-23: snapshots are git trees written through
+   a temporary index before and after each run; the changes view is a unified diff per file
+   with notes beside their lines.
 5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at
    the owner's request (2026-11-22): the settings dialog and file, with agent detection,
    custom agents, the agent and the reviewers (sections "Agents" and "Settings"; it replaces

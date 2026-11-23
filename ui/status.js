@@ -9,6 +9,8 @@ import { diffStats, foldRun, isLive, isOpen, isResolved, sentIn, toolRow } from 
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
 // `runs` maps a run id to its view; `live` is the latest run of this window, or null.
 export function runOf(note, runs, live) {
+  // A follow-up under way works on its thread's notes, so they show it while it runs.
+  if (isLive(live) && live.followUp && live.notes.includes(note.id)) return live;
   const id = sentIn(note);
   if (id !== null) return live?.id === id ? live : (runs.get(id) ?? null);
   // A reviewer's run carries the notes it reviews, but they were not sent in it.
@@ -145,6 +147,28 @@ export function groupNotes(notes, statusOf) {
   const number = (note) => Number(sentIn(note)?.slice(1) ?? 0);
   done.sort((a, b) => number(b) - number(a));
   return { inRun, open, done, resolved };
+}
+
+// The runs of the thread run `id` is in, among `views` (every run read so far): the run of
+// notes it started from, then its follow-ups in the order they were sent (src/run.rs,
+// `follow_up`). A follow-up whose earlier run is not read yet starts a thread of its own
+// until it is.
+export function threadOf(id, views) {
+  const byId = new Map(views.map((view) => [view.id, view]));
+  const rootOf = (view) => {
+    let at = view;
+    for (let seen = 0; at?.followUp && seen < views.length; seen += 1) {
+      const before = byId.get(at.followUp.of);
+      if (!before) break;
+      at = before;
+    }
+    return at.id;
+  };
+  const start = byId.get(id);
+  if (!start) return [];
+  const root = rootOf(start);
+  const number = (view) => Number(view.id.slice(1));
+  return views.filter((view) => !view.review && rootOf(view) === root).sort((a, b) => number(a) - number(b));
 }
 
 // The latest review of run `id` among `views` (every run read so far; src/review.rs): its

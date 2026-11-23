@@ -47,7 +47,7 @@
 //! `notify`, and fetches what it has not seen.
 
 use std::collections::BTreeSet;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -80,14 +80,19 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// when from [`RunView`]'s `force_in`.
 const FORCE_AFTER: Duration = Duration::from_secs(3);
 
+/// The most runs a thread of follow-ups is read through. Arbitrary, far above any real thread:
+/// it only stops a hand-edited log whose follow-ups loop.
+const MAX_THREAD: usize = 1000;
+
 /// How long a send waits for the run lock before it reports another window's run
 /// ([`take_run_lock`]). Arbitrary: far longer than a fork-to-exec window, short enough that a
 /// refused send answers at once.
 const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
-/// (`review` in the header, the `findings` entry); version 1 logs read as runs of notes.
-const LOG_VERSION: u32 = 2;
+/// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
+/// header). Older logs read as runs of notes.
+const LOG_VERSION: u32 = 3;
 
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
@@ -242,7 +247,7 @@ impl Runner {
             &agent.name,
             ids,
             &prompt.text,
-            None,
+            Origin::Notes,
         )?);
         slot.run = Some(Arc::clone(&run));
 
@@ -269,6 +274,126 @@ impl Runner {
         drop(replaced);
         (self.notify)();
         Ok(())
+    }
+
+    /// Sends `text`, the engineer's follow-up to run `of`, to `agent` as a new run that
+    /// follows it (docs/design.md, "Follow-ups"). It goes to the same conversation when the
+    /// kept agent is `agent` and ran `of`, this window's latest run. Otherwise a fresh agent
+    /// gets the thread's earlier prompts and replies before the text. The run carries `of`'s
+    /// notes, so it goes with them, and marks none sent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TurnRunning`] while a run of this window is under way, and
+    /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] for a blank
+    /// text or a run that is a review; as [`Runner::view_of`] for `of` and the runs it
+    /// follows; and [`Error::WriteRun`] when the run log cannot be created.
+    pub(crate) fn follow_up(
+        self: &Arc<Self>,
+        of: &str,
+        agent: AgentChoice,
+        text: &str,
+    ) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(Error::BadRequest("the follow-up has no text".to_owned()));
+        }
+        let thread = self.thread(of)?;
+        let followed = thread
+            .last()
+            .expect("a thread holds at least the run it ends with");
+        let notes = {
+            let state = followed.state();
+            if state.header.review.is_some() {
+                return Err(Error::BadRequest(format!(
+                    "{of} is a review: follow up the run it reviews"
+                )));
+            }
+            state.header.notes.clone()
+        };
+        // Takes each run's state lock in turn, so it runs after `followed`'s is let go.
+        let files = edited_files(&thread);
+        let mut slot = self.slot();
+        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
+            return Err(Error::TurnRunning);
+        }
+        slot.chain = None;
+        let same_conversation = matches!(
+            &slot.agent,
+            Held::Ready(kept, live) if *kept == agent && live.is_alive()
+        ) && slot
+            .run
+            .as_ref()
+            .is_some_and(|run| Arc::ptr_eq(run, followed));
+        let prompt = Prompt {
+            text: if same_conversation {
+                text.to_owned()
+            } else {
+                fresh_follow_up(&thread, text)
+            },
+            files: if same_conversation { Vec::new() } else { files },
+        };
+        let run = Arc::new(Run::create(
+            &self.repo.runs_dir(),
+            &agent.name,
+            &notes,
+            &prompt.text,
+            Origin::FollowUp(FollowUp {
+                of: of.to_owned(),
+                text: text.to_owned(),
+            }),
+        )?);
+        slot.run = Some(Arc::clone(&run));
+        let replaced = match &slot.agent {
+            Held::Ready(_, live) if same_conversation => {
+                // A follow-up marks no note sent: the notes went to the run it follows.
+                self.begin(live, &run, &[], &prompt);
+                Held::None
+            }
+            _ => {
+                let replaced = slot.release();
+                let pending = Pending {
+                    agent,
+                    run,
+                    ids: Vec::new(),
+                    prompt,
+                    generation: slot.generation,
+                };
+                self.start(pending);
+                replaced
+            }
+        };
+        drop(slot);
+        drop(replaced);
+        (self.notify)();
+        Ok(())
+    }
+
+    /// The runs of the thread that ends with run `of`: the run of notes it started from, then
+    /// each follow-up in order, `of` last.
+    fn thread(&self, of: &str) -> Result<Vec<Arc<Run>>> {
+        let mut thread = vec![self.run_by_id(of)?];
+        loop {
+            let before = thread
+                .last()
+                .expect("the thread starts with one run")
+                .state()
+                .header
+                .follow_up
+                .as_ref()
+                .map(|follow_up| follow_up.of.clone());
+            let Some(before) = before else { break };
+            // Run numbers only grow, so a follow-up names an older run and the walk ends; the
+            // check guards against a log edited by hand into a loop.
+            if thread.len() > MAX_THREAD {
+                return Err(Error::BadRequest(format!(
+                    "the thread of {of} is longer than {MAX_THREAD} runs"
+                )));
+            }
+            thread.push(self.run_by_id(&before)?);
+        }
+        thread.reverse();
+        Ok(thread)
     }
 
     /// Starts a review of run `of` by `reviewers`, in order (`review.rs`): each stage is a run
@@ -358,7 +483,7 @@ impl Runner {
             &agent.name,
             &chain.notes,
             &text,
-            Some(chain.stage.clone()),
+            Origin::Review(chain.stage.clone()),
         )?);
         slot.run = Some(Arc::clone(&run));
         let replaced = slot.release();
@@ -555,6 +680,15 @@ impl Runner {
     /// when its log is missing or cannot be read.
     pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
         Ok(self.run_by_id(id)?.view(0))
+    }
+
+    /// The name of the agent that ran run `id`: a follow-up goes to it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::view_of`].
+    pub(crate) fn agent_of(&self, id: &str) -> Result<String> {
+        Ok(self.run_by_id(id)?.state().header.agent.clone())
     }
 
     /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.
@@ -1033,6 +1167,28 @@ struct Header {
     /// the chain. Absent for a run of notes, and in every log written before reviews.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     review: Option<Stage>,
+    /// Set when the run is a follow-up: the run it follows and the engineer's words. Absent
+    /// in every log written before follow-ups. Never set together with `review`
+    /// ([`Origin`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    follow_up: Option<FollowUp>,
+}
+
+/// What a new run is: a send of notes, a reviewer's stage, or a follow-up. One value, so a
+/// header never holds both a review and a follow-up.
+enum Origin {
+    Notes,
+    Review(Stage),
+    FollowUp(FollowUp),
+}
+
+/// A follow-up run's link to its thread: `of` is the run it follows, `text` what the engineer
+/// wrote. The prompt holds more when a fresh agent had to be told the thread first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FollowUp {
+    of: String,
+    text: String,
 }
 
 /// The one field of a header that every log version has. Unknown fields are ignored here on
@@ -1202,6 +1358,8 @@ pub(crate) struct RunView {
     force_in: Option<u64>,
     /// For a reviewer's run, which run it reviews and its place in the chain.
     review: Option<Stage>,
+    /// For a follow-up, the run it follows and the engineer's words.
+    follow_up: Option<FollowUp>,
 }
 
 impl Run {
@@ -1212,7 +1370,7 @@ impl Run {
         agent: &str,
         notes: &[String],
         prompt: &str,
-        review: Option<Stage>,
+        origin: Origin,
     ) -> Result<Self> {
         let error = |path: &Path| {
             let path = path.to_owned();
@@ -1248,6 +1406,11 @@ impl Run {
                 Err(source) => return Err(Error::WriteRun { path: file, source }),
             }
         };
+        let (review, follow_up) = match origin {
+            Origin::Notes => (None, None),
+            Origin::Review(stage) => (Some(stage), None),
+            Origin::FollowUp(follow_up) => (None, Some(follow_up)),
+        };
         let header = Header {
             version: LOG_VERSION,
             id: format!("R{number}"),
@@ -1258,6 +1421,7 @@ impl Run {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
             review,
+            follow_up,
         };
         if let Err(source) = log.write_all(&json_line(&header)) {
             // A log without its header would be skipped as unreadable on every restart.
@@ -1461,6 +1625,7 @@ impl Run {
                     .expect("at most FORCE_AFTER, 3 s")
             }),
             review: state.header.review.clone(),
+            follow_up: state.header.follow_up.clone(),
         }
     }
 }
@@ -1810,6 +1975,49 @@ fn relative(path: &str, root: &Path) -> String {
     )
 }
 
+/// The prompt of a follow-up that goes to a fresh agent: the thread so far, each run's prompt
+/// and reply in order, then the engineer's `text`. The diffs stay out: the agent reads the
+/// files as they are now, linked after the text.
+fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
+    let mut prompt = String::from(
+        "You are continuing work another coding agent did in this repository; its \
+         conversation is gone. Here is what it was asked and what it answered, oldest first. \
+         Read the files for their current state.\n",
+    );
+    for run in thread {
+        let state = run.state();
+        let asked = state
+            .header
+            .follow_up
+            .as_ref()
+            .map_or(state.header.prompt.as_str(), |follow_up| &follow_up.text);
+        write!(
+            prompt,
+            "\n{} was asked:\n\n{}\n\nIt answered:\n\n{}\n",
+            state.header.id,
+            asked.trim_end(),
+            state.reply().trim()
+        )
+        .expect("writing to a String cannot fail");
+    }
+    write!(prompt, "\nThe engineer now asks:\n\n{text}\n")
+        .expect("writing to a String cannot fail");
+    prompt
+}
+
+/// The files the thread's runs edited, each once, in the order first edited.
+fn edited_files(thread: &[Arc<Run>]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for run in thread {
+        for diff in run.state().work().diffs {
+            if !files.contains(&diff.path) {
+                files.push(diff.path);
+            }
+        }
+    }
+    files
+}
+
 /// The prompt as ACP content: the text, then a link to each file with notes. Every agent
 /// accepts both block types, so no capability check is needed.
 fn prompt_blocks(prompt: &Prompt, root: &Path) -> Vec<ContentBlock> {
@@ -1858,7 +2066,14 @@ mod tests {
     fn debug_output_names_the_run_but_never_shows_its_prompt() {
         let dir = std::env::temp_dir().join(format!("postil-run-debug-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "secret prompt", None).unwrap();
+        let run = Run::create(
+            &dir,
+            "Fake",
+            &["N1".to_owned()],
+            "secret prompt",
+            Origin::Notes,
+        )
+        .unwrap();
         run.record(Entry::Thought {
             text: "secret thought".to_owned(),
         });
@@ -1876,7 +2091,7 @@ mod tests {
     fn after_a_failed_write_the_log_is_not_written_again_and_the_run_says_so() {
         let dir = std::env::temp_dir().join(format!("postil-run-log-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", None).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
         let written = fs::read(&run.file).unwrap();
         // A log that refuses writes, as a full disk would.
         run.state().log = Some(File::open(&run.file).unwrap());
@@ -1909,7 +2124,7 @@ mod tests {
     fn the_work_holds_each_finished_call_s_last_diffs_and_the_reply_by_message() {
         let dir = std::env::temp_dir().join(format!("postil-run-work-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", None).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
         let diff = |after: &str| Output::Diff {
             path: "a.rs".to_owned(),
             old_text: None,
