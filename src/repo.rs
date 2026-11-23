@@ -165,9 +165,10 @@ impl Repo {
     /// since the last one, untracked files included. It starts from a copy of the real index,
     /// and again whenever the two track different ignored files (one force-added, or one taken
     /// out of git and added to `.gitignore`), which `git add --all` cannot reconcile; each copy
-    /// hashes the untracked files in full once. One that git cannot use is removed, and the
-    /// next snapshot starts afresh. `git add` runs the
-    /// repository's clean filters (git-lfs copies a changed file into `.git/lfs`). The tree and
+    /// hashes the untracked files in full once. A snapshot index git cannot read is copied
+    /// again at once; one that fails `git add` or `write-tree` is removed, so the next snapshot
+    /// starts afresh. `git add` runs the repository's clean filters (git-lfs copies a changed
+    /// file into `.git/lfs`). The tree and
     /// its blobs are objects no ref holds, so `git gc` may prune them once they are older than
     /// its prune period (two weeks by default).
     ///
@@ -234,8 +235,15 @@ impl Repo {
         ];
         let listed = |index: Option<&Path>| -> Option<HashSet<String>> {
             let list = run_git(&self.root, index, &args).ok()?;
-            // During a merge conflict a path is listed once per stage.
-            Some(list.split_terminator('\0').map(str::to_owned).collect())
+            // During a merge conflict a path is listed once per stage. A path gone from disk
+            // is dropped from ours by `git add --all` but stays in the real index until the
+            // deletion is staged; counting it would copy the index again on every snapshot.
+            Some(
+                list.split_terminator('\0')
+                    .filter(|path| self.root.join(path).symlink_metadata().is_ok())
+                    .map(str::to_owned)
+                    .collect(),
+            )
         };
         match (listed(Some(index)), listed(None)) {
             (Some(ours), Some(real)) => ours != real,
