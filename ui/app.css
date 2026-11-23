@@ -1607,10 +1607,22 @@ button.repo-name:hover {
 
 .send-bar .send {
   flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  min-width: 0;
   gap: 10px;
+}
+
+.send-words {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The send step's split button: the send part and the agent part share one shape. */
+.send-bar.split {
+  gap: 0;
+}
+
+.send-bar.split .send {
+  border-radius: 7px 0 0 7px;
 }
 
 .send-bar .send kbd {
@@ -1624,22 +1636,12 @@ button.repo-name:hover {
   filter: none;
 }
 
-.agent-picker {
+.send-bar .agent-picker {
   flex: none;
-  max-width: 45%;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  border-color: var(--accent);
-  color: var(--text-strong);
-}
-
-.agent-picker .chevron {
-  font-size: 10px;
-  color: var(--text-muted);
+  width: 34px;
+  padding: 0;
+  border-left-color: rgb(0 0 0 / 25%);
+  border-radius: 0 7px 7px 0;
 }
 
 .note-item:has(.note-tick) {
@@ -1727,15 +1729,39 @@ button.repo-name:hover {
 
 .run-title {
   min-width: 0;
+  display: flex;
+  align-items: center;
   overflow: hidden;
   white-space: nowrap;
-  text-overflow: ellipsis;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
 .run-title strong {
-  font-weight: 600;
+  font-weight: 500;
   color: var(--text-strong);
+}
+
+.run-title .run-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.run-title .status-icon {
+  margin-right: 6px;
+}
+
+.run-title .run-word.done {
+  color: var(--added);
+}
+
+.run-title .run-word.attention {
+  color: var(--attention);
+}
+
+.run-title .run-word.failed {
+  color: var(--removed);
 }
 
 .run-time {
@@ -1772,6 +1798,8 @@ button.repo-name:hover {
   border-color: var(--border);
 }
 
+/* The Run tab reads top to bottom: a question, the plan, the notes, the steps, the reply
+   (docs/design.md, "The Run tab"). Steps sit close together; each part has room above it. */
 .run {
   flex: 1;
   min-height: 0;
@@ -1779,13 +1807,134 @@ button.repo-name:hover {
   padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 2px;
   font-size: 12.5px;
 }
 
+.run > :is(.permission, .run-plan, .run-notes, .run-steps-label, .run-reply, .run-notice, .run-error) {
+  margin-top: 14px;
+}
+
+.run > :first-child {
+  margin-top: 0;
+}
+
 .run-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
   font-size: 11.5px;
   color: var(--text-muted);
+}
+
+.run-more {
+  padding: 0 4px;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  color: var(--accent);
+  font: inherit;
+}
+
+.run-more:hover {
+  text-decoration: underline;
+}
+
+.run-progress {
+  height: 4px;
+  overflow: hidden;
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.run-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 200ms ease-out;
+}
+
+.run-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.run-note {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+}
+
+.run-note:hover {
+  border-color: var(--border-strong);
+}
+
+.run-note.needs {
+  border-color: var(--attention-border);
+}
+
+.run-note-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.run-note-status {
+  flex: 1;
+  font-family: "Geist", system-ui, sans-serif;
+  color: var(--text-soft);
+}
+
+.run-note-status.done {
+  color: var(--added);
+}
+
+.run-note-status.attention {
+  color: var(--attention);
+}
+
+.run-note-status.failed {
+  color: var(--removed);
+}
+
+.run-note-said {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 18px;
+}
+
+.run-reply {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.run-reply-body.cut {
+  max-height: 200px;
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, black 70%, transparent);
+  -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent);
+}
+
+.run-whole {
+  align-self: flex-start;
+  height: 26px;
+  font-size: 12px;
 }
 
 .run-plan {

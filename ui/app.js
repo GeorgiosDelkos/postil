@@ -1203,6 +1203,8 @@ const runs = runPanel({
   statusEl: $("agent-status"),
   onChange: followRun,
   onError: showToast,
+  noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
+  openNote: (id) => noteDetail.open(id),
 });
 
 const noteDialogEl = $("note-dialog");
@@ -1235,14 +1237,18 @@ function renderSendBar() {
   sendBarEl.hidden = !shown;
   if (!shown) return;
 
+  // In the send step the bar is one split button: the wide part sends and names the agent,
+  // the narrow part chooses it (chosen with the owner on 2026-11-23 over a separate picker).
   const picker = $("agent-picker");
   picker.hidden = !state.send;
-  picker.replaceChildren(chosenAgent() ?? "Choose an agent", el("span", "chevron", "▴"));
+  sendBarEl.classList.toggle("split", Boolean(state.send));
   const button = $("send-button");
   const count = state.send ? tickedIds().length : open;
   const noun = count === 1 ? "1 note" : `${count} notes`;
-  button.replaceChildren(state.send ? `Send ${noun}` : `Send ${noun}…`, el("kbd", "", "⌘⇧↵"));
-  button.disabled = Boolean(state.send) && (count === 0 || !chosenAgent() || state.send.sending);
+  const agent = chosenAgent();
+  const words = !state.send ? `Send ${noun}…` : agent ? `Send ${noun} to ${agent}` : "Choose an agent";
+  button.replaceChildren(el("span", "send-words", words), el("kbd", "", "⌘⇧↵"));
+  button.disabled = Boolean(state.send) && agent !== null && (count === 0 || state.send.sending);
 }
 
 // Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
@@ -1345,8 +1351,9 @@ async function startRun(ids, agent) {
 }
 
 $("send-button").addEventListener("click", () => {
-  if (state.send) sendNotes();
-  else openSend();
+  if (!state.send) openSend();
+  else if (chosenAgent()) sendNotes();
+  else $("agent-picker").click();
 });
 
 // The agents turned on in the settings, to send this one run to; the settings' agent is the

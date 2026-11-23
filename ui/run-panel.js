@@ -19,6 +19,16 @@ import {
   toolRow,
   underWay,
 } from "./run.js";
+import { statusIcon } from "./note-dialog.js";
+import { agentSaid, noteStatus, planProgress } from "./status.js";
+
+// A finished run shows this many of its last steps until "Show all" (docs/design.md, "The
+// Run tab"). Arbitrary: enough to see how the run ended.
+const STEPS_SHOWN = 5;
+
+// A reply longer than this many characters is cut until "Show the whole reply". Arbitrary:
+// about ten lines in a tray of the default width.
+const REPLY_CUT = 700;
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -27,10 +37,11 @@ function el(tag, className, text) {
   return node;
 }
 
-// `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
+// `noteOf(id)` gives a note by id, or null once it is deleted; `openNote(id)` opens its
+// detail. `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
 // sidebar's agent status. `onChange(run, previous)` is called after every fetch that
 // changed the run, so the page can follow it (switch tabs, re-read files).
-export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
+export function runPanel({ panelEl, headerEl, statusEl, onChange, onError, noteOf, openNote }) {
   let run = null;
   let fetching = false;
   let again = false;
@@ -41,6 +52,9 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
   let views = new Map();
   let drawnRun = null;
+  // Whether the engineer asked for every step of a finished run, and for its whole reply.
+  let allSteps = false;
+  let wholeReply = false;
   // Whether the panel follows the end of the run: true until the engineer scrolls up, and
   // again once they scroll back to the end. Scrolling up is read as any move above where
   // `reveal` last put the panel, not as a distance from the end: a slow trackpad scroll moves
@@ -141,6 +155,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       drawnRun = run?.id ?? null;
       follow = true;
       forceAt = null;
+      allSteps = false;
+      wholeReply = false;
     }
     renderStatus();
     renderHeader();
@@ -148,13 +164,38 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       panelEl.replaceChildren(el("div", "empty", "No run yet. Send notes to an agent to start one."));
       return;
     }
+    // Top to bottom: what needs the engineer, the plan, each note's result, the steps, and the
+    // agent's reply (docs/design.md, "The Run tab").
     const { plan, items } = foldRun(run.entries);
     const live = isLive(run);
+    const asking = items.filter((item) => item.type === "permission" && item.answer === undefined);
+    const steps = items.filter((item) => item.type !== "message" && !asking.includes(item));
+    const messages = items.filter((item) => item.type === "message");
     const wanted = [];
+    const itemEntry = (item, index) => [
+      itemKey(item, index),
+      signature(item, live),
+      item.output ?? null,
+      (open) => itemView(item, open),
+    ];
+    for (const item of asking) wanted.push(itemEntry(item, items.indexOf(item)));
     if (plan?.length) wanted.push(["plan", JSON.stringify(plan), null, () => planView(plan)]);
-    items.forEach((item, index) => {
-      wanted.push([itemKey(item, index), signature(item, live), item.output, (open) => itemView(item, open)]);
-    });
+
+    const cards = run.notes.map((id) => noteCard(id));
+    wanted.push(["notes", JSON.stringify(cards), null, () => notesView(cards)]);
+
+    if (steps.length) {
+      const cut = !live && !allSteps && steps.length > STEPS_SHOWN + 1;
+      wanted.push(["steps", JSON.stringify([steps.length, cut]), null, () => stepsLabel(steps.length, cut)]);
+      for (const item of cut ? steps.slice(-STEPS_SHOWN) : steps) {
+        wanted.push(itemEntry(item, items.indexOf(item)));
+      }
+    }
+    if (messages.length) {
+      const texts = messages.map((message) => message.text);
+      const cut = !live && !wholeReply && texts.join("").length > REPLY_CUT;
+      wanted.push(["reply", JSON.stringify([texts, live, cut]), null, () => replyView(texts, live, cut)]);
+    }
     if (run.problem) wanted.push(["problem", run.problem, null, () => el("div", "run-notice", run.problem)]);
     if (wanted.length === 0) {
       wanted.push(["empty", statusLine(run).text, null, () => el("div", "empty", statusLine(run).text)]);
@@ -228,13 +269,23 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       headerEl.replaceChildren();
       return;
     }
+    // The status's icon and word, then the run, its agent and, while it runs, its time.
+    const { text, tone } = statusLine(run);
+    const word = run.status === "unfinished" ? "Unfinished" : text;
+    const kind = { busy: "working", attention: "needs", done: "addressed", failed: "failed" }[tone];
+    const title = el("span", "run-title");
+    title.title = text;
     const time = el("span", "run-time");
     const tick = () => {
-      time.textContent = elapsed(Date.now() / 1000 - run.startedAt);
+      if (isLive(run)) time.textContent = ` · ${elapsed(Date.now() / 1000 - run.startedAt)}`;
     };
     tick();
-    const title = el("span", "run-title");
-    title.append(el("strong", "", run.agent), " · ", time);
+    title.append(
+      statusIcon(kind ?? "stopped"),
+      el("strong", `run-word ${tone}`, word),
+      el("span", "run-meta", ` · ${run.id} · ${run.agent}`),
+      time,
+    );
     const parts = [title];
     if (!isLive(run) || run.status !== "cancelling") forceAt = null;
     if (isLive(run)) {
@@ -256,17 +307,90 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       }, 1000);
       button.addEventListener("click", stop);
       parts.push(button);
-    } else {
-      const { text, tone } = statusLine(run);
-      time.textContent = run.id;
-      parts.push(el("span", `run-end ${tone}`, text));
     }
     headerEl.replaceChildren(...parts);
   }
 
+  // A note sent in the run: its status in this run and the agent's line about it.
+  function noteCard(id) {
+    const note = noteOf(id);
+    if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle", said: null };
+    const { start, end } = note.lines;
+    const where = `${note.path.split("/").at(-1)}:${start === end ? start : `${start}-${end}`}`;
+    const status = noteStatus(note, run);
+    return { id, where, ...status, said: agentSaid(run, id) };
+  }
+
+  function notesView(cards) {
+    const view = el("section", "run-notes");
+    const addressed = cards.filter((card) => card.kind === "addressed").length;
+    const label = el("div", "run-label");
+    label.append(
+      el("span", "", cards.length === 1 ? "Note" : `Notes · ${cards.length}`),
+      el("span", "", addressed ? `${addressed} addressed` : ""),
+    );
+    view.append(label);
+    for (const card of cards) {
+      const button = el("button", `run-note ${card.kind}`);
+      button.type = "button";
+      const head = el("span", "run-note-head");
+      head.append(
+        statusIcon(card.kind),
+        el("span", `run-note-status ${card.tone}`, card.label),
+        el("span", "run-note-where", card.where),
+        el("span", "note-id", card.id),
+      );
+      button.append(head);
+      if (card.said) button.append(el("span", "run-note-said", card.said));
+      button.addEventListener("click", () => openNote(card.id));
+      view.append(button);
+    }
+    return view;
+  }
+
+  function stepsLabel(count, cut) {
+    const label = el("div", "run-label run-steps-label");
+    label.append(el("span", "", count === 1 ? "Step" : `Steps · ${count}`));
+    if (cut) {
+      const more = el("button", "run-more", "Show all");
+      more.type = "button";
+      more.addEventListener("click", () => {
+        allSteps = true;
+        render();
+      });
+      label.append(more);
+    }
+    return label;
+  }
+
+  function replyView(texts, live, cut) {
+    const view = el("section", "run-reply");
+    view.append(el("div", "run-label", live ? `${run.agent} is writing` : `${run.agent}'s reply`));
+    const body = el("div", cut ? "run-reply-body cut" : "run-reply-body");
+    for (const text of texts) body.append(markdownView(text));
+    view.append(body);
+    if (cut) {
+      const more = el("button", "button run-whole", "Show the whole reply");
+      more.type = "button";
+      more.addEventListener("click", () => {
+        wholeReply = true;
+        render();
+      });
+      view.append(more);
+    }
+    return view;
+  }
+
   function planView(plan) {
     const view = el("section", "run-plan");
-    view.append(el("div", "run-label", "Plan"));
+    const progress = planProgress(run);
+    const label = el("div", "run-label");
+    label.append(el("span", "", `Plan · ${progress.done} of ${progress.total}`));
+    const bar = el("div", "run-progress");
+    const fill = el("div", "run-progress-fill");
+    fill.style.width = `${(100 * progress.done) / progress.total}%`;
+    bar.append(fill);
+    view.append(label, bar);
     for (const step of plan) {
       const row = el("div", `plan-step ${step.status}`);
       const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
