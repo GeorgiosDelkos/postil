@@ -1,5 +1,7 @@
 //! The `postil` binary's failures that happen before any window opens.
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -66,6 +68,40 @@ fn bad_arguments_print_usage_and_exit_2() {
     assert!(stderr.contains("--bench needs a file"), "{stderr}");
     assert!(stderr.contains("usage: postil"), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+}
+
+/// `prefix` followed by the byte 0xFF, which is never UTF-8.
+fn not_utf8(prefix: &str) -> OsString {
+    let mut bytes = prefix.as_bytes().to_vec();
+    bytes.push(0xFF);
+    OsString::from_vec(bytes)
+}
+
+#[test]
+fn a_folder_that_is_not_utf8_is_looked_for_like_any_other() {
+    let output = command()
+        .arg(not_utf8("/no/such/"))
+        .output()
+        .expect("the test binary was built by cargo");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr, "postil: /no/such/\u{FFFD} is not a folder\n");
+}
+
+#[test]
+fn a_bench_file_that_is_not_utf8_prints_usage_and_exits_2() {
+    let output = command()
+        .args([OsString::from("--bench"), not_utf8("a")])
+        .output()
+        .expect("the test binary was built by cargo");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("postil: --bench needs a UTF-8 file name, not a\u{FFFD}\nusage:"),
+        "{stderr}"
+    );
 }
 
 #[test]
