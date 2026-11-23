@@ -538,9 +538,16 @@ kbd {
   gap: 8px;
 }
 
+/* A button lays out its label and any key hint (`kbd`) in a row with a gap, so no button
+   puts the hint against its words. */
 .button {
   height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   padding: 0 12px;
+  white-space: nowrap;
   background: transparent;
   border: 1px solid var(--border-strong);
   border-radius: 7px;
@@ -563,6 +570,18 @@ kbd {
 
 .button.primary:hover {
   filter: brightness(1.08);
+}
+
+.button kbd {
+  padding: 0 4px;
+  border-color: currentColor;
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  filter: none;
 }
 
 /* Tray */
