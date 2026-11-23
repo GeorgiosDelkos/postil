@@ -250,13 +250,15 @@ export function runFailure(run) {
 }
 
 // What the run and note dialogs show of a review (`reviewOf`), as plain data to compare:
-// each stage's status and each finding with its verdict. A stage's entries are left out, so
-// a reviewer that streams leaves the dialogs alone until something shown changes.
+// each stage's status and each finding with its verdict's word. A stage's entries are left
+// out, and so is the judge's line (the verdict's text), which grows with every token while
+// the judge writes it: a reviewer that streams leaves the dialogs alone until something shown
+// changes. The note dialog, which shows the judge's line, adds it for its own findings.
 export function reviewKey(review) {
   if (!review) return null;
   return [
     review.stages.map((stage) => [stage.id, stage.agent, stage.review.reviewer, stage.status, statusLine(stage)]),
-    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [id, note, text, fix, path, line, verdict]),
+    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [id, note, text, fix, path, line, verdict.word]),
     review.problems,
   ];
 }
@@ -339,5 +341,6 @@ export function noteDialogKey(note, run, review, shown) {
     fileStats(note, run),
     noteHistory(note, run),
     reviewKey(review),
+    review?.findings.filter((finding) => finding.note === note.id).map((finding) => finding.verdict.text) ?? null,
   ]);
 }

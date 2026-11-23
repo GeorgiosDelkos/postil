@@ -11,6 +11,7 @@ import {
   planProgress,
   runStatus,
   replyText,
+  reviewKey,
   reviewOf,
   latestOfThreads,
   runOf,
@@ -230,6 +231,20 @@ test("the note dialog keeps its key while its run streams what the dialog does n
     streaming("R2", "running", entries, { review: { of: "R1", reviewer: 1, reviewers: 1 } });
   const reviewed = (entries) => key(start, "running", reviewOf("R1", [stage(entries)]));
   assert.equal(reviewed([said("reading")]), reviewed([said("reading"), said(" on")]), "a reviewer's token");
+});
+
+test("a judge writing its line changes the verdict's word only for the run dialog", () => {
+  const stage = (id, reviewer, entries) =>
+    streaming(id, "running", entries, { review: { of: "R1", reviewer, reviewers: 2 } });
+  const finding = { id: "F1", note: "N1", path: "a.rs", line: 1, text: "too short", fix: null };
+  const proposer = { ...stage("R2", 1, [{ kind: "findings", findings: [finding], problem: null }]), status: "ended" };
+  const review = (line) => reviewOf("R1", [proposer, stage("R3", 2, [said(line)])]);
+  const writing = review("F1: accepted - bec");
+  const more = review("F1: accepted - because it");
+  assert.deepEqual(reviewKey(more), reviewKey(writing), "the run dialog shows only the word");
+  assert.notDeepEqual(reviewKey(review("F1: rejected - no")), reviewKey(writing), "a new word");
+  const noteKey = (judged) => noteDialogKey(sent("N1", "R1"), streaming("R1", "ended", []), judged, []);
+  assert.notEqual(noteKey(more), noteKey(writing), "the note dialog shows the judge's line");
 });
 
 test("the run dialog keeps its key while the agent streams its reply and thoughts", () => {
