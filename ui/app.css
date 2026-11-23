@@ -57,6 +57,9 @@
   --syntax-constant: #dcc28c;
   --syntax-punctuation: #a9adb6;
 
+  /* How far every disabled control fades. */
+  --disabled-opacity: 0.45;
+
   /* The code view's text size, line height, and tab width. ui/app.js sets all three from the
      settings (applySettings) and places rows by the line height; these are the defaults. */
   --code-font-size: 13px;
@@ -574,8 +577,9 @@ kbd {
 }
 
 .button:disabled {
-  opacity: 0.5;
+  opacity: var(--disabled-opacity);
   filter: none;
+  pointer-events: none;
 }
 
 /* Tray */
@@ -888,7 +892,7 @@ body.welcome-mode > .pane {
 }
 
 .recent-item:disabled {
-  opacity: 0.5;
+  opacity: var(--disabled-opacity);
 }
 
 .recent-name {
@@ -1231,18 +1235,13 @@ button.repo-name:hover {
 }
 
 .icon-button:disabled {
-  opacity: 0.35;
+  opacity: var(--disabled-opacity);
 }
 
 .button.danger {
   color: var(--text-strong);
   border-color: var(--text-muted);
   font-weight: 600;
-}
-
-.button:disabled {
-  opacity: 0.45;
-  pointer-events: none;
 }
 
 /* A choice of a few values, drawn as one control with the chosen part raised. */
@@ -1281,7 +1280,7 @@ button.repo-name:hover {
 }
 
 .segment:disabled {
-  opacity: 0.45;
+  opacity: var(--disabled-opacity);
 }
 
 .stepper .segment {
@@ -1332,7 +1331,7 @@ button.repo-name:hover {
 }
 
 .switch:disabled {
-  opacity: 0.45;
+  opacity: var(--disabled-opacity);
 }
 
 .segment:focus-visible,
@@ -1635,11 +1634,6 @@ button.repo-name:hover {
   border-color: rgb(0 0 0 / 25%);
   color: inherit;
   font-weight: 400;
-}
-
-.send-bar .button:disabled {
-  opacity: 0.5;
-  filter: none;
 }
 
 .send-bar .agent-picker {
