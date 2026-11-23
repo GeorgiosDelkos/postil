@@ -384,28 +384,27 @@ impl Runner {
     /// each follow-up in order, `of` last.
     fn thread(&self, of: &str) -> Result<Vec<Arc<Run>>> {
         let mut thread = vec![self.run_by_id(of)?];
+        // The number of the log last read: its file's, not its header's, which a hand edit
+        // could change.
+        let mut number = run_number(of).expect("run_by_id read run `of`, so its id parses");
         loop {
-            let (id, before) = {
-                let state = thread
-                    .last()
-                    .expect("the thread starts with one run")
-                    .state();
-                let before = state
-                    .header
-                    .follow_up
-                    .as_ref()
-                    .map(|follow_up| follow_up.of.clone());
-                (state.header.id.clone(), before)
-            };
+            let before = thread
+                .last()
+                .expect("the thread starts with one run")
+                .state()
+                .header
+                .follow_up
+                .as_ref()
+                .map(|follow_up| follow_up.of.clone());
             let Some(before) = before else { break };
-            // A follow-up is created after the run it follows, so it names an older run and the
-            // walk ends. A log edited by hand could say otherwise.
-            if run_number(&before) >= run_number(&id) {
-                return Err(Error::NoSuchRun {
-                    id,
+            // A follow-up is created after the run it follows, so each step goes to a lower
+            // number and the walk ends. A log edited by hand could say otherwise.
+            number = run_number(&before)
+                .filter(|older| *older < number)
+                .ok_or_else(|| Error::NoSuchRun {
+                    id: format!("R{number}"),
                     problem: format!("it follows {before}, which is not an older run"),
-                });
-            }
+                })?;
             thread.push(self.run_by_id(&before)?);
         }
         thread.reverse();
@@ -415,8 +414,7 @@ impl Runner {
     /// The run that already follows run `of`, if any, read from the headers of the newer
     /// logs. A log that cannot be read is passed over: it follows nothing the page can show.
     fn followed_by(&self, of: &str) -> Result<Option<String>> {
-        let number = run_number(of)
-            .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
+        let number = run_number(of).expect("follow_up read run `of`, so its id parses");
         let dir = self.repo.runs_dir();
         let numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
             path: dir.clone(),
@@ -438,7 +436,7 @@ impl Runner {
     ///
     /// [`Error::TurnRunning`] while a run of this window is under way, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
-    /// reviewers, or for a run that is itself a review; as [`Runner::view_of`] for the
+    /// reviewers, for a run that is itself a review, or for a follow-up; as [`Runner::view_of`] for the
     /// reviewed run; and [`Error::WriteRun`] when the first stage's log cannot be created.
     pub(crate) fn review(self: &Arc<Self>, of: &str, reviewers: Vec<AgentChoice>) -> Result<()> {
         if reviewers.is_empty() {

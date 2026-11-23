@@ -3920,23 +3920,35 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_of_a_log_that_follows_itself_is_refused() {
+    fn a_follow_up_of_a_log_that_follows_itself_or_a_newer_run_is_refused() {
         let repo = TempRepo::new("run-follow-loop");
         let (site, _nudges) = run_site(&repo, "plain");
         let runs = repo.root.join(".git/postil/runs");
         fs::create_dir_all(&runs).unwrap();
-        let looped = header("R2").replace(
-            r#""version":1"#,
-            r#""version":3,"followUp":{"of":"R2","text":"x"}"#,
-        );
-        fs::write(runs.join("R2.jsonl"), format!("{looped}\n")).unwrap();
-        let body = serde_json::json!({ "of": "R2", "text": "more" }).to_string();
-        let (status, reply) = post(&site, &format!("{RUN}/follow"), &body);
-        assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
-        assert!(
-            reply.contains("it follows R2, which is not an older run"),
-            "{reply}"
-        );
+        let follows = |file: &str, id: &str, of: &str| {
+            let log = header(id).replace(
+                r#""version":1"#,
+                &format!(r#""version":3,"followUp":{{"of":"{of}","text":"x"}}"#),
+            );
+            fs::write(runs.join(format!("{file}.jsonl")), format!("{log}\n")).unwrap();
+        };
+        // R2 follows itself; R3 and R4 follow each other; R6.jsonl names itself R7, so a
+        // check of the header's id would let it follow R6 again and again.
+        follows("R2", "R2", "R2");
+        follows("R3", "R3", "R4");
+        follows("R4", "R4", "R3");
+        follows("R6", "R7", "R6");
+        for (of, problem) in [
+            ("R2", "R2: it follows R2"),
+            ("R4", "R3: it follows R4"),
+            ("R6", "R6: it follows R6"),
+        ] {
+            let body = serde_json::json!({ "of": of, "text": "more" }).to_string();
+            let (status, reply) = post(&site, &format!("{RUN}/follow"), &body);
+            assert_eq!(status, StatusCode::NOT_FOUND, "{of}: {reply}");
+            assert!(reply.contains(problem), "{of}: {reply}");
+            assert!(reply.contains("which is not an older run"), "{reply}");
+        }
     }
 
     #[test]
