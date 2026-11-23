@@ -244,9 +244,11 @@ kbd {
   /* No `content-visibility: auto` here, though it would skip painting rows off screen. With
      it, WebKit stopped painting the row of a folder just opened once a file inside it was
      clicked, and painted it again only after the list scrolled (seen 2026-11-23; the cause
-     inside WebKit was not found). The list holds only open folders' rows, or at most
-     `MAX_MATCHES` filter results; a folder of thousands of files open makes it long, a cost
-     accepted over rows that vanish. Not measured either way. */
+     inside WebKit was not found). Without it every row is laid out on each `renderFiles`,
+     which rebuilds the list on every window focus: the root's rows and every open folder's
+     (open folders are restored at launch), or at most `MAX_MATCHES` filter results. A
+     repository of thousands of files in view makes that long; not measured. If it shows,
+     the fix is a virtual list like the code pane's, not this property. */
 }
 
 .file {
