@@ -224,9 +224,8 @@ impl Starting {
 }
 
 impl Agent {
-    /// Whether the agent is still there: false once the reader has seen its output end, which
-    /// is up to [`STDERR_GRACE`] after the process exits. A kept agent that is not alive is
-    /// started again; a send in that short window fails with the exit instead.
+    /// Whether the agent is still there: false once the reader has seen its output end. A
+    /// kept agent that is not alive is started again.
     pub(crate) fn is_alive(&self) -> bool {
         !self.process.state().gone
     }
@@ -621,12 +620,15 @@ impl<F: FnMut(Event)> Reader<F> {
             }
         }
 
+        // Gone at once, so a caller that asks during the wait below starts a fresh agent
+        // instead of sending to this one.
+        lock(&self.shared.state).gone = true;
         // A timeout or a gone sender both mean: stop waiting for the agent's last words.
         stderr_closed.recv_timeout(STDERR_GRACE).ok();
         let closed = {
             let mut state = lock(&self.shared.state);
-            state.gone = true;
-            // Dropping the waiters wakes every blocked caller with "exited".
+            // Dropped after the wait, so a blocked caller's "exited" error carries the agent's
+            // last words. Dropping the waiters wakes every blocked caller with "exited".
             state.waiters.clear();
             state
                 .requests

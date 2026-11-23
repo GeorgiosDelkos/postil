@@ -4980,6 +4980,46 @@ mod tests {
     }
 
     #[test]
+    fn a_send_right_after_the_kept_agent_exited_starts_a_fresh_one() {
+        let repo = TempRepo::new("run-dead-at-once");
+        repo.write("a.txt", "a\n");
+        let pid_file = repo.root.join(".git/agent.pid");
+        let (site, nudges) = run_site(&repo, "plain");
+        let command = format!(
+            "{} {}",
+            fake_agent("exit-leaving-stderr"),
+            pid_file.display()
+        );
+        set_agents(&site, &[("Fake", &command)], "Fake");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        // Exited, and not yet reaped: the reader waits out its grace for standard error,
+        // which the agent's grandchild holds open, so no exit event has come.
+        wait_for_exited(&pid_file);
+
+        send(&site, &["N1"]);
+        let second = wait_for_run(&site, &nudges, "R2");
+        assert_eq!(second["status"], "ended", "{second}");
+        assert!(
+            kinds(&second).contains(&"message:prompt 1".to_owned()),
+            "a new process: {second}"
+        );
+    }
+
+    /// Waits until the fake agent's grandchild saw the agent exit (`exit-leaving-stderr`
+    /// writes `<pid file>.exited`). `kill -0` cannot tell: it succeeds on a process that
+    /// exited and is not reaped yet.
+    fn wait_for_exited(pid_file: &Path) {
+        let exited = pid_file.with_extension("pid.exited");
+        let deadline = Instant::now() + WAIT;
+        while !exited.exists() {
+            assert!(Instant::now() < deadline, "the agent did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn run_ids_continue_after_the_highest_log_on_disk() {
         let repo = TempRepo::new("run-ids");
         repo.write("a.txt", "a\n");
