@@ -407,8 +407,9 @@ impl fmt::Display for Error {
     }
 }
 
-/// The error and its sources on one line, for the page to show.
-pub(crate) fn error_chain(error: &Error) -> String {
+/// The error and its sources on one line, each after a colon, as the page and the `postil`
+/// command show it.
+pub fn error_chain(error: &Error) -> String {
     let mut text = error.to_string();
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
