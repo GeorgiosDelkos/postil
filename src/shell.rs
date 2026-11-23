@@ -718,6 +718,14 @@ struct AnswerPermission {
     option: String,
 }
 
+/// The body of `POST /api/run/review`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewRun {
+    /// The run to review, `R3`.
+    of: String,
+}
+
 /// The body of `POST /api/run/question`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1018,7 +1026,8 @@ impl Site {
             ),
             "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
             "/api/run/question" if post => json_or_error(self.answer_question(request.body())),
-            "/api/run/cancel" | "/api/run/permission" | "/api/run/question" => {
+            "/api/run/review" if post => json_or_error(self.review_run(request.body())),
+            "/api/run/cancel" | "/api/run/permission" | "/api/run/question" | "/api/run/review" => {
                 reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
             }
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
@@ -1091,6 +1100,24 @@ impl Site {
         let answer: AnswerPermission = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
         self.runner()?.answer(answer.request, &answer.option)?;
+        Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `POST /api/run/review`: starts the settings' reviewers on the run, in
+    /// order, and answers `{}`.
+    fn review_run(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let review: ReviewRun = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let names = self
+            .settings_file
+            .as_deref()
+            .map_or_else(Settings::default, |file| settings::load(file).settings)
+            .reviewers;
+        let reviewers = names
+            .into_iter()
+            .map(|name| self.agent_choice(Some(name)))
+            .collect::<Result<Vec<_>>>()?;
+        self.runner()?.review(&review.of, reviewers)?;
         Ok(b"{}".to_vec())
     }
 
@@ -3377,6 +3404,87 @@ mod tests {
             kinds(&ended).contains(&"message:chose no".to_owned()),
             "{ended}"
         );
+    }
+
+    #[test]
+    fn reviewers_propose_read_only_then_the_last_judges_the_findings() {
+        let repo = TempRepo::new("run-review");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        let review = |of: &str| {
+            let body = serde_json::json!({ "of": of }).to_string();
+            post(&site, &format!("{RUN}/review"), &body)
+        };
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        let (status, body) = review("R1");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("no reviewers are set"), "{body}");
+
+        let settings = serde_json::json!({
+            "customAgents": [
+                { "name": "Fake", "command": fake_agent("plain") },
+                { "name": "Reviewer", "command": fake_agent("reviewer") },
+            ],
+            "enabledAgents": ["Fake", "Reviewer"],
+            "agent": "Fake",
+            "reviewers": ["Reviewer", "Reviewer"],
+        });
+        let (status, body) = save(&site, &settings.to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = review("R1");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The judge, R3, starts on its own once the proposer, R2, ends.
+        let judge = loop {
+            let run = get_json(&site, RUN);
+            if run["id"] == "R3" && run["status"] == "ended" {
+                break run;
+            }
+            nudges
+                .recv_timeout(WAIT)
+                .unwrap_or_else(|_| panic!("no change while waiting for the judge: {run}"));
+        };
+        let proposer = get_json(&site, &format!("{RUN}?id=R2"));
+        assert_eq!(
+            proposer["review"],
+            serde_json::json!({ "of": "R1", "reviewer": 1, "reviewers": 2 })
+        );
+        assert_eq!(
+            proposer["notes"],
+            serde_json::json!(["N1"]),
+            "the reviewed run's notes"
+        );
+        let kinds_of = |run: &serde_json::Value| kinds(run);
+        assert!(
+            kinds_of(&proposer).contains(&"message:edit no".to_owned()),
+            "a proposer cannot edit: {proposer}"
+        );
+        assert!(
+            kinds_of(&proposer).contains(&"message:read once".to_owned()),
+            "a proposer can read: {proposer}"
+        );
+        let findings = first_of_kind(&proposer, "findings");
+        assert_eq!(findings["findings"][0]["id"], "F1");
+        assert_eq!(findings["findings"][0]["note"], "N1");
+        assert_eq!(findings["problem"], serde_json::Value::Null);
+
+        assert_eq!(judge["review"]["reviewer"], 2);
+        assert!(
+            kinds_of(&judge).contains(&"message:judged: saw F1".to_owned()),
+            "the judge is given the findings: {judge}"
+        );
+        assert!(kinds_of(&judge).contains(&"message:F1: accepted - said more".to_owned()));
+        assert_eq!(
+            states(&site),
+            [serde_json::json!({ "kind": "sent", "run": "R1" })],
+            "a review marks no note sent"
+        );
+
+        let (status, body) = review("R2");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("is itself a review"), "{body}");
     }
 
     #[test]

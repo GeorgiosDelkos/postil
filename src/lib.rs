@@ -20,6 +20,7 @@ mod menu;
 mod notes;
 mod recent;
 mod repo;
+mod review;
 mod run;
 mod settings;
 mod shell;

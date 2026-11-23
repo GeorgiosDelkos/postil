@@ -198,6 +198,34 @@ async function prompt(id, params) {
       say(`left open answered ${(await leftOpen).result.action}`);
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "reviewer": {
+      // Plays both reviewers, told apart by the prompt (src/review.rs).
+      if (blocks[0].includes("Do not change any file")) {
+        const edit = await ask("session/request_permission", {
+          sessionId: "S1",
+          toolCall: { toolCallId: "e1", title: "Edit src/a.rs", kind: "edit" },
+          options: [
+            { optionId: "once", name: "Allow", kind: "allow_once" },
+            { optionId: "no", name: "Reject", kind: "reject_once" },
+          ],
+        });
+        say(`edit ${edit.result.outcome.optionId}`);
+        const read = await ask("session/request_permission", {
+          sessionId: "S1",
+          toolCall: { toolCallId: "r1", title: "Read src/a.rs", kind: "read" },
+          options: [
+            { optionId: "once", name: "Allow", kind: "allow_once" },
+            { optionId: "no", name: "Reject", kind: "reject_once" },
+          ],
+        });
+        say(`read ${read.result.outcome.optionId}`);
+        say('Found one.\n\n```json\n[{"note": "N1", "path": "a.txt", "line": 1, "finding": "a is too short", "fix": "say more"}]\n```');
+      } else {
+        say(`judged: ${blocks[0].includes("F1 [N1] a.txt:1: a is too short") ? "saw F1" : "no F1"}`);
+        say("F1: accepted - said more");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "reject-only": {
       // No option allows, so Postil cannot answer it alone: the engineer does.
       const reply = await ask("session/request_permission", {
