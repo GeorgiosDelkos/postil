@@ -27,7 +27,16 @@ import {
   underWay,
 } from "./run.js";
 import { questionForm, statusIcon } from "./note-dialog.js";
-import { latestOfThreads, noteStatus, planProgress, reviewOf, threadOf } from "./status.js";
+import {
+  latestOfThreads,
+  noteStatus,
+  planProgress,
+  replyText,
+  reviewKey,
+  reviewOf,
+  threadKey,
+  threadOf,
+} from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
@@ -106,11 +115,15 @@ export function runPanel({
   // The follow-up box of the thread shown, kept across redraws for the same reason:
   // `{ root, form, update(latest) }`.
   let following = null;
+  // What the dialog writes in place while the stamp it was drawn from holds: the text the
+  // agent streams, and the time. Each writes what is now known of its run.
+  let streamed = [];
   detailEl.addEventListener("close", () => {
     detail = null;
     detailDrawn = null;
     asking = null;
     following = null;
+    streamed = [];
   });
   detailEl.addEventListener("keydown", (event) => {
     if (detail?.kind !== "step" || event.metaKey || event.altKey || event.ctrlKey) return;
@@ -456,13 +469,13 @@ export function runPanel({
     if (detail && !list.includes(detail.id)) detailEl.close();
   }
 
-  // The run's steps in order, each with its key: every item but the agent's messages and,
-  // while the run is live, an open request, which shows above the runs. Once the run is over
-  // a request left open is a step too, shown as closed.
+  // The run's steps in order, each with its index among the run's items and its key: every
+  // item but the agent's messages and, while the run is live, an open request, which shows
+  // above the runs. Once the run is over a request left open is a step too, shown as closed.
   function stepsOf(view) {
     const live = isLive(view);
     return foldRun(view.entries)
-      .items.map((item, index) => ({ item, key: itemKey(item, index) }))
+      .items.map((item, index) => ({ item, index, key: itemKey(item, index) }))
       .filter(
         ({ item }) =>
           item.type !== "message" &&
@@ -476,8 +489,8 @@ export function runPanel({
     return `${item.type}:${index}`;
   }
 
-  // Draws the dialog again when what it shows changed, and keeps its scroll otherwise, while
-  // the run streams.
+  // Draws the dialog again when what it shows changed, keeping its scroll; otherwise writes
+  // only the streamed text in place, while the run streams.
   function drawDetail() {
     if (!detail) return;
     const view = byId(detail.id);
@@ -491,9 +504,8 @@ export function runPanel({
       const root = thread[0] ?? view;
       const notes = root.notes.map((id) => noteLine(id, root));
       const review = root.review ? null : reviewOf(root.id, knownViews());
-      const reviewKey = JSON.stringify(review && [review.stages.map((stage) => [stage.id, stage.status, stage.total])]);
-      const threadKey = JSON.stringify(thread.map((turn) => [turn.id, turn.status, turn.total]));
-      stamp = [`run:${root.id}`, threadKey, JSON.stringify(notes), reviewKey, isLive(run)];
+      const shown = [notes, reviewKey(review), reviewers()];
+      stamp = [`run:${root.id}`, threadKey(thread), JSON.stringify(shown), isLive(run)];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, knownViews());
@@ -508,8 +520,12 @@ export function runPanel({
       stamp = [`${view.id}:${detail.key}`, item.status, item.output, item.text, item.answer, isLive(view)];
       draw = () => stepDetail(view, item, index, steps.length);
     }
-    if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) return;
+    if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) {
+      for (const write of streamed) write();
+      return;
+    }
     detailDrawn = stamp;
+    streamed = [];
     const scroll = detailEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
     const same = detailEl.dataset.shown === stamp[0];
     detailEl.dataset.shown = stamp[0];
@@ -565,7 +581,6 @@ export function runPanel({
   // agent's reply; then each follow-up in `thread` (the run first), and the box for the next.
   function runDetail(view, steps, notes, review, thread) {
     const latest = thread.at(-1) ?? view;
-    const live = isLive(view);
     const body = el("div", "note-dialog-body");
     // A reviewer's run says which run it reviews, and leads back to it.
     if (view.review) {
@@ -578,7 +593,7 @@ export function runPanel({
       nav.append(back, el("span", "", `Reviewer ${reviewer} of ${count} of ${of}: ${role}`));
       body.append(nav);
     }
-    const { plan, items } = foldRun(view.entries);
+    const { plan } = foldRun(view.entries);
 
     // The thread's question, from whichever of its runs is under way: the latest.
     const question = isLive(latest) ? openQuestion(foldRun(latest.entries).items) : null;
@@ -627,14 +642,14 @@ export function runPanel({
 
     if (steps.length) {
       const stepCards = el("div", "run-cards");
-      for (const { item, key } of steps) {
-        stepCards.append(stepCard(view, item, () => openDetail({ kind: "step", id: view.id, key })));
+      for (const step of steps) {
+        stepCards.append(stepCard(view, step, () => openDetail({ kind: "step", id: view.id, key: step.key })));
       }
       body.append(section(`Steps · ${steps.length}`, stepCards));
     }
 
-    const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
-    if (text) body.append(section(live ? `${view.agent} is writing` : `${view.agent}'s reply`, markdownView(text)));
+    const reply = replyPart(view);
+    if (reply) body.append(reply);
     if (view.problem) body.append(el("div", "run-notice", view.problem));
     for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
     if (!view.review) {
@@ -643,7 +658,11 @@ export function runPanel({
     }
 
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const when = isLive(latest) ? elapsed(Date.now() / 1000 - latest.startedAt) : `started ${started}`;
+    const status = () => {
+      const now = byId(latest.id) ?? latest;
+      const when = isLive(now) ? elapsed(Date.now() / 1000 - now.startedAt) : `started ${started}`;
+      return `${statusWord(now)} · ${when}`;
+    };
     const title = latest.id === view.id ? `${view.id} · ${view.agent}` : `${view.id} to ${latest.id} · ${view.agent}`;
     const actions = [];
     // A run logged before snapshots has no changes view.
@@ -657,7 +676,28 @@ export function runPanel({
       });
       actions.push(button);
     }
-    return [detailHeader(statusIcon(iconKind(latest)), title, `${statusWord(latest)} · ${when}`, actions), body];
+    const head = detailHeader(statusIcon(iconKind(latest)), title, status(), actions);
+    const where = head.querySelector(".note-dialog-where");
+    streamed.push(() => {
+      where.textContent = status();
+    });
+    return [head, body];
+  }
+
+  // A run's reply, or null before it writes one: its text is written in place as it streams
+  // (`streamed`), and only the reply's own nodes change.
+  function replyPart(turn) {
+    let text = replyText(turn);
+    if (!text) return null;
+    const view = el("div", "run-message");
+    fillMarkdown(view, text);
+    streamed.push(() => {
+      const now = replyText(byId(turn.id) ?? turn);
+      if (now === text) return;
+      text = now;
+      fillMarkdown(view, text);
+    });
+    return section(isLive(turn) ? `${turn.agent} is writing` : `${turn.agent}'s reply`, view);
   }
 
   // One follow-up in its thread's dialog: what the engineer asked, its steps, and the reply.
@@ -672,14 +712,13 @@ export function runPanel({
     const steps = stepsOf(turn);
     if (steps.length) {
       const cards = el("div", "run-cards");
-      for (const { item, key } of steps) {
-        cards.append(stepCard(turn, item, () => openDetail({ kind: "step", id: turn.id, key })));
+      for (const step of steps) {
+        cards.append(stepCard(turn, step, () => openDetail({ kind: "step", id: turn.id, key: step.key })));
       }
       parts.push(section(`Steps · ${steps.length}`, cards));
     }
-    const { items } = foldRun(turn.entries);
-    const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
-    if (text) parts.push(section(isLive(turn) ? `${turn.agent} is writing` : `${turn.agent}'s reply`, markdownView(text)));
+    const reply = replyPart(turn);
+    if (reply) parts.push(reply);
     if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
     return parts;
   }
@@ -833,8 +872,8 @@ export function runPanel({
     return [detailHeader(null, `${finding.id} · ${finding.verdict.word}`, `review of ${view.id}`), body];
   }
 
-  // A step's card: what it did and how it went, in one line.
-  function stepCard(view, item, open) {
+  // A step's card: what it did and how it went, in one line. `step` is one of `stepsOf(view)`.
+  function stepCard(view, { item, index }, open) {
     const card = (parts) => {
       const button = el("button", "run-card step");
       button.type = "button";
@@ -851,11 +890,16 @@ export function runPanel({
         node.title = item.title;
         return node;
       }
-      case "thought":
-        return card([
-          el("span", "tool-verb", "think"),
-          el("span", "run-card-text run-thought-preview", item.text.trim().replace(/\s+/g, " ")),
-        ]);
+      case "thought": {
+        const words = (thought) => thought.text.trim().replace(/\s+/g, " ");
+        const preview = el("span", "run-card-text run-thought-preview", words(item));
+        // The thought streams: its words change in place, and the card stays the same node.
+        streamed.push(() => {
+          const now = foldRun((byId(view.id) ?? view).entries).items[index];
+          if (now?.type === "thought" && preview.textContent !== words(now)) preview.textContent = words(now);
+        });
+        return card([el("span", "tool-verb", "think"), preview]);
+      }
       case "permission": {
         const chosen = item.options.find((option) => option.id === item.answer);
         // "allow" when it was allowed, by Postil or by hand; "ask" when rejected or closed.
@@ -953,9 +997,10 @@ export function runPanel({
     return item.answer?.content ? "answered" : "skipped";
   }
 
-  // The agent's Markdown as elements, built node by node: its text is never parsed as HTML.
-  function markdownView(text) {
-    const view = el("div", "run-message");
+  // Fills `view` with the agent's Markdown as elements, built node by node: its text is never
+  // parsed as HTML.
+  function fillMarkdown(view, text) {
+    view.replaceChildren();
     for (const block of markdownBlocks(text.trim())) {
       if (block.type === "code") view.append(el("pre", "run-code", block.text));
       else if (block.type === "list") {
@@ -964,7 +1009,6 @@ export function runPanel({
         view.append(list);
       } else view.append(inlineView(block.type === "heading" ? "h4" : "p", block.inline));
     }
-    return view;
   }
 
   function inlineView(tag, parts) {

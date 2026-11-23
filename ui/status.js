@@ -261,6 +261,57 @@ export function reviewKey(review) {
   ];
 }
 
+// The agent's reply in a run: its messages, joined.
+export function replyText(run) {
+  return foldRun(run.entries)
+    .items.filter((item) => item.type === "message")
+    .map((item) => item.text.trim())
+    .join("\n\n");
+}
+
+// What the run dialog shows of a thread (`threadOf`), as one string, but for the text the
+// agent streams: its replies and thoughts, which the dialog writes in place. The dialog is
+// built again only when this changes, so while the agent writes its step cards, Changes and
+// Review keep their clicks and its follow-up box keeps the focus.
+export function threadKey(thread) {
+  return JSON.stringify(thread.map(turnShown));
+}
+
+function turnShown(turn) {
+  const live = isLive(turn);
+  const { plan, items } = foldRun(turn.entries);
+  return [
+    turn.id,
+    turn.agent,
+    turn.status,
+    statusLine(turn),
+    turn.startedAt,
+    turn.problem ?? null,
+    turn.review ?? null,
+    turn.followUp ?? null,
+    turn.prompt === turn.followUp?.text,
+    plan,
+    items.map((item) => itemShown(item, live)),
+    // Whether the reply shows at all: its text is written in place.
+    replyText(turn) !== "",
+    turn.entries.some((entry) => entry.kind === "snapshot"),
+  ];
+}
+
+// What a step card shows of an item, its streamed text left out. A tool's output is not on
+// its card, and can be large.
+function itemShown(item, live) {
+  switch (item.type) {
+    case "message":
+    case "thought":
+      return [item.type];
+    case "tool":
+      return [item.id, item.title, toolRow(item, live)];
+    default:
+      return item;
+  }
+}
+
 // What the note dialog shows, as one string: the dialog is drawn again only when it changes.
 // A run's entries come many a second while the agent writes, and most change nothing the
 // dialog shows; drawing it again on each would scroll it, take its focus, drop a click whose

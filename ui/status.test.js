@@ -10,9 +10,11 @@ import {
   noteStatus,
   planProgress,
   runStatus,
+  replyText,
   reviewOf,
   latestOfThreads,
   runOf,
+  threadKey,
   threadOf,
 } from "./status.js";
 
@@ -228,4 +230,19 @@ test("the note dialog keeps its key while its run streams what the dialog does n
     streaming("R2", "running", entries, { review: { of: "R1", reviewer: 1, reviewers: 1 } });
   const reviewed = (entries) => key(start, "running", reviewOf("R1", [stage(entries)]));
   assert.equal(reviewed([said("reading")]), reviewed([said("reading"), said(" on")]), "a reviewer's token");
+});
+
+test("the run dialog keeps its key while the agent streams its reply and thoughts", () => {
+  const thought = (text) => ({ kind: "thought", text });
+  const edit = tool("t1", "edit", "a.rs", [], "in_progress");
+  const start = [thought("Reading"), edit, said("Done")];
+  const key = (entries, status = "running") => threadKey([streaming("R1", status, entries)]);
+  const drawn = key(start);
+  assert.equal(key([...start, said(" with it")]), drawn, "a token of the reply");
+  assert.equal(key([thought("Reading a.rs"), edit, said("Done")]), drawn, "a token of a thought");
+  assert.notEqual(key([...start, { ...edit, status: "completed" }]), drawn, "a step's card changes");
+  assert.notEqual(key([...start, thought("Then")]), drawn, "a new step");
+  assert.notEqual(key(start, "cancelling"), drawn, "the run's status");
+  assert.notEqual(key([thought("Reading"), edit]), key([thought("Reading"), edit, said("Done")]), "the reply shows");
+  assert.equal(replyText(streaming("R1", "ended", start)), "Done");
 });
