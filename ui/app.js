@@ -1924,13 +1924,26 @@ function toggleFocus() {
   }
   // The send step's ticks live in the tray, which focus mode hides: it closes first.
   closeSend();
-  document.body.classList.add("focus-mode");
+  movePanes(() => document.body.classList.add("focus-mode"));
   // A control in a hidden pane would keep the keys.
   codeEl.focus();
 }
 
 function leaveFocus() {
-  document.body.classList.remove("focus-mode");
+  if (inFocus()) movePanes(() => document.body.classList.remove("focus-mode"));
+}
+
+// Eases the side panes while `change` opens or closes them, and only then (app.css,
+// `panes-moving`): a divider dragged by hand follows the pointer at once. The class goes 20 ms
+// after the 160 ms easing, which starts at the next style update: a busier main thread only
+// makes the panes snap to where they were going. The code pane redraws through its
+// ResizeObserver as its width changes.
+let panesSettle = null;
+function movePanes(change) {
+  document.body.classList.add("panes-moving");
+  change();
+  clearTimeout(panesSettle);
+  panesSettle = setTimeout(() => document.body.classList.remove("panes-moving"), 180);
 }
 
 function inFocus() {
