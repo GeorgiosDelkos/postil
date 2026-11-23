@@ -224,7 +224,10 @@ test("the status line says where the run is and whether it needs the engineer", 
     text: "Done",
     tone: "done",
   });
-  assert.equal(statusLine(run("ended", [{ kind: "ended", reason: "cancelled" }])).text, "Stopped");
+  assert.deepEqual(statusLine(run("ended", [{ kind: "ended", reason: "cancelled" }])), {
+    text: "Stopped",
+    tone: "idle",
+  });
   assert.equal(statusLine(run("ended", [{ kind: "ended", reason: "other" }])).text, "Ended");
   assert.equal(statusLine(run("failed")).tone, "failed");
   assert.match(statusLine(run("unfinished")).text, /another window/);
@@ -244,11 +247,11 @@ test("elapsed time reads as minutes, then hours", () => {
 
 test("prompt lines are told apart for coloring", () => {
   const lines = promptLines(
-    "Intro.\n\n[N1] src/a.rs:3\n(These lines are no longer in the file; they were:)\n> }\nFix it.\n",
+    "Intro.\n\n[N1] src/a.rs:3\n(These lines are no longer in the file; they were:)\n> }\nFix it.\n[Nope] not a heading\n",
   );
   assert.deepEqual(
     lines.map((line) => line.kind),
-    ["text", "text", "heading", "lost", "quote", "text"],
+    ["text", "text", "heading", "lost", "quote", "text", "text"],
   );
 });
 
@@ -284,6 +287,11 @@ test("inline marks: code first, and unclosed or in-word marks stay text", () => 
   assert.deepEqual(inline("2 * 3 and snake_case_name and **open"), [
     { type: "text", text: "2 * 3 and snake_case_name and **open" },
   ]);
+  assert.deepEqual(
+    inline("a my_var_ b"),
+    [{ type: "text", text: "a my_var_ b" }],
+    "a mark that starts inside a word is text",
+  );
   assert.deepEqual(inline("<b>not html</b>"), [{ type: "text", text: "<b>not html</b>" }]);
 });
 
