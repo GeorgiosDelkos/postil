@@ -678,7 +678,9 @@ retired; the measured numbers above are the baseline to not regress.
    value; folders start closed, opening a file opens the folders around it, and a closed
    folder shows the count of notes inside it. Keys follow the ARIA tree pattern: up and down
    move, right opens or enters a folder, left closes it or goes to the parent, Enter opens.
-   Which folders are open is not kept across restarts yet. Rows carry file-type and folder
+   Which folders are open is kept per working tree in `<git dir>/postil/folders.json`
+   (`GET`/`PUT /api/folders`), so the tree opens as it was left; like `layout.json`, a file
+   that cannot be read counts as none open. Rows carry file-type and folder
    icons from Material Icon Theme (MIT, `ui/icons.LICENSE`), the set VS Code users know,
    chosen 2026-11-22 over monochrome glyphs. They are one SVG sprite, `ui/icons.svg`, taken
    at a pinned upstream commit (the sprite's header comment says how), with colours toned
@@ -689,8 +691,9 @@ retired; the measured numbers above are the baseline to not regress.
    not drawn on code.
    Notes are deleted from the tray (× then Delete) or from the code's right-click menu, through
    `DELETE /api/notes?id=N1`; ids are not reused. A + on a hovered line number adds a note on
-   that line, as in GitHub's and GitLab's diff views. Not built: editing a note's text in the
-   app (edit `review.json` by hand for now).
+   that line, as in GitHub's and GitLab's diff views. A note's text is edited in its dialog
+   (Edit, then Save or Cmd-Enter; `PATCH /api/notes?id=N1 {body}`); its lines, snippet and
+   state stay, and a run it was sent in keeps the text it got.
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.
    Built (section "Runs" has the core). `Cmd-Shift-Enter`, or Send under the notes, opens
    the send step: the open notes whose lines are still there are ticked, the code pane shows

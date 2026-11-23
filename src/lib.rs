@@ -13,6 +13,7 @@ mod agents;
 mod dialog;
 mod error;
 mod files;
+mod folders;
 mod highlight;
 mod layout;
 #[cfg(target_os = "macos")]

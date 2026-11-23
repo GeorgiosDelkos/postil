@@ -110,7 +110,8 @@ function fieldView(field, index, values) {
 // `dialogEl` is the `<dialog>`. `find(id)` gives `{ note, run }` for a note id, or null once
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
-// ticked), `remove(note)`, `resolve(note)`, `reopen(note)`, `showRun()`, and `answerQuestion(request, content)` for the run's
+// ticked), `remove(note)`, `resolve(note)`, `reopen(note)`, `editNote(note, body)` (resolves
+// to whether the new text was saved), `showRun()`, and `answerQuestion(request, content)` for the run's
 // open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
 // (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
@@ -126,6 +127,7 @@ export function noteDialog(
     remove,
     resolve,
     reopen,
+    editNote,
     showRun,
     answerQuestion,
     reviewOf,
@@ -138,6 +140,9 @@ export function noteDialog(
   // The open question's form, kept while it stays open: a redraw must not drop what the
   // engineer has chosen or typed.
   let asking = null;
+  // The editor of the note's text while it is open, `{ id, form }`, kept across redraws for
+  // the same reason.
+  let editing = null;
   // What the dialog was drawn from: drawn again only when this changes, so a run's every
   // token leaves the dialog, its scroll and its focus alone.
   let drawn = null;
@@ -146,11 +151,15 @@ export function noteDialog(
     shownId = null;
     drawn = null;
     asking = null;
+    editing = null;
   });
   dialogEl.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      dialogEl.querySelector(".note-dialog-send:not(:disabled)")?.click();
+      // While the text is edited, Cmd-Enter saves it, from any control: sending would send
+      // the old text.
+      if (editing) editing.form.requestSubmit();
+      else dialogEl.querySelector(".note-dialog-send:not(:disabled)")?.click();
     }
   });
 
@@ -179,7 +188,7 @@ export function noteDialog(
     // The question's form is the same node across redraws, and so is the control that had
     // the focus in it, which gets it back; a button outside it is found by its class.
     const active = document.activeElement;
-    const typing = asking?.form.contains(active) ? active : null;
+    const typing = [asking?.form, editing?.form].some((form) => form?.contains(active)) ? active : null;
     const focused = typing ? null : active?.className;
     dialogEl.replaceChildren(header(note, run), body(note, run), footer(note, run));
     typing?.focus();
@@ -220,7 +229,7 @@ export function noteDialog(
       }
       main.append(asking.form);
     } else asking = null;
-    main.append(section("Your note", el("div", "note-dialog-note", note.body)));
+    main.append(noteSection(note));
 
     const lost = note.anchor === "lost";
     const label = lost ? "Its lines when written; they are no longer in the file" : "Its lines";
@@ -240,6 +249,65 @@ export function noteDialog(
       main.append(reviewPart(note, run));
     }
     return main;
+  }
+
+  // The note's text, with Edit; or, while it is edited, the editor.
+  function noteSection(note) {
+    if (editing?.id === note.id) return section("Your note", editing.form);
+    const part = section("Your note", el("div", "note-dialog-note", note.body));
+    const button = el("button", "button note-dialog-edit", "Edit");
+    button.type = "button";
+    button.addEventListener("click", () => startEditing(note));
+    part.firstChild.append(button);
+    return part;
+  }
+
+  function startEditing(note) {
+    const form = el("form", "note-edit");
+    const input = el("textarea", "note-edit-input");
+    input.value = note.body;
+    input.rows = 3;
+    input.setAttribute("aria-label", `The text of ${note.id}`);
+    const cancel = el("button", "button", "Cancel");
+    cancel.type = "button";
+    const save = el("button", "button primary");
+    save.type = "submit";
+    save.append("Save", el("kbd", "", "⌘↵"));
+    const actions = el("div", "note-edit-actions");
+    actions.append(cancel, save);
+    form.append(input, actions);
+    const stop = () => {
+      editing = null;
+      drawn = null;
+      draw();
+      // Back to Edit: the focus kept by class could otherwise land on Send.
+      dialogEl.querySelector(".note-dialog-edit")?.focus();
+    };
+    cancel.addEventListener("click", stop);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text || save.disabled) return;
+      save.disabled = true;
+      if (await editNote(note, text)) stop();
+      else save.disabled = false;
+    });
+    input.addEventListener("keydown", (event) => {
+      // Kept from the dialog: Cmd-Enter there sends the note, and Esc closes it.
+      if (event.key === "Enter" && event.metaKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        form.requestSubmit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        stop();
+      }
+    });
+    editing = { id: note.id, form };
+    drawn = null;
+    draw();
+    input.focus();
   }
 
   function said(note, run) {
