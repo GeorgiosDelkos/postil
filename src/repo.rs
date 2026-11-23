@@ -3,10 +3,12 @@
 //! No git library is linked: the app needs a file list, a branch name, snapshots of the
 //! working tree and the diffs between them, and `git` already knows the ignore rules.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, Result};
@@ -160,9 +162,10 @@ impl Repo {
     /// The tree is written through an index of Postil's own, `<git dir>/postil-snapshot.index`
     /// beside the real one, so the engineer's index, branch and stash are left as they are. It
     /// is kept between snapshots, so git hashes again only the files whose stat data changed
-    /// since the last one, untracked files included. It starts again from a copy of the real
-    /// index whenever that one changed since (a file staged, or taken out of git), so it never
-    /// keeps a file git no longer tracks; untracked files are then hashed in full once. One that
+    /// since the last one, untracked files included; the first snapshot starts from a copy of
+    /// the real index, and hashes the untracked files in full. Before each snapshot it drops
+    /// the files that are ignored and that the real index no longer tracks (taken out of git
+    /// and added to `.gitignore`), which `git add --all` would otherwise go on adding. One that
     /// git cannot use is removed, and the next snapshot starts afresh. `git add` runs the
     /// repository's clean filters (git-lfs copies a changed file into `.git/lfs`). The tree and
     /// its blobs are objects no ref holds, so `git gc` may prune them once they are older than
@@ -177,36 +180,79 @@ impl Repo {
             .snapshotting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let real = self.git_dir.join("index");
         let index = self.git_dir.join("postil-snapshot.index");
-        if stale(&real, &index) {
-            // Copied beside it and renamed into place: a copy cut short, or one by another
-            // window at the same moment, never leaves a torn index where git reads it.
-            let copy = self
-                .git_dir
-                .join(format!("postil-snapshot.{}.copy", std::process::id()));
-            let failed = |source| Error::CopyIndex {
-                from: real.clone(),
-                to: index.clone(),
-                source,
-            };
-            match fs::copy(&real, &copy) {
-                Ok(_) => fs::rename(&copy, &index).map_err(failed)?,
-                // A repository with nothing staged yet has no index: git starts an empty one.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    drop(fs::remove_file(&copy));
-                    return Err(failed(error));
-                }
-            }
+        if !index.exists() {
+            self.copy_index(&index)?;
         }
-        let tree = run_git(&self.root, Some(&index), &["add", "--all"])
+        let tree = self
+            .forget_ignored(&index)
+            .and_then(|()| run_git(&self.root, Some(&index), &["add", "--all"]))
             .and_then(|_| run_git(&self.root, Some(&index), &["write-tree"]));
         if tree.is_err() {
             // An index git cannot use would fail every later snapshot too.
             drop(fs::remove_file(&index));
         }
         Ok(tree?.trim_end().to_owned())
+    }
+
+    /// Copies the real index to `index`, through a file of its own renamed into place: a copy
+    /// cut short, or one made at the same moment by another window or another `Repo` of this
+    /// working tree, never leaves a torn index where git reads it.
+    fn copy_index(&self, index: &Path) -> Result<()> {
+        // A unique name only: nothing is ordered by it.
+        static COPIES: AtomicU64 = AtomicU64::new(0);
+        let real = self.git_dir.join("index");
+        let copy = self.git_dir.join(format!(
+            "postil-snapshot.{}.{}.copy",
+            std::process::id(),
+            COPIES.fetch_add(1, Ordering::Relaxed)
+        ));
+        let copied = match fs::copy(&real, &copy) {
+            // A repository with nothing staged yet has no index: git starts an empty one.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            copied => copied.and_then(|_| fs::rename(&copy, index)),
+        };
+        copied.map_err(|source| {
+            drop(fs::remove_file(&copy));
+            Error::CopyIndex {
+                from: real,
+                to: index.to_owned(),
+                source,
+            }
+        })
+    }
+
+    /// Drops from the snapshot index `index` the files that are ignored and that the real
+    /// index does not track: `git add --all` adds no ignored file, but goes on updating one an
+    /// index already has.
+    fn forget_ignored(&self, index: &Path) -> Result<()> {
+        let ignored = run_git(
+            &self.root,
+            Some(index),
+            &[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--ignored",
+                "--exclude-standard",
+            ],
+        )?;
+        if ignored.is_empty() {
+            return Ok(());
+        }
+        let tracked = git(&self.root, &["ls-files", "-z", "--cached"])?;
+        let tracked: HashSet<&str> = tracked.split_terminator('\0').collect();
+        let gone: Vec<&str> = ignored
+            .split_terminator('\0')
+            .filter(|path| !tracked.contains(path))
+            .collect();
+        if gone.is_empty() {
+            return Ok(());
+        }
+        // `update-index` takes paths as they are, never as patterns.
+        let mut args = vec!["update-index", "--force-remove", "--"];
+        args.extend(gone);
+        run_git(&self.root, Some(index), &args).map(drop)
     }
 
     /// The changes from snapshot `before` to snapshot `after` ([`Repo::snapshot`]), as
@@ -267,19 +313,6 @@ impl Repo {
 
         let path = self.root.join(file);
         fs::read_to_string(&path).map_err(|source| Error::Read { path, source })
-    }
-}
-
-/// Whether the snapshot index `ours` must start again from the real index `real`: it is
-/// missing, or the real one changed after it was last written. Either one unreadable counts as
-/// stale, so the copy reports why.
-fn stale(real: &Path, ours: &Path) -> bool {
-    let modified = |path: &Path| fs::metadata(path).and_then(|metadata| metadata.modified());
-    match (modified(real), modified(ours)) {
-        (Ok(real), Ok(ours)) => real > ours,
-        // No real index: git starts ours empty, or goes on with the one it has.
-        (Err(error), Ok(_)) if error.kind() == io::ErrorKind::NotFound => false,
-        _ => true,
     }
 }
 

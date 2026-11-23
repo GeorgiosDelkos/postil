@@ -4189,6 +4189,23 @@ mod tests {
         let (status, body) = get(&site, &format!("{RUN}/changes?from=R1"));
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("R1 has no snapshot from before it"), "{body}");
+
+        // An index git cannot read fails one snapshot, and is removed: the next starts afresh.
+        let ours = repo.root.join(".git/postil-snapshot.index");
+        fs::write(&ours, "torn").unwrap();
+        send(&site, &["N1"]);
+        let torn = wait_for_run(&site, &nudges, "R2");
+        assert!(
+            torn["problem"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no snapshot"),
+            "{torn}"
+        );
+        assert!(!ours.exists(), "the torn index is gone");
+        send(&site, &["N1"]);
+        let next = wait_for_run(&site, &nudges, "R3");
+        assert_eq!(snapshot_points(&next), ["before", "after"], "{next}");
     }
 
     #[test]

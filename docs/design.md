@@ -458,9 +458,9 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
   tree's id (`Repo::snapshot`, run log version 4). A proposing reviewer, which may not edit,
   takes none. A snapshot is every tracked file and every untracked file that is not ignored,
   written as a tree through Postil's own index, `<git dir>/postil-snapshot.index`, kept between
-  snapshots, and started again from a copy of the real index whenever that one changed (a
-  file staged, or taken out of git and ignored, which the copy then leaves out). The
-  engineer's index, branch and stash are left alone. A snapshot that cannot be taken is the run's problem, and the run goes
+  snapshots; the first starts from a copy of the real index. Before each snapshot it drops the
+  files that are ignored and that the real index no longer tracks (taken out of git and added
+  to `.gitignore`). The engineer's index, branch and stash are left alone. A snapshot that cannot be taken is the run's problem, and the run goes
   on without a changes view.
 - **What it costs.** A snapshot runs `git add --all` and `git write-tree`, under the runner's
   lock before the run (so on the window's thread, which waits) and on the agent's reader
