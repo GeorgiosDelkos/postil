@@ -212,9 +212,11 @@ export function noteDialog(
     // The agent's question comes first: it is why a note needs the engineer (board 9).
     const question = run && isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
     if (question) {
-      if (asking?.request !== question.request) {
+      // Keyed by run too: each agent numbers its requests from 0.
+      const key = `${run.id}:${question.request}`;
+      if (asking?.key !== key) {
         const form = questionForm(question, run.agent, (content) => answerQuestion(question.request, content));
-        asking = { request: question.request, form };
+        asking = { key, form };
       }
       main.append(asking.form);
     } else asking = null;

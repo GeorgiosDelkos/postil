@@ -9,6 +9,8 @@ import { diffStats, foldRun, isLive, isOpen, isResolved, sentIn, toolRow } from 
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
 // `runs` maps a run id to its view; `live` is the latest run of this window, or null.
 export function runOf(note, runs, live) {
+  // A follow-up under way works on its thread's notes, so they show it while it runs.
+  if (isLive(live) && live.followUp && live.notes.includes(note.id)) return live;
   const id = sentIn(note);
   if (id !== null) return live?.id === id ? live : (runs.get(id) ?? null);
   // A reviewer's run carries the notes it reviews, but they were not sent in it.
@@ -146,6 +148,48 @@ export function groupNotes(notes, statusOf) {
   done.sort((a, b) => number(b) - number(a));
   return { inRun, open, done, resolved };
 }
+
+// The runs of the thread run `id` is in, among `views` (every run read so far): the run of
+// notes it started from, then its follow-ups in the order they were sent (src/run.rs,
+// `follow_up`). A follow-up whose earlier run is not read yet starts a thread of its own
+// until it is.
+export function threadOf(id, views) {
+  const roots = rootsOf(views);
+  const root = roots.get(id);
+  if (root === undefined) return [];
+  return views.filter((view) => !view.review && roots.get(view.id) === root).sort((a, b) => runNumber(a) - runNumber(b));
+}
+
+// Each thread's latest run among `views`, by the id of the run it started from. The Run tab
+// reads it once per draw, rather than `threadOf` once per card.
+export function latestOfThreads(views) {
+  const roots = rootsOf(views);
+  const latest = new Map();
+  for (const view of views) {
+    if (view.review) continue;
+    const root = roots.get(view.id);
+    const known = latest.get(root);
+    if (!known || runNumber(view) > runNumber(known)) latest.set(root, view);
+  }
+  return latest;
+}
+
+// The id of the run each of `views` started its thread from, by id. A follow-up names an
+// older run, so each walk ends; the count only stops a log edited into a loop.
+function rootsOf(views) {
+  const byId = new Map(views.map((view) => [view.id, view]));
+  const roots = new Map();
+  for (const view of views) {
+    let at = view;
+    for (let seen = 0; at.followUp && byId.has(at.followUp.of) && seen < views.length; seen += 1) {
+      at = byId.get(at.followUp.of);
+    }
+    roots.set(view.id, at.id);
+  }
+  return roots;
+}
+
+const runNumber = (view) => Number(view.id.slice(1));
 
 // The latest review of run `id` among `views` (every run read so far; src/review.rs): its
 // stages, reviewer 1 first, and each finding with the judge's verdict. Null when the run was

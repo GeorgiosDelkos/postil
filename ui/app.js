@@ -1413,6 +1413,8 @@ function followRun(run, previous) {
     refresh().catch((error) => showToast(String(error)));
   } else if (
     !run.problem &&
+    // A follow-up marks no note sent, so it is not waited for.
+    !run.followUp &&
     run.notes.some((id) => state.notes.find((note) => note.id === id && isOpen(note)))
   ) {
     // Its notes are marked sent once the agent takes the turn, which is no status change and

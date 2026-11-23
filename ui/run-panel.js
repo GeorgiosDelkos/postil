@@ -1,7 +1,8 @@
 // The run panel: the tray's Run tab and the agent status at the foot of the sidebar. The tab
 // lists the runs, one small card each, newest first; a card opens the run's dialog, which
 // holds everything about it: its plan, its notes, every step, and the agent's reply
-// (docs/design.md, "The Run tab"). ui/run.js has the rules.
+// (docs/design.md, "The Run tab"). ui/run.js has the rules. A run's follow-ups are part of
+// its card and its dialog, which ends with the box that sends the next one.
 //
 // The panel follows the latest run: the Rust process calls `window.postil.runChanged()`
 // whenever it changes, and the panel fetches the entries it has not seen. Fetches never
@@ -25,7 +26,7 @@ import {
   underWay,
 } from "./run.js";
 import { questionForm, statusIcon } from "./note-dialog.js";
-import { noteStatus, planProgress, reviewOf } from "./status.js";
+import { latestOfThreads, noteStatus, planProgress, reviewOf, threadOf } from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
@@ -97,10 +98,14 @@ export function runPanel({
   // The open question's form, kept while it stays open: a redraw must not drop what the
   // engineer has chosen or typed.
   let asking = null;
+  // The follow-up box of the thread shown, kept across redraws for the same reason:
+  // `{ root, form, update(latest) }`.
+  let following = null;
   detailEl.addEventListener("close", () => {
     detail = null;
     detailDrawn = null;
     asking = null;
+    following = null;
   });
   detailEl.addEventListener("keydown", (event) => {
     if (detail?.kind !== "step" || event.metaKey || event.altKey || event.ctrlKey) return;
@@ -292,16 +297,19 @@ export function runPanel({
         wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
       }
     }
-    // Reviewers' runs show inside the run they review, not here.
-    const shown = list.filter((id) => !byId(id)?.review);
+    // Reviewers' runs show inside the run they review, and follow-ups inside the run they
+    // follow, not here.
+    const shown = list.filter((id) => !byId(id)?.review && !byId(id)?.followUp);
     const label = shown.length === 1 ? "Run" : `Runs · ${shown.length}`;
     wanted.push(["label", label, () => el("div", "run-label", label)]);
+    const latests = latestOfThreads(knownViews());
     for (const id of shown) {
       const view = byId(id);
+      const latest = view ? (latests.get(id) ?? view) : null;
       const sig = view
-        ? JSON.stringify([view.status, view.agent, view.notes, statusWord(view)])
+        ? JSON.stringify([latest.id, latest.status, view.agent, view.notes, statusWord(latest)])
         : (failed.get(id) ?? "loading");
-      wanted.push([`run:${id}`, sig, () => runCard(id, view)]);
+      wanted.push([`run:${id}`, sig, () => runCard(id, view, latest)]);
     }
 
     const next = new Map();
@@ -335,8 +343,9 @@ export function runPanel({
     return button;
   }
 
-  // A run's card: its status, id, agent and notes, in one line.
-  function runCard(id, view) {
+  // A run's card: its status, id, agent and notes, in one line. The status is its thread's
+  // latest run's, `latest`: the run itself, or its last follow-up.
+  function runCard(id, view, latest) {
     const button = el("button", "run-card run-entry");
     button.type = "button";
     if (!view) {
@@ -347,14 +356,15 @@ export function runPanel({
       if (problem) button.title = problem;
       return button;
     }
+    const more = latest.id === view.id ? "" : ` · +${latest.id}`;
     button.append(
-      statusIcon(iconKind(view)),
+      statusIcon(iconKind(latest)),
       el("span", "run-id", view.id),
-      el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}`),
-      el("span", `run-entry-status ${statusLine(view).tone}`, statusWord(view)),
+      el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`),
+      el("span", `run-entry-status ${statusLine(latest).tone}`, statusWord(latest)),
       el("span", "run-chevron", "›"),
     );
-    button.title = `${view.id} · ${view.agent} · ${statusLine(view).text}`;
+    button.title = `${latest.id} · ${view.agent} · ${statusLine(latest).text}`;
     button.addEventListener("click", () => openDetail({ kind: "run", id }));
     return button;
   }
@@ -457,11 +467,15 @@ export function runPanel({
     let stamp;
     let draw;
     if (detail.kind === "run") {
-      const notes = view.notes.map((id) => noteLine(id, view));
-      const review = view.review ? null : reviewOf(view.id, knownViews());
+      // A follow-up opens as its thread, from the run it started from.
+      const thread = view.review ? [view] : threadOf(view.id, knownViews());
+      const root = thread[0] ?? view;
+      const notes = root.notes.map((id) => noteLine(id, root));
+      const review = root.review ? null : reviewOf(root.id, knownViews());
       const reviewKey = JSON.stringify(review && [review.stages.map((stage) => [stage.id, stage.status, stage.total])]);
-      stamp = [`run:${view.id}`, view.status, view.total, JSON.stringify(notes), reviewKey, isLive(run)];
-      draw = () => runDetail(view, steps, notes, review);
+      const threadKey = JSON.stringify(thread.map((turn) => [turn.id, turn.status, turn.total]));
+      stamp = [`run:${root.id}`, threadKey, JSON.stringify(notes), reviewKey, isLive(run)];
+      draw = () => runDetail(root, stepsOf(root), notes, review, thread);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, knownViews());
       const finding = review?.findings.find((item) => item.id === detail.finding);
@@ -482,7 +496,9 @@ export function runPanel({
     detailEl.dataset.shown = stamp[0];
     // The question's form is the same node across redraws; so is the control that had the
     // focus in it, which gets it back.
-    const typing = asking?.form.contains(document.activeElement) ? document.activeElement : null;
+    const typing = [asking?.form, following?.form].some((form) => form?.contains(document.activeElement))
+      ? document.activeElement
+      : null;
     detailEl.replaceChildren(...draw());
     typing?.focus();
     const body = detailEl.querySelector(".note-dialog-body");
@@ -527,8 +543,9 @@ export function runPanel({
   }
 
   // The run whole: its question if it asks one, its plan, its notes, every step, and the
-  // agent's reply.
-  function runDetail(view, steps, notes, review) {
+  // agent's reply; then each follow-up in `thread` (the run first), and the box for the next.
+  function runDetail(view, steps, notes, review, thread) {
+    const latest = thread.at(-1) ?? view;
     const live = isLive(view);
     const body = el("div", "note-dialog-body");
     // A reviewer's run says which run it reviews, and leads back to it.
@@ -544,11 +561,15 @@ export function runPanel({
     }
     const { plan, items } = foldRun(view.entries);
 
-    const question = live ? openQuestion(items) : null;
+    // The thread's question, from whichever of its runs is under way: the latest.
+    const question = isLive(latest) ? openQuestion(foldRun(latest.entries).items) : null;
     if (question) {
-      if (asking?.request !== question.request) {
-        const form = questionForm(question, view.agent, (content) => answerQuestion(question.request, content));
-        asking = { request: question.request, form };
+      // Keyed by run too: each agent numbers its requests from 0, and a thread's runs can
+      // have different agents.
+      const key = `${latest.id}:${question.request}`;
+      if (asking?.key !== key) {
+        const form = questionForm(question, latest.agent, (content) => answerQuestion(question.request, content));
+        asking = { key, form };
       }
       body.append(asking.form);
     } else asking = null;
@@ -596,14 +617,93 @@ export function runPanel({
     const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
     if (text) body.append(section(live ? `${view.agent} is writing` : `${view.agent}'s reply`, markdownView(text)));
     if (view.problem) body.append(el("div", "run-notice", view.problem));
-    if (!view.review) body.append(reviewSection(view, review));
+    for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
+    if (!view.review) {
+      body.append(reviewSection(view, review));
+      body.append(followUpBox(view, latest));
+    }
 
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const when = live ? elapsed(Date.now() / 1000 - view.startedAt) : `started ${started}`;
-    return [
-      detailHeader(statusIcon(iconKind(view)), `${view.id} · ${view.agent}`, `${statusWord(view)} · ${when}`),
-      body,
-    ];
+    const when = isLive(latest) ? elapsed(Date.now() / 1000 - latest.startedAt) : `started ${started}`;
+    const title = latest.id === view.id ? `${view.id} · ${view.agent}` : `${view.id} to ${latest.id} · ${view.agent}`;
+    return [detailHeader(statusIcon(iconKind(latest)), title, `${statusWord(latest)} · ${when}`), body];
+  }
+
+  // One follow-up in its thread's dialog: what the engineer asked, its steps, and the reply.
+  function followUpPart(turn) {
+    const parts = [];
+    const asked = section(`You · ${turn.id}`, el("div", "follow-up-text", turn.followUp.text));
+    // The prompt holds more than the words when a fresh agent was told the thread first.
+    if (turn.prompt !== turn.followUp.text) {
+      asked.append(el("div", "note-dialog-said muted", `Sent to a new ${turn.agent} with the thread so far: the earlier conversation had ended.`));
+    }
+    parts.push(asked);
+    const steps = stepsOf(turn);
+    if (steps.length) {
+      const cards = el("div", "run-cards");
+      for (const { item, key } of steps) {
+        cards.append(stepCard(turn, item, () => openDetail({ kind: "step", id: turn.id, key })));
+      }
+      parts.push(section(`Steps · ${steps.length}`, cards));
+    }
+    const { items } = foldRun(turn.entries);
+    const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
+    if (text) parts.push(section(isLive(turn) ? `${turn.agent} is writing` : `${turn.agent}'s reply`, markdownView(text)));
+    if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
+    return parts;
+  }
+
+  // The box that sends a follow-up to the thread's latest run, `latest`. One node per thread,
+  // kept across redraws so a draft and the focus survive the run streaming.
+  function followUpBox(root, latest) {
+    if (following?.root !== root.id) {
+      const form = el("form", "follow-up");
+      const input = el("textarea", "follow-up-input");
+      input.rows = 3;
+      input.setAttribute("aria-label", "Follow-up");
+      const why = el("span", "note-dialog-why");
+      const button = el("button", "button primary");
+      button.type = "submit";
+      const actions = el("div", "follow-up-actions");
+      actions.append(why, button);
+      form.append(input, actions);
+      let target = latest;
+      let sending = false;
+      const update = (next) => {
+        target = next;
+        const busy = isLive(run);
+        input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
+        button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
+        button.disabled = busy || sending;
+        why.textContent = busy ? "Wait for the run under way, or stop it." : "";
+      };
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = input.value.trim();
+        if (!text || button.disabled) return;
+        sending = true;
+        update(target);
+        post("api/run/follow", { of: target.id, text }).then(
+          () => {
+            input.value = "";
+          },
+          (error) => onError(error.message),
+        ).finally(() => {
+          sending = false;
+          update(target);
+        });
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && event.metaKey) {
+          event.preventDefault();
+          event.stopPropagation();
+          form.requestSubmit();
+        }
+      });
+      following = { root: root.id, form, update };
+    }
+    following.update(latest);
+    return section("Follow up", following.form);
   }
 
   // Every run read so far, to find a run's reviews among them.
