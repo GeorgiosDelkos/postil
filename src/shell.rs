@@ -1792,7 +1792,6 @@ mod tests {
                 .map(|note| note["state"].clone())
                 .collect::<Vec<_>>()
         };
-        let sent = serde_json::json!({ "kind": "sent", "run": "R1" });
         let open = serde_json::json!({ "kind": "open" });
         let resolved_after_r1 = serde_json::json!({ "kind": "resolved", "run": "R1" });
         let resolved = serde_json::json!({ "kind": "resolved" });
@@ -1812,7 +1811,7 @@ mod tests {
         );
 
         // Only Reopen takes a note out of Resolved: a send is refused, and a run that takes
-        // its turn after the engineer resolved the note leaves the note resolved.
+        // its turn after the engineer resolved the note leaves it resolved, with that run.
         let (status, body) = send(&site, &["N2"]);
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("N2 is resolved: reopen it"), "{body}");
@@ -1820,11 +1819,12 @@ mod tests {
         assert_eq!(
             states(&site),
             [
-                serde_json::json!({ "kind": "resolved", "run": "R1" }),
+                serde_json::json!({ "kind": "resolved", "run": "R9" }),
                 resolved.clone()
             ]
         );
 
+        let sent = serde_json::json!({ "kind": "sent", "run": "R9" });
         assert_eq!(change("reopen", "N1"), [sent.clone(), resolved.clone()]);
         assert_eq!(
             change("reopen", "N1"),

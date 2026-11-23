@@ -166,7 +166,7 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
 
 /// Marks the note `id` resolved, saves, and returns all notes. A resolved note keeps the run
 /// it was sent in, so its dialog still shows what that run did. Only [`reopen`] takes a note
-/// out of this state: [`prompt`] refuses it and [`mark_sent`] leaves it. Resolving a resolved
+/// out of this state: [`prompt`] refuses it, and [`mark_sent`] only records its run. Resolving a resolved
 /// note leaves its state as it is, but saves all the same, as every write does: with every
 /// note at its current place, and the file at this version.
 ///
@@ -277,9 +277,11 @@ pub(crate) struct Prompt {
     pub(crate) files: Vec<String>,
 }
 
-/// Marks the notes `ids` sent in `run` and saves. A note deleted or resolved meanwhile is
-/// skipped: the run it went to is under way, and the engineer's word on it is later than the
-/// send. The mark comes when the agent takes the turn, which can be seconds after the send.
+/// Marks the notes `ids` sent in `run` and saves. The mark comes when the agent takes the
+/// turn, which can be seconds after the send. A note deleted meanwhile is skipped: the run it
+/// went to is under way, and the engineer removed it. A note resolved meanwhile stays
+/// resolved, the engineer's word being later than the send, and records `run`: the agent did
+/// get it, so its dialog shows this run and a reopen makes it sent in this run.
 ///
 /// # Errors
 ///
@@ -290,11 +292,18 @@ pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<()> {
     let file = repo.review_file();
     let _lock = lock(&file)?;
     let mut review = current(repo)?;
-    for note in &mut review.notes {
-        if wanted.contains(&note.id) && !matches!(note.state, NoteState::Resolved { .. }) {
-            note.state = NoteState::Sent {
-                run: run.to_owned(),
-            };
+    for note in review
+        .notes
+        .iter_mut()
+        .filter(|note| wanted.contains(&note.id))
+    {
+        match &mut note.state {
+            NoteState::Resolved { run: last } => *last = Some(run.to_owned()),
+            state @ (NoteState::Open {} | NoteState::Sent { .. }) => {
+                *state = NoteState::Sent {
+                    run: run.to_owned(),
+                };
+            }
         }
     }
     review.save(&file)
