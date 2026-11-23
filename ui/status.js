@@ -3,7 +3,7 @@
 // view (`GET api/run`, src/run.rs `RunView`), kept apart from the document so `node --test`
 // runs them.
 
-import { diffStats, foldRun, isLive, isOpen, sentIn, toolRow } from "./run.js";
+import { diffStats, foldRun, isLive, isOpen, isResolved, sentIn, toolRow } from "./run.js";
 
 // The run a note's status comes from, or null: the run it was marked sent in, else the live
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
@@ -18,6 +18,14 @@ export function runOf(note, runs, live) {
 // A note's status: `kind` names its icon and group, `label` is its words, `tone` its color.
 // A note sent in a run not read yet is "Sent in R2" until it is.
 export function noteStatus(note, run) {
+  // The engineer's word ends the loop, whatever the run says.
+  if (isResolved(note)) return { kind: "resolved", label: "Resolved", tone: "done" };
+  return runStatus(note, run);
+}
+
+// A note's status from its run alone, as `noteStatus` gives it for a note not resolved: a
+// resolved note's dialog still says how its run went.
+export function runStatus(note, run) {
   const id = sentIn(note);
   if (run === null) {
     return id === null
@@ -119,21 +127,24 @@ export function fileDiffs(note, run) {
     .flatMap((tool) => tool.output.filter((part) => part.type === "diff" && part.path === note.path));
 }
 
-// The tray's groups, each in the tray's order: the notes of the live run, the open ones, and
-// the ones whose run is over, newest run first. `statusOf(note)` gives a note's status.
+// The tray's groups, each in the tray's order: the notes of the live run, the open ones, the
+// ones whose run is over, newest run first, and the resolved ones last. `statusOf(note)`
+// gives a note's status.
 export function groupNotes(notes, statusOf) {
   const inRun = [];
   const open = [];
   const done = [];
+  const resolved = [];
   for (const note of notes) {
     const { kind } = statusOf(note);
     if (["starting", "working", "needs"].includes(kind)) inRun.push(note);
     else if (kind === "open") open.push(note);
+    else if (kind === "resolved") resolved.push(note);
     else done.push(note);
   }
   const number = (note) => Number(sentIn(note)?.slice(1) ?? 0);
   done.sort((a, b) => number(b) - number(a));
-  return { inRun, open, done };
+  return { inRun, open, done, resolved };
 }
 
 // The latest review of run `id` among `views` (every run read so far; src/review.rs): its

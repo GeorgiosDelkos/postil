@@ -3,8 +3,8 @@
 // run (status.js), and drawn again when either changes while it is open.
 
 import { questionContent, questionFields } from "./question.js";
-import { isLive, openQuestion, foldRun, partLines, statusLine } from "./run.js";
-import { agentSaid, fileDiffs, fileStats, noteHistory, noteStatus } from "./status.js";
+import { isLive, isResolved, openQuestion, foldRun, partLines, statusLine } from "./run.js";
+import { agentSaid, fileDiffs, fileStats, noteHistory, noteStatus, runStatus } from "./status.js";
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -15,7 +15,7 @@ function el(tag, className, text) {
 
 // The status icon of a card or the dialog: its shape is CSS (`.status-icon.<kind>`).
 export function statusIcon(kind) {
-  const glyph = { needs: "!", addressed: "✓", silent: "–", failed: "×" }[kind] ?? "";
+  const glyph = { needs: "!", addressed: "✓", resolved: "✓", silent: "–", failed: "×" }[kind] ?? "";
   const icon = el("span", `status-icon ${kind}`, glyph);
   icon.setAttribute("aria-hidden", "true");
   return icon;
@@ -110,7 +110,7 @@ function fieldView(field, index, values) {
 // `dialogEl` is the `<dialog>`. `find(id)` gives `{ note, run }` for a note id, or null once
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
-// ticked), `remove(note)`, `showRun()`, and `answerQuestion(request, content)` for the run's
+// ticked), `remove(note)`, `resolve(note)`, `reopen(note)`, `showRun()`, and `answerQuestion(request, content)` for the run's
 // open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
 // (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
@@ -124,6 +124,8 @@ export function noteDialog(
     showInCode,
     send,
     remove,
+    resolve,
+    reopen,
     showRun,
     answerQuestion,
     reviewOf,
@@ -250,7 +252,7 @@ export function noteDialog(
       silent: `Nothing: the run ended without a line for ${note.id}.`,
       stopped: "Nothing: the run was stopped before the agent wrote its summary.",
       failed: run.problem ?? failure(run) ?? "The run failed.",
-    }[noteStatus(note, run).kind];
+    }[runStatus(note, run).kind];
     const text = el("div", "note-dialog-said muted", words ?? "");
     // A permission request with no allow option waits in the run, not here.
     if (run.status === "waiting" && !openQuestion(foldRun(run.entries).items)) {
@@ -344,8 +346,18 @@ export function noteDialog(
     });
     // A disabled button says why beside it, not only in a tooltip.
     const why = sendable ? "" : "Wait for the run under way, or stop it.";
-    foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), button);
+    foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), resolveButton(note), button);
     return foot;
+  }
+
+  // Resolve ends the note's loop, kept with the run it was sent in; Reopen undoes it.
+  function resolveButton(note) {
+    const done = isResolved(note);
+    const button = el("button", "button note-dialog-resolve", done ? "Reopen" : "Resolve");
+    button.type = "button";
+    button.title = done ? "Back to where it was before you resolved it." : "Mark the note done.";
+    button.addEventListener("click", () => (done ? reopen(note) : resolve(note)));
+    return button;
   }
 
   // A note is the engineer's writing, so deleting takes two clicks, as on the card.

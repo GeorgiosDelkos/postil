@@ -8,12 +8,14 @@ import {
   noteHistory,
   noteStatus,
   planProgress,
+  runStatus,
   reviewOf,
   runOf,
 } from "./status.js";
 
 const open = (id, path = "a.rs") => ({ id, path, state: { kind: "open" } });
 const sent = (id, run, path = "a.rs") => ({ id, path, state: { kind: "sent", run } });
+const resolved = (id, run) => ({ id, path: "a.rs", state: { kind: "resolved", run } });
 const run = (id, status, entries = [], notes = []) => ({ id, status, entries, notes });
 const said = (text) => ({ kind: "message", text, message: null });
 const ended = (reason) => ({ kind: "ended", reason });
@@ -60,6 +62,10 @@ test("a note's status follows its run", () => {
     "Open",
     "a note the agent never took is open again",
   );
+  assert.equal(status(resolved("N1", "R1"), run("R1", "failed")), "Resolved", "the engineer's word wins");
+  assert.equal(status(resolved("N1"), null), "Resolved");
+  assert.equal(runStatus(resolved("N1", "R1"), run("R1", "failed")).label, "Failed in R1", "its run's own status");
+  assert.equal(runOf(resolved("N1", "R1"), new Map([["R1", run("R1", "ended")]]), null)?.id, "R1");
 });
 
 test("the agent's line about a note is read in the forms agents write", () => {
@@ -115,14 +121,15 @@ test("a note's history is the run's tool calls on its file and the plan steps na
   assert.equal(noteHistory(note, run("R1", "ended", [moved])).length, 1);
 });
 
-test("notes are grouped as in the run, open, and done, newest run first", () => {
-  const notes = [sent("N1", "R1"), open("N2"), sent("N3", "R3"), sent("N4", "R2"), open("N5")];
-  const kinds = { N1: "addressed", N2: "open", N3: "working", N4: "failed", N5: "open" };
+test("notes are grouped as in the run, open, done newest run first, and resolved", () => {
+  const notes = [sent("N1", "R1"), open("N2"), sent("N3", "R3"), sent("N4", "R2"), open("N5"), resolved("N6", "R3")];
+  const kinds = { N1: "addressed", N2: "open", N3: "working", N4: "failed", N5: "open", N6: "resolved" };
   const groups = groupNotes(notes, (note) => ({ kind: kinds[note.id] }));
   const ids = (list) => list.map((note) => note.id);
   assert.deepEqual(ids(groups.inRun), ["N3"]);
   assert.deepEqual(ids(groups.open), ["N2", "N5"]);
   assert.deepEqual(ids(groups.done), ["N4", "N1"]);
+  assert.deepEqual(ids(groups.resolved), ["N6"]);
 });
 
 test("a run's latest review: its stages, findings, and the judge's verdict on each", () => {

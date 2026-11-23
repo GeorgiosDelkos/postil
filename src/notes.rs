@@ -18,11 +18,11 @@
 //! The notes live in `<git dir>/postil/review.json` (docs/design.md, "Data structures"). That
 //! file is the only copy: every request reads it, so an agent or a script that edits it is
 //! seen on the next request, and the page holds nothing that a reload would lose. The module
-//! offers three operations, [`current`], [`add`] and [`delete`], each of which does every
-//! step (read, relocate, and for the two writers lock and write) so that no caller can skip
-//! one.
+//! offers [`current`] to read and [`add`], [`delete`], [`resolve`] and [`reopen`] to write,
+//! each of which does every step (read, relocate, and for the writers lock and write) so
+//! that no caller can skip one. [`mark_sent`] writes too, for the runner.
 //!
-//! Only [`add`] and [`delete`] write. Reading the notes, which the page does whenever the
+//! Only those writers write. Reading the notes, which the page does whenever the
 //! window regains focus, never rewrites the file, so it cannot overwrite an edit made by
 //! hand. The cost: the stored lines catch up with the code only on the next write, and until
 //! then each read relocates from the older lines.
@@ -36,7 +36,8 @@
 //! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
 //! write), and an older build must say "version 2" rather than "unknown field". A newer build
 //! reads every older version. Version 2 added each note's `state`; a version 1 file reads
-//! with every note open, and the next write makes it version 2.
+//! with every note open. Version 3 added the resolved state. The next write makes an older
+//! file version 3.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -53,7 +54,7 @@ use crate::repo::Repo;
 
 /// The format version this build writes. It reads this one and every older one; a file with
 /// a newer version is refused, not rewritten.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// Reads the review file and places every note where its snippet is now. Does not write.
 ///
@@ -159,6 +160,56 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
     if review.notes.len() == before {
         return Err(Error::NoSuchNote { id: id.to_owned() });
     }
+    review.save(&file)?;
+    Ok(review)
+}
+
+/// Marks the note `id` resolved, saves, and returns all notes. A resolved note keeps the run
+/// it was sent in, so its dialog still shows what that run did. Resolving a resolved note
+/// changes nothing.
+///
+/// # Errors
+///
+/// As [`delete`].
+pub(crate) fn resolve(repo: &Repo, id: &str) -> Result<Review> {
+    change_state(repo, id, |state| match state {
+        NoteState::Open {} => NoteState::Resolved { run: None },
+        NoteState::Sent { run } => NoteState::Resolved { run: Some(run) },
+        resolved @ NoteState::Resolved { .. } => resolved,
+    })
+}
+
+/// Reopens the resolved note `id`, saves, and returns all notes: it is sent again in the run
+/// it was resolved after, or open when it was never sent. Any other note is left as it is.
+///
+/// # Errors
+///
+/// As [`delete`].
+pub(crate) fn reopen(repo: &Repo, id: &str) -> Result<Review> {
+    change_state(repo, id, |state| match state {
+        NoteState::Resolved { run: Some(run) } => NoteState::Sent { run },
+        NoteState::Resolved { run: None } => NoteState::Open {},
+        other @ (NoteState::Open {} | NoteState::Sent { .. }) => other,
+    })
+}
+
+/// Replaces the state of note `id` with `change(state)` and saves, under the lock.
+fn change_state(
+    repo: &Repo,
+    id: &str,
+    change: impl FnOnce(NoteState) -> NoteState,
+) -> Result<Review> {
+    let wanted = NoteId::parse(id)
+        .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
+    let file = repo.review_file();
+    let _lock = lock(&file)?;
+    let mut review = current(repo)?;
+    let note = review
+        .notes
+        .iter_mut()
+        .find(|note| note.id == wanted)
+        .ok_or_else(|| Error::NoSuchNote { id: id.to_owned() })?;
+    note.state = change(std::mem::take(&mut note.state));
     review.save(&file)?;
     Ok(review)
 }
@@ -307,6 +358,11 @@ enum NoteState {
     Open {},
     /// Sent to the agent in the run with this id (`R1`).
     Sent { run: String },
+    /// The engineer is done with it. `run` is the run it was sent in last, if any.
+    Resolved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<String>,
+    },
 }
 
 /// What the page sends to create a note.

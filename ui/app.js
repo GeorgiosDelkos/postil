@@ -990,6 +990,12 @@ function renderNotes() {
       ...groups.done.map((note) => noteItem(note, cards.get(note.id))),
     );
   }
+  if (groups.resolved.length) {
+    parts.push(
+      groupHeader(`Resolved · ${groups.resolved.length}`, ""),
+      ...groups.resolved.map((note) => noteItem(note, cards.get(note.id))),
+    );
+  }
   notesEl.replaceChildren(...parts);
 }
 
@@ -1132,6 +1138,24 @@ async function deleteNote(note) {
   await runs.reload();
 }
 
+// Resolves or reopens a note (`action` is the route's last part, src/shell.rs), and draws
+// the notes the reply holds.
+async function changeNote(action, note) {
+  const response = await fetch(`api/notes/${action}?id=${encodeURIComponent(note.id)}`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    showToast(await response.text());
+    await loadNotes();
+    return;
+  }
+  state.notes = (await response.json()).notes;
+  indexNotes();
+  renderNotes();
+  renderFiles();
+  redecorateRows();
+}
+
 async function showNote(note) {
   if (state.file?.path !== note.path && !(await openFile(note.path))) return;
   // A third of the way down reads better than the very top edge.
@@ -1176,6 +1200,8 @@ const noteDetail = noteDialog(noteDialogEl, {
   showInCode: showNote,
   send: sendAlone,
   remove: deleteNote,
+  resolve: (note) => changeNote("resolve", note),
+  reopen: (note) => changeNote("reopen", note),
   showRun: () => showTab("run"),
   answerQuestion: (request, content) => runs.answerQuestion(request, content),
   reviewOf: (id) => reviewOf(id, runs.knownViews()),
