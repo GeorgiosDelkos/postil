@@ -1,8 +1,8 @@
 # Postil: design plan
 
 Status: 2026-11-23. The UI layer is decided (a system webview through wry, core in Rust).
-Milestones 0 to 3 are built. Section "Decisions" lists what is settled and what is still
-assumed.
+Milestones 0 to 4 are built, and milestone 5 is under way. Section "Decisions" lists what is
+settled and what is still assumed.
 
 Mockups: https://claude.ai/code/artifact/68e1a720-a3d5-4d71-92d4-9acd76ea9d5e (private to the
 owner until shared).
