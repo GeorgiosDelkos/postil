@@ -434,19 +434,6 @@ struct FileView<'a> {
 
 pub(crate) type Reply = Response<Cow<'static, [u8]>>;
 
-// The request thread drops the site on `Job::Close`, while the event loop still runs. The
-// event loop exits on `AppEvent::SiteClosed`, or at `QUIT_WAIT` without it. A runner whose
-// agent is still starting is also held by its start thread, so dropping the project alone
-// would not stop that agent: the site stops it here, so a quit that closes the site in time
-// leaves no agent behind.
-impl Drop for Site {
-    fn drop(&mut self) {
-        if let Some(project) = self.project.borrow_mut().take() {
-            project.runner.close();
-        }
-    }
-}
-
 impl Site {
     /// A site with no project open, keeping its files in `config` (`None` turns the recent
     /// list and the settings off).
@@ -1002,6 +989,19 @@ impl Site {
     fn reset_settings(&self) -> Result<Vec<u8>> {
         settings::reset(self.settings_file.as_deref().ok_or(Error::NoHome)?)?;
         Ok(self.settings())
+    }
+}
+
+// The request thread drops the site on `Job::Close`, while the event loop still runs. The
+// event loop exits on `AppEvent::SiteClosed`, or at `QUIT_WAIT` without it. A runner whose
+// agent is still starting is also held by its start thread, so dropping the project alone
+// would not stop that agent: the site stops it here, so a quit that closes the site in time
+// leaves no agent behind.
+impl Drop for Site {
+    fn drop(&mut self) {
+        if let Some(project) = self.project.borrow_mut().take() {
+            project.runner.close();
+        }
     }
 }
 
