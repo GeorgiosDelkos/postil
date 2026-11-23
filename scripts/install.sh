@@ -5,7 +5,8 @@
 #
 # Usage: scripts/install.sh [DIR], DIR being where to install instead. Quit Postil first: a
 # running copy keeps running the old build until it is quit. Needs what scripts/bundle.sh
-# needs, and macOS's `trash` and `ditto`.
+# needs, and macOS's `trash` and `ditto`. With POSTIL_SIGN_IDENTITY set, it signs (and with the
+# notary variables, notarizes) the bundle through scripts/sign.sh before installing it.
 set -euo pipefail
 
 usage="usage: scripts/install.sh [DIR]"
@@ -35,6 +36,9 @@ else
 fi
 
 "$root/scripts/bundle.sh"
+if [[ -n "${POSTIL_SIGN_IDENTITY:-}" ]]; then
+  "$root/scripts/sign.sh"
+fi
 
 mkdir -p "$dest"
 # Copied in beside the old one first, so a copy that fails leaves the installed app as it was.

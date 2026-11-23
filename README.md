@@ -17,8 +17,9 @@ changed lines, and the Run tab on the right.](docs/screenshot.png)
 Postil is a reader with a notes tray and an agent panel. It is not an editor, a terminal or a
 pull request tool: the agent edits, and you read and write notes.
 
-> **Status:** early (0.1.0). macOS only. The app is built from source; there is no signed or
-> notarized release yet.
+> **Status:** early (0.1.0). macOS only. The app is built from source, and can be signed and
+> notarized with your own Developer ID (see [Build and run](#build-and-run)); there is no
+> published release yet.
 
 ## Contents
 
@@ -95,6 +96,19 @@ writable), moving an older copy to the Trash:
 ```sh
 scripts/install.sh
 ```
+
+To sign the app with a Developer ID certificate and notarize it, so it opens on other Macs
+without a Gatekeeper warning, set these first; `scripts/install.sh` then signs before it
+installs (`scripts/sign.sh` signs a bundle on its own):
+
+```sh
+export POSTIL_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export POSTIL_NOTARY_KEY=/path/to/AuthKey_XXXXXXXXXX.p8   # App Store Connect API key
+export POSTIL_NOTARY_KEY_ID=XXXXXXXXXX
+export POSTIL_NOTARY_ISSUER=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+Without the three notary variables it signs only.
 
 ## Agents
 
@@ -193,6 +207,7 @@ Read it before a change of any size.
 | `tests/`               | The fake ACP agent and the command-line and page tests             |
 | `scripts/bundle.sh`    | Builds `Postil.app`                                                |
 | `scripts/install.sh`   | Builds `Postil.app` and installs it in `/Applications`             |
+| `scripts/sign.sh`      | Signs `Postil.app` with a Developer ID, and notarizes it           |
 
 ## License
 
