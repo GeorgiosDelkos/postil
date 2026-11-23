@@ -385,6 +385,36 @@ One source of run state, the log, so the Rust process has no second summary to k
   it ticked. Decided with the owner on 2026-11-23. A run that starts no longer takes the tray
   to the Run tab unless it came from the send step; one that needs the engineer still does.
 
+### Reviews
+
+A Review button in a run's dialog, and in the dialog of each of its notes, sends the run's
+work to the settings' reviewers in order (`src/review.rs`, `POST /api/run/review {of}`). The
+work is the run's prompt, its reply, and the diffs its finished edits made. Decided with the
+owner on 2026-11-23:
+
+- **Every reviewer but the last proposes, read-only.** Postil rejects its tool calls but reads,
+  searches, fetches and thinking, and its prompt says not to change files. That stops only
+  the calls an agent asks permission for; an agent set to edit without asking is caught when
+  its turn ends, by the edits its run reports, and the review stops there. An edit made
+  through a command reports none. The reviewer ends its reply with its findings as a JSON
+  array fenced as json, which Postil reads and logs as the run ends; the findings are
+  numbered `F1`, `F2`, ... across the chain. The prompt gives the format in words, not as an
+  example block, which an agent quoting it would make read as findings.
+- **The last of two or more judges.** It gets every finding, accepts or rejects each, makes the
+  accepted changes, and ends with one line per finding (`F1: accepted - ...`). A single
+  reviewer only proposes.
+- **Each stage is a run,** marked in its header with the run it reviews and its place in the
+  chain, started with a fresh agent when the one before ends well: a reviewer never inherits
+  the reviewed agent's conversation. That replaces the agent kept for follow-ups, and a send
+  after a review starts a fresh agent too, never a reviewer's. A stage that fails or is
+  stopped ends the review, and a send ends one between stages. A review marks no note sent.
+  The run log is version 2 for the review header field and the `findings` entry; version 1
+  logs read as runs of notes.
+- **Findings live in the work, not as notes or runs of their own.** The Run tab lists only runs
+  of notes; a run's dialog has a Review section with a card per reviewer (it opens that
+  reviewer's run) and a card per finding with its verdict (it opens the finding whole), and a
+  note's dialog shows the findings about that note, in full.
+
 ### Cards and dialogs
 
 Every list in the tray is made of small cards: a status, a place, an id, and the note in two
@@ -438,10 +468,8 @@ installed while the app runs.
 
 The settings (`~/.config/postil/settings.json`, below) keep which agents are turned on, the
 custom agents, the agent notes are sent to, and the reviewers: an ordered list of agents, the
-same one allowed more than once, that each review the agent's work in turn before it comes
-back to the engineer. An empty list means no review. The send step (milestone 3) uses the
-agent; the review step (milestone 4) runs the reviewers, and the send step can change the list
-for one send, for a change that needs more eyes. Asked for by the owner on 2026-11-22.
+same one allowed more than once, that review a run's work in turn when the engineer asks
+(section "Reviews"). An empty list means no review. Asked for by the owner on 2026-11-22.
 
 Login is not handled in version 1 of the app: when an agent reports that it needs
 authentication, the run panel says which command to run in a terminal.

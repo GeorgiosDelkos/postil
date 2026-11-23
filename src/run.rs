@@ -41,7 +41,8 @@
 //! # Threads and locks
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
-//! and an agent's start on a thread of its own. Two locks, always taken in this order: the
+//! an agent's start on a thread of its own, and a review's next stage on one more
+//! (`review-next`, [`Runner::advance`]). Two locks, always taken in this order: the
 //! runner's [`Slot`], then a run's state. The page is told about every change through
 //! `notify`, and fetches what it has not seen.
 
@@ -58,13 +59,14 @@ use serde_json::Value;
 
 use crate::acp::{
     Agent, ContentBlock, ElicitationReply, Event, Launch, Location, PermissionKind,
-    PermissionOption, PlanEntryStatus, SessionUpdate, StopReason, Stopper, ToolCallContent,
-    ToolCallStatus, ToolKind, TurnEnd,
+    PermissionOption, PermissionRequest, PlanEntryStatus, SessionUpdate, StopReason, Stopper,
+    ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::agents::Scanner;
 use crate::error::{Error, Result, error_chain};
 use crate::notes::{self, Prompt};
 use crate::repo::Repo;
+use crate::review::{self, Diff, Finding, Stage, Work};
 
 /// How long an agent may take to start, and then to open a session. Claude's adapter took
 /// 4.3 s to open a session with npx's cache warm (2026-11-23); a first `npx` run downloads
@@ -83,8 +85,9 @@ const FORCE_AFTER: Duration = Duration::from_secs(3);
 /// refused send answers at once.
 const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
-/// The run log's format version, in its header line.
-const LOG_VERSION: u32 = 1;
+/// The run log's format version, in its header line. Version 2 added a reviewer's run
+/// (`review` in the header, the `findings` entry); version 1 logs read as runs of notes.
+const LOG_VERSION: u32 = 2;
 
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
@@ -105,6 +108,17 @@ pub(crate) struct Runner {
     slot: Mutex<Slot>,
 }
 
+impl fmt::Debug for Chain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chain")
+            .field("stage", &self.stage)
+            .field("reviewers", &self.reviewers)
+            .field("work", &self.work)
+            .field("findings", &self.findings.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// What a runner holds now.
 #[derive(Debug, Default)]
 struct Slot {
@@ -117,6 +131,27 @@ struct Slot {
     run: Option<Arc<Run>>,
     /// Set when the project closed: an agent that finishes starting afterwards is stopped.
     closed: bool,
+    /// The review under way, while its stages run one after another; cleared when a stage
+    /// does not end well or reports edits it may not make, when the engineer stops it, by a
+    /// send, when the project closes, and when the last stage ends; `advance` takes it to
+    /// start the next stage. From a stage's end until `advance` starts the next one, `stage`
+    /// is the stage to start, not the slot's run's: a late event from the ended agent no
+    /// longer ends the review.
+    chain: Option<Chain>,
+}
+
+/// A review under way (`review.rs`): the stage now running, the reviewers, what they review,
+/// and the findings proposed so far. Its `Debug` counts the findings: their text quotes code.
+struct Chain {
+    stage: Stage,
+    reviewers: Vec<AgentChoice>,
+    work: Work,
+    /// The reviewed run's notes: a review run carries them, so it goes with them when the
+    /// last is deleted.
+    notes: Vec<String>,
+    /// The files the reviewed run changed, linked in each reviewer's prompt.
+    files: Vec<String>,
+    findings: Vec<Finding>,
 }
 
 /// The runner's agent: none, one starting, or one ready and kept between runs.
@@ -195,16 +230,24 @@ impl Runner {
             return Err(Error::TurnRunning);
         }
         let prompt = notes::prompt(&self.repo, ids)?;
+        slot.chain = None;
+        // The agent kept from a reviewer's run holds that reviewer's conversation (told not to
+        // change files, or to judge findings), so a send after a review starts afresh.
+        let after_review = slot
+            .run
+            .as_ref()
+            .is_some_and(|run| run.state().header.review.is_some());
         let run = Arc::new(Run::create(
             &self.repo.runs_dir(),
             &agent.name,
             ids,
             &prompt.text,
+            None,
         )?);
         slot.run = Some(Arc::clone(&run));
 
         let replaced = match &slot.agent {
-            Held::Ready(kept, live) if *kept == agent && live.is_alive() => {
+            Held::Ready(kept, live) if *kept == agent && live.is_alive() && !after_review => {
                 self.begin(live, &run, ids, &prompt);
                 Held::None
             }
@@ -228,6 +271,146 @@ impl Runner {
         Ok(())
     }
 
+    /// Starts a review of run `of` by `reviewers`, in order (`review.rs`): each stage is a run
+    /// of its own, started with a fresh agent when the one before it ends well.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TurnRunning`] while a run of this window is under way, and
+    /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
+    /// reviewers, or for a run that is itself a review; as [`Runner::view_of`] for the
+    /// reviewed run; and [`Error::WriteRun`] when the first stage's log cannot be created.
+    pub(crate) fn review(self: &Arc<Self>, of: &str, reviewers: Vec<AgentChoice>) -> Result<()> {
+        if reviewers.is_empty() {
+            return Err(Error::BadRequest(
+                "no reviewers are set: add them in Settings".to_owned(),
+            ));
+        }
+        let reviewed = self.run_by_id(of)?;
+        let mut slot = self.slot();
+        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
+            return Err(Error::TurnRunning);
+        }
+        let (notes, work, files) = {
+            let state = reviewed.state();
+            if state.header.review.is_some() {
+                return Err(Error::BadRequest(format!("{of} is itself a review")));
+            }
+            let work = state.work();
+            let mut files: Vec<String> = Vec::new();
+            for diff in &work.diffs {
+                if !files.contains(&diff.path) {
+                    files.push(diff.path.clone());
+                }
+            }
+            (state.header.notes.clone(), work, files)
+        };
+        let chain = Chain {
+            stage: Stage {
+                of: of.to_owned(),
+                reviewer: 1,
+                reviewers: reviewers.len(),
+            },
+            reviewers,
+            work,
+            notes,
+            files,
+            findings: Vec::new(),
+        };
+        let replaced = self.start_stage(&mut slot, chain)?;
+        drop(slot);
+        drop(replaced);
+        (self.notify)();
+        Ok(())
+    }
+
+    /// The run `of`, this window's when it is that one, else read from its log.
+    fn run_by_id(&self, of: &str) -> Result<Arc<Run>> {
+        let number = run_number(of)
+            .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
+        let own = self.slot().run.clone();
+        if let Some(run) = own.filter(|run| run.state().header.id == of) {
+            return Ok(run);
+        }
+        let no_such = |problem: String| Error::NoSuchRun {
+            id: of.to_owned(),
+            problem,
+        };
+        let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
+        if !file.exists() {
+            return Err(no_such("there is no such run log".to_owned()));
+        }
+        Run::read(&file).map(Arc::new).map_err(no_such)
+    }
+
+    /// Starts `chain`'s current stage as a new run, with a fresh agent, so a reviewer never
+    /// inherits the reviewed agent's conversation. Returns the agent it replaced, to drop
+    /// outside the lock.
+    fn start_stage(self: &Arc<Self>, slot: &mut Slot, chain: Chain) -> Result<Held> {
+        let agent = chain.reviewers[chain.stage.reviewer - 1].clone();
+        let text = if chain.stage.judges() {
+            review::judge_prompt(&chain.work, &chain.findings)
+        } else {
+            review::propose_prompt(&chain.work)
+        };
+        let run = Arc::new(Run::create(
+            &self.repo.runs_dir(),
+            &agent.name,
+            &chain.notes,
+            &text,
+            Some(chain.stage.clone()),
+        )?);
+        slot.run = Some(Arc::clone(&run));
+        let replaced = slot.release();
+        let pending = Pending {
+            agent,
+            run,
+            // A review marks no note sent: the notes went to the reviewed run.
+            ids: Vec::new(),
+            prompt: Prompt {
+                text,
+                files: chain.files.clone(),
+            },
+            generation: slot.generation,
+        };
+        slot.chain = Some(chain);
+        self.start(pending);
+        Ok(replaced)
+    }
+
+    /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
+    /// ended. Runs on a thread of its own: the stage's agent is replaced, and dropping an
+    /// agent from its own reader thread would wait on itself.
+    fn advance(self: &Arc<Self>, ended: &str) {
+        let mut slot = self.slot();
+        // A send, a stop, or another review meanwhile took the chain, or replaced its run.
+        let current = slot.run.as_ref().map(|run| run.state().header.id.clone());
+        let Some(chain) = slot.chain.take() else {
+            return;
+        };
+        if current.as_deref() != Some(ended) {
+            slot.chain = Some(chain);
+            return;
+        }
+        match self.start_stage(&mut slot, chain) {
+            Ok(replaced) => {
+                drop(slot);
+                drop(replaced);
+            }
+            Err(error) => {
+                // The stage that ended says why the review stopped there.
+                if let Some(run) = &slot.run {
+                    run.state().problem.get_or_insert(format!(
+                        "the next reviewer could not start: {}",
+                        error_chain(&error)
+                    ));
+                }
+                drop(slot);
+            }
+        }
+        (self.notify)();
+    }
+
     /// Stops the run (module docs, "Stopping").
     ///
     /// # Errors
@@ -247,6 +430,8 @@ impl Runner {
         };
         let mut released = Held::None;
         let mut result = Ok(());
+        // A stopped reviewer ends its review: the next stage does not start.
+        slot.chain = None;
         match (started, asked) {
             (false, _) => {
                 // The agent is still starting: it is stopped, and the run ends now.
@@ -369,24 +554,7 @@ impl Runner {
     /// [`Error::BadRequest`] when `id` is not of the form `R<number>`; [`Error::NoSuchRun`]
     /// when its log is missing or cannot be read.
     pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
-        let no_such = |problem: &str| Error::NoSuchRun {
-            id: id.to_owned(),
-            problem: problem.to_owned(),
-        };
-        let number = run_number(id)
-            .ok_or_else(|| Error::BadRequest(format!("run id {id:?}: expected R and a number")))?;
-
-        let own = self.slot().run.clone();
-        if let Some(run) = own.filter(|run| run.state().header.id == id) {
-            return Ok(run.view(0));
-        }
-        let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
-        if !file.exists() {
-            return Err(no_such("there is no such run log"));
-        }
-        Run::read(&file)
-            .map(|run| run.view(0))
-            .map_err(|problem| no_such(&problem))
+        Ok(self.run_by_id(id)?.view(0))
     }
 
     /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.
@@ -475,6 +643,7 @@ impl Runner {
         let released = {
             let mut slot = self.slot();
             slot.closed = true;
+            slot.chain = None;
             slot.release()
         };
         drop(released);
@@ -566,7 +735,9 @@ impl Runner {
     /// Sends the prompt to a running agent. Its notes are marked sent once the agent shows it
     /// took the turn ([`Run::record_event`]).
     fn begin(&self, agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt) {
-        run.state().unmarked = Some(ids.to_vec());
+        if !ids.is_empty() {
+            run.state().unmarked = Some(ids.to_vec());
+        }
         let blocks = prompt_blocks(prompt, self.repo.root());
         if let Err(error) = agent.prompt(&blocks) {
             return run.record(Entry::Failed {
@@ -591,6 +762,11 @@ impl Runner {
 
 #[cfg(test)]
 impl Runner {
+    /// Whether a review is under way: decided as each stage ends, before its end is logged.
+    pub(crate) fn reviewing(&self) -> bool {
+        self.slot().chain.is_some()
+    }
+
     /// Moves the run's first Stop back by [`FORCE_AFTER`], so a test can force a stop without
     /// waiting that long.
     pub(crate) fn backdate_stop(&self) {
@@ -621,33 +797,47 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
     };
-    // Postil answers permission requests itself (docs/design.md, "Runs", decided with the
-    // owner on 2026-11-23): only a question stops for the engineer.
-    let allow = match &event {
-        Event::Permission(request) => allow_option(&request.options).map(|id| (request.number, id)),
-        _ => None,
-    };
-    let (run, released, answer) = {
+    let ended_well = matches!(
+        event,
+        Event::TurnEnded(TurnEnd::Stopped(StopReason::EndTurn))
+    );
+    let ends_turn = matches!(event, Event::TurnEnded(_) | Event::Exited { .. });
+    let (run, released, answer, next) = {
         let mut slot = runner.slot();
         if slot.let_go(generation) {
             return;
         }
-        // Answered before the request is logged, and logged with it at once: a page that
-        // read the request alone would show the run waiting for the engineer. Fails when a
-        // Stop already answered the request (and logged that), or the agent is gone; the run
-        // then shows the request open until it ends.
-        let answer = allow.and_then(|(request, option)| match &slot.agent {
-            Held::Ready(_, agent) => {
-                agent
-                    .answer_permission(request, &option)
-                    .ok()
-                    .map(|()| Entry::Answer {
-                        request,
-                        option: Some(option),
-                    })
-            }
-            Held::None | Held::Starting(_) => None,
+        // The review stage this run is, while its review goes on.
+        let stage = slot
+            .run
+            .as_ref()
+            .and_then(|run| run.state().header.review.clone())
+            .filter(|stage| {
+                slot.chain
+                    .as_ref()
+                    .is_some_and(|chain| chain.stage == *stage)
+            });
+        // Answered before the request is logged, and logged with it at once: a page that read
+        // the request alone would show the run waiting for the engineer.
+        // From the run's header, which never changes: a Stop that ends the chain does not lift
+        // it for the rest of the proposer's turn.
+        let read_only = slot.run.as_ref().is_some_and(|run| {
+            run.state()
+                .header
+                .review
+                .as_ref()
+                .is_some_and(|stage| !stage.judges())
         });
+        let answer = match (&event, &slot.agent) {
+            (Event::Permission(request), Held::Ready(_, agent)) => {
+                auto_answer(agent, request, read_only)
+            }
+            _ => None,
+        };
+        // A stage that does not end well ends its review.
+        if ends_turn && !ended_well && stage.is_some() {
+            slot.chain = None;
+        }
         let ends_agent = matches!(
             event,
             Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
@@ -657,7 +847,15 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         } else {
             Held::None
         };
-        (slot.run.clone(), released, answer)
+        let run = slot.run.clone();
+        // Decided under the lock, before the stage's end is logged: a reader that sees the end
+        // sees the decision, and no Stop or new review can replace the chain meanwhile. Only
+        // starting the next stage waits for a thread of its own.
+        let next = match (&stage, &run) {
+            (Some(stage), Some(run)) if ended_well => decide(&mut slot, run, stage),
+            _ => None,
+        };
+        (run, released, answer, next)
     };
     if let Some(run) = run
         && let Some(ids) = run.record_event(event, answer, runner.repo.root())
@@ -667,6 +865,114 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
     (runner.notify)();
+    if let Some(ended) = next {
+        let next = Arc::clone(&runner);
+        let advanced = std::thread::Builder::new()
+            .name("review-next".to_owned())
+            .spawn(move || next.advance(&ended));
+        if let Err(error) = advanced {
+            let mut slot = runner.slot();
+            slot.chain = None;
+            if let Some(run) = &slot.run {
+                run.state().problem.get_or_insert(format!(
+                    "the next reviewer could not start: no thread for it ({error})"
+                ));
+            }
+        }
+    }
+}
+
+/// Ends review stage `stage` of `run`, whose turn ended well, and decides whether the review
+/// goes on: the id of the ended run when the next stage is to start, else `None`, the chain
+/// then cleared. A proposer's findings are logged here, before the end, while the run still
+/// takes entries.
+fn decide(slot: &mut Slot, run: &Run, stage: &Stage) -> Option<String> {
+    let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
+    let findings = end_stage(run, stage, found);
+    let goes = match (findings, slot.chain.as_mut()) {
+        (Some(findings), Some(chain)) => goes_on(chain, findings),
+        _ => false,
+    };
+    if goes {
+        Some(run.state().header.id.clone())
+    } else {
+        slot.chain = None;
+        None
+    }
+}
+
+/// Answers a permission request as Postil does on the engineer's behalf (docs/design.md,
+/// "Runs", decided with the owner on 2026-11-23: only a question stops for the engineer), and
+/// returns the entry that logs the answer. A proposing reviewer is kept read-only: only its
+/// reads, searches, fetches and thinking are allowed. `None` when no option fits, or when a
+/// Stop already answered the request (and logged that) or the agent is gone; the run then
+/// shows the request open until it ends.
+fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> Option<Entry> {
+    let reads = matches!(
+        request.tool_call.kind,
+        Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think)
+    );
+    let option = if read_only && !reads {
+        reject_option(&request.options)
+    } else {
+        allow_option(&request.options)
+    }?;
+    agent.answer_permission(request.number, &option).ok()?;
+    Some(Entry::Answer {
+        request: request.number,
+        option: Some(option),
+    })
+}
+
+/// Moves `chain` to its next stage, given the findings of the stage that ended. Returns
+/// whether there is one to start: not past the last reviewer, and not a judge with nothing
+/// to judge.
+fn goes_on(chain: &mut Chain, findings: Vec<Finding>) -> bool {
+    chain.findings.extend(findings);
+    chain.stage.reviewer += 1;
+    chain.stage.reviewer <= chain.stage.reviewers
+        && !(chain.stage.judges() && chain.findings.is_empty())
+}
+
+/// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
+/// proposer's findings are read from its reply (numbered after the `found` before it) and
+/// logged. Returns them for the next stage; `None` when the review ends here: this was the
+/// judge, or a proposer changed files.
+fn end_stage(run: &Run, stage: &Stage, found: usize) -> Option<Vec<Finding>> {
+    if stage.judges() {
+        return None;
+    }
+    let reply = run.state().reply();
+    let (findings, problem) = match review::findings_in(&reply, found + 1) {
+        Ok(findings) => (findings, None),
+        Err(problem) => (Vec::new(), Some(problem)),
+    };
+    // A proposer may only read, but an agent that edits without asking is not stopped by the
+    // permission rule: its edits are checked here, and they end the review, so no judge takes
+    // a changed tree for the reviewed one.
+    let edited = !run.state().work().diffs.is_empty();
+    let problem = if edited {
+        Some(format!(
+            "reviewer {} changed files, though it may only read: the review stops here",
+            stage.reviewer
+        ))
+    } else {
+        problem
+    };
+    run.record(Entry::Findings {
+        findings: findings.clone(),
+        problem,
+    });
+    (!edited).then_some(findings)
+}
+
+/// The option that rejects a permission request: once, else always. `None` when the agent
+/// offers neither; the request then waits for the engineer.
+fn reject_option(options: &[PermissionOption]) -> Option<String> {
+    [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
+        .into_iter()
+        .find_map(|kind| options.iter().find(|option| option.kind == kind))
+        .map(|option| option.option_id.clone())
 }
 
 /// The option that allows a permission request: once, else always. `None` when the agent
@@ -704,7 +1010,7 @@ struct RunState {
     // Sets: a cancel can log a request's answer before the request itself.
     requested: BTreeSet<usize>,
     answered: BTreeSet<usize>,
-    /// Why the log is incomplete, or the notes were not marked sent.
+    /// Why the log is incomplete, the notes were not marked sent, or a review stopped here.
     problem: Option<String>,
 }
 
@@ -723,6 +1029,10 @@ struct Header {
     prompt: String,
     /// Seconds since the Unix epoch.
     started_at: u64,
+    /// Set when the run is a reviewer's (`review.rs`): which run it reviews, and its place in
+    /// the chain. Absent for a run of notes, and in every log written before reviews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review: Option<Stage>,
 }
 
 /// The one field of a header that every log version has. Unknown fields are ignored here on
@@ -807,6 +1117,12 @@ pub(crate) enum Entry {
     Ended { reason: StopReason },
     /// The run failed: the agent did not start, refused the prompt, or exited.
     Failed { error: String },
+    /// A proposing reviewer's findings, read from its reply when its turn ended
+    /// (`review::findings_in`); `problem` says why none could be read.
+    Findings {
+        findings: Vec<Finding>,
+        problem: Option<String>,
+    },
 }
 
 /// A file a tool call touches: relative to the repository root when it is inside it.
@@ -884,12 +1200,20 @@ pub(crate) struct RunView {
     /// Milliseconds until a second Stop ends the agent, 0 once it would, while this process
     /// is stopping the run; the page offers Force stop from then on, after a reload too.
     force_in: Option<u64>,
+    /// For a reviewer's run, which run it reviews and its place in the chain.
+    review: Option<Stage>,
 }
 
 impl Run {
     /// Creates the log for a new run in `dir`, with the next free id, takes the working
     /// tree's run lock, and writes the header.
-    fn create(dir: &Path, agent: &str, notes: &[String], prompt: &str) -> Result<Self> {
+    fn create(
+        dir: &Path,
+        agent: &str,
+        notes: &[String],
+        prompt: &str,
+        review: Option<Stage>,
+    ) -> Result<Self> {
         let error = |path: &Path| {
             let path = path.to_owned();
             move |source| Error::WriteRun { path, source }
@@ -933,6 +1257,7 @@ impl Run {
             started_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
+            review,
         };
         if let Err(source) = log.write_all(&json_line(&header)) {
             // A log without its header would be skipped as unreadable on every restart.
@@ -1135,6 +1460,7 @@ impl Run {
                 u64::try_from(FORCE_AFTER.saturating_sub(at.elapsed()).as_millis())
                     .expect("at most FORCE_AFTER, 3 s")
             }),
+            review: state.header.review.clone(),
         }
     }
 }
@@ -1170,6 +1496,76 @@ impl RunState {
         }
     }
 
+    /// The agent's reply: its message parts joined, a blank line between messages.
+    fn reply(&self) -> String {
+        let mut reply = String::new();
+        let mut last: Option<&Option<String>> = None;
+        for entry in &self.entries {
+            if let Entry::Message { text, message } = entry {
+                if last.is_some_and(|last| last != message) {
+                    reply.push_str("\n\n");
+                }
+                reply.push_str(text);
+                last = Some(message);
+            }
+        }
+        reply
+    }
+
+    /// The run's work as a reviewer reads it: its prompt, its reply, and the diffs of its
+    /// finished tool calls, each call's last report, in the order the calls were made.
+    fn work(&self) -> Work {
+        let mut calls: Vec<(&str, &[Output], bool)> = Vec::new();
+        for entry in &self.entries {
+            match entry {
+                Entry::Tool {
+                    id, status, output, ..
+                } => {
+                    let done = *status == ToolCallStatus::Completed;
+                    match calls.iter_mut().find(|call| call.0 == id) {
+                        Some(call) => *call = (id, output, done),
+                        None => calls.push((id, output, done)),
+                    }
+                }
+                Entry::ToolUpdate {
+                    id, status, output, ..
+                } => {
+                    if let Some(call) = calls.iter_mut().find(|call| call.0 == id) {
+                        if let Some(output) = output {
+                            call.1 = output;
+                        }
+                        if let Some(status) = status {
+                            call.2 = *status == ToolCallStatus::Completed;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let diffs = calls
+            .into_iter()
+            .filter(|call| call.2)
+            .flat_map(|call| call.1)
+            .filter_map(|output| match output {
+                Output::Diff {
+                    path,
+                    old_text,
+                    new_text,
+                } => Some(Diff {
+                    path: path.clone(),
+                    before: old_text.clone(),
+                    after: new_text.clone(),
+                }),
+                Output::Text { .. } => None,
+            })
+            .collect();
+        Work {
+            prompt: self.header.prompt.clone(),
+            reply: self.reply(),
+            diffs,
+        }
+    }
+
     /// Whether this process runs the run and it has not ended.
     fn live(&self) -> bool {
         self.active.is_some()
@@ -1201,7 +1597,8 @@ impl RunState {
             | Entry::Tool { .. }
             | Entry::ToolUpdate { .. }
             | Entry::Plan { .. }
-            | Entry::Unreadable { .. } => {}
+            | Entry::Unreadable { .. }
+            | Entry::Findings { .. } => {}
         }
     }
 
@@ -1275,9 +1672,9 @@ fn run_number(id: &str) -> Option<u64> {
 fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
     let VersionOnly { version } = serde_json::from_slice(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
-    if version != LOG_VERSION {
+    if !(1..=LOG_VERSION).contains(&version) {
         return Err(format!(
-            "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
+            "it is version {version}, and this build of Postil reads versions 1 to {LOG_VERSION}"
         ));
     }
     serde_json::from_slice(first)
@@ -1461,7 +1858,7 @@ mod tests {
     fn debug_output_names_the_run_but_never_shows_its_prompt() {
         let dir = std::env::temp_dir().join(format!("postil-run-debug-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "secret prompt").unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "secret prompt", None).unwrap();
         run.record(Entry::Thought {
             text: "secret thought".to_owned(),
         });
@@ -1479,7 +1876,7 @@ mod tests {
     fn after_a_failed_write_the_log_is_not_written_again_and_the_run_says_so() {
         let dir = std::env::temp_dir().join(format!("postil-run-log-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p").unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", None).unwrap();
         let written = fs::read(&run.file).unwrap();
         // A log that refuses writes, as a full disk would.
         run.state().log = Some(File::open(&run.file).unwrap());
@@ -1506,5 +1903,86 @@ mod tests {
         );
         drop(state);
         drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn the_work_holds_each_finished_call_s_last_diffs_and_the_reply_by_message() {
+        let dir = std::env::temp_dir().join(format!("postil-run-work-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", None).unwrap();
+        let diff = |after: &str| Output::Diff {
+            path: "a.rs".to_owned(),
+            old_text: None,
+            new_text: after.to_owned(),
+        };
+        let tool = |id: &str, status, output| Entry::Tool {
+            id: id.to_owned(),
+            title: "Edit".to_owned(),
+            tool: ToolKind::Edit,
+            status,
+            places: Vec::new(),
+            output,
+        };
+        let message = |text: &str, id: &str| Entry::Message {
+            text: text.to_owned(),
+            message: Some(id.to_owned()),
+        };
+        for entry in [
+            tool("t1", ToolCallStatus::Pending, Vec::new()),
+            tool("t2", ToolCallStatus::Completed, vec![diff("second")]),
+            Entry::ToolUpdate {
+                id: "t1".to_owned(),
+                title: None,
+                tool: None,
+                status: Some(ToolCallStatus::Completed),
+                places: None,
+                output: Some(vec![diff("first")]),
+            },
+            message("one ", "m1"),
+            message("part", "m1"),
+            message("two", "m2"),
+        ] {
+            run.record(entry);
+        }
+
+        let work = run.state().work();
+        let afters: Vec<_> = work.diffs.iter().map(|diff| diff.after.as_str()).collect();
+        assert_eq!(afters, ["first", "second"], "the update reached t1 only");
+        assert_eq!(work.reply, "one part\n\ntwo");
+        drop(run);
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_chain_s_debug_output_counts_its_findings_and_never_shows_their_text() {
+        let chain = Chain {
+            stage: Stage {
+                of: "R1".to_owned(),
+                reviewer: 2,
+                reviewers: 2,
+            },
+            reviewers: Vec::new(),
+            work: Work {
+                prompt: "secret note".to_owned(),
+                reply: "secret reply".to_owned(),
+                diffs: Vec::new(),
+            },
+            notes: vec!["N1".to_owned()],
+            files: Vec::new(),
+            findings: vec![Finding {
+                id: "F1".to_owned(),
+                note: None,
+                path: None,
+                line: None,
+                text: "secret finding".to_owned(),
+                fix: Some("secret fix".to_owned()),
+            }],
+        };
+        let shown = format!("{chain:?}");
+        assert!(
+            shown.contains("reviewer: 2") && shown.contains("findings: 1"),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret"), "{shown}");
     }
 }

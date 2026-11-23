@@ -25,7 +25,7 @@ import {
   underWay,
 } from "./run.js";
 import { questionForm, statusIcon } from "./note-dialog.js";
-import { noteStatus, planProgress } from "./status.js";
+import { noteStatus, planProgress, reviewOf } from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
@@ -52,7 +52,7 @@ function statusWord(run) {
 // called after every fetch that changed the latest run, so the page can follow it (switch
 // tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
 // by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
-// file in the code pane.
+// file in the code pane; `reviewers()` names the settings' reviewers, in order.
 export function runPanel({
   panelEl,
   headerEl,
@@ -64,6 +64,7 @@ export function runPanel({
   noteOf,
   openNote,
   openFile,
+  reviewers,
 }) {
   // The latest run, followed as it changes.
   let run = null;
@@ -291,9 +292,11 @@ export function runPanel({
         wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
       }
     }
-    const label = list.length === 1 ? "Run" : `Runs · ${list.length}`;
+    // Reviewers' runs show inside the run they review, not here.
+    const shown = list.filter((id) => !byId(id)?.review);
+    const label = shown.length === 1 ? "Run" : `Runs · ${shown.length}`;
     wanted.push(["label", label, () => el("div", "run-label", label)]);
-    for (const id of list) {
+    for (const id of shown) {
       const view = byId(id);
       const sig = view
         ? JSON.stringify([view.status, view.agent, view.notes, statusWord(view)])
@@ -455,8 +458,16 @@ export function runPanel({
     let draw;
     if (detail.kind === "run") {
       const notes = view.notes.map((id) => noteLine(id, view));
-      stamp = [`run:${view.id}`, view.status, view.total, JSON.stringify(notes)];
-      draw = () => runDetail(view, steps, notes);
+      const review = view.review ? null : reviewOf(view.id, knownViews());
+      const reviewKey = JSON.stringify(review && [review.stages.map((stage) => [stage.id, stage.status, stage.total])]);
+      stamp = [`run:${view.id}`, view.status, view.total, JSON.stringify(notes), reviewKey, isLive(run)];
+      draw = () => runDetail(view, steps, notes, review);
+    } else if (detail.kind === "finding") {
+      const review = reviewOf(view.id, knownViews());
+      const finding = review?.findings.find((item) => item.id === detail.finding);
+      if (!finding) return;
+      stamp = [`finding:${view.id}:${finding.id}`, JSON.stringify(finding)];
+      draw = () => findingDetail(view, finding);
     } else {
       const index = steps.findIndex((step) => step.key === detail.key);
       if (index < 0) return;
@@ -517,9 +528,20 @@ export function runPanel({
 
   // The run whole: its question if it asks one, its plan, its notes, every step, and the
   // agent's reply.
-  function runDetail(view, steps, notes) {
+  function runDetail(view, steps, notes, review) {
     const live = isLive(view);
     const body = el("div", "note-dialog-body");
+    // A reviewer's run says which run it reviews, and leads back to it.
+    if (view.review) {
+      const { of, reviewer, reviewers: count } = view.review;
+      const role = count > 1 && reviewer === count ? "judges the findings and makes the changes" : "proposes findings, read-only";
+      const back = el("button", "button", `‹ ${of}`);
+      back.type = "button";
+      back.addEventListener("click", () => openDetail({ kind: "run", id: of }));
+      const nav = el("div", "run-detail-nav");
+      nav.append(back, el("span", "", `Reviewer ${reviewer} of ${count} of ${of}: ${role}`));
+      body.append(nav);
+    }
     const { plan, items } = foldRun(view.entries);
 
     const question = live ? openQuestion(items) : null;
@@ -574,6 +596,7 @@ export function runPanel({
     const text = items.filter((item) => item.type === "message").map((item) => item.text.trim()).join("\n\n");
     if (text) body.append(section(live ? `${view.agent} is writing` : `${view.agent}'s reply`, markdownView(text)));
     if (view.problem) body.append(el("div", "run-notice", view.problem));
+    if (!view.review) body.append(reviewSection(view, review));
 
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     const when = live ? elapsed(Date.now() / 1000 - view.startedAt) : `started ${started}`;
@@ -581,6 +604,102 @@ export function runPanel({
       detailHeader(statusIcon(iconKind(view)), `${view.id} · ${view.agent}`, `${statusWord(view)} · ${when}`),
       body,
     ];
+  }
+
+  // Every run read so far, to find a run's reviews among them.
+  function knownViews() {
+    return [...new Set([...ids, run?.id].filter(Boolean))].map(byId).filter(Boolean);
+  }
+
+  // Starts the settings' reviewers on run `of`.
+  function startReview(of) {
+    return post("api/run/review", { of }).catch((error) => onError(error.message));
+  }
+
+  // The run's review: the Review button, a card per reviewer of the latest review, and a
+  // card per finding with its verdict (docs/design.md, "Reviews").
+  function reviewSection(view, review) {
+    const names = reviewers();
+    const part = el("section", "note-dialog-section");
+    const label = el("div", "note-dialog-label");
+    label.append(el("span", "", review ? `Review · ${review.findings.length} found` : "Review"));
+    const button = el("button", "button", review ? "Review again" : "Review");
+    button.type = "button";
+    button.disabled = isLive(run) || isLive(view) || names.length === 0;
+    button.title = names.length
+      ? `Reviewers in order: ${names.join(", ")}`
+      : "Add reviewers in Settings first";
+    button.addEventListener("click", () => {
+      // Once: a second click would only be refused, as a run is then under way.
+      button.disabled = true;
+      startReview(view.id);
+    });
+    label.append(button);
+    part.append(label);
+    if (!review) {
+      part.append(
+        el(
+          "div",
+          "run-detail-text muted",
+          names.length ? `Not reviewed yet. Reviewers: ${names.join(", ")}.` : "Not reviewed yet. Add reviewers in Settings.",
+        ),
+      );
+      return part;
+    }
+    const cards = el("div", "run-cards");
+    for (const stage of review.stages) {
+      const judges = review.reviewers > 1 && stage.review.reviewer === review.reviewers;
+      const button = el("button", "run-card");
+      button.type = "button";
+      button.append(
+        statusIcon(iconKind(stage)),
+        el("span", "run-id", stage.id),
+        el("span", "run-card-text", `${stage.agent} · ${judges ? "judges and fixes" : "proposes"}`),
+        el("span", `run-entry-status ${statusLine(stage).tone}`, statusWord(stage)),
+        el("span", "run-chevron", "›"),
+      );
+      button.addEventListener("click", () => openDetail({ kind: "run", id: stage.id }));
+      cards.append(button);
+    }
+    for (const finding of review.findings) {
+      const icon = { accepted: "addressed", rejected: "stopped", judging: "working" }[finding.verdict.word] ?? "open";
+      const button = el("button", `run-card finding ${finding.verdict.word.replace(" ", "-")}`);
+      button.type = "button";
+      button.title = finding.text;
+      button.append(
+        statusIcon(icon),
+        el("span", "note-id", finding.id),
+        el("span", "run-card-text", finding.text),
+        el("span", "run-entry-status", finding.verdict.word),
+        el("span", "run-chevron", "›"),
+      );
+      button.addEventListener("click", () => openDetail({ kind: "finding", id: view.id, finding: finding.id }));
+      cards.append(button);
+    }
+    part.append(cards);
+    for (const problem of review.problems) part.append(el("div", "run-notice", `A reviewer's findings could not be read: ${problem}`));
+    return part;
+  }
+
+  // A finding whole: what the reviewer found and proposed, where, and the judge's verdict.
+  function findingDetail(view, finding) {
+    const body = el("div", "note-dialog-body");
+    const back = el("button", "button", `‹ ${view.id}`);
+    back.type = "button";
+    back.addEventListener("click", () => openDetail({ kind: "run", id: view.id }));
+    const nav = el("div", "run-detail-nav");
+    const where = [finding.note, finding.path && (finding.line ? `${finding.path}:${finding.line}` : finding.path)];
+    nav.append(back, el("span", "", [`found by ${finding.from}`, ...where].filter(Boolean).join(" · ")));
+    body.append(nav, section("Finding", el("div", "run-detail-text", finding.text)));
+    if (finding.fix) body.append(section("Proposed fix", el("div", "run-detail-text", finding.fix)));
+    const verdict = finding.verdict.text || {
+      "not judged": "A single reviewer only proposes: no one judged it.",
+      waiting: "The judging reviewer has not started yet.",
+      judging: "The judging reviewer is at work.",
+      "no word": "The judging reviewer ended without a line about it.",
+    }[finding.verdict.word] || finding.verdict.word;
+    body.append(section("Verdict", el("div", "run-detail-text", verdict)));
+    return [detailHeader(null, `${finding.id} · ${finding.verdict.word}`, `review of ${view.id}`), body];
   }
 
   // A step's card: what it did and how it went, in one line.
@@ -759,6 +878,8 @@ export function runPanel({
     stop,
     keydown,
     byId,
+    knownViews,
+    startReview,
     answerQuestion,
     forget,
     reload,

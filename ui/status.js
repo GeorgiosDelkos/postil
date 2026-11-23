@@ -11,7 +11,8 @@ import { diffStats, foldRun, isLive, isOpen, sentIn, toolRow } from "./run.js";
 export function runOf(note, runs, live) {
   const id = sentIn(note);
   if (id !== null) return live?.id === id ? live : (runs.get(id) ?? null);
-  return isLive(live) && live.notes.includes(note.id) ? live : null;
+  // A reviewer's run carries the notes it reviews, but they were not sent in it.
+  return isLive(live) && !live.review && live.notes.includes(note.id) ? live : null;
 }
 
 // A note's status: `kind` names its icon and group, `label` is its words, `tone` its color.
@@ -133,4 +134,57 @@ export function groupNotes(notes, statusOf) {
   const number = (note) => Number(sentIn(note)?.slice(1) ?? 0);
   done.sort((a, b) => number(b) - number(a));
   return { inRun, open, done };
+}
+
+// The latest review of run `id` among `views` (every run read so far; src/review.rs): its
+// stages, reviewer 1 first, and each finding with the judge's verdict. Null when the run was
+// never reviewed. A run reviewed twice shows its second review: a chain starts at reviewer 1.
+//
+// A verdict is `{ word, text }`: "accepted" or "rejected" with the judge's line about it
+// (`agentSaid`, the judge answers "F1: accepted - ..."), "answered" for a line that says
+// neither, "judging" while the judge runs, "waiting" before it starts, "no word" when it
+// ended without a line, and "not judged" when a single reviewer only proposed or the review
+// stopped before its judge (a stage failed or was stopped).
+export function reviewOf(id, views) {
+  const stages = views
+    .filter((view) => view?.review?.of === id)
+    .sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)));
+  const start = stages.findLastIndex((view) => view.review.reviewer === 1);
+  if (start < 0) return null;
+  const chain = stages.slice(start);
+  const reviewers = chain[0].review.reviewers;
+  // A stage that did not end well, or a proposer whose findings say why it stopped the
+  // review, ends the chain before its judge.
+  const stopped = chain.some(
+    (view) =>
+      (!isLive(view) && view.status !== "ended") ||
+      view.entries.some((entry) => entry.kind === "findings" && /stops here/.test(entry.problem ?? "")) ||
+      view.entries.some((entry) => entry.kind === "ended" && entry.reason !== "end_turn"),
+  );
+  const judge = chain.find((view) => reviewers > 1 && view.review.reviewer === reviewers) ?? null;
+  const verdict = (finding) => {
+    if (reviewers === 1) return { word: "not judged", text: "" };
+    if (!judge) {
+      const last = chain.at(-1);
+      // Between stages the next reviewer is about to start; a stopped chain has no judge.
+      return !stopped && (isLive(last) || chain.length < reviewers)
+        ? { word: "waiting", text: "" }
+        : { word: "not judged", text: `the review stopped after ${last.id}` };
+    }
+    const said = agentSaid(judge, finding.id);
+    if (said !== null) {
+      const word = /^(accepted|rejected)\b/i.exec(said)?.[1]?.toLowerCase() ?? "answered";
+      return { word, text: said };
+    }
+    return { word: isLive(judge) ? "judging" : "no word", text: "" };
+  };
+  const findings = chain.flatMap((view) =>
+    view.entries
+      .filter((entry) => entry.kind === "findings")
+      .flatMap((entry) => entry.findings.map((finding) => ({ ...finding, from: view.id, verdict: verdict(finding) }))),
+  );
+  const problems = chain.flatMap((view) =>
+    view.entries.filter((entry) => entry.kind === "findings" && entry.problem).map((entry) => `${view.id}: ${entry.problem}`),
+  );
+  return { stages: chain, reviewers, findings, problems };
 }

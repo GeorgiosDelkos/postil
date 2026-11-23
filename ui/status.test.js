@@ -8,6 +8,7 @@ import {
   noteHistory,
   noteStatus,
   planProgress,
+  reviewOf,
   runOf,
 } from "./status.js";
 
@@ -122,4 +123,41 @@ test("notes are grouped as in the run, open, and done, newest run first", () => 
   assert.deepEqual(ids(groups.inRun), ["N3"]);
   assert.deepEqual(ids(groups.open), ["N2", "N5"]);
   assert.deepEqual(ids(groups.done), ["N4", "N1"]);
+});
+
+test("a run's latest review: its stages, findings, and the judge's verdict on each", () => {
+  const stage = (id, reviewer, reviewers, status, entries) => ({
+    id, status, notes: ["N1"], entries, review: { of: "R1", reviewer, reviewers },
+  });
+  const found = (...findings) => ({ kind: "findings", findings, problem: null });
+  const finding = (id, text) => ({ id, note: "N1", path: "a.rs", line: 1, text, fix: null });
+  const old = stage("R2", 1, 1, "ended", [found(finding("F1", "an old review"))]);
+  const proposer = stage("R4", 1, 2, "ended", [found(finding("F1", "too short"), finding("F2", "no test"))]);
+  const judging = stage("R5", 2, 2, "running", [said("F1: accepted - said more")]);
+  const other = { id: "R3", status: "ended", notes: [], entries: [], review: null };
+
+  assert.equal(reviewOf("R1", [other]), null, "never reviewed");
+  const live = reviewOf("R1", [old, other, judging, proposer]);
+  assert.deepEqual(live.stages.map((view) => view.id), ["R4", "R5"], "the latest chain only");
+  assert.deepEqual(
+    live.findings.map((item) => [item.id, item.from, item.verdict.word]),
+    [["F1", "R4", "accepted"], ["F2", "R4", "judging"]],
+  );
+  assert.equal(live.findings[0].verdict.text, "accepted - said more");
+
+  const ended = reviewOf("R1", [proposer, { ...judging, status: "ended", entries: [said("F1: Rejected - fine as is\nF2: added one")] }]);
+  assert.deepEqual(ended.findings.map((item) => item.verdict.word), ["rejected", "answered"]);
+  const silent = reviewOf("R1", [proposer, { ...judging, status: "ended", entries: [] }]);
+  assert.equal(silent.findings[0].verdict.word, "no word");
+  assert.equal(reviewOf("R1", [proposer]).findings[0].verdict.word, "waiting", "the judge has not started");
+  const failed = { ...proposer, status: "failed" };
+  assert.deepEqual(
+    reviewOf("R1", [failed]).findings[0].verdict,
+    { word: "not judged", text: "the review stopped after R4" },
+    "a stage that failed ends the review before its judge",
+  );
+  assert.equal(reviewOf("R1", [old]).findings[0].verdict.word, "not judged", "a single reviewer");
+
+  const unreadable = stage("R6", 1, 1, "ended", [{ kind: "findings", findings: [], problem: "no block" }]);
+  assert.deepEqual(reviewOf("R1", [unreadable]).problems, ["R6: no block"]);
 });

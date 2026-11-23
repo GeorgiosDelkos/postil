@@ -112,10 +112,25 @@ function fieldView(field, index, values) {
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
 // ticked), `remove(note)`, `showRun()`, and `answerQuestion(request, content)` for the run's
 // open question (`content` null to skip). `agent()` names the agent Send sends to, the
-// default one, or null when none is set.
+// default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
+// (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
+// `live()` says whether a run is under way.
 export function noteDialog(
   dialogEl,
-  { find, canSend, agent, showInCode, send, remove, showRun, answerQuestion },
+  {
+    find,
+    canSend,
+    agent,
+    showInCode,
+    send,
+    remove,
+    showRun,
+    answerQuestion,
+    reviewOf,
+    reviewers,
+    startReview,
+    live,
+  },
 ) {
   let shownId = null;
   // The open question's form, kept while it stays open: a redraw must not drop what the
@@ -154,7 +169,9 @@ export function noteDialog(
       return;
     }
     const { note, run } = found;
-    const key = JSON.stringify([note, run?.id, run?.status, run?.total, canSend(note), agent()]);
+    const review = run ? reviewOf(run.id) : null;
+    const reviewKey = review && review.stages.map((stage) => [stage.id, stage.status, stage.total]);
+    const key = JSON.stringify([note, run?.id, run?.status, run?.total, canSend(note), agent(), reviewKey, live()]);
     if (key === drawn) return;
     drawn = key;
     // The question's form is the same node across redraws, and so is the control that had
@@ -216,6 +233,7 @@ export function noteDialog(
         main.append(changed);
       }
       main.append(section(`History · ${run.id} · ${run.agent}`, history(note, run)));
+      main.append(reviewPart(note, run));
     }
     return main;
   }
@@ -264,6 +282,48 @@ export function noteDialog(
     }
     if (!isLive(run)) list.append(el("li", "end", `Run ended: ${statusLine(run).text}`));
     return list;
+  }
+
+  // The review of the note's run: the Review button, and every finding about this note with
+  // its verdict, in full (docs/design.md, "Reviews").
+  function reviewPart(note, run) {
+    const review = reviewOf(run.id);
+    const names = reviewers();
+    const mine = review ? review.findings.filter((finding) => finding.note === note.id) : [];
+    const part = el("section", "note-dialog-section");
+    const label = el("div", "note-dialog-label");
+    label.append(el("span", "", review ? `Review of ${run.id} · ${mine.length} about ${note.id}` : `Review of ${run.id}`));
+    const button = el("button", "button", review ? "Review again" : "Review");
+    button.type = "button";
+    button.disabled = live() || names.length === 0;
+    button.title = names.length ? `Reviewers in order: ${names.join(", ")}` : "Add reviewers in Settings first";
+    button.addEventListener("click", () => {
+      // Once: a second click would only be refused, as a run is then under way.
+      button.disabled = true;
+      startReview(run.id);
+    });
+    label.append(button);
+    part.append(label);
+    if (!review) {
+      const hint = names.length ? `Not reviewed yet. Reviewers: ${names.join(", ")}.` : "Not reviewed yet. Add reviewers in Settings.";
+      part.append(el("div", "note-dialog-said muted", hint));
+      return part;
+    }
+    if (mine.length === 0) {
+      part.append(el("div", "note-dialog-said muted", `No finding about ${note.id}; ${review.findings.length} about the run.`));
+      return part;
+    }
+    for (const finding of mine) {
+      const item = el("div", "review-finding");
+      const head = el("div", "review-finding-head");
+      head.append(el("span", "note-id", finding.id), el("span", `review-verdict ${finding.verdict.word.replace(" ", "-")}`, finding.verdict.word));
+      if (finding.path) head.append(el("span", "note-dialog-where", finding.line ? `${finding.path}:${finding.line}` : finding.path));
+      item.append(head, el("div", "note-dialog-said", finding.text));
+      if (finding.fix) item.append(el("div", "note-dialog-said muted", `Proposed: ${finding.fix}`));
+      if (finding.verdict.text) item.append(el("div", "note-dialog-said", `Judged: ${finding.verdict.text}`));
+      part.append(item);
+    }
+    return part;
   }
 
   function footer(note, run) {

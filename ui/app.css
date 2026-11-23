@@ -2831,3 +2831,42 @@ body.resizing * {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+/* A run's review (docs/design.md, "Reviews"): findings as cards in the run's dialog, in full
+   in a note's dialog. */
+.note-dialog-label .button {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.review-finding {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.review-finding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-verdict {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.review-verdict.accepted,
+.run-card.finding.accepted .run-entry-status {
+  color: var(--added);
+}
+
+.review-verdict.rejected,
+.run-card.finding.rejected .run-entry-status {
+  color: var(--text-muted);
+}

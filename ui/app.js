@@ -13,7 +13,7 @@ import { runPanel } from "./run-panel.js";
 import { foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
-import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
+import { groupNotes, noteStatus, planProgress, reviewOf, runOf } from "./status.js";
 import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
@@ -1162,6 +1162,7 @@ const runs = runPanel({
   noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
   openNote: (id) => noteDetail.open(id),
   openFile,
+  reviewers: () => state.settings?.reviewers ?? [],
 });
 
 const noteDialogEl = $("note-dialog");
@@ -1177,6 +1178,10 @@ const noteDetail = noteDialog(noteDialogEl, {
   remove: deleteNote,
   showRun: () => showTab("run"),
   answerQuestion: (request, content) => runs.answerQuestion(request, content),
+  reviewOf: (id) => reviewOf(id, runs.knownViews()),
+  reviewers: () => state.settings?.reviewers ?? [],
+  startReview: (id) => runs.startReview(id),
+  live: () => runs.live(),
 });
 
 // The agent of this send, or the settings' agent.
