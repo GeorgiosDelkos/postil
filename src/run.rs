@@ -41,8 +41,8 @@
 //! # Threads and locks
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
-//! an agent's start on a thread of its own, and a review's next stage on one more
-//! (`review-next`, [`Runner::advance`]). Three locks, always taken in this order: the
+//! and an agent's start on a thread of its own. A review's next stage starts on the reader
+//! thread of the stage that ended ([`Runner::advance`]). Three locks, always taken in this order: the
 //! runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`], which takes
 //! no other), then a run's state; no snapshot is taken under a run's state. The page is told
 //! about every change through `notify`, and fetches what it has not seen.
@@ -507,8 +507,10 @@ impl Runner {
     }
 
     /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
-    /// ended. Runs on a thread of its own: the stage's agent is replaced, and dropping an
-    /// agent from its own reader thread would wait on itself.
+    /// ended. Runs on the ended agent's reader thread, and replaces that agent there, as
+    /// [`on_event`] does with an agent that exited: [`Agent`]'s drop kills and reaps the
+    /// process but never joins its threads, and the reader holds none of the agent's locks
+    /// while it delivers an event.
     fn advance(self: &Arc<Self>, ended: &Arc<Run>) {
         let mut slot = self.slot();
         // A send, a stop, or another review meanwhile took the chain, or replaced its run.
@@ -1137,8 +1139,8 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         };
         let run = slot.run.clone();
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
-        // sees the decision, and no Stop or new review can replace the chain meanwhile. Only
-        // starting the next stage waits for a thread of its own.
+        // sees the decision, and no Stop or new review can replace the chain meanwhile. The
+        // next stage starts once the end is logged.
         let next = match (&stage, &run) {
             (Some(stage), Some(run)) if ended_well && decide(&mut slot, run, stage) => {
                 Some(Arc::clone(run))
@@ -1160,23 +1162,9 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     drop(released);
     (runner.notify)();
     if let Some(ended) = next {
-        let next = Arc::clone(&runner);
-        let advanced = std::thread::Builder::new()
-            .name("review-next".to_owned())
-            .spawn(move || {
-                #[cfg(test)]
-                next.pass_next_stage_gate();
-                next.advance(&ended);
-            });
-        if let Err(error) = advanced {
-            let mut slot = runner.slot();
-            slot.chain = None;
-            if let Some(run) = &slot.run {
-                run.state().problem.get_or_insert(format!(
-                    "the next reviewer could not start: no thread for it ({error})"
-                ));
-            }
-        }
+        #[cfg(test)]
+        runner.pass_next_stage_gate();
+        runner.advance(&ended);
     }
 }
 
