@@ -6,6 +6,7 @@ import {
   diffLines,
   diffStats,
   elapsed,
+  escapeAction,
   foldRun,
   isLive,
   inline,
@@ -254,6 +255,24 @@ test("Stop is built once per live run, not on every update or status change of i
   assert.equal(stopKey(r1("ended")), null, "an ended run has no Stop");
   assert.notEqual(stopKey({ ...run("running"), id: "R2" }), drawn, "the next run gets its own");
   assert.equal(stopKey(null), null);
+});
+
+test("Escape closes the nearest thing on screen, and stops the run only when nothing is left", () => {
+  const none = { focusMode: false, composer: false, send: false, changes: false, selection: false, live: false };
+  const cases = [
+    [{ live: true, changes: true }, "close-changes", "the changes view before the run"],
+    [{ live: true, changes: true, selection: true }, "close-changes", "it covers the selection"],
+    [{ live: true, focusMode: true }, "leave-focus", "focus mode hides what would stop"],
+    [{ focusMode: true, composer: true }, "close-composer", "a draft closes even in focus mode"],
+    [{ composer: true, send: true, live: true }, "close-composer", ""],
+    [{ send: true, changes: true, live: true }, "close-send", ""],
+    [{ selection: true, live: true }, "clear-selection", ""],
+    [{ live: true }, "stop", ""],
+    [{}, null, "nothing to do"],
+  ];
+  for (const [page, action, why] of cases) {
+    assert.equal(escapeAction({ ...none, ...page }), action, `${JSON.stringify(page)}: ${why}`);
+  }
 });
 
 test("elapsed time reads as minutes, then hours", () => {

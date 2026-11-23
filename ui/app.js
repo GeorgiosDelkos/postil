@@ -11,7 +11,7 @@ import { changesView } from "./changes-view.js";
 import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
 import { noteDialog, statusIcon } from "./note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { foldRun, isLive, isOpen, isResolved, promptLines, sendable, sentIn } from "./run.js";
+import { escapeAction, foldRun, isLive, isOpen, isResolved, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, reviewOf, runOf } from "./status.js";
@@ -1727,18 +1727,23 @@ window.addEventListener("keydown", (event) => {
   const typing = event.target.matches("input, textarea");
   // `a`, Shift-`a` and `r` answer a permission request while the run shows; focus mode hides it.
   if (!typing && !state.composer && state.tab === "run" && !inFocus() && runs.keydown(event)) return;
-  // Escape leaves focus mode first: what it would stop or close cannot be seen there.
-  if (event.key === "Escape" && inFocus() && !state.composer) {
-    leaveFocus();
-    return;
-  }
   if (event.key === "Escape") {
-    if (state.composer) closeComposer({ save: false });
-    else if (state.send) closeSend();
-    else if (state.selection) {
+    const action = escapeAction({
+      focusMode: inFocus(),
+      composer: Boolean(state.composer),
+      send: Boolean(state.send),
+      changes: changes.isOpen(),
+      selection: Boolean(state.selection),
+      live: runs.live(),
+    });
+    if (action === "leave-focus") leaveFocus();
+    else if (action === "close-composer") closeComposer({ save: false });
+    else if (action === "close-send") closeSend();
+    else if (action === "close-changes") changes.close();
+    else if (action === "clear-selection") {
       state.selection = null;
       redecorateRows();
-    } else if (runs.live()) runs.stop();
+    } else if (action === "stop") runs.stop();
   } else if (state.send) {
     // The code is covered by the prompt: no key acts on it.
   } else if (event.key === "c" && event.metaKey && !typing && state.file && state.selection) {

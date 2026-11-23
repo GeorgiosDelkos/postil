@@ -383,6 +383,23 @@ export function stopKey(run) {
   return isLive(run) ? run.id : null;
 }
 
+// What Escape does in the window, when no dialog is open and the welcome screen is hidden:
+// it closes or clears the nearest thing on screen, and stops the run only when nothing else
+// is left. Focus mode gives way first, as what it hides cannot be seen. The changes view
+// covers the file, so it closes before the file's selection clears. Its own handler takes
+// Escape while it has the focus; this is for when the focus is elsewhere.
+// `page` says what is open: `{ focusMode, composer, send, changes, selection, live }`, each a
+// boolean. Returns the action's name, or null.
+export function escapeAction({ focusMode, composer, send, changes, selection, live }) {
+  if (focusMode && !composer) return "leave-focus";
+  if (composer) return "close-composer";
+  if (send) return "close-send";
+  if (changes) return "close-changes";
+  if (selection) return "clear-selection";
+  if (live) return "stop";
+  return null;
+}
+
 // Seconds as `m:ss`, or `h:mm:ss` from an hour on.
 export function elapsed(seconds) {
   const s = Math.max(0, Math.floor(seconds));
