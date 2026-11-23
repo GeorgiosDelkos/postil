@@ -134,7 +134,9 @@ struct Slot {
     /// The review under way, while its stages run one after another; cleared when a stage
     /// does not end well or reports edits it may not make, when the engineer stops it, by a
     /// send, when the project closes, and when the last stage ends; `advance` takes it to
-    /// start the next stage.
+    /// start the next stage. From a stage's end until `advance` starts the next one, `stage`
+    /// is the stage to start, not the slot's run's: a late event from the ended agent no
+    /// longer ends the review.
     chain: Option<Chain>,
 }
 
@@ -861,17 +863,7 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         // reader that sees the end sees the decision. Only starting the next stage waits for
         // a thread of its own.
         if ended_well && let Some((stage, found)) = &stage {
-            let findings = end_stage(&run, stage, *found);
-            let mut slot = runner.slot();
-            let goes = match (findings, slot.chain.as_mut()) {
-                (Some(findings), Some(chain)) => goes_on(chain, findings),
-                _ => false,
-            };
-            if goes {
-                next = Some(run.state().header.id.clone());
-            } else {
-                slot.chain = None;
-            }
+            next = decide(&runner, &run, stage, *found);
         }
         if let Some(ids) = run.record_event(event, answer, runner.repo.root()) {
             runner.mark_sent(&run, &ids);
@@ -894,6 +886,34 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
                 ));
             }
         }
+    }
+}
+
+/// Ends review stage `stage` of `run`, whose turn ended well, and decides whether the review
+/// goes on: the id of the ended run when the next stage is to start, else `None`, the chain
+/// then cleared.
+fn decide(runner: &Runner, run: &Arc<Run>, stage: &Stage, found: usize) -> Option<String> {
+    let findings = end_stage(run, stage, found);
+    let mut slot = runner.slot();
+    // The lock was let go for `end_stage`: a forced Stop and a new review may have replaced
+    // this run and its chain since, and that chain is not this one to change. A stage check
+    // would not do: a new review of the same run is at the same stage.
+    if !slot
+        .run
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, run))
+    {
+        return None;
+    }
+    let goes = match (findings, slot.chain.as_mut()) {
+        (Some(findings), Some(chain)) => goes_on(chain, findings),
+        _ => false,
+    };
+    if goes {
+        Some(run.state().header.id.clone())
+    } else {
+        slot.chain = None;
+        None
     }
 }
 
