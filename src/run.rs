@@ -919,7 +919,12 @@ impl Runner {
         // The agent is gone first, so nothing it reports lands after the end. `closed` drops
         // its events anyway.
         drop(released);
-        if let Some(run) = run.filter(|run| run.state().live()) {
+        if let Some(run) = run {
+            // As a forced Stop does: the agent's exit is not reported, so the snapshot after
+            // the run is taken here, or its changes view would stay empty. It runs `git add`
+            // on the closing thread, the main one when the app quits. Both calls do nothing
+            // for a run that already ended.
+            self.record_end_snapshot(&run);
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
             });
@@ -1536,8 +1541,8 @@ pub(crate) enum Status {
     Cancelling,
     Ended,
     Failed,
-    /// The log has no end and this process does not run it: the app quit or the project was
-    /// closed while it ran, or another window is running it.
+    /// The log has no end and this process does not run it: the app crashed or was killed
+    /// while it ran, or another window is running it.
     Unfinished,
 }
 

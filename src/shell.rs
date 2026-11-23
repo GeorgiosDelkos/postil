@@ -5234,6 +5234,11 @@ mod tests {
             end.contains("Postil closed the project while it ran"),
             "{end}"
         );
+        // And it has the snapshot after it, so its changes view still shows what it did.
+        assert!(
+            stopped.contains(r#""kind":"snapshot","point":"after""#),
+            "{stopped}"
+        );
     }
 
     #[test]
