@@ -70,11 +70,19 @@ work="$(mktemp -d)"
 trap 'trash "$work"' EXIT
 # notarytool takes a zip, a disk image or a package, not a bare bundle.
 ditto -c -k --keepParent "$app" "$work/Postil.zip"
-xcrun notarytool submit "$work/Postil.zip" "${profile[@]}" \
-  --wait --output-format json >"$work/submission.json"
-# notarytool can exit 0 with a rejected submission, so its status is read, and on a rejection
-# Apple's log says why.
-status="$(plutil -extract status raw -o - "$work/submission.json")"
+# notarytool's exit status is not the verdict: it can exit 0 with a rejected submission, and a
+# non-zero exit must not stop the script before Apple's log is fetched. The submission's status
+# is the verdict, and on a rejection the log says why. A failure before any submission (no
+# network, a bad profile) leaves no status.
+if ! xcrun notarytool submit "$work/Postil.zip" "${profile[@]}" \
+  --wait --output-format json >"$work/submission.json"; then
+  echo "notarytool submit failed" >&2
+fi
+if ! status="$(plutil -extract status raw -o - "$work/submission.json" 2>/dev/null)"; then
+  echo "notarization: no submission status; notarytool said:" >&2
+  cat "$work/submission.json" >&2
+  exit 1
+fi
 if [[ "$status" != "Accepted" ]]; then
   id="$(plutil -extract id raw -o - "$work/submission.json")"
   echo "notarization $id: $status" >&2

@@ -1,4 +1,8 @@
 /target
 /mutants.out*
-# App Store Connect API keys (scripts/sign.sh): kept out of the repository by accident too.
+# Signing material (scripts/sign.sh, .github/workflows/release.yml), kept out of the repository
+# by accident too: App Store Connect API keys, the Developer ID certificate export, and keychains.
 *.p8
+*.p12
+*.cer
+*.keychain-db
