@@ -241,9 +241,12 @@ kbd {
   text-align: left;
   white-space: nowrap;
   transition: background-color 80ms linear;
-  /* Rows far from the viewport skip layout and paint, which keeps a long list cheap. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 26px;
+  /* No `content-visibility: auto` here, though it would skip painting rows off screen. With
+     it, WebKit stopped painting the row of a folder just opened once a file inside it was
+     clicked, and painted it again only after the list scrolled (seen 2026-11-23; the cause
+     inside WebKit was not found). The list holds only open folders' rows, or at most
+     `MAX_MATCHES` filter results; a folder of thousands of files open makes it long, a cost
+     accepted over rows that vanish. Not measured either way. */
 }
 
 .file {
