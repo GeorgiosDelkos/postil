@@ -121,6 +121,16 @@ async function prompt(id, params) {
       say(`late permission ${late.result.outcome.outcome}`);
       return send({ id, result: { stopReason: "cancelled" } });
     }
+    case "stream": {
+      // An edit, then one reply streamed in parts, slowly enough to act on the panel meanwhile.
+      update({ sessionUpdate: "tool_call", toolCallId: "t1", title: "Edit src/a.rs", kind: "edit", status: "pending", locations: [{ path: file, line: 1 }] });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed", content: [{ type: "diff", path: file, oldText: "one\ntwo\nthree\n", newText: "one\n2\nthree\n" }] });
+      for (let part = 0; part < 40; part += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `part ${part} ` }, messageId: "reply" });
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "hang":
       // Never ends the turn, and ignores the cancel.
       return;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_EDITS,
   diffLines,
   diffStats,
   elapsed,
@@ -311,4 +312,53 @@ test("a line diff keeps unchanged lines as context and puts removals before addi
     "a blank line is a line",
   );
   assert.deepEqual(diffLines("", "x"), [{ kind: "add", text: "x" }], "a new file");
+});
+
+// The length of the longest common subsequence, by the plain table: the model the line diff
+// is checked against.
+function lcs(a, b) {
+  let previous = new Array(b.length + 1).fill(0);
+  for (const line of a) {
+    const current = [0];
+    for (let j = 0; j < b.length; j += 1) {
+      current.push(line === b[j] ? previous[j] + 1 : Math.max(previous[j + 1], current[j]));
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+test("the line diff rebuilds both texts with the fewest edits, on random texts", () => {
+  // A fixed seed, so a failure repeats.
+  let seed = 7;
+  const random = (limit) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % limit;
+  };
+  for (let round = 0; round < 300; round += 1) {
+    const text = () => Array.from({ length: random(12) }, () => "abc"[random(3)]);
+    const before = text();
+    const after = text();
+    const lines = diffLines(before.join("\n"), after.join("\n"));
+    const old = lines.filter((line) => line.kind !== "add").map((line) => line.text);
+    const now = lines.filter((line) => line.kind !== "del").map((line) => line.text);
+    assert.deepEqual([old, now], [before, after], `round ${round}`);
+    const edits = lines.filter((line) => line.kind !== "same").length;
+    assert.equal(edits, before.length + after.length - 2 * lcs(before, after), `round ${round}`);
+  }
+});
+
+test("a one-line change in a large file is one line, and too many edits count as all changed", () => {
+  const big = Array.from({ length: 2001 }, (_, index) => `line ${index}`);
+  const changed = big.with(1000, "changed");
+  assert.deepEqual(diffStats([{ type: "diff", path: "a", oldText: big.join("\n"), newText: changed.join("\n") }]), {
+    added: 1,
+    removed: 1,
+  });
+  const other = big.map((line) => `${line} x`);
+  assert.ok(other.length > MAX_EDITS);
+  assert.deepEqual(
+    diffStats([{ type: "diff", path: "a", oldText: big.join("\n"), newText: other.join("\n") }]),
+    { added: 2001, removed: 2001 },
+  );
 });

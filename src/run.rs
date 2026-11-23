@@ -695,6 +695,9 @@ pub(crate) struct RunView {
     /// How many entries the run has; the page asks for the ones after it next time.
     total: usize,
     problem: Option<String>,
+    /// How long ago, in milliseconds, this process asked the agent to stop, while the run is
+    /// stopping; the page offers Force stop from [`FORCE_AFTER`] on, after a reload too.
+    stopping_for: Option<u64>,
 }
 
 impl Run {
@@ -919,6 +922,10 @@ impl Run {
             entries: state.entries.get(after..).unwrap_or_default().to_vec(),
             total: state.entries.len(),
             problem: state.problem.clone(),
+            stopping_for: state
+                .cancel_asked
+                .filter(|_| state.live())
+                .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
         }
     }
 }

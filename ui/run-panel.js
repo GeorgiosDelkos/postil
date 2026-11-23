@@ -6,13 +6,13 @@
 // during one is fetched right after it.
 
 import {
-  diffLines,
   elapsed,
   foldRun,
   isLive,
   keyFor,
   markdownBlocks,
   openPermission,
+  partLines,
   permissionKeys,
   statusLine,
   toolRow,
@@ -36,8 +36,18 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   let fetching = false;
   let again = false;
   let clock = null;
-  // When this page first saw the run stopping: from FORCE_AFTER_MS on, Stop ends the agent.
+  // When the agent was asked to stop, by this page's clock: from FORCE_AFTER_MS on, Stop ends
+  // the agent.
   let stoppingSince = null;
+  // The drawn items by key, each with the signature it was drawn from: an item whose
+  // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
+  let views = new Map();
+  let drawnRun = null;
+  // Whether the panel follows the end of the run: true until the engineer scrolls up.
+  let follow = true;
+  panelEl.addEventListener("scroll", () => {
+    if (panelEl.clientHeight > 0) follow = atEnd();
+  });
 
   async function fetchRun() {
     // Only the entries not seen yet, unless the run is another one: then all of them.
@@ -71,6 +81,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       } while (again);
     } catch (error) {
       onError(String(error.message ?? error));
+      // A change that arrived during the failed fetch is fetched once more.
+      if (again) setTimeout(sync, 1000);
     } finally {
       fetching = false;
     }
@@ -101,12 +113,15 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   }
 
   // `a`, Shift-`a` and `r` answer the open permission request. Returns whether the key was
-  // used.
+  // used. The physical key decides, not the character: with Caps Lock on, `a` types "A",
+  // which must not allow always. A held key answers once.
   function keydown(event) {
-    if (event.metaKey || event.ctrlKey || event.altKey) return false;
+    if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return false;
     const request = run && openPermission(foldRun(run.entries).items);
     if (!request) return false;
-    const option = permissionKeys(request.options).get(event.key);
+    const key = { KeyA: event.shiftKey ? "A" : "a", KeyR: event.shiftKey ? null : "r" }[event.code];
+    if (!key) return false;
+    const option = permissionKeys(request.options).get(key);
     if (option === undefined) return false;
     event.preventDefault();
     answer(request, option);
@@ -120,17 +135,69 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       panelEl.replaceChildren(el("div", "empty", "No run yet. Send notes to an agent to start one."));
       return;
     }
-    // The panel is redrawn whole; it keeps its scroll, and follows the end while it is there.
-    const atEnd = panelEl.scrollHeight - panelEl.scrollTop - panelEl.clientHeight < 24;
-    const top = panelEl.scrollTop;
+    if (drawnRun !== run.id) {
+      views = new Map();
+      drawnRun = run.id;
+      follow = true;
+    }
     const { plan, items } = foldRun(run.entries);
-    const parts = [];
-    if (plan?.length) parts.push(planView(plan));
-    parts.push(...items.map(itemView));
-    if (run.problem) parts.push(el("div", "run-notice", run.problem));
-    if (parts.length === 0) parts.push(el("div", "empty", statusLine(run).text));
-    panelEl.replaceChildren(...parts);
-    panelEl.scrollTop = atEnd ? panelEl.scrollHeight : top;
+    const live = isLive(run);
+    const wanted = [];
+    if (plan?.length) wanted.push(["plan", JSON.stringify(plan), () => planView(plan)]);
+    items.forEach((item, index) => {
+      wanted.push([itemKey(item, index), signature(item, live), () => itemView(item)]);
+    });
+    if (run.problem) wanted.push(["problem", run.problem, () => el("div", "run-notice", run.problem)]);
+    if (wanted.length === 0) {
+      wanted.push(["empty", statusLine(run).text, () => el("div", "empty", statusLine(run).text)]);
+    }
+
+    const next = new Map();
+    const nodes = wanted.map(([key, sig, build]) => {
+      const drawn = views.get(key);
+      const node = drawn?.sig === sig ? drawn.node : build();
+      // A redrawn details element opens as the one it replaces was.
+      if (drawn && drawn.node !== node && drawn.node.open && node.tagName === "DETAILS") {
+        node.open = true;
+      }
+      next.set(key, { sig, node });
+      return node;
+    });
+    views = next;
+    // Only nodes out of place move; the rest, the top of a long run, are left untouched.
+    nodes.forEach((node, index) => {
+      if (panelEl.childNodes[index] !== node) panelEl.insertBefore(node, panelEl.childNodes[index] ?? null);
+    });
+    while (panelEl.childNodes.length > nodes.length) panelEl.lastChild.remove();
+    reveal();
+  }
+
+  // Scrolls to the end while the panel follows it. Measured only while the panel shows: a
+  // hidden panel has no height, and would read as both at the end and scrolled to the top.
+  function reveal() {
+    if (follow && panelEl.clientHeight > 0) panelEl.scrollTop = panelEl.scrollHeight;
+  }
+
+  function atEnd() {
+    return panelEl.scrollHeight - panelEl.scrollTop - panelEl.clientHeight < 24;
+  }
+
+  function itemKey(item, index) {
+    if (item.type === "tool") return `tool:${item.id}`;
+    if (item.type === "permission") return `permission:${item.request}`;
+    return `${item.type}:${index}`;
+  }
+
+  // What an item's node is drawn from: when this is unchanged, so is the node.
+  function signature(item, live) {
+    switch (item.type) {
+      case "tool":
+        return JSON.stringify([item.title, item.tool, item.status, item.places, item.output.length, live]);
+      case "permission":
+        return JSON.stringify([item.title, item.answer ?? "open"]);
+      default:
+        return item.text;
+    }
   }
 
   function renderStatus() {
@@ -159,8 +226,10 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     const parts = [title];
     if (isLive(run)) {
       const stopping = run.status === "cancelling";
+      // The Rust process says how long ago the agent was asked, so a reloaded page offers
+      // Force stop as soon as the process would act on it.
       if (!stopping) stoppingSince = null;
-      else stoppingSince ??= Date.now();
+      else stoppingSince ??= Date.now() - (run.stoppingFor ?? 0);
       const button = el("button", "button stop");
       button.type = "button";
       const label = () => {
@@ -252,20 +321,26 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
       line.title = tool.title;
       return line;
     }
-    // A call with output opens to show it: its diffs, or what it printed.
+    // A call with output opens to show it: its diffs, or what it printed. They are built when
+    // first opened: a run can carry many large diffs nobody opens.
     const details = el("details", "tool");
     const summary = el("summary");
     summary.append(line);
     details.append(summary);
-    for (const diff of diffs) details.append(diffView(diff));
-    for (const text of texts) details.append(el("pre", "tool-output", text.text));
+    let built = false;
+    details.addEventListener("toggle", () => {
+      if (!details.open || built) return;
+      built = true;
+      for (const diff of diffs) details.append(diffView(diff));
+      for (const text of texts) details.append(el("pre", "tool-output", text.text));
+    });
     return details;
   }
 
   function diffView(diff) {
     const view = el("pre", "tool-diff");
     const marks = { same: "  ", del: "- ", add: "+ " };
-    for (const line of diffLines(diff.oldText ?? "", diff.newText)) {
+    for (const line of partLines(diff)) {
       view.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
     }
     return view;
@@ -306,5 +381,6 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     run: () => run,
     live: () => isLive(run),
     render,
+    reveal,
   };
 }

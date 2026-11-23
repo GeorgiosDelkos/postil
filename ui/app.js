@@ -1005,6 +1005,8 @@ function deleteButton(item, note) {
 }
 
 async function deleteNote(note) {
+  // A deleted note leaves the send it was ticked in.
+  state.send?.ticked.delete(note.id);
   const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
     method: "DELETE",
   });
@@ -1066,7 +1068,7 @@ function renderSendBar() {
   picker.hidden = !state.send;
   picker.replaceChildren(chosenAgent() ?? "Choose an agent", el("span", "chevron", "▴"));
   const button = $("send-button");
-  const count = state.send ? state.send.ticked.size : open;
+  const count = state.send ? tickedIds().length : open;
   const noun = count === 1 ? "1 note" : `${count} notes`;
   button.replaceChildren(state.send ? `Send ${noun}` : `Send ${noun}…`, el("kbd", "", "⌘⇧↵"));
   button.disabled = Boolean(state.send) && (count === 0 || !chosenAgent() || state.send.sending);
@@ -1136,7 +1138,7 @@ async function showPrompt() {
 
 async function sendNotes() {
   const agent = chosenAgent();
-  if (!state.send || state.send.sending || state.send.ticked.size === 0 || !agent) return;
+  if (!state.send || state.send.sending || tickedIds().length === 0 || !agent) return;
   state.send.sending = true;
   renderSendBar();
   const response = await fetch("api/run", {
@@ -1193,6 +1195,8 @@ function showTab(tab) {
   $("note-count").hidden = run;
   $("run-header").hidden = !run;
   renderSendBar();
+  // Measured only now that the panel shows: a run that comes to the front opens at its end.
+  if (run) runs.reveal();
 }
 
 $("tab-notes").addEventListener("click", () => showTab("notes"));
@@ -1224,6 +1228,10 @@ function followRun(run, previous) {
   // (docs/design.md, "Working with the repository").
   if (!fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run))) {
     refresh().catch((error) => showToast(String(error)));
+  } else if (run.notes.some((id) => state.notes.find((note) => note.id === id && isOpen(note)))) {
+    // Its notes are marked sent once the agent takes the turn, which is no status change and
+    // no edit: read them until they show it.
+    loadNotes().catch((error) => showToast(String(error)));
   }
   renderSendBar();
 }
@@ -1379,6 +1387,7 @@ function quit() {
 // the open file, and the notes change while the engineer is in another app, so all three are
 // read again on return and drawn once, so the notes never show on the old text. Not while
 // the composer is open: reading the file again would move its lines under the text.
+let refreshes = 0;
 async function refresh() {
   // A project being opened replaces this page: what a refresh drew would be thrown away,
   // and its requests would already reach the new project.
@@ -1390,13 +1399,16 @@ async function refresh() {
   }
   if (!state.projectOpen || state.composer) return;
   const path = state.wanted;
+  // A later refresh may answer first, as a run's edits come one after another: only the
+  // latest refresh draws, or an older file would be painted over a newer one.
+  const generation = ++refreshes;
   const [repo, notes, file] = await Promise.all([
     fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
     fetchNotes(),
     path ? fetchFile(path) : null,
   ]);
   // The engineer moved on while the replies were in flight: their action wins.
-  if (state.composer || state.wanted !== path) return;
+  if (state.composer || state.wanted !== path || generation !== refreshes) return;
 
   if (repo) showRepo(repo);
   applyNotes(notes);
