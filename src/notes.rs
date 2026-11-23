@@ -481,7 +481,7 @@ impl Review {
 
         // The version is read on its own first: a newer format would otherwise fail on its
         // first new field, with a message that hides the real reason.
-        let version = version_of(&json).map_err(parse_error)?;
+        let version = version_of(json.as_bytes()).map_err(parse_error)?;
         if !(1..=VERSION).contains(&version) {
             return Err(invalid(format!(
                 "version {version}, but this build of Postil reads versions 1 to {VERSION}"

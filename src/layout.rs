@@ -53,10 +53,11 @@ pub(crate) struct RawLayout {
 impl Default for Layout {
     /// The widths of the app before panes could be resized.
     fn default() -> Self {
-        Self {
+        let raw = RawLayout {
             sidebar: 248,
             tray: 320,
-        }
+        };
+        Self::try_from(raw).expect("the default widths are within their ranges")
     }
 }
 

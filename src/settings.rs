@@ -8,7 +8,8 @@
 //! so running an older build cannot drop the newer build's settings. A missing file is the
 //! defaults, and the first save creates it.
 //!
-//! The rules, which only [`Settings::try_from`] a [`RawSettings`] checks:
+//! The rules, checked when a [`RawSettings`] becomes a [`Settings`] (`TryFrom`), the only way
+//! to make one:
 //! - the code font size is 11 to 20 px and the tab width 2, 4 or 8;
 //! - a custom agent has a name of 1 to 40 characters, unlike any other agent's name
 //!   whatever the case, built-in ones included, and a command of plain words (no quotes)
@@ -24,10 +25,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agents::{self, BUILT_IN};
+use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
-use crate::run::AgentChoice;
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -348,7 +348,7 @@ fn revision_of(json: &str) -> String {
 
 fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
     let shown = file.display();
-    match version_of(json) {
+    match version_of(json.as_bytes()) {
         Ok(version) if version > VERSION => {
             return Err(format!(
                 "{shown} was written by a newer Postil (format version {version})"

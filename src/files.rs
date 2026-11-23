@@ -36,7 +36,7 @@ pub(crate) fn load_versioned<T: DeserializeOwned>(file: &Path, version: u32) -> 
     let Ok(json) = fs::read_to_string(file) else {
         return Stored::Nothing;
     };
-    match version_of(&json) {
+    match version_of(json.as_bytes()) {
         Ok(stored) if stored > version => Stored::Newer,
         Ok(stored) if stored == version => {
             serde_json::from_str(&json).map_or(Stored::Nothing, Stored::Current)
@@ -46,17 +46,20 @@ pub(crate) fn load_versioned<T: DeserializeOwned>(file: &Path, version: u32) -> 
 }
 
 /// The `version` field of the JSON object `json`. Every other field is ignored, so this reads
-/// a file of any version.
+/// a file, or a run log's header line, of any version.
 ///
 /// # Errors
 ///
 /// When `json` is not a JSON object with a `version` that is a `u32`.
-pub(crate) fn version_of(json: &str) -> serde_json::Result<u32> {
+pub(crate) fn version_of(json: &[u8]) -> serde_json::Result<u32> {
+    // The name shows in serde's message for a value that is not an object ("expected struct
+    // VersionOnly"), which the page shows for a broken review file or run log: renaming it
+    // changes that message.
     #[derive(Deserialize)]
     struct VersionOnly {
         version: u32,
     }
-    serde_json::from_str::<VersionOnly>(json).map(|stored| stored.version)
+    serde_json::from_slice::<VersionOnly>(json).map(|stored| stored.version)
 }
 
 /// Writes `value` to `file` as pretty JSON ending in a newline, through [`write_atomically`].

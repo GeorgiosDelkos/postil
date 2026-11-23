@@ -43,7 +43,7 @@ use crate::acp::{
     Agent, ContentBlock, ElicitationReply, Event, Launch, PermissionKind, PermissionOption,
     PermissionRequest, StopReason, Stopper, ToolKind, TurnEnd,
 };
-use crate::agents::Scanner;
+use crate::agents::{AgentChoice, Scanner};
 use crate::error::{Error, Result, error_chain};
 use crate::notes::{self, Prompt};
 use crate::repo::Repo;
@@ -67,13 +67,6 @@ const FORCE_AFTER: Duration = Duration::from_secs(3);
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
 pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
-
-/// The agent a run goes to: its name in the settings and the command that starts it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentChoice {
-    pub(crate) name: String,
-    pub(crate) command: String,
-}
 
 /// The runs of the open project, and the agent kept between them.
 pub(crate) struct Runner {
