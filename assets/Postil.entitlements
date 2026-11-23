@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The exceptions Postil.app takes from the hardened runtime (scripts/sign.sh). macOS holds
+     Postil responsible for the agents it starts, so an agent that scripts another app with
+     Apple Events does so as Postil; Info.plist's NSAppleEventsUsageDescription is what the
+     permission prompt then says. -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>

@@ -723,8 +723,11 @@ retired; the measured numbers above are the baseline to not regress.
    only for the bundle, since macOS reads it from `Info.plist`; `cargo run` shows the generic
    one. `scripts/install.sh` builds the bundle and installs it in `/Applications` (or
    `~/Applications` when that is not writable), moving an older copy to the Trash. Focus mode
-   and motion (section "Look and feel") are built. Not yet: signing and notarizing, which
-   need the owner's Apple Developer ID.
+   and motion (section "Look and feel") are built. `scripts/sign.sh` signs the bundle with the
+   hardened runtime (one exception: Apple Events, which agents Postil starts send as Postil) and
+   notarizes and staples it, from a Developer ID certificate and a notarytool keychain profile
+   holding an App Store Connect API key, both named in environment variables, so no credential
+   is in the repository; `scripts/install.sh` runs it when they are set. Not yet: a published release.
 
 ## Testing
 

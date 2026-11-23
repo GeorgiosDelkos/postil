@@ -1,2 +1,4 @@
 /target
 /mutants.out*
+# App Store Connect API keys (scripts/sign.sh): kept out of the repository by accident too.
+*.p8
