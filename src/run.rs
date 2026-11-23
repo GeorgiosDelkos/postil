@@ -627,11 +627,26 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         Event::Permission(request) => allow_option(&request.options).map(|id| (request.number, id)),
         _ => None,
     };
-    let (run, released) = {
+    let (run, released, answer) = {
         let mut slot = runner.slot();
         if slot.let_go(generation) {
             return;
         }
+        // Answered before the request is logged, and logged with it at once: a page that
+        // read the request alone would show the run waiting for the engineer. Fails only when
+        // the agent is gone; the run then shows the request open until it ends.
+        let answer = allow.and_then(|(request, option)| match &slot.agent {
+            Held::Ready(_, agent) => {
+                agent
+                    .answer_permission(request, &option)
+                    .ok()
+                    .map(|()| Entry::Answer {
+                        request,
+                        option: Some(option),
+                    })
+            }
+            Held::None | Held::Starting(_) => None,
+        });
         let ends_agent = matches!(
             event,
             Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
@@ -641,20 +656,15 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         } else {
             Held::None
         };
-        (slot.run.clone(), released)
+        (slot.run.clone(), released, answer)
     };
     if let Some(run) = run
-        && let Some(ids) = run.record_event(event, runner.repo.root())
+        && let Some(ids) = run.record_event(event, answer, runner.repo.root())
     {
         runner.mark_sent(&run, &ids);
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
-    if let Some((request, option)) = allow {
-        // Fails only when the request closed meanwhile (a cancel, or the engineer, answered
-        // it) or the agent is gone; the run shows each.
-        drop(runner.answer(request, &option));
-    }
     (runner.notify)();
 }
 
@@ -1022,28 +1032,36 @@ impl Run {
 
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     fn record(&self, entry: Entry) {
+        self.record_all([entry]);
+    }
+
+    /// Records `entries` in order, under one hold of the state: a reader sees all or none.
+    fn record_all(&self, entries: impl IntoIterator<Item = Entry>) {
         let mut state = self.state();
         if !state.live() {
             return;
         }
-        if let Some(log) = &mut state.log
-            && let Err(error) = log.write_all(&json_line(&entry))
-        {
-            state.log = None;
-            state.problem.get_or_insert(format!(
-                "the run log {} could not be written, so this run will not be shown whole \
-                 after a restart: {error}",
-                self.file.display()
-            ));
+        for entry in entries {
+            if let Some(log) = &mut state.log
+                && let Err(error) = log.write_all(&json_line(&entry))
+            {
+                state.log = None;
+                state.problem.get_or_insert(format!(
+                    "the run log {} could not be written, so this run will not be shown whole \
+                     after a restart: {error}",
+                    self.file.display()
+                ));
+            }
+            state.apply(&entry);
+            state.entries.push(entry);
         }
-        state.apply(&entry);
-        state.entries.push(entry);
     }
 
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
     /// the agent took the turn (an update, a permission request, or a stop other than a
     /// refusal) releases them. A turn that fails or is refused at once leaves them open.
-    fn record_event(&self, event: Event, root: &Path) -> Option<Vec<String>> {
+    /// `then`, the event's auto-answer, is recorded with it, at once.
+    fn record_event(&self, event: Event, then: Option<Entry>, root: &Path) -> Option<Vec<String>> {
         let entry = match event {
             Event::Update(update) => entry_of(update, root)?,
             Event::Permission(request) => Entry::Permission {
@@ -1087,7 +1105,7 @@ impl Run {
                 }
         );
         let live = self.state().live();
-        self.record(entry);
+        self.record_all(std::iter::once(entry).chain(then));
         if took_turn && live {
             self.state().unmarked.take()
         } else {

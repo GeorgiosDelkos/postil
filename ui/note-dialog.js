@@ -23,7 +23,8 @@ export function statusIcon(kind) {
 
 // The agent's open question as a form (board 9 on the design canvas): its message, a field
 // per form field, Skip and Send answer (Cmd-Enter). `answer(content)` sends the reply: the
-// form's values, or `null` to skip. Shared by the note and run dialogs.
+// form's values, or `null` to skip; it resolves to whether the reply was taken. Shared by
+// the note and run dialogs.
 export function questionForm(question, agent, answer) {
   const fields = questionFields(question.fields);
   const values = {};
@@ -39,11 +40,13 @@ export function questionForm(question, agent, answer) {
   actions.append(skip, el("span", "spacer"), send);
   form.append(actions);
   // Sent once: the buttons stay disabled while the reply is on its way, and the run's next
-  // draw replaces the form.
-  const reply = (content) => {
+  // draw replaces the form. A reply that was not taken (the post failed) can be sent again.
+  const reply = async (content) => {
     skip.disabled = true;
     send.disabled = true;
-    answer(content);
+    if (await answer(content)) return;
+    skip.disabled = false;
+    send.disabled = false;
   };
   skip.addEventListener("click", () => reply(null));
   form.addEventListener("submit", (event) => {
@@ -154,9 +157,13 @@ export function noteDialog(
     const key = JSON.stringify([note, run?.id, run?.status, run?.total, canSend(note), agent()]);
     if (key === drawn) return;
     drawn = key;
-    const focused = document.activeElement?.className;
+    // The question's form is the same node across redraws, and so is the control that had
+    // the focus in it, which gets it back; a button outside it is found by its class.
+    const active = document.activeElement;
+    const typing = asking?.form.contains(active) ? active : null;
+    const focused = typing ? null : active?.className;
     dialogEl.replaceChildren(header(note, run), body(note, run), footer(note, run));
-    // A redraw keeps the focus on the button that had it.
+    typing?.focus();
     if (focused) dialogEl.getElementsByClassName(focused)[0]?.focus();
   }
 

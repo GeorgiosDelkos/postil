@@ -3296,6 +3296,10 @@ mod tests {
             kinds.contains(&"message:url answered -32602".to_owned()),
             "a URL question cannot be shown as a form: {ended}"
         );
+        assert!(
+            kinds.contains(&"message:withdrawn answered cancel".to_owned()),
+            "a withdrawn request is still answered, as ACP asks: {ended}"
+        );
         let question = kinds.iter().position(|kind| kind == "question").unwrap();
         assert_eq!(kinds[question + 1], "answer", "withdrawn: {ended}");
         assert_eq!(

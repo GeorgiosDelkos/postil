@@ -228,9 +228,16 @@ export function runPanel({
     return forceAt !== null && Date.now() >= forceAt;
   }
 
-  // Answers the run's open question with the form's values, or `null` to skip it.
+  // Answers the run's open question with the form's values, or `null` to skip it. Resolves
+  // to whether the answer was taken.
   function answerQuestion(request, content) {
-    return post("api/run/question", { request, content }).catch((error) => onError(error.message));
+    return post("api/run/question", { request, content }).then(
+      () => true,
+      (error) => {
+        onError(error.message);
+        return false;
+      },
+    );
   }
 
   function answer(request, option) {
@@ -417,15 +424,17 @@ export function runPanel({
     if (detail && !list.includes(detail.id)) detailEl.close();
   }
 
-  // The run's steps in order, each with its key: every item but the agent's messages and an
-  // open permission request, which shows above the runs.
-  function stepsOf(items) {
-    return items
-      .map((item, index) => ({ item, key: itemKey(item, index) }))
+  // The run's steps in order, each with its key: every item but the agent's messages and,
+  // while the run is live, an open request, which shows above the runs. Once the run is over
+  // a request left open is a step too, shown as closed.
+  function stepsOf(view) {
+    const live = isLive(view);
+    return foldRun(view.entries)
+      .items.map((item, index) => ({ item, key: itemKey(item, index) }))
       .filter(
         ({ item }) =>
           item.type !== "message" &&
-          !((item.type === "permission" || item.type === "question") && item.answer === undefined),
+          !(live && (item.type === "permission" || item.type === "question") && item.answer === undefined),
       );
   }
 
@@ -441,7 +450,7 @@ export function runPanel({
     if (!detail) return;
     const view = byId(detail.id);
     if (!view) return;
-    const steps = stepsOf(foldRun(view.entries).items);
+    const steps = stepsOf(view);
     let stamp;
     let draw;
     if (detail.kind === "run") {
@@ -460,7 +469,11 @@ export function runPanel({
     const scroll = detailEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
     const same = detailEl.dataset.shown === stamp[0];
     detailEl.dataset.shown = stamp[0];
+    // The question's form is the same node across redraws; so is the control that had the
+    // focus in it, which gets it back.
+    const typing = asking?.form.contains(document.activeElement) ? document.activeElement : null;
     detailEl.replaceChildren(...draw());
+    typing?.focus();
     const body = detailEl.querySelector(".note-dialog-body");
     if (body && same) body.scrollTop = scroll;
   }
@@ -468,7 +481,7 @@ export function runPanel({
   function moveStep(by) {
     const view = byId(detail.id);
     if (!view) return;
-    const steps = stepsOf(foldRun(view.entries).items);
+    const steps = stepsOf(view);
     const next = steps[steps.findIndex((step) => step.key === detail.key) + by];
     if (next) openDetail({ kind: "step", id: detail.id, key: next.key });
   }
@@ -595,8 +608,10 @@ export function runPanel({
         ]);
       case "permission": {
         const chosen = item.options.find((option) => option.id === item.answer);
+        // "allow" when it was allowed, by Postil or by hand; "ask" when rejected or closed.
+        const verb = chosen?.kind?.startsWith("allow") ? "allow" : "ask";
         return card([
-          el("span", "tool-verb", "allow"),
+          el("span", "tool-verb", verb),
           el("span", "run-card-text", item.title),
           el("span", "tool-state", chosen ? chosen.name : "cancelled"),
         ]);

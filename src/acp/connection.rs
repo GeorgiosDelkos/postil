@@ -678,11 +678,11 @@ impl<F: FnMut(Event)> Reader<F> {
                 {
                     let mut state = lock(&self.shared.state);
                     state.cancelling = false;
-                    // A request still open when its turn ended can no longer be answered.
-                    state
-                        .requests
-                        .iter_mut()
-                        .for_each(|request| *request = None);
+                    // A request still open when its turn ended is closed, and answered as a
+                    // cancel, which ACP asks of a request its sender gave up on.
+                    for open in state.requests.iter_mut().filter_map(Option::take) {
+                        drop(self.outbox.send(cancelled(&open)));
+                    }
                 }
                 let end = match outcome {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
@@ -832,8 +832,9 @@ impl<F: FnMut(Event)> Reader<F> {
         }
     }
 
-    /// Closes the open request the agent withdrew. A withdrawn request needs no answer; one
-    /// already answered, or not the app's to answer, is ignored.
+    /// Closes the open request the agent withdrew, and answers it as a cancel: ACP's
+    /// cancellation rule asks for a reply to the original request all the same. One already
+    /// answered, or not the app's to answer, is ignored.
     fn withdraw(&mut self, params: Value) {
         let request_id = match serde_json::from_value::<CancelRequestParams>(params) {
             Ok(params) => params.request_id,
@@ -842,18 +843,16 @@ impl<F: FnMut(Event)> Reader<F> {
                 return self.emit(Event::Unreadable(problem));
             }
         };
-        let number = {
+        let closed = {
             let mut state = lock(&self.shared.state);
             let found = state
                 .requests
                 .iter()
                 .position(|open| open.as_ref().is_some_and(|open| open.id == request_id));
-            if let Some(number) = found {
-                state.requests[number] = None;
-            }
-            found
+            found.and_then(|number| state.requests[number].take().map(|open| (number, open)))
         };
-        if let Some(number) = number {
+        if let Some((number, open)) = closed {
+            drop(self.outbox.send(cancelled(&open)));
             self.emit(Event::Withdrawn { number });
         }
     }

@@ -164,9 +164,10 @@ async function prompt(id, params) {
       say(`url answered ${url.error?.code}`);
       // Asked, then withdrawn before anyone answered: the agent no longer needs it.
       const withdrawn = nextId;
-      question();
+      const reply = question();
       send({ method: "$/cancel_request", params: { requestId: withdrawn } });
-      say("withdrew it");
+      // ACP asks for a reply to a withdrawn request all the same.
+      say(`withdrawn answered ${(await reply).result.action}`);
       return send({ id, result: { stopReason: "end_turn" } });
     }
     case "always-only": {
