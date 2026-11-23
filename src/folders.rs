@@ -6,6 +6,9 @@
 //! cannot be read or parsed counts as no folder open, and the next change replaces it. A file a
 //! newer Postil wrote reads as none open and is never replaced. A folder that no longer exists
 //! is kept, and simply opens nothing: the page draws only folders that are in the tree.
+//!
+//! Windows on one working tree do not share open folders live: each `PUT` replaces the whole
+//! list, and the last window to save decides what the next one opens with.
 
 use std::fs;
 use std::path::Path;
@@ -65,13 +68,6 @@ pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
     if fs::read_to_string(file).is_ok_and(|json| newer(&json)) {
         return Ok(());
     }
-    let failed = |source| Error::WriteFolders {
-        path: file.to_owned(),
-        source,
-    };
-    if let Some(dir) = file.parent() {
-        fs::create_dir_all(dir).map_err(failed)?;
-    }
     let stored = FoldersFile {
         version: VERSION,
         open: folders.open,
@@ -79,7 +75,10 @@ pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
     let mut json =
         serde_json::to_vec_pretty(&stored).expect("a version and a list of strings serialize");
     json.push(b'\n');
-    write_atomically(file, &json).map_err(failed)
+    write_atomically(file, &json).map_err(|source| Error::WriteFolders {
+        path: file.to_owned(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -117,6 +116,18 @@ mod tests {
             assert_eq!(load(&file), Folders::default(), "{broken}");
             save(&file, folders()).unwrap();
             assert_eq!(load(&file), folders(), "{broken} is replaced");
+        }
+        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
+    }
+
+    #[test]
+    fn folders_that_cannot_be_written_are_a_write_folders_error() {
+        let file = temp_file("unwritable");
+        // The path is a directory, so the write over it fails.
+        fs::create_dir_all(&file).unwrap();
+        match save(&file, Folders::default()) {
+            Err(Error::WriteFolders { path, .. }) => assert_eq!(path, file),
+            other => panic!("expected WriteFolders, got {other:?}"),
         }
         drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }

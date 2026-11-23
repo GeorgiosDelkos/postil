@@ -1914,6 +1914,8 @@ function chooseFolder() {
 // the reload, so the composer keeps the focus instead.
 async function requestProject(route, path) {
   if (guardDraft("opening another project")) return;
+  // A save still waiting would land in the next project: its folders are dropped instead.
+  clearTimeout(foldersTimer);
   state.switching = true;
   let response;
   try {

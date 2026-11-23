@@ -1858,6 +1858,8 @@ mod tests {
         post_note(&site, "a.txt", 1, 1, "one");
         post_note(&site, "a.txt", 2, 2, "two");
         let file = site.repo().unwrap().review_file();
+        // A resolved note stays resolved: an edit changes the text alone.
+        post(&site, &format!("{NOTES}/resolve?id=N2"), "");
 
         let (status, body) = patch(
             &site,
@@ -1873,6 +1875,10 @@ mod tests {
             .map(|note| note["body"].as_str().unwrap())
             .collect();
         assert_eq!(bodies, ["one", "second"], "trimmed, and only N2");
+        assert_eq!(
+            review["notes"][1]["state"],
+            serde_json::json!({ "kind": "resolved" })
+        );
         assert_eq!(
             anchors(&review)[1],
             anchor("N2", 2, 2, "found"),
@@ -2623,8 +2629,6 @@ mod tests {
         (reply.status(), body)
     }
 
-    /// Saves `settings` (JSON text, possibly malformed) as the page does: naming the
-    /// revision of the file it last read.
     #[test]
     fn open_folders_are_kept_per_working_tree_and_read_back() {
         let repo = TempRepo::new("folders");
@@ -2653,6 +2657,8 @@ mod tests {
         );
     }
 
+    /// Saves `settings` (JSON text, possibly malformed) as the page does: naming the
+    /// revision of the file it last read.
     fn save(site: &Site, settings: &str) -> (StatusCode, String) {
         let revision = get_json(site, SETTINGS)["revision"].clone();
         put(

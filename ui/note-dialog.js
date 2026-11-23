@@ -156,7 +156,10 @@ export function noteDialog(
   dialogEl.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      dialogEl.querySelector(".note-dialog-send:not(:disabled)")?.click();
+      // While the text is edited, Cmd-Enter saves it, from any control: sending would send
+      // the old text.
+      if (editing) editing.form.requestSubmit();
+      else dialogEl.querySelector(".note-dialog-send:not(:disabled)")?.click();
     }
   });
 
@@ -277,6 +280,8 @@ export function noteDialog(
       editing = null;
       drawn = null;
       draw();
+      // Back to Edit: the focus kept by class could otherwise land on Send.
+      dialogEl.querySelector(".note-dialog-edit")?.focus();
     };
     cancel.addEventListener("click", stop);
     form.addEventListener("submit", async (event) => {
