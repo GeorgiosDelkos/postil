@@ -11,12 +11,13 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SendError, Sender};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -193,6 +194,8 @@ enum AppEvent {
     BenchPainted,
     /// The benchmark finished; the payload is its JSON report.
     BenchDone(String),
+    /// The request thread has closed the site, so the app may exit ([`Job::Close`]).
+    SiteClosed,
 }
 
 impl AppEvent {
@@ -258,7 +261,9 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         }
     });
     let (site, settings) = start_site(dir, bench, notify)?;
-    let (requests, worker) = spawn_site_worker(site)?;
+    // A failure before the event loop runs drops the site without closing it: no page has
+    // started a run yet, so there is no agent to stop.
+    let jobs = spawn_site_worker(site, event_loop.create_proxy())?;
 
     let window = build_window(&event_loop, settings.theme)?;
 
@@ -276,7 +281,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     };
 
     let committed = Rc::new(Cell::new(false));
-    let webview = build_webview(&event_loop, &window, requests, Rc::clone(&committed))?;
+    let webview = build_webview(&event_loop, &window, jobs.clone(), Rc::clone(&committed))?;
 
     let page = Page {
         webview: &webview,
@@ -293,7 +298,8 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 event: WindowEvent::CloseRequested,
                 ..
             } => ask_page(&page, "close-window", Unanswered::Quit),
-            Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(AppEvent::Quit) => close_site(&jobs, control_flow),
+            Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
             // The system switched between light and dark while the window follows it.
             Event::WindowEvent {
                 event: WindowEvent::ThemeChanged(theme),
@@ -348,48 +354,98 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                     launch_to_paint: launch_to_paint.unwrap_or_else(|| started.elapsed()),
                     page,
                 });
-                *control_flow = ControlFlow::Exit;
+                close_site(&jobs, control_flow);
             }
             _ => {}
         }
     });
 
-    // The webview draws into the window, so it goes first. It holds the only sender of
-    // requests, so the worker then finishes the request it is on and stops.
+    // The webview draws into the window, so it goes first. The request thread is not
+    // joined: it has closed the site, and a late request it may be answering would wait for
+    // this thread's run loop, which has stopped. The process ending stops it.
     drop(webview);
     drop(window);
-    // The site is dropped on the worker, and its drop stops the agent of a run under way.
-    // Waiting for it keeps the process alive until that agent is gone. A worker that
-    // panicked has printed why; there is nothing more to do about it here.
-    drop(worker.join());
     Ok(report)
 }
 
-/// A request from the page and the way to answer it, as wry hands them over.
-type Asked = (Request<Vec<u8>>, RequestAsyncResponder);
+/// What the request thread is asked to do ([`spawn_site_worker`]).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the queue holds a handful of jobs and one Close; boxing every request would cost more"
+)]
+enum Job {
+    /// Answer a request from the page, as wry hands it over.
+    Answer(Request<Vec<u8>>, RequestAsyncResponder),
+    /// Drop the site, which stops the agent of a run under way, then send
+    /// [`AppEvent::SiteClosed`]. Later requests get 503.
+    Close,
+}
 
-/// Starts the thread that answers the page's requests: it owns `site`, answers each request
-/// in the order it arrives, and drops `site` once every sender is gone.
+impl fmt::Debug for Job {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Answer(request, _) => f
+                .debug_tuple("Answer")
+                .field(&request.uri())
+                .finish_non_exhaustive(),
+            Self::Close => f.write_str("Close"),
+        }
+    }
+}
+
+/// Starts the thread that answers the page's requests and returns the way to send it jobs.
+/// It owns `site` and does each job in the order it arrives; on [`Job::Close`] it drops the
+/// site and tells `closed`.
 ///
 /// wry calls the URL scheme handler on the main thread, and answering there would stop the
 /// window (input, redraws, Stop) for as long as git, a file read or highlighting takes, so
 /// the handler only queues the request. One thread rather than one per request: the page
-/// relies on order (`api/open`, then `api/repo`), and requests answered one at a time never
-/// contend for `Site`'s lock. The queue is unbounded: its sender is the page's fetches, a
-/// handful at a time, and a bounded queue that filled up would block the main thread.
-/// WebKit's scheme task may be answered from any thread (wry's `RequestAsyncResponder`
-/// exists for that).
-fn spawn_site_worker(site: Site) -> Result<(Sender<Asked>, JoinHandle<()>)> {
-    let (sender, asked) = mpsc::channel::<Asked>();
-    let worker = thread::Builder::new()
+/// relies on order (`api/open`, then `api/repo`), and one at a time, `Site` needs no lock.
+/// The queue is unbounded: its sender is the page's fetches, a handful at a time, and a
+/// bounded queue that filled up would block the main thread.
+///
+/// An answer may come from any thread (wry's `RequestAsyncResponder` exists for that), but
+/// WebKit delivers it on the main thread's run loop and waits for that. So the main thread
+/// must never wait for this one while its run loop is stopped: the site is closed by a job
+/// while the event loop still runs, and the event loop exits on [`AppEvent::SiteClosed`].
+fn spawn_site_worker(site: Site, closed: EventLoopProxy<AppEvent>) -> Result<Sender<Job>> {
+    let (sender, jobs) = mpsc::channel::<Job>();
+    thread::Builder::new()
         .name("page-requests".to_owned())
         .spawn(move || {
-            for (request, responder) in asked {
-                responder.respond(site.respond(&request));
+            let mut site = Some(site);
+            for job in jobs {
+                match job {
+                    Job::Answer(request, responder) => {
+                        let answer = match &site {
+                            Some(site) => site.respond(&request),
+                            None => reply(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "text/plain",
+                                &b"Postil is closing"[..],
+                            ),
+                        };
+                        responder.respond(answer);
+                    }
+                    Job::Close => {
+                        drop(site.take());
+                        // Fails only once the event loop is gone, when nobody waits for it.
+                        drop(closed.send_event(AppEvent::SiteClosed));
+                    }
+                }
             }
         })
         .map_err(Error::SpawnWorker)?;
-    Ok((sender, worker))
+    Ok(sender)
+}
+
+/// Asks the request thread to close the site; the event loop exits once it has
+/// ([`AppEvent::SiteClosed`]), or at once when that thread is gone. Asking twice is harmless:
+/// the second close finds no site and answers again.
+fn close_site(jobs: &Sender<Job>, control_flow: &mut ControlFlow) {
+    if jobs.send(Job::Close).is_err() {
+        *control_flow = ControlFlow::Exit;
+    }
 }
 
 /// Which drags over the window are the app's. A drag that carries files is: the webview
@@ -454,13 +510,13 @@ fn offer_folder(webview: &WebView, folder: &Path) {
     drop(webview.evaluate_script(&format!("window.postil?.openFolder({path})")));
 }
 
-/// The webview that shows the page in `window`, its requests sent to `requests` (see
+/// The webview that shows the page in `window`, its requests sent to `jobs` (see
 /// [`spawn_site_worker`]). It sets `committed` once the page's first navigation commits (see
 /// [`Page`]).
 fn build_webview(
     event_loop: &EventLoop<AppEvent>,
     window: &Window,
-    requests: Sender<Asked>,
+    jobs: Sender<Job>,
     committed: Rc<Cell<bool>>,
 ) -> Result<WebView> {
     let page_proxy = event_loop.create_proxy();
@@ -471,7 +527,8 @@ fn build_webview(
         .with_asynchronous_custom_protocol("postil".to_owned(), move |_webview, request, answer| {
             // Fails only when the worker is gone, which it is only after a panic: the request
             // is then answered here, so the page shows an error instead of waiting forever.
-            if let Err(SendError((_, answer))) = requests.send((request, answer)) {
+            if let Err(SendError(Job::Answer(_, answer))) = jobs.send(Job::Answer(request, answer))
+            {
                 let problem = "the thread that answers the page stopped; restart Postil";
                 answer.respond(reply(
                     StatusCode::INTERNAL_SERVER_ERROR,

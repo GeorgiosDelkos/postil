@@ -36,7 +36,7 @@ pub enum Error {
     FileTooLarge {
         /// The file's path on disk.
         path: PathBuf,
-        /// Its size, in bytes, as far as it was read.
+        /// Its size on disk, in bytes; the limit plus one when it cannot be measured.
         bytes: u64,
     },
     /// The syntax highlighter failed on a file.

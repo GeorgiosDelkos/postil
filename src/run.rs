@@ -923,8 +923,8 @@ impl Runner {
         if let Some(run) = run {
             // As a forced Stop does: the agent's exit is not reported, so the snapshot after
             // the run is taken here, or its changes view would stay empty. It runs `git add`
-            // on the request thread, quitting included. Both calls do nothing
-            // for a run that already ended.
+            // on the request thread, quitting included. Both calls do nothing for a run that
+            // already ended.
             self.record_end_snapshot(&run);
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
