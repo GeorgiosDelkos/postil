@@ -74,12 +74,10 @@ ditto -c -k --keepParent "$app" "$work/Postil.zip"
 # non-zero exit must not stop the script before Apple's log is fetched. The submission's status
 # is the verdict, and on a rejection the log says why. A failure before any submission (no
 # network, a bad profile) leaves no status.
-if ! xcrun notarytool submit "$work/Postil.zip" "${profile[@]}" \
-  --wait --output-format json >"$work/submission.json"; then
-  echo "notarytool submit failed" >&2
-fi
+xcrun notarytool submit "$work/Postil.zip" "${profile[@]}" \
+  --wait --output-format json >"$work/submission.json" || true
 if ! status="$(plutil -extract status raw -o - "$work/submission.json" 2>/dev/null)"; then
-  echo "notarization: no submission status; notarytool said:" >&2
+  echo "notarytool submit failed with no submission status; it said:" >&2
   cat "$work/submission.json" >&2
   exit 1
 fi

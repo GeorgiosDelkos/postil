@@ -5,4 +5,5 @@
 *.p8
 *.p12
 *.cer
+*.keychain
 *.keychain-db
