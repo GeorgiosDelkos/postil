@@ -3684,8 +3684,8 @@ mod tests {
         repo.write("a.txt", "a\nb\n");
         let runs = repo.root.join(".git/postil/runs");
         fs::create_dir_all(&runs).unwrap();
-        // A tail a crash left, which never parses: it reads as no number.
-        fs::write(runs.join("active.lock"), "5\0\0").unwrap();
+        // A tail a crash left, not even UTF-8, which never parses: it reads as no number.
+        fs::write(runs.join("active.lock"), b"5\0\xff").unwrap();
         let (site, nudges) = run_site(&repo, "plain");
         post_note(&site, "a.txt", 1, 1, "one");
         post_note(&site, "a.txt", 2, 2, "two");

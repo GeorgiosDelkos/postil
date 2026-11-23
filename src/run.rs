@@ -35,9 +35,8 @@
 //! The app never rewrites a log. It reads logs to show runs, and deletes one with the last of
 //! its notes (`Runner::delete_runs_without_notes`). `runs/active.lock` also holds the highest
 //! run number ever given, so a deleted run's number is not given again unless a crash loses
-//! the counter (`last_run`). A log
-//! with no end is shown as unfinished: the app quit or the project was closed while it ran,
-//! or another window is running it.
+//! the counter (`last_run`). A log with no end is shown as unfinished: the app quit or the
+//! project was closed while it ran, or another window is running it.
 //!
 //! # Threads and locks
 //!
@@ -1208,10 +1207,15 @@ fn highest_run(dir: &Path) -> io::Result<u64> {
 /// the write). A crash can also leave an older, lower number. Either way the highest log left
 /// then decides, and a deleted run above it can get its number again.
 fn last_run(active: &mut File) -> io::Result<u64> {
-    let mut text = String::new();
+    // Read as bytes: damage that is not UTF-8 is no number too, not an error that would stop
+    // every run before `record_last_run` repairs the file.
+    let mut bytes = Vec::new();
     active.seek(SeekFrom::Start(0))?;
-    active.read_to_string(&mut text)?;
-    Ok(text.trim().parse().unwrap_or(0))
+    active.read_to_end(&mut bytes)?;
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0))
 }
 
 /// Records `number` as the highest run number given. The caller holds the file's lock.
