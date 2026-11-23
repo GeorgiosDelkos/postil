@@ -216,6 +216,8 @@ pub(crate) enum Entry {
     },
     /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]), taken before the
     /// agent gets the prompt or as its turn ends.
+    ///
+    /// [`Repo::snapshot`]: crate::repo::Repo::snapshot
     Snapshot { point: Point, tree: String },
 }
 

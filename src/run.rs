@@ -225,7 +225,7 @@ impl Runner {
     /// the one kept from the last run and still alive. Takes the snapshot before the run first
     /// ([`Repo::snapshot`], `git add --all` through Postil's own index), under the runner's
     /// lock; otherwise returns at once, except while another window's run holds the run lock:
-    /// then it waits up to [`LOCK_PATIENCE`] under the runner's lock before it refuses. The run
+    /// then it waits up to `LOCK_PATIENCE` under the runner's lock before it refuses. The run
     /// reports its progress through its log.
     ///
     /// # Errors
