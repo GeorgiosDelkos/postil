@@ -91,11 +91,15 @@ Motion: every animation is short and ends still.
 |---|---|---|
 | Hover and focus color | 80 ms | linear |
 | Note composer opening under a line | 120 ms | ease-out |
-| Side pane open and close | 160 ms | ease-out |
+| Side pane open and close (focus mode) | 160 ms | ease-out |
+| Dialog, toast, the changes view and the prompt preview coming in | 120 ms | ease-out |
 | Keyboard scroll (`j`, `k`, page keys, jump to note) | 120 ms | critically damped spring |
 | Trackpad scroll | none added: follow the OS deltas exactly | |
 
-The window draws only when something changed. An idle window draws zero frames.
+The window draws only when something changed. An idle window draws zero frames. Every animation
+is off when macOS's Reduce Motion is on (`prefers-reduced-motion`). The side panes ease only
+while focus mode changes, never while a divider is dragged, which follows the pointer at once.
+Keyboard scroll waits for `j` and `k`, which are not built.
 
 ## Architecture
 
@@ -719,8 +723,8 @@ retired; the measured numbers above are the baseline to not regress.
    only for the bundle, since macOS reads it from `Info.plist`; `cargo run` shows the generic
    one. `scripts/install.sh` builds the bundle and installs it in `/Applications` (or
    `~/Applications` when that is not writable), moving an older copy to the Trash. Focus mode
-   is built. Not yet: signing and notarizing, which need the owner's Apple Developer ID, and
-   motion.
+   and motion (section "Look and feel") are built. Not yet: signing and notarizing, which
+   need the owner's Apple Developer ID.
 
 ## Testing
 

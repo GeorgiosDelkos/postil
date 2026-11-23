@@ -3083,13 +3083,18 @@ button.changes-number:focus-visible {
 }
 
 /* Focus mode: the code alone, centered at a readable width (Cmd-\). */
+/* The side columns close to nothing rather than leave the grid, so the change can be eased. */
 body.focus-mode {
-  grid-template-columns: minmax(0, 1fr);
-  padding: 0 8px;
+  grid-template-columns: 0px minmax(0, 1fr) 0px;
 }
 
 body.focus-mode > .sidebar,
-body.focus-mode > .tray,
+body.focus-mode > .tray {
+  visibility: hidden;
+  opacity: 0;
+  overflow: hidden;
+}
+
 body.focus-mode > .divider {
   display: none;
 }
@@ -3097,6 +3102,19 @@ body.focus-mode > .divider {
 body.focus-mode > .code-pane {
   justify-self: center;
   width: min(100%, 1100px);
+}
+
+/* Side panes open and close in 160 ms (docs/design.md, "Motion"). Only while focus mode
+   changes: a divider dragged by hand must follow the pointer at once. */
+body.panes-moving {
+  transition: grid-template-columns 160ms ease-out;
+}
+
+body.panes-moving > .sidebar,
+body.panes-moving > .tray {
+  transition:
+    opacity 160ms ease-out,
+    visibility 160ms;
 }
 
 body.focus-mode .focus-pill {
@@ -3135,4 +3153,63 @@ body.focus-mode .code {
 
 .focus-pill:not(:disabled):hover {
   border-color: var(--accent);
+}
+
+/* Dialogs, the toast, and the views over the code come in short and end still (docs/design.md,
+   "Motion"). */
+.note-dialog[open],
+.settings[open] {
+  animation: dialog-in 120ms ease-out;
+}
+
+.note-dialog[open]::backdrop,
+.settings[open]::backdrop {
+  animation: fade-in 120ms ease-out;
+}
+
+.toast:not([hidden]) {
+  animation: toast-in 120ms ease-out;
+}
+
+.changes-view:not([hidden]),
+.prompt-preview:not([hidden]) {
+  animation: fade-in 120ms ease-out;
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .note-dialog[open],
+  .settings[open],
+  .note-dialog[open]::backdrop,
+  .settings[open]::backdrop,
+  .toast:not([hidden]),
+  .changes-view:not([hidden]),
+  .prompt-preview:not([hidden]) {
+    animation: none;
+  }
+
+  body.panes-moving,
+  body.panes-moving > .sidebar,
+  body.panes-moving > .tray {
+    transition: none;
+  }
 }

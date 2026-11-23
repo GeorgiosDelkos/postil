@@ -1924,13 +1924,27 @@ function toggleFocus() {
   }
   // The send step's ticks live in the tray, which focus mode hides: it closes first.
   closeSend();
-  document.body.classList.add("focus-mode");
+  movePanes(() => document.body.classList.add("focus-mode"));
   // A control in a hidden pane would keep the keys.
   codeEl.focus();
 }
 
 function leaveFocus() {
-  document.body.classList.remove("focus-mode");
+  if (inFocus()) movePanes(() => document.body.classList.remove("focus-mode"));
+}
+
+// Eases the side panes while `change` opens or closes them, and only then (app.css,
+// `panes-moving`): a divider dragged by hand follows the pointer at once. The code redraws
+// once they settle, as its height may have changed with them.
+let panesSettle = null;
+function movePanes(change) {
+  document.body.classList.add("panes-moving");
+  change();
+  clearTimeout(panesSettle);
+  panesSettle = setTimeout(() => {
+    document.body.classList.remove("panes-moving");
+    renderCode({ force: true });
+  }, 180);
 }
 
 function inFocus() {
