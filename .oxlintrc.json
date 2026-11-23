@@ -1,0 +1,11 @@
+{
+  "plugins": ["eslint", "unicorn", "oxc", "import"],
+  "env": { "browser": true, "es2024": true },
+  "rules": {
+    "no-undef": "error",
+    "import/named": "error",
+    "import/namespace": "error",
+    "import/no-cycle": "error"
+  },
+  "overrides": [{ "files": ["ui/*.test.js"], "env": { "node": true } }]
+}

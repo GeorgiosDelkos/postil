@@ -1,5 +1,5 @@
 // The file tree in the sidebar: the repository's paths as folders and files, and the rows to
-// draw for the folders that are open. Plain data in, plain data out; app.js draws the rows.
+// draw for the folders that are open. Plain data in, plain data out; file-list.js draws the rows.
 
 // Names sort the way file managers and IDEs list them: case ignored, and digits by value, so
 // "file2" comes before "file10". Names equal under those rules fall back to code-unit order,

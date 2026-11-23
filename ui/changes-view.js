@@ -5,19 +5,13 @@
 // at that line with the composer, so the engineer writes the next note on the change itself.
 // ui/patch.js reads the diff.
 
+import { el } from "./dom.js";
 import { notesByLine, parsePatch } from "./patch.js";
 
 // How many lines of one file are drawn before the rest waits for a click. Arbitrary: a few
 // screens of a review, well below the thousands a regenerated lockfile brings, each of which
 // is four elements.
 const LINES_SHOWN = 400;
-
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 // `viewEl` is the view's element. `setHeader(title, meta)` fills the code pane's header;
 // `notes()` gives the notes; `noteCard(note)` builds a note's card, which opens its dialog;
@@ -66,7 +60,13 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     // The run is under way, or ended without a snapshot after it: the files as they are now
     // stand in for it, and may hold changes made since.
     if (sinceNow) {
-      parts.push(el("div", "changes-notice", "Compared with the files as they are now: the run has no snapshot after it."));
+      parts.push(
+        el(
+          "div",
+          "changes-notice",
+          "Compared with the files as they are now: the run has no snapshot after it.",
+        ),
+      );
     }
     if (files.length === 0) parts.push(el("div", "empty", "No file changed."));
     const all = notes();

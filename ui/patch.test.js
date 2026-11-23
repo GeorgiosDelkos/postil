@@ -51,7 +51,11 @@ test("a patch reads as files with their status, counts and numbered lines", () =
     { kind: "add", old: null, new: 2, text: "prompt 2" },
     { kind: "context", old: 3, new: 3, text: "c" },
   ]);
-  assert.deepEqual(files[1].hunks[0].lines, [{ kind: "add", old: null, new: 1, text: "new" }], "the no-newline marker is not a line");
+  assert.deepEqual(
+    files[1].hunks[0].lines,
+    [{ kind: "add", old: null, new: 1, text: "new" }],
+    "the no-newline marker is not a line",
+  );
   assert.equal(files[3].hunks.length, 0);
   assert.deepEqual(parsePatch(""), []);
 });
@@ -75,10 +79,17 @@ test("quoted paths are read back, and a second hunk numbers its lines from its h
     "",
   ].join("\n");
   const files = parsePatch(quoted);
-  assert.deepEqual(files.map((file) => file.path), ["tab\there.txt", 'café "x".png']);
+  assert.deepEqual(
+    files.map((file) => file.path),
+    ["tab\there.txt", 'café "x".png'],
+  );
   assert.deepEqual(
     files[0].hunks[1].lines.map((line) => [line.kind, line.old, line.new]),
-    [["context", 40, 40], ["add", null, 41], ["context", 41, 42]],
+    [
+      ["context", 40, 40],
+      ["add", null, 41],
+      ["context", 41, 42],
+    ],
   );
   assert.equal(unquote("plain/path.rs"), "plain/path.rs");
   assert.equal(unquote('"a\\\\b\\nc"'), "a\\b\nc");
@@ -92,6 +103,14 @@ test("a character outside the BMP in a quoted path is read whole, not as two hal
 test("a note shows at the changed line its lines end on, and only there", () => {
   const [file] = parsePatch(patch);
   const note = (id, path, end) => ({ id, path, lines: { start: end, end } });
-  const placed = notesByLine(file, [note("N1", "a.txt", 2), note("N2", "a.txt", 2), note("N3", "a.txt", 9), note("N4", "b.txt", 2)]);
-  assert.deepEqual([...placed].map(([line, notes]) => [line, notes.map((n) => n.id)]), [[2, ["N1", "N2"]]]);
+  const placed = notesByLine(file, [
+    note("N1", "a.txt", 2),
+    note("N2", "a.txt", 2),
+    note("N3", "a.txt", 9),
+    note("N4", "b.txt", 2),
+  ]);
+  assert.deepEqual(
+    [...placed].map(([line, notes]) => [line, notes.map((n) => n.id)]),
+    [[2, ["N1", "N2"]]],
+  );
 });

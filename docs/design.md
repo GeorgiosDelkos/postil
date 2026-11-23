@@ -157,9 +157,11 @@ schedule three tasks.
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
 | `src/run.rs` | Runs: the prompt, the run log, the agent kept between runs. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
-| `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables. |
+| `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
+| `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
+| `ui/dom.js`, `ui/dialog-parts.js`, `ui/question-form.js` | Helpers the views share: `el()`, icons, the toast and two-click delete; the parts both dialogs draw; the question form. |
 | `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
-| `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel's drawing. |
+| `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 
 ### Data structures
@@ -498,7 +500,7 @@ view on 2026-11-23.
 
 ### The Run tab
 
-The Run tab (`ui/run-panel.js`) lists the runs, newest first, one card each: the status's
+The Run tab (`ui/run-tab.js`) lists the runs, newest first, one card each: the status's
 icon, the run id, the agent, the notes sent, and the status (`GET /api/runs` gives the ids).
 A card opens the run's dialog, which holds everything about it: the plan, one card per note
 (it opens the note's detail), one card per step (it opens the step whole: its command, diffs

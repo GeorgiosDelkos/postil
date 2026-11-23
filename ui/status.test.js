@@ -49,7 +49,10 @@ test("a note's run is the one it was sent in, or the live run carrying it", () =
 });
 
 test("a thread is its run of notes and the follow-ups after it, in order", () => {
-  const follow = (id, of, status = "ended") => ({ ...run(id, status), followUp: { of, text: "more" } });
+  const follow = (id, of, status = "ended") => ({
+    ...run(id, status),
+    followUp: { of, text: "more" },
+  });
   const views = [
     follow("R5", "R3"),
     run("R1", "ended"),
@@ -73,7 +76,11 @@ test("a thread is its run of notes and the follow-ups after it, in order", () =>
 
   const live = follow("R3", "R1", "running");
   live.notes = ["N1"];
-  assert.equal(runOf(sent("N1", "R1"), new Map(), live), live, "a follow-up under way shows on its notes");
+  assert.equal(
+    runOf(sent("N1", "R1"), new Map(), live),
+    live,
+    "a follow-up under way shows on its notes",
+  );
   assert.equal(runOf(sent("N2", "R1"), new Map(), live), null);
 });
 
@@ -97,9 +104,17 @@ test("a note's status follows its run", () => {
     "Open",
     "a note the agent never took is open again",
   );
-  assert.equal(status(resolved("N1", "R1"), run("R1", "failed")), "Resolved", "the engineer's word wins");
+  assert.equal(
+    status(resolved("N1", "R1"), run("R1", "failed")),
+    "Resolved",
+    "the engineer's word wins",
+  );
   assert.equal(status(resolved("N1"), null), "Resolved");
-  assert.equal(runStatus(resolved("N1", "R1"), run("R1", "failed")).label, "Failed in R1", "its run's own status");
+  assert.equal(
+    runStatus(resolved("N1", "R1"), run("R1", "failed")).label,
+    "Failed in R1",
+    "its run's own status",
+  );
   assert.equal(runOf(resolved("N1", "R1"), new Map([["R1", run("R1", "ended")]]), null)?.id, "R1");
 });
 
@@ -138,27 +153,50 @@ test("a note's history is the run's tool calls on its file and the plan steps na
     tool("t1", "read", "src/math.rs"),
     tool("t2", "read", "src/other.rs"),
     tool("t3", "edit", "src/math.rs", [diff("src/math.rs", "a\nb\n", "a\nc\nd\n")]),
-    { kind: "plan", steps: [
-      { content: "Fix N3 in divide", status: "completed" },
-      { content: "Fix N30", status: "pending" },
-    ] },
+    {
+      kind: "plan",
+      steps: [
+        { content: "Fix N3 in divide", status: "completed" },
+        { content: "Fix N30", status: "pending" },
+      ],
+    },
   ];
   const r = run("R1", "ended", entries);
   assert.deepEqual(
-    noteHistory(note, r).map((step) => (step.kind === "tool" ? `${step.verb} ${step.state}` : step.text)),
+    noteHistory(note, r).map((step) =>
+      step.kind === "tool" ? `${step.verb} ${step.state}` : step.text,
+    ),
     ["read done", "edit +2 -1", "Fix N3 in divide"],
   );
   assert.deepEqual(fileStats(note, r), { added: 2, removed: 1 });
   assert.equal(fileStats(sent("N4", "R1", "src/none.rs"), r), null);
 
   // A call that names the file only in its diff concerns it too.
-  const moved = { ...tool("t4", "other", "x"), places: [], output: [diff("src/math.rs", null, "z\n")] };
+  const moved = {
+    ...tool("t4", "other", "x"),
+    places: [],
+    output: [diff("src/math.rs", null, "z\n")],
+  };
   assert.equal(noteHistory(note, run("R1", "ended", [moved])).length, 1);
 });
 
 test("notes are grouped as in the run, open, done newest run first, and resolved", () => {
-  const notes = [sent("N1", "R1"), open("N2"), sent("N3", "R3"), sent("N4", "R2"), open("N5"), resolved("N6", "R3")];
-  const kinds = { N1: "addressed", N2: "open", N3: "working", N4: "failed", N5: "open", N6: "resolved" };
+  const notes = [
+    sent("N1", "R1"),
+    open("N2"),
+    sent("N3", "R3"),
+    sent("N4", "R2"),
+    open("N5"),
+    resolved("N6", "R3"),
+  ];
+  const kinds = {
+    N1: "addressed",
+    N2: "open",
+    N3: "working",
+    N4: "failed",
+    N5: "open",
+    N6: "resolved",
+  };
   const groups = groupNotes(notes, (note) => ({ kind: kinds[note.id] }));
   const ids = (list) => list.map((note) => note.id);
   assert.deepEqual(ids(groups.inRun), ["N3"]);
@@ -169,29 +207,52 @@ test("notes are grouped as in the run, open, done newest run first, and resolved
 
 test("a run's latest review: its stages, findings, and the judge's verdict on each", () => {
   const stage = (id, reviewer, reviewers, status, entries) => ({
-    id, status, notes: ["N1"], entries, review: { of: "R1", reviewer, reviewers },
+    id,
+    status,
+    notes: ["N1"],
+    entries,
+    review: { of: "R1", reviewer, reviewers },
   });
   const found = (...findings) => ({ kind: "findings", findings, problem: null });
   const finding = (id, text) => ({ id, note: "N1", path: "a.rs", line: 1, text, fix: null });
   const old = stage("R2", 1, 1, "ended", [found(finding("F1", "an old review"))]);
-  const proposer = stage("R4", 1, 2, "ended", [found(finding("F1", "too short"), finding("F2", "no test"))]);
+  const proposer = stage("R4", 1, 2, "ended", [
+    found(finding("F1", "too short"), finding("F2", "no test")),
+  ]);
   const judging = stage("R5", 2, 2, "running", [said("F1: accepted - said more")]);
   const other = { id: "R3", status: "ended", notes: [], entries: [], review: null };
 
   assert.equal(reviewOf("R1", [other]), null, "never reviewed");
   const live = reviewOf("R1", [old, other, judging, proposer]);
-  assert.deepEqual(live.stages.map((view) => view.id), ["R4", "R5"], "the latest chain only");
+  assert.deepEqual(
+    live.stages.map((view) => view.id),
+    ["R4", "R5"],
+    "the latest chain only",
+  );
   assert.deepEqual(
     live.findings.map((item) => [item.id, item.from, item.verdict.word]),
-    [["F1", "R4", "accepted"], ["F2", "R4", "judging"]],
+    [
+      ["F1", "R4", "accepted"],
+      ["F2", "R4", "judging"],
+    ],
   );
   assert.equal(live.findings[0].verdict.text, "accepted - said more");
 
-  const ended = reviewOf("R1", [proposer, { ...judging, status: "ended", entries: [said("F1: Rejected - fine as is\nF2: added one")] }]);
-  assert.deepEqual(ended.findings.map((item) => item.verdict.word), ["rejected", "answered"]);
+  const ended = reviewOf("R1", [
+    proposer,
+    { ...judging, status: "ended", entries: [said("F1: Rejected - fine as is\nF2: added one")] },
+  ]);
+  assert.deepEqual(
+    ended.findings.map((item) => item.verdict.word),
+    ["rejected", "answered"],
+  );
   const silent = reviewOf("R1", [proposer, { ...judging, status: "ended", entries: [] }]);
   assert.equal(silent.findings[0].verdict.word, "no word");
-  assert.equal(reviewOf("R1", [proposer]).findings[0].verdict.word, "waiting", "the judge has not started");
+  assert.equal(
+    reviewOf("R1", [proposer]).findings[0].verdict.word,
+    "waiting",
+    "the judge has not started",
+  );
   const failed = { ...proposer, status: "failed" };
   assert.deepEqual(
     reviewOf("R1", [failed]).findings[0].verdict,
@@ -200,7 +261,9 @@ test("a run's latest review: its stages, findings, and the judge's verdict on ea
   );
   assert.equal(reviewOf("R1", [old]).findings[0].verdict.word, "not judged", "a single reviewer");
 
-  const unreadable = stage("R6", 1, 1, "ended", [{ kind: "findings", findings: [], problem: "no block" }]);
+  const unreadable = stage("R6", 1, 1, "ended", [
+    { kind: "findings", findings: [], problem: "no block" },
+  ]);
   assert.deepEqual(reviewOf("R1", [unreadable]).problems, ["R6: no block"]);
 });
 
@@ -230,20 +293,28 @@ test("the note dialog keeps its key while its run streams what the dialog does n
   const stage = (entries) =>
     streaming("R2", "running", entries, { review: { of: "R1", reviewer: 1, reviewers: 1 } });
   const reviewed = (entries) => key(start, "running", reviewOf("R1", [stage(entries)]));
-  assert.equal(reviewed([said("reading")]), reviewed([said("reading"), said(" on")]), "a reviewer's token");
+  assert.equal(
+    reviewed([said("reading")]),
+    reviewed([said("reading"), said(" on")]),
+    "a reviewer's token",
+  );
 });
 
 test("a judge writing its line changes the verdict's word only for the run dialog", () => {
   const stage = (id, reviewer, entries) =>
     streaming(id, "running", entries, { review: { of: "R1", reviewer, reviewers: 2 } });
   const finding = { id: "F1", note: "N1", path: "a.rs", line: 1, text: "too short", fix: null };
-  const proposer = { ...stage("R2", 1, [{ kind: "findings", findings: [finding], problem: null }]), status: "ended" };
+  const proposer = {
+    ...stage("R2", 1, [{ kind: "findings", findings: [finding], problem: null }]),
+    status: "ended",
+  };
   const review = (line) => reviewOf("R1", [proposer, stage("R3", 2, [said(line)])]);
   const writing = review("F1: accepted - bec");
   const more = review("F1: accepted - because it");
   assert.deepEqual(reviewKey(more), reviewKey(writing), "the run dialog shows only the word");
   assert.notDeepEqual(reviewKey(review("F1: rejected - no")), reviewKey(writing), "a new word");
-  const noteKey = (judged) => noteDialogKey(sent("N1", "R1"), streaming("R1", "ended", []), judged, []);
+  const noteKey = (judged) =>
+    noteDialogKey(sent("N1", "R1"), streaming("R1", "ended", []), judged, []);
   assert.notEqual(noteKey(more), noteKey(writing), "the note dialog shows the judge's line");
 });
 
@@ -255,9 +326,17 @@ test("the run dialog keeps its key while the agent streams its reply and thought
   const drawn = key(start);
   assert.equal(key([...start, said(" with it")]), drawn, "a token of the reply");
   assert.equal(key([thought("Reading a.rs"), edit, said("Done")]), drawn, "a token of a thought");
-  assert.notEqual(key([...start, { ...edit, status: "completed" }]), drawn, "a step's card changes");
+  assert.notEqual(
+    key([...start, { ...edit, status: "completed" }]),
+    drawn,
+    "a step's card changes",
+  );
   assert.notEqual(key([...start, thought("Then")]), drawn, "a new step");
   assert.notEqual(key(start, "cancelling"), drawn, "the run's status");
-  assert.notEqual(key([thought("Reading"), edit]), key([thought("Reading"), edit, said("Done")]), "the reply shows");
+  assert.notEqual(
+    key([thought("Reading"), edit]),
+    key([thought("Reading"), edit, said("Done")]),
+    "the reply shows",
+  );
   assert.equal(replyText(streaming("R1", "ended", start)), "Done");
 });

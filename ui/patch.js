@@ -13,7 +13,14 @@ export function parsePatch(patch) {
   let next = 0;
   for (const line of patch.split("\n")) {
     if (line.startsWith("diff --git ")) {
-      file = { path: pathOf(line), status: "modified", binary: false, added: 0, removed: 0, hunks: [] };
+      file = {
+        path: pathOf(line),
+        status: "modified",
+        binary: false,
+        added: 0,
+        removed: 0,
+        hunks: [],
+      };
       files.push(file);
       hunk = null;
       continue;
@@ -24,8 +31,10 @@ export function parsePatch(patch) {
       if (line.startsWith("new file mode")) file.status = "added";
       else if (line.startsWith("deleted file mode")) file.status = "deleted";
       else if (line.startsWith("Binary files ")) file.binary = true;
-      else if (line.startsWith("+++ ") && line !== "+++ /dev/null") file.path = sidePath(line.slice(4), "b/");
-      else if (line.startsWith("--- ") && file.status === "deleted") file.path = sidePath(line.slice(4), "a/");
+      else if (line.startsWith("+++ ") && line !== "+++ /dev/null")
+        file.path = sidePath(line.slice(4), "b/");
+      else if (line.startsWith("--- ") && file.status === "deleted")
+        file.path = sidePath(line.slice(4), "a/");
     }
     const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
     if (header) {
@@ -109,7 +118,11 @@ export function unquote(text) {
 // end on to the notes there. A note whose lines are not in any hunk is left out: the changes
 // view shows only the changed lines and their context.
 export function notesByLine(file, notes) {
-  const shown = new Set(file.hunks.flatMap((hunk) => hunk.lines.map((line) => line.new)).filter((line) => line !== null));
+  const shown = new Set(
+    file.hunks
+      .flatMap((hunk) => hunk.lines.map((line) => line.new))
+      .filter((line) => line !== null),
+  );
   const placed = new Map();
   for (const note of notes) {
     if (note.path !== file.path || !shown.has(note.lines.end)) continue;

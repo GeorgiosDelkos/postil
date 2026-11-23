@@ -6,6 +6,7 @@
 // costs nothing noticeable, and one drawing function is easier to keep right than updates by
 // hand. The control that had the focus gets it back by its `data-key`.
 
+import { el } from "./dom.js";
 import {
   addReviewer,
   agentRows,
@@ -20,13 +21,6 @@ import {
 // How long the dialog waits before asking again while the agent scan runs. Arbitrary: short
 // enough that the list appears as soon as the scan ends, long enough not to busy the process.
 const SCAN_POLL_MS = 250;
-
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 function button(text, key, onClick, className = "button") {
   const node = el("button", className, text);
@@ -85,8 +79,7 @@ export function settingsDialog(dialogEl, { apply }) {
       settings: ahead ? ui.view.settings : view.settings,
       agents: scanning ? (ui.view?.agents ?? null) : view.agents,
     };
-    const unchanged =
-      scanning === ui.scanning && JSON.stringify(next) === JSON.stringify(ui.view);
+    const unchanged = scanning === ui.scanning && JSON.stringify(next) === JSON.stringify(ui.view);
     ui.view = next;
     ui.scanning = scanning;
     if (!ahead) apply(view.settings);
@@ -168,7 +161,10 @@ export function settingsDialog(dialogEl, { apply }) {
     const header = el("header", "settings-header");
     const title = el("h2", "settings-title", "Settings");
     title.id = "settings-title";
-    header.append(title, button("×", "close", () => dialogEl.close(), "icon-button"));
+    header.append(
+      title,
+      button("×", "close", () => dialogEl.close(), "icon-button"),
+    );
     header.lastChild.setAttribute("aria-label", "Close");
 
     const body = el("div", "settings-body");
@@ -220,21 +216,6 @@ export function settingsDialog(dialogEl, { apply }) {
   // Controls are off while the file cannot be saved over: a change would only be refused.
   const locked = () => Boolean(ui.view.problem);
 
-  function section(title, ...children) {
-    const node = el("section", "settings-section");
-    node.append(el("h3", "settings-heading", title), ...children);
-    return node;
-  }
-
-  function row(label, hint, control) {
-    const node = el("div", "settings-row");
-    const text = el("div", "settings-label");
-    text.append(el("div", "", label));
-    if (hint) text.append(el("div", "settings-hint", hint));
-    node.append(text, control);
-    return node;
-  }
-
   // A row of mutually exclusive choices, as macOS draws a segmented control.
   function segmented(key, options, current, choose) {
     const node = el("div", "segmented");
@@ -263,7 +244,11 @@ export function settingsDialog(dialogEl, { apply }) {
     larger.disabled = locked() || size >= largest;
     stepper.append(smaller, el("span", "stepper-value", `${size} px`), larger);
 
-    const themes = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
+    const themes = [
+      ["system", "System"],
+      ["light", "Light"],
+      ["dark", "Dark"],
+    ];
     const tabs = ui.view.tabWidths.map((width) => [width, String(width)]);
     return section(
       "Appearance",
@@ -592,4 +577,19 @@ export function settingsDialog(dialogEl, { apply }) {
       await refresh().catch(fail);
     },
   };
+}
+
+function section(title, ...children) {
+  const node = el("section", "settings-section");
+  node.append(el("h3", "settings-heading", title), ...children);
+  return node;
+}
+
+function row(label, hint, control) {
+  const node = el("div", "settings-row");
+  const text = el("div", "settings-label");
+  text.append(el("div", "", label));
+  if (hint) text.append(el("div", "settings-hint", hint));
+  node.append(text, control);
+  return node;
 }

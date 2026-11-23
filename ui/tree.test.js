@@ -6,10 +6,22 @@ import { ancestors, buildTree, folderCounts, shouldReveal, visibleRows } from ".
 const show = (rows) => rows.map((row) => `${"  ".repeat(row.depth)}${row.name}`);
 
 test("a refresh of the open file leaves the tree alone; opening a file reveals it", () => {
-  assert.equal(shouldReveal("src/a.rs", "src/a.rs", { keepView: true }), false, "the same file read again");
-  assert.equal(shouldReveal("src/a.rs", "src/a.rs", { keepView: false }), true, "the open file clicked again");
+  assert.equal(
+    shouldReveal("src/a.rs", "src/a.rs", { keepView: true }),
+    false,
+    "the same file read again",
+  );
+  assert.equal(
+    shouldReveal("src/a.rs", "src/a.rs", { keepView: false }),
+    true,
+    "the open file clicked again",
+  );
   assert.equal(shouldReveal("src/a.rs", "src/b.rs", { keepView: false }), true, "another file");
-  assert.equal(shouldReveal(undefined, "src/a.rs", { keepView: true }), true, "a file that failed to read before");
+  assert.equal(
+    shouldReveal(undefined, "src/a.rs", { keepView: true }),
+    true,
+    "a file that failed to read before",
+  );
 });
 
 test("folders come before files, names ignore case and sort digits by value", () => {

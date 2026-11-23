@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { runPanel } from "./run-panel.js";
-
-// The panel draws only after a fetch succeeds, and these all fail: its elements are never
-// drawn into, only given the dialog's listeners.
-const element = { addEventListener() {} };
+import { runStore } from "./run-store.js";
 
 // Lets the failed fetches settle; setImmediate is not one of the mocked timers.
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -18,17 +14,17 @@ test("failed fetches keep one retry waiting, not one per failure", async (t) => 
     throw new Error("offline");
   });
   const errors = [];
-  const panel = runPanel({
-    panelEl: element,
-    headerEl: element,
-    statusEl: element,
-    detailEl: element,
+  // The store draws only after a fetch succeeds, and these all fail.
+  const store = runStore({
+    render: () => assert.fail("nothing to draw"),
+    onChange: () => assert.fail("no run changed"),
+    onLoaded: () => assert.fail("no run was read"),
     onError: (text) => errors.push(text),
   });
 
   // The first failure waits 1 s to retry; a second, before then, waits 2 s and replaces it.
-  await panel.sync();
-  await panel.sync();
+  await store.sync();
+  await store.sync();
   assert.equal(fetches, 2);
   t.mock.timers.tick(1000);
   await settle();

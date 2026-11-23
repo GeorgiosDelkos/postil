@@ -94,6 +94,21 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/run-panel.js"),
     ),
     (
+        "/run-store.js",
+        "text/javascript",
+        include_bytes!("../ui/run-store.js"),
+    ),
+    (
+        "/run-tab.js",
+        "text/javascript",
+        include_bytes!("../ui/run-tab.js"),
+    ),
+    (
+        "/run-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/run-dialog.js"),
+    ),
+    (
         "/panes.js",
         "text/javascript",
         include_bytes!("../ui/panes.js"),
@@ -112,6 +127,52 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/question.js",
         "text/javascript",
         include_bytes!("../ui/question.js"),
+    ),
+    (
+        "/question-form.js",
+        "text/javascript",
+        include_bytes!("../ui/question-form.js"),
+    ),
+    ("/dom.js", "text/javascript", include_bytes!("../ui/dom.js")),
+    (
+        "/dialog-parts.js",
+        "text/javascript",
+        include_bytes!("../ui/dialog-parts.js"),
+    ),
+    (
+        "/bench.js",
+        "text/javascript",
+        include_bytes!("../ui/bench.js"),
+    ),
+    (
+        "/code-view.js",
+        "text/javascript",
+        include_bytes!("../ui/code-view.js"),
+    ),
+    (
+        "/context-menu.js",
+        "text/javascript",
+        include_bytes!("../ui/context-menu.js"),
+    ),
+    (
+        "/dividers.js",
+        "text/javascript",
+        include_bytes!("../ui/dividers.js"),
+    ),
+    (
+        "/file-list.js",
+        "text/javascript",
+        include_bytes!("../ui/file-list.js"),
+    ),
+    (
+        "/notes-tray.js",
+        "text/javascript",
+        include_bytes!("../ui/notes-tray.js"),
+    ),
+    (
+        "/welcome.js",
+        "text/javascript",
+        include_bytes!("../ui/welcome.js"),
     ),
     (
         "/icons.svg",
@@ -143,7 +204,7 @@ const LIGHT_CANVAS: (u8, u8, u8, u8) = (0xf4, 0xf4, 0xf1, 0xff);
 pub struct BenchReport {
     /// From the start of [`bench()`] to the page reporting that the file is painted.
     pub launch_to_paint: Duration,
-    /// The page's own measurements, as the JSON object `ui/app.js` builds in `runBench`.
+    /// The page's own measurements, as the JSON object `ui/bench.js` builds in `runBench`.
     pub page: String,
 }
 
@@ -199,7 +260,7 @@ enum AppEvent {
 }
 
 impl AppEvent {
-    /// Reads a message as `ui/app.js` posts it.
+    /// Reads a message as the page (`ui/`) posts it.
     fn parse(body: &str) -> Option<Self> {
         match body {
             "drag" => Some(Self::DragWindow),
@@ -1681,7 +1742,7 @@ mod tests {
 
     // The page's files, as the tests that check its links and colours read them.
     const INDEX_HTML: &str = include_str!("../ui/index.html");
-    const APP_JS: &str = include_str!("../ui/app.js");
+    const DOM_JS: &str = include_str!("../ui/dom.js");
     const APP_CSS: &str = include_str!("../ui/app.css");
 
     /// A real git working tree in the temporary directory, removed on drop.
@@ -2889,12 +2950,26 @@ mod tests {
         for link in ["app.css", "app.js"] {
             assert!(INDEX_HTML.contains(&format!("\"{link}\"")), "{link}");
         }
-        assert!(APP_JS.contains("\"./fuzzy.js\""), "app.js imports fuzzy.js");
-        assert!(APP_JS.contains("\"./tree.js\""), "app.js imports tree.js");
-        assert!(APP_JS.contains("\"./icons.js\""), "app.js imports icons.js");
+        // Every module any page module imports is in PAGE.
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        for entry in fs::read_dir(&ui).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|extension| extension != "js") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            for import in source.split("from \"./").skip(1) {
+                let name = format!("/{}", import.split('"').next().unwrap());
+                assert!(
+                    PAGE.iter().any(|(served, ..)| *served == name),
+                    "{} imports {name}",
+                    path.display()
+                );
+            }
+        }
         assert!(
-            APP_JS.contains("\"icons.svg\""),
-            "app.js loads the icon sprite"
+            DOM_JS.contains("\"icons.svg\""),
+            "dom.js loads the icon sprite"
         );
         for font in [
             "fonts/Geist-Variable.woff2",

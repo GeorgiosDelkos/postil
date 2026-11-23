@@ -2,8 +2,10 @@
 // a card's click (docs/design.md, "Notes and their status"). It is drawn from the note and its
 // run (status.js), and drawn again when either changes while it is open.
 
-import { questionContent, questionFields } from "./question.js";
-import { isLive, isResolved, openQuestion, foldRun, partLines, statusLine } from "./run.js";
+import { diffView, reviewSection } from "./dialog-parts.js";
+import { actOnSecondClick, el, statusIcon } from "./dom.js";
+import { keptQuestion } from "./question-form.js";
+import { foldRun, isLive, isResolved, openQuestion, statusLine } from "./run.js";
 import {
   agentSaid,
   fileDiffs,
@@ -15,113 +17,12 @@ import {
   runStatus,
 } from "./status.js";
 
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-// The status icon of a card or the dialog: its shape is CSS (`.status-icon.<kind>`).
-export function statusIcon(kind) {
-  const glyph = { needs: "!", addressed: "✓", resolved: "✓", silent: "–", failed: "×" }[kind] ?? "";
-  const icon = el("span", `status-icon ${kind}`, glyph);
-  icon.setAttribute("aria-hidden", "true");
-  return icon;
-}
-
-// The agent's open question as a form (board 9 on the design canvas): its message, a field
-// per form field, Skip and Send answer (Cmd-Enter). `answer(content)` sends the reply: the
-// form's values, or `null` to skip; it resolves to whether the reply was taken. Shared by
-// the note and run dialogs.
-export function questionForm(question, agent, answer) {
-  const fields = questionFields(question.fields);
-  const values = {};
-  const form = el("form", "question");
-  form.append(el("div", "question-label", `${agent} has a question`), el("div", "question-message", question.message));
-  fields.forEach((field, index) => form.append(fieldView(field, index, values)));
-  const actions = el("div", "question-actions");
-  const skip = el("button", "button", `Skip, let ${agent} decide`);
-  skip.type = "button";
-  const send = el("button", "button primary");
-  send.type = "submit";
-  send.append("Send answer", el("kbd", "", "⌘↵"));
-  actions.append(skip, el("span", "spacer"), send);
-  form.append(actions);
-  // Sent once: the buttons stay disabled while the reply is on its way, and the run's next
-  // draw replaces the form. A reply that was not taken (the post failed) can be sent again.
-  const reply = async (content) => {
-    skip.disabled = true;
-    send.disabled = true;
-    if (await answer(content)) return;
-    skip.disabled = false;
-    send.disabled = false;
-  };
-  skip.addEventListener("click", () => reply(null));
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    reply(questionContent(fields, values));
-  });
-  form.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && event.metaKey) {
-      event.preventDefault();
-      event.stopPropagation();
-      form.requestSubmit();
-    }
-  });
-  return form;
-}
-
-// One field of a question's form; what the engineer enters goes into `values` by key.
-function fieldView(field, index, values) {
-  const part = el("fieldset", `question-field ${field.kind}`);
-  part.append(el("legend", "question-title", field.title));
-  if (field.description) part.append(el("div", "question-description", field.description));
-  const name = `question-${index}`;
-  if (field.kind === "one" || field.kind === "many" || field.kind === "yesno") {
-    const options =
-      field.kind === "yesno"
-        ? [{ value: true, title: "Yes", description: "" }, { value: false, title: "No", description: "" }]
-        : field.options;
-    const chosen = new Set();
-    for (const option of options) {
-      const choice = el("label", "question-choice");
-      const input = el("input");
-      input.type = field.kind === "many" ? "checkbox" : "radio";
-      input.name = name;
-      input.addEventListener("change", () => {
-        if (field.kind === "many") {
-          if (input.checked) chosen.add(option.value);
-          else chosen.delete(option.value);
-          values[field.key] = [...chosen];
-        } else values[field.key] = option.value;
-      });
-      const text = el("span", "question-choice-text");
-      text.append(el("span", "question-choice-title", option.title));
-      if (option.description) text.append(el("span", "question-choice-description", option.description));
-      choice.append(input, text);
-      part.append(choice);
-    }
-    return part;
-  }
-  const input = field.kind === "text" ? el("textarea") : el("input");
-  if (field.kind === "text") input.rows = 2;
-  else input.type = "number";
-  input.className = "question-input";
-  input.setAttribute("aria-label", field.title);
-  input.addEventListener("input", () => {
-    values[field.key] = input.value;
-  });
-  part.append(input);
-  return part;
-}
-
 // `dialogEl` is the `<dialog>`. `find(id)` gives `{ note, run }` for a note id, or null once
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
 // ticked), `remove(note)`, `resolve(note)`, `reopen(note)`, `editNote(note, body)` (resolves
-// to whether the new text was saved), `showRun()`, and `answerQuestion(request, content)` for the run's
-// open question (`content` null to skip). `agent()` names the agent Send sends to, the
+// to whether the new text was saved), `showRun()`, and `answerQuestion(request, content)` for
+// the run's open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
 // (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
 // `live()` says whether a run is under way.
@@ -200,7 +101,9 @@ export function noteDialog(
     // The question's form is the same node across redraws, and so is the control that had
     // the focus in it, which gets it back; a button outside it is found by its class.
     const active = document.activeElement;
-    const typing = [asking?.form, editing?.form].some((form) => form?.contains(active)) ? active : null;
+    const typing = [asking?.form, editing?.form].some((form) => form?.contains(active))
+      ? active
+      : null;
     const focused = typing ? null : active?.className;
     const scroll = dialogEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
     dialogEl.replaceChildren(header(note, run), body(note, run), footer(note, run));
@@ -227,23 +130,20 @@ export function noteDialog(
     });
     const actions = el("span", "note-dialog-actions");
     actions.append(show, close);
-    head.append(statusIcon(status.kind), title, el("span", "note-dialog-where", where(note)), actions);
+    head.append(
+      statusIcon(status.kind),
+      title,
+      el("span", "note-dialog-where", where(note)),
+      actions,
+    );
     return head;
   }
 
   function body(note, run) {
     const main = el("div", "note-dialog-body");
     // The agent's question comes first: it is why a note needs the engineer (board 9).
-    const question = run && isLive(run) ? openQuestion(foldRun(run.entries).items) : null;
-    if (question) {
-      // Keyed by run too: each agent numbers its requests from 0.
-      const key = `${run.id}:${question.request}`;
-      if (asking?.key !== key) {
-        const form = questionForm(question, run.agent, (content) => answerQuestion(question.request, content));
-        asking = { key, form };
-      }
-      main.append(asking.form);
-    } else asking = null;
+    asking = keptQuestion(asking, run, answerQuestion);
+    if (asking) main.append(asking.form);
     main.append(noteSection(note));
 
     const lost = note.anchor === "lost";
@@ -257,7 +157,9 @@ export function noteDialog(
       if (diffs.length) {
         const stats = fileStats(note, run);
         const changed = section(`What changed in ${note.path}`, diffsView(diffs));
-        changed.firstChild.append(el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`));
+        changed.firstChild.append(
+          el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`),
+        );
         main.append(changed);
       }
       main.append(section(`History · ${run.id} · ${run.agent}`, history(note, run)));
@@ -368,62 +270,56 @@ export function noteDialog(
     return text;
   }
 
-  function history(note, run) {
-    const list = el("ol", "note-dialog-history");
-    const others = run.notes.filter((id) => id !== note.id);
-    const sentWith = others.length ? ` with ${others.join(", ")}` : " alone";
-    list.append(el("li", "", `Sent to ${run.agent}${sentWith}`));
-    for (const step of noteHistory(note, run)) {
-      const item = el("li", step.kind === "tool" ? "tool" : "step");
-      if (step.kind === "tool") {
-        item.append(el("span", "verb", step.verb), el("span", "target", step.target));
-        if (step.state) item.append(el("span", "state", step.state));
-      } else {
-        item.append(el("span", "verb", step.status === "completed" ? "done" : "plan"), el("span", "target", step.text));
-      }
-      list.append(item);
-    }
-    if (!isLive(run)) list.append(el("li", "end", `Run ended: ${statusLine(run).text}`));
-    return list;
-  }
-
   // The review of the note's run: the Review button, and every finding about this note with
   // its verdict, in full (docs/design.md, "Reviews").
   function reviewPart(note, run) {
     const review = reviewOf(run.id);
     const names = reviewers();
     const mine = review ? review.findings.filter((finding) => finding.note === note.id) : [];
-    const part = el("section", "note-dialog-section");
-    const label = el("div", "note-dialog-label");
-    label.append(el("span", "", review ? `Review of ${run.id} · ${mine.length} about ${note.id}` : `Review of ${run.id}`));
-    const button = el("button", "button", review ? "Review again" : "Review");
-    button.type = "button";
-    button.disabled = live() || names.length === 0;
-    button.title = names.length ? `Reviewers in order: ${names.join(", ")}` : "Add reviewers in Settings first";
-    button.addEventListener("click", () => {
-      // Once: a second click would only be refused, as a run is then under way.
-      button.disabled = true;
-      startReview(run.id);
+    const title = review
+      ? `Review of ${run.id} · ${mine.length} about ${note.id}`
+      : `Review of ${run.id}`;
+    const part = reviewSection(title, {
+      reviewed: Boolean(review),
+      names,
+      busy: live(),
+      start: () => startReview(run.id),
+      hintClass: "note-dialog-said muted",
     });
-    label.append(button);
-    part.append(label);
-    if (!review) {
-      const hint = names.length ? `Not reviewed yet. Reviewers: ${names.join(", ")}.` : "Not reviewed yet. Add reviewers in Settings.";
-      part.append(el("div", "note-dialog-said muted", hint));
-      return part;
-    }
+    if (!review) return part;
     if (mine.length === 0) {
-      part.append(el("div", "note-dialog-said muted", `No finding about ${note.id}; ${review.findings.length} about the run.`));
+      part.append(
+        el(
+          "div",
+          "note-dialog-said muted",
+          `No finding about ${note.id}; ${review.findings.length} about the run.`,
+        ),
+      );
       return part;
     }
     for (const finding of mine) {
       const item = el("div", "review-finding");
       const head = el("div", "review-finding-head");
-      head.append(el("span", "note-id", finding.id), el("span", `review-verdict ${finding.verdict.word.replace(" ", "-")}`, finding.verdict.word));
-      if (finding.path) head.append(el("span", "note-dialog-where", finding.line ? `${finding.path}:${finding.line}` : finding.path));
+      head.append(
+        el("span", "note-id", finding.id),
+        el(
+          "span",
+          `review-verdict ${finding.verdict.word.replace(" ", "-")}`,
+          finding.verdict.word,
+        ),
+      );
+      if (finding.path)
+        head.append(
+          el(
+            "span",
+            "note-dialog-where",
+            finding.line ? `${finding.path}:${finding.line}` : finding.path,
+          ),
+        );
       item.append(head, el("div", "note-dialog-said", finding.text));
       if (finding.fix) item.append(el("div", "note-dialog-said muted", `Proposed: ${finding.fix}`));
-      if (finding.verdict.text) item.append(el("div", "note-dialog-said", `Judged: ${finding.verdict.text}`));
+      if (finding.verdict.text)
+        item.append(el("div", "note-dialog-said", `Judged: ${finding.verdict.text}`));
       part.append(item);
     }
     return part;
@@ -440,7 +336,8 @@ export function noteDialog(
     button.disabled = !sendable;
     const again = run && !isLive(run) ? "Send again" : "Send";
     button.append(to ? `${again} to ${to}` : again, el("kbd", "", "⌘↵"));
-    button.title = "Sends this note alone to the default agent. Shift-click shows the prompt first.";
+    button.title =
+      "Sends this note alone to the default agent. Shift-click shows the prompt first.";
     button.addEventListener("click", (event) => {
       dialogEl.close();
       send(note, { review: event.shiftKey });
@@ -451,7 +348,13 @@ export function noteDialog(
       : isResolved(note)
         ? "Reopen it to send it again."
         : "Wait for the run under way, or stop it.";
-    foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), resolveButton(note), button);
+    foot.append(
+      remove,
+      el("span", "spacer"),
+      el("span", "note-dialog-why", why),
+      resolveButton(note),
+      button,
+    );
     return foot;
   }
 
@@ -469,18 +372,17 @@ export function noteDialog(
   function deleteButton(note) {
     const button = el("button", "button note-dialog-delete", "Delete note");
     button.type = "button";
-    button.addEventListener("click", () => {
-      if (button.dataset.confirming) {
+    actOnSecondClick(button, {
+      arm: () => {
+        button.textContent = "Click again to delete";
+      },
+      disarm: () => {
+        button.textContent = "Delete note";
+      },
+      act: () => {
         dialogEl.close();
         remove(note);
-        return;
-      }
-      button.dataset.confirming = "1";
-      button.textContent = "Click again to delete";
-    });
-    button.addEventListener("blur", () => {
-      delete button.dataset.confirming;
-      button.textContent = "Delete note";
+      },
     });
     return button;
   }
@@ -496,15 +398,10 @@ function section(label, content) {
   return part;
 }
 
-// Diffs as lines marked removed, added or unchanged (run.js `partLines`), one block each.
+// Diffs, one block each.
 function diffsView(diffs) {
   const view = el("div", "note-dialog-diffs");
-  const marks = { same: "  ", del: "- ", add: "+ " };
-  for (const diff of diffs) {
-    const block = el("pre", "tool-diff");
-    for (const line of partLines(diff)) block.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
-    view.append(block);
-  }
+  for (const diff of diffs) view.append(diffView(diff));
   return view;
 }
 
@@ -513,7 +410,10 @@ function snippetView(note) {
   const view = el("pre", "note-dialog-snippet");
   note.snippet.split("\n").forEach((text, index) => {
     const row = el("span", "row");
-    row.append(el("span", "number", String(note.lines.start + index)), el("span", "text", text || " "));
+    row.append(
+      el("span", "number", String(note.lines.start + index)),
+      el("span", "text", text || " "),
+    );
     view.append(row);
   });
   return view;
@@ -522,4 +422,26 @@ function snippetView(note) {
 function where(note) {
   const { start, end } = note.lines;
   return `${note.id} · ${note.path}:${start === end ? start : `${start}-${end}`}`;
+}
+
+function history(note, run) {
+  const list = el("ol", "note-dialog-history");
+  const others = run.notes.filter((id) => id !== note.id);
+  const sentWith = others.length ? ` with ${others.join(", ")}` : " alone";
+  list.append(el("li", "", `Sent to ${run.agent}${sentWith}`));
+  for (const step of noteHistory(note, run)) {
+    const item = el("li", step.kind === "tool" ? "tool" : "step");
+    if (step.kind === "tool") {
+      item.append(el("span", "verb", step.verb), el("span", "target", step.target));
+      if (step.state) item.append(el("span", "state", step.state));
+    } else {
+      item.append(
+        el("span", "verb", step.status === "completed" ? "done" : "plan"),
+        el("span", "target", step.text),
+      );
+    }
+    list.append(item);
+  }
+  if (!isLive(run)) list.append(el("li", "end", `Run ended: ${statusLine(run).text}`));
+  return list;
 }

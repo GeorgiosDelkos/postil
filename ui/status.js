@@ -3,7 +3,17 @@
 // view (`GET api/run`, src/run.rs `RunView`), kept apart from the document so `node --test`
 // runs them.
 
-import { diffStats, foldRun, isLive, isOpen, isResolved, openQuestion, sentIn, statusLine, toolRow } from "./run.js";
+import {
+  diffStats,
+  foldRun,
+  isLive,
+  isOpen,
+  isResolved,
+  openQuestion,
+  sentIn,
+  statusLine,
+  toolRow,
+} from "./run.js";
 
 // The run a note's status comes from, or null: the run it was marked sent in, else the live
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
@@ -105,7 +115,8 @@ export function noteHistory(note, run) {
   }
   const named = new RegExp(String.raw`\b${note.id}\b`);
   for (const step of plan ?? []) {
-    if (named.test(step.content)) steps.push({ kind: "step", text: step.content, status: step.status });
+    if (named.test(step.content))
+      steps.push({ kind: "step", text: step.content, status: step.status });
   }
   return steps;
 }
@@ -126,7 +137,9 @@ export function fileStats(note, run) {
 export function fileDiffs(note, run) {
   return foldRun(run.entries)
     .items.filter((item) => item.type === "tool" && item.status === "completed")
-    .flatMap((tool) => tool.output.filter((part) => part.type === "diff" && part.path === note.path));
+    .flatMap((tool) =>
+      tool.output.filter((part) => part.type === "diff" && part.path === note.path),
+    );
 }
 
 // The tray's groups, each in the tray's order: the notes of the live run, the open ones, the
@@ -157,7 +170,9 @@ export function threadOf(id, views) {
   const roots = rootsOf(views);
   const root = roots.get(id);
   if (root === undefined) return [];
-  return views.filter((view) => !view.review && roots.get(view.id) === root).sort((a, b) => runNumber(a) - runNumber(b));
+  return views
+    .filter((view) => !view.review && roots.get(view.id) === root)
+    .sort((a, b) => runNumber(a) - runNumber(b));
 }
 
 // Each thread's latest run among `views`, by the id of the run it started from. The Run tab
@@ -213,7 +228,9 @@ export function reviewOf(id, views) {
   const stopped = chain.some(
     (view) =>
       (!isLive(view) && view.status !== "ended") ||
-      view.entries.some((entry) => entry.kind === "findings" && /stops here/.test(entry.problem ?? "")) ||
+      view.entries.some(
+        (entry) => entry.kind === "findings" && /stops here/.test(entry.problem ?? ""),
+      ) ||
       view.entries.some((entry) => entry.kind === "ended" && entry.reason !== "end_turn"),
   );
   const judge = chain.find((view) => reviewers > 1 && view.review.reviewer === reviewers) ?? null;
@@ -236,10 +253,14 @@ export function reviewOf(id, views) {
   const findings = chain.flatMap((view) =>
     view.entries
       .filter((entry) => entry.kind === "findings")
-      .flatMap((entry) => entry.findings.map((finding) => ({ ...finding, from: view.id, verdict: verdict(finding) }))),
+      .flatMap((entry) =>
+        entry.findings.map((finding) => ({ ...finding, from: view.id, verdict: verdict(finding) })),
+      ),
   );
   const problems = chain.flatMap((view) =>
-    view.entries.filter((entry) => entry.kind === "findings" && entry.problem).map((entry) => `${view.id}: ${entry.problem}`),
+    view.entries
+      .filter((entry) => entry.kind === "findings" && entry.problem)
+      .map((entry) => `${view.id}: ${entry.problem}`),
   );
   return { stages: chain, reviewers, findings, problems };
 }
@@ -257,8 +278,22 @@ export function runFailure(run) {
 export function reviewKey(review) {
   if (!review) return null;
   return [
-    review.stages.map((stage) => [stage.id, stage.agent, stage.review.reviewer, stage.status, statusLine(stage)]),
-    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [id, note, text, fix, path, line, verdict.word]),
+    review.stages.map((stage) => [
+      stage.id,
+      stage.agent,
+      stage.review.reviewer,
+      stage.status,
+      statusLine(stage),
+    ]),
+    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [
+      id,
+      note,
+      text,
+      fix,
+      path,
+      line,
+      verdict.word,
+    ]),
     review.problems,
   ];
 }
@@ -341,6 +376,8 @@ export function noteDialogKey(note, run, review, shown) {
     fileStats(note, run),
     noteHistory(note, run),
     reviewKey(review),
-    review?.findings.filter((finding) => finding.note === note.id).map((finding) => finding.verdict.text) ?? null,
+    review?.findings
+      .filter((finding) => finding.note === note.id)
+      .map((finding) => finding.verdict.text) ?? null,
   ]);
 }

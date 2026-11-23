@@ -89,7 +89,15 @@ test("a tool call's changes apply to it in place, and only the fields they set",
   const { items } = foldRun([
     tool("t1"),
     { kind: "message", text: "between" },
-    { kind: "toolUpdate", id: "t1", title: null, tool: null, status: "completed", places: null, output: [diff] },
+    {
+      kind: "toolUpdate",
+      id: "t1",
+      title: null,
+      tool: null,
+      status: "completed",
+      places: null,
+      output: [diff],
+    },
   ]);
   assert.equal(items.length, 2, "the change is not a row of its own");
   assert.equal(items[0].status, "completed");
@@ -97,7 +105,7 @@ test("a tool call's changes apply to it in place, and only the fields they set",
   assert.deepEqual(items[0].output, [diff]);
 });
 
-test("a repeated tool call replaces the first, and a change to an unknown call shows under its id", () => {
+test("a repeated tool call replaces the first; a change to an unknown call shows by id", () => {
   const { items } = foldRun([
     tool("t1"),
     tool("t1", { title: "Edit again" }),
@@ -161,11 +169,14 @@ test("a permission request takes its tool's title and is open until answered", (
 
 test("keys answer with the options the agent offered, and only those", () => {
   const keys = permissionKeys(options);
-  assert.deepEqual([...keys], [
-    ["a", "once"],
-    ["A", "always"],
-    ["r", "no"],
-  ]);
+  assert.deepEqual(
+    [...keys],
+    [
+      ["a", "once"],
+      ["A", "always"],
+      ["r", "no"],
+    ],
+  );
   assert.equal(keyFor(keys, "always"), "⇧a");
   assert.equal(keyFor(keys, "other"), "");
 
@@ -173,10 +184,14 @@ test("keys answer with the options the agent offered, and only those", () => {
     { id: "ok", name: "Allow", kind: "allow_once" },
     { id: "never", name: "Never", kind: "reject_always" },
   ]);
-  assert.deepEqual([...without], [
-    ["a", "ok"],
-    ["r", "never"],
-  ], "no always key without an always option; reject falls back to reject always");
+  assert.deepEqual(
+    [...without],
+    [
+      ["a", "ok"],
+      ["r", "never"],
+    ],
+    "no always key without an always option; reject falls back to reject always",
+  );
 });
 
 test("a tool row names the file for file tools and the title for commands", () => {
@@ -190,8 +205,19 @@ test("a tool row names the file for file tools and the title for commands", () =
     state: "+2 -1",
     running: false,
   });
-  const command = { tool: "execute", title: "cargo test", places: [], output: [], status: "in_progress" };
-  assert.deepEqual(toolRow(command, true), { verb: "run", target: "cargo test", state: "", running: true });
+  const command = {
+    tool: "execute",
+    title: "cargo test",
+    places: [],
+    output: [],
+    status: "in_progress",
+  };
+  assert.deepEqual(toolRow(command, true), {
+    verb: "run",
+    target: "cargo test",
+    state: "",
+    running: true,
+  });
   assert.deepEqual(
     toolRow(command, false),
     { verb: "run", target: "cargo test", state: "unfinished", running: false },
@@ -257,8 +283,15 @@ test("Stop is built once per live run, not on every update or status change of i
   assert.equal(stopKey(null), null);
 });
 
-test("Escape closes the nearest thing on screen, and stops the run only when nothing is left", () => {
-  const none = { focusMode: false, composer: false, send: false, changes: false, selection: false, live: false };
+test("Escape closes the nearest thing on screen, and stops the run only when none is left", () => {
+  const none = {
+    focusMode: false,
+    composer: false,
+    send: false,
+    changes: false,
+    selection: false,
+    live: false,
+  };
   const cases = [
     [{ live: true, changes: true }, "close-changes", "the changes view before the run"],
     [{ live: true, changes: true, selection: true }, "close-changes", "it covers the selection"],
@@ -285,7 +318,8 @@ test("elapsed time reads as minutes, then hours", () => {
 
 test("prompt lines are told apart for coloring", () => {
   const lines = promptLines(
-    "Intro.\n\n[N1] src/a.rs:3\n(These lines are no longer in the file; they were:)\n> }\nFix it.\n[Nope] not a heading\n",
+    "Intro.\n\n[N1] src/a.rs:3\n(These lines are no longer in the file; they were:)\n" +
+      "> }\nFix it.\n[Nope] not a heading\n",
   );
   assert.deepEqual(
     lines.map((line) => line.kind),
@@ -295,7 +329,8 @@ test("prompt lines are told apart for coloring", () => {
 
 test("markdown blocks: paragraphs, lists, headings and fenced code", () => {
   const blocks = markdownBlocks(
-    "## Done\n\n- **N3**: `divide` returns *Option*.\n- N4 too\n\n1. first\n2. second\n\nText\nwraps.\n\n```rust\nlet x = a * b; // **not bold**\n```",
+    "## Done\n\n- **N3**: `divide` returns *Option*.\n- N4 too\n\n1. first\n2. second\n\n" +
+      "Text\nwraps.\n\n```rust\nlet x = a * b; // **not bold**\n```",
   );
   assert.deepEqual(
     blocks.map((block) => block.type),
@@ -334,7 +369,10 @@ test("inline marks: code first, and unclosed or in-word marks stay text", () => 
 });
 
 test("a line diff keeps unchanged lines as context and puts removals before additions", () => {
-  const lines = diffLines("a\n}\n/// Divides.\nfn divide() -> i32 {\n", "a\n}\n/// Divides, or None.\nfn divide() -> Option<i32> {\n\n");
+  const lines = diffLines(
+    "a\n}\n/// Divides.\nfn divide() -> i32 {\n",
+    "a\n}\n/// Divides, or None.\nfn divide() -> Option<i32> {\n\n",
+  );
   assert.deepEqual(
     lines.map((line) => `${line.kind}:${line.text}`),
     [
@@ -354,7 +392,7 @@ test("a line diff keeps unchanged lines as context and puts removals before addi
 // The length of the longest common subsequence, by the plain table: the model the line diff
 // is checked against.
 function lcs(a, b) {
-  let previous = new Array(b.length + 1).fill(0);
+  let previous = Array.from({ length: b.length + 1 }, () => 0);
   for (const line of a) {
     const current = [0];
     for (let j = 0; j < b.length; j += 1) {
@@ -385,13 +423,16 @@ test("the line diff rebuilds both texts with the fewest edits, on random texts",
   }
 });
 
-test("a one-line change in a large file is one line, and too many edits count as all changed", () => {
+test("a one-line change in a large file is one line; too many edits count as all changed", () => {
   const big = Array.from({ length: 2001 }, (_, index) => `line ${index}`);
   const changed = big.with(1000, "changed");
-  assert.deepEqual(diffStats([{ type: "diff", path: "a", oldText: big.join("\n"), newText: changed.join("\n") }]), {
-    added: 1,
-    removed: 1,
-  });
+  assert.deepEqual(
+    diffStats([{ type: "diff", path: "a", oldText: big.join("\n"), newText: changed.join("\n") }]),
+    {
+      added: 1,
+      removed: 1,
+    },
+  );
   const other = big.map((line) => `${line} x`);
   assert.ok(other.length > MAX_EDITS);
   assert.deepEqual(
