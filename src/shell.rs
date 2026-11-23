@@ -261,8 +261,8 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         }
     });
     let (site, settings) = start_site(dir, bench, notify)?;
-    // A failure before the event loop runs drops the site without closing it: no page has
-    // started a run yet, so there is no agent to stop.
+    // A failure before the event loop runs returns without waiting for the request thread to
+    // drop the site: no page has started a run yet, so there is no agent to stop.
     let jobs = spawn_site_worker(site, event_loop.create_proxy())?;
 
     let window = build_window(&event_loop, settings.theme)?;
@@ -698,11 +698,9 @@ fn build_window(event_loop: &EventLoop<AppEvent>, theme: settings::Theme) -> Res
 
 /// Everything the page can ask for.
 ///
-/// One thread owns it and answers the requests one at a time ([`spawn_site_worker`]). The open
-/// project still sits behind a mutex, which is never contended: requests take `&self`, and a
-/// `Mutex` keeps `Site` `Send` as the worker needs. The lock is held only to replace the
-/// project or clone it out, never across a `git` call or a file read, and the project is
-/// replaced whole, so the state is valid after any panic.
+/// One thread owns it and answers the requests one at a time ([`spawn_site_worker`]), so the
+/// open project needs no lock. It is a `RefCell` because requests take `&self`; no borrow of
+/// it is held across a call back into `Site`, so none panics.
 struct Site {
     /// The open project, if any.
     project: RefCell<Option<Project>>,
@@ -904,10 +902,10 @@ struct FileView<'a> {
 
 type Reply = Response<Cow<'static, [u8]>>;
 
-// The request thread owns the site and drops it once the webview is gone, and `serve` waits
-// for that. A runner whose agent is still starting is also held by its start thread, so
-// dropping the project alone would not stop that agent: the site stops it here, and quitting
-// leaves no agent behind.
+// The request thread drops the site on `Job::Close`, while the event loop still runs, and the
+// event loop exits only on `AppEvent::SiteClosed`. A runner whose agent is still starting is
+// also held by its start thread, so dropping the project alone would not stop that agent: the
+// site stops it here, and quitting leaves no agent behind.
 impl Drop for Site {
     fn drop(&mut self) {
         if let Some(project) = self.project.borrow_mut().take() {
@@ -987,8 +985,8 @@ impl Site {
             warning,
         });
         drop(project);
-        // Stops the agent of the project this one replaces, after the lock: that waits for
-        // its process.
+        // Stops the agent of the project this one replaces, after the borrow ends: that waits
+        // for its process.
         if let Some(old) = old {
             old.runner.close();
         }
@@ -2754,7 +2752,14 @@ mod tests {
         let limit = usize::try_from(crate::repo::MAX_READ).expect("20 MB fits a usize");
         repo.write("at.txt", &"x".repeat(limit));
         repo.write("over.txt", &"x".repeat(limit + 1));
+        // Valid text with a two-byte character just past the limit, so the bytes read (the
+        // limit plus one) end inside it: refused as large, not as "not text".
+        repo.write("wide.txt", &format!("{}é", "x".repeat(limit)));
         let site = repo.site();
+
+        let (status, body) = get(&site, "postil://localhost/api/file?path=wide.txt");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("too large to show"), "{body}");
 
         let (status, body) = get(&site, "postil://localhost/api/file?path=at.txt");
         assert_eq!(status, StatusCode::OK, "at the limit the file is shown");

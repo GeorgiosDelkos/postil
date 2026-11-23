@@ -351,19 +351,23 @@ impl Repo {
         }
 
         let path = self.root.join(file);
-        // One byte past the limit is read, so a file that grew past it since it was listed
-        // is still refused, and memory stays bounded whatever its size.
-        let mut text = String::new();
-        let read = File::open(&path)
-            .and_then(|opened| opened.take(MAX_READ + 1).read_to_string(&mut text));
+        // At most one byte past the limit is read, so a file is refused without reading more
+        // than that, whatever its size. Bytes, then text: the limit can cut a character in
+        // two, and a large file must be refused as large, not as "not text".
+        let mut bytes = Vec::new();
+        let read =
+            File::open(&path).and_then(|opened| opened.take(MAX_READ + 1).read_to_end(&mut bytes));
         match read {
-            Ok(bytes) if bytes as u64 > MAX_READ => {
-                // The size on disk says how far past the limit it is; the bytes read are a
+            Ok(read) if read as u64 > MAX_READ => {
+                // The size on disk says how far past the limit it is; one past the limit is a
                 // floor when the file cannot be measured.
                 let bytes = fs::metadata(&path).map_or(MAX_READ + 1, |metadata| metadata.len());
                 Err(Error::FileTooLarge { path, bytes })
             }
-            Ok(_) => Ok(text),
+            Ok(_) => String::from_utf8(bytes).map_err(|error| Error::Read {
+                path,
+                source: io::Error::new(io::ErrorKind::InvalidData, error),
+            }),
             Err(source) => Err(Error::Read { path, source }),
         }
     }

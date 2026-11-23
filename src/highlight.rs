@@ -238,9 +238,9 @@ impl Highlighter {
     pub(crate) fn lines<'a>(&self, path: &str, text: &'a str) -> Result<Vec<Vec<Token<'a>>>> {
         let mut lines = Lines::new(text);
 
-        let grammar = (text.len() <= MAX_HIGHLIGHTED)
-            .then(|| self.configuration(path))
-            .flatten();
+        let grammar = self
+            .configuration(path)
+            .filter(|_| text.len() <= MAX_HIGHLIGHTED);
         if let Some(configuration) = grammar {
             let mut highlighter = tree_sitter_highlight::Highlighter::new();
             let events = highlighter
