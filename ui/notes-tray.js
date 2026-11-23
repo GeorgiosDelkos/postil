@@ -1,0 +1,440 @@
+// The tray's notes: a card per note, grouped by where it is in the loop (status.js), and the
+// send step.
+//
+// Sending (docs/design.md, "The loop", step 5): Cmd-Shift-Enter or the Send button opens the
+// send step. The tray's notes get checkboxes, the open ones ticked (run.js, `sendable`),
+// and the code pane shows the prompt exactly as the agent will receive it. Cmd-Shift-Enter
+// again, or Send, sends; Escape closes the step. The run then shows in the tray's Run tab
+// (run-panel.js), which takes the front whenever the agent needs the engineer.
+
+import { $, el, showToast } from "./dom.js";
+import { statusIcon } from "./note-dialog.js";
+import { isLive, isOpen, isResolved, promptLines, sendable } from "./run.js";
+import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
+
+// `state` is the page's state: the tray reads `notes`, `settings` and `projectOpen`, and keeps
+// `send` and `tab`. `runs` is the run panel (run-panel.js) and `menu` the context menu
+// (context-menu.js). The callbacks:
+// - `openNote(id)` opens a note's dialog, and `drawNoteDetail()` draws it again if open;
+// - `deleteNote(note)` deletes a note;
+// - `openSettings()` opens the settings;
+// - `beforeSend()` clears the way for the send step, and returns false when it cannot open;
+// - `renderHeader(path)` gives the code pane's header back to the file at `path`.
+export function notesTray({
+  state,
+  notesEl,
+  runs,
+  menu,
+  openNote,
+  drawNoteDetail,
+  deleteNote,
+  openSettings,
+  beforeSend,
+  renderHeader,
+}) {
+  const previewEl = $("prompt-preview");
+  const sendBarEl = $("send-bar");
+
+  // The tray: in the send step, every note with its checkbox, in the prompt's order; otherwise
+  // the notes grouped by where they are in the loop (status.js), each card with its status.
+  // Drawn again only when what it shows changed: a run updates many times a second, and a
+  // redraw would drop a card's hover and a delete waiting for its second click.
+  let drawnNotes = null;
+  function renderNotes() {
+    const count = state.notes.length;
+    $("note-count").textContent = state.send
+      ? `${state.send.ticked.size} of ${count} selected`
+      : count === 1
+        ? "1 note"
+        : `${count} notes`;
+    renderSendBar();
+    drawNoteDetail();
+    if (count === 0) {
+      drawnNotes = null;
+      const empty = el("div", "empty", "Select lines, then press ");
+      empty.append(el("kbd", "", "c"), " to write a note.");
+      notesEl.replaceChildren(empty);
+      return;
+    }
+    if (state.send) {
+      drawnNotes = null;
+      // A resolved note is sent only once reopened (src/notes.rs, `resolve`).
+      notesEl.replaceChildren(...state.notes.filter((note) => !isResolved(note)).map(sendItem));
+      return;
+    }
+
+    const live = runs.run();
+    const cards = new Map(state.notes.map((note) => [note.id, cardOf(note)]));
+    const key = JSON.stringify([
+      ...cards.values(),
+      live?.id,
+      live?.status,
+      live && planProgress(live),
+    ]);
+    if (key === drawnNotes) return;
+    drawnNotes = key;
+
+    const groups = groupNotes(state.notes, (note) => cards.get(note.id).status);
+    const parts = [];
+    if (groups.inRun.length && isLive(live)) {
+      const progress = planProgress(live);
+      parts.push(
+        groupHeader(
+          `In ${live.id} · ${live.agent}`,
+          progress ? `${progress.done} of ${progress.total} steps` : "",
+        ),
+        ...groups.inRun.map((note) => noteItem(note, cards.get(note.id))),
+      );
+    }
+    if (groups.open.length) {
+      parts.push(
+        groupHeader(`Open · ${groups.open.length}`, ""),
+        ...groups.open.map((note) => noteItem(note, cards.get(note.id))),
+      );
+    }
+    if (groups.done.length) {
+      parts.push(
+        groupHeader(`Done · ${groups.done.length}`, "Newest first"),
+        ...groups.done.map((note) => noteItem(note, cards.get(note.id))),
+      );
+    }
+    if (groups.resolved.length) {
+      parts.push(
+        groupHeader(`Resolved · ${groups.resolved.length}`, ""),
+        ...groups.resolved.map((note) => noteItem(note, cards.get(note.id))),
+      );
+    }
+    notesEl.replaceChildren(...parts);
+  }
+
+  // The run a note's status comes from, or null (status.js, `runOf`).
+  function runFor(note) {
+    return runOf(note, { get: (id) => runs.byId(id) }, runs.run());
+  }
+
+  // Everything a note's card shows, as plain data: two cards with equal data look the same. A
+  // card is small, its status and the note in two lines at most, so the tray scans fast; what
+  // the agent said and did is in the note's detail. The owner set this for every view on
+  // 2026-11-23: compact cards, full information in the dialogs.
+  function cardOf(note) {
+    const run = runFor(note);
+    const status = noteStatus(note, run);
+    return {
+      id: note.id,
+      path: note.path,
+      lines: note.lines,
+      body: note.body,
+      outdated: note.anchor === "lost",
+      status,
+      sendable: canSendAlone() && !isResolved(note),
+    };
+  }
+
+  // Whether the arrow on a card sends its note now: no run under way. A note whose lines moved
+  // can be sent too: the prompt quotes the lines as they were (src/notes.rs, `prompt`), and an
+  // agent's edit is the usual reason they moved.
+  function canSendAlone() {
+    return !runs.live();
+  }
+
+  function groupHeader(left, right) {
+    const header = el("div", "note-group");
+    header.append(el("span", "", left), el("span", "", right));
+    return header;
+  }
+
+  // A note's card: its status, its place and id, and the note in two lines at most.
+  function noteCard(card, onClick) {
+    const { start, end } = card.lines;
+    const lines = start === end ? start : `${start}-${end}`;
+    const button = el("button", `note ${card.status.kind}${card.outdated ? " outdated" : ""}`);
+    button.type = "button";
+    const head = el("div", "note-where");
+    const label = el("span", `note-status ${card.status.tone}`);
+    const said = card.outdated ? `${card.status.label} · outdated` : card.status.label;
+    label.append(statusIcon(card.status.kind), said);
+    const place = el("span", "note-place", `${card.path.split("/").at(-1)}:${lines}`);
+    place.title = card.path;
+    head.append(label, place, el("span", "note-id", card.id));
+    button.append(head, el("div", "note-body", card.body));
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  function noteItem(note, card) {
+    const item = el("div", "note-item");
+    item.append(noteCard(card, () => openNote(note.id)));
+    if (card.sendable) item.append(sendButton(note));
+    item.append(deleteButton(item, note));
+    return item;
+  }
+
+  // The arrow on a card: sends the note alone to the default agent, or with Shift opens the
+  // send step with only it ticked (decided with the owner on 2026-11-23).
+  function sendButton(note) {
+    const button = el("button", "note-send", "↗");
+    button.type = "button";
+    button.setAttribute("aria-label", `Send note ${note.id} alone`);
+    const agent = state.settings?.agent ?? "the agent";
+    button.title = `Send ${note.id} to ${agent} now · Shift-click to see the prompt first`;
+    button.addEventListener("click", (event) => sendAlone(note, { review: event.shiftKey }));
+    return button;
+  }
+
+  // A card of the send step: the same card, with its checkbox, and a click that ticks it.
+  function sendItem(note) {
+    const item = el("div", "note-item");
+    const card = noteCard(cardOf(note), () => toggleTick(note.id));
+    item.append(tickBox(note), card, deleteButton(item, note));
+    return item;
+  }
+
+  // The checkbox that puts a note in the send, or takes it out.
+  function tickBox(note) {
+    const box = el("input", "note-tick");
+    box.type = "checkbox";
+    box.checked = state.send.ticked.has(note.id);
+    box.setAttribute("aria-label", `Send note ${note.id}`);
+    box.addEventListener("change", () => toggleTick(note.id));
+    return box;
+  }
+
+  function toggleTick(id) {
+    if (state.send.ticked.has(id)) state.send.ticked.delete(id);
+    else state.send.ticked.add(id);
+    renderNotes();
+    showPrompt();
+  }
+
+  // The ×  on a note card. A note is the engineer's writing, so deleting takes two clicks: the
+  // first turns the button into "Delete", the second deletes. Leaving the card undoes the first.
+  function deleteButton(item, note) {
+    const button = el("button", "note-delete", "×");
+    button.type = "button";
+    button.setAttribute("aria-label", `Delete note ${note.id}`);
+    const reset = () => {
+      item.classList.remove("confirming");
+      button.textContent = "×";
+    };
+    button.addEventListener("click", () => {
+      if (item.classList.contains("confirming")) {
+        deleteNote(note);
+        return;
+      }
+      item.classList.add("confirming");
+      button.textContent = "Delete";
+    });
+    item.addEventListener("mouseleave", reset);
+    button.addEventListener("blur", reset);
+    return button;
+  }
+
+  // ---- The send step ----------------------------------------------------------------------
+
+  // The agent of this send, or the settings' agent.
+  function chosenAgent() {
+    return state.send?.agent ?? state.settings?.agent ?? null;
+  }
+
+  // The notes ticked for the send, in the tray's order, which is the prompt's order.
+  function tickedIds() {
+    return state.notes.filter((note) => state.send.ticked.has(note.id)).map((note) => note.id);
+  }
+
+  function renderSendBar() {
+    renderFocusPill();
+    const open = state.notes.filter(isOpen).length;
+    const shown =
+      state.projectOpen &&
+      state.tab === "notes" &&
+      !runs.live() &&
+      (state.send !== null || open > 0);
+    sendBarEl.hidden = !shown;
+    if (!shown) return;
+
+    // In the send step the bar is one split button: the wide part sends and names the agent,
+    // the narrow part chooses it (chosen with the owner on 2026-11-23 over a separate picker).
+    const picker = $("agent-picker");
+    picker.hidden = !state.send;
+    sendBarEl.classList.toggle("split", Boolean(state.send));
+    const button = $("send-button");
+    const count = state.send ? tickedIds().length : open;
+    const noun = count === 1 ? "1 note" : `${count} notes`;
+    const agent = chosenAgent();
+    const words = !state.send
+      ? `Send ${noun}…`
+      : agent
+        ? `Send ${noun} to ${agent}`
+        : "Choose an agent";
+    button.replaceChildren(el("span", "send-words", words), el("kbd", "", "⌘⇧↵"));
+    button.disabled = Boolean(state.send) && agent !== null && (count === 0 || state.send.sending);
+  }
+
+  // Focus mode's pill (app.js, `toggleFocus`): the open notes' count and Send.
+  function renderFocusPill() {
+    const pill = $("focus-pill");
+    const open = state.notes.filter(isOpen).length;
+    pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
+    if (open > 0 && !runs.live()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
+    pill.disabled = open === 0 || runs.live();
+  }
+
+  // Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
+  function openSend(ids = sendable(state.notes)) {
+    if (!beforeSend()) return;
+    state.send = { ticked: new Set(ids), agent: null, sending: false };
+    showTab("notes");
+    renderNotes();
+    showPrompt();
+  }
+
+  function closeSend() {
+    if (!state.send) return;
+    state.send = null;
+    previewEl.hidden = true;
+    if (state.file) renderHeader(state.file.path);
+    else {
+      $("crumbs").replaceChildren();
+      $("file-meta").textContent = "";
+    }
+    renderNotes();
+  }
+
+  // Shows the prompt of the ticked notes in the code pane, as the Rust process builds it.
+  let promptRequest = 0;
+  async function showPrompt() {
+    if (!state.send) return;
+    const ids = tickedIds();
+    const request = ++promptRequest;
+    $("crumbs").replaceChildren(el("b", "", "What the agent receives"));
+    previewEl.hidden = false;
+    if (ids.length === 0) {
+      $("file-meta").textContent = "";
+      previewEl.replaceChildren(el("div", "empty", "Tick the notes to send."));
+      return;
+    }
+    const response = await fetch(`api/run/preview?notes=${ids.join(",")}`);
+    const reply = response.ok ? await response.json() : await response.text();
+    // A later tick, or the step closed, while this was in flight.
+    if (request !== promptRequest || !state.send) return;
+    if (!response.ok) {
+      previewEl.replaceChildren(el("div", "empty", reply));
+      return;
+    }
+
+    const ticked = state.notes.filter((note) => state.send.ticked.has(note.id));
+    const files = [...new Set(ticked.map((note) => note.path))];
+    const notes = ids.length === 1 ? "1 note" : `${ids.length} notes`;
+    const fileCount = files.length === 1 ? "1 file" : `${files.length} files`;
+    $("file-meta").textContent = `${notes} · ${fileCount}`;
+    const text = el("pre", "prompt-text");
+    for (const line of promptLines(reply.prompt)) {
+      text.append(el("span", `prompt-${line.kind}`, `${line.text}\n`));
+    }
+    const links = el("div", "prompt-links");
+    links.append(el("span", "prompt-links-label", "Linked files"));
+    for (const path of files) links.append(el("span", "prompt-link", path));
+    previewEl.replaceChildren(text, links);
+  }
+
+  async function sendNotes() {
+    const agent = chosenAgent();
+    if (!state.send || state.send.sending || tickedIds().length === 0 || !agent) return;
+    state.send.sending = true;
+    renderSendBar();
+    if (!(await startRun(tickedIds(), agent))) {
+      if (state.send) state.send.sending = false;
+      renderSendBar();
+      return;
+    }
+    closeSend();
+    showTab("run");
+  }
+
+  // Sends `note` alone to the default agent, and stays on the notes: its card shows the run.
+  // With `review`, or with no agent chosen yet, opens the send step with only it ticked.
+  async function sendAlone(note, { review }) {
+    const agent = state.settings?.agent;
+    if (review || !agent) {
+      openSend([note.id]);
+      return;
+    }
+    if (await startRun([note.id], agent)) showTab("notes");
+  }
+
+  // Starts a run of `ids` with `agent`. Returns whether it started; a refusal is shown.
+  async function startRun(ids, agent) {
+    const body = JSON.stringify({ notes: ids, agent });
+    const response = await fetch("api/run", { method: "POST", body });
+    if (!response.ok) {
+      showToast(await response.text());
+      return false;
+    }
+    await runs.sync();
+    return true;
+  }
+
+  $("send-button").addEventListener("click", () => {
+    if (!state.send) openSend();
+    else if (chosenAgent()) sendNotes();
+    else $("agent-picker").click();
+  });
+
+  // The agents turned on in the settings, to send this one run to; the settings' agent is the
+  // default.
+  $("agent-picker").addEventListener("click", (event) => {
+    const { left, top } = event.currentTarget.getBoundingClientRect();
+    const agents = state.settings?.enabledAgents ?? [];
+    const actions = agents.map((name) => ({
+      label: name,
+      detail: name === state.settings.agent ? "default" : "",
+      key: name === chosenAgent() ? "✓" : "",
+      run: () => {
+        if (!state.send) return;
+        state.send.agent = name;
+        renderSendBar();
+      },
+    }));
+    actions.push({
+      label: agents.length === 0 ? "Turn on an agent in Settings…" : "Agents in Settings…",
+      separated: agents.length > 0,
+      run: () => openSettings(),
+    });
+    menu.open(left, top, actions);
+  });
+
+  $("focus-pill").addEventListener("click", () => openSend());
+
+  // ---- The tabs ---------------------------------------------------------------------------
+
+  function showTab(tab) {
+    state.tab = tab;
+    const run = tab === "run";
+    if (run) closeSend();
+    $("tab-notes").setAttribute("aria-selected", String(!run));
+    $("tab-run").setAttribute("aria-selected", String(run));
+    notesEl.hidden = run;
+    $("run").hidden = !run;
+    $("note-count").hidden = run;
+    $("run-header").hidden = !run;
+    renderSendBar();
+  }
+
+  $("tab-notes").addEventListener("click", () => showTab("notes"));
+  $("tab-run").addEventListener("click", () => showTab("run"));
+  $("agent-status").addEventListener("click", () => showTab("run"));
+
+  return {
+    render: renderNotes,
+    renderSendBar,
+    runFor,
+    cardOf,
+    noteCard,
+    canSendAlone,
+    openSend,
+    closeSend,
+    sendNotes,
+    sendAlone,
+    showTab,
+  };
+}
