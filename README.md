@@ -11,8 +11,8 @@ what it changed, and send follow-ups or more notes on the changes, all in one wi
 
 A postil is a note written in the margin of a text.
 
-![Postil's changes view: the diff a run made to two files, with a note beside the changed lines
-it was written on, and the Run tab on the right.](docs/screenshot.png)
+![Postil's changes view: the diff a run made to two files, with the note it addressed under the
+changed lines, and the Run tab on the right.](docs/screenshot.png)
 
 Postil is a reader with a notes tray and an agent panel. It is not an editor, a terminal or a
 pull request tool: the agent edits, and you read and write notes.
