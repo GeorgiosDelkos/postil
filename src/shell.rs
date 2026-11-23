@@ -3366,7 +3366,7 @@ mod tests {
         assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
         let stopping = get_json(&site, RUN);
         assert_eq!(stopping["status"], "cancelling");
-        assert!(stopping["stoppingFor"].as_u64().is_some(), "{stopping}");
+        assert!(stopping["forceIn"].as_u64().unwrap() > 0, "{stopping}");
         assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
         assert_eq!(
             get_json(&site, RUN)["status"],
@@ -3375,14 +3375,15 @@ mod tests {
         );
 
         site.runner().unwrap().backdate_stop();
-        assert!(
-            get_json(&site, RUN)["stoppingFor"].as_u64().unwrap() >= 3000,
-            "the page is told the agent had its 3 s"
+        assert_eq!(
+            get_json(&site, RUN)["forceIn"],
+            0,
+            "the page is told the agent had its time"
         );
         assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
         let failed = get_json(&site, RUN);
         assert_eq!(
-            failed["stoppingFor"],
+            failed["forceIn"],
             serde_json::Value::Null,
             "only while stopping"
         );

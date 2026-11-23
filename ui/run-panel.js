@@ -18,9 +18,6 @@ import {
   toolRow,
 } from "./run.js";
 
-// How long after the first Stop a second one ends the agent: src/run.rs, FORCE_AFTER.
-const FORCE_AFTER_MS = 3000;
-
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -36,9 +33,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   let fetching = false;
   let again = false;
   let clock = null;
-  // When the agent was asked to stop, by this page's clock: from FORCE_AFTER_MS on, Stop ends
-  // the agent.
-  let stoppingSince = null;
+  // When Stop starts to end the agent, by this page's clock; null unless it is stopping.
+  let forceAt = null;
   // The drawn items by key, each with the signature it was drawn from: an item whose
   // signature is unchanged keeps its node, so an open diff stays open and a selection stays.
   let views = new Map();
@@ -94,7 +90,7 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     await sync();
   }
 
-  // Stop asks the agent to stop. Once it has been asked for FORCE_AFTER_MS, Stop ends it
+  // Stop asks the agent to stop. Once the Rust process would force it (forceAt), Stop ends it
   // (src/run.rs, "Stopping"); sooner, the Rust process takes it as the same request.
   function stop() {
     if (!isLive(run)) return Promise.resolve();
@@ -103,7 +99,7 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   }
 
   function forceable() {
-    return stoppingSince !== null && Date.now() - stoppingSince >= FORCE_AFTER_MS;
+    return forceAt !== null && Date.now() >= forceAt;
   }
 
   function answer(request, option) {
@@ -226,10 +222,10 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     const parts = [title];
     if (isLive(run)) {
       const stopping = run.status === "cancelling";
-      // The Rust process says how long ago the agent was asked, so a reloaded page offers
-      // Force stop as soon as the process would act on it.
-      if (!stopping) stoppingSince = null;
-      else stoppingSince ??= Date.now() - (run.stoppingFor ?? 0);
+      // The Rust process says how long until it would force the agent, so a reloaded page
+      // offers Force stop as soon as the process would act on it.
+      if (!stopping) forceAt = null;
+      else forceAt ??= Date.now() + (run.forceIn ?? 0);
       const button = el("button", "button stop");
       button.type = "button";
       const label = () => {
