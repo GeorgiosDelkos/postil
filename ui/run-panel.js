@@ -392,10 +392,15 @@ export function runPanel({
     return button;
   }
 
+  // The sidebar's agent status. It is a button (it shows the Run tab), so its children change
+  // only when what they say changes, not on every update of the run.
   function renderStatus() {
     statusEl.hidden = !run;
     if (!run) return;
     const { text, tone } = statusLine(run);
+    const shown = JSON.stringify([run.agent, text, tone]);
+    if (statusEl.dataset.shown === shown) return;
+    statusEl.dataset.shown = shown;
     const dot = el("span", `status-dot ${tone}`);
     dot.setAttribute("aria-hidden", "true");
     statusEl.replaceChildren(dot, el("span", "status-text", `${run.agent} · ${text}`));
@@ -522,7 +527,9 @@ export function runPanel({
       const index = steps.findIndex((step) => step.key === detail.key);
       if (index < 0) return;
       const { item } = steps[index];
-      stamp = [`${view.id}:${detail.key}`, item.status, item.output, item.text, item.answer, isLive(view)];
+      // An answer as JSON: a question's is a new object on every fold (run.js, `foldRun`).
+      const answer = JSON.stringify(item.answer);
+      stamp = [`${view.id}:${detail.key}`, item.status, item.output, item.text, answer, isLive(view)];
       draw = () => stepDetail(view, item, index, steps.length);
     }
     if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) {
