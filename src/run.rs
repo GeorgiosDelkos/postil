@@ -633,8 +633,9 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
             return;
         }
         // Answered before the request is logged, and logged with it at once: a page that
-        // read the request alone would show the run waiting for the engineer. Fails only when
-        // the agent is gone; the run then shows the request open until it ends.
+        // read the request alone would show the run waiting for the engineer. Fails when a
+        // Stop already answered the request (and logged that), or the agent is gone; the run
+        // then shows the request open until it ends.
         let answer = allow.and_then(|(request, option)| match &slot.agent {
             Held::Ready(_, agent) => {
                 agent
@@ -1060,8 +1061,13 @@ impl Run {
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
     /// the agent took the turn (an update, a permission request, or a stop other than a
     /// refusal) releases them. A turn that fails or is refused at once leaves them open.
-    /// `then`, the event's auto-answer, is recorded with it, at once.
-    fn record_event(&self, event: Event, then: Option<Entry>, root: &Path) -> Option<Vec<String>> {
+    /// `answer`, the event's auto-answer, is recorded with it, at once.
+    fn record_event(
+        &self,
+        event: Event,
+        answer: Option<Entry>,
+        root: &Path,
+    ) -> Option<Vec<String>> {
         let entry = match event {
             Event::Update(update) => entry_of(update, root)?,
             Event::Permission(request) => Entry::Permission {
@@ -1105,7 +1111,7 @@ impl Run {
                 }
         );
         let live = self.state().live();
-        self.record_all(std::iter::once(entry).chain(then));
+        self.record_all(std::iter::once(entry).chain(answer));
         if took_turn && live {
             self.state().unmarked.take()
         } else {

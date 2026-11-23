@@ -67,6 +67,9 @@ const question = (method = "elicitation/create") =>
     },
   });
 
+// A question the agent asked and left open when its turn ended ("leave-open").
+let leftOpen = null;
+
 // The client's capabilities, as `initialize` gave them.
 let capabilities = null;
 
@@ -184,6 +187,15 @@ async function prompt(id, params) {
         ],
       });
       say(`chose ${reply.result.outcome.optionId}`);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "leave-open": {
+      // The first turn ends with its question open; the second reports how it was answered.
+      if (prompts === 1) {
+        leftOpen = question();
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      say(`left open answered ${(await leftOpen).result.action}`);
       return send({ id, result: { stopReason: "end_turn" } });
     }
     case "reject-only": {

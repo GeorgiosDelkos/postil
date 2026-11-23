@@ -3334,6 +3334,24 @@ mod tests {
     }
 
     #[test]
+    fn a_question_left_open_at_the_turn_s_end_is_answered_cancel() {
+        let repo = TempRepo::new("run-leave-open");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "leave-open");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        // The same agent, kept: its second turn reports the reply to the first's question.
+        send(&site, &["N2"]);
+        let ended = wait_for(&site, &nudges, "ended");
+        assert!(
+            kinds(&ended).contains(&"message:left open answered cancel".to_owned()),
+            "{ended}"
+        );
+    }
+
+    #[test]
     fn a_permission_request_with_no_allow_option_waits_for_the_engineer() {
         let repo = TempRepo::new("run-reject-only");
         repo.write("a.txt", "a\n");

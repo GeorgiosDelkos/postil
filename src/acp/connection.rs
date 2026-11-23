@@ -60,8 +60,8 @@ pub(crate) enum Event {
     Permission(PermissionRequest),
     /// The agent asks the engineer a question; answer with [`Agent::answer_question`].
     Question(QuestionRequest),
-    /// The agent withdrew the open request `number` (`$/cancel_request`): it is closed
-    /// without an answer.
+    /// The agent withdrew the open request `number` (`$/cancel_request`): it is closed, and
+    /// answered as a cancel, which ACP asks for all the same.
     Withdrawn { number: usize },
     /// The turn started by [`Agent::prompt`] ended.
     TurnEnded(TurnEnd),
@@ -675,14 +675,15 @@ impl<F: FnMut(Event)> Reader<F> {
             // The caller timed out and left: nobody wants the reply.
             Some(Waiter::Call(sender)) => drop(sender.send(outcome)),
             Some(Waiter::Turn) => {
-                {
+                let open: Vec<Open> = {
                     let mut state = lock(&self.shared.state);
                     state.cancelling = false;
-                    // A request still open when its turn ended is closed, and answered as a
-                    // cancel, which ACP asks of a request its sender gave up on.
-                    for open in state.requests.iter_mut().filter_map(Option::take) {
-                        drop(self.outbox.send(cancelled(&open)));
-                    }
+                    state.requests.iter_mut().filter_map(Option::take).collect()
+                };
+                // A request still open when its turn ended is answered as a cancel, which
+                // ACP asks of a request its sender gave up on.
+                for open in &open {
+                    drop(self.outbox.send(cancelled(open)));
                 }
                 let end = match outcome {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
