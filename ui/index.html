@@ -47,7 +47,7 @@
   <div class="prompt-preview" id="prompt-preview" tabindex="0" hidden></div>
 </main>
 
-<aside class="pane tray" aria-label="Review">
+<aside class="pane tray" id="tray" aria-label="Review">
   <header class="pane-header" data-drag>
     <div class="tray-tabs" role="tablist" aria-label="Tray">
       <button type="button" role="tab" class="tray-tab" id="tab-notes" aria-selected="true" aria-controls="notes">Review</button>
@@ -65,6 +65,9 @@
     <button type="button" class="button primary send" id="send-button"></button>
   </footer>
 </aside>
+
+<div class="divider" id="divider-files" role="separator" aria-orientation="vertical" aria-label="File list width" aria-controls="files" tabindex="0" title="Drag to resize · double-click to reset"></div>
+<div class="divider" id="divider-tray" role="separator" aria-orientation="vertical" aria-label="Tray width" aria-controls="tray" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
 <section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>
   <div class="drag-strip" data-drag></div>

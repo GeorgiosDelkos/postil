@@ -32,6 +32,7 @@ use crate::dialog;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::highlight::{Highlighter, Token};
+use crate::layout::{self, Layout};
 #[cfg(target_os = "macos")]
 use crate::menu::Command;
 use crate::notes::{self, NewNote};
@@ -50,6 +51,7 @@ const SETTINGS_JS: &str = include_str!("../ui/settings.js");
 const SETTINGS_DIALOG_JS: &str = include_str!("../ui/settings-dialog.js");
 const RUN_JS: &str = include_str!("../ui/run.js");
 const RUN_PANEL_JS: &str = include_str!("../ui/run-panel.js");
+const PANES_JS: &str = include_str!("../ui/panes.js");
 const ICONS_SVG: &str = include_str!("../ui/icons.svg");
 const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
 const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
@@ -540,6 +542,9 @@ struct Site {
     /// Where the settings are kept (`settings.rs`); `None`, for the same reason as
     /// `recent_file`, turns them off: the defaults apply and saving fails.
     settings_file: Option<PathBuf>,
+    /// Where the pane widths are kept (`layout.rs`); `None`, for the same reason as
+    /// `recent_file`, keeps them in each window only, until it closes.
+    layout_file: Option<PathBuf>,
     /// Where agents' programs are looked for, found in the background.
     agents: Scanner,
     /// Tells the page a run changed (`run.rs`).
@@ -615,6 +620,23 @@ struct AgentView<'a> {
     found: Option<String>,
 }
 
+/// The reply to `GET /api/layout`.
+#[derive(Serialize)]
+struct LayoutView {
+    #[serde(flatten)]
+    layout: Layout,
+    /// The widths a double-click on a divider resets to.
+    defaults: Layout,
+    limits: LayoutLimits,
+}
+
+/// The smallest and largest width of each resizable pane, in CSS px.
+#[derive(Serialize)]
+struct LayoutLimits {
+    sidebar: [u32; 2],
+    tray: [u32; 2],
+}
+
 /// The body of `POST /api/run`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -686,6 +708,7 @@ impl Site {
             bench: bench.map(str::to_owned),
             recent_file: config.map(|dir| dir.join("recent.json")),
             settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
+            layout_file: config.map(|dir| dir.join("layout.json")),
             agents,
             notify,
         }
@@ -743,6 +766,7 @@ impl Site {
                 SETTINGS_DIALOG_JS.as_bytes(),
             ),
             "/run.js" => reply(StatusCode::OK, "text/javascript", RUN_JS.as_bytes()),
+            "/panes.js" => reply(StatusCode::OK, "text/javascript", PANES_JS.as_bytes()),
             "/run-panel.js" => reply(StatusCode::OK, "text/javascript", RUN_PANEL_JS.as_bytes()),
             "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
@@ -780,6 +804,15 @@ impl Site {
             "/api/run" | "/api/run/preview" | "/api/run/cancel" | "/api/run/permission" => {
                 self.respond_run(request)
             }
+            "/api/layout" => match *request.method() {
+                Method::GET => reply(StatusCode::OK, "application/json", self.layout()),
+                Method::PUT => json_or_error(self.save_layout(request.body())),
+                _ => reply(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "text/plain",
+                    &b"GET the pane widths or PUT new ones"[..],
+                ),
+            },
             "/api/settings/reset" if post => json_or_error(self.reset_settings()),
             "/api/agents/rescan" if post => {
                 self.agents.rescan();
@@ -923,6 +956,32 @@ impl Site {
             }
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
+    }
+
+    /// The reply to `GET /api/layout`: the pane widths and their limits.
+    fn layout(&self) -> Vec<u8> {
+        let layout = self
+            .layout_file
+            .as_deref()
+            .map_or_else(Layout::default, layout::load);
+        to_json(&LayoutView {
+            layout,
+            defaults: Layout::default(),
+            limits: LayoutLimits {
+                sidebar: [*layout::SIDEBAR.start(), *layout::SIDEBAR.end()],
+                tray: [*layout::TRAY.start(), *layout::TRAY.end()],
+            },
+        })
+    }
+
+    /// The reply to `PUT /api/layout`: saves the widths in the body and answers `{}`; the
+    /// page already holds what it sent.
+    fn save_layout(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let layout: Layout = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable layout: {error}")))?;
+        let file = self.layout_file.as_deref().ok_or(Error::NoHome)?;
+        layout::save(file, &layout)?;
+        Ok(b"{}".to_vec())
     }
 
     /// The open project's runner.
@@ -1126,6 +1185,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }
+                | Error::WriteLayout { .. }
                 | Error::ReadRun { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
             };
@@ -3541,5 +3601,66 @@ mod tests {
             StatusCode::NOT_FOUND,
             "no run, so no request: {body}"
         );
+    }
+
+    // Pane widths (layout.rs).
+
+    const LAYOUT: &str = "postil://localhost/api/layout";
+
+    #[test]
+    fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
+        let repo = TempRepo::new("layout");
+        let site = repo.empty_site();
+        let defaults = serde_json::json!({ "sidebar": 248, "tray": 320 });
+        let fresh = get_json(&site, LAYOUT);
+        assert_eq!(
+            fresh,
+            serde_json::json!({
+                "sidebar": 248, "tray": 320,
+                "defaults": defaults,
+                "limits": { "sidebar": [200, 480], "tray": [280, 720] },
+            })
+        );
+
+        let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Another window, or the next start, reads the same widths: they are the Mac's, not
+        // the project's.
+        let other = TempRepo::new("layout-other");
+        let again = Site::new(Some(&repo.config()), None, no_agents(), quiet());
+        again.open(Repo::open(&other.root).unwrap());
+        let kept = get_json(&again, LAYOUT);
+        assert_eq!(
+            (kept["sidebar"].clone(), kept["tray"].clone()),
+            (300.into(), 460.into())
+        );
+
+        for (body, words) in [
+            (r#"{"sidebar": 100, "tray": 320}"#, "outside 200 to 480"),
+            (r#"{"sidebar": 248}"#, "unreadable layout"),
+            (
+                r#"{"sidebar": 248, "tray": 320, "x": 1}"#,
+                "unreadable layout",
+            ),
+        ] {
+            let (status, reply) = put(&site, LAYOUT, body);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+            assert!(reply.contains(words), "{body}: {reply}");
+        }
+        assert_eq!(
+            get_json(&site, LAYOUT)["sidebar"],
+            300,
+            "a refused layout changes nothing"
+        );
+        assert_eq!(post(&site, LAYOUT, "{}").0, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn without_a_configuration_directory_widths_are_the_defaults_and_not_kept() {
+        let site = Site::new(None, None, no_agents(), quiet());
+        assert_eq!(get_json(&site, LAYOUT)["tray"], 320);
+        let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("HOME"), "{body}");
     }
 }

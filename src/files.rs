@@ -19,10 +19,10 @@ use crate::error::{Error, Result};
 /// that happened (a note saved twice).
 ///
 /// At most one call per `file` may run at a time in one process; callers serialise
-/// (`notes` holds `review.lock`; `recent` and `settings` run only on the main thread: from
-/// `serve` before the event loop starts, then in the URL scheme handler, which wry calls on
-/// that thread). Separate processes use separate temporary files. A crash
-/// between creating the temporary and the rename leaves it behind; readers ignore it.
+/// (`notes` holds `review.lock`; `recent`, `settings` and `layout` run only on the main
+/// thread: from `serve` before the event loop starts, then in the URL scheme handler, which wry
+/// calls on that thread). Separate processes use separate temporary files. A crash between
+/// creating the temporary and the rename leaves it behind; readers ignore it.
 pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let invalid = |problem| io::Error::new(io::ErrorKind::InvalidInput, problem);
     let dir = file
@@ -58,7 +58,8 @@ pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// The app's configuration directory: `$XDG_CONFIG_HOME/postil` when that variable holds an
-/// absolute path, else `~/.config/postil`, which holds `recent.json` and `settings.json`.
+/// absolute path, else `~/.config/postil`, which holds `recent.json`, `settings.json` and
+/// `layout.json`.
 ///
 /// # Errors
 ///

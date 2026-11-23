@@ -126,7 +126,9 @@ body {
 body {
   margin: 0;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) 320px;
+  /* The side panes' widths are set by ui/app.js from the kept layout (ui/panes.js); these
+     are the defaults, as in src/layout.rs. */
+  grid-template-columns: var(--sidebar-width, 248px) minmax(0, 1fr) var(--tray-width, 320px);
   gap: 8px;
   padding: 0 8px 0 0;
   overflow: hidden;
@@ -188,6 +190,9 @@ kbd {
 .repo-branch {
   font: 11.5px "Geist Mono", monospace;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .filter {
@@ -2112,4 +2117,56 @@ details.tool[open] .tool-line {
   .status-dot.busy {
     animation: none;
   }
+}
+
+/* The dividers between the panes: each sits in the 8 px gap beside its pane, shows a line
+   when hovered, focused or dragged, and is moved by dragging or the arrow keys. */
+
+.divider {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  z-index: 3;
+  width: 8px;
+  cursor: col-resize;
+  outline: none;
+}
+
+#divider-files {
+  left: var(--sidebar-width, 248px);
+}
+
+#divider-tray {
+  right: calc(var(--tray-width, 320px) + 8px);
+}
+
+.divider::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 3px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.divider:hover::after,
+.divider:focus-visible::after,
+body.resizing .divider.active::after {
+  opacity: 1;
+}
+
+body.welcome-mode > .divider {
+  display: none;
+}
+
+/* While a divider is dragged, the cursor stays a resize cursor over every pane and no text
+   is selected. */
+body.resizing,
+body.resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
