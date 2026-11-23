@@ -111,14 +111,27 @@ pub(crate) struct InitializeParams {
     pub(crate) client_capabilities: ClientCapabilities,
 }
 
-/// What the app can do for the agent: nothing. It has no unsaved buffers, so the agent's own
-/// file tools see the bytes the app shows, and it has no terminal (docs/design.md, "ACP
-/// integration").
+/// What the app can do for the agent: show a question as a form, and nothing else. It has no
+/// unsaved buffers, so the agent's own file tools see the bytes the app shows, and it has no
+/// terminal (docs/design.md, "ACP integration").
 #[derive(Debug, Serialize)]
 pub(crate) struct ClientCapabilities {
     pub(crate) fs: FsCapabilities,
     pub(crate) terminal: bool,
+    pub(crate) elicitation: ElicitationCapabilities,
 }
+
+/// Form questions only (`{"form": {}}`): a URL question would send the engineer to a page
+/// outside the app. Claude's adapter asks its questions (`AskUserQuestion`) this way only when
+/// the client says it can; otherwise as permission requests, which Postil answers itself.
+#[derive(Debug, Serialize)]
+pub(crate) struct ElicitationCapabilities {
+    pub(crate) form: Empty,
+}
+
+/// An empty JSON object, `{}`: how ACP says a capability is supported.
+#[derive(Debug, Serialize)]
+pub(crate) struct Empty {}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -365,6 +378,41 @@ pub(crate) enum PermissionKind {
     RejectAlways,
     #[serde(other)]
     Other,
+}
+
+/// A question for the engineer: `elicitation/create` in ACP's unstable schema at the pinned
+/// commit, `session/create_elicitation` in Claude's adapter, which follows a later SDK.
+/// `requested_schema` is a JSON Schema object whose properties are the form's fields; the
+/// page draws it. A URL question (`mode` "url") has none.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ElicitationParams {
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) requested_schema: Option<Value>,
+    #[serde(default)]
+    pub(crate) tool_call_id: Option<String>,
+}
+
+/// The app's answer to a question: the form's values, a skip, or the turn's cancel.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub(crate) enum ElicitationReply {
+    Accept {
+        content: serde_json::Map<String, Value>,
+    },
+    Decline,
+    Cancel,
+}
+
+/// `$/cancel_request` params: the agent withdraws a request it sent, such as a question no
+/// longer needed.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CancelRequestParams {
+    pub(crate) request_id: Value,
 }
 
 /// The app's answer to a permission request.

@@ -38,6 +38,6 @@ mod wire;
 
 pub(crate) use crate::acp::connection::{Agent, Event, Launch, Stopper, TurnEnd};
 pub(crate) use crate::acp::wire::{
-    ContentBlock, Location, PermissionKind, PlanEntryStatus, SessionUpdate, StopReason,
-    ToolCallContent, ToolCallStatus, ToolKind,
+    ContentBlock, ElicitationReply, Location, PermissionKind, PermissionOption, PlanEntryStatus,
+    SessionUpdate, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
 };

@@ -43,6 +43,33 @@ const permission = (toolCallId) =>
     ],
   });
 
+// A form question, as Claude's adapter asks one (AskUserQuestion): one single-select field
+// and its free-text companion. `method` is the name ACP's unstable schema gives at the pinned
+// commit, or the one Claude's adapter sends.
+const question = (method = "elicitation/create") =>
+  ask(method, {
+    mode: "form",
+    sessionId: "S1",
+    message: "Should divide(i32::MIN, -1) also return None?",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        question_0: {
+          type: "string",
+          title: "Overflow",
+          oneOf: [
+            { const: "Yes", title: "Return None", description: "Use checked_div." },
+            { const: "No", title: "Keep the panic" },
+          ],
+        },
+        question_0_custom: { type: "string", title: "Other" },
+      },
+    },
+  });
+
+// The client's capabilities, as `initialize` gave them.
+let capabilities = null;
+
 const initialize = (id) =>
   send({
     id,
@@ -113,13 +140,44 @@ async function prompt(id, params) {
       return send({ id, result: { stopReason: "end_turn" } });
     }
     case "cancel": {
-      const answer = permission("t1");
+      // A question waits for the engineer, so the run is waiting when the cancel comes.
+      const answer = question();
       await onCancel;
-      say(`permission ${(await answer).result.outcome.outcome}`);
-      // A request that crosses the cancel on the wire is answered too.
+      say(`question ${(await answer).result.action}`);
+      // Requests that cross the cancel on the wire are answered too.
       const late = await permission("t2");
       say(`late permission ${late.result.outcome.outcome}`);
+      const lateQuestion = await question();
+      say(`late question ${lateQuestion.result.action}`);
       return send({ id, result: { stopReason: "cancelled" } });
+    }
+    case "ask": {
+      // The first prompt asks by ACP's name and the second by Claude's adapter's.
+      if (prompts === 1) say(`form ${JSON.stringify(capabilities.elicitation)}`);
+      const method = prompts === 1 ? "elicitation/create" : "session/create_elicitation";
+      const reply = await question(method);
+      say(`answered ${JSON.stringify(reply.result)}`);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "ask-withdraw": {
+      const url = await ask("elicitation/create", { mode: "url", sessionId: "S1", message: "Sign in", url: "https://example.com", elicitationId: "e1" });
+      say(`url answered ${url.error?.code}`);
+      // Asked, then withdrawn before anyone answered: the agent no longer needs it.
+      const withdrawn = nextId;
+      question();
+      send({ method: "$/cancel_request", params: { requestId: withdrawn } });
+      say("withdrew it");
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "reject-only": {
+      // No option allows, so Postil cannot answer it alone: the engineer does.
+      const reply = await ask("session/request_permission", {
+        sessionId: "S1",
+        toolCall: { toolCallId: "t1", title: "Delete everything", kind: "delete" },
+        options: [{ optionId: "no", name: "Reject", kind: "reject_once" }],
+      });
+      say(`chose ${reply.result.outcome.optionId}`);
+      return send({ id, result: { stopReason: "end_turn" } });
     }
     case "stream": {
       // An edit, then one reply streamed in parts, slowly enough to act on the panel meanwhile.
@@ -171,6 +229,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
   switch (message.method) {
     case "initialize":
+      capabilities = message.params.clientCapabilities;
       if (scenario === "silent") return;
       if (scenario === "no-session-id") return initialize(message.id);
       if (scenario === "exit-on-start") {

@@ -660,6 +660,16 @@ struct AnswerPermission {
     option: String,
 }
 
+/// The body of `POST /api/run/question`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerQuestion {
+    /// The question's number, as the run's log gives it.
+    request: usize,
+    /// The form's values by field, or `null` to skip the question.
+    content: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
 /// The reply to `/api/run/preview`.
 #[derive(Serialize)]
 struct PreviewView {
@@ -815,7 +825,8 @@ impl Site {
                 ),
                 _ => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
             },
-            "/api/run" | "/api/run/preview" | "/api/run/cancel" | "/api/run/permission" => {
+            // `respond_run` answers "not found" for a path under it that it does not serve.
+            path if path == "/api/run" || path.starts_with("/api/run/") => {
                 self.respond_run(request)
             }
             "/api/layout" => match *request.method() {
@@ -967,7 +978,8 @@ impl Site {
                     .map(|()| b"{}".to_vec()),
             ),
             "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
-            "/api/run/cancel" | "/api/run/permission" => {
+            "/api/run/question" if post => json_or_error(self.answer_question(request.body())),
+            "/api/run/cancel" | "/api/run/permission" | "/api/run/question" => {
                 reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
             }
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
@@ -1040,6 +1052,14 @@ impl Site {
         let answer: AnswerPermission = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
         self.runner()?.answer(answer.request, &answer.option)?;
+        Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `POST /api/run/question`.
+    fn answer_question(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let answer: AnswerQuestion = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        self.runner()?.reply(answer.request, answer.content)?;
         Ok(b"{}".to_vec())
     }
 
@@ -2874,14 +2894,15 @@ mod tests {
         let (status, body) = send(&site, &["N2", "N1"]);
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        let waiting = wait_for(&site, &nudges, "waiting");
-        let prompt = waiting["prompt"].as_str().unwrap();
+        // Postil answers the permission request itself, so the run goes to its end.
+        let ended = wait_for(&site, &nudges, "ended");
+        let prompt = ended["prompt"].as_str().unwrap();
         assert!(
             prompt.find("[N2] b.txt:1") < prompt.find("[N1] src/a.rs:2"),
             "the notes in the order chosen: {prompt}"
         );
         assert_eq!(
-            kinds(&waiting)[..3],
+            kinds(&ended)[..3],
             [
                 "started".to_owned(),
                 format!(
@@ -2893,8 +2914,8 @@ mod tests {
             ],
             "the prompt as previewed, then one link per file"
         );
-        assert_eq!(waiting["notes"], serde_json::json!(["N2", "N1"]));
-        assert_eq!(waiting["agent"], "Fake");
+        assert_eq!(ended["notes"], serde_json::json!(["N2", "N1"]));
+        assert_eq!(ended["agent"], "Fake");
         assert_eq!(
             states(&site),
             [
@@ -2905,25 +2926,18 @@ mod tests {
             "only the notes sent are marked, with their run"
         );
 
-        let permission = first_of_kind(&waiting, "permission");
+        let permission = first_of_kind(&ended, "permission");
         assert_eq!(permission["toolCall"], "t1");
         assert_eq!(
-            first_of_kind(&waiting, "tool")["places"],
+            first_of_kind(&ended, "answer")["option"],
+            "once",
+            "allowed once, of the options allow once, allow always and reject"
+        );
+        assert_eq!(
+            first_of_kind(&ended, "tool")["places"],
             serde_json::json!([{ "path": "src/a.rs", "line": 3 }]),
             "a tool's files are relative to the repository"
         );
-        let wrong = serde_json::json!({ "request": permission["request"], "option": "sure" });
-        let (status, body) = post(&site, &format!("{RUN}/permission"), &wrong.to_string());
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "not an offered option: {body}"
-        );
-        let answer = serde_json::json!({ "request": permission["request"], "option": "once" });
-        let (status, body) = post(&site, &format!("{RUN}/permission"), &answer.to_string());
-        assert_eq!(status, StatusCode::OK, "{body}");
-
-        let ended = wait_for(&site, &nudges, "ended");
         let kinds = kinds(&ended);
         assert_eq!(
             kinds[3..],
@@ -3159,6 +3173,122 @@ mod tests {
     }
 
     #[test]
+    fn a_question_waits_for_the_engineer_and_reaches_the_agent_answered_or_skipped() {
+        let repo = TempRepo::new("run-ask");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "ask");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        let answer =
+            |body: serde_json::Value| post(&site, &format!("{RUN}/question"), &body.to_string());
+
+        send(&site, &["N1"]);
+        let waiting = wait_for(&site, &nudges, "waiting");
+        assert!(
+            kinds(&waiting).contains(&r#"message:form {"form":{}}"#.to_owned()),
+            "Postil says it shows form questions: {waiting}"
+        );
+        let question = first_of_kind(&waiting, "question");
+        assert_eq!(
+            question["message"],
+            "Should divide(i32::MIN, -1) also return None?"
+        );
+        assert_eq!(
+            question["fields"]["properties"]["question_0"]["oneOf"][0]["const"], "Yes",
+            "the form as the agent sent it"
+        );
+        let request = question["request"].clone();
+        let (status, body) = answer(serde_json::json!({ "request": 99, "content": {} }));
+        assert_eq!(status, StatusCode::NOT_FOUND, "no such question: {body}");
+        let (status, body) = post(
+            &site,
+            &format!("{RUN}/permission"),
+            &serde_json::json!({ "request": request, "option": "once" }).to_string(),
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a question is no permission request: {body}"
+        );
+
+        let content = serde_json::json!({ "question_0": "Yes", "question_0_custom": "and log it" });
+        let (status, body) = answer(serde_json::json!({ "request": request, "content": content }));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ended = wait_for(&site, &nudges, "ended");
+        let accepted = serde_json::json!({ "action": "accept", "content": content });
+        assert!(
+            kinds(&ended).contains(&format!("message:answered {accepted}")),
+            "{ended}"
+        );
+        assert_eq!(first_of_kind(&ended, "reply")["content"], content);
+
+        // The second asks by the name Claude's adapter uses; a skip is a decline.
+        send(&site, &["N2"]);
+        let waiting = wait_for(&site, &nudges, "waiting");
+        let request = first_of_kind(&waiting, "question")["request"].clone();
+        let (status, body) = answer(serde_json::json!({ "request": request, "content": null }));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ended = wait_for(&site, &nudges, "ended");
+        assert!(
+            kinds(&ended).contains(&r#"message:answered {"action":"decline"}"#.to_owned()),
+            "{ended}"
+        );
+        assert_eq!(
+            first_of_kind(&ended, "reply")["content"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_question_closes_and_a_url_question_is_refused() {
+        let repo = TempRepo::new("run-withdraw");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "ask-withdraw");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let ended = wait_for(&site, &nudges, "ended");
+        let kinds = kinds(&ended);
+        assert!(
+            kinds.contains(&"message:url answered -32602".to_owned()),
+            "a URL question cannot be shown as a form: {ended}"
+        );
+        let question = kinds.iter().position(|kind| kind == "question").unwrap();
+        assert_eq!(kinds[question + 1], "answer", "withdrawn: {ended}");
+        assert_eq!(
+            ended["entries"][question + 1]["option"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_permission_request_with_no_allow_option_waits_for_the_engineer() {
+        let repo = TempRepo::new("run-reject-only");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "reject-only");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let waiting = wait_for(&site, &nudges, "waiting");
+        let request = first_of_kind(&waiting, "permission")["request"].clone();
+        let choose = |option: &str| {
+            let body = serde_json::json!({ "request": request, "option": option });
+            post(&site, &format!("{RUN}/permission"), &body.to_string())
+        };
+        let (status, body) = choose("sure");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "not an offered option: {body}"
+        );
+        let (status, body) = choose("no");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ended = wait_for(&site, &nudges, "ended");
+        assert!(
+            kinds(&ended).contains(&"message:chose no".to_owned()),
+            "{ended}"
+        );
+    }
+
+    #[test]
     fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
         let repo = TempRepo::new("run-cancel");
         repo.write("a.txt", "a\n");
@@ -3184,20 +3314,26 @@ mod tests {
         assert_eq!(
             kinds(&ended)[3..],
             [
-                "permission",
+                "question",
                 "cancelRequested",
                 "answer",
-                "message:permission cancelled",
+                "message:question cancel",
                 "message:late permission cancelled",
+                "message:late question cancel",
                 "ended"
-            ]
+            ],
+            "the open question, and the ones that crossed the cancel, are answered cancel"
         );
         assert_eq!(ended["entries"][5]["option"], serde_json::Value::Null);
-        assert_eq!(ended["entries"][8]["reason"], "cancelled");
+        assert_eq!(ended["entries"][9]["reason"], "cancelled");
 
-        let late = serde_json::json!({ "request": 0, "option": "once" });
-        let (status, body) = post(&site, &format!("{RUN}/permission"), &late.to_string());
-        assert_eq!(status, StatusCode::NOT_FOUND, "a cancelled request: {body}");
+        let late = serde_json::json!({ "request": 0, "content": {} });
+        let (status, body) = post(&site, &format!("{RUN}/question"), &late.to_string());
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a cancelled question: {body}"
+        );
     }
 
     #[test]

@@ -54,10 +54,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::acp::{
-    Agent, ContentBlock, Event, Launch, Location, PermissionKind, PlanEntryStatus, SessionUpdate,
-    StopReason, Stopper, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
+    Agent, ContentBlock, ElicitationReply, Event, Launch, Location, PermissionKind,
+    PermissionOption, PlanEntryStatus, SessionUpdate, StopReason, Stopper, ToolCallContent,
+    ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::agents::Scanner;
 use crate::error::{Error, Result, error_chain};
@@ -290,6 +292,34 @@ impl Runner {
         drop(released);
         (self.notify)();
         result
+    }
+
+    /// Answers the run's question `request` (its number, as the log gives it) with the form's
+    /// values, or with `None` to skip it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchPermission`] when no agent is running, and as [`Agent::answer_question`].
+    pub(crate) fn reply(
+        &self,
+        request: usize,
+        content: Option<serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        let slot = self.slot();
+        let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
+            return Err(Error::NoSuchPermission);
+        };
+        let reply = match &content {
+            Some(content) => ElicitationReply::Accept {
+                content: content.clone(),
+            },
+            None => ElicitationReply::Decline,
+        };
+        agent.answer_question(request, &reply)?;
+        run.record(Entry::Reply { request, content });
+        drop(slot);
+        (self.notify)();
+        Ok(())
     }
 
     /// Answers the run's permission request `request` (its number, as the log gives it) with
@@ -591,6 +621,12 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
     };
+    // Postil answers permission requests itself (docs/design.md, "Runs", decided with the
+    // owner on 2026-11-23): only a question stops for the engineer.
+    let allow = match &event {
+        Event::Permission(request) => allow_option(&request.options).map(|id| (request.number, id)),
+        _ => None,
+    };
     let (run, released) = {
         let mut slot = runner.slot();
         if slot.let_go(generation) {
@@ -614,7 +650,21 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
+    if let Some((request, option)) = allow {
+        // Fails only when the request closed meanwhile (a cancel answered it) or the agent
+        // is gone; the run shows either.
+        drop(runner.answer(request, &option));
+    }
     (runner.notify)();
+}
+
+/// The option that allows a permission request: once, else always. `None` when the agent
+/// offers neither; the request then waits for the engineer, as before auto-allow.
+fn allow_option(options: &[PermissionOption]) -> Option<String> {
+    [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+        .into_iter()
+        .find_map(|kind| options.iter().find(|option| option.kind == kind))
+        .map(|option| option.option_id.clone())
 }
 
 /// One run and its log.
@@ -719,9 +769,24 @@ pub(crate) enum Entry {
         options: Vec<Choice>,
     },
     /// A permission request was answered; `option` is `None` when the run was cancelled.
+    /// `None` also closes a question that was not answered: the run was stopped, or the
+    /// agent withdrew it.
     Answer {
         request: usize,
         option: Option<String>,
+    },
+    /// The agent asks the engineer a question. `fields` is the form, a JSON Schema object
+    /// whose properties are its fields, as the agent sent it; the page draws it.
+    Question {
+        request: usize,
+        message: String,
+        fields: Value,
+        tool_call: Option<String>,
+    },
+    /// The engineer answered question `request`: the form's values, or `None` for a skip.
+    Reply {
+        request: usize,
+        content: Option<serde_json::Map<String, Value>>,
     },
     /// The agent sent something the app could not read; the run goes on.
     Unreadable { problem: String },
@@ -995,6 +1060,16 @@ impl Run {
                     })
                     .collect(),
             },
+            Event::Question(question) => Entry::Question {
+                request: question.number,
+                message: question.message,
+                fields: question.schema,
+                tool_call: question.tool_call,
+            },
+            Event::Withdrawn { number } => Entry::Answer {
+                request: number,
+                option: None,
+            },
             Event::TurnEnded(TurnEnd::Stopped(reason)) => Entry::Ended { reason },
             Event::TurnEnded(TurnEnd::Failed(error)) => Entry::Failed { error },
             Event::Unreadable(problem) => Entry::Unreadable { problem },
@@ -1081,10 +1156,10 @@ impl RunState {
         match entry {
             Entry::Started => self.started = true,
             Entry::CancelRequested => self.cancel_requested = true,
-            Entry::Permission { request, .. } => {
+            Entry::Permission { request, .. } | Entry::Question { request, .. } => {
                 self.requested.insert(*request);
             }
-            Entry::Answer { request, .. } => {
+            Entry::Answer { request, .. } | Entry::Reply { request, .. } => {
                 self.answered.insert(*request);
             }
             Entry::Ended { .. } | Entry::Failed { .. } => {
