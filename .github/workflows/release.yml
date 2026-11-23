@@ -172,15 +172,11 @@ jobs:
       # A keychain of this run's own holds the certificate and the notary profile, so nothing
       # lands in the runner's login keychain; the last step deletes it.
       #
-      # `security` takes the keychain's password (-p, -k) and the .p12's (-P) only as arguments,
-      # which any process of this user can read with `ps`, or from a dialog a runner cannot
-      # answer. So the commands that carry one are read by `security -i` from stdin, written by
-      # bash's builtin printf, and no argv holds a password. `security -i` reads a line as
-      # words, takes "..." as one word with \" and \\ escaped inside it, expands nothing, and
-      # exits with the status of the last command it read: checked on macOS 27, and the first
-      # release on the runner's macOS 15 shows whether that holds there. The .p12 password is
-      # still in this step's environment, which `ps -E` shows to processes of the same user; the
-      # sign job runs no build code that could look.
+      # The passwords reach `security` as arguments (-p, -k, -P). A process of this user could
+      # read them with `ps`, but it could read the .p12 password from this step's environment
+      # just as well (`ps -E`), and the keychain password is a fresh UUID for a keychain that is
+      # already unlocked. Keeping them off argv would protect nothing more: what protects them is
+      # that this job runs no build code, so no such process exists.
       - name: Import the certificate and the notary key into a keychain of this run
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -190,37 +186,23 @@ jobs:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           set -euo pipefail
-          # Runs one `security` command given as arguments, through stdin.
-          security_stdin() {
-            local line="" arg
-            for arg in "$@"; do
-              if [[ "${arg}" == *$'\n'* ]]; then
-                echo "::error::an argument to security holds a newline, which security -i cannot read"
-                return 1
-              fi
-              arg="${arg//\\/\\\\}"
-              arg="${arg//\"/\\\"}"
-              line+=" \"${arg}\""
-            done
-            printf '%s\n' "${line# }" | security -i
-          }
           keychain="${RUNNER_TEMP}/release.keychain-db"
           certificate="${RUNNER_TEMP}/certificate.p12"
           key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
           # Gone on every way out of this step, a failed import included.
           trap 'rm -f "${certificate}" "${key}"' EXIT
           keychain_password="$(uuidgen)"
-          security_stdin create-keychain -p "${keychain_password}" "${keychain}"
+          security create-keychain -p "${keychain_password}" "${keychain}"
           # Named at once, so the last step deletes the keychain even if this step fails.
           echo "POSTIL_NOTARY_KEYCHAIN=${keychain}" >> "${GITHUB_ENV}"
           # Locks after 90 minutes unused, the job's limit: never during notarization's wait.
           security set-keychain-settings -lut 5400 "${keychain}"
-          security_stdin unlock-keychain -p "${keychain_password}" "${keychain}"
+          security unlock-keychain -p "${keychain_password}" "${keychain}"
           umask 077
           printf '%s' "${APPLE_CERTIFICATE}" | base64 --decode > "${certificate}"
-          security_stdin import "${certificate}" -k "${keychain}" \
+          security import "${certificate}" -k "${keychain}" \
             -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
-          security_stdin set-key-partition-list -S apple-tool:,apple:,codesign: \
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "${keychain_password}" "${keychain}" > /dev/null
           # codesign finds the identity only in a keychain on the search list.
           existing="$(security list-keychains -d user | tr -d '"' | xargs)"
