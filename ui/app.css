@@ -1727,25 +1727,13 @@ button.repo-name:hover {
   color: var(--text-muted);
 }
 
-.run-title strong {
+.run-word {
   font-weight: 500;
   color: var(--text-strong);
 }
 
 .run-title .status-icon {
   margin-right: 6px;
-}
-
-.run-title .run-word.done {
-  color: var(--added);
-}
-
-.run-title .run-word.attention {
-  color: var(--attention);
-}
-
-.run-title .run-word.failed {
-  color: var(--removed);
 }
 
 .run-time {
@@ -1844,18 +1832,6 @@ button.repo-name:hover {
   flex: none;
   font: 11.5px var(--font-mono);
   color: var(--text-muted);
-}
-
-.run-note-status.done {
-  color: var(--added);
-}
-
-.run-note-status.attention {
-  color: var(--attention);
-}
-
-.run-note-status.failed {
-  color: var(--removed);
 }
 
 .run-detail-nav {
@@ -2149,29 +2125,19 @@ button.repo-name:hover {
   text-overflow: ellipsis;
 }
 
+/* The dot is filled with its text colour, so the shared tone classes colour it. */
 .status-dot {
   flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--text-muted);
+  background: currentColor;
+  color: var(--text-muted);
 }
 
-.status-dot.busy {
-  background: var(--accent);
+.status-dot.tone-busy {
+  color: var(--accent);
   animation: pulse 1.2s ease-in-out infinite;
-}
-
-.status-dot.attention {
-  background: var(--attention);
-}
-
-.status-dot.done {
-  background: var(--added);
-}
-
-.status-dot.failed {
-  background: var(--removed);
 }
 
 @keyframes pulse {
@@ -2181,7 +2147,7 @@ button.repo-name:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .status-dot.busy {
+  .status-dot.tone-busy {
     animation: none;
   }
 }
@@ -2260,18 +2226,6 @@ body.resizing * {
   white-space: nowrap;
   text-overflow: ellipsis;
   font-family: "Geist", system-ui, sans-serif;
-}
-
-.note-status.attention {
-  color: var(--attention);
-}
-
-.note-status.done {
-  color: var(--added);
-}
-
-.note-status.failed {
-  color: var(--removed);
 }
 
 .note-place {
@@ -2614,15 +2568,18 @@ body.resizing * {
   color: var(--text-soft);
 }
 
-.run-entry-status.done {
+/* A status's tone (`tone` in ui/status.js and ui/run.js), on the words and dots that show
+   it. These rules follow every rule that gives such an element its plain colour, so they win
+   at the same specificity. `busy` and `idle` keep the plain colour. */
+.tone-done {
   color: var(--added);
 }
 
-.run-entry-status.attention {
+.tone-attention {
   color: var(--attention);
 }
 
-.run-entry-status.failed {
+.tone-failed {
   color: var(--removed);
 }
 
