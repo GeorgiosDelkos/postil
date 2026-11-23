@@ -2820,6 +2820,11 @@ mod tests {
 
         let permission = first_of_kind(&waiting, "permission");
         assert_eq!(permission["toolCall"], "t1");
+        assert_eq!(
+            first_of_kind(&waiting, "tool")["places"],
+            serde_json::json!([{ "path": "src/a.rs", "line": 3 }]),
+            "a tool's files are relative to the repository"
+        );
         let wrong = serde_json::json!({ "request": permission["request"], "option": "sure" });
         let (status, body) = post(&site, &format!("{RUN}/permission"), &wrong.to_string());
         assert_eq!(
@@ -2871,12 +2876,16 @@ mod tests {
         assert_eq!(tail["entries"], serde_json::json!([last]));
         assert_eq!(tail["total"], total);
 
-        // The log on disk holds the same run, read back after a restart.
         drop(site);
+        assert_read_back(&repo, &ended);
+    }
+
+    /// The log on disk holds `run`, as a new site (a restart) reads it back.
+    fn assert_read_back(repo: &TempRepo, run: &serde_json::Value) {
         let read = get_json(&repo.site(), RUN);
         assert_eq!(read["status"], "ended");
-        assert_eq!(read["entries"], ended["entries"]);
-        assert_eq!(read["prompt"], ended["prompt"]);
+        assert_eq!(read["entries"], run["entries"]);
+        assert_eq!(read["prompt"], run["prompt"]);
         assert_eq!(read["problem"], serde_json::Value::Null);
     }
 
@@ -3145,6 +3154,13 @@ mod tests {
 
         fs::remove_file(runs.join("R2.jsonl")).unwrap();
         assert_eq!(get(&site, RUN).1, "null", "nothing readable is no run");
+
+        // A runs directory that cannot be listed is an error, not "no runs".
+        fs::remove_dir_all(&runs).unwrap();
+        fs::write(&runs, "not a directory").unwrap();
+        let (status, body) = get(&site, RUN);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("cannot read the run log"), "{body}");
     }
 
     #[test]
@@ -3282,17 +3298,19 @@ mod tests {
             last["error"],
             "the agent refused session/prompt: model overloaded (-32603)"
         );
-        assert_eq!(
-            states(&site),
-            [serde_json::json!({ "kind": "open" })],
-            "the agent never took the turn"
-        );
 
         // The failed turn let the agent go (its session may be broken): a fresh one refuses
         // its first prompt again, where the kept one would have answered.
         send(&site, &["N1"]);
         let again = wait_for(&site, &nudges, "failed");
         assert_eq!(again["id"], "R2");
+        // Checked last: the first run's notes would be marked on its reader thread after the
+        // run showed failed, and by now that thread is long done.
+        assert_eq!(
+            states(&site),
+            [serde_json::json!({ "kind": "open" })],
+            "the agent never took the turn"
+        );
     }
 
     #[test]
@@ -3502,6 +3520,14 @@ mod tests {
         );
         assert_eq!(
             get(&site, &format!("{RUN}/cancel")).0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            get(&site, &format!("{RUN}/permission")).0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            post(&site, &format!("{RUN}/preview?notes=N1"), "").0,
             StatusCode::METHOD_NOT_ALLOWED
         );
         let answer = r#"{"request": 0, "option": "once"}"#;

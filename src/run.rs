@@ -294,16 +294,13 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when that request is not open in this run; as
-    /// [`Agent::answer_permission`].
+    /// [`Error::NoSuchPermission`] when no agent is running, and as
+    /// [`Agent::answer_permission`], which keeps the table of open requests.
     pub(crate) fn answer(&self, request: usize, option: &str) -> Result<()> {
         let slot = self.slot();
         let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
             return Err(Error::NoSuchPermission);
         };
-        if !run.state().is_open(request) {
-            return Err(Error::NoSuchPermission);
-        }
         // The agent checks the option against what it offered; only an accepted answer is
         // logged, so a refused one can be made again.
         agent.answer_permission(request, option)?;
@@ -522,7 +519,8 @@ struct RunState {
     /// whether it is held is whether the run is live (`RunState::live`). A log read from disk
     /// has none.
     active: Option<File>,
-    // Kept as each entry is recorded, so a status needs no scan of the entries.
+    // Kept as each entry is recorded, so a status needs no scan of the entries. Requests and
+    // answers are sets: a cancel can log a request's answer before the request itself.
     started: bool,
     cancel_requested: bool,
     /// When this process asked the agent to stop, for [`FORCE_AFTER`]. Not logged.
@@ -988,13 +986,6 @@ impl RunState {
         }
     }
 
-    /// Whether the permission request `request` was logged and not answered. An answer can
-    /// be logged before its request (a cancel answers one whose event is on its way), so
-    /// the two are kept as sets.
-    fn is_open(&self, request: usize) -> bool {
-        self.requested.contains(&request) && !self.answered.contains(&request)
-    }
-
     fn status(&self) -> Status {
         if let Some(end) = self.end {
             return end;
@@ -1187,6 +1178,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_names_the_run_but_never_shows_its_prompt() {
+        let dir = std::env::temp_dir().join(format!("postil-run-debug-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "secret prompt").unwrap();
+        run.record(Entry::Thought {
+            text: "secret thought".to_owned(),
+        });
+        let debug = format!("{run:?}");
+        assert!(
+            debug.contains("R1") && debug.contains("entries: 1"),
+            "{debug}"
+        );
+        assert!(!debug.contains("secret"), "{debug}");
+        drop(run);
+        drop(fs::remove_dir_all(&dir));
+    }
 
     #[test]
     fn after_a_failed_write_the_log_is_not_written_again_and_the_run_says_so() {
