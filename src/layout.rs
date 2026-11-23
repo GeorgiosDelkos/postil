@@ -32,8 +32,9 @@ pub(crate) const SIDEBAR: RangeInclusive<u32> = 200..=480;
 pub(crate) const TRAY: RangeInclusive<u32> = 280..=720;
 
 /// The pane widths. The code pane takes what is left of the window.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Layout {
     /// The file list's width in CSS px.
     sidebar: u32,
@@ -74,8 +75,8 @@ impl Layout {
 #[serde(deny_unknown_fields)]
 struct LayoutFile {
     version: u32,
-    #[serde(flatten)]
-    layout: Layout,
+    sidebar: u32,
+    tray: u32,
 }
 
 /// The one field every version of the file has; other fields are ignored here on purpose.
@@ -101,8 +102,13 @@ fn stored(file: &Path) -> Stored {
         Ok(VersionOnly { version }) if version > VERSION => Stored::Newer,
         _ => serde_json::from_str::<LayoutFile>(&json)
             .ok()
-            .filter(|stored| stored.version == VERSION && stored.layout.check().is_ok())
-            .map_or(Stored::Nothing, |stored| Stored::Layout(stored.layout)),
+            .filter(|stored| stored.version == VERSION)
+            .map(|stored| Layout {
+                sidebar: stored.sidebar,
+                tray: stored.tray,
+            })
+            .filter(|layout| layout.check().is_ok())
+            .map_or(Stored::Nothing, Stored::Layout),
     }
 }
 
@@ -127,7 +133,8 @@ pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
     }
     let stored = LayoutFile {
         version: VERSION,
-        layout: Layout { ..*layout },
+        sidebar: layout.sidebar,
+        tray: layout.tray,
     };
     let mut json =
         serde_json::to_vec_pretty(&stored).expect("a version and two numbers always serialize");
