@@ -1176,6 +1176,7 @@ const noteDetail = noteDialog(noteDialogEl, {
   send: sendAlone,
   remove: deleteNote,
   showRun: () => showTab("run"),
+  answerQuestion: (request, content) => runs.answerQuestion(request, content),
 });
 
 // The agent of this send, or the settings' agent.

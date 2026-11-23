@@ -16,7 +16,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::acp::wire::{
-    self, CancelParams, ClientCapabilities, ContentBlock, FsCapabilities, Incoming,
+    self, CancelParams, CancelRequestParams, ClientCapabilities, ContentBlock,
+    ElicitationCapabilities, ElicitationParams, ElicitationReply, Empty, FsCapabilities, Incoming,
     InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, Notification, Outcome,
     PermissionOption, PermissionOutcome, PermissionParams, PermissionResult, PromptParams,
     PromptResult, Request, Response, RpcError, SessionUpdate, StopReason, ToolCallUpdate,
@@ -57,6 +58,11 @@ pub(crate) enum Event {
     Update(SessionUpdate),
     /// The agent asks to run a tool call; answer with [`Agent::answer_permission`].
     Permission(PermissionRequest),
+    /// The agent asks the engineer a question; answer with [`Agent::answer_question`].
+    Question(QuestionRequest),
+    /// The agent withdrew the open request `number` (`$/cancel_request`): it is closed, and
+    /// answered as a cancel, which ACP asks for all the same.
+    Withdrawn { number: usize },
     /// The turn started by [`Agent::prompt`] ended.
     TurnEnded(TurnEnd),
     /// A message that could not be read; the text says what was wrong. The agent goes on.
@@ -77,6 +83,18 @@ pub(crate) struct PermissionRequest {
     pub(crate) number: usize,
     pub(crate) tool_call: ToolCallUpdate,
     pub(crate) options: Vec<PermissionOption>,
+}
+
+/// A question: the agent's message and its form. The number counts with the permission
+/// requests (`acp`, "Permission requests").
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct QuestionRequest {
+    pub(crate) number: usize,
+    pub(crate) message: String,
+    /// A JSON Schema object whose properties are the form's fields, as the agent sent it.
+    pub(crate) schema: Value,
+    /// The tool call the question belongs to, when the agent says.
+    pub(crate) tool_call: Option<String>,
 }
 
 /// How a turn ended.
@@ -172,6 +190,7 @@ impl Starting {
                     write_text_file: false,
                 },
                 terminal: false,
+                elicitation: ElicitationCapabilities { form: Empty {} },
             },
         };
         let process = self.process;
@@ -240,17 +259,18 @@ impl Agent {
         self.process.send(&request(id, "session/prompt", &params))
     }
 
-    /// Asks the agent to stop the turn, and answers every open permission request
-    /// `cancelled`, as the protocol requires; so is every request that arrives until the turn
-    /// ends. The turn still ends with [`Event::TurnEnded`], normally
-    /// [`StopReason::Cancelled`]. Returns the numbers of the requests it answered, which may
-    /// include one whose [`Event::Permission`] is still on its way.
+    /// Asks the agent to stop the turn, and answers every open request `cancelled` (a
+    /// permission request) or `cancel` (a question), as the protocol requires; so is every
+    /// request that arrives until the turn ends. The turn still ends with
+    /// [`Event::TurnEnded`], normally [`StopReason::Cancelled`]. Returns the numbers of the
+    /// requests it answered, which may include one whose event ([`Event::Permission`] or
+    /// [`Event::Question`]) is still on its way.
     ///
     /// # Errors
     ///
     /// [`Error::AgentExited`] when the process is gone.
     pub(crate) fn cancel(&self) -> Result<Vec<usize>> {
-        let open: Vec<(usize, Value)> = {
+        let open: Vec<(usize, Open)> = {
             let mut state = self.process.state();
             // Only while a turn runs: a cancel that comes just after the turn ended must not
             // make the next turn answer its requests `cancelled`.
@@ -259,10 +279,10 @@ impl Agent {
                 .values()
                 .any(|waiter| matches!(waiter, Waiter::Turn));
             state
-                .permissions
+                .requests
                 .iter_mut()
                 .enumerate()
-                .filter_map(|(number, request)| request.take().map(|(id, _)| (number, id)))
+                .filter_map(|(number, request)| request.take().map(|open| (number, open)))
                 .collect()
         };
         let params = CancelParams {
@@ -270,11 +290,8 @@ impl Agent {
         };
         self.process
             .send(&notification("session/cancel", &params))?;
-        for (_, id) in &open {
-            let result = PermissionResult {
-                outcome: PermissionOutcome::Cancelled,
-            };
-            self.process.send(&response(id, Outcome::Result(result)))?;
+        for (_, open) in &open {
+            self.process.send(&cancelled(open))?;
         }
         Ok(open.into_iter().map(|(number, _)| number).collect())
     }
@@ -284,28 +301,84 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when no such request is open (it was answered, or
+    /// [`Error::NoSuchRequest`] when no such request is open (it was answered, or
     /// cancelled); [`Error::BadRequest`] when the agent did not offer `option_id`, and the
     /// request stays open; [`Error::AgentExited`] when the process is gone.
     pub(crate) fn answer_permission(&self, number: usize, option_id: &str) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state
-                .permissions
-                .get_mut(number)
-                .ok_or(Error::NoSuchPermission)?;
-            let (_, offered) = request.as_ref().ok_or(Error::NoSuchPermission)?;
+            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
+            let Some(Open {
+                kind: Kind::Permission { offered },
+                ..
+            }) = request.as_ref()
+            else {
+                return Err(Error::NoSuchRequest);
+            };
             if !offered.iter().any(|offered| offered == option_id) {
                 return Err(Error::BadRequest(format!(
                     "the agent did not offer the answer {option_id:?}"
                 )));
             }
-            request.take().expect("checked to be open above").0
+            request.take().expect("checked to be open above").id
         };
         let result = PermissionResult {
             outcome: PermissionOutcome::Selected { option_id },
         };
         self.process.send(&response(&id, Outcome::Result(result)))
+    }
+
+    /// Answers the question numbered `number` with `reply`: the form's values, or a skip.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchRequest`] when no such question is open (it was answered, withdrawn,
+    /// or cancelled); [`Error::AgentExited`] when the process is gone.
+    pub(crate) fn answer_question(&self, number: usize, reply: &ElicitationReply) -> Result<()> {
+        let id = {
+            let mut state = self.process.state();
+            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
+            if !matches!(
+                request,
+                Some(Open {
+                    kind: Kind::Question,
+                    ..
+                })
+            ) {
+                return Err(Error::NoSuchRequest);
+            }
+            request.take().expect("checked to be open above").id
+        };
+        self.process.send(&response(&id, Outcome::Result(reply)))
+    }
+}
+
+/// An open request of the agent's: its id, for the answer, and what kind of answer it takes.
+#[derive(Debug)]
+struct Open {
+    id: Value,
+    kind: Kind,
+}
+
+#[derive(Debug)]
+enum Kind {
+    /// A permission request, with the option ids the agent offered.
+    Permission {
+        offered: Vec<String>,
+    },
+    Question,
+}
+
+/// The answer that closes `open` because its turn is being cancelled.
+fn cancelled(open: &Open) -> String {
+    match open.kind {
+        Kind::Permission { .. } => {
+            let result = PermissionResult {
+                outcome: PermissionOutcome::Cancelled,
+            };
+            response(&open.id, Outcome::Result(result))
+        }
+        Kind::Question => response(&open.id, Outcome::Result(ElicitationReply::Cancel)),
     }
 }
 
@@ -337,9 +410,9 @@ struct State {
     next_id: u64,
     /// Who waits for the reply to each request the app sent.
     waiters: HashMap<u64, Waiter>,
-    /// The agent's permission requests by number: its id for each and the option ids it
-    /// offered while open, `None` once answered.
-    permissions: Vec<Option<(Value, Vec<String>)>>,
+    /// The agent's permission requests and questions by number, while open; `None` once
+    /// answered, withdrawn, or closed with the turn.
+    requests: Vec<Option<Open>>,
     /// Set by [`Agent::cancel`] until the turn ends: requests that arrive meanwhile are
     /// answered `cancelled` at once.
     cancelling: bool,
@@ -556,7 +629,7 @@ impl<F: FnMut(Event)> Reader<F> {
             // Dropping the waiters wakes every blocked caller with "exited".
             state.waiters.clear();
             state
-                .permissions
+                .requests
                 .iter_mut()
                 .for_each(|request| *request = None);
             state.closed
@@ -602,14 +675,15 @@ impl<F: FnMut(Event)> Reader<F> {
             // The caller timed out and left: nobody wants the reply.
             Some(Waiter::Call(sender)) => drop(sender.send(outcome)),
             Some(Waiter::Turn) => {
-                {
+                let open: Vec<Open> = {
                     let mut state = lock(&self.shared.state);
                     state.cancelling = false;
-                    // A request still open when its turn ended can no longer be answered.
-                    state
-                        .permissions
-                        .iter_mut()
-                        .for_each(|request| *request = None);
+                    state.requests.iter_mut().filter_map(Option::take).collect()
+                };
+                // A request still open when its turn ended is answered as a cancel, which
+                // ACP asks of a request its sender gave up on.
+                for open in &open {
+                    drop(self.outbox.send(cancelled(open)));
                 }
                 let end = match outcome {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
@@ -635,26 +709,29 @@ impl<F: FnMut(Event)> Reader<F> {
         }
     }
 
-    /// A request from the agent. The app serves only permission requests; it advertised no
-    /// file or terminal capability, so any other method is answered "not found".
+    /// A request from the agent. The app serves permission requests and form questions; it
+    /// advertised no file or terminal capability, so any other method is answered "not found".
     fn request(&mut self, id: &Value, method: &str, params: Value) {
-        if method != "session/request_permission" {
-            let error = RpcError {
-                code: wire::METHOD_NOT_FOUND,
-                message: format!("Postil does not serve {method}"),
-            };
-            return self.answer(id, error);
+        match method {
+            "session/request_permission" => self.permission(id, params),
+            // The name in ACP's unstable schema at the pinned commit, and the one Claude's
+            // adapter sends, from a later SDK (`wire::ElicitationParams`).
+            "elicitation/create" | "session/create_elicitation" => self.question(id, params),
+            _ => {
+                let error = RpcError {
+                    code: wire::METHOD_NOT_FOUND,
+                    message: format!("Postil does not serve {method}"),
+                };
+                self.answer(id, error);
+            }
         }
+    }
+
+    fn permission(&mut self, id: &Value, params: Value) {
         let params: PermissionParams = match serde_json::from_value(params) {
             Ok(params) => params,
             Err(error) => {
-                let problem = format!("an unreadable permission request: {error}");
-                let rpc = RpcError {
-                    code: wire::INVALID_PARAMS,
-                    message: problem.clone(),
-                };
-                self.answer(id, rpc);
-                return self.emit(Event::Unreadable(problem));
+                return self.refuse(id, format!("an unreadable permission request: {error}"));
             }
         };
         let offered = params
@@ -662,21 +739,11 @@ impl<F: FnMut(Event)> Reader<F> {
             .iter()
             .map(|option| option.option_id.clone())
             .collect();
-        let number = {
-            let mut state = lock(&self.shared.state);
-            if state.cancelling {
-                None
-            } else {
-                state.permissions.push(Some((id.clone(), offered)));
-                Some(state.permissions.len() - 1)
-            }
+        let open = Open {
+            id: id.clone(),
+            kind: Kind::Permission { offered },
         };
-        let Some(number) = number else {
-            // The turn is being cancelled: the request crossed the cancel on the wire.
-            let result = PermissionResult {
-                outcome: PermissionOutcome::Cancelled,
-            };
-            self.outbox.send(response(id, Outcome::Result(result))).ok();
+        let Some(number) = self.open(open) else {
             return;
         };
         self.emit(Event::Permission(PermissionRequest {
@@ -686,9 +753,72 @@ impl<F: FnMut(Event)> Reader<F> {
         }));
     }
 
+    /// A question as a form. A URL question, or a form with no fields, is refused as one the
+    /// app cannot show: the agent then goes on without an answer.
+    fn question(&mut self, id: &Value, params: Value) {
+        let params: ElicitationParams = match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(error) => return self.refuse(id, format!("an unreadable question: {error}")),
+        };
+        let has_fields = |schema: &Value| {
+            schema["properties"]
+                .as_object()
+                .is_some_and(|fields| !fields.is_empty())
+        };
+        let schema = match (params.mode.as_deref(), params.requested_schema) {
+            (None | Some("form"), Some(schema)) if has_fields(&schema) => schema,
+            (Some("url"), _) => {
+                return self.refuse(id, "a URL question, which Postil cannot show".to_owned());
+            }
+            (mode, _) => {
+                let mode = mode.unwrap_or("form");
+                return self.refuse(id, format!("a {mode} question with no form fields"));
+            }
+        };
+        let open = Open {
+            id: id.clone(),
+            kind: Kind::Question,
+        };
+        let Some(number) = self.open(open) else {
+            return;
+        };
+        self.emit(Event::Question(QuestionRequest {
+            number,
+            message: params.message,
+            schema,
+            tool_call: params.tool_call_id,
+        }));
+    }
+
+    /// Numbers `open` and keeps it until it is answered; `None`, and answered at once, while
+    /// the turn is being cancelled: the request crossed the cancel on the wire.
+    fn open(&mut self, open: Open) -> Option<usize> {
+        let mut state = lock(&self.shared.state);
+        if state.cancelling {
+            drop(state);
+            self.outbox.send(cancelled(&open)).ok();
+            return None;
+        }
+        state.requests.push(Some(open));
+        Some(state.requests.len() - 1)
+    }
+
+    /// Answers a request the app cannot read or serve with an error, and says so in the run.
+    fn refuse(&mut self, id: &Value, problem: String) {
+        let rpc = RpcError {
+            code: wire::INVALID_PARAMS,
+            message: problem.clone(),
+        };
+        self.answer(id, rpc);
+        self.emit(Event::Unreadable(problem));
+    }
+
     fn notification(&mut self, method: &str, params: Value) {
         // Agents send notifications of their own (Grok's `_x.ai/...`, Claude's
-        // `_auth/...`); only session updates change what the app shows.
+        // `_auth/...`); only session updates and withdrawn requests change what the app shows.
+        if method == "$/cancel_request" {
+            return self.withdraw(params);
+        }
         if method != "session/update" {
             return;
         }
@@ -700,6 +830,31 @@ impl<F: FnMut(Event)> Reader<F> {
             Err(error) => self.emit(Event::Unreadable(format!(
                 "an unreadable session update: {error}"
             ))),
+        }
+    }
+
+    /// Closes the open request the agent withdrew, and answers it as a cancel: ACP's
+    /// cancellation rule asks for a reply to the original request all the same. One already
+    /// answered, or not the app's to answer, is ignored.
+    fn withdraw(&mut self, params: Value) {
+        let request_id = match serde_json::from_value::<CancelRequestParams>(params) {
+            Ok(params) => params.request_id,
+            Err(error) => {
+                let problem = format!("an unreadable $/cancel_request: {error}");
+                return self.emit(Event::Unreadable(problem));
+            }
+        };
+        let closed = {
+            let mut state = lock(&self.shared.state);
+            let found = state
+                .requests
+                .iter()
+                .position(|open| open.as_ref().is_some_and(|open| open.id == request_id));
+            found.and_then(|number| state.requests[number].take().map(|open| (number, open)))
+        };
+        if let Some((number, open)) = closed {
+            drop(self.outbox.send(cancelled(&open)));
+            self.emit(Event::Withdrawn { number });
         }
     }
 
@@ -932,7 +1087,7 @@ mod tests {
         assert!(
             matches!(
                 agent.answer_permission(request.number, "once"),
-                Err(Error::NoSuchPermission)
+                Err(Error::NoSuchRequest)
             ),
             "a request is answered once"
         );
@@ -1017,30 +1172,31 @@ mod tests {
     }
 
     #[test]
-    fn cancel_answers_open_permission_requests_cancelled_and_the_turn_ends_cancelled() {
+    fn cancel_answers_open_requests_cancelled_and_the_turn_ends_cancelled() {
         let (agent, events) = start("cancel").unwrap();
         agent.prompt(&[text("x")]).unwrap();
         assert_eq!(said(&events), "got x");
         said(&events);
-        let Event::Permission(request) = next(&events) else {
-            panic!("expected a permission request");
+        let Event::Question(question) = next(&events) else {
+            panic!("expected a question");
         };
 
         assert!(
             matches!(agent.prompt(&[text("y")]), Err(Error::TurnRunning)),
             "one turn at a time"
         );
-        assert_eq!(agent.cancel().unwrap(), [request.number]);
-        assert_eq!(said(&events), "permission cancelled");
+        assert_eq!(agent.cancel().unwrap(), [question.number]);
+        assert_eq!(said(&events), "question cancel");
         // Asked while the cancel is under way: answered at once, and never an event.
         assert_eq!(said(&events), "late permission cancelled");
+        assert_eq!(said(&events), "late question cancel");
         assert_eq!(
             next(&events),
             Event::TurnEnded(TurnEnd::Stopped(StopReason::Cancelled))
         );
         assert!(matches!(
-            agent.answer_permission(request.number, "once"),
-            Err(Error::NoSuchPermission)
+            agent.answer_question(question.number, &ElicitationReply::Decline),
+            Err(Error::NoSuchRequest)
         ));
     }
 
@@ -1264,7 +1420,11 @@ mod tests {
                 }) => reply.push_str(&text),
                 Event::TurnEnded(end) => break end,
                 Event::Exited { stderr } => panic!("the agent exited: {stderr}"),
-                Event::Update(_) | Event::Permission(_) | Event::Unreadable(_) => {}
+                Event::Update(_)
+                | Event::Permission(_)
+                | Event::Question(_)
+                | Event::Withdrawn { .. }
+                | Event::Unreadable(_) => {}
             }
         };
         assert_eq!(end, TurnEnd::Stopped(StopReason::EndTurn), "{reply}");

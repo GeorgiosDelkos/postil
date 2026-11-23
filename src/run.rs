@@ -54,10 +54,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::acp::{
-    Agent, ContentBlock, Event, Launch, Location, PermissionKind, PlanEntryStatus, SessionUpdate,
-    StopReason, Stopper, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
+    Agent, ContentBlock, ElicitationReply, Event, Launch, Location, PermissionKind,
+    PermissionOption, PlanEntryStatus, SessionUpdate, StopReason, Stopper, ToolCallContent,
+    ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::agents::Scanner;
 use crate::error::{Error, Result, error_chain};
@@ -292,17 +294,45 @@ impl Runner {
         result
     }
 
+    /// Answers the run's question `request` (its number, as the log gives it) with the form's
+    /// values, or with `None` to skip it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchRequest`] when no agent is running, and as [`Agent::answer_question`].
+    pub(crate) fn reply(
+        &self,
+        request: usize,
+        content: Option<serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        let slot = self.slot();
+        let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
+            return Err(Error::NoSuchRequest);
+        };
+        let reply = match &content {
+            Some(content) => ElicitationReply::Accept {
+                content: content.clone(),
+            },
+            None => ElicitationReply::Decline,
+        };
+        agent.answer_question(request, &reply)?;
+        run.record(Entry::Reply { request, content });
+        drop(slot);
+        (self.notify)();
+        Ok(())
+    }
+
     /// Answers the run's permission request `request` (its number, as the log gives it) with
     /// the option `option`.
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when no agent is running, and as
+    /// [`Error::NoSuchRequest`] when no agent is running, and as
     /// [`Agent::answer_permission`], which keeps the table of open requests.
     pub(crate) fn answer(&self, request: usize, option: &str) -> Result<()> {
         let slot = self.slot();
         let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
-            return Err(Error::NoSuchPermission);
+            return Err(Error::NoSuchRequest);
         };
         // The agent checks the option against what it offered; only an accepted answer is
         // logged, so a refused one can be made again.
@@ -591,11 +621,33 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
     };
-    let (run, released) = {
+    // Postil answers permission requests itself (docs/design.md, "Runs", decided with the
+    // owner on 2026-11-23): only a question stops for the engineer.
+    let allow = match &event {
+        Event::Permission(request) => allow_option(&request.options).map(|id| (request.number, id)),
+        _ => None,
+    };
+    let (run, released, answer) = {
         let mut slot = runner.slot();
         if slot.let_go(generation) {
             return;
         }
+        // Answered before the request is logged, and logged with it at once: a page that
+        // read the request alone would show the run waiting for the engineer. Fails when a
+        // Stop already answered the request (and logged that), or the agent is gone; the run
+        // then shows the request open until it ends.
+        let answer = allow.and_then(|(request, option)| match &slot.agent {
+            Held::Ready(_, agent) => {
+                agent
+                    .answer_permission(request, &option)
+                    .ok()
+                    .map(|()| Entry::Answer {
+                        request,
+                        option: Some(option),
+                    })
+            }
+            Held::None | Held::Starting(_) => None,
+        });
         let ends_agent = matches!(
             event,
             Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
@@ -605,16 +657,25 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         } else {
             Held::None
         };
-        (slot.run.clone(), released)
+        (slot.run.clone(), released, answer)
     };
     if let Some(run) = run
-        && let Some(ids) = run.record_event(event, runner.repo.root())
+        && let Some(ids) = run.record_event(event, answer, runner.repo.root())
     {
         runner.mark_sent(&run, &ids);
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
     (runner.notify)();
+}
+
+/// The option that allows a permission request: once, else always. `None` when the agent
+/// offers neither; the request then waits for the engineer, as before auto-allow.
+fn allow_option(options: &[PermissionOption]) -> Option<String> {
+    [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+        .into_iter()
+        .find_map(|kind| options.iter().find(|option| option.kind == kind))
+        .map(|option| option.option_id.clone())
 }
 
 /// One run and its log.
@@ -718,10 +779,25 @@ pub(crate) enum Entry {
         title: Option<String>,
         options: Vec<Choice>,
     },
-    /// A permission request was answered; `option` is `None` when the run was cancelled.
+    /// A permission request was answered; `option` is `None` when the request closed without
+    /// an answer: the run was stopped, or the agent withdrew it. A question closed that way is
+    /// logged here too; an answered one is [`Entry::Reply`].
     Answer {
         request: usize,
         option: Option<String>,
+    },
+    /// The agent asks the engineer a question. `fields` is the form, a JSON Schema object
+    /// whose properties are its fields, as the agent sent it; the page draws it.
+    Question {
+        request: usize,
+        message: String,
+        fields: Value,
+        tool_call: Option<String>,
+    },
+    /// The engineer answered question `request`: the form's values, or `None` for a skip.
+    Reply {
+        request: usize,
+        content: Option<serde_json::Map<String, Value>>,
     },
     /// The agent sent something the app could not read; the run goes on.
     Unreadable { problem: String },
@@ -957,28 +1033,41 @@ impl Run {
 
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     fn record(&self, entry: Entry) {
+        self.record_all([entry]);
+    }
+
+    /// Records `entries` in order, under one hold of the state: a reader sees all or none.
+    fn record_all(&self, entries: impl IntoIterator<Item = Entry>) {
         let mut state = self.state();
         if !state.live() {
             return;
         }
-        if let Some(log) = &mut state.log
-            && let Err(error) = log.write_all(&json_line(&entry))
-        {
-            state.log = None;
-            state.problem.get_or_insert(format!(
-                "the run log {} could not be written, so this run will not be shown whole \
-                 after a restart: {error}",
-                self.file.display()
-            ));
+        for entry in entries {
+            if let Some(log) = &mut state.log
+                && let Err(error) = log.write_all(&json_line(&entry))
+            {
+                state.log = None;
+                state.problem.get_or_insert(format!(
+                    "the run log {} could not be written, so this run will not be shown whole \
+                     after a restart: {error}",
+                    self.file.display()
+                ));
+            }
+            state.apply(&entry);
+            state.entries.push(entry);
         }
-        state.apply(&entry);
-        state.entries.push(entry);
     }
 
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
     /// the agent took the turn (an update, a permission request, or a stop other than a
     /// refusal) releases them. A turn that fails or is refused at once leaves them open.
-    fn record_event(&self, event: Event, root: &Path) -> Option<Vec<String>> {
+    /// `answer`, the event's auto-answer, is recorded with it, at once.
+    fn record_event(
+        &self,
+        event: Event,
+        answer: Option<Entry>,
+        root: &Path,
+    ) -> Option<Vec<String>> {
         let entry = match event {
             Event::Update(update) => entry_of(update, root)?,
             Event::Permission(request) => Entry::Permission {
@@ -994,6 +1083,16 @@ impl Run {
                         kind: option.kind,
                     })
                     .collect(),
+            },
+            Event::Question(question) => Entry::Question {
+                request: question.number,
+                message: question.message,
+                fields: question.schema,
+                tool_call: question.tool_call,
+            },
+            Event::Withdrawn { number } => Entry::Answer {
+                request: number,
+                option: None,
             },
             Event::TurnEnded(TurnEnd::Stopped(reason)) => Entry::Ended { reason },
             Event::TurnEnded(TurnEnd::Failed(error)) => Entry::Failed { error },
@@ -1012,7 +1111,7 @@ impl Run {
                 }
         );
         let live = self.state().live();
-        self.record(entry);
+        self.record_all(std::iter::once(entry).chain(answer));
         if took_turn && live {
             self.state().unmarked.take()
         } else {
@@ -1081,10 +1180,10 @@ impl RunState {
         match entry {
             Entry::Started => self.started = true,
             Entry::CancelRequested => self.cancel_requested = true,
-            Entry::Permission { request, .. } => {
+            Entry::Permission { request, .. } | Entry::Question { request, .. } => {
                 self.requested.insert(*request);
             }
-            Entry::Answer { request, .. } => {
+            Entry::Answer { request, .. } | Entry::Reply { request, .. } => {
                 self.answered.insert(*request);
             }
             Entry::Ended { .. } | Entry::Failed { .. } => {

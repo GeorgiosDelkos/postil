@@ -44,8 +44,8 @@ panel. It is not an editor, not a terminal, and not a PR tool.
 5. **Send.** Pick an agent, press `Cmd-Shift-Enter`. The prompt preview shows the exact text the
    agent receives before it is sent.
 6. **Watch.** The tray becomes the run panel: the agent's plan, its tool calls, its messages.
-   Permission requests appear as a card with keys `a` (allow once), `Shift-a` (always), `r`
-   (reject). `Esc` cancels the run.
+   Postil allows the agent's tool calls itself; only a question the agent asks stops for the
+   engineer, answered in the note's or the run's dialog. `Esc` cancels the run.
 7. **Verify.** The code pane switches to the changes the run made. Each note shows next to the
    lines that replaced it. Mark notes resolved, or write new notes on the changes and send them
    to the same session.
@@ -257,12 +257,14 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 
 | Direction | Method | Used for |
 |---|---|---|
-| app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false. |
+| app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false, and form questions (`elicitation.form`). |
 | app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. |
 | app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn. |
-| app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`. |
+| app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`, every open question `cancel`. |
 | agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`. Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
-| agent to app | `session/request_permission` | The permission card. The reply names the chosen `optionId`. |
+| agent to app | `session/request_permission` | Answered at once with the allow option (once, else always). With none, it waits for the engineer. |
+| agent to app | `elicitation/create`, `session/create_elicitation` | A question as a form; the reply is `accept` with the form's values, `decline` (skipped), or `cancel`. Unstable in ACP; the first name is the schema's at the pinned commit, the second Claude's adapter's. A URL question is refused. |
+| agent to app | `$/cancel_request` | The agent withdraws a request; an open question closes unanswered. |
 
 The app advertises no file or terminal capability on purpose. It has no unsaved buffers, so the
 agent's own file tools see the same bytes the app does. That removes five client methods, and
@@ -273,9 +275,13 @@ app does not serve (`fs/*`, `terminal/*`, anything newer) are answered "method n
 and notifications it does not know (Grok's `_x.ai/...`, Claude's `_auth/...`) are ignored.
 `src/acp/wire.rs` names the schema commit the types were written from.
 
-Permissions are never auto-approved from a tool call's `kind` or `title`: the agent writes those
-labels. "Always" is offered only when the agent sends an `allow_always` option, and the choice is
-the agent's to remember.
+Every permission request is allowed, whatever the tool call: the owner decided on 2026-11-23
+that runs go without permission prompts, and that only the agent's questions stop for the
+engineer. A request is allowed once when the agent offers that, else always; one with no
+allow option waits, as before. Postil advertises form questions because Claude's adapter
+otherwise sends its questions (`AskUserQuestion`) as permission requests, which auto-allow
+would wave through unanswered (checked in claude-agent-acp at 130fbbc, `src/v1/acp-agent.ts`).
+How Grok asks a question is not checked yet.
 
 ### The prompt
 
@@ -307,7 +313,8 @@ Built in `src/run.rs`, with the API the page calls:
 | `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
 | `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
 | `GET /api/runs` | The ids of the runs on disk, newest first. |
-| `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered. |
+| `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
+| `POST /api/run/question` `{request, content}` | Answers a question with the form's values, or skips it (`content` `null`). |
 | `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
 
 - **The agent is kept between runs**, with its session, until a send names another agent or
@@ -323,8 +330,11 @@ Built in `src/run.rs`, with the API the page calls:
   still starting is killed instead, and the run ends at once. A second Stop from 3 s after
   the first kills an agent that did not stop, so a hung agent never holds the working tree;
   sooner, it is the same request (a double click).
-- **Permission requests** are numbered by `acp::Agent`, which keeps the only table of open
-  ones; the log records each request and its answer by that number.
+- **Permission requests and questions** are numbered together by `acp::Agent`, which keeps
+  the only table of open ones; the log records each and its answer by that number. A
+  permission request is answered as it is logged (auto-allow); a question waits for
+  `POST /api/run/question` `{request, content}`, `content` the form's values or `null` to
+  skip. Stop answers open questions `cancel`, and an agent's withdrawal closes one.
 - **Starting** happens on a thread of its own, because it can take minutes. Each start-up
   step (`initialize`, `session/new`) may take 120 seconds, and Stop ends the wait. Gemini 0.40.1, not signed in,
   never answers `initialize` (it waits for a browser sign-in), checked 2026-11-23; the run
@@ -390,8 +400,10 @@ A card opens the run's dialog, which holds everything about it: the plan, one ca
 (it opens the note's detail), one card per step (it opens the step whole: its command, diffs
 and output, with the arrow keys or ‹ › to move between steps and the run's id to go back),
 and the agent's whole reply. Nothing of a run but its card is in the tab: the owner asked on
-2026-11-23 for the steps and the reply to live in each run's dialog. An open permission
-request is the one exception, above the runs, as it needs an answer now. The tray header
+2026-11-23 for the steps and the reply to live in each run's dialog. What needs an answer
+now is the exception, above the runs: a card for the agent's open question, which opens the
+run's dialog with the question at its top (the note's dialog shows it too), and a permission
+request Postil could not answer. The tray header
 shows the latest run's status, its time and Stop while it runs.
 
 Older runs are read once each by id and kept in the panel, which the notes' statuses read
