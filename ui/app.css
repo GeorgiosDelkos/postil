@@ -402,6 +402,9 @@ kbd {
   outline: none;
   font: var(--code-font-size) var(--font-mono);
   tab-size: var(--tab-width);
+  /* The composer sizes itself by this pane's width (`cqw`): the rows it sits in are as wide
+     as the longest line, and the window's width says nothing of the side panes'. */
+  container-type: inline-size;
 }
 
 /* The line-number gutter's width: 24 px on the left for the + button (6 px in, 16 px wide,
@@ -511,7 +514,11 @@ kbd {
 .composer {
   position: sticky;
   left: var(--gutter-width);
-  width: min(640px, calc(100vw - 700px));
+  /* What the code pane shows right of the gutter, less 16 px clear of its edge, up to 640 px.
+     The pane keeps at least 420 px (CODE_MIN in ui/panes.js), which leaves 320 px beside
+     the gutter of most files; where it does not, the composer keeps 320 px and the pane
+     scrolls sideways to it. */
+  width: min(640px, 100cqw - var(--gutter-width) - 16px);
   min-width: 320px;
   margin: 8px 0 10px var(--gutter-width);
   display: flex;
