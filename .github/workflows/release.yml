@@ -3,8 +3,8 @@
 # App Store Connect key serve both apps.
 #
 # Two macOS jobs, so the code that builds the app never shares a machine with the Developer ID:
-# - build: no secrets and read-only. It checks that the tagged commit is on main and that the
-#   tag is the app's version, runs the tests, builds the unsigned app with scripts/bundle.sh
+# - build: no secrets and read-only. It checks that the commit is on main and that a tag is the
+#   app's version, runs the tests, builds the unsigned app with scripts/bundle.sh
 #   (Apple Silicon; the runner's architecture) and uploads it as an artifact. Every dependency's
 #   build script and proc macro runs here.
 # - sign: in the Environment `release`, with the secrets, on a fresh runner. It runs no cargo and
@@ -16,8 +16,8 @@
 # runner of its own, so the build's processes are gone before any secret is decrypted.
 #
 # workflow_dispatch is the dry run: the same build, signing, notarization and checks, and no
-# release. The Environment's deployment policy admits only main and v* tags, so a dry run from
-# another branch builds, and the Environment refuses its sign job.
+# release. It runs from main, or from a tag on main; the build job stops a dry run of any other
+# commit, and the Environment's deployment policy (main and v* tags) refuses other refs too.
 #
 # Secrets live only in the GitHub Environment `release` of this repository (required reviewer:
 # the owner; deployment policy: branch main and tags v*; set up on 2026-11-23, as vigil's), never
@@ -33,9 +33,10 @@
 #   APPLE_API_KEY_P8            the AuthKey_<id>.p8 text
 #
 # Both jobs run on macos-15, not test.yml's macos-latest: the scripts use /usr/bin/trash, which
-# macOS 15 ships, and a release should not change image when GitHub moves macos-latest. Both use
-# the same image, so the sign job unpacks with the ditto that packed. The build job runs the
-# tests itself, so a release is tested on the image it is built on.
+# macOS 15 ships, and a release should not change image when GitHub moves macos-latest. Both ask
+# for the same image label, so the sign job unpacks with the same macOS release's ditto that
+# packed. The build job runs the tests itself, so a release is tested on the image it is built
+# on.
 name: release
 on:
   push:
@@ -66,33 +67,41 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check that the tagged commit is on main
-        if: env.RELEASE_TAG != ''
+      # On every run, dry runs included: a dry run of a tag still signs, and the sign job runs
+      # the commit's own scripts/sign.sh with the Developer ID unlocked. "On main" means it was
+      # main's head once (first parent), so a commit inside a merged branch does not count.
+      # grep has no -q: it reads all of rev-list's output, so pipefail sees no SIGPIPE.
+      - name: Check that the commit is on main
         run: |
           set -euo pipefail
           git rev-parse --verify --quiet refs/remotes/origin/main > /dev/null \
-            || { echo "::error::checkout fetched no origin/main to check the tag against"; exit 1; }
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
-            echo "::error::tag ${RELEASE_TAG} (${GITHUB_SHA}) is not on main: tag a commit of main"
+            || { echo "::error::checkout fetched no origin/main to check the commit against"; exit 1; }
+          if ! git rev-list --first-parent refs/remotes/origin/main \
+              | grep -Fx "${GITHUB_SHA}" > /dev/null; then
+            echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main: release a commit of main"
             exit 1
           fi
 
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --profile minimal --no-self-update
 
+      # On every tag, dry runs of a tag included, so a dry run signs only what a push would.
       - name: Check that the tag is the app's version
-        if: env.RELEASE_TAG != ''
+        if: github.ref_type == 'tag'
         run: |
           version="$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "postil") | .version')"
-          if [ "v${version}" != "${RELEASE_TAG}" ]; then
-            echo "::error::tag ${RELEASE_TAG} is not the app's version v${version}"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not the app's version v${version}"
             exit 1
           fi
 
       # The tests run here rather than asking whether test.yml passed on this commit: a tag can be
       # pushed before main's checks finish, and a lookup of check runs depends on their names and
       # on branch protection, while running them depends on nothing. The cost is a few minutes.
+      # Not run again here: check.yml (fmt, clippy) and deny.yml (advisories, licenses). Those
+      # run on the PRs that reach main, so an advisory published after the merge does not stop
+      # a release.
       - name: cargo test --locked
         run: cargo test --locked --all-features
 
@@ -163,12 +172,15 @@ jobs:
       # A keychain of this run's own holds the certificate and the notary profile, so nothing
       # lands in the runner's login keychain; the last step deletes it.
       #
-      # The keychain's password (-p, -k) and the .p12's (-P) go on the command line, which
-      # `security` itself calls insecure: any process of this user can read them with `ps` while
-      # the command runs. `security` takes them no other way but from a SecurityAgent dialog,
-      # which a runner cannot answer. The exposure is accepted because this job runs no build
-      # code, so no such process is there to read them; the keychain's password is random and
-      # lives for this job only.
+      # `security` takes the keychain's password (-p, -k) and the .p12's (-P) only as arguments,
+      # which any process of this user can read with `ps`, or from a dialog a runner cannot
+      # answer. So the commands that carry one are read by `security -i` from stdin, written by
+      # bash's builtin printf, and no argv holds a password. `security -i` reads a line as
+      # words, takes "..." as one word with \" and \\ escaped inside it, expands nothing, and
+      # exits with the status of the last command it read: checked on macOS 27, and the first
+      # release on the runner's macOS 15 shows whether that holds there. The .p12 password is
+      # still in this step's environment, which `ps -E` shows to processes of the same user; the
+      # sign job runs no build code that could look.
       - name: Import the certificate and the notary key into a keychain of this run
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -178,23 +190,37 @@ jobs:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           set -euo pipefail
+          # Runs one `security` command given as arguments, through stdin.
+          security_stdin() {
+            local line="" arg
+            for arg in "$@"; do
+              if [[ "${arg}" == *$'\n'* ]]; then
+                echo "::error::an argument to security holds a newline, which security -i cannot read"
+                return 1
+              fi
+              arg="${arg//\\/\\\\}"
+              arg="${arg//\"/\\\"}"
+              line+=" \"${arg}\""
+            done
+            printf '%s\n' "${line# }" | security -i
+          }
           keychain="${RUNNER_TEMP}/release.keychain-db"
           certificate="${RUNNER_TEMP}/certificate.p12"
           key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
           # Gone on every way out of this step, a failed import included.
           trap 'rm -f "${certificate}" "${key}"' EXIT
           keychain_password="$(uuidgen)"
-          security create-keychain -p "${keychain_password}" "${keychain}"
+          security_stdin create-keychain -p "${keychain_password}" "${keychain}"
           # Named at once, so the last step deletes the keychain even if this step fails.
           echo "POSTIL_NOTARY_KEYCHAIN=${keychain}" >> "${GITHUB_ENV}"
           # Locks after 90 minutes unused, the job's limit: never during notarization's wait.
           security set-keychain-settings -lut 5400 "${keychain}"
-          security unlock-keychain -p "${keychain_password}" "${keychain}"
+          security_stdin unlock-keychain -p "${keychain_password}" "${keychain}"
           umask 077
           printf '%s' "${APPLE_CERTIFICATE}" | base64 --decode > "${certificate}"
-          security import "${certificate}" -k "${keychain}" \
+          security_stdin import "${certificate}" -k "${keychain}" \
             -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+          security_stdin set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "${keychain_password}" "${keychain}" > /dev/null
           # codesign finds the identity only in a keychain on the search list.
           existing="$(security list-keychains -d user | tr -d '"' | xargs)"
