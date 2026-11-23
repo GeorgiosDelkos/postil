@@ -29,9 +29,14 @@
 //!
 //! # Permission requests
 //!
-//! The agent numbers the permission requests it receives (0, 1, ... across its turns) and
-//! keeps the only table of the open ones, with the agent's own request ids; callers answer
-//! by number. While a cancel is under way, a request is answered `cancelled` as it arrives.
+//! [`Agent`] numbers the permission requests and questions it passes on as events (0, 1, ...
+//! across its turns, one count for both) and keeps the only table of them, with the agent's
+//! own request id and, for a permission request, the options it offered; callers answer by
+//! number. A request stays open until it is answered or cancelled, its turn ends, the agent
+//! withdraws it (`$/cancel_request`), or the agent exits. While a cancel is under way, a
+//! request is answered `cancelled` (a question: `cancel`) as it arrives and gets no number.
+//! An unreadable request, or a question that is not a form, is answered with an error and
+//! gets no number either.
 
 mod connection;
 mod wire;
