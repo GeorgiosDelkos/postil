@@ -220,7 +220,8 @@ async function prompt(id, params) {
         });
         say(`read ${read.result.outcome.optionId}`);
         say(`saw the edit: ${blocks[0].includes("src/a.rs, before:\n```\na\n```\nafter:\n```\nb\n```")}`);
-        say('Found one.\n\n```json\n[{"note": "N1", "path": "a.txt", "line": 1, "finding": "a is too short", "fix": "say more"}]\n```');
+        // The fix quotes a fence, as a fix that shows a block does: the findings still read.
+        say('Found one.\n\n```json\n[{"note": "N1", "path": "a.txt", "line": 1, "finding": "a is too short", "fix": "say more, as ```json [] ``` does"}]\n```');
       } else {
         say(`judged: ${blocks[0].includes("F1 [N1] a.txt:1: a is too short") ? "saw F1" : "no F1"}`);
         say("F1: accepted - said more");

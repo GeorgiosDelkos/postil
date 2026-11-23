@@ -160,27 +160,53 @@ fn context(text: &mut String, work: &Work) {
     }
 }
 
-/// The findings in a proposer's reply: its last ```` ```json ```` block, an array of objects,
-/// numbered from `F{first}` on. A field of the wrong type is left out; an entry without its
-/// text is skipped.
+/// The findings in a proposer's reply: the last ```` ```json ```` block that starts a line and
+/// holds an array, of objects, numbered from `F{first}` on. A field of the wrong type is left
+/// out; an entry without its text is skipped.
 ///
 /// # Errors
 ///
-/// Why the findings cannot be read: no JSON block, or one that is not an array.
+/// Why the findings cannot be read: no JSON block, or none that is an array (the last
+/// block's problem is given).
 pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, String> {
-    let start = reply
-        .rfind("```json")
-        .ok_or("the reply has no ```json block of findings")?;
-    // The array ends where the JSON says, not at the next fence: a finding's text can quote
-    // code in a fence of its own.
-    let body = &reply[start + "```json".len()..];
-    let entries: Vec<Value> = serde_json::Deserializer::from_str(body)
+    const FENCE: &str = "```json";
+    // A fence opens a block only at the start of a line, after spaces at most. JSON strings
+    // cannot hold a raw line break, so a fence that a finding's text quotes never starts a
+    // line, and is passed over here. From the last block backwards: a block
+    // after the findings that is not an array (an example, say) does not hide them.
+    let opens_block = |at: usize| {
+        let before = reply[..at].trim_end_matches(' ');
+        before.is_empty() || before.ends_with('\n')
+    };
+    let mut problem = None;
+    for (start, _) in reply
+        .rmatch_indices(FENCE)
+        .filter(|(at, _)| opens_block(*at))
+    {
+        match array_after(&reply[start + FENCE.len()..]) {
+            Ok(entries) => return Ok(numbered(&entries, first)),
+            Err(error) => {
+                problem.get_or_insert(error);
+            }
+        }
+    }
+    Err(problem.unwrap_or_else(|| "the reply has no ```json block of findings".to_owned()))
+}
+
+/// The JSON array at the start of `body`, after any whitespace. It ends where the JSON says,
+/// not at the next fence: a finding's text can quote code in a fence of its own.
+fn array_after(body: &str) -> Result<Vec<Value>, String> {
+    serde_json::Deserializer::from_str(body)
         .into_iter::<Vec<Value>>()
         .next()
         .ok_or("the ```json block of findings is empty")?
-        .map_err(|error| format!("its findings are not a JSON array: {error}"))?;
+        .map_err(|error| format!("its findings are not a JSON array: {error}"))
+}
+
+/// The findings `entries` hold, numbered from `F{first}` on.
+fn numbered(entries: &[Value], first: usize) -> Vec<Finding> {
     let text = |entry: &Value, key: &str| entry[key].as_str().map(str::to_owned);
-    Ok(entries
+    entries
         .iter()
         .filter_map(|entry| {
             let finding = text(entry, "finding").or_else(|| text(entry, "text"))?;
@@ -195,7 +221,7 @@ pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, Str
             text: finding,
             fix: text(entry, "fix"),
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -322,5 +348,65 @@ mod tests {
                 .unwrap_err()
                 .contains("not a JSON array")
         );
+    }
+
+    /// Replies that quote a ```` ```json ```` fence inside a finding, or put other blocks
+    /// around the findings. Each case gives the texts of the findings read, or a part of the
+    /// error.
+    #[test]
+    fn a_fence_quoted_in_a_finding_or_another_block_does_not_hide_the_findings() {
+        let found = |texts: &[&str]| -> Result<Vec<String>, String> {
+            Ok(texts.iter().map(|text| (*text).to_owned()).collect())
+        };
+        let cases = [
+            (
+                // What follows the quoted fence parses as an empty array: read from there, the
+                // findings would be lost without a word.
+                "a quoted fence followed by an empty array",
+                "```json\n[{\"finding\": \"a\", \"fix\": \"write ```json [] ``` here\"}]\n```",
+                found(&["a"]),
+            ),
+            (
+                "a quoted fence followed by text that is not JSON",
+                "```json\n[{\"finding\": \"a\", \"fix\": \"```json\\n{\\\"x\\\": 1}\\n```\"}, \
+                 {\"text\": \"b\"}]\n```",
+                found(&["a", "b"]),
+            ),
+            (
+                "an example block that is not an array after the findings",
+                "```json\n[{\"finding\": \"a\"}]\n```\nFor example:\n```json\n{\"x\": 1}\n```",
+                found(&["a"]),
+            ),
+            (
+                "an indented block",
+                "Findings:\n  ```json\n  [{\"finding\": \"a\"}]\n  ```",
+                found(&["a"]),
+            ),
+            (
+                "the last of two arrays",
+                "```json\n[{\"finding\": \"old\"}]\n```\n```json\n[{\"finding\": \"new\"}]\n```",
+                found(&["new"]),
+            ),
+            (
+                "a fence inside a line opens no block",
+                "I answer in ```json [{\"finding\": \"a\"}]",
+                Err("no ```json block".to_owned()),
+            ),
+            (
+                "no block holds an array: the last block's problem",
+                "```json\n{\"x\": 1}\n```\n```json\n\n```",
+                // The first block's problem would be "invalid type: map".
+                Err("expected value".to_owned()),
+            ),
+        ];
+        for (case, reply, expected) in cases {
+            let read: Result<Vec<String>, String> = findings_in(reply, 1)
+                .map(|findings| findings.into_iter().map(|finding| finding.text).collect());
+            match (read, expected) {
+                (Ok(read), Ok(expected)) => assert_eq!(read, expected, "{case}"),
+                (Err(read), Err(expected)) => assert!(read.contains(&expected), "{case}: {read}"),
+                (read, expected) => panic!("{case}: read {read:?}, expected {expected:?}"),
+            }
+        }
     }
 }
