@@ -54,12 +54,13 @@ function endReason(run) {
 
 // What the agent said about note `id`: the last line of its messages that starts with the id,
 // as the prompt asks it to end ("list each note id with one line on what you did", src/notes.rs
-// `prompt`). Agents write that list in Markdown: `N3: …`, `- N3 — …`, `**N3**: …`, `1. [N3] …`.
-// Null when no line does.
+// `prompt`). Agents write that list in Markdown: `N3: …`, `- N3 — …`, `**N3**: …`, `1. [N3] …`,
+// and often put the note's place in brackets after the id, as Claude did on 2026-11-23:
+// "- **N1** (`src/acp.rs:36-37`): No change…". Null when no line does.
 export function agentSaid(run, id) {
   const line = new RegExp(
     String.raw`^\s*(?:[-*+]|\d+[.)])?\s*(?:\*\*|__|\x60)?\[?${id}\]?(?:\*\*|__|\x60)?` +
-      String.raw`\s*(?::\*\*|:__|[:.)\-–—])\s*(?:\*\*|__)?\s*(\S.*)$`,
+      String.raw`(?:\s*\([^)]*\))?\s*(?::\*\*|:__|[:.)\-–—])\s*(?:\*\*|__)?\s*(\S.*)$`,
   );
   let said = null;
   for (const item of foldRun(run.entries).items) {

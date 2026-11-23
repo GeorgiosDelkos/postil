@@ -29,7 +29,7 @@
 //!
 //! # Permission requests
 //!
-//! The agent numbers the permission requests it receives (0, 1, ... across its turns) and
+//! [`Agent`] numbers the permission requests it receives (0, 1, ... across its turns) and
 //! keeps the only table of the open ones, with the agent's own request ids; callers answer
 //! by number. While a cancel is under way, a request is answered `cancelled` as it arrives.
 

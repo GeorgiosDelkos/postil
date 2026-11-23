@@ -70,6 +70,12 @@ test("the agent's line about a note is read in the forms agents write", () => {
   assert.equal(line("**N3:** made it return Option"), "made it return Option");
   assert.equal(line("1. [N3] - made it return Option"), "made it return Option");
   assert.equal(line("2) `N3`: made it return Option"), "made it return Option");
+  // Claude's own line, 2026-11-23: the place in brackets between the id and the colon.
+  assert.equal(
+    line("- **N1** (`src/acp.rs:36-37`): No change. These two lines declare.", "N1"),
+    "No change. These two lines declare.",
+  );
+  assert.equal(line("N3 (src/math.rs:7) — returns Option now"), "returns Option now");
   assert.equal(line("N30: something else"), null, "N3 is not N30");
   assert.equal(line("See N3: it was hard"), null, "only at the start of a line");
   assert.equal(line("N3:"), null, "an empty line says nothing");
