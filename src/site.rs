@@ -10,6 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode, Uri};
@@ -642,8 +643,7 @@ impl Site {
     /// open project, through `open_repo` (`Repo::open`, or `Repo::init` to make it a
     /// repository first), and answers `{}`. The page then reloads.
     fn open_folder(&self, body: &[u8], open_repo: fn(&Path) -> Result<Repo>) -> Result<Vec<u8>> {
-        let request: FolderRequest = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let request: FolderRequest = parse_body(body, Error::BadRequest)?;
         let live = if request.stop {
             LiveRun::Stop
         } else {
@@ -669,8 +669,7 @@ impl Site {
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
     /// notes.
     fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let new: NewNote = serde_json::from_slice(body)
-            .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
+        let new: NewNote = parse_body(body, Error::InvalidNote)?;
         let review = notes::add(&*self.repo()?, new)?;
         Ok(to_json(&review))
     }
@@ -678,8 +677,7 @@ impl Site {
     /// The reply to `PUT /api/folders` `{"open": ["src"]}`: saves the folders open in the file
     /// list, and answers `{}`.
     fn save_folders(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let open: Folders = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let open: Folders = parse_body(body, Error::BadRequest)?;
         folders::save(&self.repo()?.folders_file(), open)?;
         Ok(b"{}".to_vec())
     }
@@ -687,8 +685,7 @@ impl Site {
     /// The reply to `PATCH /api/notes?id=N1` `{"body": "..."}`: replaces the note's text, saves,
     /// and returns all notes.
     fn edit_note(&self, id: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let edit: EditNote = serde_json::from_slice(body)
-            .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
+        let edit: EditNote = parse_body(body, Error::InvalidNote)?;
         let review = notes::edit(&*self.repo()?, id, &edit.body)?;
         Ok(to_json(&review))
     }
@@ -855,8 +852,7 @@ impl Site {
     /// The reply to `POST /api/run`: sends the notes in the body to the agent, and answers
     /// `{}`. The page fetches the run (`GET /api/run`), as after every change.
     fn send_run(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let request: SendRun = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let request: SendRun = parse_body(body, Error::BadRequest)?;
         let settings = self.current_settings();
         let agent = match &request.agent {
             Some(name) => settings.chosen_agent(name)?,
@@ -875,8 +871,7 @@ impl Site {
 
     /// The reply to `POST /api/run/permission`.
     fn answer_permission(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let answer: AnswerPermission = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let answer: AnswerPermission = parse_body(body, Error::BadRequest)?;
         self.runner()?.answer(answer.request, &answer.option)?;
         Ok(b"{}".to_vec())
     }
@@ -884,8 +879,7 @@ impl Site {
     /// The reply to `POST /api/run/review`: starts the settings' reviewers on the run, in
     /// order, and answers `{}`.
     fn review_run(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let review: ReviewRun = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let review: ReviewRun = parse_body(body, Error::BadRequest)?;
         // Loaded once, so every reviewer is checked against the same revision of the file.
         let settings = self.current_settings();
         let reviewers = settings
@@ -900,8 +894,7 @@ impl Site {
     /// The reply to `POST /api/run/follow`: sends the engineer's follow-up to the agent that
     /// ran the run it follows, and answers `{}`.
     fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let follow: FollowRun = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let follow: FollowRun = parse_body(body, Error::BadRequest)?;
         let runner = self.runner()?;
         let agent = self
             .current_settings()
@@ -912,8 +905,7 @@ impl Site {
 
     /// The reply to `POST /api/run/question`.
     fn answer_question(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let answer: AnswerQuestion = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let answer: AnswerQuestion = parse_body(body, Error::BadRequest)?;
         self.runner()?.reply(answer.request, answer.content)?;
         Ok(b"{}".to_vec())
     }
@@ -961,8 +953,7 @@ impl Site {
     /// The reply to `PUT /api/settings`: checks and saves the settings in the body, if the
     /// file is still at the revision the body names.
     fn save_settings(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let request: SaveSettings = serde_json::from_slice(body)
-            .map_err(|error| Error::InvalidSettings(format!("unreadable request: {error}")))?;
+        let request: SaveSettings = parse_body(body, Error::InvalidSettings)?;
         let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
         // Checked here, not by serde, for the same reason as `save_layout`.
         let settings = Settings::try_from(request.settings).map_err(Error::InvalidSettings)?;
@@ -1027,6 +1018,12 @@ fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
         "the reply types are plain structs of strings, numbers, and sequences, which always \
          serialize",
     )
+}
+
+/// The JSON request body `body` as a `T`; when it does not parse, `error` of "unreadable
+/// request" and serde's reason, which names the line and column.
+fn parse_body<T: DeserializeOwned>(body: &[u8], error: fn(String) -> Error) -> Result<T> {
+    serde_json::from_slice(body).map_err(|problem| error(format!("unreadable request: {problem}")))
 }
 
 fn json_or_error(body: Result<Vec<u8>>) -> Reply {
