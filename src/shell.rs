@@ -294,8 +294,10 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
     };
     let mut launch_to_paint = None;
     let mut report = None;
+    // Set by the first quit: the event loop exits by then even if the site never closes.
+    let mut quit_by: Option<Instant> = None;
     event_loop.run_return(|event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = waiting(quit_by);
         match event {
             // The close button does what Close Window does, so a draft note stops it too.
             Event::WindowEvent {
@@ -306,7 +308,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                 // Gone from the screen at once: closing the site can take a while (a slow git
                 // call queued ahead of it, the snapshot after a live run).
                 window.set_visible(false);
-                close_site(&jobs, control_flow);
+                close_site(&jobs, &mut quit_by, control_flow);
             }
             Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
             // The system switched between light and dark while the window follows it.
@@ -363,7 +365,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                     launch_to_paint: launch_to_paint.unwrap_or_else(|| started.elapsed()),
                     page,
                 });
-                close_site(&jobs, control_flow);
+                close_site(&jobs, &mut quit_by, control_flow);
             }
             _ => {}
         }
@@ -390,7 +392,7 @@ enum Job {
     /// Answer a request from the page.
     Answer(Request<Vec<u8>>, Answer),
     /// Drop the site, which stops the agent of a run under way, then say so. Later requests
-    /// get 503.
+    /// are dropped unanswered: the page is closing.
     Close,
 }
 
@@ -431,14 +433,13 @@ fn spawn_site_worker(site: Site, closed: impl Fn() + Send + 'static) -> Result<S
             let mut site = Some(site);
             for job in jobs {
                 match job {
-                    Job::Answer(request, answer) => answer(match &site {
-                        Some(site) => site.respond(&request),
-                        None => reply(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "text/plain",
-                            &b"Postil is closing"[..],
-                        ),
-                    }),
+                    Job::Answer(request, answer) => {
+                        // After a close the request is dropped unanswered: answering goes
+                        // through the main run loop, which may have stopped by then.
+                        if let Some(site) = &site {
+                            answer(site.respond(&request));
+                        }
+                    }
                     Job::Close => {
                         drop(site.take());
                         closed();
@@ -450,13 +451,35 @@ fn spawn_site_worker(site: Site, closed: impl Fn() + Send + 'static) -> Result<S
     Ok(sender)
 }
 
+/// How the event loop waits for its next event: until `quit_by` once the app is quitting, and
+/// past it not at all.
+fn waiting(quit_by: Option<Instant>) -> ControlFlow {
+    match quit_by {
+        Some(deadline) if Instant::now() >= deadline => ControlFlow::Exit,
+        Some(deadline) => ControlFlow::WaitUntil(deadline),
+        None => ControlFlow::Wait,
+    }
+}
+
+/// How long quitting waits for the request thread to close the site before the app exits
+/// anyway. Closing stops a run's agent and takes the snapshot after the run (seconds for a
+/// large tree: 3.5 s measured for a 200 MB untracked file, docs/design.md), after any request
+/// queued ahead of it. Arbitrary above that: long enough for those, short enough that a
+/// request stuck on a dead network volume does not keep a hidden app running. Exiting at the
+/// deadline can leave that run's agent behind; accepted over an app that never quits.
+const QUIT_WAIT: Duration = Duration::from_secs(10);
+
 /// Asks the request thread to close the site; the event loop exits once it has
-/// ([`AppEvent::SiteClosed`]), or at once when that thread is gone. Asking twice is harmless:
-/// the second close finds no site and answers again.
-fn close_site(jobs: &Sender<Job>, control_flow: &mut ControlFlow) {
+/// ([`AppEvent::SiteClosed`]), at `quit_by` (set to [`QUIT_WAIT`] from the first ask), or at
+/// once when that thread is gone. Asking twice is harmless: the second close finds no site
+/// and says so again.
+fn close_site(jobs: &Sender<Job>, quit_by: &mut Option<Instant>, control_flow: &mut ControlFlow) {
     if jobs.send(Job::Close).is_err() {
         *control_flow = ControlFlow::Exit;
+        return;
     }
+    let deadline = *quit_by.get_or_insert_with(|| Instant::now() + QUIT_WAIT);
+    *control_flow = ControlFlow::WaitUntil(deadline);
 }
 
 /// Which drags over the window are the app's. A drag that carries files is: the webview
@@ -5364,6 +5387,9 @@ mod tests {
         ask("postil://localhost/api/notes", "second");
         jobs.send(Job::Close).unwrap();
         ask("postil://localhost/api/repo", "after");
+        // Every answer now held is the request thread's: once it has answered or dropped each,
+        // the channel closes.
+        drop(answer_sender);
 
         closed
             .recv_timeout(Duration::from_secs(60))
@@ -5375,16 +5401,12 @@ mod tests {
             end.contains("Postil closed the project while it ran"),
             "{end}"
         );
-        let answered: Vec<_> = (0..3)
-            .map(|_| answers.recv_timeout(Duration::from_secs(60)).unwrap())
-            .collect();
+        // The request after the close is dropped unanswered: answering it could wait on a
+        // main run loop that has stopped.
+        let answered: Vec<_> = answers.iter().collect();
         assert_eq!(
             answered,
-            [
-                ("first", StatusCode::OK),
-                ("second", StatusCode::OK),
-                ("after", StatusCode::SERVICE_UNAVAILABLE),
-            ]
+            [("first", StatusCode::OK), ("second", StatusCode::OK)]
         );
     }
 

@@ -359,9 +359,11 @@ impl Repo {
             File::open(&path).and_then(|opened| opened.take(MAX_READ + 1).read_to_end(&mut bytes));
         match read {
             Ok(read) if read as u64 > MAX_READ => {
-                // The size on disk says how far past the limit it is; one past the limit is a
-                // floor when the file cannot be measured.
-                let bytes = fs::metadata(&path).map_or(MAX_READ + 1, |metadata| metadata.len());
+                // The size on disk says how far past the limit it is, and one past the limit is
+                // the floor: the file may have shrunk, or vanished, since it was read.
+                let bytes = fs::metadata(&path)
+                    .map_or(0, |metadata| metadata.len())
+                    .max(MAX_READ + 1);
                 Err(Error::FileTooLarge { path, bytes })
             }
             Ok(_) => String::from_utf8(bytes).map_err(|error| Error::Read {
