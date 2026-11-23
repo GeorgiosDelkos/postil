@@ -2,7 +2,9 @@
 # additions), adapted for an application that ships on macOS only:
 # - fmt: rustfmt; needs no build, so it runs on Linux.
 # - clippy: no warnings, blocking. On macOS, because wry builds against GTK on Linux.
-# Dropped from the template: semver, doc and msrv (libraries only), hack (no features), and the
+# - doc: rustdoc with warnings denied. Cargo.toml denies broken intra-doc links, and clippy does
+#   not run rustdoc, so without this job a broken link merges green.
+# Dropped from the template: semver and msrv (libraries only), hack (no features), and the
 # beta clippy run: rust-toolchain.toml pins the toolchain, which would override the matrix.
 # A draft PR gets no CI (gh-actions-style): every job carries the draft condition and no job has
 # `needs:`, so a skipped run's green is replaced as soon as the PR is marked ready.
@@ -47,3 +49,17 @@ jobs:
           # Fails the build on any warning without touching RUSTFLAGS, so the build cache stays
           # shared with other cargo invocations.
           CARGO_BUILD_WARNINGS: deny
+  doc:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-latest
+    name: doc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: cargo doc
+        run: cargo doc --no-deps --locked --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
