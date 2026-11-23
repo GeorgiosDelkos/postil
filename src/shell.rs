@@ -3063,6 +3063,34 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_settings_file_keeps_its_link_and_its_mode() {
+        let repo = TempRepo::new("settings-linked");
+        let real = repo.root.join(".git/dotfiles/settings.json");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "{\"version\": 1, \"settings\": {}}\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        // Relative, as `ln -s` in a dotfiles setup often makes it: resolved from the link's
+        // directory, not from the process's.
+        let link = repo.config().join("settings.json");
+        fs::create_dir_all(repo.config()).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &link).unwrap();
+
+        let (status, reply) = save(&repo.empty_site(), &custom_settings().to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
+
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("../dotfiles/settings.json"),
+            "the link is still a link, to the same place"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(stored["settings"], custom_settings());
+        let mode = fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the file is as private as before");
+    }
+
+    #[test]
     fn every_page_module_is_served() {
         // The page imports its modules by name; one left out of PAGE stops the page.
         let site = Site::new(None, None, no_agents(), quiet());

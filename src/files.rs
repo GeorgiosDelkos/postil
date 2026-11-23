@@ -5,12 +5,20 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
 /// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`, so
 /// a crash leaves the old file or the new one and never a part. Creates the directory first
 /// when it does not exist.
+///
+/// A symbolic link at `file` is followed (through further links, up to [`MAX_LINKS`]) and the
+/// file it points at is replaced, so the link stays in place: an engineer who links
+/// `settings.json` into a dotfiles repository keeps the link. A link to a missing file
+/// creates that file. The new file takes the old one's permissions, so a `0600` file stays
+/// private; a new file gets the default mode (`0666` less the umask). The owner is not
+/// copied: the process can only create files it owns.
 ///
 /// A failure before the rename leaves the old file. After the rename the directory is synced,
 /// so the rename survives a power loss, and so is its parent, so a directory just created
@@ -19,12 +27,14 @@ use crate::error::{Error, Result};
 /// place and readers see it, and reporting a failed write would make the caller redo a write
 /// that happened (a note saved twice).
 ///
-/// At most one call per `file` may run at a time in one process; callers serialise
-/// (`notes` holds `review.lock`; `recent`, `settings`, `layout` and `folders` run only on the
-/// main thread: from `serve` before the event loop starts, then in the URL scheme handler, which wry
-/// calls on that thread). Separate processes use separate temporary files. A crash between
+/// Every call writes a temporary file of its own, so calls on one file at once, from this
+/// process or another, never write into each other's; the last rename wins. A crash between
 /// creating the temporary and the rename leaves it behind; readers ignore it.
 pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    // A unique name only: nothing is ordered by it.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+
+    let file = follow_links(file)?;
     let invalid = |problem| io::Error::new(io::ErrorKind::InvalidInput, problem);
     let dir = file
         .parent()
@@ -33,17 +43,27 @@ pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| invalid("a file to write needs a name"))?;
     fs::create_dir_all(dir)?;
+    let permissions = match fs::metadata(&file) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
 
     let temporary = dir.join(format!(
-        "{}.{}.tmp",
+        "{}.{}.{}.tmp",
         name.to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
         let mut out = File::create(&temporary)?;
+        // Before any byte is written, so the text is never readable under a wider mode.
+        if let Some(permissions) = permissions {
+            out.set_permissions(permissions)?;
+        }
         out.write_all(bytes)?;
         out.sync_all()?;
-        fs::rename(&temporary, file)
+        fs::rename(&temporary, &file)
     })();
     if written.is_err() {
         // Best effort: a leftover temporary file is ignored by every reader.
@@ -56,6 +76,43 @@ pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
         drop(File::open(parent).and_then(|parent| parent.sync_all()));
     }
     Ok(())
+}
+
+/// The most symbolic links [`write_atomically`] follows from one path: macOS's `MAXSYMLINKS`
+/// (`<sys/param.h>`), the count at which the system itself gives up on a path.
+const MAX_LINKS: usize = 32;
+
+/// `file` with the symbolic links at its end followed: the file it names, the missing file
+/// its last link points at, or `file` itself when it is not a link.
+///
+/// After [`MAX_LINKS`] links it stops and returns the path it reached, still a link: the
+/// system then refuses that path with ELOOP ("too many levels of symbolic links") at the
+/// first use, so a cycle fails with the system's own message instead of looping here.
+fn follow_links(file: &Path) -> io::Result<PathBuf> {
+    let mut file = file.to_owned();
+    for _ in 0..MAX_LINKS {
+        let target = match fs::read_link(&file) {
+            Ok(target) => target,
+            // `readlink` fails with EINVAL on a path that is not a link and with ENOENT on a
+            // missing one: either way this is the file to write.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+                ) =>
+            {
+                return Ok(file);
+            }
+            Err(error) => return Err(error),
+        };
+        // A relative target is relative to the link's directory; `join` keeps an absolute one
+        // as it is.
+        let dir = file
+            .parent()
+            .expect("a path that is a link has a parent, the empty path for a bare name");
+        file = dir.join(target);
+    }
+    Ok(file)
 }
 
 /// The app's configuration directory: `$XDG_CONFIG_HOME/postil` when that variable holds an
@@ -113,5 +170,39 @@ mod tests {
     fn a_path_without_a_file_name_is_refused_before_anything_is_written() {
         let error = write_atomically(Path::new("/"), b"x").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// An empty directory in the temporary directory. `name` must differ between tests.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("postil-files-{}-{name}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_link_to_a_missing_file_creates_that_file_and_stays_a_link() {
+        let dir = temp_dir("dangling");
+        let link = dir.join("settings.json");
+        std::os::unix::fs::symlink("real.json", &link).unwrap();
+
+        write_atomically(&link, b"new").unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("real.json"));
+        assert_eq!(fs::read(dir.join("real.json")).unwrap(), b"new");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cycle_of_links_is_refused_and_nothing_is_written() {
+        let dir = temp_dir("cycle");
+        std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
+
+        let error = write_atomically(&dir.join("a"), b"x").unwrap_err();
+
+        assert!(error.to_string().contains("symbolic links"), "{error}");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "only the two links");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
