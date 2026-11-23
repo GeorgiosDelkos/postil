@@ -222,8 +222,8 @@ As built in milestone 2 (`src/notes.rs`):
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
   naming a resolved note is refused (400), and a run that takes its turn after the note was
-  resolved leaves it resolved. The tray lists resolved notes last, and the page offers no send
-  for them.
+  resolved leaves it resolved, with that run. The tray lists resolved notes last, and the page
+  offers no send for them.
 - **Placing a note:** it stays where its snippet still is, or moves to the only other copy of
   the snippet; with several copies and none at its last lines its anchor is lost. The nearest
   copy is not taken: short lines such as `}` repeat, and the nearest is often the wrong one.

@@ -285,8 +285,9 @@ pub(crate) struct Prompt {
 ///
 /// # Errors
 ///
-/// As [`current`]; [`Error::BadRequest`] as for [`prompt`]; [`Error::WriteReview`] when
-/// the lock or the file cannot be written.
+/// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, or holds
+/// something that is not a note id; [`Error::WriteReview`] when the lock or the file
+/// cannot be written.
 pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<()> {
     let wanted = parse_ids(ids)?;
     let file = repo.review_file();
