@@ -376,26 +376,18 @@ impl Runner {
         Ok(replaced)
     }
 
-    /// Goes on with the review once a stage ended well, given the findings it proposed: the
-    /// next reviewer starts, unless this was the last, or only a judge is left and nothing
-    /// was found. Runs on a thread of its own: the stage's agent is replaced, and dropping an
+    /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
+    /// ended. Runs on a thread of its own: the stage's agent is replaced, and dropping an
     /// agent from its own reader thread would wait on itself.
-    fn advance(self: &Arc<Self>, ended: &str, findings: Vec<Finding>) {
+    fn advance(self: &Arc<Self>, ended: &str) {
         let mut slot = self.slot();
         // A send, a stop, or another review meanwhile took the chain, or replaced its run.
         let current = slot.run.as_ref().map(|run| run.state().header.id.clone());
-        let Some(mut chain) = slot.chain.take() else {
+        let Some(chain) = slot.chain.take() else {
             return;
         };
         if current.as_deref() != Some(ended) {
             slot.chain = Some(chain);
-            return;
-        }
-        chain.findings.extend(findings);
-        chain.stage.reviewer += 1;
-        let done = chain.stage.reviewer > chain.stage.reviewers
-            || (chain.stage.judges() && chain.findings.is_empty());
-        if done {
             return;
         }
         match self.start_stage(&mut slot, chain) {
@@ -768,6 +760,11 @@ impl Runner {
 
 #[cfg(test)]
 impl Runner {
+    /// Whether a review is under way: decided as each stage ends, before its end is logged.
+    pub(crate) fn reviewing(&self) -> bool {
+        self.slot().chain.is_some()
+    }
+
     /// Moves the run's first Stop back by [`FORCE_AFTER`], so a test can force a stop without
     /// waiting that long.
     pub(crate) fn backdate_stop(&self) {
@@ -860,10 +857,20 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     if let Some(run) = run {
         // A proposer's findings are read from its reply as its turn ends, and logged before
         // the end, while the run still takes entries.
+        // Whether the review goes on is decided here, before the stage's end is logged: a
+        // reader that sees the end sees the decision. Only starting the next stage waits for
+        // a thread of its own.
         if ended_well && let Some((stage, found)) = &stage {
-            match end_stage(&run, stage, *found) {
-                Some(findings) => next = Some((run.state().header.id.clone(), findings)),
-                None => runner.slot().chain = None,
+            let findings = end_stage(&run, stage, *found);
+            let mut slot = runner.slot();
+            let goes = match (findings, slot.chain.as_mut()) {
+                (Some(findings), Some(chain)) => goes_on(chain, findings),
+                _ => false,
+            };
+            if goes {
+                next = Some(run.state().header.id.clone());
+            } else {
+                slot.chain = None;
             }
         }
         if let Some(ids) = run.record_event(event, answer, runner.repo.root()) {
@@ -873,11 +880,11 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
     (runner.notify)();
-    if let Some((ended, findings)) = next {
+    if let Some(ended) = next {
         let next = Arc::clone(&runner);
         let advanced = std::thread::Builder::new()
             .name("review-next".to_owned())
-            .spawn(move || next.advance(&ended, findings));
+            .spawn(move || next.advance(&ended));
         if let Err(error) = advanced {
             let mut slot = runner.slot();
             slot.chain = None;
@@ -911,6 +918,16 @@ fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> O
         request: request.number,
         option: Some(option),
     })
+}
+
+/// Moves `chain` to its next stage, given the findings of the stage that ended. Returns
+/// whether there is one to start: not past the last reviewer, and not a judge with nothing
+/// to judge.
+fn goes_on(chain: &mut Chain, findings: Vec<Finding>) -> bool {
+    chain.findings.extend(findings);
+    chain.stage.reviewer += 1;
+    chain.stage.reviewer <= chain.stage.reviewers
+        && !(chain.stage.judges() && chain.findings.is_empty())
 }
 
 /// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
@@ -1882,5 +1899,86 @@ mod tests {
         );
         drop(state);
         drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn the_work_holds_each_finished_call_s_last_diffs_and_the_reply_by_message() {
+        let dir = std::env::temp_dir().join(format!("postil-run-work-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", None).unwrap();
+        let diff = |after: &str| Output::Diff {
+            path: "a.rs".to_owned(),
+            old_text: None,
+            new_text: after.to_owned(),
+        };
+        let tool = |id: &str, status, output| Entry::Tool {
+            id: id.to_owned(),
+            title: "Edit".to_owned(),
+            tool: ToolKind::Edit,
+            status,
+            places: Vec::new(),
+            output,
+        };
+        let message = |text: &str, id: &str| Entry::Message {
+            text: text.to_owned(),
+            message: Some(id.to_owned()),
+        };
+        for entry in [
+            tool("t1", ToolCallStatus::Pending, Vec::new()),
+            tool("t2", ToolCallStatus::Completed, vec![diff("second")]),
+            Entry::ToolUpdate {
+                id: "t1".to_owned(),
+                title: None,
+                tool: None,
+                status: Some(ToolCallStatus::Completed),
+                places: None,
+                output: Some(vec![diff("first")]),
+            },
+            message("one ", "m1"),
+            message("part", "m1"),
+            message("two", "m2"),
+        ] {
+            run.record(entry);
+        }
+
+        let work = run.state().work();
+        let afters: Vec<_> = work.diffs.iter().map(|diff| diff.after.as_str()).collect();
+        assert_eq!(afters, ["first", "second"], "the update reached t1 only");
+        assert_eq!(work.reply, "one part\n\ntwo");
+        drop(run);
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_chain_s_debug_output_counts_its_findings_and_never_shows_their_text() {
+        let chain = Chain {
+            stage: Stage {
+                of: "R1".to_owned(),
+                reviewer: 2,
+                reviewers: 2,
+            },
+            reviewers: Vec::new(),
+            work: Work {
+                prompt: "secret note".to_owned(),
+                reply: "secret reply".to_owned(),
+                diffs: Vec::new(),
+            },
+            notes: vec!["N1".to_owned()],
+            files: Vec::new(),
+            findings: vec![Finding {
+                id: "F1".to_owned(),
+                note: None,
+                path: None,
+                line: None,
+                text: "secret finding".to_owned(),
+                fix: Some("secret fix".to_owned()),
+            }],
+        };
+        let shown = format!("{chain:?}");
+        assert!(
+            shown.contains("reviewer: 2") && shown.contains("findings: 1"),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret"), "{shown}");
     }
 }

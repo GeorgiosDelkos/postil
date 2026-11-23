@@ -3475,6 +3475,15 @@ mod tests {
             "the judge is given the findings: {judge}"
         );
         assert!(kinds(&judge).contains(&"message:F1: accepted - said more".to_owned()));
+        let got = kinds(&proposer)
+            .into_iter()
+            .find(|kind| kind.starts_with("message:got "))
+            .unwrap();
+        assert!(
+            got.contains("a.txt\n\nprompt 1"),
+            "the reviewed reply, its messages a blank line apart: {got}"
+        );
+        assert!(!site.runner().unwrap().reviewing(), "the judge ends it");
         assert_eq!(
             states(&site),
             [serde_json::json!({ "kind": "sent", "run": "R1" })],
@@ -3484,6 +3493,10 @@ mod tests {
         let (status, body) = review("R2");
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("is itself a review"), "{body}");
+        assert_eq!(
+            get(&site, &format!("{RUN}/review")).0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 
     /// Saves Fake (`author`) as the agent notes go to and `reviewers`, each a (name,
@@ -3539,6 +3552,14 @@ mod tests {
             kinds(&proposer).contains(&"message:saw the edit: true".to_owned()),
             "the run's diff, before and after, is in the prompt: {proposer}"
         );
+        let linked = kinds(&proposer)
+            .into_iter()
+            .find(|kind| kind.starts_with("message:got "))
+            .unwrap();
+        assert!(
+            linked.ends_with(&format!(" | {}", file_uri_of(&repo, "src/a.rs"))),
+            "the edited file is linked once: {linked}"
+        );
     }
 
     #[test]
@@ -3573,10 +3594,14 @@ mod tests {
                     "{scenario}: {found}"
                 );
             }
+            assert!(
+                !site.runner().unwrap().reviewing(),
+                "{scenario}: no judge starts"
+            );
             assert_eq!(
                 get_json(&site, RUNS)["runs"],
                 serde_json::json!(["R2", "R1"]),
-                "{scenario}: no judge starts"
+                "{scenario}"
             );
         }
     }
@@ -3610,6 +3635,7 @@ mod tests {
             serde_json::json!(["R2", "R1"]),
             "no judge"
         );
+        assert!(!site.runner().unwrap().reviewing());
 
         // The kept agent is the reviewer's, told not to change files: a send starts afresh.
         send(&site, &["N2"]);
