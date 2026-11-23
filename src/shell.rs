@@ -3679,6 +3679,26 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_run_counter_is_repaired_by_the_next_run() {
+        let repo = TempRepo::new("run-counter");
+        repo.write("a.txt", "a\nb\n");
+        let runs = repo.root.join(".git/postil/runs");
+        fs::create_dir_all(&runs).unwrap();
+        // A tail a crash left, which never parses: it reads as no number.
+        fs::write(runs.join("active.lock"), "5\0\0").unwrap();
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R1");
+
+        // R1 goes with N1; its number must not come back, which needs the counter readable.
+        delete(&site, &format!("{NOTES}?id=N1"));
+        send(&site, &["N2"]);
+        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R2");
+    }
+
+    #[test]
     fn bad_run_requests_name_the_problem_and_make_no_run() {
         let repo = TempRepo::new("run-bad");
         repo.write("a.txt", "a\n");

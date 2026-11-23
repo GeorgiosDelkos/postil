@@ -34,7 +34,8 @@
 //!
 //! The app never rewrites a log. It reads logs to show runs, and deletes one with the last of
 //! its notes (`Runner::delete_runs_without_notes`). `runs/active.lock` also holds the highest
-//! run number ever given, so a deleted run's number is never given again (`last_run`). A log
+//! run number ever given, so a deleted run's number is not given again unless a crash loses
+//! the counter (`last_run`). A log
 //! with no end is shown as unfinished: the app quit or the project was closed while it ran,
 //! or another window is running it.
 //!
@@ -835,7 +836,7 @@ impl Run {
             },
         })?;
 
-        // A deleted run's number is never given again (`last_run`): a page that read the old R5
+        // A deleted run's number is not given again (`last_run`): a page that read the old R5
         // would show a new R5 as the old one.
         let used = last_run(&mut active).map_err(error(&active_path))?;
         let mut number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
@@ -1203,8 +1204,9 @@ fn highest_run(dir: &Path) -> io::Result<u64> {
 
 /// The highest run number ever given, kept as text in `runs/active.lock`, the file every new
 /// run locks: logs are deleted with their notes, so the highest log left can be lower. 0 when
-/// the file is new, or holds no number: a build before this one left it empty, or a crash
-/// lost the last update. The highest log left then decides the next number.
+/// the file is new or holds no number (a build before this one left it empty, or a crash tore
+/// the write). A crash can also leave an older, lower number. Either way the highest log left
+/// then decides, and a deleted run above it can get its number again.
 fn last_run(active: &mut File) -> io::Result<u64> {
     let mut text = String::new();
     active.seek(SeekFrom::Start(0))?;
@@ -1213,11 +1215,14 @@ fn last_run(active: &mut File) -> io::Result<u64> {
 }
 
 /// Records `number` as the highest run number given. The caller holds the file's lock.
-/// Numbers only grow, so the new text covers the old one and the file is not truncated: a
-/// truncate then a crash would leave it empty. Not synced, like the logs.
+/// Written over the old text, then cut to its length: a truncate first and a crash would
+/// leave the file empty, and without the cut a damaged tail would stay and never parse
+/// again. Not synced, like the logs.
 fn record_last_run(active: &mut File, number: u64) -> io::Result<()> {
+    let text = number.to_string();
     active.seek(SeekFrom::Start(0))?;
-    active.write_all(number.to_string().as_bytes())
+    active.write_all(text.as_bytes())?;
+    active.set_len(text.len() as u64)
 }
 
 /// A session update as a log entry; `None` for what the run panel does not show.
