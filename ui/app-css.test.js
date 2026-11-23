@@ -32,11 +32,10 @@ test("every colour in the rules is a palette variable", () => {
 
 test("Paper sets every colour Graphite sets", () => {
   const paper = declared(light.text);
-  const colors = dark.text
-    .split("\n")
-    .filter((line) => COLOR.test(line))
-    .map((line) => line.match(/(--[\w-]+):/)?.[1])
-    .filter(Boolean);
+  // A declaration's value may run over several lines, as a shadow list does.
+  const colors = [...dark.text.matchAll(/(--[\w-]+):([^;]*);/g)]
+    .filter(([, , value]) => COLOR.test(value))
+    .map(([, name]) => name);
   assert.ok(colors.length > 30, "the dark palette was found");
   assert.deepEqual(
     colors.filter((name) => !paper.has(name)),

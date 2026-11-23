@@ -515,9 +515,9 @@ kbd {
   position: sticky;
   left: var(--gutter-width);
   /* What the code pane shows right of the gutter, less 16 px clear of its edge, up to 640 px.
-     The pane keeps at least 420 px (CODE_MIN in ui/panes.js), which leaves 320 px beside
-     the gutter of most files; where it does not, the composer keeps 320 px and the pane
-     scrolls sideways to it. */
+     The pane keeps 420 px (CODE_MIN in ui/panes.js) unless the window is too narrow for it,
+     which leaves 320 px beside the gutter of most files; where it does not, the composer
+     keeps 320 px and the pane scrolls sideways to it. */
   width: min(640px, 100cqw - var(--gutter-width) - 16px);
   min-width: 320px;
   margin: 8px 0 10px var(--gutter-width);
@@ -563,8 +563,8 @@ kbd {
 }
 
 /* The text area has no edge of its own: the composer's border shows its focus, as a text
-   field's does (.field). */
-.composer:has(textarea:focus-visible) {
+   field's does (.field). The text area has focus whenever the composer opens. */
+.composer:has(textarea:focus) {
   border-color: var(--accent);
 }
 
@@ -2605,7 +2605,8 @@ body.resizing * {
 
 /* A status's tone (`tone` in ui/status.js and ui/run.js), on the words and dots that show
    it. These rules follow every rule that gives such an element its plain colour, so they win
-   at the same specificity. `busy` and `idle` keep the plain colour. */
+   at the same specificity. `busy` and `idle` keep the plain colour, except the status dot's
+   own `busy` rule. */
 .tone-done {
   color: var(--added);
 }
@@ -2822,13 +2823,16 @@ body.resizing * {
   outline: none;
 }
 
-/* The scrolling panes take focus so the keyboard scrolls them. A click shows nothing; focus
-   reached by the keyboard is drawn inside the pane's edge, where nothing clips it. */
-.code:focus-visible,
-.prompt-preview:focus-visible,
-.changes-view:focus-visible {
+/* The scrolling panes take focus so the keyboard scrolls them. After a key, focus on one is
+   drawn inside its edge; after the pointer, nothing is (ui/app.js sets `keyboard-input`).
+   The ring's bottom corners follow the pane's (10 px less its 1 px border), which would
+   otherwise cut them. */
+body.keyboard-input .code:focus-visible,
+body.keyboard-input .prompt-preview:focus-visible,
+body.keyboard-input .changes-view:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+  border-radius: 0 0 9px 9px;
 }
 
 .changes-notice {

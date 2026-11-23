@@ -468,6 +468,18 @@ window.addEventListener("mousedown", (event) => {
   window.ipc.postMessage("drag");
 });
 
+// Whether the last input was a key, for the focus rings of the scrolling panes (app.css,
+// `keyboard-input`). `:focus-visible` alone is not enough: the page moves focus to the code
+// pane by script, and WebKit then shows the ring whenever the element that had focus showed
+// it, which a focused text area always does. Clicking Save in the composer would ring the
+// whole code pane. Captured, so a handler that stops the event cannot hide it.
+window.addEventListener("keydown", () => document.body.classList.add("keyboard-input"), true);
+window.addEventListener(
+  "pointerdown",
+  () => document.body.classList.remove("keyboard-input"),
+  true,
+);
+
 // ---- Start --------------------------------------------------------------------------------
 
 function showRepo(repo) {
