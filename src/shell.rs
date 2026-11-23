@@ -227,7 +227,7 @@ fn start_site(dir: Option<&Path>, bench: Option<&str>, notify: Notify) -> Result
     };
     let site = Site::new(config.as_deref(), bench, agents, notify);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
-        site.open(repo);
+        site.open(repo, LiveRun::Stop)?;
     }
     // A benchmark of a file that cannot be read would time an empty pane and report it as a
     // result. Fail here instead, before the window opens.
@@ -778,6 +778,19 @@ struct PreviewView {
 #[serde(deny_unknown_fields)]
 struct FolderRequest {
     path: PathBuf,
+    /// Whether to stop a run under way in another project; refused (409) without it. The
+    /// page sends it once the engineer agreed.
+    #[serde(default)]
+    stop: bool,
+}
+
+/// What opening another project does while the open one has a run under way.
+#[derive(Debug, Clone, Copy)]
+enum LiveRun {
+    /// Refuses to open it, so the page can ask first.
+    Refuse,
+    /// Stops the run.
+    Stop,
 }
 
 /// The reply to `/api/file`.
@@ -832,7 +845,24 @@ impl Site {
 
     /// Makes `repo` the open project and puts it first among the recent projects. A
     /// benchmark does not count as opening: a scripted run must not reorder the list.
-    fn open(&self, repo: Repo) {
+    ///
+    /// Opening the project that is open keeps its runner, and with it a run under way and
+    /// the kept agent: the page only reloads. Opening another one stops the open project's
+    /// agent, and `live` says whether to do that during a run (decided with the owner on
+    /// 2026-11-23: the page asks first). Holds the project's lock from the check to the
+    /// switch, so no request for the open project comes between them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TurnRunning`] when `live` is [`LiveRun::Refuse`], `repo` is another project,
+    /// and the open project has a run or a review under way.
+    fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
+        let mut project = lock(&self.project);
+        let open = project.as_ref();
+        let same = open.is_some_and(|open| open.repo.root() == repo.root());
+        if !same && matches!(live, LiveRun::Refuse) && open.is_some_and(|open| open.runner.busy()) {
+            return Err(Error::TurnRunning);
+        }
         let warning = match (&self.recent_file, &self.bench) {
             (_, Some(_)) => None,
             (None, None) => Some(format!("recent projects are off: {}", Error::NoHome)),
@@ -840,21 +870,28 @@ impl Site {
                 .err()
                 .map(|error| error_chain(&error)),
         };
+        if let Some(open) = project.as_mut().filter(|_| same) {
+            open.warning = warning;
+            return Ok(());
+        }
         let repo = Arc::new(repo);
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
             Arc::clone(&self.notify),
         );
-        let old = lock(&self.project).replace(Project {
+        let old = project.replace(Project {
             repo,
             runner,
             warning,
         });
-        // Stops the agent of the project this one replaces.
+        drop(project);
+        // Stops the agent of the project this one replaces, after the lock: that waits for
+        // its process.
         if let Some(old) = old {
             old.runner.close();
         }
+        Ok(())
     }
 
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
@@ -988,7 +1025,12 @@ impl Site {
     fn open_folder(&self, body: &[u8], open_repo: fn(&Path) -> Result<Repo>) -> Result<Vec<u8>> {
         let request: FolderRequest = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
-        self.open(open_repo(&request.path)?);
+        let live = if request.stop {
+            LiveRun::Stop
+        } else {
+            LiveRun::Refuse
+        };
+        self.open(open_repo(&request.path)?, live)?;
         Ok(b"{}".to_vec())
     }
 
@@ -1517,7 +1559,8 @@ mod tests {
         /// A site with this repository open.
         fn site(&self) -> Site {
             let site = self.empty_site();
-            site.open(Repo::open(&self.root).unwrap());
+            site.open(Repo::open(&self.root).unwrap(), LiveRun::Stop)
+                .unwrap();
             site
         }
 
@@ -2410,7 +2453,8 @@ mod tests {
         let repo = TempRepo::new("recent-off");
         let site = Site::new(None, None, no_agents(), quiet());
 
-        site.open(Repo::open(&repo.root).unwrap());
+        site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         let info = get_json(&site, "postil://localhost/api/repo");
         assert_eq!(
             info["warning"],
@@ -2426,7 +2470,8 @@ mod tests {
         let recent = repo.config().join("recent.json");
         let site = Site::new(Some(&repo.config()), Some("a.rs"), no_agents(), quiet());
 
-        site.open(Repo::open(&repo.root).unwrap());
+        site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         assert!(!recent.exists());
         assert_eq!(
             get_json(&site, "postil://localhost/api/repo")["warning"],
@@ -2467,7 +2512,8 @@ mod tests {
         repo.write("src/a.rs", "fn a() {}\n");
 
         let site = Site::new(Some(&repo.config()), Some("src/a.rs"), no_agents(), quiet());
-        site.open(Repo::open(&repo.root.join("src")).unwrap());
+        site.open(Repo::open(&repo.root.join("src")).unwrap(), LiveRun::Stop)
+            .unwrap();
         let info = get_json(&site, "postil://localhost/api/repo");
 
         assert_eq!(info["files"], serde_json::json!(["src/a.rs"]));
@@ -3178,7 +3224,8 @@ mod tests {
             Scanner::new(move || path.clone()),
             notify,
         );
-        site.open(Repo::open(&repo.root).unwrap());
+        site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         set_agents(&site, &[("Fake", &fake_agent(scenario))], "Fake");
         (site, nudges)
     }
@@ -4583,7 +4630,8 @@ mod tests {
         };
         assert!(alive(), "the agent is kept after its run");
 
-        site.open(Repo::open(&other.root).unwrap());
+        site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         assert!(!alive(), "opening another project stopped it");
         assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
     }
@@ -4779,7 +4827,8 @@ mod tests {
         send(&site, &["N1"]);
         wait_for_pid(&pid_file);
 
-        site.open(Repo::open(&other.root).unwrap());
+        site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         wait_for_exit(&pid_file);
     }
 
@@ -4982,6 +5031,48 @@ mod tests {
             kinds.contains(&"message:after the long line".to_owned()),
             "the line after it is read whole"
         );
+    }
+
+    #[test]
+    fn opening_during_a_run_keeps_it_for_the_same_project_and_asks_first_for_another() {
+        let repo = TempRepo::new("run-open-live");
+        let other = TempRepo::new("run-open-live-other");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "ask");
+        post_note(&site, "a.txt", 1, 1, "one");
+        let open = |path: &Path, stop: bool| {
+            let body = serde_json::json!({ "path": path, "stop": stop }).to_string();
+            post(&site, "postil://localhost/api/open", &body)
+        };
+        send(&site, &["N1"]);
+        let waiting = wait_for(&site, &nudges, "waiting");
+
+        // Dropping the open project on the window again: the run and its agent stay.
+        assert_eq!(open(&repo.root, false).0, StatusCode::OK);
+        assert_eq!(get_json(&site, RUN)["status"], "waiting");
+        let (status, body) = open(&other.root, false);
+        assert_eq!(status, StatusCode::CONFLICT, "another project: {body}");
+        assert_eq!(get_json(&site, RUN)["status"], "waiting");
+        let request = first_of_kind(&waiting, "question")["request"].clone();
+        let content = serde_json::json!({ "question_0": "Yes" });
+        let body = serde_json::json!({ "request": request, "content": content }).to_string();
+        let (status, body) = post(&site, &format!("{RUN}/question"), &body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the agent that asked is still there: {body}"
+        );
+        wait_for(&site, &nudges, "ended");
+
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "waiting");
+        let (status, body) = open(&other.root, true);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            get_json(&site, "postil://localhost/api/repo")["root"],
+            site_root(&other.root)
+        );
+        assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
     }
 
     #[test]
@@ -5191,7 +5282,9 @@ mod tests {
         // the project's.
         let other = TempRepo::new("layout-other");
         let again = Site::new(Some(&repo.config()), None, no_agents(), quiet());
-        again.open(Repo::open(&other.root).unwrap());
+        again
+            .open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+            .unwrap();
         let kept = get_json(&again, LAYOUT);
         assert_eq!(
             (kept["sidebar"].clone(), kept["tray"].clone()),

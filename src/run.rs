@@ -882,6 +882,13 @@ impl Runner {
         Ok(())
     }
 
+    /// Whether this window has a run under way, or a review between two stages, whose next
+    /// stage starts with no request from the page.
+    pub(crate) fn busy(&self) -> bool {
+        let slot = self.slot();
+        slot.chain.is_some() || slot.run.as_ref().is_some_and(|run| run.state().live())
+    }
+
     /// Stops the agent, running or starting, and ignores anything it would still report: the
     /// project is closing, or the app quits.
     pub(crate) fn close(&self) {
