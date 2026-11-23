@@ -175,4 +175,15 @@ mod tests {
         assert_eq!(list(&file), ["/p/b"]);
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let file = temp_file("bytes");
+        record(&file, Path::new("/p/a")).unwrap();
+        record(&file, Path::new("/p/b")).unwrap();
+        let expected =
+            "{\n  \"version\": 1,\n  \"projects\": [\n    \"/p/b\",\n    \"/p/a\"\n  ]\n}\n";
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        drop(fs::remove_dir_all(file.parent().unwrap()));
+    }
 }

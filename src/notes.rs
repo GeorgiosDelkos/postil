@@ -815,4 +815,52 @@ mod tests {
         }
         assert!(format!("{review:?}").contains("NoteId(1)"));
     }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("postil-notes-{}-bytes", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        let file = dir.join("review.json");
+        let note = |id, state| Note {
+            id: NoteId(id),
+            path: "src/a.rs".to_owned(),
+            lines: range(2, 3),
+            snippet: "b\nc".to_owned(),
+            body: "Why?".to_owned(),
+            anchor: Anchor::Found,
+            state,
+        };
+        let review = Review {
+            version: VERSION,
+            notes: vec![
+                note(1, NoteState::Open {}),
+                note(
+                    2,
+                    NoteState::Sent {
+                        run: "R1".to_owned(),
+                    },
+                ),
+                note(3, NoteState::Resolved { run: None }),
+            ],
+        };
+
+        review.save(&file).unwrap();
+
+        let note_json = |id: u32, state: &str| {
+            format!(
+                "    {{\n      \"id\": \"N{id}\",\n      \"path\": \"src/a.rs\",\n      \
+                 \"lines\": {{\n        \"start\": 2,\n        \"end\": 3\n      }},\n      \
+                 \"snippet\": \"b\\nc\",\n      \"body\": \"Why?\",\n      \
+                 \"anchor\": \"found\",\n      \"state\": {{\n{state}\n      }}\n    }}"
+            )
+        };
+        let expected = format!(
+            "{{\n  \"version\": 3,\n  \"notes\": [\n{},\n{},\n{}\n  ]\n}}\n",
+            note_json(1, "        \"kind\": \"open\""),
+            note_json(2, "        \"kind\": \"sent\",\n        \"run\": \"R1\""),
+            note_json(3, "        \"kind\": \"resolved\""),
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        drop(fs::remove_dir_all(&dir));
+    }
 }

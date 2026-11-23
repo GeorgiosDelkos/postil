@@ -143,4 +143,17 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), newer);
         drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let file = temp_file("bytes");
+        let folders = Folders {
+            open: vec!["src".to_owned(), "src/acp".to_owned()],
+        };
+        save(&file, folders).unwrap();
+        let expected =
+            "{\n  \"version\": 1,\n  \"open\": [\n    \"src\",\n    \"src/acp\"\n  ]\n}\n";
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
+    }
 }

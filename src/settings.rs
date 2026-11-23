@@ -353,4 +353,53 @@ mod tests {
         assert_eq!(revision_of(""), "cbf29ce484222325");
         assert_eq!(revision_of("a"), "af63dc4c8601ec8c");
     }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let dir =
+            std::env::temp_dir().join(format!("postil-settings-{}-bytes", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        let file = dir.join("settings.json");
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "theme": "dark",
+            "codeFontSize": 14,
+            "tabWidth": 2,
+            "reopenLastProject": true,
+            "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
+            "enabledAgents": ["Claude", "Local"],
+            "agent": "Local",
+            "reviewers": ["Claude", "Claude"],
+        }))
+        .unwrap();
+
+        save(&file, &settings, "").unwrap();
+
+        let expected = r#"{
+  "version": 1,
+  "settings": {
+    "theme": "dark",
+    "codeFontSize": 14,
+    "tabWidth": 2,
+    "reopenLastProject": true,
+    "customAgents": [
+      {
+        "name": "Local",
+        "command": "local-agent --acp"
+      }
+    ],
+    "enabledAgents": [
+      "Claude",
+      "Local"
+    ],
+    "agent": "Local",
+    "reviewers": [
+      "Claude",
+      "Claude"
+    ]
+  }
+}
+"#;
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        drop(fs::remove_dir_all(&dir));
+    }
 }
