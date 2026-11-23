@@ -1240,7 +1240,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsChanged
                 | Error::TurnRunning
                 | Error::RunElsewhere => StatusCode::CONFLICT,
-                Error::NoSuchNote { .. } | Error::NoSuchPermission | Error::NoSuchRun { .. } => {
+                Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
                     StatusCode::NOT_FOUND
                 }
                 // The agent, the server behind this one, failed.
@@ -2715,7 +2715,7 @@ mod tests {
 
     #[test]
     fn every_page_module_is_served() {
-        // The page imports its modules by name; one left out of `respond` stops the page.
+        // The page imports its modules by name; one left out of PAGE stops the page.
         let site = Site::new(None, None, no_agents(), quiet());
         let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
         for entry in fs::read_dir(&ui).unwrap() {
@@ -3301,6 +3301,21 @@ mod tests {
         assert_eq!(
             ended["entries"][question + 1]["option"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_permission_request_with_no_allow_once_option_is_allowed_always() {
+        let repo = TempRepo::new("run-always-only");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "always-only");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let ended = wait_for(&site, &nudges, "ended");
+        assert_eq!(first_of_kind(&ended, "answer")["option"], "always");
+        assert!(
+            kinds(&ended).contains(&"message:chose always".to_owned()),
+            "{ended}"
         );
     }
 

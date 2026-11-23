@@ -397,7 +397,7 @@ pub(crate) struct ElicitationParams {
 }
 
 /// The app's answer to a question: the form's values, a skip, or the turn's cancel.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
 pub(crate) enum ElicitationReply {
     Accept {

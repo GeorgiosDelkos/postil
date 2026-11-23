@@ -169,6 +169,19 @@ async function prompt(id, params) {
       say("withdrew it");
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "always-only": {
+      // No "once": Postil allows always, the option that allows.
+      const reply = await ask("session/request_permission", {
+        sessionId: "S1",
+        toolCall: { toolCallId: "t1", title: "Edit src/a.rs", kind: "edit" },
+        options: [
+          { optionId: "no", name: "Reject", kind: "reject_once" },
+          { optionId: "always", name: "Always allow", kind: "allow_always" },
+        ],
+      });
+      say(`chose ${reply.result.outcome.optionId}`);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "reject-only": {
       // No option allows, so Postil cannot answer it alone: the engineer does.
       const reply = await ask("session/request_permission", {

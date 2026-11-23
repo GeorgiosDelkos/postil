@@ -186,8 +186,9 @@ pub enum Error {
     TurnRunning,
     /// A run was asked for while another window runs one on the same working tree.
     RunElsewhere,
-    /// A permission request was answered that is not open: already answered, or cancelled.
-    NoSuchPermission,
+    /// A permission request or question was answered that is not open: already answered,
+    /// withdrawn by the agent, or cancelled.
+    NoSuchRequest,
     /// A run was asked for by an id that names no readable run log.
     NoSuchRun {
         /// The id asked for, `R2`.
@@ -329,9 +330,9 @@ impl fmt::Display for Error {
                 "another Postil window is running an agent on this working tree (wait for it, \
                  or stop it there)"
             ),
-            Self::NoSuchPermission => write!(
+            Self::NoSuchRequest => write!(
                 f,
-                "that permission request is no longer open (it was answered or cancelled)"
+                "that request is no longer open (it was answered, withdrawn or cancelled)"
             ),
             Self::NoSuchRun { id, problem } => write!(f, "cannot show the run {id}: {problem}"),
         }
@@ -390,7 +391,7 @@ impl std::error::Error for Error {
             | Self::AgentProtocol(_)
             | Self::TurnRunning
             | Self::RunElsewhere
-            | Self::NoSuchPermission
+            | Self::NoSuchRequest
             | Self::NoSuchRun { .. } => None,
         }
     }

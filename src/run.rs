@@ -299,7 +299,7 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when no agent is running, and as [`Agent::answer_question`].
+    /// [`Error::NoSuchRequest`] when no agent is running, and as [`Agent::answer_question`].
     pub(crate) fn reply(
         &self,
         request: usize,
@@ -307,7 +307,7 @@ impl Runner {
     ) -> Result<()> {
         let slot = self.slot();
         let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
-            return Err(Error::NoSuchPermission);
+            return Err(Error::NoSuchRequest);
         };
         let reply = match &content {
             Some(content) => ElicitationReply::Accept {
@@ -327,12 +327,12 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when no agent is running, and as
+    /// [`Error::NoSuchRequest`] when no agent is running, and as
     /// [`Agent::answer_permission`], which keeps the table of open requests.
     pub(crate) fn answer(&self, request: usize, option: &str) -> Result<()> {
         let slot = self.slot();
         let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
-            return Err(Error::NoSuchPermission);
+            return Err(Error::NoSuchRequest);
         };
         // The agent checks the option against what it offered; only an accepted answer is
         // logged, so a refused one can be made again.
@@ -651,8 +651,8 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
     if let Some((request, option)) = allow {
-        // Fails only when the request closed meanwhile (a cancel answered it) or the agent
-        // is gone; the run shows either.
+        // Fails only when the request closed meanwhile (a cancel, or the engineer, answered
+        // it) or the agent is gone; the run shows each.
         drop(runner.answer(request, &option));
     }
     (runner.notify)();
@@ -768,9 +768,9 @@ pub(crate) enum Entry {
         title: Option<String>,
         options: Vec<Choice>,
     },
-    /// A permission request was answered; `option` is `None` when the run was cancelled.
-    /// `None` also closes a question that was not answered: the run was stopped, or the
-    /// agent withdrew it.
+    /// A permission request was answered; `option` is `None` when the request closed without
+    /// an answer: the run was stopped, or the agent withdrew it. A question closed that way is
+    /// logged here too; an answered one is [`Entry::Reply`].
     Answer {
         request: usize,
         option: Option<String>,

@@ -87,7 +87,7 @@ pub(crate) struct PermissionRequest {
 
 /// A question: the agent's message and its form. The number counts with the permission
 /// requests (`acp`, "Permission requests").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct QuestionRequest {
     pub(crate) number: usize,
     pub(crate) message: String,
@@ -263,7 +263,8 @@ impl Agent {
     /// permission request) or `cancel` (a question), as the protocol requires; so is every
     /// request that arrives until the turn ends. The turn still ends with
     /// [`Event::TurnEnded`], normally [`StopReason::Cancelled`]. Returns the numbers of the
-    /// requests it answered, which may include one whose event is still on its way.
+    /// requests it answered, which may include one whose event ([`Event::Permission`] or
+    /// [`Event::Question`]) is still on its way.
     ///
     /// # Errors
     ///
@@ -300,22 +301,19 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when no such request is open (it was answered, or
+    /// [`Error::NoSuchRequest`] when no such request is open (it was answered, or
     /// cancelled); [`Error::BadRequest`] when the agent did not offer `option_id`, and the
     /// request stays open; [`Error::AgentExited`] when the process is gone.
     pub(crate) fn answer_permission(&self, number: usize, option_id: &str) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state
-                .requests
-                .get_mut(number)
-                .ok_or(Error::NoSuchPermission)?;
+            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
             let Some(Open {
                 kind: Kind::Permission { offered },
                 ..
             }) = request.as_ref()
             else {
-                return Err(Error::NoSuchPermission);
+                return Err(Error::NoSuchRequest);
             };
             if !offered.iter().any(|offered| offered == option_id) {
                 return Err(Error::BadRequest(format!(
@@ -334,15 +332,12 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchPermission`] when no such question is open (it was answered, withdrawn,
+    /// [`Error::NoSuchRequest`] when no such question is open (it was answered, withdrawn,
     /// or cancelled); [`Error::AgentExited`] when the process is gone.
     pub(crate) fn answer_question(&self, number: usize, reply: &ElicitationReply) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state
-                .requests
-                .get_mut(number)
-                .ok_or(Error::NoSuchPermission)?;
+            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
             if !matches!(
                 request,
                 Some(Open {
@@ -350,7 +345,7 @@ impl Agent {
                     ..
                 })
             ) {
-                return Err(Error::NoSuchPermission);
+                return Err(Error::NoSuchRequest);
             }
             request.take().expect("checked to be open above").id
         };
@@ -764,14 +759,19 @@ impl<F: FnMut(Event)> Reader<F> {
             Ok(params) => params,
             Err(error) => return self.refuse(id, format!("an unreadable question: {error}")),
         };
+        let has_fields = |schema: &Value| {
+            schema["properties"]
+                .as_object()
+                .is_some_and(|fields| !fields.is_empty())
+        };
         let schema = match (params.mode.as_deref(), params.requested_schema) {
-            (None | Some("form"), Some(schema)) if schema.is_object() => schema,
+            (None | Some("form"), Some(schema)) if has_fields(&schema) => schema,
+            (Some("url"), _) => {
+                return self.refuse(id, "a URL question, which Postil cannot show".to_owned());
+            }
             (mode, _) => {
                 let mode = mode.unwrap_or("form");
-                return self.refuse(
-                    id,
-                    format!("a {mode} question Postil cannot show as a form"),
-                );
+                return self.refuse(id, format!("a {mode} question with no form fields"));
             }
         };
         let open = Open {
@@ -835,8 +835,12 @@ impl<F: FnMut(Event)> Reader<F> {
     /// Closes the open request the agent withdrew. A withdrawn request needs no answer; one
     /// already answered, or not the app's to answer, is ignored.
     fn withdraw(&mut self, params: Value) {
-        let Ok(CancelRequestParams { request_id }) = serde_json::from_value(params) else {
-            return;
+        let request_id = match serde_json::from_value::<CancelRequestParams>(params) {
+            Ok(params) => params.request_id,
+            Err(error) => {
+                let problem = format!("an unreadable $/cancel_request: {error}");
+                return self.emit(Event::Unreadable(problem));
+            }
         };
         let number = {
             let mut state = lock(&self.shared.state);
@@ -1083,7 +1087,7 @@ mod tests {
         assert!(
             matches!(
                 agent.answer_permission(request.number, "once"),
-                Err(Error::NoSuchPermission)
+                Err(Error::NoSuchRequest)
             ),
             "a request is answered once"
         );
@@ -1192,7 +1196,7 @@ mod tests {
         );
         assert!(matches!(
             agent.answer_question(question.number, &ElicitationReply::Decline),
-            Err(Error::NoSuchPermission)
+            Err(Error::NoSuchRequest)
         ));
     }
 
