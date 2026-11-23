@@ -323,7 +323,8 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                     Command::OpenFolder
                     | Command::SwitchProject
                     | Command::GoToFile
-                    | Command::Settings => Unanswered::Ignore,
+                    | Command::Settings
+                    | Command::FocusMode => Unanswered::Ignore,
                 };
                 ask_page(&page, command.id(), unanswered);
             }

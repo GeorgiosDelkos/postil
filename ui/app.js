@@ -1299,6 +1299,7 @@ function tickedIds() {
 }
 
 function renderSendBar() {
+  renderFocusPill();
   const open = state.notes.filter(isOpen).length;
   const shown =
     state.projectOpen && state.tab === "notes" && !runs.live() && (state.send !== null || open > 0);
@@ -1321,6 +1322,8 @@ function renderSendBar() {
 
 // Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
 function openSend(ids = sendable(state.notes)) {
+  // The send step lives in the tray, which focus mode hides.
+  leaveFocus();
   if (runs.live()) {
     showToast("The agent is still working on the last run: wait for it, or stop it.");
     return;
@@ -1483,7 +1486,11 @@ function followRun(run, previous) {
   const fresh = previous?.id !== run.id;
   // A run that needs the engineer comes to the front. One that starts does not: the send
   // step shows it (`sendNotes`), and a note sent alone from its card is followed on the card.
-  if (run.status === "waiting" && previous?.status !== "waiting") showTab("run");
+  if (run.status === "waiting" && previous?.status !== "waiting") {
+    // Focus mode hides the tray, where the request is: it gives way.
+    leaveFocus();
+    showTab("run");
+  }
   // The agent edits files, and the notes are marked sent once it has the prompt: both are
   // read again when the run moves on and when an edit finishes. There is no file watcher
   // (docs/design.md, "Working with the repository").
@@ -1700,7 +1707,7 @@ filterEl.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("keydown", (event) => {
-  // Cmd-Q, Cmd-W, Cmd-O, Cmd-Shift-O and Cmd-P belong to the menu bar (src/menu.rs), which
+  // Cmd-Q, Cmd-W, Cmd-O, Cmd-Shift-O, Cmd-P and Cmd-\ belong to the menu bar (src/menu.rs), which
   // calls `window.postil.menu`. The page leaves them alone, so each shortcut is defined once.
   // A dialog and the welcome screen cover the panes: their keys must not act on what cannot be
   // seen. Each dialog handles its own keys (Escape closes it).
@@ -1718,8 +1725,13 @@ window.addEventListener("keydown", (event) => {
   }
 
   const typing = event.target.matches("input, textarea");
-  // `a`, Shift-`a` and `r` answer a permission request while the run shows.
-  if (!typing && !state.composer && state.tab === "run" && runs.keydown(event)) return;
+  // `a`, Shift-`a` and `r` answer a permission request while the run shows; focus mode hides it.
+  if (!typing && !state.composer && state.tab === "run" && !inFocus() && runs.keydown(event)) return;
+  // Escape leaves focus mode first: what it would stop or close cannot be seen there.
+  if (event.key === "Escape" && inFocus() && !state.composer) {
+    leaveFocus();
+    return;
+  }
   if (event.key === "Escape") {
     if (state.composer) closeComposer({ save: false });
     else if (state.send) closeSend();
@@ -1891,15 +1903,55 @@ window.postil = {
     else if (command === "switch-project") showWelcome();
     else if (command === "go-to-file") goToFile();
     else if (command === "settings") settings.open();
+    else if (command === "focus-mode") toggleFocus();
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
   runChanged: () => runs.sync(),
 };
 
+// Focus mode (docs/design.md, "Look and feel"): Cmd-\ hides the file list and the tray, and
+// the code column centers at a readable width. A pill in the corner keeps the open notes'
+// count and Send, which leaves focus mode for the send step. Nothing to focus on the welcome
+// screen.
+// The pill shows only in focus mode, by CSS: no code path can leave it behind. Every way out
+// goes through `leaveFocus`.
+function toggleFocus() {
+  if (!welcomeEl.hidden) return;
+  if (inFocus()) {
+    leaveFocus();
+    return;
+  }
+  // The send step's ticks live in the tray, which focus mode hides: it closes first.
+  closeSend();
+  document.body.classList.add("focus-mode");
+  // A control in a hidden pane would keep the keys.
+  codeEl.focus();
+}
+
+function leaveFocus() {
+  document.body.classList.remove("focus-mode");
+}
+
+function inFocus() {
+  return document.body.classList.contains("focus-mode");
+}
+
+$("focus-pill").addEventListener("click", () => openSend());
+
+function renderFocusPill() {
+  const pill = $("focus-pill");
+  const open = state.notes.filter(isOpen).length;
+  pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
+  if (open > 0 && !runs.live()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
+  pill.disabled = open === 0 || runs.live();
+}
+
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
 function goToFile() {
   if (!welcomeEl.hidden) return;
+  // The filter is in the file list, which focus mode hides.
+  leaveFocus();
   filterEl.focus();
   filterEl.select();
 }
@@ -1945,6 +1997,7 @@ function showWelcomeError(text, folderToInit) {
 }
 
 function showWelcome() {
+  leaveFocus();
   document.body.classList.add("welcome-mode");
   welcomeEl.hidden = false;
   const back = $("welcome-back");
