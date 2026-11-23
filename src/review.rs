@@ -234,7 +234,8 @@ mod tests {
     fn the_judge_gets_every_finding_by_id_and_says_what_to_answer() {
         let findings = findings_in(
             "```json\n[{\"note\": \"N1\", \"path\": \"src/a.rs\", \"line\": 2, \"finding\": \
-             \"two is a bad name\", \"fix\": \"call it renamed\"}, {\"finding\": \"no test\"}]\n```",
+             \"two is a bad name\", \"fix\": \"call it renamed\"}, \
+             {\"finding\": \"no test\"}]\n```",
             1,
         )
         .unwrap();
