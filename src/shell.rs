@@ -3963,6 +3963,51 @@ mod tests {
     }
 
     #[test]
+    fn a_send_that_fails_between_two_stages_leaves_the_review_going() {
+        let repo = TempRepo::new("run-review-refused-send");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        set_reviewers(
+            &site,
+            "plain",
+            &[("First", "reviewer"), ("Judge", "reviewer")],
+        );
+        let release = site.runner().unwrap().hold_next_stage();
+        let body = serde_json::json!({ "of": "R1" }).to_string();
+        assert_eq!(
+            post(&site, &format!("{RUN}/review"), &body).0,
+            StatusCode::OK
+        );
+        wait_for_run(&site, &nudges, "R2");
+        assert!(site.runner().unwrap().reviewing(), "the judge is next");
+
+        // A send between the proposer's end and the judge's start, whose log cannot be made.
+        let runs = repo.root.join(".git/postil/runs");
+        fs::set_permissions(&runs, fs::Permissions::from_mode(0o555)).unwrap();
+        let (status, body) = send(&site, &["N1"]);
+        fs::set_permissions(&runs, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        drop(release);
+
+        let judge = loop {
+            let run = get_json(&site, RUN);
+            if run["review"]["reviewer"] == 2 && run["status"] == "ended" {
+                break run;
+            }
+            nudges
+                .recv_timeout(WAIT)
+                .unwrap_or_else(|_| panic!("no judge after the refused send: {run}"));
+        };
+        assert!(
+            kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
+            "{judge}"
+        );
+    }
+
+    #[test]
     fn a_single_reviewer_only_proposes_and_a_send_after_a_review_starts_a_fresh_agent() {
         let repo = TempRepo::new("run-review-single");
         repo.write("a.txt", "a\nb\n");
