@@ -1,4 +1,5 @@
-//! Projects: `/api/repo`, `/api/open`, `/api/init` and `/api/recent`.
+//! Projects: `/api/repo`, `/api/open`, `/api/init` and `/api/recent`, and the project
+//! opened at start (`startup_repo`), which no request reaches.
 
 use super::*;
 
