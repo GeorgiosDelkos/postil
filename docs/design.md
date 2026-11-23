@@ -1,7 +1,8 @@
 # Postil: design plan
 
-Status: 2026-11-22. The UI layer is decided (a system webview through wry, core in Rust).
-Milestones 0, 1, and 2 are built. Section "Decisions" lists what is settled and what is still
+Status: 2026-11-23. The UI layer is decided (a system webview through wry, core in Rust).
+Milestones 0, 1, and 2 are built; milestone 3's core (the ACP client, runs and their API) is
+built, and its page is next. Section "Decisions" lists what is settled and what is still
 assumed.
 
 Mockups: https://claude.ai/code/artifact/68e1a720-a3d5-4d71-92d4-9acd76ea9d5e (private to the
@@ -24,7 +25,6 @@ panel. It is not an editor, not a terminal, and not a PR tool.
 - Running several agents at once on one working tree. One run at a time per repository: two
   agents writing the same files conflict, and solving that means worktrees, which is a later
   step.
-- Settings UI. Configuration is one JSON file.
 
 ## The loop
 
@@ -142,6 +142,7 @@ schedule three tasks.
 | `scripts/bundle.sh` | Builds `target/release/Postil.app` with the icon from `assets/`. |
 | `src/acp/wire.rs` | Serde types for the ACP messages the app sends and receives. |
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
+| `src/run.rs` | Runs: the prompt, the run log, the agent kept between runs. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables. |
 | `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
@@ -187,8 +188,11 @@ enum NoteState {
 - **Shaped lines** are cached per visible line and dropped when the file or the width changes.
   Only visible lines are ever shaped, so a 50,000-line file costs the same per frame as a
   50-line one.
-- **A run** is an append-only `Vec<RunItem>` (message, thought, plan, tool call, permission
-  request) plus a `HashMap<ToolCallId, usize>` so a `tool_call_update` finds its row in O(1).
+- **A run** is an append-only `Vec<Entry>` (message part, thought, tool call, tool call
+  change, plan, permission request and answer, end), the same lines as its log on disk. A
+  tool call's later changes are entries of their own, and the page folds them into the call:
+  the log stays append-only, and the page fetches only the entries it has not seen. Section
+  "Runs" has the rest.
 - **State on disk** is one file, `<git dir>/postil/review.json`, written atomically on every
   change. It sits inside the git directory, so it is never committed and needs no `.gitignore`
   entry. An agent or script can read and write notes by editing this file; the app reloads it on
@@ -247,13 +251,17 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 | app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. |
 | app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn. |
 | app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`. |
-| app to agent | `session/set_mode` | Only when the agent lists modes. |
-| agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `current_mode_update`. Unknown kinds are ignored. |
+| agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`. Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
 | agent to app | `session/request_permission` | The permission card. The reply names the chosen `optionId`. |
 
 The app advertises no file or terminal capability on purpose. It has no unsaved buffers, so the
 agent's own file tools see the same bytes the app does. That removes five client methods, and
 version 2 removes them from the protocol anyway.
+
+The app does not set a mode (`session/set_mode`): the agent's default applies. Requests the
+app does not serve (`fs/*`, `terminal/*`, anything newer) are answered "method not found",
+and notifications it does not know (Grok's `_x.ai/...`, Claude's `_auth/...`) are ignored.
+`src/acp/wire.rs` names the schema commit the types were written from.
 
 Permissions are never auto-approved from a tool call's `kind` or `title`: the agent writes those
 labels. "Always" is offered only when the agent sends an `allow_always` option, and the choice is
@@ -278,11 +286,48 @@ AcpError::AgentExited instead.
 The quoted snippet travels with the note because line numbers go stale the moment the agent
 edits the file.
 
+### Runs
+
+Built in `src/run.rs`, with the API the page calls:
+
+| Route | Does |
+|---|---|
+| `GET /api/run/preview?notes=N1,N2` | The prompt's text, exactly as the agent receives it. |
+| `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
+| `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
+| `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered. |
+| `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
+
+- **The agent is kept between runs**, with its session, until a send names another agent or
+  command, the project closes, or the agent exits; the next send then starts it again. The
+  owner chose this on 2026-11-23 over a fresh agent per send, so milestone 4's follow-up notes
+  reach the same conversation.
+- **One run at a time** per project: a send during a run is refused (409).
+- **Starting** happens on a thread of its own, because it can take minutes. Each start-up
+  step (`initialize`, `session/new`) may take 120 seconds. Gemini 0.40.1, not signed in,
+  never answers `initialize` (it waits for a browser sign-in), checked 2026-11-23; the run
+  then fails with the hint to run the agent in a terminal.
+- **The log** is `<git dir>/postil/runs/R<n>.jsonl`: a header line (agent, notes, prompt,
+  start time), then one line per entry, appended as it happens. The owner chose on 2026-11-23
+  to keep runs on disk. Creating the file claims the id, so two windows never share one. After
+  a restart the newest log is shown; one without an end reads as interrupted, and an
+  unreadable line (a torn write) is reported while the rest is shown.
+- **Notes** are marked sent, with the run's id, once the agent has the prompt. A run that
+  fails to start leaves them open. `review.json` is version 2 for this field; version 1 files
+  read with every note open.
+- **The page** is told about every change by a script call (`window.postil.runChanged()`)
+  and fetches the entries it has not seen.
+- Closing the project or quitting kills the agent's process group (`npx` leaves `node`
+  running). A run cut short this way reads as interrupted.
+
 ### Agents
 
 An agent is a name and the command that starts it as an ACP server. Postil ships a catalog
 (`src/agents.rs`, `BUILT_IN`) and finds which of them are installed; the engineer adds others
-in the settings. Each catalog command is confirmed end to end when the ACP milestone starts:
+in the settings. Each catalog command is confirmed end to end with a real prompt by the test
+`a_real_agent_answers_a_prompt` (`POSTIL_REAL_AGENT='<command>' cargo test real_agent`):
+Claude and Grok passed on 2026-11-23; Codex and OpenCode are not installed on the development
+Mac; Gemini needs a sign-in first.
 
 | Name | Found by | Command | ACP support |
 |---|---|---|---|
@@ -472,9 +517,13 @@ retired; the measured numbers above are the baseline to not regress.
 
 ## Testing
 
-- **End to end first.** A fake ACP agent (a small binary in `tests/`) speaks real JSON-RPC over
-  real pipes. Tests drive `acp::Connection` against it: a full turn, a permission round trip,
-  cancel, a malformed line, the agent exiting mid-request.
+- **End to end first.** A fake ACP agent (`tests/fake-agent.mjs`, run by Node, which the page
+  tests need anyway) speaks real JSON-RPC over real pipes, one scenario per argument. Tests
+  drive `acp::Agent` against it (a full turn, a permission round trip, cancel, unreadable
+  messages, the agent exiting at start and mid-turn, a silent agent, the process group killed
+  on drop) and the run API through `Site::respond` (send, the log, keeping and replacing the
+  agent, cancel, failures, restart). One test runs a real agent when `POSTIL_REAL_AGENT` is
+  set.
 - **Repository code** runs against real `git` in a temporary directory: snapshot, edit, diff.
 - **App logic** is tested through `App::update` with no window: select lines, write a note, send,
   receive updates, resolve.

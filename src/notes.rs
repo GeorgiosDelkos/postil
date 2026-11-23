@@ -35,7 +35,8 @@
 //! The format has a version. Every field added is a new version: a build refuses fields it
 //! does not know (so a typo in a hand edit fails loudly instead of being dropped on the next
 //! write), and an older build must say "version 2" rather than "unknown field". A newer build
-//! reads every older version.
+//! reads every older version. Version 2 added each note's `state`; a version 1 file reads
+//! with every note open, and the next write makes it version 2.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -50,9 +51,9 @@ use crate::error::{Error, Result};
 use crate::files::write_atomically;
 use crate::repo::Repo;
 
-/// The format version this build reads and writes. A file with another version is refused,
-/// not rewritten.
-const VERSION: u32 = 1;
+/// The format version this build writes. It reads this one and every older one; a file with
+/// a newer version is refused, not rewritten.
+const VERSION: u32 = 2;
 
 /// Reads the review file and places every note where its snippet is now. Does not write.
 ///
@@ -114,6 +115,7 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
         snippet: new.snippet,
         body: body.to_owned(),
         anchor: Anchor::Found,
+        state: NoteState::Open,
     });
     review.save(&file)?;
     Ok(review)
@@ -146,6 +148,69 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
     Ok(review)
 }
 
+/// The notes `ids` name, in that order, placed where their snippets are now.
+///
+/// # Errors
+///
+/// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, or holds
+/// something that is not a note id; [`Error::NoSuchNote`] when no note has one of them.
+pub(crate) fn select(repo: &Repo, ids: &[String]) -> Result<Vec<Note>> {
+    let wanted = parse_ids(ids)?;
+    let mut review = current(repo)?;
+    wanted
+        .iter()
+        .map(|id| {
+            let index = review
+                .notes
+                .iter()
+                .position(|note| note.id == *id)
+                .ok_or_else(|| Error::NoSuchNote { id: id.to_string() })?;
+            Ok(review.notes.swap_remove(index))
+        })
+        .collect()
+}
+
+/// Marks the notes `ids` sent in `run`, saves, and returns all notes. A note deleted
+/// meanwhile is skipped: the run it went to is under way, and the engineer removed it.
+///
+/// # Errors
+///
+/// As [`current`]; [`Error::BadRequest`] as for [`select`]; [`Error::WriteReview`] when
+/// the lock or the file cannot be written.
+pub(crate) fn mark_sent(repo: &Repo, ids: &[String], run: &str) -> Result<Review> {
+    let wanted = parse_ids(ids)?;
+    let file = repo.review_file();
+    let _lock = lock(&file)?;
+    let mut review = current(repo)?;
+    for note in &mut review.notes {
+        if wanted.contains(&note.id) {
+            note.state = NoteState::Sent {
+                run: run.to_owned(),
+            };
+        }
+    }
+    review.save(&file)?;
+    Ok(review)
+}
+
+/// Reads note ids as the page sends them: at least one, none twice.
+fn parse_ids(ids: &[String]) -> Result<Vec<NoteId>> {
+    if ids.is_empty() {
+        return Err(Error::BadRequest("no notes were chosen".to_owned()));
+    }
+    let mut wanted = Vec::with_capacity(ids.len());
+    for text in ids {
+        let id = NoteId::parse(text).ok_or_else(|| {
+            Error::BadRequest(format!("note id {text:?}: expected N and a number"))
+        })?;
+        if wanted.contains(&id) {
+            return Err(Error::BadRequest(format!("note {text} is chosen twice")));
+        }
+        wanted.push(id);
+    }
+    Ok(wanted)
+}
+
 /// Every note of one working tree, as stored in `review.json`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -164,19 +229,34 @@ struct VersionOnly {
 /// A note the engineer wrote on a line range.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Note {
-    id: NoteId,
+pub(crate) struct Note {
+    pub(crate) id: NoteId,
     /// Relative to the repository root.
-    path: String,
+    pub(crate) path: String,
     /// Where the snippet was found last.
-    lines: LineRange,
+    pub(crate) lines: LineRange,
     /// The text of the lines when the note was written, without line endings, joined with
     /// `\n`.
-    snippet: String,
-    body: String,
+    pub(crate) snippet: String,
+    pub(crate) body: String,
     /// Recomputed on every read, so a note written by hand may leave it out.
     #[serde(default)]
-    anchor: Anchor,
+    pub(crate) anchor: Anchor,
+    /// Absent in version 1, where every note is open; a note written by hand may leave it
+    /// out too.
+    #[serde(default)]
+    pub(crate) state: NoteState,
+}
+
+/// Where a note is in the loop. Kept apart from [`Anchor`] (module docs).
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NoteState {
+    /// Not sent yet, or sent in a run that did not start.
+    #[default]
+    Open,
+    /// Sent to the agent in the run with this id (`R1`).
+    Sent { run: String },
 }
 
 /// What the page sends to create a note.
@@ -193,7 +273,7 @@ pub(crate) struct NewNote {
 
 /// A note's number, written `N1`, `N2`: shown in the page and sent to the agent.
 #[derive(Debug, PartialEq, Eq)]
-struct NoteId(u32);
+pub(crate) struct NoteId(u32);
 
 impl NoteId {
     /// Reads `N` and a positive number, as `Display` writes it.
@@ -209,9 +289,9 @@ impl NoteId {
 /// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawLineRange")]
-struct LineRange {
-    start: usize,
-    end: usize,
+pub(crate) struct LineRange {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// A [`LineRange`] before its bounds are checked.
@@ -223,9 +303,9 @@ struct RawLineRange {
 }
 
 /// Whether a note's snippet is still in its file.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum Anchor {
+pub(crate) enum Anchor {
     /// The snippet is in the file, at `lines`.
     #[default]
     Found,
@@ -265,13 +345,15 @@ impl Review {
         // The version is read on its own first: a newer format would otherwise fail on its
         // first new field, with a message that hides the real reason.
         let VersionOnly { version } = serde_json::from_str(&json).map_err(parse_error)?;
-        if version != VERSION {
+        if !(1..=VERSION).contains(&version) {
             return Err(invalid(format!(
-                "version {version}, but this build of Postil reads version {VERSION}"
+                "version {version}, but this build of Postil reads versions 1 to {VERSION}"
             )));
         }
 
-        let review: Self = serde_json::from_str(&json).map_err(parse_error)?;
+        let mut review: Self = serde_json::from_str(&json).map_err(parse_error)?;
+        // An older file is read as this version, and written as this version next time.
+        review.version = VERSION;
         for (index, note) in review.notes.iter().enumerate() {
             if review.notes[..index]
                 .iter()
@@ -380,6 +462,7 @@ impl fmt::Debug for Note {
             .field("path", &self.path)
             .field("lines", &self.lines)
             .field("anchor", &self.anchor)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -533,6 +616,9 @@ mod tests {
             snippet: "secret snippet".to_owned(),
             body: "secret body".to_owned(),
             anchor: Anchor::Found,
+            state: NoteState::Sent {
+                run: "R1".to_owned(),
+            },
         };
         let review = Review {
             version: VERSION,

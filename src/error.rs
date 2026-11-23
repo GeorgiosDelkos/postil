@@ -125,11 +125,76 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// An agent's program is not on the search path.
+    AgentNotFound {
+        /// The program as the agent's command names it.
+        program: String,
+    },
+    /// An agent's process could not be started, or the threads around it could not.
+    StartAgent {
+        /// The agent's command.
+        command: String,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// An agent did not answer a start-up request in time.
+    AgentSilent {
+        /// The ACP method it did not answer.
+        step: &'static str,
+        /// How long the app waited.
+        seconds: u64,
+    },
+    /// An agent's process ended.
+    AgentExited {
+        /// The end of what it wrote to standard error.
+        stderr: String,
+    },
+    /// An agent answered a request with an error.
+    AgentRefused {
+        /// The ACP method it refused.
+        step: &'static str,
+        /// The JSON-RPC error code.
+        code: i64,
+        /// The agent's message.
+        message: String,
+    },
+    /// An agent speaks another protocol version or replied in a shape the app cannot read;
+    /// the text says which.
+    AgentProtocol(String),
+    /// A run log could not be created or written.
+    WriteRun {
+        /// The log, or its directory.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// A run log could not be read.
+    ReadRun {
+        /// The log, or its directory.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// A run log is not in the expected format; the text says how.
+    InvalidRun {
+        /// The log.
+        path: PathBuf,
+        /// What is wrong.
+        problem: String,
+    },
+    /// A prompt was sent while the agent's previous turn is still running.
+    TurnRunning,
+    /// A permission request was answered that is not open: already answered, or cancelled.
+    NoSuchPermission,
 }
 
 // Written by hand instead of with `thiserror` to keep the dependency tree small
 // (docs/design.md, "Dependencies").
 impl fmt::Display for Error {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per variant; split, a message would sit apart from its variant's peers"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SpawnGit(_) => write!(f, "cannot run git (is it installed and on PATH?)"),
@@ -203,8 +268,69 @@ impl fmt::Display for Error {
                  saved)",
                 path.display()
             ),
+            Self::AgentNotFound { program } => write!(
+                f,
+                "cannot find the agent's program {program} (install it, or change the agent's \
+                 command in Settings)"
+            ),
+            Self::StartAgent { command, .. } => write!(f, "cannot start the agent ({command})"),
+            Self::AgentSilent { step, seconds } => write!(
+                f,
+                "the agent did not answer {step} within {seconds} s (run it in a terminal: it \
+                 may be waiting for you to sign in)"
+            ),
+            Self::AgentExited { stderr } if stderr.is_empty() => {
+                write!(f, "the agent exited without a message")
+            }
+            Self::AgentExited { stderr } => write!(f, "the agent exited: {stderr}"),
+            // ACP's code for "sign in first". Login is not handled in version 1 of the app
+            // (docs/design.md, "Agents").
+            Self::AgentRefused {
+                step,
+                code: -32000,
+                message,
+            } => write!(
+                f,
+                "the agent needs you to sign in (run it in a terminal and sign in there): \
+                 {step} answered {message}"
+            ),
+            Self::AgentRefused {
+                step,
+                code,
+                message,
+            } => write!(f, "the agent refused {step}: {message} ({code})"),
+            Self::AgentProtocol(problem) => write!(f, "the agent cannot be used: {problem}"),
+            Self::WriteRun { path, .. } => write!(
+                f,
+                "cannot write the run log {} (check that the directory is writable)",
+                path.display()
+            ),
+            Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
+            Self::InvalidRun { path, problem } => {
+                write!(f, "cannot show the run log {}: {problem}", path.display())
+            }
+            Self::TurnRunning => write!(
+                f,
+                "the agent is still working on the last prompt (wait for it, or cancel it)"
+            ),
+            Self::NoSuchPermission => write!(
+                f,
+                "that permission request is no longer open (it was answered or cancelled)"
+            ),
         }
     }
+}
+
+/// The error and its sources on one line, for the page to show.
+pub(crate) fn error_chain(error: &Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 impl std::error::Error for Error {
@@ -215,7 +341,10 @@ impl std::error::Error for Error {
             | Self::ReadReview { source, .. }
             | Self::WriteReview { source, .. }
             | Self::WriteRecent { source, .. }
-            | Self::WriteSettings { source, .. } => Some(source),
+            | Self::WriteSettings { source, .. }
+            | Self::StartAgent { source, .. }
+            | Self::WriteRun { source, .. }
+            | Self::ReadRun { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
             Self::Highlight(source) => Some(source),
             Self::Window(source) => Some(source),
@@ -235,7 +364,15 @@ impl std::error::Error for Error {
             | Self::InvalidReview { .. }
             | Self::InvalidSettings(_)
             | Self::SettingsLocked(_)
-            | Self::SettingsChanged => None,
+            | Self::SettingsChanged
+            | Self::AgentNotFound { .. }
+            | Self::AgentSilent { .. }
+            | Self::AgentExited { .. }
+            | Self::AgentRefused { .. }
+            | Self::AgentProtocol(_)
+            | Self::InvalidRun { .. }
+            | Self::TurnRunning
+            | Self::NoSuchPermission => None,
         }
     }
 }

@@ -28,7 +28,7 @@ use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::dialog;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::highlight::{Highlighter, Token};
 #[cfg(target_os = "macos")]
@@ -36,6 +36,7 @@ use crate::menu::Command;
 use crate::notes::{self, NewNote};
 use crate::recent;
 use crate::repo::Repo;
+use crate::run::{AgentChoice, Notify, Runner};
 use crate::settings::{self, Settings};
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -108,6 +109,8 @@ enum AppEvent {
     /// A menu command was chosen; the page carries it out.
     #[cfg(target_os = "macos")]
     Menu(crate::menu::Command),
+    /// A run changed (`run.rs`); the page fetches what it has not seen.
+    RunChanged,
     /// The benchmark's file is on screen.
     BenchPainted,
     /// The benchmark finished; the payload is its JSON report.
@@ -134,7 +137,7 @@ impl AppEvent {
 
 /// The site the page talks to, with the start-up project open (see [`startup_repo`]), and
 /// the settings the window starts with.
-fn start_site(dir: Option<&Path>, bench: Option<&str>) -> Result<(Site, Settings)> {
+fn start_site(dir: Option<&Path>, bench: Option<&str>, notify: Notify) -> Result<(Site, Settings)> {
     // Without a configuration directory the recent list and the settings are off, which the
     // page says: both are conveniences, so they never stop the app from starting.
     let config = config_dir().ok();
@@ -146,7 +149,7 @@ fn start_site(dir: Option<&Path>, bench: Option<&str>) -> Result<(Site, Settings
         Some(_) => Scanner::new(OsString::new),
         None => Scanner::new(agents::search_path),
     };
-    let site = Site::new(config.as_deref(), bench, agents);
+    let site = Site::new(config.as_deref(), bench, agents, notify);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
         site.open(repo);
     }
@@ -160,9 +163,14 @@ fn start_site(dir: Option<&Path>, bench: Option<&str>) -> Result<(Site, Settings
 
 fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>> {
     let started = Instant::now();
-    let (site, settings) = start_site(dir, bench)?;
-
     let mut event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
+    let run_proxy = Mutex::new(event_loop.create_proxy());
+    let notify: Notify = Arc::new(move || {
+        // Fails only once the event loop is gone, when no page is left to tell.
+        drop(lock(&run_proxy).send_event(AppEvent::RunChanged));
+    });
+    let (site, settings) = start_site(dir, bench, notify)?;
+
     let window = build_window(&event_loop, settings.theme)?;
 
     // The menu bar lives as long as this function, which is as long as the app.
@@ -232,6 +240,11 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                     | Command::Settings => Unanswered::Ignore,
                 };
                 ask_page(&page, command.id(), unanswered);
+            }
+            Event::UserEvent(AppEvent::RunChanged) => {
+                // A page that has not loaded yet fetches the run when it starts. Fails only
+                // when the webview is being torn down.
+                drop(webview.evaluate_script("window.postil?.runChanged?.()"));
             }
             Event::UserEvent(AppEvent::BenchPainted) => {
                 launch_to_paint = Some(started.elapsed());
@@ -514,12 +527,16 @@ struct Site {
     settings_file: Option<PathBuf>,
     /// Where agents' programs are looked for, found in the background.
     agents: Scanner,
+    /// Tells the page a run changed (`run.rs`).
+    notify: Notify,
 }
 
 /// The open project.
 #[derive(Clone)]
 struct Project {
     repo: Arc<Repo>,
+    /// The project's runs and the agent kept between them.
+    runner: Arc<Runner>,
     /// Why the recent projects could not be updated when this project opened, shown under
     /// the branch name. Kept with the project, so every page load of it shows the line.
     warning: Option<String>,
@@ -583,6 +600,33 @@ struct AgentView<'a> {
     found: Option<String>,
 }
 
+/// The body of `POST /api/run`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendRun {
+    /// The agent's name; the settings' agent when absent.
+    agent: Option<String>,
+    /// The ids of the notes to send, in order.
+    notes: Vec<String>,
+}
+
+/// The body of `POST /api/run/permission`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerPermission {
+    /// The request's number in the run.
+    request: usize,
+    /// The id of the option chosen, one the agent offered.
+    option: String,
+}
+
+/// The reply to `/api/run/preview`.
+#[derive(Serialize)]
+struct PreviewView {
+    /// The prompt's text, exactly as the agent will receive it.
+    prompt: String,
+}
+
 /// The body of `POST /api/open` and `POST /api/init`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -608,7 +652,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Site {
     /// A site with no project open, keeping its files in `config` (`None` turns the recent
     /// list and the settings off).
-    fn new(config: Option<&Path>, bench: Option<&str>, agents: Scanner) -> Self {
+    fn new(config: Option<&Path>, bench: Option<&str>, agents: Scanner, notify: Notify) -> Self {
         Self {
             project: Mutex::new(None),
             highlighter: Highlighter::new(),
@@ -616,6 +660,7 @@ impl Site {
             recent_file: config.map(|dir| dir.join("recent.json")),
             settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
             agents,
+            notify,
         }
     }
 
@@ -637,10 +682,21 @@ impl Site {
                 .err()
                 .map(|error| error_chain(&error)),
         };
-        *lock(&self.project) = Some(Project {
-            repo: Arc::new(repo),
+        let repo = Arc::new(repo);
+        let runner = Runner::new(
+            Arc::clone(&repo),
+            self.agents.clone(),
+            Arc::clone(&self.notify),
+        );
+        let old = lock(&self.project).replace(Project {
+            repo,
+            runner,
             warning,
         });
+        // Stops the agent of the project this one replaces.
+        if let Some(old) = old {
+            old.runner.close();
+        }
     }
 
     fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
@@ -692,6 +748,9 @@ impl Site {
                     &b"GET the settings or PUT new ones"[..],
                 ),
             },
+            "/api/run" | "/api/run/preview" | "/api/run/cancel" | "/api/run/permission" => {
+                self.respond_run(request)
+            }
             "/api/settings/reset" if post => json_or_error(self.reset_settings()),
             "/api/agents/rescan" if post => {
                 self.agents.rescan();
@@ -721,7 +780,7 @@ impl Site {
 
     /// The open project, or `null`: the page then shows the welcome screen.
     fn repo_info(&self) -> Result<Vec<u8>> {
-        let Some(Project { repo, warning }) = lock(&self.project).clone() else {
+        let Some(Project { repo, warning, .. }) = lock(&self.project).clone() else {
             return Ok(b"null".to_vec());
         };
         let info = RepoInfo {
@@ -793,6 +852,118 @@ impl Site {
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
         let review = notes::delete(&*self.repo()?, id)?;
         Ok(to_json(&review))
+    }
+
+    /// The replies to `/api/run` and the routes under it.
+    fn respond_run(&self, request: &Request<Vec<u8>>) -> Reply {
+        let uri = request.uri();
+        let post = *request.method() == Method::POST;
+        match uri.path() {
+            "/api/run" => match *request.method() {
+                Method::GET => json_or_error(self.run_view(uri.query().unwrap_or(""))),
+                Method::POST => json_or_error(self.send_run(request.body())),
+                _ => reply(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "text/plain",
+                    &b"GET the latest run (?after=<entries seen>) or POST a new one"[..],
+                ),
+            },
+            "/api/run/preview" => match query_value(uri.query().unwrap_or(""), "notes") {
+                Some(ids) => json_or_error(self.preview_run(&ids)),
+                None => reply(
+                    StatusCode::BAD_REQUEST,
+                    "text/plain",
+                    &b"expected ?notes=N1,N2"[..],
+                ),
+            },
+            "/api/run/cancel" if post => json_or_error(
+                self.runner()
+                    .and_then(|runner| runner.cancel())
+                    .and_then(|()| self.run_view("")),
+            ),
+            "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
+            "/api/run/cancel" | "/api/run/permission" => {
+                reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
+            }
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    /// The open project's runner.
+    fn runner(&self) -> Result<Arc<Runner>> {
+        lock(&self.project)
+            .as_ref()
+            .map(|project| Arc::clone(&project.runner))
+            .ok_or(Error::NoProject)
+    }
+
+    /// The reply to `GET /api/run?after=N`: the latest run with its entries from number
+    /// `N` on (all of them without `after`), or `null` when the project has none.
+    fn run_view(&self, query: &str) -> Result<Vec<u8>> {
+        let after = match query_value(query, "after") {
+            None => 0,
+            Some(after) => after.parse().map_err(|_| {
+                Error::BadRequest(format!("after={after:?}: expected a number of entries"))
+            })?,
+        };
+        Ok(to_json(&self.runner()?.view(after)?))
+    }
+
+    /// The reply to `POST /api/run`: sends the notes in the body to the agent, and returns
+    /// the new run.
+    fn send_run(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: SendRun = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let agent = self.agent_choice(request.agent)?;
+        self.runner()?.send(agent, &request.notes)?;
+        self.run_view("")
+    }
+
+    /// The reply to `GET /api/run/preview?notes=N1,N2`.
+    fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
+        let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
+        let prompt = self.runner()?.preview(&ids)?;
+        Ok(to_json(&PreviewView { prompt }))
+    }
+
+    /// The reply to `POST /api/run/permission`.
+    fn answer_permission(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let answer: AnswerPermission = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        self.runner()?.answer(answer.request, &answer.option)?;
+        self.run_view("")
+    }
+
+    /// The agent called `name`, or the settings' agent, with its command. It must be turned
+    /// on in the settings.
+    fn agent_choice(&self, name: Option<String>) -> Result<AgentChoice> {
+        let settings = self
+            .settings_file
+            .as_deref()
+            .map_or_else(Settings::default, |file| settings::load(file).settings);
+        let name = name.or(settings.agent).ok_or_else(|| {
+            Error::BadRequest("choose the agent notes are sent to in Settings".to_owned())
+        })?;
+        if !settings.enabled_agents.contains(&name) {
+            return Err(Error::BadRequest(format!(
+                "turn {name} on in Settings before sending to it"
+            )));
+        }
+        let built_in = BUILT_IN
+            .iter()
+            .find(|agent| agent.name == name)
+            .map(|agent| agent.command.to_owned());
+        let custom = || {
+            settings
+                .custom_agents
+                .into_iter()
+                .find(|agent| agent.name == name)
+                .map(|agent| agent.command)
+        };
+        let command = built_in
+            .or_else(custom)
+            .ok_or_else(|| Error::BadRequest(format!("there is no agent called {name}")))?;
+        Ok(AgentChoice { name, command })
     }
 
     /// The reply to `GET /api/settings`, and to every request that changes them: the
@@ -889,8 +1060,16 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::NoteTextChanged { .. }
                 | Error::NoProject
                 | Error::SettingsLocked(_)
-                | Error::SettingsChanged => StatusCode::CONFLICT,
-                Error::NoSuchNote { .. } => StatusCode::NOT_FOUND,
+                | Error::SettingsChanged
+                | Error::TurnRunning => StatusCode::CONFLICT,
+                Error::NoSuchNote { .. } | Error::NoSuchPermission => StatusCode::NOT_FOUND,
+                // The agent, the server behind this one, failed.
+                Error::AgentNotFound { .. }
+                | Error::StartAgent { .. }
+                | Error::AgentSilent { .. }
+                | Error::AgentExited { .. }
+                | Error::AgentRefused { .. }
+                | Error::AgentProtocol(_) => StatusCode::BAD_GATEWAY,
                 // The page tells this one apart: it offers to make the folder a repository.
                 Error::NotARepository { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                 Error::SpawnGit(_)
@@ -906,23 +1085,14 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteReview { .. }
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
+                | Error::WriteRun { .. }
+                | Error::ReadRun { .. }
+                | Error::InvalidRun { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
         }
     }
-}
-
-/// The error and its sources on one line, for the page to show.
-fn error_chain(error: &Error) -> String {
-    let mut text = error.to_string();
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
 
 fn reply(
@@ -976,6 +1146,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::mpsc;
 
     use super::*;
 
@@ -1018,7 +1189,7 @@ mod tests {
         /// A site with no project open, its configuration in [`Self::config`] and no agents
         /// installed.
         fn empty_site(&self) -> Site {
-            Site::new(Some(&self.config()), None, no_agents())
+            Site::new(Some(&self.config()), None, no_agents(), quiet())
         }
 
         /// The configuration directory of this repository's sites: inside its git directory,
@@ -1026,6 +1197,11 @@ mod tests {
         fn config(&self) -> PathBuf {
             self.root.join(".git/test-config")
         }
+    }
+
+    /// A page that is never told about runs.
+    fn quiet() -> Notify {
+        Arc::new(|| {})
     }
 
     /// A scanner whose search path is empty: every agent is missing.
@@ -1133,8 +1309,9 @@ mod tests {
             file.display()
         );
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(stored["version"], 1);
+        assert_eq!(stored["version"], 2);
         assert_eq!(stored["notes"], review["notes"]);
+        assert_eq!(note["state"], "open");
 
         // A new process reads the same file.
         let restarted = repo.site();
@@ -1260,6 +1437,11 @@ mod tests {
             anchors(&review),
             [anchor("N5", 2, 2, "found"), anchor("N6", 1, 1, "found")]
         );
+        // A version 1 file has no states: its notes read as open, and the write that added
+        // N6 made it version 2.
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(stored["version"], 2);
+        assert_eq!(stored["notes"][0]["state"], "open");
     }
 
     #[test]
@@ -1382,7 +1564,11 @@ mod tests {
 
         let cases = [
             ("{\"version\": 1, \"notes\": [", "cannot parse".to_owned()),
-            (r#"{"version": 2, "notes": []}"#, "version 2".to_owned()),
+            (
+                r#"{"version": 3, "notes": []}"#,
+                "version 3, but this build of Postil reads versions 1 to 2".to_owned(),
+            ),
+            (r#"{"version": 0, "notes": []}"#, "version 0".to_owned()),
             (r#"{"notes": []}"#, "cannot parse".to_owned()),
             (
                 &*format!(r#"{{"version": 1, "notes": [{note}, {note}]}}"#),
@@ -1702,7 +1888,7 @@ mod tests {
     #[test]
     fn without_a_configuration_directory_the_recent_list_is_off_and_projects_open() {
         let repo = TempRepo::new("recent-off");
-        let site = Site::new(None, None, no_agents());
+        let site = Site::new(None, None, no_agents(), quiet());
 
         site.open(Repo::open(&repo.root).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
@@ -1718,7 +1904,7 @@ mod tests {
         let repo = TempRepo::new("recent-bench");
         repo.write("a.rs", "fn a() {}\n");
         let recent = repo.config().join("recent.json");
-        let site = Site::new(Some(&repo.config()), Some("a.rs"), no_agents());
+        let site = Site::new(Some(&repo.config()), Some("a.rs"), no_agents(), quiet());
 
         site.open(Repo::open(&repo.root).unwrap());
         assert!(!recent.exists());
@@ -1760,7 +1946,7 @@ mod tests {
         let repo = TempRepo::new("subdir");
         repo.write("src/a.rs", "fn a() {}\n");
 
-        let site = Site::new(Some(&repo.config()), Some("src/a.rs"), no_agents());
+        let site = Site::new(Some(&repo.config()), Some("src/a.rs"), no_agents(), quiet());
         site.open(Repo::open(&repo.root.join("src")).unwrap());
         let info = get_json(&site, "postil://localhost/api/repo");
 
@@ -2196,7 +2382,7 @@ mod tests {
 
     #[test]
     fn without_a_configuration_directory_settings_are_the_defaults_and_cannot_be_saved() {
-        let site = Site::new(None, None, no_agents());
+        let site = Site::new(None, None, no_agents(), quiet());
         let view = get_json(&site, SETTINGS);
         assert_eq!(
             view["problem"],
@@ -2234,6 +2420,7 @@ mod tests {
                     OsString::new()
                 }
             }),
+            quiet(),
         );
         let (status, body) = save(&site, &custom_settings().to_string());
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -2330,7 +2517,7 @@ mod tests {
     #[test]
     fn every_page_module_is_served() {
         // The page imports its modules by name; one left out of `respond` stops the page.
-        let site = Site::new(None, None, no_agents());
+        let site = Site::new(None, None, no_agents(), quiet());
         let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
         for entry in fs::read_dir(&ui).unwrap() {
             let name = entry.unwrap().file_name().into_string().unwrap();
@@ -2412,6 +2599,517 @@ mod tests {
             root(gone),
             None,
             "a project that is gone shows the welcome screen"
+        );
+    }
+
+    // Runs (run.rs), against the fake ACP agent in tests/fake-agent.mjs.
+
+    const RUN: &str = "postil://localhost/api/run";
+
+    /// Long enough for Node to start on a loaded machine; a test that waits this long has
+    /// failed (it bounds a hang and times nothing).
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// The command that starts the fake agent in `scenario`.
+    fn fake_agent(scenario: &str) -> String {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-agent.mjs");
+        format!("node {} {scenario}", script.display())
+    }
+
+    /// A site on `repo` whose agent is the fake agent in `scenario`, called Fake, with this
+    /// process's PATH (to find `node`). The receiver gets one message per page nudge.
+    fn run_site(repo: &TempRepo, scenario: &str) -> (Site, mpsc::Receiver<()>) {
+        let (sender, nudges) = mpsc::channel();
+        // The receiver is gone once the test finished.
+        let notify: Notify = Arc::new(move || sender.send(()).unwrap_or_default());
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        let site = Site::new(
+            Some(&repo.config()),
+            None,
+            Scanner::new(move || path.clone()),
+            notify,
+        );
+        site.open(Repo::open(&repo.root).unwrap());
+        set_agents(&site, &[("Fake", &fake_agent(scenario))], "Fake");
+        (site, nudges)
+    }
+
+    /// Saves custom agents `agents`, all turned on, with `chosen` as the agent.
+    fn set_agents(site: &Site, agents: &[(&str, &str)], chosen: &str) {
+        let custom: Vec<_> = agents
+            .iter()
+            .map(|(name, command)| serde_json::json!({ "name": name, "command": command }))
+            .collect();
+        let names: Vec<_> = agents.iter().map(|(name, _)| *name).collect();
+        let settings = serde_json::json!({
+            "customAgents": custom,
+            "enabledAgents": names,
+            "agent": chosen,
+        });
+        let (status, body) = save(site, &settings.to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Waits, nudge by nudge, until the run's status is `status`, and returns the run.
+    fn wait_for(site: &Site, nudges: &mpsc::Receiver<()>, status: &str) -> serde_json::Value {
+        loop {
+            let run = get_json(site, RUN);
+            if run["status"] == status {
+                return run;
+            }
+            nudges
+                .recv_timeout(WAIT)
+                .unwrap_or_else(|_| panic!("no change while waiting for {status}: {run}"));
+        }
+    }
+
+    fn send(site: &Site, notes: &[&str]) -> (StatusCode, String) {
+        post(
+            site,
+            RUN,
+            &serde_json::json!({ "notes": notes }).to_string(),
+        )
+    }
+
+    /// The entries' kinds, with a message's text after a colon.
+    fn kinds(run: &serde_json::Value) -> Vec<String> {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| match entry["kind"].as_str().unwrap() {
+                "message" => format!("message:{}", entry["text"].as_str().unwrap()),
+                kind => kind.to_owned(),
+            })
+            .collect()
+    }
+
+    fn states(site: &Site) -> Vec<serde_json::Value> {
+        get_json(site, NOTES)["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["state"].clone())
+            .collect()
+    }
+
+    fn file_uri_of(repo: &TempRepo, path: &str) -> String {
+        let root = Repo::open(&repo.root).unwrap().root().to_owned();
+        format!("file://{}/{path}", root.display())
+    }
+
+    #[test]
+    fn sent_notes_reach_the_agent_and_every_step_of_the_run_is_kept_on_disk() {
+        let repo = TempRepo::new("run-turn");
+        repo.write("src/a.rs", "fn a() {\n    one();\n}\n");
+        repo.write("b.txt", "b\n");
+        let (site, nudges) = run_site(&repo, "turn");
+        post_note(&site, "src/a.rs", 2, 2, "rename one");
+        post_note(&site, "b.txt", 1, 1, "drop b");
+        post_note(&site, "src/a.rs", 1, 3, "not this one");
+
+        assert_eq!(
+            get(&site, RUN),
+            (StatusCode::OK, "null".to_owned()),
+            "no run yet"
+        );
+        let (status, body) = send(&site, &["N2", "N1"]);
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let waiting = wait_for(&site, &nudges, "waiting");
+        let prompt = waiting["prompt"].as_str().unwrap();
+        assert!(
+            prompt.find("[N2] b.txt:1") < prompt.find("[N1] src/a.rs:2"),
+            "the notes in the order chosen: {prompt}"
+        );
+        assert_eq!(
+            kinds(&waiting)[..3],
+            [
+                "started".to_owned(),
+                format!(
+                    "message:got {prompt} | {} | {}",
+                    file_uri_of(&repo, "b.txt"),
+                    file_uri_of(&repo, "src/a.rs")
+                ),
+                "message:prompt 1".to_owned(),
+            ],
+            "the prompt as previewed, then one link per file"
+        );
+        assert_eq!(waiting["notes"], serde_json::json!(["N2", "N1"]));
+        assert_eq!(waiting["agent"], "Fake");
+        assert_eq!(
+            states(&site),
+            [
+                serde_json::json!({ "sent": { "run": "R1" } }),
+                serde_json::json!({ "sent": { "run": "R1" } }),
+                serde_json::json!("open"),
+            ],
+            "only the notes sent are marked, with their run"
+        );
+
+        let permission = waiting["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "permission")
+            .unwrap()
+            .clone();
+        assert_eq!(permission["toolCall"], "t1");
+        let wrong = serde_json::json!({ "request": permission["request"], "option": "sure" });
+        let (status, body) = post(&site, &format!("{RUN}/permission"), &wrong.to_string());
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "not an offered option: {body}"
+        );
+        let answer = serde_json::json!({ "request": permission["request"], "option": "once" });
+        let (status, body) = post(&site, &format!("{RUN}/permission"), &answer.to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let ended = wait_for(&site, &nudges, "ended");
+        let kinds = kinds(&ended);
+        assert_eq!(
+            kinds[3..],
+            [
+                "message:fs answered -32601",
+                "thought",
+                "tool",
+                "tool",
+                "permission",
+                "answer",
+                "message:chose once",
+                "toolUpdate",
+                "plan",
+                "ended",
+            ]
+        );
+        let update = &ended["entries"][kinds.iter().position(|kind| kind == "toolUpdate").unwrap()];
+        assert_eq!(
+            update["output"],
+            serde_json::json!([
+                { "type": "diff", "path": "src/a.rs", "oldText": "a", "newText": "b" }
+            ]),
+            "paths inside the repository are shown relative to it"
+        );
+        let last = ended["entries"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["reason"], "end_turn");
+
+        // The page asks only for what it has not seen.
+        let total = ended["total"].as_u64().unwrap();
+        let tail = get_json(&site, &format!("{RUN}?after={}", total - 1));
+        assert_eq!(tail["entries"], serde_json::json!([last]));
+        assert_eq!(tail["total"], total);
+
+        // The log on disk holds the same run, read back after a restart.
+        drop(site);
+        let read = get_json(&repo.site(), RUN);
+        assert_eq!(read["status"], "ended");
+        assert_eq!(read["entries"], ended["entries"]);
+        assert_eq!(read["prompt"], ended["prompt"]);
+        assert_eq!(read["problem"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_prompt_preview_is_the_text_the_agent_receives() {
+        let repo = TempRepo::new("run-preview");
+        repo.write("src/a.rs", "fn a() {\n    one();\n}\n");
+        let (site, _nudges) = run_site(&repo, "plain");
+        post_note(&site, "src/a.rs", 1, 2, "  explain this  \n");
+        post_note(&site, "src/a.rs", 3, 3, "and this");
+        repo.write("src/a.rs", "fn a() {\n    one();\n// moved\n");
+
+        let preview = get_json(&site, &format!("{RUN}/preview?notes=N2,N1"));
+        assert_eq!(
+            preview["prompt"],
+            "These are review notes an engineer wrote while reading this repository.\n\
+             Address every note. Change nothing the notes do not ask for.\n\
+             When you finish, list each note id with one line on what you did.\n\
+             \n\
+             [N2] src/a.rs:3\n\
+             (These lines are no longer in the file; they were:)\n\
+             > }\n\
+             and this\n\
+             \n\
+             [N1] src/a.rs:1-2\n\
+             > fn a() {\n\
+             >     one();\n\
+             explain this\n"
+        );
+    }
+
+    #[test]
+    fn the_agent_is_kept_between_runs_and_replaced_when_another_is_chosen() {
+        let repo = TempRepo::new("run-keep");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+
+        send(&site, &["N1"]);
+        let first = wait_for(&site, &nudges, "ended");
+        assert!(
+            kinds(&first).contains(&"message:prompt 1".to_owned()),
+            "{first}"
+        );
+        let (status, body) = send(&site, &["N2"]);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let second = wait_for(&site, &nudges, "ended");
+        assert_eq!(second["id"], "R2");
+        assert!(
+            kinds(&second).contains(&"message:prompt 2".to_owned()),
+            "the same agent process: {second}"
+        );
+
+        // Another command is another agent, started fresh.
+        set_agents(&site, &[("Other", &fake_agent("plain2"))], "Other");
+        send(&site, &["N1"]);
+        let third = wait_for(&site, &nudges, "ended");
+        assert_eq!(third["agent"], "Other");
+        assert!(
+            kinds(&third).contains(&"message:prompt 1".to_owned()),
+            "{third}"
+        );
+    }
+
+    #[test]
+    fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
+        let repo = TempRepo::new("run-cancel");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "cancel");
+        post_note(&site, "a.txt", 1, 1, "one");
+        let cancel = format!("{RUN}/cancel");
+        let (status, body) = post(&site, &cancel, "");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "nothing to cancel yet: {body}"
+        );
+
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "waiting");
+        let (status, body) = send(&site, &["N1"]);
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("still working"), "{body}");
+
+        let (status, body) = post(&site, &cancel, "");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ended = wait_for(&site, &nudges, "ended");
+        assert_eq!(
+            kinds(&ended)[3..],
+            [
+                "permission",
+                "cancelRequested",
+                "answer",
+                "message:permission cancelled",
+                "ended"
+            ]
+        );
+        assert_eq!(ended["entries"][5]["option"], serde_json::Value::Null);
+        assert_eq!(ended["entries"][7]["reason"], "cancelled");
+
+        let late = serde_json::json!({ "request": 0, "option": "once" });
+        let (status, body) = post(&site, &format!("{RUN}/permission"), &late.to_string());
+        assert_eq!(status, StatusCode::NOT_FOUND, "a cancelled request: {body}");
+    }
+
+    #[test]
+    fn an_agent_that_fails_to_start_fails_the_run_and_leaves_the_notes_open() {
+        let repo = TempRepo::new("run-fail");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "exit-on-start");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let failed = wait_for(&site, &nudges, "failed");
+        let error = failed["entries"][0]["error"].as_str().unwrap().to_owned();
+        assert!(
+            error.contains("Please sign in: run `fake login`"),
+            "the agent's own words: {error}"
+        );
+        assert_eq!(states(&site), [serde_json::json!("open")]);
+
+        set_agents(&site, &[("Fake", &fake_agent("auth"))], "Fake");
+        send(&site, &["N1"]);
+        let failed = wait_for(&site, &nudges, "failed");
+        assert_eq!(failed["id"], "R2");
+        let error = failed["entries"][0]["error"].as_str().unwrap().to_owned();
+        assert!(error.contains("needs you to sign in"), "{error}");
+
+        set_agents(&site, &[("Ghost", "no-such-agent-program --acp")], "Ghost");
+        send(&site, &["N1"]);
+        let failed = wait_for(&site, &nudges, "failed");
+        let error = failed["entries"][0]["error"].as_str().unwrap().to_owned();
+        assert!(
+            error.contains("cannot find the agent's program no-such-agent-program"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_exits_mid_run_fails_it_and_is_started_again_next_time() {
+        let repo = TempRepo::new("run-exit");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "exit-mid-turn");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let failed = wait_for(&site, &nudges, "failed");
+        let last = failed["entries"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["error"], "the agent exited: panicked at the model");
+
+        send(&site, &["N1"]);
+        let again = wait_for(&site, &nudges, "failed");
+        assert_eq!(again["id"], "R2");
+        assert!(
+            kinds(&again).contains(&"message:prompt 1".to_owned()),
+            "a new process: {again}"
+        );
+    }
+
+    #[test]
+    fn closing_the_project_stops_its_agent() {
+        let repo = TempRepo::new("run-close");
+        let other = TempRepo::new("run-close-other");
+        repo.write("a.txt", "a\n");
+        let pid_file = repo.root.join(".git/agent-child.pid");
+        let command = format!("{} {}", fake_agent("spawns-child"), pid_file.display());
+        let (site, nudges) = run_site(&repo, "plain");
+        set_agents(&site, &[("Fake", &command)], "Fake");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let alive = || {
+            Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive(), "the agent is kept after its run");
+
+        site.open(Repo::open(&other.root).unwrap());
+        assert!(!alive(), "opening another project stopped it");
+        assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
+    }
+
+    #[test]
+    fn a_log_without_an_end_reads_as_interrupted_and_a_torn_line_is_reported() {
+        let repo = TempRepo::new("run-torn");
+        let runs = repo.root.join(".git/postil/runs");
+        fs::create_dir_all(&runs).unwrap();
+        let header =
+            r#"{"version":1,"id":"R3","agent":"Fake","notes":["N1"],"prompt":"p","startedAt":1}"#;
+        fs::write(
+            runs.join("R3.jsonl"),
+            format!("{header}\n{{\"kind\":\"started\"}}\n{{\"kind\":\"mess"),
+        )
+        .unwrap();
+        fs::write(runs.join("R2.jsonl"), "older\n").unwrap();
+        fs::write(runs.join("notes.txt"), "not a run\n").unwrap();
+
+        let site = repo.site();
+        let run = get_json(&site, RUN);
+        assert_eq!(run["id"], "R3", "the newest log");
+        assert_eq!(run["status"], "interrupted");
+        assert_eq!(run["entries"], serde_json::json!([{ "kind": "started" }]));
+        let problem = run["problem"].as_str().unwrap();
+        assert!(problem.contains("line 3 of"), "{problem}");
+
+        fs::write(runs.join("R3.jsonl"), "not a header\n").unwrap();
+        let (status, body) = get(&site, RUN);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("not a run header"), "{body}");
+    }
+
+    #[test]
+    fn run_ids_continue_after_the_highest_log_on_disk() {
+        let repo = TempRepo::new("run-ids");
+        repo.write("a.txt", "a\n");
+        let runs = repo.root.join(".git/postil/runs");
+        fs::create_dir_all(&runs).unwrap();
+        let header =
+            r#"{"version":1,"id":"R9","agent":"Fake","notes":["N1"],"prompt":"p","startedAt":1}"#;
+        fs::write(runs.join("R9.jsonl"), format!("{header}\n")).unwrap();
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R10");
+    }
+
+    #[test]
+    fn bad_run_requests_name_the_problem_and_make_no_run() {
+        let repo = TempRepo::new("run-bad");
+        repo.write("a.txt", "a\n");
+        let (site, _nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+
+        let refused = |body: &str, status: StatusCode, words: &str| {
+            let (got, reply) = post(&site, RUN, body);
+            assert_eq!(got, status, "{body}: {reply}");
+            assert!(reply.contains(words), "{body}: {reply}");
+        };
+        refused(
+            r#"{"notes": []}"#,
+            StatusCode::BAD_REQUEST,
+            "no notes were chosen",
+        );
+        refused(
+            r#"{"notes": ["N1", "N1"]}"#,
+            StatusCode::BAD_REQUEST,
+            "chosen twice",
+        );
+        refused(
+            r#"{"notes": ["N7"]}"#,
+            StatusCode::NOT_FOUND,
+            "there is no note N7",
+        );
+        refused(
+            r#"{"notes": ["x"]}"#,
+            StatusCode::BAD_REQUEST,
+            "expected N and a number",
+        );
+        refused(
+            r#"{"notes": ["N1"], "extra": 1}"#,
+            StatusCode::BAD_REQUEST,
+            "unreadable",
+        );
+        refused(
+            r#"{"agent": "Nobody", "notes": ["N1"]}"#,
+            StatusCode::BAD_REQUEST,
+            "turn Nobody on in Settings",
+        );
+        let (status, body) = save(&site, r#"{"customAgents": [], "enabledAgents": []}"#);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        refused(
+            r#"{"notes": ["N1"]}"#,
+            StatusCode::BAD_REQUEST,
+            "choose the agent notes are sent to",
+        );
+        assert_eq!(get(&site, RUN).1, "null", "a refused send makes no run");
+
+        assert_eq!(
+            get(&site, &format!("{RUN}?after=x")).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(&site, &format!("{RUN}/preview")).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(&site, &format!("{RUN}/cancel")).0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let answer = r#"{"request": 0, "option": "once"}"#;
+        let (status, body) = post(&site, &format!("{RUN}/permission"), answer);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "no run, so no request: {body}"
         );
     }
 }
