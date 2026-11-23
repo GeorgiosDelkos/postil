@@ -2,8 +2,7 @@
 // lists the runs, one small card each, newest first; a card opens the run's dialog
 // (run-dialog.js). What needs an answer now shows above the runs.
 
-import { el } from "./dom.js";
-import { statusIcon } from "./note-dialog.js";
+import { el, statusIcon } from "./dom.js";
 import {
   elapsed,
   foldRun,

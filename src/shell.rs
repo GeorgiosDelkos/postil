@@ -125,6 +125,11 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "text/javascript",
         include_bytes!("../ui/question.js"),
     ),
+    (
+        "/question-form.js",
+        "text/javascript",
+        include_bytes!("../ui/question-form.js"),
+    ),
     ("/dom.js", "text/javascript", include_bytes!("../ui/dom.js")),
     (
         "/bench.js",

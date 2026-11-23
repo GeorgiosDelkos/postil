@@ -22,6 +22,14 @@ export function icon(id) {
   return svg;
 }
 
+// The status icon of a card or a dialog: its shape is CSS (`.status-icon.<kind>`).
+export function statusIcon(kind) {
+  const glyph = { needs: "!", addressed: "✓", resolved: "✓", silent: "–", failed: "×" }[kind] ?? "";
+  const icon = el("span", `status-icon ${kind}`, glyph);
+  icon.setAttribute("aria-hidden", "true");
+  return icon;
+}
+
 // Puts icons.svg into the page once, so every icon refers to a symbol in this document.
 // Until it arrives, or if it fails, the icons are empty boxes and nothing else changes.
 export async function loadIcons() {

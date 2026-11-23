@@ -3,8 +3,8 @@
 // its review's findings. ui/run.js has the rules. A run's follow-ups are part of its dialog,
 // which ends with the box that sends the next one.
 
-import { el } from "./dom.js";
-import { questionForm, statusIcon } from "./note-dialog.js";
+import { el, statusIcon } from "./dom.js";
+import { questionForm } from "./question-form.js";
 import {
   elapsed,
   foldRun,
@@ -86,26 +86,6 @@ export function runDialog({
     if (detail && !list.includes(detail.id)) detailEl.close();
   }
 
-  // The run's steps in order, each with its index among the run's items and its key: every
-  // item but the agent's messages and, while the run is live, an open request, which shows
-  // above the runs. Once the run is over a request left open is a step too, shown as closed.
-  function stepsOf(view) {
-    const live = isLive(view);
-    return foldRun(view.entries)
-      .items.map((item, index) => ({ item, index, key: itemKey(item, index) }))
-      .filter(
-        ({ item }) =>
-          item.type !== "message" &&
-          !(live && (item.type === "permission" || item.type === "question") && item.answer === undefined),
-      );
-  }
-
-  function itemKey(item, index) {
-    if (item.type === "tool") return `tool:${item.id}`;
-    if (item.type === "permission") return `permission:${item.request}`;
-    return `${item.type}:${index}`;
-  }
-
   // Draws the dialog again when what it shows changed, keeping its scroll; otherwise writes
   // only the streamed text in place, while the run streams.
   function drawDetail() {
@@ -179,12 +159,6 @@ export function runDialog({
     right.append(...actions, close);
     head.append(...(icon ? [icon] : []), heading, el("span", "note-dialog-where", extra), right);
     return head;
-  }
-
-  function section(label, ...content) {
-    const part = el("section", "note-dialog-section");
-    part.append(el("div", "note-dialog-label", label), ...content);
-    return part;
   }
 
   // A note sent in the run: its status in this run, its place and id.
@@ -626,43 +600,69 @@ export function runDialog({
     return [detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions), body];
   }
 
-  // How a closed question ended: answered, skipped, or closed with no answer.
-  function questionState(item) {
-    if (item.answer === null) return "closed";
-    return item.answer?.content ? "answered" : "skipped";
-  }
-
-  // Fills `view` with the agent's Markdown as elements, built node by node: its text is never
-  // parsed as HTML.
-  function fillMarkdown(view, text) {
-    view.replaceChildren();
-    for (const block of markdownBlocks(text.trim())) {
-      if (block.type === "code") view.append(el("pre", "run-code", block.text));
-      else if (block.type === "list") {
-        const list = el(block.ordered ? "ol" : "ul");
-        for (const item of block.items) list.append(inlineView("li", item));
-        view.append(list);
-      } else view.append(inlineView(block.type === "heading" ? "h4" : "p", block.inline));
-    }
-  }
-
-  function inlineView(tag, parts) {
-    const node = el(tag);
-    for (const part of parts) {
-      const wrap = { code: "code", strong: "strong", em: "em" }[part.type];
-      node.append(wrap ? el(wrap, "", part.text) : part.text);
-    }
-    return node;
-  }
-
-  function diffView(diff) {
-    const view = el("pre", "tool-diff");
-    const marks = { same: "  ", del: "- ", add: "+ " };
-    for (const line of partLines(diff)) {
-      view.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
-    }
-    return view;
-  }
-
   return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft };
+}
+
+// The run's steps in order, each with its index among the run's items and its key: every
+// item but the agent's messages and, while the run is live, an open request, which shows
+// above the runs. Once the run is over a request left open is a step too, shown as closed.
+function stepsOf(view) {
+  const live = isLive(view);
+  return foldRun(view.entries)
+    .items.map((item, index) => ({ item, index, key: itemKey(item, index) }))
+    .filter(
+      ({ item }) =>
+        item.type !== "message" &&
+        !(live && (item.type === "permission" || item.type === "question") && item.answer === undefined),
+    );
+}
+
+function itemKey(item, index) {
+  if (item.type === "tool") return `tool:${item.id}`;
+  if (item.type === "permission") return `permission:${item.request}`;
+  return `${item.type}:${index}`;
+}
+
+function section(label, ...content) {
+  const part = el("section", "note-dialog-section");
+  part.append(el("div", "note-dialog-label", label), ...content);
+  return part;
+}
+
+// How a closed question ended: answered, skipped, or closed with no answer.
+function questionState(item) {
+  if (item.answer === null) return "closed";
+  return item.answer?.content ? "answered" : "skipped";
+}
+
+// Fills `view` with the agent's Markdown as elements, built node by node: its text is never
+// parsed as HTML.
+function fillMarkdown(view, text) {
+  view.replaceChildren();
+  for (const block of markdownBlocks(text.trim())) {
+    if (block.type === "code") view.append(el("pre", "run-code", block.text));
+    else if (block.type === "list") {
+      const list = el(block.ordered ? "ol" : "ul");
+      for (const item of block.items) list.append(inlineView("li", item));
+      view.append(list);
+    } else view.append(inlineView(block.type === "heading" ? "h4" : "p", block.inline));
+  }
+}
+
+function inlineView(tag, parts) {
+  const node = el(tag);
+  for (const part of parts) {
+    const wrap = { code: "code", strong: "strong", em: "em" }[part.type];
+    node.append(wrap ? el(wrap, "", part.text) : part.text);
+  }
+  return node;
+}
+
+function diffView(diff) {
+  const view = el("pre", "tool-diff");
+  const marks = { same: "  ", del: "- ", add: "+ " };
+  for (const line of partLines(diff)) {
+    view.append(el("span", line.kind, `${marks[line.kind]}${line.text}\n`));
+  }
+  return view;
 }

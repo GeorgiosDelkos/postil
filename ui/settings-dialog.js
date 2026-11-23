@@ -220,21 +220,6 @@ export function settingsDialog(dialogEl, { apply }) {
   // Controls are off while the file cannot be saved over: a change would only be refused.
   const locked = () => Boolean(ui.view.problem);
 
-  function section(title, ...children) {
-    const node = el("section", "settings-section");
-    node.append(el("h3", "settings-heading", title), ...children);
-    return node;
-  }
-
-  function row(label, hint, control) {
-    const node = el("div", "settings-row");
-    const text = el("div", "settings-label");
-    text.append(el("div", "", label));
-    if (hint) text.append(el("div", "settings-hint", hint));
-    node.append(text, control);
-    return node;
-  }
-
   // A row of mutually exclusive choices, as macOS draws a segmented control.
   function segmented(key, options, current, choose) {
     const node = el("div", "segmented");
@@ -592,4 +577,19 @@ export function settingsDialog(dialogEl, { apply }) {
       await refresh().catch(fail);
     },
   };
+}
+
+function section(title, ...children) {
+  const node = el("section", "settings-section");
+  node.append(el("h3", "settings-heading", title), ...children);
+  return node;
+}
+
+function row(label, hint, control) {
+  const node = el("div", "settings-row");
+  const text = el("div", "settings-label");
+  text.append(el("div", "", label));
+  if (hint) text.append(el("div", "settings-hint", hint));
+  node.append(text, control);
+  return node;
 }

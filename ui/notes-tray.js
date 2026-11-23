@@ -7,8 +7,7 @@
 // again, or Send, sends; Escape closes the step. The run then shows in the tray's Run tab
 // (run-panel.js), which takes the front whenever the agent needs the engineer.
 
-import { $, el, showToast } from "./dom.js";
-import { statusIcon } from "./note-dialog.js";
+import { $, el, showToast, statusIcon } from "./dom.js";
 import { isLive, isOpen, isResolved, promptLines, sendable } from "./run.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
