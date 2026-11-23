@@ -30,10 +30,14 @@ test("the send step ticks the open notes whose lines are still there", () => {
     note("N2", { kind: "sent", run: "R1" }),
     note("N3", OPEN, "lost"),
     note("N4", OPEN),
+    note("N5", { kind: "resolved", run: "R2" }),
+    note("N6", { kind: "resolved" }),
   ];
-  assert.deepEqual(sendable(notes), ["N1", "N4"]);
+  assert.deepEqual(sendable(notes), ["N1", "N4"], "a resolved note is not ticked");
   assert.equal(sentIn(notes[1]), "R1");
   assert.equal(sentIn(notes[0]), null);
+  assert.equal(sentIn(notes[4]), "R2", "a resolved note keeps its run");
+  assert.equal(sentIn(notes[5]), null, "resolved without being sent");
 });
 
 test("message and thought parts join until something else comes between them", () => {

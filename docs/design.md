@@ -181,7 +181,7 @@ enum Anchor {
 enum NoteState {
     Open,
     Sent { run: RunId },
-    Resolved,
+    Resolved { run: Option<RunId> }, // The run it was sent in last, so its dialog keeps it.
 }
 ```
 
@@ -217,7 +217,13 @@ As built in milestone 2 (`src/notes.rs`):
 - **Every new field is a new format version.** A build refuses fields it does not know, so a
   milestone 2 build reading a file with milestone 3's `state` must fail on "version 2", not on
   "unknown field". Milestone 3 therefore writes version 2 and still reads version 1, with
-  `state` defaulting to `open`.
+  `state` defaulting to `open`. Milestone 4's resolved state is version 3.
+- **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
+  dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
+  that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
+  naming a resolved note is refused (400), and a run that takes its turn after the note was
+  resolved leaves it resolved, with that run. The tray lists resolved notes last, and the page
+  offers no send for them.
 - **Placing a note:** it stays where its snippet still is, or moves to the only other copy of
   the snippet; with several copies and none at its last lines its anchor is lost. The nearest
   copy is not taken: short lines such as `}` repeat, and the nearest is often the wrong one.
@@ -227,9 +233,10 @@ As built in milestone 2 (`src/notes.rs`):
   changed meanwhile, the note goes where that text is now (same rule), or the request fails
   with 409 and the draft stays in the composer.
 - The Rust process keeps no copy. Every `api/notes` request reads the file and places every
-  note. Only adding a note writes the file, with every note at its current place; reading never
-  writes, so the refresh on focus cannot overwrite a hand edit. A file that does not parse, has
-  another version, or repeats an id is reported with its path and never overwritten.
+  note. Only a change (add, delete, resolve, reopen, marking sent) writes the file, with every
+  note at its current place; reading never writes, so the refresh on focus cannot overwrite a
+  hand edit. A file that does not parse, has another version, or repeats an id is reported
+  with its path and never overwritten.
 - An add holds an exclusive lock on `<git dir>/postil/review.lock` from its read to its rename,
   so two app windows on one working tree keep each other's notes. A script that edits
   `review.json` without that lock can lose an edit made during an add.
@@ -634,6 +641,10 @@ retired; the measured numbers above are the baseline to not regress.
    foot of the sidebar shows the agent's state. The open file and the notes are read again when the run moves on and when
    an edit finishes. Not built: the follow-up field under the run (milestone 4).
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
+   Built: resolving notes, from the note's dialog (Resolve, Reopen). Planned with the owner on
+   2026-11-23: follow-ups are new runs sent to the same conversation and threaded under the
+   first run's card; snapshots are git trees written through a temporary index before and after
+   each run; the changes view is a unified diff per file with notes beside their lines.
 5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at
    the owner's request (2026-11-22): the settings dialog and file, with agent detection,
    custom agents, the agent and the reviewers (sections "Agents" and "Settings"; it replaces

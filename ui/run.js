@@ -9,15 +9,21 @@ export function sendable(notes) {
   return notes.filter((note) => isOpen(note) && note.anchor === "found").map((note) => note.id);
 }
 
-// Whether a note is still to be sent. `state` is `{ kind: "open" }` or
-// `{ kind: "sent", run: "R1" }` (src/notes.rs).
+// Whether a note is still to be sent. `state` is `{ kind: "open" }`,
+// `{ kind: "sent", run: "R1" }` or `{ kind: "resolved", run: "R1" }`, a resolved note's run
+// left out when it was never sent (src/notes.rs).
 export function isOpen(note) {
   return note.state.kind === "open";
 }
 
-// The run a note was sent in, or null.
+// Whether the engineer marked the note done.
+export function isResolved(note) {
+  return note.state.kind === "resolved";
+}
+
+// The run a note was sent in, or null. A resolved note keeps the run it was sent in last.
 export function sentIn(note) {
-  return note.state.kind === "sent" ? note.state.run : null;
+  return note.state.run ?? null;
 }
 
 // Folds a run's entries into what the panel shows: the latest plan, and the items in the

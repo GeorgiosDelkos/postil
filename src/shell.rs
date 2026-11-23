@@ -24,7 +24,7 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::header::CONTENT_TYPE;
-use wry::http::{Method, Request, Response, StatusCode};
+use wry::http::{Method, Request, Response, StatusCode, Uri};
 use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::agents::{self, BUILT_IN, Scanner};
@@ -35,7 +35,7 @@ use crate::highlight::{Highlighter, Token};
 use crate::layout::{self, Layout};
 #[cfg(target_os = "macos")]
 use crate::menu::Command;
-use crate::notes::{self, NewNote};
+use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
 use crate::run::{AgentChoice, Notify, Runner};
@@ -855,6 +855,8 @@ impl Site {
                     &b"GET the notes, POST a new one, or DELETE ?id=N1"[..],
                 ),
             },
+            "/api/notes/resolve" if post => self.change_note(uri, notes::resolve),
+            "/api/notes/reopen" if post => self.change_note(uri, notes::reopen),
             "/api/settings" => match *request.method() {
                 Method::GET => reply(StatusCode::OK, "application/json", self.settings()),
                 Method::PUT => json_or_error(self.save_settings(request.body())),
@@ -890,6 +892,11 @@ impl Site {
                 self.agents.rescan();
                 reply(StatusCode::OK, "application/json", self.settings())
             }
+            "/api/notes/resolve" | "/api/notes/reopen" => reply(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                &b"POST ?id=<note id> with no body"[..],
+            ),
             "/api/settings/reset" | "/api/agents/rescan" => reply(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "text/plain",
@@ -989,6 +996,24 @@ impl Site {
         // a log that cannot be removed is reported, and tried again at the next delete.
         self.runner()?.delete_runs_without_notes()?;
         Ok(to_json(&review))
+    }
+
+    /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
+    /// changes the note's state with `change` (`notes::resolve` or `notes::reopen`), and
+    /// returns all notes.
+    fn change_note(&self, uri: &Uri, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
+        let Some(id) = query_value(uri.query().unwrap_or(""), "id") else {
+            return reply(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                &b"expected ?id=<note id>"[..],
+            );
+        };
+        json_or_error(
+            self.repo()
+                .and_then(|repo| change(&repo, &id))
+                .map(|review| to_json(&review)),
+        )
     }
 
     /// The replies to `/api/run` and the routes under it.
@@ -1522,7 +1547,7 @@ mod tests {
             file.display()
         );
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(stored["version"], 2);
+        assert_eq!(stored["version"], 3);
         assert_eq!(stored["notes"], review["notes"]);
         assert_eq!(note["state"], serde_json::json!({ "kind": "open" }));
 
@@ -1651,9 +1676,9 @@ mod tests {
             [anchor("N5", 2, 2, "found"), anchor("N6", 1, 1, "found")]
         );
         // A version 1 file has no states: its notes read as open, and the write that added
-        // N6 made it version 2.
+        // N6 made it version 3.
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(stored["version"], 2);
+        assert_eq!(stored["version"], 3);
         assert_eq!(
             stored["notes"][0]["state"],
             serde_json::json!({ "kind": "open" })
@@ -1748,7 +1773,77 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_missing_or_malformed_id_says_so_and_changes_nothing() {
+    fn a_note_is_resolved_with_its_run_and_reopened_to_where_it_was() {
+        let repo = TempRepo::new("notes-resolve");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        let change = |action: &str, id: &str| {
+            let (status, body) = post(&site, &format!("{NOTES}/{action}?id={id}"), "");
+            assert_eq!(status, StatusCode::OK, "{action} {id}: {body}");
+            let review: serde_json::Value = serde_json::from_str(&body).unwrap();
+            review["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|note| note["state"].clone())
+                .collect::<Vec<_>>()
+        };
+        let open = serde_json::json!({ "kind": "open" });
+        let resolved_after_r1 = serde_json::json!({ "kind": "resolved", "run": "R1" });
+        let resolved = serde_json::json!({ "kind": "resolved" });
+
+        assert_eq!(
+            change("resolve", "N1"),
+            [resolved_after_r1.clone(), open.clone()]
+        );
+        assert_eq!(
+            change("resolve", "N1"),
+            [resolved_after_r1.clone(), open.clone()],
+            "resolving twice changes nothing"
+        );
+        assert_eq!(
+            change("resolve", "N2"),
+            [resolved_after_r1, resolved.clone()]
+        );
+
+        // Only Reopen takes a note out of Resolved: a send is refused, and a run that takes
+        // its turn after the engineer resolved the note leaves it resolved, with that run.
+        let (status, body) = send(&site, &["N2"]);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("N2 is resolved: reopen it"), "{body}");
+        notes::mark_sent(&site.repo().unwrap(), &["N1".to_owned()], "R9").unwrap();
+        assert_eq!(
+            states(&site),
+            [
+                serde_json::json!({ "kind": "resolved", "run": "R9" }),
+                resolved.clone()
+            ]
+        );
+
+        let sent = serde_json::json!({ "kind": "sent", "run": "R9" });
+        assert_eq!(change("reopen", "N1"), [sent.clone(), resolved.clone()]);
+        assert_eq!(
+            change("reopen", "N1"),
+            [sent.clone(), resolved],
+            "reopening a sent note changes nothing"
+        );
+        assert_eq!(change("reopen", "N2"), [sent.clone(), open.clone()]);
+        assert_eq!(
+            change("reopen", "N2"),
+            [sent, open],
+            "reopening an open note changes nothing"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(site.repo().unwrap().review_file()).unwrap()).unwrap();
+        assert_eq!(stored["version"], 3);
+    }
+
+    #[test]
+    fn changing_a_missing_or_malformed_id_says_so_and_changes_nothing() {
         let repo = TempRepo::new("notes-delete-bad");
         repo.write("a.txt", "x\n");
         let site = repo.site();
@@ -1764,6 +1859,20 @@ mod tests {
         assert!(body.contains("note id \"nine\""), "{body}");
         let (status, _) = delete(&site, NOTES);
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        for (uri, status) in [
+            (format!("{NOTES}/resolve?id=N9"), StatusCode::NOT_FOUND),
+            (format!("{NOTES}/reopen?id=nine"), StatusCode::BAD_REQUEST),
+            (format!("{NOTES}/resolve"), StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(post(&site, &uri, "").0, status, "{uri}");
+        }
+        for action in ["resolve", "reopen"] {
+            assert_eq!(
+                get(&site, &format!("{NOTES}/{action}?id=N1")).0,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "only a POST changes a note: {action}"
+            );
+        }
 
         assert_eq!(fs::read_to_string(&file).unwrap(), before);
     }
@@ -1781,8 +1890,8 @@ mod tests {
         let cases = [
             ("{\"version\": 1, \"notes\": [", "cannot parse".to_owned()),
             (
-                r#"{"version": 3, "notes": []}"#,
-                "version 3, but this build of Postil reads versions 1 to 2".to_owned(),
+                r#"{"version": 4, "notes": []}"#,
+                "version 4, but this build of Postil reads versions 1 to 3".to_owned(),
             ),
             (r#"{"version": 0, "notes": []}"#, "version 0".to_owned()),
             (r#"{"notes": []}"#, "cannot parse".to_owned()),

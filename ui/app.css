@@ -2385,9 +2385,15 @@ body.resizing * {
   background: var(--attention);
 }
 
-.status-icon.addressed {
+.status-icon.addressed,
+.status-icon.resolved {
   border: 0;
   background: var(--added);
+}
+
+/* A resolved note is finished: its card steps back. */
+.note.resolved .note-body {
+  color: var(--text-muted);
 }
 
 .status-icon.failed {
