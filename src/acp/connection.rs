@@ -1,6 +1,6 @@
 //! A running agent: its process, the threads around its pipes, and the requests in flight.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -247,15 +247,12 @@ impl Agent {
     pub(crate) fn prompt(&self, prompt: &[ContentBlock]) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            if state
-                .waiters
-                .values()
-                .any(|waiter| matches!(waiter, Waiter::Turn))
-            {
+            if state.turn.is_some() {
                 return Err(Error::TurnRunning);
             }
             state.cancelling = false;
-            state.register(Waiter::Turn)
+            state.turn = state.new_id();
+            state.turn
         };
         let id = id.ok_or_else(|| self.process.exited())?;
         let params = PromptParams {
@@ -276,30 +273,22 @@ impl Agent {
     ///
     /// [`Error::AgentExited`] when the process is gone.
     pub(crate) fn cancel(&self) -> Result<Vec<usize>> {
-        let open: Vec<(usize, Open)> = {
+        let open = {
             let mut state = self.process.state();
             // Only while a turn runs: a cancel that comes just after the turn ended must not
             // make the next turn answer its requests `cancelled`.
-            state.cancelling = state
-                .waiters
-                .values()
-                .any(|waiter| matches!(waiter, Waiter::Turn));
-            state
-                .requests
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(number, request)| request.take().map(|open| (number, open)))
-                .collect()
+            state.cancelling = state.turn.is_some();
+            std::mem::take(&mut state.requests)
         };
         let params = CancelParams {
             session_id: &self.session,
         };
         self.process
             .send(&notification("session/cancel", &params))?;
-        for (_, open) in &open {
+        for open in open.values() {
             self.process.send(&cancelled(open))?;
         }
-        Ok(open.into_iter().map(|(number, _)| number).collect())
+        Ok(open.into_keys().collect())
     }
 
     /// Answers the permission request numbered `number` with the option `option_id`, one the
@@ -313,11 +302,10 @@ impl Agent {
     pub(crate) fn answer_permission(&self, number: usize, option_id: &str) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
             let Some(Open {
                 kind: Kind::Permission { offered },
                 ..
-            }) = request.as_ref()
+            }) = state.requests.get(&number)
             else {
                 return Err(Error::NoSuchRequest);
             };
@@ -326,7 +314,11 @@ impl Agent {
                     "the agent did not offer the answer {option_id:?}"
                 )));
             }
-            request.take().expect("checked to be open above").id
+            state
+                .requests
+                .remove(&number)
+                .expect("checked to be open above")
+                .id
         };
         let result = PermissionResult {
             outcome: PermissionOutcome::Selected { option_id },
@@ -343,9 +335,8 @@ impl Agent {
     pub(crate) fn answer_question(&self, number: usize, reply: &ElicitationReply) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
             if !matches!(
-                request,
+                state.requests.get(&number),
                 Some(Open {
                     kind: Kind::Question,
                     ..
@@ -353,7 +344,11 @@ impl Agent {
             ) {
                 return Err(Error::NoSuchRequest);
             }
-            request.take().expect("checked to be open above").id
+            state
+                .requests
+                .remove(&number)
+                .expect("checked to be open above")
+                .id
         };
         self.process.send(&response(&id, Outcome::Result(reply)))
     }
@@ -414,11 +409,17 @@ struct Shared {
 struct State {
     /// The id of the app's next request.
     next_id: u64,
-    /// Who waits for the reply to each request the app sent.
-    waiters: HashMap<u64, Waiter>,
-    /// The agent's permission requests and questions by number, while open; `None` once
-    /// answered, withdrawn, or closed with the turn.
-    requests: Vec<Option<Open>>,
+    /// The callers blocked in [`Process::call`], by the id of the request each waits on.
+    waiters: HashMap<u64, Caller>,
+    /// The id of the prompt whose turn runs; its reply ends the turn and becomes
+    /// [`Event::TurnEnded`]. One turn at a time: [`Agent::prompt`] refuses while it is set.
+    turn: Option<u64>,
+    /// The number the agent's next permission request or question gets.
+    next_request: usize,
+    /// The agent's permission requests and questions by number, while open: removed once
+    /// answered, withdrawn, or closed with the turn. Ordered, so a cancel answers and reports
+    /// them oldest first.
+    requests: BTreeMap<usize, Open>,
     /// Set by [`Agent::cancel`] until the turn ends: requests that arrive meanwhile are
     /// answered `cancelled` at once.
     cancelling: bool,
@@ -429,24 +430,32 @@ struct State {
     gone: bool,
 }
 
-/// Who waits for a reply.
-#[derive(Debug)]
-enum Waiter {
+/// Where a blocked caller receives its reply.
+type Caller = SyncSender<std::result::Result<Value, RpcError>>;
+
+/// Whom a reply from the agent is for.
+enum Addressee {
     /// A caller blocked in [`Process::call`].
-    Call(SyncSender<std::result::Result<Value, RpcError>>),
-    /// The prompt's reply, which ends the turn and becomes [`Event::TurnEnded`].
-    Turn,
+    Caller(Caller),
+    /// The turn, which the reply ends, with the requests that were still open.
+    Turn(BTreeMap<usize, Open>),
 }
 
 impl State {
-    /// A new request id with `waiter` waiting for its reply; `None` once the agent is gone.
-    fn register(&mut self, waiter: Waiter) -> Option<u64> {
+    /// A new id for a request of the app's; `None` once the agent is gone.
+    fn new_id(&mut self) -> Option<u64> {
         if self.gone {
             return None;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.waiters.insert(id, waiter);
+        Some(id)
+    }
+
+    /// A new request id with `caller` waiting for its reply; `None` once the agent is gone.
+    fn register(&mut self, caller: Caller) -> Option<u64> {
+        let id = self.new_id()?;
+        self.waiters.insert(id, caller);
         Some(id)
     }
 }
@@ -537,10 +546,7 @@ impl Process {
         timeout: Duration,
     ) -> Result<R> {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let id = self
-            .state()
-            .register(Waiter::Call(sender))
-            .ok_or_else(|| self.exited())?;
+        let id = self.state().register(sender).ok_or_else(|| self.exited())?;
         self.send(&request(id, method, params))?;
         match receiver.recv_timeout(timeout) {
             Ok(Ok(result)) => serde_json::from_value(result).map_err(|error| {
@@ -655,10 +661,10 @@ impl<F: FnMut(Event)> Reader<F> {
             // Dropped after the wait, so a blocked caller's "exited" error carries the agent's
             // last words. Dropping the waiters wakes every blocked caller with "exited".
             state.waiters.clear();
-            state
-                .requests
-                .iter_mut()
-                .for_each(|request| *request = None);
+            // No reply ends the turn now, and a prompt must fail as "exited", not as a turn
+            // still running.
+            state.turn = None;
+            state.requests.clear();
             state.closed
         };
         if !closed {
@@ -688,9 +694,16 @@ impl<F: FnMut(Event)> Reader<F> {
 
     /// A reply to one of the app's requests.
     fn reply(&mut self, id: &Value, result: Option<Value>, error: Option<RpcError>) {
-        let waiter = id
-            .as_u64()
-            .and_then(|id| lock(&self.shared.state).waiters.remove(&id));
+        let addressee = id.as_u64().and_then(|id| {
+            let mut state = lock(&self.shared.state);
+            if state.turn == Some(id) {
+                state.turn = None;
+                state.cancelling = false;
+                Some(Addressee::Turn(std::mem::take(&mut state.requests)))
+            } else {
+                state.waiters.remove(&id).map(Addressee::Caller)
+            }
+        });
         let outcome = match (result, error) {
             (_, Some(error)) => Err(error),
             (Some(result), None) => Ok(result),
@@ -698,18 +711,13 @@ impl<F: FnMut(Event)> Reader<F> {
             // fail its own parse below, so this needs no case of its own.
             (None, None) => Ok(Value::Null),
         };
-        match waiter {
+        match addressee {
             // The caller timed out and left: nobody wants the reply.
-            Some(Waiter::Call(sender)) => drop(sender.send(outcome)),
-            Some(Waiter::Turn) => {
-                let open: Vec<Open> = {
-                    let mut state = lock(&self.shared.state);
-                    state.cancelling = false;
-                    state.requests.iter_mut().filter_map(Option::take).collect()
-                };
+            Some(Addressee::Caller(sender)) => drop(sender.send(outcome)),
+            Some(Addressee::Turn(open)) => {
                 // A request still open when its turn ended is answered as a cancel, which
                 // ACP asks of a request its sender gave up on.
-                for open in &open {
+                for open in open.values() {
                     drop(self.outbox.send(cancelled(open)));
                 }
                 let end = match outcome {
@@ -826,8 +834,10 @@ impl<F: FnMut(Event)> Reader<F> {
             self.outbox.send(cancelled(&open)).ok();
             return None;
         }
-        state.requests.push(Some(open));
-        Some(state.requests.len() - 1)
+        let number = state.next_request;
+        state.next_request += 1;
+        state.requests.insert(number, open);
+        Some(number)
     }
 
     /// Answers a request the app cannot read or serve with an error, and says so in the run.
@@ -876,8 +886,8 @@ impl<F: FnMut(Event)> Reader<F> {
             let found = state
                 .requests
                 .iter()
-                .position(|open| open.as_ref().is_some_and(|open| open.id == request_id));
-            found.and_then(|number| state.requests[number].take().map(|open| (number, open)))
+                .find_map(|(number, open)| (open.id == request_id).then_some(*number));
+            found.and_then(|number| state.requests.remove_entry(&number))
         };
         if let Some((number, open)) = closed {
             drop(self.outbox.send(cancelled(&open)));
