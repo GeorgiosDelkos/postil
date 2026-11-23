@@ -7,3 +7,4 @@
 *.cer
 *.keychain
 *.keychain-db
+/tests/e2e/node_modules
