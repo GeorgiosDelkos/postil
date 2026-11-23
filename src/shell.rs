@@ -252,7 +252,6 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
                     Command::OpenFolder
                     | Command::SwitchProject
                     | Command::GoToFile
-                    | Command::ToggleFiles
                     | Command::Settings => Unanswered::Ignore,
                 };
                 ask_page(&page, command.id(), unanswered);
@@ -3612,22 +3611,18 @@ mod tests {
     fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         let repo = TempRepo::new("layout");
         let site = repo.empty_site();
-        let defaults = serde_json::json!({ "sidebar": 248, "tray": 320, "filesFolded": false });
+        let defaults = serde_json::json!({ "sidebar": 248, "tray": 320 });
         let fresh = get_json(&site, LAYOUT);
         assert_eq!(
             fresh,
             serde_json::json!({
-                "sidebar": 248, "tray": 320, "filesFolded": false,
+                "sidebar": 248, "tray": 320,
                 "defaults": defaults,
-                "limits": { "sidebar": [180, 480], "tray": [280, 720] },
+                "limits": { "sidebar": [200, 480], "tray": [280, 720] },
             })
         );
 
-        let (status, body) = put(
-            &site,
-            LAYOUT,
-            r#"{"sidebar": 300, "tray": 460, "filesFolded": true}"#,
-        );
+        let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
         assert_eq!(status, StatusCode::OK, "{body}");
         // Another window, or the next start, reads the same widths: they are the Mac's, not
         // the project's.
@@ -3636,22 +3631,15 @@ mod tests {
         again.open(Repo::open(&other.root).unwrap());
         let kept = get_json(&again, LAYOUT);
         assert_eq!(
-            (
-                kept["sidebar"].clone(),
-                kept["tray"].clone(),
-                kept["filesFolded"].clone()
-            ),
-            (300.into(), 460.into(), true.into())
+            (kept["sidebar"].clone(), kept["tray"].clone()),
+            (300.into(), 460.into())
         );
 
         for (body, words) in [
+            (r#"{"sidebar": 100, "tray": 320}"#, "outside 200 to 480"),
+            (r#"{"sidebar": 248}"#, "unreadable layout"),
             (
-                r#"{"sidebar": 100, "tray": 320, "filesFolded": false}"#,
-                "outside 180 to 480",
-            ),
-            (r#"{"sidebar": 248, "tray": 320}"#, "unreadable layout"),
-            (
-                r#"{"sidebar": 248, "tray": 320, "filesFolded": false, "x": 1}"#,
+                r#"{"sidebar": 248, "tray": 320, "x": 1}"#,
                 "unreadable layout",
             ),
         ] {
@@ -3671,11 +3659,7 @@ mod tests {
     fn without_a_configuration_directory_widths_are_the_defaults_and_not_kept() {
         let site = Site::new(None, None, no_agents(), quiet());
         assert_eq!(get_json(&site, LAYOUT)["tray"], 320);
-        let (status, body) = put(
-            &site,
-            LAYOUT,
-            r#"{"sidebar": 300, "tray": 460, "filesFolded": false}"#,
-        );
+        let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
         assert!(body.contains("HOME"), "{body}");
     }

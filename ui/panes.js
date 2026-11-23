@@ -1,11 +1,7 @@
-// The rules for the window's pane widths: dragging the two dividers, folding the file list,
-// and fitting the panes into the window. Kept apart from the document so `node --test` runs
-// them. A layout is what `api/layout` keeps (src/layout.rs): `{ sidebar, tray, filesFolded }`,
-// widths in CSS px, with the limits it sends: `{ sidebar: [min, max], tray: [min, max] }`.
-
-// The folded file list's width: the window's buttons sit over its top, so it is as wide as
-// they are, with a margin.
-export const RAIL = 76;
+// The rules for the window's pane widths: dragging the two dividers and fitting the panes into
+// the window. Kept apart from the document so `node --test` runs them. A layout is what
+// `api/layout` keeps (src/layout.rs): `{ sidebar, tray }`, widths in CSS px, with the limits it
+// sends: `{ sidebar: [min, max], tray: [min, max] }`.
 
 // The code pane's least width: about 50 columns of code at the default size, enough to read a
 // line and its note. Arbitrary.
@@ -25,7 +21,7 @@ const clamp = (value, [min, max]) => Math.min(Math.max(value, min), max);
 // the tray gives way first, then the file list, neither below its minimum. A window too
 // narrow even for that draws the minimums, and the code pane is what shrinks.
 export function fit(layout, limits, width) {
-  let sidebar = layout.filesFolded ? RAIL : clamp(layout.sidebar, limits.sidebar);
+  let sidebar = clamp(layout.sidebar, limits.sidebar);
   let tray = clamp(layout.tray, limits.tray);
   let excess = sidebar + tray + CODE_MIN + GAPS - width;
   if (excess > 0) {
@@ -33,18 +29,15 @@ export function fit(layout, limits, width) {
     tray -= fromTray;
     excess -= fromTray;
   }
-  if (excess > 0 && !layout.filesFolded) {
-    sidebar -= Math.min(excess, sidebar - limits.sidebar[0]);
-  }
+  if (excess > 0) sidebar -= Math.min(excess, sidebar - limits.sidebar[0]);
   return { sidebar, tray };
 }
 
 // The layout once the file list's divider is dragged to `x`, the pointer's distance from the
-// window's left edge. Dragged below the list's minimum, the list folds and keeps its last
-// width for unfolding; dragged back past the minimum, it unfolds at the pointer.
+// window's left edge. The list stops at its minimum, which still shows the Settings button
+// whole: the owner asked on 2026-11-23 for no narrower list, and no folded rail.
 export function dragFiles(layout, limits, x) {
-  if (x < limits.sidebar[0]) return { ...layout, filesFolded: true };
-  return { ...layout, sidebar: Math.min(Math.round(x), limits.sidebar[1]), filesFolded: false };
+  return { ...layout, sidebar: clamp(Math.round(x), limits.sidebar) };
 }
 
 // The layout once the tray's divider is dragged to `x` in a window `width` px wide. The tray
@@ -54,18 +47,16 @@ export function dragTray(layout, limits, x, width) {
 }
 
 // The layout once a focused divider is moved by `delta` px with the arrow keys: right is
-// positive, which widens the file list and narrows the tray. A folded list unfolds.
+// positive, which widens the file list and narrows the tray.
 export function step(layout, limits, divider, delta) {
-  if (divider === "files") {
-    const from = layout.filesFolded ? limits.sidebar[0] - delta : layout.sidebar;
-    return { ...layout, sidebar: clamp(from + delta, limits.sidebar), filesFolded: false };
-  }
-  return { ...layout, tray: clamp(layout.tray - delta, limits.tray) };
+  return divider === "files"
+    ? { ...layout, sidebar: clamp(layout.sidebar + delta, limits.sidebar) }
+    : { ...layout, tray: clamp(layout.tray - delta, limits.tray) };
 }
 
 // The layout with one pane back at its default width (a double-click on its divider).
 export function reset(layout, defaults, divider) {
   return divider === "files"
-    ? { ...layout, sidebar: defaults.sidebar, filesFolded: false }
+    ? { ...layout, sidebar: defaults.sidebar }
     : { ...layout, tray: defaults.tray };
 }

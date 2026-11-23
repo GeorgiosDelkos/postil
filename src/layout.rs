@@ -22,10 +22,10 @@ use crate::files::write_atomically;
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
 
-/// The file list's width in CSS px, when it is not folded. Below the minimum it folds to a
-/// rail (`ui/panes.js`); past the maximum it takes room the code needs. Both arbitrary, from
-/// trying file names in the app: 180 px shows a short path, 480 px a long one.
-pub(crate) const SIDEBAR: RangeInclusive<u32> = 180..=480;
+/// The file list's width in CSS px. At 200 px its foot still shows "Settings ⌘," whole (about
+/// 140 px with its icon and padding) and the filter a short path; the owner asked on 2026-11-23
+/// for no narrower list. Past 480 px it takes room the code needs. The maximum is arbitrary.
+pub(crate) const SIDEBAR: RangeInclusive<u32> = 200..=480;
 
 /// The tray's width in CSS px. 280 px fits a note card's header; 720 px is half a 1440 px
 /// window.
@@ -35,12 +35,10 @@ pub(crate) const TRAY: RangeInclusive<u32> = 280..=720;
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Layout {
-    /// The file list's width in CSS px, kept while it is folded so unfolding restores it.
+    /// The file list's width in CSS px.
     sidebar: u32,
     /// The tray's width in CSS px.
     tray: u32,
-    /// Whether the file list is folded to a rail.
-    files_folded: bool,
 }
 
 impl Default for Layout {
@@ -49,7 +47,6 @@ impl Default for Layout {
         Self {
             sidebar: 248,
             tray: 320,
-            files_folded: false,
         }
     }
 }
@@ -156,14 +153,13 @@ mod tests {
         let layout = Layout {
             sidebar: 300,
             tray: 460,
-            files_folded: true,
         };
         save(&file, &layout).unwrap();
         assert_eq!(load(&file), layout);
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "version": 1, "sidebar": 300, "tray": 460, "filesFolded": true })
+            serde_json::json!({ "version": 1, "sidebar": 300, "tray": 460 })
         );
         drop(fs::remove_dir_all(file.parent().unwrap()));
     }
@@ -171,11 +167,7 @@ mod tests {
     #[test]
     fn widths_outside_their_range_are_refused_and_their_limits_allowed() {
         let file = temp_file("range");
-        let with = |sidebar, tray| Layout {
-            sidebar,
-            tray,
-            files_folded: false,
-        };
+        let with = |sidebar, tray| Layout { sidebar, tray };
         for (sidebar, tray, words) in [
             (179, 320, "file list"),
             (481, 320, "file list"),
@@ -188,7 +180,7 @@ mod tests {
             }
         }
         assert!(!file.exists(), "nothing refused was written");
-        save(&file, &with(180, 280)).unwrap();
+        save(&file, &with(200, 280)).unwrap();
         save(&file, &with(480, 720)).unwrap();
         assert_eq!(load(&file), with(480, 720));
         drop(fs::remove_dir_all(file.parent().unwrap()));
@@ -201,9 +193,9 @@ mod tests {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         for contents in [
             "{ not json",
-            r#"{"version": 1, "sidebar": 10, "tray": 320, "filesFolded": false}"#,
-            r#"{"version": 0, "sidebar": 248, "tray": 320, "filesFolded": false}"#,
-            r#"{"version": 1, "sidebar": 248, "tray": 320, "filesFolded": false, "x": 1}"#,
+            r#"{"version": 1, "sidebar": 10, "tray": 320}"#,
+            r#"{"version": 0, "sidebar": 248, "tray": 320}"#,
+            r#"{"version": 1, "sidebar": 248, "tray": 320, "x": 1}"#,
         ] {
             fs::write(&file, contents).unwrap();
             assert_eq!(load(&file), Layout::default(), "{contents}");

@@ -1231,13 +1231,12 @@ function followRun(run, previous) {
 
 // ---- Panes ----------------------------------------------------------------------------
 //
-// The file list and the tray are resized by the dividers beside them, and the file list folds
-// to a rail (⌘B). The widths are kept per Mac in layout.json (src/layout.rs); ui/panes.js has
-// the rules. Until the kept widths arrive, app.css's defaults stand.
+// The file list and the tray are resized by the dividers beside them. The widths are kept per
+// Mac in layout.json (src/layout.rs); ui/panes.js has the rules. Until the kept widths arrive,
+// app.css's defaults stand.
 
-const sidebarEl = document.querySelector(".sidebar");
 const panes = {
-  // As `api/layout` gives them: { sidebar, tray, filesFolded }, the defaults, and the limits.
+  // As `api/layout` gives them: { sidebar, tray }, the defaults, and the limits.
   layout: null,
   defaults: null,
   limits: null,
@@ -1271,7 +1270,6 @@ function drawLayout() {
   const root = document.documentElement.style;
   root.setProperty("--sidebar-width", `${sidebar}px`);
   root.setProperty("--tray-width", `${tray}px`);
-  sidebarEl.classList.toggle("folded", panes.layout.filesFolded);
   $("divider-files").setAttribute("aria-valuenow", String(sidebar));
   $("divider-tray").setAttribute("aria-valuenow", String(tray));
 }
@@ -1280,11 +1278,6 @@ async function saveLayout() {
   const response = await fetch("api/layout", { method: "PUT", body: JSON.stringify(panes.layout) });
   // The widths still apply in this window; the toast says they will not be kept.
   if (!response.ok) showToast(await response.text());
-}
-
-function toggleFiles() {
-  if (!panes.layout || !welcomeEl.hidden) return;
-  setLayout({ ...panes.layout, filesFolded: !panes.layout.filesFolded }, { save: true });
 }
 
 for (const [id, divider] of [
@@ -1331,7 +1324,6 @@ for (const [id, divider] of [
   });
 }
 
-$("unfold-files").addEventListener("click", toggleFiles);
 // The kept widths are fitted to the window again whenever it changes size; that is drawing,
 // not a change of layout, so nothing is saved.
 window.addEventListener("resize", drawLayout);
@@ -1576,7 +1568,6 @@ function showRepo(repo) {
   state.repo = repo;
   state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
-  $("rail-name").textContent = repo.branch ? `${repo.name} · ${repo.branch}` : repo.name;
   $("repo-name").title = `${repo.root}\nSwitch project (⇧⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
   // Set once by the Rust process when the recent projects could not be updated. It does
@@ -1610,7 +1601,6 @@ window.postil = {
     if (command === "open-folder") chooseFolder();
     else if (command === "switch-project") showWelcome();
     else if (command === "go-to-file") goToFile();
-    else if (command === "toggle-files") toggleFiles();
     else if (command === "settings") settings.open();
     else if (command === "close-window" || command === "quit") quit();
   },
@@ -1621,8 +1611,6 @@ window.postil = {
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
 function goToFile() {
   if (!welcomeEl.hidden) return;
-  // The filter is in the file list, so a folded list unfolds.
-  if (panes.layout?.filesFolded) toggleFiles();
   filterEl.focus();
   filterEl.select();
 }

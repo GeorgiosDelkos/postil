@@ -14,18 +14,16 @@ pub(crate) enum Command {
     OpenFolder,
     SwitchProject,
     GoToFile,
-    ToggleFiles,
     CloseWindow,
     Settings,
     Quit,
 }
 
 impl Command {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 6] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
-        Self::ToggleFiles,
         Self::CloseWindow,
         Self::Settings,
         Self::Quit,
@@ -37,7 +35,6 @@ impl Command {
             Self::OpenFolder => "open-folder",
             Self::SwitchProject => "switch-project",
             Self::GoToFile => "go-to-file",
-            Self::ToggleFiles => "toggle-files",
             Self::CloseWindow => "close-window",
             Self::Settings => "settings",
             Self::Quit => "quit",
@@ -120,15 +117,7 @@ fn build() -> muda::Result<Menu> {
             &PredefinedMenuItem::select_all(None),
         ],
     )?;
-    let view = Submenu::with_items(
-        "View",
-        true,
-        &[
-            &Command::ToggleFiles.item("Show or Hide File List", command(Code::KeyB)),
-            &separator(),
-            &PredefinedMenuItem::fullscreen(None),
-        ],
-    )?;
+    let view = Submenu::with_items("View", true, &[&PredefinedMenuItem::fullscreen(None)])?;
     let window = Submenu::with_items(
         "Window",
         true,
