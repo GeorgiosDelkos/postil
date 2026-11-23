@@ -1866,11 +1866,13 @@ mod tests {
         ] {
             assert_eq!(post(&site, &uri, "").0, status, "{uri}");
         }
-        assert_eq!(
-            get(&site, &format!("{NOTES}/resolve?id=N1")).0,
-            StatusCode::METHOD_NOT_ALLOWED,
-            "only a POST changes a note"
-        );
+        for action in ["resolve", "reopen"] {
+            assert_eq!(
+                get(&site, &format!("{NOTES}/{action}?id=N1")).0,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "only a POST changes a note: {action}"
+            );
+        }
 
         assert_eq!(fs::read_to_string(&file).unwrap(), before);
     }
