@@ -366,6 +366,13 @@ One source of run state, the log, so the Rust process has no second summary to k
   it ticked. Decided with the owner on 2026-11-23. A run that starts no longer takes the tray
   to the Run tab unless it came from the send step; one that needs the engineer still does.
 
+### Cards and dialogs
+
+Every list in the tray is made of small cards: a status, a place, an id, and the note in two
+lines at most, so the engineer scans and moves fast. Everything else (what the agent said, its
+diffs and output, the whole reply) is in the dialog a card opens. The owner set this for every
+view on 2026-11-23.
+
 ### The Run tab
 
 The Run tab (`ui/run-panel.js`) is a column of small cards, each opening a dialog, so the

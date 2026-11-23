@@ -13,7 +13,7 @@ import { runPanel } from "./run-panel.js";
 import { elapsed, foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
-import { agentSaid, groupNotes, latestOnFile, noteStatus, planProgress, runOf } from "./status.js";
+import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
@@ -1028,19 +1028,13 @@ function fetchRuns() {
   }
 }
 
-// Everything a note's card shows, as plain data: two cards with equal data look the same.
+// Everything a note's card shows, as plain data: two cards with equal data look the same. A card
+// is small, its status and the note in two lines at most, so the tray scans fast; what the
+// agent said and did is in the note's detail. The owner set this for every view on 2026-11-23:
+// compact cards, full information in the dialogs.
 function cardOf(note) {
   const run = runFor(note);
   const status = noteStatus(note, run);
-  let foot = null;
-  if (run && status.kind === "addressed") foot = { agent: run.agent, text: agentSaid(run, note.id) };
-  else if (run && status.kind === "needs") foot = { text: `${run.agent} is waiting for you · open to see` };
-  else if (run && (status.kind === "working" || status.kind === "starting")) {
-    const tool = latestOnFile(note, run);
-    if (tool) foot = { text: [tool.verb, tool.target, tool.state].filter(Boolean).join(" ") };
-  } else if (run && status.kind === "failed") {
-    foot = { text: run.problem ?? run.entries.findLast((entry) => entry.kind === "failed")?.error ?? "" };
-  }
   return {
     id: note.id,
     path: note.path,
@@ -1048,7 +1042,6 @@ function cardOf(note) {
     body: note.body,
     outdated: note.anchor === "lost",
     status,
-    foot,
     sendable: canSendAlone(),
   };
 }
@@ -1078,12 +1071,6 @@ function noteItem(note, card) {
   place.title = card.path;
   head.append(label, place, el("span", "note-id", card.id));
   button.append(head, el("div", "note-body", card.body));
-  if (card.foot) {
-    const foot = el("div", "note-foot");
-    if (card.foot.agent) foot.append(el("strong", "", card.foot.agent), " ");
-    foot.append(card.foot.text);
-    button.append(foot);
-  }
   button.addEventListener("click", () => noteDetail.open(note.id));
 
   const item = el("div", "note-item");

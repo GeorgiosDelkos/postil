@@ -20,7 +20,7 @@ import {
   underWay,
 } from "./run.js";
 import { statusIcon } from "./note-dialog.js";
-import { agentSaid, noteStatus, planProgress } from "./status.js";
+import { noteStatus, planProgress } from "./status.js";
 
 // A finished run shows this many of its last steps until "Show all" (docs/design.md, "The
 // Run tab"). Arbitrary: enough to see how the run ended.
@@ -338,11 +338,11 @@ export function runPanel({
   // A note sent in the run: its status in this run and the agent's line about it.
   function noteCard(id) {
     const note = noteOf(id);
-    if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle", said: null };
+    if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle" };
     const { start, end } = note.lines;
     const where = `${note.path.split("/").at(-1)}:${start === end ? start : `${start}-${end}`}`;
     const status = noteStatus(note, run);
-    return { id, where, ...status, said: agentSaid(run, id) };
+    return { id, where, ...status };
   }
 
   function notesView(cards) {
@@ -357,10 +357,10 @@ export function runPanel({
     for (const card of cards) {
       const button = el("button", `run-card ${card.kind}`);
       button.type = "button";
-      button.title = card.said ?? card.label;
+      // Its status only: what the agent said is in the note's detail.
       button.append(
         statusIcon(card.kind),
-        el("span", `run-card-text run-note-status ${card.said ? "" : card.tone}`, card.said ?? card.label),
+        el("span", `run-card-text run-note-status ${card.tone}`, card.label),
         el("span", "run-note-where", card.where),
         el("span", "note-id", card.id),
       );

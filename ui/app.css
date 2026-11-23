@@ -634,6 +634,14 @@ kbd {
   overflow-wrap: anywhere;
 }
 
+/* A card in the tray shows the note in two lines at most; the detail has it whole. */
+.note-item > .note .note-body {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 /* File filter results */
 
 .file.active {
@@ -946,14 +954,9 @@ button.repo-name:hover {
   position: relative;
 }
 
-/* A card's actions (the arrow, and ×) sit in its bottom-right corner, in a row the card keeps
-   free for them, so they never cover its status, place or id. A card with a foot line shares
-   that row: the line stops short of them. */
-.note-item > .note:not(:has(.note-foot)) {
-  padding-bottom: 36px;
-}
-
-.note-foot {
+/* A card's actions (the arrow, and ×) sit in its bottom-right corner, beside the note's text,
+   which stops short of them; they never cover its status, place or id. */
+.note-item > .note .note-body {
   min-height: 22px;
   padding-right: 64px;
 }
@@ -1950,18 +1953,8 @@ button.repo-name:hover {
   gap: 6px;
 }
 
-.run-card.reply {
-  align-items: flex-start;
-  padding: 8px 10px;
-}
 
-.run-reply-preview {
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  white-space: normal;
-  line-height: 18px;
-}
+
 
 .run-plan-body {
   flex: 1;
@@ -2429,18 +2422,6 @@ body.resizing * {
 
 .note.needs {
   border-color: var(--attention-border);
-}
-
-.note-foot {
-  font-size: 12px;
-  line-height: 17px;
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
-.note-foot strong {
-  color: var(--text-soft);
-  font-weight: 600;
 }
 
 .status-icon {

@@ -99,14 +99,6 @@ export function noteHistory(note, run) {
   return steps;
 }
 
-// The latest tool call of `run` on the note's file, for the card of a note being worked on.
-export function latestOnFile(note, run) {
-  const tool = foldRun(run.entries).items.findLast(
-    (item) => item.type === "tool" && touches(item, note.path),
-  );
-  return tool ? toolRow(tool, isLive(run)) : null;
-}
-
 function touches(tool, path) {
   return (
     tool.places.some((place) => place.path === path) ||

@@ -5,7 +5,6 @@ import {
   agentSaid,
   fileStats,
   groupNotes,
-  latestOnFile,
   noteHistory,
   noteStatus,
   planProgress,
@@ -107,7 +106,6 @@ test("a note's history is the run's tool calls on its file and the plan steps na
     noteHistory(note, r).map((step) => (step.kind === "tool" ? `${step.verb} ${step.state}` : step.text)),
     ["read done", "edit +2 -1", "Fix N3 in divide"],
   );
-  assert.deepEqual(latestOnFile(note, r), { verb: "edit", target: "src/math.rs", state: "+2 -1", running: false });
   assert.deepEqual(fileStats(note, r), { added: 2, removed: 1 });
   assert.equal(fileStats(sent("N4", "R1", "src/none.rs"), r), null);
 
