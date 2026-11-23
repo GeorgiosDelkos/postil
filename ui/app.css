@@ -8,10 +8,17 @@
   font-weight: 100 900;
 }
 
+/* Geist Mono's ligatures are off wherever it is used: they change the shape of operators a
+   reviewer is reading closely, and join " --" into one glyph, which hides the space in
+   "gemini --acp" when a command must read exactly as it runs. Set here, on the face, rather
+   than by `font-variant-ligatures: none` on every monospace rule: that property is inherited
+   by Geist text too, whose fi and fl ligatures are kept. WebKit applies this descriptor
+   (measured in the app's WKWebView, 2026-11-24); Chrome ignores it. */
 @font-face {
   font-family: "Geist Mono";
   src: url("fonts/GeistMono-Variable.woff2") format("woff2");
   font-weight: 100 900;
+  font-feature-settings: "liga" 0;
 }
 
 :root {
@@ -56,6 +63,10 @@
   --syntax-comment: #868b96;
   --syntax-constant: #dcc28c;
   --syntax-punctuation: #a9adb6;
+
+  /* ui-monospace (SF Mono on macOS) draws a character Geist Mono lacks before the generic
+     family is tried. */
+  --font-mono: "Geist Mono", ui-monospace, monospace;
 
   /* How far every disabled control fades. */
   --disabled-opacity: 0.45;
@@ -153,7 +164,7 @@ body {
 }
 
 kbd {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   padding: 1px 5px;
   border: 1px solid var(--border-strong);
   border-radius: 4px;
@@ -185,7 +196,7 @@ kbd {
 }
 
 .repo-branch {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -305,7 +316,7 @@ kbd {
 .dir .count {
   margin-left: auto;
   padding-left: 8px;
-  font: 11px "Geist Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--note);
 }
 
@@ -348,7 +359,7 @@ kbd {
 
 .meta {
   flex: none;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -360,10 +371,8 @@ kbd {
   position: relative;
   overflow: auto;
   outline: none;
-  font: var(--code-font-size) "Geist Mono", ui-monospace, monospace;
+  font: var(--code-font-size) var(--font-mono);
   tab-size: var(--tab-width);
-  /* Ligatures change the shape of operators a reviewer is reading closely. */
-  font-variant-ligatures: none;
 }
 
 /* The line-number gutter's width: 24 px on the left for the + button (6 px in, 16 px wide,
@@ -617,7 +626,7 @@ kbd {
   display: flex;
   justify-content: space-between;
   gap: 8px;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -746,7 +755,7 @@ kbd {
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -907,7 +916,7 @@ body.welcome-mode > .pane {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -1202,7 +1211,7 @@ button.repo-name:hover {
   text-overflow: ellipsis;
   direction: rtl;
   text-align: left;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   user-select: text;
 }
 
@@ -1292,7 +1301,7 @@ button.repo-name:hover {
 .stepper-value {
   min-width: 56px;
   text-align: center;
-  font: 12.5px "Geist Mono", monospace;
+  font: 12.5px var(--font-mono);
   color: var(--text-strong);
 }
 
@@ -1412,17 +1421,8 @@ button.repo-name:hover {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font: 11px "Geist Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--text-muted);
-}
-
-/* Geist Mono's ligatures join " --" into one glyph, which hides the space in "gemini --acp":
-   a command must read exactly as it runs. */
-.agent-found,
-.agent-command,
-.agent-field input,
-.settings-file {
-  font-variant-ligatures: none;
 }
 
 .agent-command::before {
@@ -1479,7 +1479,7 @@ button.repo-name:hover {
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text);
-  font: 12.5px "Geist Mono", monospace;
+  font: 12.5px var(--font-mono);
   outline: none;
 }
 
@@ -1673,8 +1673,7 @@ button.repo-name:hover {
 
 .prompt-text {
   margin: 0;
-  font: 12.5px/21px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 12.5px/21px var(--font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--text);
@@ -1695,8 +1694,7 @@ button.repo-name:hover {
   align-items: center;
   gap: 8px;
   margin-top: 18px;
-  font: 11.5px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px var(--font-mono);
 }
 
 .prompt-links-label {
@@ -1755,7 +1753,7 @@ button.repo-name:hover {
 }
 
 .run-time {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
 }
 
 .button.stop {
@@ -1823,8 +1821,7 @@ button.repo-name:hover {
 }
 
 .run-card.step {
-  font: 11.5px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px var(--font-mono);
   color: var(--text-soft);
 }
 
@@ -1849,7 +1846,7 @@ button.repo-name:hover {
 
 .run-note-where {
   flex: none;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -1898,7 +1895,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 8px;
-  font: 12px/18px "Geist Mono", monospace;
+  font: 12px/18px var(--font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1973,8 +1970,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 6px;
-  font: 11.5px/18px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px/18px var(--font-mono);
   white-space: pre;
   user-select: text;
 }
@@ -2032,8 +2028,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 6px;
-  font: 12px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 12px var(--font-mono);
   color: var(--text-strong);
   overflow-wrap: anywhere;
   user-select: text;
@@ -2099,8 +2094,7 @@ button.repo-name:hover {
   padding: 0 3px;
   background: var(--canvas);
   border-radius: 4px;
-  font: 12px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 12px var(--font-mono);
 }
 
 .run-code {
@@ -2109,8 +2103,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 6px;
-  font: 11.5px/18px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px/18px var(--font-mono);
 }
 
 .run-error {
@@ -2448,7 +2441,7 @@ body.resizing * {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font: 12px "Geist Mono", monospace;
+  font: 12px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -2482,7 +2475,7 @@ body.resizing * {
 }
 
 .note-dialog-stats {
-  font-family: "Geist Mono", monospace;
+  font-family: var(--font-mono);
   color: var(--added);
 }
 
@@ -2501,7 +2494,7 @@ body.resizing * {
   overflow: auto;
   background: var(--canvas);
   border-radius: 8px;
-  font: 12px/20px "Geist Mono", monospace;
+  font: 12px/20px var(--font-mono);
 }
 
 .note-dialog-snippet .row {
@@ -2552,7 +2545,7 @@ body.resizing * {
 .note-dialog-history .verb {
   flex: none;
   width: 40px;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -2562,12 +2555,12 @@ body.resizing * {
 }
 
 .note-dialog-history .tool .target {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
 }
 
 .note-dialog-history .state {
   margin-left: auto;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--added);
 }
 
@@ -2610,7 +2603,7 @@ body.resizing * {
 /* The Run tab: one card per run, newest first; the run's dialog holds the rest. */
 .run-entry .run-id {
   flex: none;
-  font: 600 12px "Geist Mono", monospace;
+  font: 600 12px var(--font-mono);
   color: var(--text-strong);
 }
 
@@ -2767,7 +2760,7 @@ body.resizing * {
 }
 
 .question-answers dt {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -2888,7 +2881,7 @@ body.resizing * {
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  font-family: "Geist Mono", monospace;
+  font-family: var(--font-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2907,19 +2900,19 @@ body.resizing * {
 
 .changes-stats {
   color: var(--text-muted);
-  font-family: "Geist Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 .changes-hunk {
   padding: 3px 12px;
   color: var(--text-muted);
-  font: 11.5px/1.6 "Geist Mono", monospace;
+  font: 11.5px/1.6 var(--font-mono);
 }
 
 .changes-line {
   display: grid;
   grid-template-columns: 4ch 4ch 2ch 1fr;
-  font: 12.5px/1.6 "Geist Mono", monospace;
+  font: 12.5px/1.6 var(--font-mono);
 }
 
 .changes-line.add {
