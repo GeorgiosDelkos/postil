@@ -8,13 +8,12 @@
 //! open projects at the same moment can lose one entry; the next open of that project adds
 //! it back.
 
-use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{Stored, load_versioned, save_json};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -31,40 +30,11 @@ struct RecentFile {
     projects: Vec<String>,
 }
 
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
-}
-
-/// What the file on disk holds, as far as this build can tell.
-enum Stored {
-    /// A list this build reads.
-    List(Vec<String>),
-    /// A list from a newer build: not read, and not to be replaced.
-    Newer,
-    /// No file, or one that cannot be read or parsed: an empty list, to be replaced.
-    Nothing,
-}
-
-fn stored(file: &Path) -> Stored {
-    let Ok(json) = fs::read_to_string(file) else {
-        return Stored::Nothing;
-    };
-    match serde_json::from_str::<VersionOnly>(&json) {
-        Ok(VersionOnly { version }) if version > VERSION => Stored::Newer,
-        _ => serde_json::from_str::<RecentFile>(&json)
-            .ok()
-            .filter(|recent| recent.version == VERSION)
-            .map_or(Stored::Nothing, |recent| Stored::List(recent.projects)),
-    }
-}
-
 /// The recent projects' roots, newest first. Empty when the file is missing, unreadable, or
 /// from a newer build (see the module docs).
 pub(crate) fn list(file: &Path) -> Vec<String> {
-    match stored(file) {
-        Stored::List(projects) => projects,
+    match load_versioned::<RecentFile>(file, VERSION) {
+        Stored::Current(recent) => recent.projects,
         Stored::Newer | Stored::Nothing => Vec::new(),
     }
 }
@@ -82,8 +52,8 @@ pub(crate) fn record(file: &Path, root: &Path) -> Result<()> {
     let Some(root) = root.to_str() else {
         return Ok(());
     };
-    let mut projects = match stored(file) {
-        Stored::List(projects) => projects,
+    let mut projects = match load_versioned::<RecentFile>(file, VERSION) {
+        Stored::Current(recent) => recent.projects,
         Stored::Nothing => Vec::new(),
         Stored::Newer => return Ok(()),
     };
@@ -95,10 +65,7 @@ pub(crate) fn record(file: &Path, root: &Path) -> Result<()> {
         version: VERSION,
         projects,
     };
-    let mut json = serde_json::to_vec_pretty(&recent)
-        .expect("a list of strings and a number always serializes");
-    json.push(b'\n');
-    write_atomically(file, &json).map_err(|source| Error::WriteRecent {
+    save_json(file, &recent).map_err(|source| Error::WriteRecent {
         path: file.to_owned(),
         source,
     })
@@ -107,6 +74,8 @@ pub(crate) fn record(file: &Path, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
 
     fn temp_file(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("postil-recent-{}-{name}", std::process::id()));

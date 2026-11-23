@@ -10,13 +10,12 @@
 //! Windows on one working tree do not share open folders live: each `PUT` replaces the whole
 //! list, and the last window to save decides what the next one opens with.
 
-use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{Stored, load_versioned, save_json};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -37,26 +36,12 @@ struct FoldersFile {
     open: Vec<String>,
 }
 
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
-}
-
-/// Whether `json` was written by a newer build.
-fn newer(json: &str) -> bool {
-    serde_json::from_str::<VersionOnly>(json).is_ok_and(|stored| stored.version > VERSION)
-}
-
 /// The open folders in `file`, or none when there is no file this build can use (module docs).
 pub(crate) fn load(file: &Path) -> Folders {
-    let Ok(json) = fs::read_to_string(file) else {
-        return Folders::default();
-    };
-    serde_json::from_str::<FoldersFile>(&json)
-        .ok()
-        .filter(|stored| stored.version == VERSION)
-        .map_or_else(Folders::default, |stored| Folders { open: stored.open })
+    match load_versioned::<FoldersFile>(file, VERSION) {
+        Stored::Current(stored) => Folders { open: stored.open },
+        Stored::Newer | Stored::Nothing => Folders::default(),
+    }
 }
 
 /// Saves `folders` to `file`, unless a newer build wrote the file (module docs).
@@ -65,17 +50,14 @@ pub(crate) fn load(file: &Path) -> Folders {
 ///
 /// [`Error::WriteFolders`] when the file cannot be written.
 pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
-    if fs::read_to_string(file).is_ok_and(|json| newer(&json)) {
+    if matches!(load_versioned::<FoldersFile>(file, VERSION), Stored::Newer) {
         return Ok(());
     }
     let stored = FoldersFile {
         version: VERSION,
         open: folders.open,
     };
-    let mut json =
-        serde_json::to_vec_pretty(&stored).expect("a version and a list of strings serialize");
-    json.push(b'\n');
-    write_atomically(file, &json).map_err(|source| Error::WriteFolders {
+    save_json(file, &stored).map_err(|source| Error::WriteFolders {
         path: file.to_owned(),
         source,
     })
@@ -84,6 +66,8 @@ pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
 
     fn temp_file(name: &str) -> std::path::PathBuf {
         let dir =

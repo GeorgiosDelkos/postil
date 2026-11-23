@@ -1,5 +1,11 @@
-//! Writing the app's own files: the notes, the recent projects, the settings, the layout and
-//! the open folders.
+//! Reading and writing the app's own files: the notes, the recent projects, the settings, the
+//! layout and the open folders.
+//!
+//! Each is a JSON object with a `version` field, written as pretty JSON ending in a newline by
+//! [`save_json`]. [`version_of`] reads that field alone, so a file in a newer format is told
+//! apart before its new fields fail the parse. The recent projects, the layout and the open
+//! folders are the app's own conveniences and read through [`load_versioned`], which never
+//! fails; the settings and the notes are the engineer's and say why a file cannot be used.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -8,7 +14,63 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
+
+/// What a versioned file holds, as far as this build can tell ([`load_versioned`]).
+#[derive(Debug)]
+pub(crate) enum Stored<T> {
+    /// A file of the version this build writes.
+    Current(T),
+    /// A file a newer build wrote: not read, and not to be replaced.
+    Newer,
+    /// No file, or one that cannot be read or parsed, or of an older version: the next save
+    /// replaces it.
+    Nothing,
+}
+
+/// Reads `file` as a `T` when its `version` is `version`, the one this build writes.
+pub(crate) fn load_versioned<T: DeserializeOwned>(file: &Path, version: u32) -> Stored<T> {
+    let Ok(json) = fs::read_to_string(file) else {
+        return Stored::Nothing;
+    };
+    match version_of(&json) {
+        Ok(stored) if stored > version => Stored::Newer,
+        Ok(stored) if stored == version => {
+            serde_json::from_str(&json).map_or(Stored::Nothing, Stored::Current)
+        }
+        Ok(_) | Err(_) => Stored::Nothing,
+    }
+}
+
+/// The `version` field of the JSON object `json`. Every other field is ignored, so this reads
+/// a file of any version.
+///
+/// # Errors
+///
+/// When `json` is not a JSON object with a `version` that is a `u32`.
+pub(crate) fn version_of(json: &str) -> serde_json::Result<u32> {
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u32,
+    }
+    serde_json::from_str::<VersionOnly>(json).map(|stored| stored.version)
+}
+
+/// Writes `value` to `file` as pretty JSON ending in a newline, through [`write_atomically`].
+///
+/// # Errors
+///
+/// As [`write_atomically`].
+pub(crate) fn save_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
+    let mut json = serde_json::to_vec_pretty(value).expect(
+        "the app's files are structs of strings, numbers and lists, which always serialize",
+    );
+    json.push(b'\n');
+    write_atomically(file, &json)
+}
 
 /// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`, so
 /// a crash leaves the old file or the new one and never a part. Creates the directory first
@@ -34,7 +96,7 @@ use crate::error::{Error, Result};
 /// Every call writes a temporary file of its own, so calls on one file at once, from this
 /// process or another, never write into each other's; the last rename wins. A crash between
 /// creating the temporary and the rename leaves it behind; readers ignore it.
-pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let real = follow_links(file);
     let written = replace(&real, bytes);
     if real == file {
@@ -270,6 +332,69 @@ mod tests {
         write_atomically(&file, b"new").unwrap();
 
         assert_eq!(fs::read(&file).unwrap(), b"new");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A versioned file of the shape [`load_versioned`] is given in the app.
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Probe {
+        version: u32,
+        value: u32,
+    }
+
+    /// What `load_versioned` makes of `contents` (`None`: no file), for a build at version 2.
+    fn loaded(name: &str, contents: Option<&str>) -> Stored<Probe> {
+        let dir = temp_dir(name);
+        let file = dir.join("probe.json");
+        if let Some(contents) = contents {
+            fs::write(&file, contents).unwrap();
+        }
+        let stored = load_versioned(&file, 2);
+        fs::remove_dir_all(&dir).unwrap();
+        stored
+    }
+
+    #[test]
+    fn a_file_of_this_version_is_read_and_a_newer_one_is_newer_whatever_its_fields() {
+        assert!(matches!(
+            loaded("current", Some(r#"{"version": 2, "value": 7}"#)),
+            Stored::Current(Probe {
+                version: 2,
+                value: 7
+            })
+        ));
+        for newer in [
+            r#"{"version": 3, "value": 7}"#,
+            r#"{"version": 3, "renamed": [1, 2]}"#,
+        ] {
+            assert!(
+                matches!(loaded("newer", Some(newer)), Stored::Newer),
+                "{newer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_unreadable_broken_or_older_file_is_nothing() {
+        for (name, contents) in [
+            ("missing", None),
+            ("broken", Some("{ not json")),
+            ("no-version", Some(r#"{"value": 7}"#)),
+            ("older", Some(r#"{"version": 1, "value": 7}"#)),
+            (
+                "unknown-field",
+                Some(r#"{"version": 2, "value": 7, "x": 1}"#),
+            ),
+        ] {
+            assert!(matches!(loaded(name, contents), Stored::Nothing), "{name}");
+        }
+
+        // A directory where the file should be: it exists, and reading it fails.
+        let dir = temp_dir("unreadable");
+        let file = dir.join("probe.json");
+        fs::create_dir(&file).unwrap();
+        assert!(matches!(load_versioned::<Probe>(&file, 2), Stored::Nothing));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

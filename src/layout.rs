@@ -10,14 +10,13 @@
 //! Windows do not share widths live: each draws what it loaded, and the last one to save
 //! decides what the next window opens with.
 
-use std::fs;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{Stored, load_versioned, save_json};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -79,44 +78,19 @@ struct LayoutFile {
     tray: u32,
 }
 
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
-}
-
-/// What the file on disk holds, as far as this build can tell.
-enum Stored {
-    Layout(Layout),
-    /// A file from a newer build: not read, and not to be replaced.
-    Newer,
-    /// No file, or one that cannot be read, parsed, or used.
-    Nothing,
-}
-
-fn stored(file: &Path) -> Stored {
-    let Ok(json) = fs::read_to_string(file) else {
-        return Stored::Nothing;
-    };
-    match serde_json::from_str::<VersionOnly>(&json) {
-        Ok(VersionOnly { version }) if version > VERSION => Stored::Newer,
-        _ => serde_json::from_str::<LayoutFile>(&json)
-            .ok()
-            .filter(|stored| stored.version == VERSION)
-            .map(|stored| Layout {
-                sidebar: stored.sidebar,
-                tray: stored.tray,
-            })
-            .filter(|layout| layout.check().is_ok())
-            .map_or(Stored::Nothing, Stored::Layout),
-    }
-}
-
 /// The layout in `file`, or the default when there is none this build can use (module docs).
 pub(crate) fn load(file: &Path) -> Layout {
-    match stored(file) {
-        Stored::Layout(layout) => layout,
-        Stored::Newer | Stored::Nothing => Layout::default(),
+    let layout = match load_versioned::<LayoutFile>(file, VERSION) {
+        Stored::Current(stored) => Layout {
+            sidebar: stored.sidebar,
+            tray: stored.tray,
+        },
+        Stored::Newer | Stored::Nothing => return Layout::default(),
+    };
+    if layout.check().is_ok() {
+        layout
+    } else {
+        Layout::default()
     }
 }
 
@@ -128,7 +102,7 @@ pub(crate) fn load(file: &Path) -> Layout {
 /// cannot be written.
 pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
     layout.check().map_err(Error::BadRequest)?;
-    if matches!(stored(file), Stored::Newer) {
+    if matches!(load_versioned::<LayoutFile>(file, VERSION), Stored::Newer) {
         return Ok(());
     }
     let stored = LayoutFile {
@@ -136,10 +110,7 @@ pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
         sidebar: layout.sidebar,
         tray: layout.tray,
     };
-    let mut json =
-        serde_json::to_vec_pretty(&stored).expect("a version and two numbers always serialize");
-    json.push(b'\n');
-    write_atomically(file, &json).map_err(|source| Error::WriteLayout {
+    save_json(file, &stored).map_err(|source| Error::WriteLayout {
         path: file.to_owned(),
         source,
     })
@@ -148,6 +119,8 @@ pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
 
     fn temp_file(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("postil-layout-{}-{name}", std::process::id()));

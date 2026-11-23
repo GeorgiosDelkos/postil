@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::{self, BUILT_IN};
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{save_json, version_of};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -206,12 +206,6 @@ struct SettingsFile<S> {
     settings: S,
 }
 
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
-}
-
 /// The settings in effect, and why the file was not used when it was not.
 #[derive(Debug)]
 pub(crate) struct Loaded {
@@ -274,13 +268,13 @@ fn revision_of(json: &str) -> String {
 
 fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
     let shown = file.display();
-    match serde_json::from_str::<VersionOnly>(json) {
-        Ok(VersionOnly { version }) if version > VERSION => {
+    match version_of(json) {
+        Ok(version) if version > VERSION => {
             return Err(format!(
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Ok(VersionOnly { version }) if version != VERSION => {
+        Ok(version) if version != VERSION => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
@@ -334,9 +328,7 @@ fn write(file: &Path, settings: &Settings) -> Result<()> {
         version: VERSION,
         settings,
     };
-    let mut json = serde_json::to_vec_pretty(&stored).expect("settings always serialize");
-    json.push(b'\n');
-    write_atomically(file, &json).map_err(|source| Error::WriteSettings {
+    save_json(file, &stored).map_err(|source| Error::WriteSettings {
         path: file.to_owned(),
         source,
     })
