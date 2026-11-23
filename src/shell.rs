@@ -1367,7 +1367,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }
-                | Error::WriteSnapshot { .. }
+                | Error::CopyIndex { .. }
                 | Error::WriteLayout { .. }
                 | Error::ReadRun { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
@@ -3084,6 +3084,17 @@ mod tests {
             .collect()
     }
 
+    /// The points of a run's snapshots, in order: `["before", "after"]` for a run that ended.
+    fn snapshot_points(run: &serde_json::Value) -> Vec<serde_json::Value> {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "snapshot")
+            .map(|entry| entry["point"].clone())
+            .collect()
+    }
+
     fn states(site: &Site) -> Vec<serde_json::Value> {
         get_json(site, NOTES)["notes"]
             .as_array()
@@ -3644,6 +3655,15 @@ mod tests {
 
         assert_eq!(judge["review"]["reviewer"], 2);
         assert!(
+            snapshot_points(&proposer).is_empty(),
+            "a proposer may not edit: {proposer}"
+        );
+        assert_eq!(
+            snapshot_points(&judge),
+            ["before", "after"],
+            "the judge edits: {judge}"
+        );
+        assert!(
             kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
             "the judge is given the findings: {judge}"
         );
@@ -3996,7 +4016,8 @@ mod tests {
     fn a_run_s_changes_are_the_diff_between_its_snapshots_and_the_index_is_left_alone() {
         let repo = TempRepo::new("run-changes");
         repo.write("a.txt", "a\n");
-        repo.git(&["add", "a.txt"]);
+        repo.write("secret.txt", "one\n");
+        repo.git(&["add", "a.txt", "secret.txt"]);
         let (site, nudges) = run_site(&repo, "writes");
         post_note(&site, "a.txt", 1, 1, "one");
         send(&site, &["N1"]);
@@ -4030,6 +4051,11 @@ mod tests {
             assert!(patch.contains(part), "{part:?} in {patch}");
         }
 
+        // The engineer takes a file out of git and ignores it: snapshots stop following it.
+        repo.git(&["rm", "--cached", "--quiet", "secret.txt"]);
+        repo.write(".gitignore", "secret.txt\n");
+        repo.write("secret.txt", "two\n");
+
         // A follow-up writes again: R1 to R2 is the whole thread, R2 alone its own change.
         let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
         assert_eq!(
@@ -4053,6 +4079,10 @@ mod tests {
         let second = patch_of("from=R2");
         assert!(second.contains("-prompt 1\n+prompt 2"), "{second}");
         assert!(!second.contains("new.txt"), "unchanged by R2: {second}");
+        assert!(
+            !second.contains("+two"),
+            "an ignored file left untracked: {second}"
+        );
 
         // Snapshots go through an index of their own: the engineer's staged files are the same.
         let staged = Command::new("git")
@@ -4151,7 +4181,7 @@ mod tests {
             problem.contains("no snapshot of the files was taken"),
             "{ended}"
         );
-        assert!(problem.contains("postil-snapshot.index"), "{problem}");
+        assert!(problem.contains(".git/index"), "{problem}");
         assert!(
             kinds(&ended).contains(&"message:prompt 1".to_owned()),
             "{ended}"

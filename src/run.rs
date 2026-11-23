@@ -42,9 +42,10 @@
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
 //! an agent's start on a thread of its own, and a review's next stage on one more
-//! (`review-next`, [`Runner::advance`]). Two locks, always taken in this order: the
-//! runner's [`Slot`], then a run's state. The page is told about every change through
-//! `notify`, and fetches what it has not seen.
+//! (`review-next`, [`Runner::advance`]). Three locks, always taken in this order: the
+//! runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`], which takes
+//! no other), then a run's state; no snapshot is taken under a run's state. The page is told
+//! about every change through `notify`, and fetches what it has not seen.
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -647,7 +648,8 @@ impl Runner {
         drop(released);
         if forced {
             // Its exit is not reported, so the snapshot after it is taken here, once nothing
-            // can write any more. The run stays live until then, so a send waits.
+            // can write any more. The run stays live until then, so a send is refused
+            // (`TurnRunning`) meanwhile.
             self.record_end_snapshot(&run);
             run.record(Entry::Failed {
                 error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
