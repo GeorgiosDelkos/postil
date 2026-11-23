@@ -162,6 +162,9 @@ async function prompt(id, params) {
     case "ask-withdraw": {
       const url = await ask("elicitation/create", { mode: "url", sessionId: "S1", message: "Sign in", url: "https://example.com", elicitationId: "e1" });
       say(`url answered ${url.error?.code}`);
+      // A form with no fields has nothing to show.
+      const empty = await ask("elicitation/create", { mode: "form", sessionId: "S1", message: "OK?", requestedSchema: { type: "object", properties: {} } });
+      say(`empty form answered ${empty.error?.code}`);
       // Asked, then withdrawn before anyone answered: the agent no longer needs it.
       const withdrawn = nextId;
       const reply = question();

@@ -3244,6 +3244,12 @@ mod tests {
         let request = question["request"].clone();
         let (status, body) = answer(serde_json::json!({ "request": 99, "content": {} }));
         assert_eq!(status, StatusCode::NOT_FOUND, "no such question: {body}");
+        let (status, _) = get(&site, &format!("{RUN}/question"));
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "an answer is posted"
+        );
         let (status, body) = post(
             &site,
             &format!("{RUN}/permission"),
@@ -3295,6 +3301,10 @@ mod tests {
         assert!(
             kinds.contains(&"message:url answered -32602".to_owned()),
             "a URL question cannot be shown as a form: {ended}"
+        );
+        assert!(
+            kinds.contains(&"message:empty form answered -32602".to_owned()),
+            "a form with no fields is refused: {ended}"
         );
         assert!(
             kinds.contains(&"message:withdrawn answered cancel".to_owned()),
