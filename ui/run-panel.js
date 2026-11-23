@@ -85,6 +85,8 @@ export function runPanel({
   let again = false;
   // How long to wait before fetching again after a failed fetch: doubled each failure.
   let retryIn = 1000;
+  // The one retry waiting, or null.
+  let retryTimer = null;
   // Every run's id, newest first (`api/runs`), read again when the latest run changes or a
   // run may have been deleted (`reload`).
   let ids = [];
@@ -165,6 +167,9 @@ export function runPanel({
       return;
     }
     fetching = true;
+    // This fetch is the retry: one waiting would start a second chain of retries beside it.
+    clearTimeout(retryTimer);
+    retryTimer = null;
     try {
       do {
         again = false;
@@ -181,7 +186,7 @@ export function runPanel({
       onError(String(error.message ?? error));
       // The nudge behind the failed fetch may have been the run's last, so the fetch is
       // tried again, less often each time it fails.
-      setTimeout(sync, retryIn);
+      retryTimer = setTimeout(sync, retryIn);
       retryIn = Math.min(retryIn * 2, 30000);
     } finally {
       fetching = false;
