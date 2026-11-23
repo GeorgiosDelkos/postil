@@ -87,8 +87,9 @@ const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
-/// header). Older logs read as runs of notes.
-const LOG_VERSION: u32 = 3;
+/// header); version 4 the `snapshot` entry. Older logs read as runs of notes, without
+/// snapshots.
+const LOG_VERSION: u32 = 4;
 
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
@@ -245,6 +246,7 @@ impl Runner {
             &prompt.text,
             Origin::Notes,
         )?);
+        self.record_snapshot(&run);
         slot.run = Some(Arc::clone(&run));
 
         let replaced = match &slot.agent {
@@ -354,6 +356,7 @@ impl Runner {
                 text: text.to_owned(),
             }),
         )?);
+        self.record_snapshot(&run);
         slot.run = Some(Arc::clone(&run));
         let replaced = match &slot.agent {
             Held::Ready(_, live) if same_conversation => {
@@ -522,6 +525,7 @@ impl Runner {
             &text,
             Origin::Review(chain.stage.clone()),
         )?);
+        self.record_snapshot(&run);
         slot.run = Some(Arc::clone(&run));
         let replaced = slot.release();
         let pending = Pending {
@@ -610,6 +614,8 @@ impl Runner {
                 // The agent did not stop when asked, so it is ended, and its exit is not
                 // reported over this.
                 released = slot.release();
+                // Its exit is not reported, so the snapshot after it is taken here.
+                self.record_end_snapshot(&run);
                 run.record(Entry::Failed {
                     error: "stopped: the agent did not stop when asked, so Postil ended it"
                         .to_owned(),
@@ -717,6 +723,39 @@ impl Runner {
     /// when its log is missing or cannot be read.
     pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
         Ok(self.run_by_id(id)?.view(0))
+    }
+
+    /// What the runs from `from` to `to` changed (docs/design.md, "The changes view"): the
+    /// diff from the snapshot taken before `from` to the one taken after `to`. A run that has
+    /// no second snapshot, because it is under way or ended without one (it was forced to
+    /// stop), is compared with the files as they are now, and `after` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::view_of`] for both runs; [`Error::BadRequest`] when `from` has no snapshot
+    /// (it ran before Postil took them) or `to` is older than `from`; and the errors of
+    /// [`Repo::snapshot`] and [`Repo::diff`].
+    pub(crate) fn changes(&self, from: &str, to: &str) -> Result<Changes> {
+        let (first, last) = (self.run_by_id(from)?, self.run_by_id(to)?);
+        if run_number(to) < run_number(from) {
+            return Err(Error::BadRequest(format!("{to} is older than {from}")));
+        }
+        let before = first.state().snapshots().first().cloned().ok_or_else(|| {
+            Error::BadRequest(format!(
+                "{from} has no snapshot of the files: it ran before Postil took them"
+            ))
+        })?;
+        let after = last.state().snapshots().get(1).cloned();
+        let now = match &after {
+            Some(after) => after.clone(),
+            None => self.repo.snapshot()?,
+        };
+        let patch = self.repo.diff(&before, &now)?;
+        Ok(Changes {
+            before,
+            after,
+            patch,
+        })
     }
 
     /// The name of the agent that ran run `id`: a follow-up goes to it.
@@ -918,6 +957,28 @@ impl Runner {
         run.record(Entry::Started);
     }
 
+    /// Records a snapshot of the working tree in `run` ([`Repo::snapshot`]). One that cannot
+    /// be taken is the run's problem: the run goes on, without its changes view.
+    fn record_snapshot(&self, run: &Run) {
+        match self.repo.snapshot() {
+            Ok(tree) => run.record(Entry::Snapshot { tree }),
+            Err(error) => {
+                run.state().problem.get_or_insert(format!(
+                    "no snapshot of the files was taken: {}",
+                    error_chain(&error)
+                ));
+            }
+        }
+    }
+
+    /// Records the snapshot after `run`, as its turn ends: only when it has the one before and
+    /// not yet one after, so an agent that exits after its run ended adds none.
+    fn record_end_snapshot(&self, run: &Run) {
+        if run.state().snapshots().len() == 1 {
+            self.record_snapshot(run);
+        }
+    }
+
     /// Marks the notes `ids` sent in `run`. A note that cannot be marked would be sent again
     /// by mistake later, so the run says so.
     fn mark_sent(&self, run: &Run, ids: &[String]) {
@@ -1028,10 +1089,14 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         };
         (run, released, answer, next)
     };
-    if let Some(run) = run
-        && let Some(ids) = run.record_event(event, answer, runner.repo.root())
-    {
-        runner.mark_sent(&run, &ids);
+    if let Some(run) = run {
+        // Before the end is logged, so a reader that sees the end sees what the run changed.
+        if ends_turn {
+            runner.record_end_snapshot(&run);
+        }
+        if let Some(ids) = run.record_event(event, answer, runner.repo.root()) {
+            runner.mark_sent(&run, &ids);
+        }
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
@@ -1316,6 +1381,19 @@ pub(crate) enum Entry {
         findings: Vec<Finding>,
         problem: Option<String>,
     },
+    /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]): the first is
+    /// taken before the agent gets the prompt, the second as its turn ends.
+    Snapshot { tree: String },
+}
+
+/// What runs changed, as `GET /api/run/changes` gives it: the snapshots compared, and the
+/// diff between them as `git diff` prints it. `after` is `None` when the files as they are
+/// now stood in for it.
+#[derive(Debug, Serialize)]
+pub(crate) struct Changes {
+    before: String,
+    after: Option<String>,
+    patch: String,
 }
 
 /// A file a tool call touches: relative to the repository root when it is inside it.
@@ -1800,8 +1878,20 @@ impl RunState {
             | Entry::ToolUpdate { .. }
             | Entry::Plan { .. }
             | Entry::Unreadable { .. }
-            | Entry::Findings { .. } => {}
+            | Entry::Findings { .. }
+            | Entry::Snapshot { .. } => {}
         }
+    }
+
+    /// The run's snapshots in order: the one before, then the one after, when taken.
+    fn snapshots(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Snapshot { tree } => Some(tree.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn status(&self) -> Status {

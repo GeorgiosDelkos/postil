@@ -1,12 +1,13 @@
 //! Reading a repository by running the `git` binary.
 //!
-//! No git library is linked: the app needs a file list and a branch name, and `git` already
-//! knows the ignore rules.
+//! No git library is linked: the app needs a file list, a branch name, snapshots of the
+//! working tree and the diffs between them, and `git` already knows the ignore rules.
 
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
@@ -147,6 +148,77 @@ impl Repo {
         Ok(files)
     }
 
+    /// Takes a snapshot of the working tree, every tracked file and every untracked file that
+    /// is not ignored, as a git tree, and returns its id. Postil takes one before a run and one
+    /// after it, and the changes view shows the diff between them (docs/design.md, "The
+    /// changes view").
+    ///
+    /// The tree is written through a temporary index, a copy of the real one so git can skip
+    /// files whose stat data did not change: the engineer's index, branch and stash are left
+    /// as they are. The tree and its blobs are objects no ref holds, so `git gc` may prune
+    /// them once they are older than its prune period (two weeks by default).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WriteSnapshot`] when the temporary index cannot be made, and the git errors.
+    pub(crate) fn snapshot(&self) -> Result<String> {
+        // Each snapshot has an index of its own: two windows, or two runs' snapshots, may
+        // overlap. It lives in the system's temporary directory, not the git directory, so a
+        // snapshot needs no write access there beyond the objects git adds.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let index = std::env::temp_dir().join(format!(
+            "postil-snapshot-{}-{}.index",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let failed = |source| Error::WriteSnapshot {
+            path: index.clone(),
+            source,
+        };
+        match fs::copy(self.git_dir.join("index"), &index) {
+            Ok(_) => {}
+            // A repository with nothing staged yet has no index: git starts an empty one.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(failed(error)),
+        }
+        let tree = run_git(&self.root, Some(&index), &["add", "--all"])
+            .and_then(|_| run_git(&self.root, Some(&index), &["write-tree"]));
+        // A leftover index is only a stray file; the snapshot is what matters.
+        drop(fs::remove_file(&index));
+        Ok(tree?.trim_end().to_owned())
+    }
+
+    /// The changes from snapshot `before` to snapshot `after` ([`Repo::snapshot`]), as
+    /// `git diff` prints them: a unified diff with three lines of context, renames shown as a
+    /// removal and an addition.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when an id is not a hexadecimal object id (they come from run
+    /// logs, which a hand edit can change), and the git errors, such as a snapshot that
+    /// `git gc` pruned.
+    pub(crate) fn diff(&self, before: &str, after: &str) -> Result<String> {
+        for id in [before, after] {
+            if id.len() < 4 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::BadRequest(format!(
+                    "snapshot {id:?}: expected a git object id"
+                )));
+            }
+        }
+        git(
+            &self.root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "--unified=3",
+                before,
+                after,
+            ],
+        )
+    }
+
     /// Reads one file as text. `file` is a path relative to the root, as [`Repo::files`]
     /// returns it.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
@@ -178,7 +250,14 @@ fn is_home_or_root(dir: &Path) -> bool {
 
 /// Runs `git` in `dir` and returns what it printed.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    run_git(dir, None, args)
+}
+
+/// Runs `git` in `dir`, with `index` as its index file when given, and returns what it
+/// printed.
+fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -190,9 +269,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .map_err(Error::SpawnGit)?;
+        .env_remove("GIT_INDEX_FILE");
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command.output().map_err(Error::SpawnGit)?;
 
     if !output.status.success() {
         return Err(Error::Git {

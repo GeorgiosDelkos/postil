@@ -227,6 +227,11 @@ async function prompt(id, params) {
       }
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "writes":
+      // Changes the working tree for real, as an agent's edits do: one file changed, one new.
+      writeFileSync(`${process.cwd()}/a.txt`, `a\nprompt ${prompts}\n`);
+      writeFileSync(`${process.cwd()}/new.txt`, "new\n");
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reviewer-silent":
       // A proposer whose reply has no findings block.
       say("Looks fine to me.");

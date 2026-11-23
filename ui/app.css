@@ -2912,3 +2912,131 @@ body.resizing * {
 .follow-up-text {
   white-space: pre-wrap;
 }
+
+/* The changes view: what runs changed, over the open file (ui/changes-view.js). */
+.changes-view {
+  position: absolute;
+  inset: 40px 0 0;
+  z-index: 2;
+  overflow: auto;
+  padding: 16px 20px 28px;
+  background: var(--surface);
+  outline: none;
+}
+
+.changes-notice {
+  margin-bottom: 12px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.changes-file {
+  margin-bottom: 18px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.changes-file-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.changes-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: "Geist Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.changes-status {
+  color: var(--text-muted);
+}
+
+.changes-status.added {
+  color: var(--added);
+}
+
+.changes-status.deleted {
+  color: var(--removed);
+}
+
+.changes-stats {
+  color: var(--text-muted);
+  font-family: "Geist Mono", monospace;
+}
+
+.changes-hunk {
+  padding: 3px 12px;
+  color: var(--text-muted);
+  font: 11.5px/1.6 "Geist Mono", monospace;
+}
+
+.changes-line {
+  display: grid;
+  grid-template-columns: 4ch 4ch 2ch 1fr;
+  font: 12.5px/1.6 "Geist Mono", monospace;
+}
+
+.changes-line.add {
+  background: var(--added-wash);
+}
+
+.changes-line.del {
+  background: var(--removed-wash);
+}
+
+.changes-number {
+  padding-right: 8px;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+button.changes-number {
+  border: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.changes-number:hover,
+button.changes-number:focus-visible {
+  color: var(--accent);
+  outline: none;
+}
+
+.changes-sign {
+  color: var(--text-muted);
+}
+
+.changes-line.add .changes-sign {
+  color: var(--added);
+}
+
+.changes-line.del .changes-sign {
+  color: var(--removed);
+}
+
+.changes-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.changes-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 12px 8px calc(10ch + 12px);
+}
+
+.changes-close {
+  margin-left: 10px;
+  padding: 1px 8px;
+  font-size: 11.5px;
+}

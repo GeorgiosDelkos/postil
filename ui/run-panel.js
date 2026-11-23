@@ -53,7 +53,8 @@ function statusWord(run) {
 // called after every fetch that changed the latest run, so the page can follow it (switch
 // tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
 // by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
-// file in the code pane; `reviewers()` names the settings' reviewers, in order.
+// file in the code pane; `reviewers()` names the settings' reviewers, in order;
+// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane.
 export function runPanel({
   panelEl,
   headerEl,
@@ -66,6 +67,7 @@ export function runPanel({
   openNote,
   openFile,
   reviewers,
+  showChanges,
 }) {
   // The latest run, followed as it changes.
   let run = null;
@@ -626,7 +628,19 @@ export function runPanel({
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     const when = isLive(latest) ? elapsed(Date.now() / 1000 - latest.startedAt) : `started ${started}`;
     const title = latest.id === view.id ? `${view.id} · ${view.agent}` : `${view.id} to ${latest.id} · ${view.agent}`;
-    return [detailHeader(statusIcon(iconKind(latest)), title, `${statusWord(latest)} · ${when}`), body];
+    const actions = [];
+    // A run logged before snapshots has no changes view.
+    if (view.entries.some((entry) => entry.kind === "snapshot")) {
+      const button = el("button", "button run-detail-changes", "Changes");
+      button.type = "button";
+      button.title = latest.id === view.id ? `What ${view.id} changed` : `What ${view.id} to ${latest.id} changed`;
+      button.addEventListener("click", () => {
+        detailEl.close();
+        showChanges(view.id, latest.id);
+      });
+      actions.push(button);
+    }
+    return [detailHeader(statusIcon(iconKind(latest)), title, `${statusWord(latest)} · ${when}`, actions), body];
   }
 
   // One follow-up in its thread's dialog: what the engineer asked, its steps, and the reply.

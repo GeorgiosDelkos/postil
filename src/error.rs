@@ -175,6 +175,14 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The temporary index a snapshot of the working tree is written through could not be
+    /// made.
+    WriteSnapshot {
+        /// The temporary index.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
     /// A run log could not be read.
     ReadRun {
         /// The log, or its directory.
@@ -320,6 +328,12 @@ impl fmt::Display for Error {
                 "cannot write the run log {} (check that the directory is writable)",
                 path.display()
             ),
+            Self::WriteSnapshot { path, .. } => write!(
+                f,
+                "cannot take a snapshot of the working tree through {} (check that the \
+                 temporary directory is writable)",
+                path.display()
+            ),
             Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
             Self::TurnRunning => write!(
                 f,
@@ -362,6 +376,7 @@ impl std::error::Error for Error {
             | Self::WriteSettings { source, .. }
             | Self::StartAgent { source, .. }
             | Self::WriteRun { source, .. }
+            | Self::WriteSnapshot { source, .. }
             | Self::WriteLayout { source, .. }
             | Self::ReadRun { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),

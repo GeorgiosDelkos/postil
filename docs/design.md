@@ -447,6 +447,33 @@ work (`POST /api/run/follow {of, text}`, `Runner::follow_up`). Decided with the 
   reply), its Review section, and the box. Review reviews the first run's work, and a review
   of a follow-up is refused, as the page would have nowhere to show it.
 
+### The changes view
+
+A run's dialog has a Changes button: the code pane then shows what the run, or its whole
+thread, changed (`ui/changes-view.js`, `GET /api/run/changes?from=R1&to=R3`). Decided with the
+owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per file.
+
+- **Snapshots.** Postil takes one before each run (before the agent gets the prompt) and one as
+  its turn ends, and logs each as a `snapshot` entry with the tree's id (`Repo::snapshot`, run
+  log version 4). A snapshot is every tracked file and every untracked file that is not
+  ignored, written as a tree through a temporary index: a copy of the real one, in the
+  system's temporary directory, so git skips the files whose stat data did not change. The
+  engineer's index, branch and stash are left alone. A snapshot that cannot be taken is the
+  run's problem, and the run goes on without a changes view.
+- **What it costs.** A snapshot runs `git add --all` and `git write-tree`, under the runner's
+  lock before the run and on the agent's reader thread after it: tens of milliseconds on a
+  medium repository, where only changed files are hashed. The trees and blobs are objects no
+  ref holds, so `git gc` may prune them after its prune period (two weeks by default); the
+  view then reports git's error.
+- **The diff** is `git diff` between the snapshot before the first run and the one after the
+  last, renames shown as a removal and an addition. A run with no snapshot after it (under
+  way, or forced to stop) is compared with the files as they are now, and the view says so.
+  Runs logged before snapshots have no Changes button.
+- **The view** shows each file with its hunks and line numbers on both sides, and each note
+  beside the changed line its lines end on. A click on a line number of the new side opens
+  that file at that line with the composer: the next note goes on the change itself, and a
+  follow-up sends it. Esc, the header's esc, or opening a file gives the pane back.
+
 ### Cards and dialogs
 
 Every list in the tray is made of small cards: a status, a place, an id, and the note in two
@@ -666,10 +693,8 @@ retired; the measured numbers above are the baseline to not regress.
    foot of the sidebar shows the agent's state. The open file and the notes are read again when the run moves on and when
    an edit finishes. The follow-up box came in milestone 4.
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
-   Built: resolving notes, from the note's dialog (Resolve, Reopen), and follow-ups (section
-   "Follow-ups"). Planned with the owner on 2026-11-23: snapshots are git trees written through
-   a temporary index before and after each run; the changes view is a unified diff per file
-   with notes beside their lines.
+   Built: resolving notes, from the note's dialog (Resolve, Reopen); follow-ups (section
+   "Follow-ups"); snapshots and the changes view (section "The changes view").
 5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at
    the owner's request (2026-11-22): the settings dialog and file, with agent detection,
    custom agents, the agent and the reviewers (sections "Agents" and "Settings"; it replaces
