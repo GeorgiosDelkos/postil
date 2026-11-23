@@ -562,6 +562,12 @@ kbd {
   line-height: 20px;
 }
 
+/* The text area has no edge of its own: the composer's border shows its focus, as a text
+   field's does (.field). */
+.composer:has(textarea:focus-visible) {
+  border-color: var(--accent);
+}
+
 .composer-actions {
   display: flex;
   align-items: center;
@@ -2814,6 +2820,15 @@ body.resizing * {
   padding: 16px 20px 28px;
   background: var(--surface);
   outline: none;
+}
+
+/* The scrolling panes take focus so the keyboard scrolls them. A click shows nothing; focus
+   reached by the keyboard is drawn inside the pane's edge, where nothing clips it. */
+.code:focus-visible,
+.prompt-preview:focus-visible,
+.changes-view:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .changes-notice {
