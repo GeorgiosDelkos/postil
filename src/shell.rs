@@ -31,6 +31,7 @@ use crate::agents::{self, BUILT_IN, Scanner};
 use crate::dialog;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
+use crate::folders::{self, Folders};
 use crate::highlight::{Highlighter, Token};
 use crate::layout::{self, Layout};
 #[cfg(target_os = "macos")]
@@ -736,6 +737,14 @@ struct ReviewRun {
     of: String,
 }
 
+/// The body of `PATCH /api/notes?id=N1`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditNote {
+    /// The note's new text.
+    body: String,
+}
+
 /// The body of `POST /api/run/follow`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -858,25 +867,21 @@ impl Site {
             "/api/recent" => json_or_error(Ok(self.recent())),
             "/api/open" if post => json_or_error(self.open_folder(request.body(), Repo::open)),
             "/api/init" if post => json_or_error(self.open_folder(request.body(), Repo::init)),
-            "/api/notes" => match *request.method() {
-                Method::GET => json_or_error(self.notes()),
-                Method::POST => json_or_error(self.add_note(request.body())),
-                Method::DELETE => match query_value(uri.query().unwrap_or(""), "id") {
-                    Some(id) => json_or_error(self.delete_note(&id)),
-                    None => reply(
-                        StatusCode::BAD_REQUEST,
-                        "text/plain",
-                        &b"expected ?id=<note id>"[..],
-                    ),
-                },
+            "/api/notes" => self.respond_notes(request),
+            "/api/notes/resolve" if post => self.change_note(uri, notes::resolve),
+            "/api/notes/reopen" if post => self.change_note(uri, notes::reopen),
+            "/api/folders" => match *request.method() {
+                Method::GET => json_or_error(
+                    self.repo()
+                        .map(|repo| to_json(&folders::load(&repo.folders_file()))),
+                ),
+                Method::PUT => json_or_error(self.save_folders(request.body())),
                 _ => reply(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "text/plain",
-                    &b"GET the notes, POST a new one, or DELETE ?id=N1"[..],
+                    &b"GET the open folders or PUT them"[..],
                 ),
             },
-            "/api/notes/resolve" if post => self.change_note(uri, notes::resolve),
-            "/api/notes/reopen" if post => self.change_note(uri, notes::reopen),
             "/api/settings" => match *request.method() {
                 Method::GET => reply(StatusCode::OK, "application/json", self.settings()),
                 Method::PUT => json_or_error(self.save_settings(request.body())),
@@ -1008,6 +1013,24 @@ impl Site {
         Ok(to_json(&review))
     }
 
+    /// The reply to `PUT /api/folders` `{"open": ["src"]}`: saves the folders open in the file
+    /// list, and answers `{}`.
+    fn save_folders(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let open: Folders = serde_json::from_slice(body)
+            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        folders::save(&self.repo()?.folders_file(), open)?;
+        Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `PATCH /api/notes?id=N1` `{"body": "..."}`: replaces the note's text, saves,
+    /// and returns all notes.
+    fn edit_note(&self, id: &str, body: &[u8]) -> Result<Vec<u8>> {
+        let edit: EditNote = serde_json::from_slice(body)
+            .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
+        let review = notes::edit(&*self.repo()?, id, &edit.body)?;
+        Ok(to_json(&review))
+    }
+
     /// The reply to `DELETE /api/notes?id=N1`: removes the note, saves, and returns the
     /// other notes.
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
@@ -1034,6 +1057,28 @@ impl Site {
                 .and_then(|repo| change(&repo, &id))
                 .map(|review| to_json(&review)),
         )
+    }
+
+    /// The replies to `/api/notes`: GET the notes, POST a new one, PATCH `?id=N1` its text, or
+    /// DELETE `?id=N1`.
+    fn respond_notes(&self, request: &Request<Vec<u8>>) -> Reply {
+        let id = query_value(request.uri().query().unwrap_or(""), "id");
+        match (request.method(), id) {
+            (&Method::GET, _) => json_or_error(self.notes()),
+            (&Method::POST, _) => json_or_error(self.add_note(request.body())),
+            (&Method::DELETE, Some(id)) => json_or_error(self.delete_note(&id)),
+            (&Method::PATCH, Some(id)) => json_or_error(self.edit_note(&id, request.body())),
+            (&Method::DELETE | &Method::PATCH, None) => reply(
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                &b"expected ?id=<note id>"[..],
+            ),
+            _ => reply(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                &b"GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1"[..],
+            ),
+        }
     }
 
     /// The replies to `/api/run` and the routes under it.
@@ -1368,6 +1413,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }
                 | Error::CopyIndex { .. }
+                | Error::WriteFolders { .. }
                 | Error::WriteLayout { .. }
                 | Error::ReadRun { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1791,6 +1837,85 @@ mod tests {
         let reply = site.respond(&request);
         let body = String::from_utf8(reply.body().to_vec()).unwrap();
         (reply.status(), body)
+    }
+
+    fn patch(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::PATCH)
+            .uri(uri)
+            .body(body.as_bytes().to_vec())
+            .unwrap();
+        let reply = site.respond(&request);
+        let body = String::from_utf8(reply.body().to_vec()).unwrap();
+        (reply.status(), body)
+    }
+
+    #[test]
+    fn a_note_s_text_is_edited_in_place_and_a_blank_or_unknown_one_is_refused() {
+        let repo = TempRepo::new("notes-edit");
+        repo.write("a.txt", "x\ny\n");
+        let site = repo.site();
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        let file = site.repo().unwrap().review_file();
+
+        let (status, body) = patch(
+            &site,
+            &format!("{NOTES}?id=N2"),
+            r#"{"body": "  second  "}"#,
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let review: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let bodies: Vec<&str> = review["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["body"].as_str().unwrap())
+            .collect();
+        assert_eq!(bodies, ["one", "second"], "trimmed, and only N2");
+        assert_eq!(
+            anchors(&review)[1],
+            anchor("N2", 2, 2, "found"),
+            "its lines stay"
+        );
+        assert!(fs::read_to_string(&file).unwrap().contains("\"second\""));
+
+        let before = fs::read_to_string(&file).unwrap();
+        for (uri, body, status, why) in [
+            (
+                format!("{NOTES}?id=N1"),
+                r#"{"body": "   "}"#,
+                StatusCode::BAD_REQUEST,
+                "no text",
+            ),
+            (
+                format!("{NOTES}?id=N9"),
+                r#"{"body": "x"}"#,
+                StatusCode::NOT_FOUND,
+                "no note N9",
+            ),
+            (
+                format!("{NOTES}?id=N1"),
+                r#"{"text": "x"}"#,
+                StatusCode::BAD_REQUEST,
+                "unreadable",
+            ),
+            (
+                NOTES.to_owned(),
+                r#"{"body": "x"}"#,
+                StatusCode::BAD_REQUEST,
+                "expected ?id=",
+            ),
+        ] {
+            let (got, reply) = patch(&site, &uri, body);
+            assert_eq!(got, status, "{uri} {body}: {reply}");
+            assert!(reply.contains(why), "{uri} {body}: {reply}");
+        }
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            before,
+            "nothing refused was written"
+        );
     }
 
     #[test]
@@ -2500,6 +2625,34 @@ mod tests {
 
     /// Saves `settings` (JSON text, possibly malformed) as the page does: naming the
     /// revision of the file it last read.
+    #[test]
+    fn open_folders_are_kept_per_working_tree_and_read_back() {
+        let repo = TempRepo::new("folders");
+        repo.write("src/a.rs", "fn a() {}\n");
+        let site = repo.site();
+        let folders = "postil://localhost/api/folders";
+        assert_eq!(get_json(&site, folders), serde_json::json!({ "open": [] }));
+
+        let (status, body) = put(&site, folders, r#"{"open": ["src", "src/gone"]}"#);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            get_json(&repo.site(), folders),
+            serde_json::json!({ "open": ["src", "src/gone"] }),
+            "a new process reads them"
+        );
+        assert!(repo.root.join(".git/postil/folders.json").exists());
+
+        let (status, body) = put(&site, folders, r#"{"open": "src"}"#);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("unreadable request"), "{body}");
+        assert_eq!(post(&site, folders, "").0, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            get(&repo.empty_site(), folders).0,
+            StatusCode::CONFLICT,
+            "no project"
+        );
+    }
+
     fn save(site: &Site, settings: &str) -> (StatusCode, String) {
         let revision = get_json(site, SETTINGS)["revision"].clone();
         put(

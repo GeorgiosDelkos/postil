@@ -185,6 +185,13 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The open folders of the file list could not be saved.
+    WriteFolders {
+        /// `folders.json`, or its directory.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
     /// A run log could not be read.
     ReadRun {
         /// The log, or its directory.
@@ -337,6 +344,11 @@ impl fmt::Display for Error {
                 from.display(),
                 to.display()
             ),
+            Self::WriteFolders { path, .. } => write!(
+                f,
+                "cannot save the open folders to {} (check that the git directory is writable)",
+                path.display()
+            ),
             Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
             Self::TurnRunning => write!(
                 f,
@@ -380,6 +392,7 @@ impl std::error::Error for Error {
             | Self::StartAgent { source, .. }
             | Self::WriteRun { source, .. }
             | Self::CopyIndex { source, .. }
+            | Self::WriteFolders { source, .. }
             | Self::WriteLayout { source, .. }
             | Self::ReadRun { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),

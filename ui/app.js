@@ -230,6 +230,29 @@ function setFolderOpen(path, open) {
   if (open) state.expanded.add(path);
   else state.expanded.delete(path);
   renderFiles();
+  saveFolders();
+}
+
+// The folders open when the project was last shown (src/folders.rs), read once as it opens.
+// One that cannot be read leaves the tree closed, as before folders were kept.
+async function loadFolders() {
+  const response = await fetch("api/folders");
+  if (response.ok) state.expanded = new Set((await response.json()).open);
+}
+
+// Saves the open folders a moment after the last change: a key held on a folder, or opening
+// a file deep in the tree, changes several at once.
+let foldersTimer = null;
+function saveFolders() {
+  clearTimeout(foldersTimer);
+  foldersTimer = setTimeout(() => {
+    const body = JSON.stringify({ open: [...state.expanded].sort() });
+    fetch("api/folders", { method: "PUT", body })
+      .then(async (response) => {
+        if (!response.ok) showToast(await response.text());
+      })
+      .catch((error) => showToast(String(error)));
+  }, 300);
 }
 
 // Opens the folders around `path` so its row exists, marks it as the open file, and scrolls
@@ -240,6 +263,7 @@ function revealFile(previous, path) {
 
   if (closed.length > 0) {
     renderFiles();
+    saveFolders();
   } else {
     if (previous) filesEl.querySelector(`.file${rowSelector(previous)}`)?.classList.remove("open");
     const row = filesEl.querySelector(`.file${rowSelector(path)}`);
@@ -1143,6 +1167,24 @@ async function deleteNote(note) {
   await runs.reload();
 }
 
+// Saves a note's new text, and draws the notes the reply holds. Resolves to whether it was
+// saved; a refusal is shown, and the editor stays open with the text.
+async function editNote(note, body) {
+  const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ body }),
+  });
+  if (!response.ok) {
+    showToast(await response.text());
+    return false;
+  }
+  state.notes = (await response.json()).notes;
+  indexNotes();
+  renderNotes();
+  redecorateRows();
+  return true;
+}
+
 // Resolves or reopens a note (`action` is the route's last part, src/shell.rs), and draws
 // the notes the reply holds.
 async function changeNote(action, note) {
@@ -1236,6 +1278,7 @@ const noteDetail = noteDialog(noteDialogEl, {
   send: sendAlone,
   remove: deleteNote,
   resolve: (note) => changeNote("resolve", note),
+  editNote,
   reopen: (note) => changeNote("reopen", note),
   showRun: () => showTab("run"),
   answerQuestion: (request, content) => runs.answerQuestion(request, content),
@@ -2003,6 +2046,7 @@ async function start() {
   }
   state.projectOpen = true;
   showRepo(repo);
+  await loadFolders().catch(() => {});
   renderFiles();
   await loadNotes();
   // The latest run, this session's or one from before a restart.

@@ -3044,3 +3044,40 @@ button.changes-number:focus-visible {
 .changes-more {
   margin: 8px 12px 10px;
 }
+
+/* Editing a note's text in its dialog. */
+.note-dialog-label .note-dialog-edit {
+  margin-left: auto;
+  padding: 1px 8px;
+  font-size: 11.5px;
+}
+
+.note-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.note-edit-input {
+  min-height: 60px;
+  padding: 8px 10px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.note-edit-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.note-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

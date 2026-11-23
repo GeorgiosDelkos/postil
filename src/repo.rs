@@ -120,6 +120,11 @@ impl Repo {
         self.git_dir.join("postil").join("review.json")
     }
 
+    /// Where this working tree's open folders are kept (`folders.rs`): beside the review file.
+    pub(crate) fn folders_file(&self) -> PathBuf {
+        self.git_dir.join("postil").join("folders.json")
+    }
+
     /// Where this working tree's run logs are stored (`run.rs`): beside the review file, for
     /// the same reason.
     pub(crate) fn runs_dir(&self) -> PathBuf {

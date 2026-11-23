@@ -18,9 +18,9 @@
 //! The notes live in `<git dir>/postil/review.json` (docs/design.md, "Data structures"). That
 //! file is the only copy: every request reads it, so an agent or a script that edits it is
 //! seen on the next request, and the page holds nothing that a reload would lose. The module
-//! offers [`current`] to read and [`add`], [`delete`], [`resolve`] and [`reopen`] to write,
-//! each of which does every step (read, relocate, and for the writers lock and write) so
-//! that no caller can skip one. [`mark_sent`] writes too, for the runner.
+//! offers [`current`] to read and [`add`], [`edit`], [`delete`], [`resolve`] and [`reopen`] to
+//! write, each of which does every step (read, relocate, and for the writers lock and write)
+//! so that no caller can skip one. [`mark_sent`] writes too, for the runner.
 //!
 //! Only those writers write. Reading the notes, which the page does whenever the
 //! window regains focus, never rewrites the file, so it cannot overwrite an edit made by
@@ -174,10 +174,12 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
 ///
 /// As [`delete`].
 pub(crate) fn resolve(repo: &Repo, id: &str) -> Result<Review> {
-    change_state(repo, id, |state| match state {
-        NoteState::Open {} => NoteState::Resolved { run: None },
-        NoteState::Sent { run } => NoteState::Resolved { run: Some(run) },
-        resolved @ NoteState::Resolved { .. } => resolved,
+    change_note(repo, id, |note| {
+        note.state = match std::mem::take(&mut note.state) {
+            NoteState::Open {} => NoteState::Resolved { run: None },
+            NoteState::Sent { run } => NoteState::Resolved { run: Some(run) },
+            resolved @ NoteState::Resolved { .. } => resolved,
+        };
     })
 }
 
@@ -189,19 +191,32 @@ pub(crate) fn resolve(repo: &Repo, id: &str) -> Result<Review> {
 ///
 /// As [`delete`].
 pub(crate) fn reopen(repo: &Repo, id: &str) -> Result<Review> {
-    change_state(repo, id, |state| match state {
-        NoteState::Resolved { run: Some(run) } => NoteState::Sent { run },
-        NoteState::Resolved { run: None } => NoteState::Open {},
-        other @ (NoteState::Open {} | NoteState::Sent { .. }) => other,
+    change_note(repo, id, |note| {
+        note.state = match std::mem::take(&mut note.state) {
+            NoteState::Resolved { run: Some(run) } => NoteState::Sent { run },
+            NoteState::Resolved { run: None } => NoteState::Open {},
+            other @ (NoteState::Open {} | NoteState::Sent { .. }) => other,
+        };
     })
 }
 
-/// Replaces the state of note `id` with `change(state)` and saves, under the lock.
-fn change_state(
-    repo: &Repo,
-    id: &str,
-    change: impl FnOnce(NoteState) -> NoteState,
-) -> Result<Review> {
+/// Replaces the text of note `id` with `body`, saves, and returns all notes. Its lines,
+/// snippet and state stay: a run it was sent in got the text it had then, which the run's
+/// prompt keeps.
+///
+/// # Errors
+///
+/// [`Error::InvalidNote`] for a blank body, and as [`delete`].
+pub(crate) fn edit(repo: &Repo, id: &str, body: &str) -> Result<Review> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(Error::InvalidNote("the note has no text".to_owned()));
+    }
+    change_note(repo, id, |note| body.clone_into(&mut note.body))
+}
+
+/// Changes note `id` with `change` and saves, under the lock.
+fn change_note(repo: &Repo, id: &str, change: impl FnOnce(&mut Note)) -> Result<Review> {
     let wanted = NoteId::parse(id)
         .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
     let file = repo.review_file();
@@ -212,7 +227,7 @@ fn change_state(
         .iter_mut()
         .find(|note| note.id == wanted)
         .ok_or_else(|| Error::NoSuchNote { id: id.to_owned() })?;
-    note.state = change(std::mem::take(&mut note.state));
+    change(note);
     review.save(&file)?;
     Ok(review)
 }
