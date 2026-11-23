@@ -58,8 +58,8 @@ use serde_json::Value;
 
 use crate::acp::{
     Agent, ContentBlock, ElicitationReply, Event, Launch, Location, PermissionKind,
-    PermissionOption, PlanEntryStatus, SessionUpdate, StopReason, Stopper, ToolCallContent,
-    ToolCallStatus, ToolKind, TurnEnd,
+    PermissionOption, PermissionRequest, PlanEntryStatus, SessionUpdate, StopReason, Stopper,
+    ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::agents::Scanner;
 use crate::error::{Error, Result, error_chain};
@@ -84,8 +84,9 @@ const FORCE_AFTER: Duration = Duration::from_secs(3);
 /// refused send answers at once.
 const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
-/// The run log's format version, in its header line.
-const LOG_VERSION: u32 = 1;
+/// The run log's format version, in its header line. Version 2 added a reviewer's run
+/// (`review` in the header, the `findings` entry); version 1 logs read as runs of notes.
+const LOG_VERSION: u32 = 2;
 
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
@@ -215,6 +216,12 @@ impl Runner {
         }
         let prompt = notes::prompt(&self.repo, ids)?;
         slot.chain = None;
+        // The agent kept from a reviewer's run holds that reviewer's conversation (told not to
+        // change files, or to judge findings), so a send after a review starts afresh.
+        let after_review = slot
+            .run
+            .as_ref()
+            .is_some_and(|run| run.state().header.review.is_some());
         let run = Arc::new(Run::create(
             &self.repo.runs_dir(),
             &agent.name,
@@ -225,7 +232,7 @@ impl Runner {
         slot.run = Some(Arc::clone(&run));
 
         let replaced = match &slot.agent {
-            Held::Ready(kept, live) if *kept == agent && live.is_alive() => {
+            Held::Ready(kept, live) if *kept == agent && live.is_alive() && !after_review => {
                 self.begin(live, &run, ids, &prompt);
                 Held::None
             }
@@ -254,9 +261,10 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run of this window is under way; [`Error::BadRequest`]
-    /// with no reviewers, or for a run that is itself a review; as [`Runner::view_of`] for
-    /// the reviewed run; and [`Error::WriteRun`] when the first stage's log cannot be created.
+    /// [`Error::TurnRunning`] while a run of this window is under way, and
+    /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
+    /// reviewers, or for a run that is itself a review; as [`Runner::view_of`] for the
+    /// reviewed run; and [`Error::WriteRun`] when the first stage's log cannot be created.
     pub(crate) fn review(self: &Arc<Self>, of: &str, reviewers: Vec<AgentChoice>) -> Result<()> {
         if reviewers.is_empty() {
             return Err(Error::BadRequest(
@@ -303,19 +311,21 @@ impl Runner {
 
     /// The run `of`, this window's when it is that one, else read from its log.
     fn reviewed(&self, of: &str) -> Result<Arc<Run>> {
+        let number = run_number(of)
+            .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
         let own = self.slot().run.clone();
         if let Some(run) = own.filter(|run| run.state().header.id == of) {
             return Ok(run);
         }
-        let number = run_number(of)
-            .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
+        let no_such = |problem: String| Error::NoSuchRun {
+            id: of.to_owned(),
+            problem,
+        };
         let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
-        Run::read(&file)
-            .map(Arc::new)
-            .map_err(|problem| Error::NoSuchRun {
-                id: of.to_owned(),
-                problem,
-            })
+        if !file.exists() {
+            return Err(no_such("there is no such run log".to_owned()));
+        }
+        Run::read(&file).map(Arc::new).map_err(no_such)
     }
 
     /// Starts `chain`'s current stage as a new run, with a fresh agent, so a reviewer never
@@ -537,24 +547,7 @@ impl Runner {
     /// [`Error::BadRequest`] when `id` is not of the form `R<number>`; [`Error::NoSuchRun`]
     /// when its log is missing or cannot be read.
     pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
-        let no_such = |problem: &str| Error::NoSuchRun {
-            id: id.to_owned(),
-            problem: problem.to_owned(),
-        };
-        let number = run_number(id)
-            .ok_or_else(|| Error::BadRequest(format!("run id {id:?}: expected R and a number")))?;
-
-        let own = self.slot().run.clone();
-        if let Some(run) = own.filter(|run| run.state().header.id == id) {
-            return Ok(run.view(0));
-        }
-        let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
-        if !file.exists() {
-            return Err(no_such("there is no such run log"));
-        }
-        Run::read(&file)
-            .map(|run| run.view(0))
-            .map_err(|problem| no_such(&problem))
+        Ok(self.reviewed(id)?.view(0))
     }
 
     /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.
@@ -812,34 +805,20 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
                     .as_ref()
                     .is_some_and(|chain| chain.stage == *stage)
             });
-        // Postil answers permission requests itself (docs/design.md, "Runs", decided with the
-        // owner on 2026-11-23): only a question stops for the engineer. A proposing reviewer
-        // is kept read-only: only its reads, searches, fetches and thinking are allowed.
         // Answered before the request is logged, and logged with it at once: a page that read
-        // the request alone would show the run waiting for the engineer. Fails when a Stop
-        // already answered the request (and logged that), or the agent is gone; the run then
-        // shows the request open until it ends.
-        let read_only = stage.as_ref().is_some_and(|stage| !stage.judges());
+        // the request alone would show the run waiting for the engineer.
+        // From the run's header, which never changes: a Stop that ends the chain does not lift
+        // it for the rest of the proposer's turn.
+        let read_only = slot.run.as_ref().is_some_and(|run| {
+            run.state()
+                .header
+                .review
+                .as_ref()
+                .is_some_and(|stage| !stage.judges())
+        });
         let answer = match (&event, &slot.agent) {
             (Event::Permission(request), Held::Ready(_, agent)) => {
-                let reads = matches!(
-                    request.tool_call.kind,
-                    Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think)
-                );
-                let option = if read_only && !reads {
-                    reject_option(&request.options)
-                } else {
-                    allow_option(&request.options)
-                };
-                option.and_then(|option| {
-                    agent
-                        .answer_permission(request.number, &option)
-                        .ok()
-                        .map(|()| Entry::Answer {
-                            request: request.number,
-                            option: Some(option),
-                        })
-                })
+                auto_answer(agent, request, read_only)
             }
             _ => None,
         };
@@ -869,22 +848,10 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         // A proposer's findings are read from its reply as its turn ends, and logged before
         // the end, while the run still takes entries.
         if ended_well && let Some((stage, found)) = &stage {
-            let (findings, problem) = if stage.judges() {
-                (Vec::new(), None)
-            } else {
-                let reply = run.state().reply();
-                match review::findings_in(&reply, found + 1) {
-                    Ok(findings) => (findings, None),
-                    Err(problem) => (Vec::new(), Some(problem)),
-                }
-            };
-            if !stage.judges() {
-                run.record(Entry::Findings {
-                    findings: findings.clone(),
-                    problem,
-                });
+            match end_stage(&run, stage, *found) {
+                Some(findings) => next = Some((run.state().header.id.clone(), findings)),
+                None => runner.slot().chain = None,
             }
-            next = Some((run.state().header.id.clone(), findings));
         }
         if let Some(ids) = run.record_event(event, answer, runner.repo.root()) {
             runner.mark_sent(&run, &ids);
@@ -894,13 +861,75 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     drop(released);
     (runner.notify)();
     if let Some((ended, findings)) = next {
-        let runner = Arc::clone(&runner);
+        let next = Arc::clone(&runner);
         let advanced = std::thread::Builder::new()
             .name("review-next".to_owned())
-            .spawn(move || runner.advance(&ended, findings));
-        // Without a thread the review stops after this stage; the run's log is whole.
-        drop(advanced);
+            .spawn(move || next.advance(&ended, findings));
+        if let Err(error) = advanced {
+            let mut slot = runner.slot();
+            slot.chain = None;
+            if let Some(run) = &slot.run {
+                run.state().problem.get_or_insert(format!(
+                    "the next reviewer could not start: no thread for it ({error})"
+                ));
+            }
+        }
     }
+}
+
+/// Answers a permission request as Postil does on the engineer's behalf (docs/design.md,
+/// "Runs", decided with the owner on 2026-11-23: only a question stops for the engineer), and
+/// returns the entry that logs the answer. A proposing reviewer is kept read-only: only its
+/// reads, searches, fetches and thinking are allowed. `None` when no option fits, or when a
+/// Stop already answered the request (and logged that) or the agent is gone; the run then
+/// shows the request open until it ends.
+fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> Option<Entry> {
+    let reads = matches!(
+        request.tool_call.kind,
+        Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think)
+    );
+    let option = if read_only && !reads {
+        reject_option(&request.options)
+    } else {
+        allow_option(&request.options)
+    }?;
+    agent.answer_permission(request.number, &option).ok()?;
+    Some(Entry::Answer {
+        request: request.number,
+        option: Some(option),
+    })
+}
+
+/// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
+/// proposer's findings are read from its reply (numbered after the `found` before it) and
+/// logged. Returns them for the next stage; `None` when the review stops here, because a
+/// proposer changed files.
+fn end_stage(run: &Run, stage: &Stage, found: usize) -> Option<Vec<Finding>> {
+    if stage.judges() {
+        return Some(Vec::new());
+    }
+    let reply = run.state().reply();
+    let (findings, problem) = match review::findings_in(&reply, found + 1) {
+        Ok(findings) => (findings, None),
+        Err(problem) => (Vec::new(), Some(problem)),
+    };
+    // A proposer may only read, but an agent that edits without asking is not stopped by the
+    // permission rule: its edits are checked here, and they end the review, so no judge takes
+    // a changed tree for the reviewed one.
+    let edited = !run.state().work().diffs.is_empty();
+    let problem = if edited {
+        Some(format!(
+            "reviewer {} changed files, though it may only read: the review stops here",
+            stage.reviewer
+        ))
+    } else {
+        problem
+    };
+    run.record(Entry::Findings {
+        findings: findings.clone(),
+        problem,
+    });
+    (!edited).then_some(findings)
 }
 
 /// The option that rejects a permission request: once, else always. `None` when the agent
@@ -947,7 +976,7 @@ struct RunState {
     // Sets: a cancel can log a request's answer before the request itself.
     requested: BTreeSet<usize>,
     answered: BTreeSet<usize>,
-    /// Why the log is incomplete, or the notes were not marked sent.
+    /// Why the log is incomplete, the notes were not marked sent, or a review stopped here.
     problem: Option<String>,
 }
 
@@ -1433,7 +1462,6 @@ impl RunState {
         }
     }
 
-    /// Whether this process runs the run and it has not ended.
     /// The agent's reply: its message parts joined, a blank line between messages.
     fn reply(&self) -> String {
         let mut reply = String::new();
@@ -1504,6 +1532,7 @@ impl RunState {
         }
     }
 
+    /// Whether this process runs the run and it has not ended.
     fn live(&self) -> bool {
         self.active.is_some()
     }
@@ -1609,9 +1638,9 @@ fn run_number(id: &str) -> Option<u64> {
 fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
     let VersionOnly { version } = serde_json::from_slice(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
-    if version != LOG_VERSION {
+    if !(1..=LOG_VERSION).contains(&version) {
         return Err(format!(
-            "it is version {version}, and this build of Postil reads version {LOG_VERSION}"
+            "it is version {version}, and this build of Postil reads versions 1 to {LOG_VERSION}"
         ));
     }
     serde_json::from_slice(first)

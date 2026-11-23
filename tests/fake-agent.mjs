@@ -219,6 +219,7 @@ async function prompt(id, params) {
           ],
         });
         say(`read ${read.result.outcome.optionId}`);
+        say(`saw the edit: ${blocks[0].includes("src/a.rs, before:\n```\na\n```\nafter:\n```\nb\n```")}`);
         say('Found one.\n\n```json\n[{"note": "N1", "path": "a.txt", "line": 1, "finding": "a is too short", "fix": "say more"}]\n```');
       } else {
         say(`judged: ${blocks[0].includes("F1 [N1] a.txt:1: a is too short") ? "saw F1" : "no F1"}`);
@@ -226,6 +227,15 @@ async function prompt(id, params) {
       }
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "reviewer-silent":
+      // A proposer whose reply has no findings block.
+      say("Looks fine to me.");
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "reviewer-edits":
+      // A proposer that edits without asking: no permission request reaches Postil.
+      update({ sessionUpdate: "tool_call", toolCallId: "x1", title: "Edit a.txt", kind: "edit", status: "completed", content: [{ type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "z" }] });
+      say("```json\n[]\n```");
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reject-only": {
       // No option allows, so Postil cannot answer it alone: the engineer does.
       const reply = await ask("session/request_permission", {

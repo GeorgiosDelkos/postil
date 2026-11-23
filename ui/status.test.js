@@ -150,6 +150,12 @@ test("a run's latest review: its stages, findings, and the judge's verdict on ea
   const silent = reviewOf("R1", [proposer, { ...judging, status: "ended", entries: [] }]);
   assert.equal(silent.findings[0].verdict.word, "no word");
   assert.equal(reviewOf("R1", [proposer]).findings[0].verdict.word, "waiting", "the judge has not started");
+  const failed = { ...proposer, status: "failed" };
+  assert.deepEqual(
+    reviewOf("R1", [failed]).findings[0].verdict,
+    { word: "not judged", text: "the review stopped after R4" },
+    "a stage that failed ends the review before its judge",
+  );
   assert.equal(reviewOf("R1", [old]).findings[0].verdict.word, "not judged", "a single reviewer");
 
   const unreadable = stage("R6", 1, 1, "ended", [{ kind: "findings", findings: [], problem: "no block" }]);

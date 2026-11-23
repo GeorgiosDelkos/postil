@@ -297,7 +297,11 @@ export function noteDialog(
     button.type = "button";
     button.disabled = live() || names.length === 0;
     button.title = names.length ? `Reviewers in order: ${names.join(", ")}` : "Add reviewers in Settings first";
-    button.addEventListener("click", () => startReview(run.id));
+    button.addEventListener("click", () => {
+      // Once: a second click would only be refused, as a run is then under way.
+      button.disabled = true;
+      startReview(run.id);
+    });
     label.append(button);
     part.append(label);
     if (!review) {

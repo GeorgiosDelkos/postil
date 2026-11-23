@@ -393,17 +393,23 @@ work is the run's prompt, its reply, and the diffs its finished edits made. Deci
 owner on 2026-11-23:
 
 - **Every reviewer but the last proposes, read-only.** Postil rejects its tool calls but reads,
-  searches, fetches and thinking, and its prompt says not to change files. It ends its reply
-  with its findings as a JSON block, which Postil reads and logs as the run ends; the findings
-  are numbered `F1`, `F2`, ... across the chain.
+  searches, fetches and thinking, and its prompt says not to change files. That stops only
+  the calls an agent asks permission for; an agent set to edit without asking is caught when
+  its turn ends, by the edits its run reports, and the review stops there. An edit made
+  through a command reports none. The reviewer ends its reply with its findings as a JSON
+  array fenced as json, which Postil reads and logs as the run ends; the findings are
+  numbered `F1`, `F2`, ... across the chain. The prompt gives the format in words, not as an
+  example block, which an agent quoting it would make read as findings.
 - **The last of two or more judges.** It gets every finding, accepts or rejects each, makes the
   accepted changes, and ends with one line per finding (`F1: accepted - ...`). A single
   reviewer only proposes.
 - **Each stage is a run,** marked in its header with the run it reviews and its place in the
   chain, started with a fresh agent when the one before ends well: a reviewer never inherits
-  the reviewed agent's conversation. That replaces the agent kept for follow-ups. A stage that
-  fails or is stopped ends the review, and a send ends one between stages. A review marks no
-  note sent.
+  the reviewed agent's conversation. That replaces the agent kept for follow-ups, and a send
+  after a review starts a fresh agent too, never a reviewer's. A stage that fails or is
+  stopped ends the review, and a send ends one between stages. A review marks no note sent.
+  The run log is version 2 for the review header field and the `findings` entry; version 1
+  logs read as runs of notes.
 - **Findings live in the work, not as notes or runs of their own.** The Run tab lists only runs
   of notes; a run's dialog has a Review section with a card per reviewer (it opens that
   reviewer's run) and a card per finding with its verdict (it opens the finding whole), and a

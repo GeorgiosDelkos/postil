@@ -143,7 +143,8 @@ export function groupNotes(notes, statusOf) {
 // A verdict is `{ word, text }`: "accepted" or "rejected" with the judge's line about it
 // (`agentSaid`, the judge answers "F1: accepted - ..."), "answered" for a line that says
 // neither, "judging" while the judge runs, "waiting" before it starts, "no word" when it
-// ended without a line, and "not judged" when a single reviewer only proposed.
+// ended without a line, and "not judged" when a single reviewer only proposed or the review
+// stopped before its judge (a stage failed or was stopped).
 export function reviewOf(id, views) {
   const stages = views
     .filter((view) => view?.review?.of === id)
@@ -152,10 +153,24 @@ export function reviewOf(id, views) {
   if (start < 0) return null;
   const chain = stages.slice(start);
   const reviewers = chain[0].review.reviewers;
+  // A stage that did not end well, or a proposer whose findings say why it stopped the
+  // review, ends the chain before its judge.
+  const stopped = chain.some(
+    (view) =>
+      (!isLive(view) && view.status !== "ended") ||
+      view.entries.some((entry) => entry.kind === "findings" && /stops here/.test(entry.problem ?? "")) ||
+      view.entries.some((entry) => entry.kind === "ended" && entry.reason !== "end_turn"),
+  );
   const judge = chain.find((view) => reviewers > 1 && view.review.reviewer === reviewers) ?? null;
   const verdict = (finding) => {
     if (reviewers === 1) return { word: "not judged", text: "" };
-    if (!judge) return { word: "waiting", text: "" };
+    if (!judge) {
+      const last = chain.at(-1);
+      // Between stages the next reviewer is about to start; a stopped chain has no judge.
+      return !stopped && (isLive(last) || chain.length < reviewers)
+        ? { word: "waiting", text: "" }
+        : { word: "not judged", text: `the review stopped after ${last.id}` };
+    }
     const said = agentSaid(judge, finding.id);
     if (said !== null) {
       const word = /^(accepted|rejected)\b/i.exec(said)?.[1]?.toLowerCase() ?? "answered";

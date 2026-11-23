@@ -629,7 +629,11 @@ export function runPanel({
     button.title = names.length
       ? `Reviewers in order: ${names.join(", ")}`
       : "Add reviewers in Settings first";
-    button.addEventListener("click", () => startReview(view.id));
+    button.addEventListener("click", () => {
+      // Once: a second click would only be refused, as a run is then under way.
+      button.disabled = true;
+      startReview(view.id);
+    });
     label.append(button);
     part.append(label);
     if (!review) {

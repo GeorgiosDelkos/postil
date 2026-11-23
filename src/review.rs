@@ -1,7 +1,8 @@
 //! Reviews: a chain of reviewer agents checks a run's work (docs/design.md, "Reviews").
 //!
-//! The reviewers are the settings' ordered list. Every reviewer but the last is read-only and
-//! proposes findings, ending its reply with them as a JSON block; the last judges all the
+//! The reviewers are the settings' ordered list. Every reviewer but the last is read-only (as
+//! far as its tool calls ask permission; `run.rs` checks its edits as it ends) and proposes
+//! findings, ending its reply with them as a JSON block; the last judges all the
 //! findings and makes the changes it accepts, ending with one line per finding. A single
 //! reviewer only proposes. Decided with the owner on 2026-11-23.
 //!
@@ -47,7 +48,7 @@ pub(crate) struct Finding {
 
 /// What is reviewed: the run's prompt (the notes as the agent got them), its reply, and the
 /// diffs its edits made, in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Work {
     pub(crate) prompt: String,
     pub(crate) reply: String,
@@ -55,7 +56,7 @@ pub(crate) struct Work {
 }
 
 /// One edit of a file: its text before (none for a new file) and after.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Diff {
     pub(crate) path: String,
     pub(crate) before: Option<String>,
@@ -72,11 +73,10 @@ pub(crate) fn propose_prompt(work: &Work) -> String {
     text.push_str(
         "Review the changes against the notes: wrong behaviour, a note not addressed, a change \
          the notes did not ask for, missing tests. Read the files as they are now where you \
-         need more context.\n\nEnd your reply with every finding in one JSON block, as an \
-         array of objects with the fields note (the note id it is about, or null), path, line, \
-         finding (what is wrong) and fix (what to change):\n\n```json\n[{\"note\": \"N1\", \
-         \"path\": \"src/a.rs\", \"line\": 12, \"finding\": \"...\", \"fix\": \"...\"}]\n```\n\n\
-         Write [] when you find nothing.\n",
+         need more context.\n\nEnd your reply with every finding as a JSON array in one code \
+         block fenced as json: one object per finding, with the fields note (the note id it is \
+         about, such as N1, or null), path, line, finding (what is wrong) and fix (what to \
+         change). An empty array when you find nothing.\n",
     );
     text
 }
@@ -128,7 +128,8 @@ fn context(text: &mut String, work: &Work) {
     )
     .expect("writing to a String cannot fail");
     if work.diffs.is_empty() {
-        text.push_str("The agent changed no file.\n\n");
+        // Edits made through a command report no diff, so "no file changed" could be false.
+        text.push_str("No edit diffs were reported; read the files to see their state.\n\n");
         return;
     }
     text.push_str("What the agent changed, each edit's text before and after:\n\n");
@@ -157,9 +158,13 @@ pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, Str
     let start = reply
         .rfind("```json")
         .ok_or("the reply has no ```json block of findings")?;
+    // The array ends where the JSON says, not at the next fence: a finding's text can quote
+    // code in a fence of its own.
     let body = &reply[start + "```json".len()..];
-    let body = body.find("```").map_or(body, |end| &body[..end]);
-    let entries: Vec<Value> = serde_json::from_str(body.trim())
+    let entries: Vec<Value> = serde_json::Deserializer::from_str(body)
+        .into_iter::<Vec<Value>>()
+        .next()
+        .ok_or("the ```json block of findings is empty")?
         .map_err(|error| format!("its findings are not a JSON array: {error}"))?;
     let text = |entry: &Value, key: &str| entry[key].as_str().map(str::to_owned);
     Ok(entries
@@ -221,13 +226,16 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("after:\n```\n    two();\n```"), "{prompt}");
-        assert!(prompt.contains("```json"), "{prompt}");
+        // The format in words: an example block would be read back as findings by anything
+        // that quotes the prompt.
+        assert!(!prompt.contains("```json"), "{prompt}");
+        assert!(prompt.contains("fenced as json"), "{prompt}");
 
         let empty = Work {
             diffs: Vec::new(),
             ..work()
         };
-        assert!(propose_prompt(&empty).contains("The agent changed no file."));
+        assert!(propose_prompt(&empty).contains("No edit diffs were reported"));
     }
 
     #[test]
@@ -272,6 +280,16 @@ mod tests {
         );
         assert_eq!(findings[1].note, None);
         assert_eq!(findings_in("```json\n[]\n```", 1), Ok(Vec::new()));
+        let fenced = findings_in(
+            "```json\n[{\"finding\": \"x\", \"fix\": \"```rust\\nfoo()\\n```\"}]\n```",
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            fenced[0].fix.as_deref(),
+            Some("```rust\nfoo()\n```"),
+            "a fence inside a fix"
+        );
         assert!(
             findings_in("no block", 1)
                 .unwrap_err()

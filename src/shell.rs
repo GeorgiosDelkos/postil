@@ -3487,6 +3487,139 @@ mod tests {
         assert!(body.contains("is itself a review"), "{body}");
     }
 
+    /// Saves Fake (`author`) as the agent notes go to and `reviewers`, each a (name,
+    /// scenario) pair, as the reviewers in order.
+    fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
+        let mut custom = vec![serde_json::json!({ "name": "Fake", "command": fake_agent(author) })];
+        custom.extend(reviewers.iter().map(
+            |(name, scenario)| serde_json::json!({ "name": name, "command": fake_agent(scenario) }),
+        ));
+        let mut enabled = vec!["Fake"];
+        enabled.extend(reviewers.iter().map(|(name, _)| *name));
+        let settings = serde_json::json!({
+            "customAgents": custom,
+            "enabledAgents": enabled,
+            "agent": "Fake",
+            "reviewers": reviewers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        });
+        let (status, body) = save(site, &settings.to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Waits until run `id` is the latest and has ended, and returns it.
+    fn wait_for_run(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) -> serde_json::Value {
+        loop {
+            let run = get_json(site, RUN);
+            if run["id"] == id
+                && ["ended", "failed"].contains(&run["status"].as_str().unwrap_or(""))
+            {
+                return run;
+            }
+            nudges
+                .recv_timeout(WAIT)
+                .unwrap_or_else(|_| panic!("no change while waiting for {id}: {run}"));
+        }
+    }
+
+    #[test]
+    fn a_reviewer_sees_the_reviewed_run_s_edits() {
+        let repo = TempRepo::new("run-review-edits");
+        repo.write("src/a.rs", "fn a() {\n    one();\n}\n");
+        let (site, nudges) = run_site(&repo, "turn");
+        post_note(&site, "src/a.rs", 2, 2, "rename one");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        set_reviewers(&site, "turn", &[("Reviewer", "reviewer")]);
+        let body = serde_json::json!({ "of": "R1" }).to_string();
+        assert_eq!(
+            post(&site, &format!("{RUN}/review"), &body).0,
+            StatusCode::OK
+        );
+        let proposer = wait_for_run(&site, &nudges, "R2");
+        assert!(
+            kinds(&proposer).contains(&"message:saw the edit: true".to_owned()),
+            "the run's diff, before and after, is in the prompt: {proposer}"
+        );
+    }
+
+    #[test]
+    fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
+        for (scenario, problem) in [
+            ("reviewer-silent", Some("no ```json block")),
+            ("refuse-prompt", None),
+            ("reviewer-edits", Some("reviewer 1 changed files")),
+        ] {
+            let repo = TempRepo::new(&format!("run-review-stop-{scenario}"));
+            repo.write("a.txt", "a\n");
+            let (site, nudges) = run_site(&repo, "plain");
+            post_note(&site, "a.txt", 1, 1, "one");
+            send(&site, &["N1"]);
+            wait_for(&site, &nudges, "ended");
+            set_reviewers(
+                &site,
+                "plain",
+                &[("First", scenario), ("Judge", "reviewer")],
+            );
+            let body = serde_json::json!({ "of": "R1" }).to_string();
+            assert_eq!(
+                post(&site, &format!("{RUN}/review"), &body).0,
+                StatusCode::OK
+            );
+            let first = wait_for_run(&site, &nudges, "R2");
+            if let Some(problem) = problem {
+                let found = first_of_kind(&first, "findings");
+                assert!(
+                    found["problem"].as_str().unwrap_or("").contains(problem),
+                    "{scenario}: {found}"
+                );
+            }
+            assert_eq!(
+                get_json(&site, RUNS)["runs"],
+                serde_json::json!(["R2", "R1"]),
+                "{scenario}: no judge starts"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_reviewer_only_proposes_and_a_send_after_a_review_starts_a_fresh_agent() {
+        let repo = TempRepo::new("run-review-single");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        // The reviewer is the very agent notes go to: Fake.
+        let settings = serde_json::json!({
+            "customAgents": [{ "name": "Fake", "command": fake_agent("plain") }],
+            "enabledAgents": ["Fake"],
+            "agent": "Fake",
+            "reviewers": ["Fake"],
+        });
+        assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
+        let body = serde_json::json!({ "of": "R1" }).to_string();
+        assert_eq!(
+            post(&site, &format!("{RUN}/review"), &body).0,
+            StatusCode::OK
+        );
+        let proposer = wait_for_run(&site, &nudges, "R2");
+        assert_eq!(proposer["review"]["reviewers"], 1);
+        assert_eq!(
+            get_json(&site, RUNS)["runs"],
+            serde_json::json!(["R2", "R1"]),
+            "no judge"
+        );
+
+        // The kept agent is the reviewer's, told not to change files: a send starts afresh.
+        send(&site, &["N2"]);
+        let next = wait_for_run(&site, &nudges, "R3");
+        assert!(
+            kinds(&next).contains(&"message:prompt 1".to_owned()),
+            "a new agent's first prompt: {next}"
+        );
+    }
+
     #[test]
     fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
         let repo = TempRepo::new("run-cancel");
@@ -3682,8 +3815,8 @@ mod tests {
             ("\n", "its first line is not a run header"),
             ("not a header\n", "its first line is not a run header"),
             (
-                r#"{"version":2,"id":"R3","newField":1}"#,
-                "it is version 2, and this build of Postil reads version 1",
+                r#"{"version":3,"id":"R3","newField":1}"#,
+                "it is version 3, and this build of Postil reads versions 1 to 2",
             ),
         ] {
             fs::write(runs.join("R3.jsonl"), newest).unwrap();
