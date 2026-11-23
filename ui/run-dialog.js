@@ -115,7 +115,14 @@ export function runDialog({
       const { item } = steps[index];
       // An answer as JSON: a question's is a new object on every fold (run.js, `foldRun`).
       const answer = JSON.stringify(item.answer);
-      stamp = [`${view.id}:${detail.key}`, item.status, item.output, item.text, answer, isLive(view)];
+      stamp = [
+        `${view.id}:${detail.key}`,
+        item.status,
+        item.output,
+        item.text,
+        answer,
+        isLive(view),
+      ];
       draw = () => stepDetail(view, item, index, steps.length);
     }
     if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) {
@@ -129,7 +136,9 @@ export function runDialog({
     detailEl.dataset.shown = stamp[0];
     // The question's form is the same node across redraws; so is the control that had the
     // focus in it, which gets it back.
-    const typing = [asking?.form, following?.form].some((form) => form?.contains(document.activeElement))
+    const typing = [asking?.form, following?.form].some((form) =>
+      form?.contains(document.activeElement),
+    )
       ? document.activeElement
       : null;
     detailEl.replaceChildren(...draw());
@@ -177,7 +186,10 @@ export function runDialog({
     // A reviewer's run says which run it reviews, and leads back to it.
     if (view.review) {
       const { of, reviewer, reviewers: count } = view.review;
-      const role = count > 1 && reviewer === count ? "judges the findings and makes the changes" : "proposes findings, read-only";
+      const role =
+        count > 1 && reviewer === count
+          ? "judges the findings and makes the changes"
+          : "proposes findings, read-only";
       const back = el("button", "button", `‹ ${of}`);
       back.type = "button";
       back.addEventListener("click", () => openDetail({ kind: "run", id: of }));
@@ -196,7 +208,11 @@ export function runDialog({
       const rows = el("div", "run-plan-rows");
       for (const step of plan) {
         const row = el("div", `plan-step ${step.status}`);
-        const mark = el("span", "plan-mark", { completed: "✓", in_progress: "●" }[step.status] ?? "○");
+        const mark = el(
+          "span",
+          "plan-mark",
+          { completed: "✓", in_progress: "●" }[step.status] ?? "○",
+        );
         mark.setAttribute("aria-hidden", "true");
         row.append(mark, el("span", "", step.content));
         rows.append(row);
@@ -234,19 +250,28 @@ export function runDialog({
       body.append(followUpBox(view, latest));
     }
 
-    const started = new Date(view.startedAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const started = new Date(view.startedAt * 1000).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
     const status = () => {
       const now = store.byId(latest.id) ?? latest;
       const when = isLive(now) ? elapsed(Date.now() / 1000 - now.startedAt) : `started ${started}`;
       return `${statusWord(now)} · ${when}`;
     };
-    const title = latest.id === view.id ? `${view.id} · ${view.agent}` : `${view.id} to ${latest.id} · ${view.agent}`;
+    const title =
+      latest.id === view.id
+        ? `${view.id} · ${view.agent}`
+        : `${view.id} to ${latest.id} · ${view.agent}`;
     const actions = [];
     // A run logged before snapshots has no changes view.
     if (view.entries.some((entry) => entry.kind === "snapshot")) {
       const button = el("button", "button run-detail-changes", "Changes");
       button.type = "button";
-      button.title = latest.id === view.id ? `What ${view.id} changed` : `What ${view.id} to ${latest.id} changed`;
+      button.title =
+        latest.id === view.id
+          ? `What ${view.id} changed`
+          : `What ${view.id} to ${latest.id} changed`;
       button.addEventListener("click", () => {
         detailEl.close();
         showChanges(view.id, latest.id);
@@ -283,7 +308,13 @@ export function runDialog({
     const asked = section(`You · ${turn.id}`, el("div", "follow-up-text", turn.followUp.text));
     // The prompt holds more than the words when a fresh agent was told the thread first.
     if (turn.prompt !== turn.followUp.text) {
-      asked.append(el("div", "note-dialog-said muted", `Sent to a new ${turn.agent} with the thread so far: the earlier conversation had ended.`));
+      asked.append(
+        el(
+          "div",
+          "note-dialog-said muted",
+          `Sent to a new ${turn.agent} with the thread so far: the earlier conversation had ended.`,
+        ),
+      );
     }
     parts.push(asked);
     const steps = stepsOf(turn);
@@ -349,15 +380,18 @@ export function runDialog({
         if (!text || button.disabled) return;
         sending = true;
         update(target);
-        store.post("api/run/follow", { of: target.id, text }).then(
-          () => {
-            input.value = "";
-          },
-          (error) => onError(error.message),
-        ).finally(() => {
-          sending = false;
-          update(target);
-        });
+        store
+          .post("api/run/follow", { of: target.id, text })
+          .then(
+            () => {
+              input.value = "";
+            },
+            (error) => onError(error.message),
+          )
+          .finally(() => {
+            sending = false;
+            update(target);
+          });
       });
       input.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && event.metaKey) {
@@ -410,7 +444,9 @@ export function runDialog({
       cards.append(button);
     }
     for (const finding of review.findings) {
-      const icon = { accepted: "addressed", rejected: "stopped", judging: "working" }[finding.verdict.word] ?? "open";
+      const icon =
+        { accepted: "addressed", rejected: "stopped", judging: "working" }[finding.verdict.word] ??
+        "open";
       const button = el("button", `run-card finding ${finding.verdict.word.replace(" ", "-")}`);
       button.type = "button";
       button.title = finding.text;
@@ -421,11 +457,14 @@ export function runDialog({
         el("span", "run-entry-status", finding.verdict.word),
         el("span", "run-chevron", "›"),
       );
-      button.addEventListener("click", () => openDetail({ kind: "finding", id: view.id, finding: finding.id }));
+      button.addEventListener("click", () =>
+        openDetail({ kind: "finding", id: view.id, finding: finding.id }),
+      );
       cards.append(button);
     }
     part.append(cards);
-    for (const problem of review.problems) part.append(el("div", "run-notice", `A reviewer's findings could not be read: ${problem}`));
+    for (const problem of review.problems)
+      part.append(el("div", "run-notice", `A reviewer's findings could not be read: ${problem}`));
     return part;
   }
 
@@ -436,18 +475,31 @@ export function runDialog({
     back.type = "button";
     back.addEventListener("click", () => openDetail({ kind: "run", id: view.id }));
     const nav = el("div", "run-detail-nav");
-    const where = [finding.note, finding.path && (finding.line ? `${finding.path}:${finding.line}` : finding.path)];
-    nav.append(back, el("span", "", [`found by ${finding.from}`, ...where].filter(Boolean).join(" · ")));
+    const where = [
+      finding.note,
+      finding.path && (finding.line ? `${finding.path}:${finding.line}` : finding.path),
+    ];
+    nav.append(
+      back,
+      el("span", "", [`found by ${finding.from}`, ...where].filter(Boolean).join(" · ")),
+    );
     body.append(nav, section("Finding", el("div", "run-detail-text", finding.text)));
-    if (finding.fix) body.append(section("Proposed fix", el("div", "run-detail-text", finding.fix)));
-    const verdict = finding.verdict.text || {
-      "not judged": "A single reviewer only proposes: no one judged it.",
-      waiting: "The judging reviewer has not started yet.",
-      judging: "The judging reviewer is at work.",
-      "no word": "The judging reviewer ended without a line about it.",
-    }[finding.verdict.word] || finding.verdict.word;
+    if (finding.fix)
+      body.append(section("Proposed fix", el("div", "run-detail-text", finding.fix)));
+    const verdict =
+      finding.verdict.text ||
+      {
+        "not judged": "A single reviewer only proposes: no one judged it.",
+        waiting: "The judging reviewer has not started yet.",
+        judging: "The judging reviewer is at work.",
+        "no word": "The judging reviewer ended without a line about it.",
+      }[finding.verdict.word] ||
+      finding.verdict.word;
     body.append(section("Verdict", el("div", "run-detail-text", verdict)));
-    return [detailHeader(null, `${finding.id} · ${finding.verdict.word}`, `review of ${view.id}`), body];
+    return [
+      detailHeader(null, `${finding.id} · ${finding.verdict.word}`, `review of ${view.id}`),
+      body,
+    ];
   }
 
   // A step's card: what it did and how it went, in one line. `step` is one of `stepsOf(view)`.
@@ -463,8 +515,14 @@ export function runDialog({
       case "tool": {
         const row = toolRow(item, isLive(view));
         const tone = row.state === "failed" || row.state === "unfinished" ? ` ${row.state}` : "";
-        const state = row.running ? statusIcon("working") : el("span", `tool-state${tone}`, row.state);
-        const node = card([el("span", "tool-verb", row.verb), el("span", "run-card-text tool-target", row.target), state]);
+        const state = row.running
+          ? statusIcon("working")
+          : el("span", `tool-state${tone}`, row.state);
+        const node = card([
+          el("span", "tool-verb", row.verb),
+          el("span", "run-card-text tool-target", row.target),
+          state,
+        ]);
         node.title = item.title;
         return node;
       }
@@ -474,7 +532,8 @@ export function runDialog({
         // The thought streams: its words change in place, and the card stays the same node.
         streamed.push(() => {
           const now = foldRun((store.byId(view.id) ?? view).entries).items[index];
-          if (now?.type === "thought" && preview.textContent !== words(now)) preview.textContent = words(now);
+          if (now?.type === "thought" && preview.textContent !== words(now))
+            preview.textContent = words(now);
         });
         return card([el("span", "tool-verb", "think"), preview]);
       }
@@ -518,7 +577,12 @@ export function runDialog({
     following.setAttribute("aria-label", "The step after");
     following.disabled = index === count - 1;
     following.addEventListener("click", () => moveStep(1));
-    nav.append(back, el("span", "", `Step ${index + 1} of ${count} · ← → to move`), previous, following);
+    nav.append(
+      back,
+      el("span", "", `Step ${index + 1} of ${count} · ← → to move`),
+      previous,
+      following,
+    );
     body.append(nav);
 
     if (item.type === "thought") {
@@ -537,7 +601,10 @@ export function runDialog({
       if (answered.length) {
         const list = el("dl", "question-answers");
         for (const [key, value] of answered) {
-          list.append(el("dt", "", key), el("dd", "", Array.isArray(value) ? value.join(", ") : String(value)));
+          list.append(
+            el("dt", "", key),
+            el("dd", "", Array.isArray(value) ? value.join(", ") : String(value)),
+          );
         }
         body.append(section("Your answer", list));
       } else body.append(el("div", "run-detail-text muted", questionState(item)));
@@ -566,7 +633,10 @@ export function runDialog({
     if (item.output.length === 0) {
       body.append(el("div", "run-detail-text muted", row.running ? "Under way…" : "No output."));
     }
-    return [detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions), body];
+    return [
+      detailHeader(statusIcon(kind), `${capital(row.verb)} ${row.target}`, row.state, actions),
+      body,
+    ];
   }
 
   return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft };
@@ -582,7 +652,11 @@ function stepsOf(view) {
     .filter(
       ({ item }) =>
         item.type !== "message" &&
-        !(live && (item.type === "permission" || item.type === "question") && item.answer === undefined),
+        !(
+          live &&
+          (item.type === "permission" || item.type === "question") &&
+          item.answer === undefined
+        ),
     );
 }
 

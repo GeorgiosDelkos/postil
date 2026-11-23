@@ -79,8 +79,7 @@ export function settingsDialog(dialogEl, { apply }) {
       settings: ahead ? ui.view.settings : view.settings,
       agents: scanning ? (ui.view?.agents ?? null) : view.agents,
     };
-    const unchanged =
-      scanning === ui.scanning && JSON.stringify(next) === JSON.stringify(ui.view);
+    const unchanged = scanning === ui.scanning && JSON.stringify(next) === JSON.stringify(ui.view);
     ui.view = next;
     ui.scanning = scanning;
     if (!ahead) apply(view.settings);
@@ -162,7 +161,10 @@ export function settingsDialog(dialogEl, { apply }) {
     const header = el("header", "settings-header");
     const title = el("h2", "settings-title", "Settings");
     title.id = "settings-title";
-    header.append(title, button("×", "close", () => dialogEl.close(), "icon-button"));
+    header.append(
+      title,
+      button("×", "close", () => dialogEl.close(), "icon-button"),
+    );
     header.lastChild.setAttribute("aria-label", "Close");
 
     const body = el("div", "settings-body");
@@ -242,7 +244,11 @@ export function settingsDialog(dialogEl, { apply }) {
     larger.disabled = locked() || size >= largest;
     stepper.append(smaller, el("span", "stepper-value", `${size} px`), larger);
 
-    const themes = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
+    const themes = [
+      ["system", "System"],
+      ["light", "Light"],
+      ["dark", "Dark"],
+    ];
     const tabs = ui.view.tabWidths.map((width) => [width, String(width)]);
     return section(
       "Appearance",

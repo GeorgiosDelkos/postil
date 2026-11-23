@@ -77,8 +77,7 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile }) {
   function treeRows() {
     const totals = folderCounts(state.noteCountByPath);
     return visibleRows(state.tree, state.expanded).map((row) => {
-      const button =
-        row.kind === "folder" ? folderRow(row, totals) : fileRow(row.path, row.name);
+      const button = row.kind === "folder" ? folderRow(row, totals) : fileRow(row.path, row.name);
       // Files get an empty chevron slot, so names line up with their folder's siblings.
       if (row.kind === "file") button.prepend(el("span", "chevron"), icon(fileIcon(row.name)));
       button.style.paddingLeft = `${INDENT_BASE + INDENT * row.depth}px`;

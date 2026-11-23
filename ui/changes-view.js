@@ -60,7 +60,13 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     // The run is under way, or ended without a snapshot after it: the files as they are now
     // stand in for it, and may hold changes made since.
     if (sinceNow) {
-      parts.push(el("div", "changes-notice", "Compared with the files as they are now: the run has no snapshot after it."));
+      parts.push(
+        el(
+          "div",
+          "changes-notice",
+          "Compared with the files as they are now: the run has no snapshot after it.",
+        ),
+      );
     }
     if (files.length === 0) parts.push(el("div", "empty", "No file changed."));
     const all = notes();

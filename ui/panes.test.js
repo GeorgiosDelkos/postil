@@ -42,7 +42,11 @@ test("arrow keys move a divider within its limits", () => {
   assert.equal(step(layout(248, 320), limits, "files", 16, 3000).sidebar, 264);
   assert.equal(step(layout(470, 320), limits, "files", 64, 3000).sidebar, 480);
   assert.equal(step(layout(210, 320), limits, "files", -64, 3000).sidebar, 200);
-  assert.equal(step(layout(248, 320), limits, "tray", 16, 3000).tray, 304, "right narrows the tray");
+  assert.equal(
+    step(layout(248, 320), limits, "tray", 16, 3000).tray,
+    304,
+    "right narrows the tray",
+  );
   assert.equal(step(layout(248, 290), limits, "tray", 64, 3000).tray, 280);
 });
 

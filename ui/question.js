@@ -25,7 +25,9 @@ export function questionFields(schema) {
       if (options.length) fields.push({ ...base, kind: "many", options });
     } else if (field.type === "string" || field.type === undefined) {
       const options = choices(field);
-      fields.push(options.length ? { ...base, kind: "one", options } : { ...base, kind: "text", options: [] });
+      fields.push(
+        options.length ? { ...base, kind: "one", options } : { ...base, kind: "text", options: [] },
+      );
     } else if (field.type === "number" || field.type === "integer") {
       fields.push({ ...base, kind: "number", options: [] });
     } else if (field.type === "boolean") {

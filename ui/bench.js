@@ -25,8 +25,7 @@ export async function runBench(path, { code, codeEl }) {
   }
 
   frameMs.sort((a, b) => a - b);
-  const at = (fraction) =>
-    Number(frameMs[Math.floor((frameMs.length - 1) * fraction)].toFixed(2));
+  const at = (fraction) => Number(frameMs[Math.floor((frameMs.length - 1) * fraction)].toFixed(2));
   const median = at(0.5);
   const report = {
     file: path,

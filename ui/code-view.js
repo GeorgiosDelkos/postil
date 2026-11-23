@@ -104,7 +104,12 @@ export function codeView({
   function renderHeader(path) {
     const parts = path.split("/");
     const crumbs = $("crumbs");
-    crumbs.replaceChildren(parts.slice(0, -1).map((part) => `${part} / `).join(""));
+    crumbs.replaceChildren(
+      parts
+        .slice(0, -1)
+        .map((part) => `${part} / `)
+        .join(""),
+    );
     crumbs.append(el("b", "", parts.at(-1)));
     $("file-meta").textContent = state.file ? `${state.file.lines.length} lines` : "";
   }
@@ -621,8 +626,7 @@ export function codeView({
   function measureComposer(node) {
     if (!node.isConnected) return;
     const style = getComputedStyle(node);
-    const height =
-      node.offsetHeight + parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+    const height = node.offsetHeight + parseFloat(style.marginTop) + parseFloat(style.marginBottom);
     if (height !== composerHeight) {
       composerHeight = height;
       setRowsPadding();

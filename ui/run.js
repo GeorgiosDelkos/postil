@@ -90,7 +90,15 @@ function foldEntries(entries) {
         let tool = tools.get(entry.id);
         if (!tool) {
           // A change to a call the log never started: shown, under its id.
-          tool = { type: "tool", id: entry.id, title: entry.id, tool: "other", status: "pending", places: [], output: [] };
+          tool = {
+            type: "tool",
+            id: entry.id,
+            title: entry.id,
+            tool: "other",
+            status: "pending",
+            places: [],
+            output: [],
+          };
           tools.set(entry.id, tool);
           items.push(tool);
         }
@@ -142,7 +150,10 @@ function foldEntries(entries) {
         break;
       }
       case "unreadable":
-        items.push({ type: "notice", text: `The agent sent something Postil could not read: ${entry.problem}` });
+        items.push({
+          type: "notice",
+          text: `The agent sent something Postil could not read: ${entry.problem}`,
+        });
         break;
       case "failed":
         items.push({ type: "error", text: entry.error });
@@ -366,7 +377,10 @@ export function statusLine(run) {
     case "failed":
       return { text: "Failed", tone: "failed" };
     default:
-      return { text: "Unfinished: Postil crashed during it, or another window runs it", tone: "idle" };
+      return {
+        text: "Unfinished: Postil crashed during it, or another window runs it",
+        tone: "idle",
+      };
   }
 }
 
@@ -425,12 +439,16 @@ export function elapsed(seconds) {
 // quoted line of code, the line that says the code moved, or text. The format is
 // src/run.rs, `prompt_text`.
 export function promptLines(text) {
-  return text.replace(/\n$/, "").split("\n").map((line) => {
-    if (/^\[N\d+\] /.test(line)) return { kind: "heading", text: line };
-    if (line.startsWith("> ")) return { kind: "quote", text: line };
-    if (line === "(These lines are no longer in the file; they were:)") return { kind: "lost", text: line };
-    return { kind: "text", text: line };
-  });
+  return text
+    .replace(/\n$/, "")
+    .split("\n")
+    .map((line) => {
+      if (/^\[N\d+\] /.test(line)) return { kind: "heading", text: line };
+      if (line.startsWith("> ")) return { kind: "quote", text: line };
+      if (line === "(These lines are no longer in the file; they were:)")
+        return { kind: "lost", text: line };
+      return { kind: "text", text: line };
+    });
 }
 
 // The agent's text as blocks of a small Markdown subset: fenced code, headings, lists, and
@@ -441,7 +459,8 @@ export function markdownBlocks(text) {
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   let paragraph = [];
   const flush = () => {
-    if (paragraph.length > 0) blocks.push({ type: "paragraph", inline: inline(paragraph.join("\n")) });
+    if (paragraph.length > 0)
+      blocks.push({ type: "paragraph", inline: inline(paragraph.join("\n")) });
     paragraph = [];
   };
   for (let index = 0; index < lines.length; index += 1) {
@@ -482,7 +501,8 @@ export function markdownBlocks(text) {
 // stars inside it stay text; an unclosed mark stays text too.
 export function inline(text) {
   const parts = [];
-  const pattern = /(`+)([\s\S]+?)\1|\*\*([\s\S]+?)\*\*|(?<![\w*])[*_]([^*_\s][^*_]*?)[*_](?![\w*])/g;
+  const pattern =
+    /(`+)([\s\S]+?)\1|\*\*([\s\S]+?)\*\*|(?<![\w*])[*_]([^*_\s][^*_]*?)[*_](?![\w*])/g;
   let at = 0;
   for (const match of text.matchAll(pattern)) {
     if (match.index > at) parts.push({ type: "text", text: text.slice(at, match.index) });

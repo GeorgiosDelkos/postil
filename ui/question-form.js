@@ -27,7 +27,10 @@ export function questionForm(question, agent, answer) {
   const fields = questionFields(question.fields);
   const values = {};
   const form = el("form", "question");
-  form.append(el("div", "question-label", `${agent} has a question`), el("div", "question-message", question.message));
+  form.append(
+    el("div", "question-label", `${agent} has a question`),
+    el("div", "question-message", question.message),
+  );
   fields.forEach((field, index) => form.append(fieldView(field, index, values)));
   const actions = el("div", "question-actions");
   const skip = el("button", "button", `Skip, let ${agent} decide`);
@@ -70,7 +73,10 @@ function fieldView(field, index, values) {
   if (field.kind === "one" || field.kind === "many" || field.kind === "yesno") {
     const options =
       field.kind === "yesno"
-        ? [{ value: true, title: "Yes", description: "" }, { value: false, title: "No", description: "" }]
+        ? [
+            { value: true, title: "Yes", description: "" },
+            { value: false, title: "No", description: "" },
+          ]
         : field.options;
     const chosen = new Set();
     for (const option of options) {
@@ -87,7 +93,8 @@ function fieldView(field, index, values) {
       });
       const text = el("span", "question-choice-text");
       text.append(el("span", "question-choice-title", option.title));
-      if (option.description) text.append(el("span", "question-choice-description", option.description));
+      if (option.description)
+        text.append(el("span", "question-choice-description", option.description));
       choice.append(input, text);
       part.append(choice);
     }

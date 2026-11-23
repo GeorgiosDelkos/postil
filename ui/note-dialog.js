@@ -21,8 +21,8 @@ import {
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
 // ticked), `remove(note)`, `resolve(note)`, `reopen(note)`, `editNote(note, body)` (resolves
-// to whether the new text was saved), `showRun()`, and `answerQuestion(request, content)` for the run's
-// open question (`content` null to skip). `agent()` names the agent Send sends to, the
+// to whether the new text was saved), `showRun()`, and `answerQuestion(request, content)` for
+// the run's open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
 // (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
 // `live()` says whether a run is under way.
@@ -101,7 +101,9 @@ export function noteDialog(
     // The question's form is the same node across redraws, and so is the control that had
     // the focus in it, which gets it back; a button outside it is found by its class.
     const active = document.activeElement;
-    const typing = [asking?.form, editing?.form].some((form) => form?.contains(active)) ? active : null;
+    const typing = [asking?.form, editing?.form].some((form) => form?.contains(active))
+      ? active
+      : null;
     const focused = typing ? null : active?.className;
     const scroll = dialogEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
     dialogEl.replaceChildren(header(note, run), body(note, run), footer(note, run));
@@ -128,7 +130,12 @@ export function noteDialog(
     });
     const actions = el("span", "note-dialog-actions");
     actions.append(show, close);
-    head.append(statusIcon(status.kind), title, el("span", "note-dialog-where", where(note)), actions);
+    head.append(
+      statusIcon(status.kind),
+      title,
+      el("span", "note-dialog-where", where(note)),
+      actions,
+    );
     return head;
   }
 
@@ -150,7 +157,9 @@ export function noteDialog(
       if (diffs.length) {
         const stats = fileStats(note, run);
         const changed = section(`What changed in ${note.path}`, diffsView(diffs));
-        changed.firstChild.append(el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`));
+        changed.firstChild.append(
+          el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`),
+        );
         main.append(changed);
       }
       main.append(section(`History · ${run.id} · ${run.agent}`, history(note, run)));
@@ -279,17 +288,38 @@ export function noteDialog(
     });
     if (!review) return part;
     if (mine.length === 0) {
-      part.append(el("div", "note-dialog-said muted", `No finding about ${note.id}; ${review.findings.length} about the run.`));
+      part.append(
+        el(
+          "div",
+          "note-dialog-said muted",
+          `No finding about ${note.id}; ${review.findings.length} about the run.`,
+        ),
+      );
       return part;
     }
     for (const finding of mine) {
       const item = el("div", "review-finding");
       const head = el("div", "review-finding-head");
-      head.append(el("span", "note-id", finding.id), el("span", `review-verdict ${finding.verdict.word.replace(" ", "-")}`, finding.verdict.word));
-      if (finding.path) head.append(el("span", "note-dialog-where", finding.line ? `${finding.path}:${finding.line}` : finding.path));
+      head.append(
+        el("span", "note-id", finding.id),
+        el(
+          "span",
+          `review-verdict ${finding.verdict.word.replace(" ", "-")}`,
+          finding.verdict.word,
+        ),
+      );
+      if (finding.path)
+        head.append(
+          el(
+            "span",
+            "note-dialog-where",
+            finding.line ? `${finding.path}:${finding.line}` : finding.path,
+          ),
+        );
       item.append(head, el("div", "note-dialog-said", finding.text));
       if (finding.fix) item.append(el("div", "note-dialog-said muted", `Proposed: ${finding.fix}`));
-      if (finding.verdict.text) item.append(el("div", "note-dialog-said", `Judged: ${finding.verdict.text}`));
+      if (finding.verdict.text)
+        item.append(el("div", "note-dialog-said", `Judged: ${finding.verdict.text}`));
       part.append(item);
     }
     return part;
@@ -306,7 +336,8 @@ export function noteDialog(
     button.disabled = !sendable;
     const again = run && !isLive(run) ? "Send again" : "Send";
     button.append(to ? `${again} to ${to}` : again, el("kbd", "", "⌘↵"));
-    button.title = "Sends this note alone to the default agent. Shift-click shows the prompt first.";
+    button.title =
+      "Sends this note alone to the default agent. Shift-click shows the prompt first.";
     button.addEventListener("click", (event) => {
       dialogEl.close();
       send(note, { review: event.shiftKey });
@@ -317,7 +348,13 @@ export function noteDialog(
       : isResolved(note)
         ? "Reopen it to send it again."
         : "Wait for the run under way, or stop it.";
-    foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), resolveButton(note), button);
+    foot.append(
+      remove,
+      el("span", "spacer"),
+      el("span", "note-dialog-why", why),
+      resolveButton(note),
+      button,
+    );
     return foot;
   }
 
@@ -373,7 +410,10 @@ function snippetView(note) {
   const view = el("pre", "note-dialog-snippet");
   note.snippet.split("\n").forEach((text, index) => {
     const row = el("span", "row");
-    row.append(el("span", "number", String(note.lines.start + index)), el("span", "text", text || " "));
+    row.append(
+      el("span", "number", String(note.lines.start + index)),
+      el("span", "text", text || " "),
+    );
     view.append(row);
   });
   return view;
@@ -395,7 +435,10 @@ function history(note, run) {
       item.append(el("span", "verb", step.verb), el("span", "target", step.target));
       if (step.state) item.append(el("span", "state", step.state));
     } else {
-      item.append(el("span", "verb", step.status === "completed" ? "done" : "plan"), el("span", "target", step.text));
+      item.append(
+        el("span", "verb", step.status === "completed" ? "done" : "plan"),
+        el("span", "target", step.text),
+      );
     }
     list.append(item);
   }
