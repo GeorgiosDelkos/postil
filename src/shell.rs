@@ -2813,6 +2813,10 @@ mod tests {
                 "cannot hold quotes",
             ),
             (
+                with("customAgents", agent("Local", "./bin/agent --acp")),
+                "must be a name on the search path or an absolute path, not ./bin/agent",
+            ),
+            (
                 with("enabledAgents", serde_json::json!(["Nobody"])),
                 "no agent called \"Nobody\"",
             ),
@@ -2861,6 +2865,11 @@ mod tests {
             let (status, reply) = save(&site, &at_limits.to_string());
             assert_eq!(status, StatusCode::OK, "{reply}");
         }
+        // So is a program named by an absolute path.
+        let mut absolute = custom_settings();
+        absolute["customAgents"][0]["command"] = "/opt/agents/local --acp".into();
+        let (status, reply) = save(&site, &absolute.to_string());
+        assert_eq!(status, StatusCode::OK, "{reply}");
     }
 
     #[test]
