@@ -1178,9 +1178,7 @@ fn read_header(file: &Path) -> std::result::Result<Header, String> {
         .map(io::BufReader::new)
         .and_then(|mut reader| io::BufRead::read_until(&mut reader, b'\n', &mut first))
         .map_err(|error| format!("it cannot be read ({error})"))?;
-    if first.last() == Some(&b'\n') {
-        first.pop();
-    }
+    // The line keeps its newline: JSON allows whitespace after the value.
     parse_header(&first)
 }
 

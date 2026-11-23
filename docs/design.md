@@ -582,12 +582,12 @@ retired; the measured numbers above are the baseline to not regress.
    Built (section "Runs" has the core). `Cmd-Shift-Enter`, or Send under the notes, opens
    the send step: the open notes whose lines are still there are ticked, the code pane shows
    the prompt exactly as the agent receives it, and the agent can be changed for this send.
-   `Cmd-Shift-Enter` again sends. The tray's Run tab then shows the run, as in mockup "Run":
-   the plan, one row per tool call (its diff opens under it), permission cards answered with
-   `a`, `Shift-a` or `r`, and the agent's messages, drawn from a small Markdown subset
-   (built as elements, never parsed as HTML). `Esc` stops the run. The run takes the front
-   when it starts and when it needs the engineer, and the foot of the sidebar shows the
-   agent's state. The open file and the notes are read again when the run moves on and when
+   `Cmd-Shift-Enter` again sends. The tray's Run tab then lists the runs, each opening a
+   dialog with its plan, notes, steps and reply (section "The Run tab"); permission requests
+   are answered with `a`, `Shift-a` or `r`, and the agent's messages are drawn from a small
+   Markdown subset (built as elements, never parsed as HTML). `Esc` stops the run. A run
+   sent from the send step takes the front, and so does one that needs the engineer; the
+   foot of the sidebar shows the agent's state. The open file and the notes are read again when the run moves on and when
    an edit finishes. Not built: the follow-up field under the run (milestone 4).
 4. **Verify.** Snapshots, the changes view, resolving notes, follow-up prompts in the same session.
 5. **Polish.** Motion, focus mode, settings, an app bundle for macOS. Started early, at
