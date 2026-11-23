@@ -23,8 +23,9 @@ export function statusIcon(kind) {
 // `dialogEl` is the `<dialog>`. `find(id)` gives `{ note, run }` for a note id, or null once
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
-// ticked), `remove(note)`, and `showRun()`.
-export function noteDialog(dialogEl, { find, canSend, showInCode, send, remove, showRun }) {
+// ticked), `remove(note)`, and `showRun()`. `agent()` names the agent Send sends to, the
+// default one, or null when none is set.
+export function noteDialog(dialogEl, { find, canSend, agent, showInCode, send, remove, showRun }) {
   let shownId = null;
   // What the dialog was drawn from: drawn again only when this changes, so a run's every
   // token leaves the dialog, its scroll and its focus alone.
@@ -58,7 +59,7 @@ export function noteDialog(dialogEl, { find, canSend, showInCode, send, remove, 
       return;
     }
     const { note, run } = found;
-    const key = JSON.stringify([note, run?.id, run?.status, run?.total, canSend(note)]);
+    const key = JSON.stringify([note, run?.id, run?.status, run?.total, canSend(note), agent()]);
     if (key === drawn) return;
     drawn = key;
     const focused = document.activeElement?.className;
@@ -158,11 +159,13 @@ export function noteDialog(dialogEl, { find, canSend, showInCode, send, remove, 
     const foot = el("footer", "note-dialog-footer");
     const remove = deleteButton(note);
     const sendable = canSend(note);
-    const agent = run?.agent;
+    // The default agent, which Send uses, whichever agent ran the note before.
+    const to = agent();
     const button = el("button", "button primary note-dialog-send");
     button.type = "button";
     button.disabled = !sendable;
-    button.append(run && !isLive(run) && agent ? `Send again to ${agent}` : "Send", el("kbd", "", "⌘↵"));
+    const again = run && !isLive(run) ? "Send again" : "Send";
+    button.append(to ? `${again} to ${to}` : again, el("kbd", "", "⌘↵"));
     button.title = "Sends this note alone to the default agent. Shift-click shows the prompt first.";
     button.addEventListener("click", (event) => {
       dialogEl.close();

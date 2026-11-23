@@ -23,7 +23,21 @@ export function sentIn(note) {
 // Folds a run's entries into what the panel shows: the latest plan, and the items in the
 // order they happened. Consecutive message parts form one message, and so do thought parts;
 // a tool call's changes are applied to the call; an answer is set on its request.
+// Folds are kept per entries list: the page folds a run on every draw, for every note sent
+// in it, and a run's entries list is replaced, not changed, when it grows. The result must not
+// be changed by its callers.
+const folds = new WeakMap();
+
 export function foldRun(entries) {
+  let fold = folds.get(entries);
+  if (!fold) {
+    fold = foldEntries(entries);
+    folds.set(entries, fold);
+  }
+  return fold;
+}
+
+function foldEntries(entries) {
   let plan = null;
   const items = [];
   const tools = new Map();

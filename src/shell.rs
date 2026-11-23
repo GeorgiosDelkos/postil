@@ -3115,14 +3115,22 @@ mod tests {
         assert_eq!(get(&site, &format!("{RUN}?id=R2")).0, StatusCode::NOT_FOUND);
         assert_eq!(runs(), serde_json::json!(["R1"]));
 
+        // R2's number is not given again: a page that read R2 would take the new run for it.
+        send(&site, &["N2"]);
+        assert_eq!(wait_for(&site, &nudges, "ended")["id"], "R3");
+        assert_eq!(runs(), serde_json::json!(["R3", "R1"]));
+
+        // A log that cannot be read is left alone: its notes cannot be checked.
+        fs::write(log("R8"), "not a run log\n").unwrap();
         delete(&site, &format!("{NOTES}?id=N2"));
         assert!(!log("R1").exists());
+        assert!(log("R8").exists(), "an unreadable log is kept");
         assert_eq!(
             get_json(&site, RUN),
             serde_json::Value::Null,
             "no run is left"
         );
-        assert_eq!(runs(), serde_json::json!([]));
+        assert_eq!(runs(), serde_json::json!(["R8"]));
     }
 
     #[test]

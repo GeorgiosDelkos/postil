@@ -343,8 +343,12 @@ Built in `src/run.rs`, with the API the page calls:
   read with every note open.
 - **A run goes with its last note.** Deleting a note deletes the log of every run none of
   whose notes is left (asked by the owner on 2026-11-23). A run with other notes keeps its log;
-  this window's live run keeps it until a delete after it ends. It also stops a freed id (a
-  deleted highest note's number is given again) from tying an old run to a new note.
+  this window's live run keeps it until a delete after it ends. Run numbers are never given
+  again: the highest one used is kept in `runs/active.lock`, so a page that read R5 never
+  takes a new run for it. Note ids still can be (a deleted highest note's number is given
+  again): a run that keeps other notes lists the new note under the old id, and shows the
+  old reply's line for it. Never reusing note ids needs the next id in `review.json`, a new
+  format version; not done yet.
 - **The page** is told about changes by a script call (`window.postil.runChanged()`) and
   fetches the entries it has not seen. Calls are coalesced: none is queued while one is
   pending, since an agent streams its reply in many small parts.

@@ -10,7 +10,7 @@ import { fileIcon, folderIcon } from "./icons.js";
 import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
 import { noteDialog, statusIcon } from "./note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { elapsed, foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
+import { foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
@@ -972,7 +972,7 @@ function renderNotes() {
     const progress = planProgress(live);
     parts.push(
       groupHeader(
-        `In ${live.id} · ${live.agent} · ${elapsed(Date.now() / 1000 - live.startedAt)}`,
+        `In ${live.id} · ${live.agent}`,
         progress ? `${progress.done} of ${progress.total} steps` : "",
       ),
       ...groups.inRun.map((note) => noteItem(note, cards.get(note.id))),
@@ -1065,7 +1065,6 @@ function sendButton(note) {
   return button;
 }
 
-// A card of the send step: its checkbox, and a click that ticks it.
 // A card of the send step: the same card, with its checkbox, and a click that ticks it.
 function sendItem(note) {
   const item = el("div", "note-item");
@@ -1114,7 +1113,7 @@ function deleteButton(item, note) {
 }
 
 // Deletes the note, and with it every run none of whose notes is left (src/run.rs,
-// `delete_runs_without`): the runs read before are dropped and the latest is fetched again.
+// `delete_runs_without_notes`): the runs read before are dropped and the latest is fetched again.
 async function deleteNote(note) {
   const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
     method: "DELETE",
@@ -1172,6 +1171,7 @@ const noteDetail = noteDialog(noteDialogEl, {
     return note ? { note, run: runFor(note) } : null;
   },
   canSend: () => canSendAlone(),
+  agent: () => state.settings?.agent ?? null,
   showInCode: showNote,
   send: sendAlone,
   remove: deleteNote,

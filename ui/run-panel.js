@@ -74,10 +74,11 @@ export function runPanel({
   // run may have been deleted (`reload`).
   let ids = [];
   let listStale = true;
-  // Older runs by id, and the ids asked for and not answered yet, or that failed: not asked
-  // again until `reload` or `forget`.
+  // Older runs by id; the ids asked for and not answered yet; and why a run could not be read,
+  // by id (an unreadable or newer log). None is asked again until `reload` or `forget`.
   const others = new Map();
   const asked = new Set();
+  const failed = new Map();
 
   let clock = null;
   // When Stop starts to end the agent, by this page's clock; null unless it is stopping.
@@ -118,10 +119,15 @@ export function runPanel({
   }
 
   async function fetchIds() {
-    const response = await fetch("api/runs");
-    if (!response.ok) throw new Error(await response.text());
-    ids = (await response.json()).runs;
+    // Cleared before the request: a `reload` while it is in flight marks the list stale
+    // again, and the next sync reads it again.
     listStale = false;
+    const response = await fetch("api/runs");
+    if (!response.ok) {
+      listStale = true;
+      throw new Error(await response.text());
+    }
+    ids = (await response.json()).runs;
   }
 
   async function sync() {
@@ -154,8 +160,8 @@ export function runPanel({
   }
 
   // The run `id`: the latest, or an older one once read; null until then, and a read is
-  // started. A run that comes back still going (another window's) is kept until `forget`:
-  // asking again on every draw would fetch it in a loop.
+  // started. Each id is asked for once until `forget` or `reload`: asking again on every draw
+  // would fetch it in a loop.
   function byId(id) {
     if (run?.id === id) return run;
     const known = others.get(id);
@@ -168,19 +174,25 @@ export function runPanel({
         render();
         onLoaded();
       })
-      // The run's card stays "loading" and its notes say "Sent in R2": the tray stays usable.
-      .catch((error) => console.warn(`run ${id}:`, error));
+      // The run's card says why, and its notes say "Sent in R2": the tray stays usable.
+      .catch((error) => {
+        failed.set(id, String(error.message ?? error));
+        render();
+      });
     return null;
   }
 
-  // Drops the older runs read while still going, and reads the list again: the page's
-  // refresh, when another window may have moved on.
+  // Drops the older runs that may still change, and reads the list again: the page's
+  // refresh, when another window may have moved on. Only an ended or failed run is final; a
+  // run another window is running reads from its log as unfinished.
   function forget() {
     for (const [id, view] of others) {
-      if (!isLive(view)) continue;
+      if (view.status === "ended" || view.status === "failed") continue;
       others.delete(id);
       asked.delete(id);
     }
+    for (const id of failed.keys()) asked.delete(id);
+    failed.clear();
     listStale = true;
   }
 
@@ -188,6 +200,7 @@ export function runPanel({
   function reload() {
     others.clear();
     asked.clear();
+    failed.clear();
     listStale = true;
     return sync();
   }
@@ -258,7 +271,9 @@ export function runPanel({
     wanted.push(["label", label, () => el("div", "run-label", label)]);
     for (const id of list) {
       const view = byId(id);
-      const sig = view ? JSON.stringify([view.status, view.agent, view.notes, statusWord(view)]) : "loading";
+      const sig = view
+        ? JSON.stringify([view.status, view.agent, view.notes, statusWord(view)])
+        : (failed.get(id) ?? "loading");
       wanted.push([`run:${id}`, sig, () => runCard(id, view)]);
     }
 
@@ -285,7 +300,10 @@ export function runPanel({
     button.type = "button";
     if (!view) {
       button.disabled = true;
-      button.append(statusIcon("stopped"), el("span", "run-id", id), el("span", "run-card-text", "Loading…"));
+      const problem = failed.get(id);
+      button.append(statusIcon(problem ? "failed" : "stopped"), el("span", "run-id", id));
+      button.append(el("span", "run-card-text", problem ? `Cannot be shown: ${problem}` : "Loading…"));
+      if (problem) button.title = problem;
       return button;
     }
     button.append(

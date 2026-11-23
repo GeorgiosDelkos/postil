@@ -46,7 +46,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -374,7 +374,7 @@ impl Runner {
     }
 
     /// Deletes the log of every run none of whose notes is left: a run goes with its last
-    /// note, and an id freed by a delete cannot attach an old run to a new note. This window's
+    /// note (docs/design.md, "Runs"). This window's
     /// live run is kept; it goes at a later delete once over. A run another window is running
     /// loses its log the same way; that window keeps writing to the deleted file, and its run
     /// shows nowhere once it ends.
@@ -817,8 +817,9 @@ impl Run {
         };
         fs::create_dir_all(dir).map_err(error(dir))?;
         let active_path = dir.join("active.lock");
-        let active = File::options()
+        let mut active = File::options()
             .create(true)
+            .read(true)
             .write(true)
             .truncate(false)
             .open(&active_path)
@@ -826,12 +827,15 @@ impl Run {
         take_run_lock(&active).map_err(|source| match source {
             TryLockError::WouldBlock => Error::RunElsewhere,
             TryLockError::Error(source) => Error::WriteRun {
-                path: active_path,
+                path: active_path.clone(),
                 source,
             },
         })?;
 
-        let mut number = highest_run(dir).map_err(error(dir))? + 1;
+        // A deleted run's number is never given again (`last_run`): a page that read the old R5
+        // would show a new R5 as the old one.
+        let used = last_run(&mut active).map_err(error(&active_path))?;
+        let mut number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
         // Creating the file claims the id; another window may have claimed it first.
         let (file, mut log) = loop {
             let file = dir.join(format!("R{number}.jsonl"));
@@ -855,6 +859,13 @@ impl Run {
             // A log without its header would be skipped as unreadable on every restart.
             drop(fs::remove_file(&file));
             return Err(Error::WriteRun { path: file, source });
+        }
+        if let Err(source) = record_last_run(&mut active, number) {
+            drop(fs::remove_file(&file));
+            return Err(Error::WriteRun {
+                path: active_path,
+                source,
+            });
         }
         Ok(Self {
             file,
@@ -1185,6 +1196,23 @@ fn read_header(file: &Path) -> std::result::Result<Header, String> {
 /// The highest run number among the logs in `dir`; 0 when there is none.
 fn highest_run(dir: &Path) -> io::Result<u64> {
     Ok(run_numbers(dir)?.into_iter().max().unwrap_or(0))
+}
+
+/// The highest run number ever given, kept as text in `runs/active.lock`, the file every new
+/// run locks: logs are deleted with their notes, so the highest log left can be lower. 0 when
+/// the file is new, or holds no number (a build before this one left it empty).
+fn last_run(active: &mut File) -> io::Result<u64> {
+    let mut text = String::new();
+    active.seek(SeekFrom::Start(0))?;
+    active.read_to_string(&mut text)?;
+    Ok(text.trim().parse().unwrap_or(0))
+}
+
+/// Records `number` as the highest run number given. The caller holds the file's lock.
+fn record_last_run(active: &mut File, number: u64) -> io::Result<()> {
+    active.set_len(0)?;
+    active.seek(SeekFrom::Start(0))?;
+    active.write_all(number.to_string().as_bytes())
 }
 
 /// A session update as a log entry; `None` for what the run panel does not show.
