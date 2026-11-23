@@ -928,15 +928,13 @@ impl Site {
         let post = *request.method() == Method::POST;
         match uri.path() {
             "/api/run" => match *request.method() {
-                Method::GET => json_or_error(match query_value(uri.query().unwrap_or(""), "id") {
-                    Some(id) => self.runner().and_then(|runner| runner.view_of(&id)).map(|view| to_json(&view)),
-                    None => after_of(uri.query().unwrap_or("")).and_then(|after| self.run_view(after)),
-                }),
+                Method::GET => json_or_error(self.run_view(uri.query().unwrap_or(""))),
                 Method::POST => json_or_error(self.send_run(request.body())),
                 _ => reply(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "text/plain",
-                    &b"GET the latest run (?after=<entries seen>) or one run (?id=R1), or POST a new one"[..],
+                    &b"GET the latest run (?after=<entries seen>) or one run (?id=R1), \
+                       or POST a new one"[..],
                 ),
             },
             "/api/run/preview" if *request.method() != Method::GET => reply(
@@ -999,10 +997,14 @@ impl Site {
             .ok_or(Error::NoProject)
     }
 
-    /// The reply to `GET /api/run`: the latest run with its entries from number `after` on, or
-    /// `null` when the project has none.
-    fn run_view(&self, after: usize) -> Result<Vec<u8>> {
-        Ok(to_json(&self.runner()?.view(after)?))
+    /// The reply to `GET /api/run`: with `?id=R2`, that run whole; else the latest run with its
+    /// entries from number `?after=` on, or `null` when the project has none.
+    fn run_view(&self, query: &str) -> Result<Vec<u8>> {
+        let runner = self.runner()?;
+        match query_value(query, "id") {
+            Some(id) => Ok(to_json(&runner.view_of(&id)?)),
+            None => Ok(to_json(&runner.view(after_of(query)?)?)),
+        }
     }
 
     /// The reply to `POST /api/run`: sends the notes in the body to the agent, and answers
