@@ -220,8 +220,9 @@ struct NewRun {
 /// Which agent a launched run goes to.
 #[derive(Debug)]
 enum Conversation {
-    /// The kept agent, whose conversation the run continues. The caller checked, under the
-    /// same lock, that it is ready and alive.
+    /// The kept agent, whose conversation the run continues, when it is the run's agent and
+    /// alive; otherwise a fresh one. A follow-up checks the same, under the same lock, to
+    /// choose its prompt.
     Kept,
     /// A fresh agent, which replaces the kept one.
     Fresh,
@@ -269,11 +270,10 @@ impl Runner {
             .run
             .as_ref()
             .is_some_and(|run| run.state().header.review.is_some());
-        let conversation = match &slot.agent {
-            Held::Ready(kept, live) if *kept == agent && live.is_alive() && !after_review => {
-                Conversation::Kept
-            }
-            _ => Conversation::Fresh,
+        let conversation = if after_review {
+            Conversation::Fresh
+        } else {
+            Conversation::Kept
         };
         let new = NewRun {
             agent,
@@ -578,23 +578,26 @@ impl Runner {
             self.record_snapshot(&run, Point::Before);
         }
         slot.run = Some(Arc::clone(&run));
-        let replaced =
-            if let (Held::Ready(_, kept), Conversation::Kept) = (&slot.agent, conversation) {
-                self.begin(kept, &run, &marks, &prompt);
-                Held::None
-            } else {
-                // The agent kept from the last run, if any, is stopped when this is dropped.
-                let replaced = slot.release();
-                let pending = Pending {
-                    agent,
-                    run,
-                    ids: marks,
-                    prompt,
-                    generation: slot.generation,
-                };
-                self.start(pending);
-                replaced
+        let replaced = if let (Held::Ready(choice, kept), Conversation::Kept) =
+            (&slot.agent, conversation)
+            && *choice == agent
+            && kept.is_alive()
+        {
+            self.begin(kept, &run, &marks, &prompt);
+            Held::None
+        } else {
+            // The agent kept from the last run, if any, is stopped when this is dropped.
+            let replaced = slot.release();
+            let pending = Pending {
+                agent,
+                run,
+                ids: marks,
+                prompt,
+                generation: slot.generation,
             };
+            self.start(pending);
+            replaced
+        };
         drop(slot);
         // Dropping an agent waits for its process to be reaped.
         drop(replaced);
@@ -888,7 +891,18 @@ impl Runner {
     /// stage starts with no request from the page.
     pub(crate) fn busy(&self) -> bool {
         let slot = self.slot();
-        slot.chain.is_some() || slot.run.as_ref().is_some_and(|run| run.state().live())
+        let Some(run) = &slot.run else {
+            return false;
+        };
+        let state = run.state();
+        // Between two stages `decide` has moved the chain on to the next one, so it names
+        // another stage than the run that ended. A stage whose agent failed to start ended
+        // with the chain still on it: no stage follows that one.
+        state.live()
+            || slot
+                .chain
+                .as_ref()
+                .is_some_and(|chain| state.header.review.as_ref() != Some(&chain.stage))
     }
 
     /// Stops the agent, running or starting, and ignores anything it would still report: the
@@ -1151,8 +1165,8 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
         // next stage starts once the end is logged.
         let next = match (&stage, &run) {
-            (Some(stage), Some(run)) if ended_well && decide(&mut slot, run, stage) => {
-                Some(Arc::clone(run))
+            (Some(stage), Some(run)) if ended_well => {
+                decide(&mut slot, run, stage).then(|| Arc::clone(run))
             }
             _ => None,
         };

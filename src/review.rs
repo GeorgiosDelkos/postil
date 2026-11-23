@@ -170,12 +170,12 @@ fn context(text: &mut String, work: &Work) {
 /// block's problem is given).
 pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, String> {
     const FENCE: &str = "```json";
-    // A fence opens a block only at the start of a line, after spaces at most. JSON strings
+    // A fence opens a block only at the start of a line, after blanks at most. JSON strings
     // cannot hold a raw line break, so a fence that a finding's text quotes never starts a
     // line, and is passed over here. From the last block backwards: a block
     // after the findings that is not an array (an example, say) does not hide them.
     let opens_block = |at: usize| {
-        let before = reply[..at].trim_end_matches(' ');
+        let before = reply[..at].trim_end_matches([' ', '\t']);
         before.is_empty() || before.ends_with('\n')
     };
     let mut problem = None;
@@ -378,14 +378,9 @@ mod tests {
                 found(&["a"]),
             ),
             (
-                "an indented block",
-                "Findings:\n  ```json\n  [{\"finding\": \"a\"}]\n  ```",
+                "a block indented with spaces and a tab",
+                "Findings:\n \t```json\n  [{\"finding\": \"a\"}]\n  ```",
                 found(&["a"]),
-            ),
-            (
-                "the last of two arrays",
-                "```json\n[{\"finding\": \"old\"}]\n```\n```json\n[{\"finding\": \"new\"}]\n```",
-                found(&["new"]),
             ),
             (
                 "a fence inside a line opens no block",

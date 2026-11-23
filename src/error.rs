@@ -203,6 +203,9 @@ pub enum Error {
     TurnRunning,
     /// A run was asked for while another window runs one on the same working tree.
     RunElsewhere,
+    /// Another project was asked to be opened while the open one has a run or a review under
+    /// way, without asking to stop it.
+    RunInOpenProject,
     /// A permission request or question was answered that is not open: already answered,
     /// withdrawn by the agent, or cancelled.
     NoSuchRequest,
@@ -359,6 +362,11 @@ impl fmt::Display for Error {
                 "another Postil window is running an agent on this working tree (wait for it, \
                  or stop it there)"
             ),
+            Self::RunInOpenProject => write!(
+                f,
+                "a run is under way in the open project (wait for it, stop it, or ask again \
+                 with \"stop\": true to stop it and open this one)"
+            ),
             Self::NoSuchRequest => write!(
                 f,
                 "that request is no longer open (it was answered, withdrawn or cancelled)"
@@ -422,6 +430,7 @@ impl std::error::Error for Error {
             | Self::AgentProtocol(_)
             | Self::TurnRunning
             | Self::RunElsewhere
+            | Self::RunInOpenProject
             | Self::NoSuchRequest
             | Self::NoSuchRun { .. } => None,
         }

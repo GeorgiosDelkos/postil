@@ -849,19 +849,22 @@ impl Site {
     /// Opening the project that is open keeps its runner, and with it a run under way and
     /// the kept agent: the page only reloads. Opening another one stops the open project's
     /// agent, and `live` says whether to do that during a run (decided with the owner on
-    /// 2026-11-23: the page asks first). Holds the project's lock from the check to the
-    /// switch, so no request for the open project comes between them.
+    /// 2026-11-23: the page asks first). No page request starts a run between the check and
+    /// the switch, because requests are answered one at a time (`respond` runs on the main
+    /// thread); a review's next stage, which starts without one, counts as under way
+    /// ([`Runner::busy`]). Takes the runner's slot lock under the project's; nothing takes
+    /// them the other way round.
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] when `live` is [`LiveRun::Refuse`], `repo` is another project,
-    /// and the open project has a run or a review under way.
+    /// [`Error::RunInOpenProject`] when `live` is [`LiveRun::Refuse`], `repo` is another
+    /// project, and the open project has a run or a review under way.
     fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
         let mut project = lock(&self.project);
         let open = project.as_ref();
         let same = open.is_some_and(|open| open.repo.root() == repo.root());
         if !same && matches!(live, LiveRun::Refuse) && open.is_some_and(|open| open.runner.busy()) {
-            return Err(Error::TurnRunning);
+            return Err(Error::RunInOpenProject);
         }
         let warning = match (&self.recent_file, &self.bench) {
             (_, Some(_)) => None,
@@ -1428,7 +1431,8 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
                 | Error::TurnRunning
-                | Error::RunElsewhere => StatusCode::CONFLICT,
+                | Error::RunElsewhere
+                | Error::RunInOpenProject => StatusCode::CONFLICT,
                 Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
                     StatusCode::NOT_FOUND
                 }
@@ -5073,6 +5077,56 @@ mod tests {
             site_root(&other.root)
         );
         assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
+    }
+
+    #[test]
+    fn a_review_between_stages_holds_the_project_and_one_that_failed_to_start_does_not() {
+        let repo = TempRepo::new("run-open-review");
+        let other = TempRepo::new("run-open-review-other");
+        repo.write("a.txt", "a\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        let open_other = || {
+            post(
+                &site,
+                "postil://localhost/api/open",
+                &open_request(&other.root),
+            )
+        };
+        let review = |of: &str| {
+            let body = serde_json::json!({ "of": of }).to_string();
+            assert_eq!(
+                post(&site, &format!("{RUN}/review"), &body).0,
+                StatusCode::OK
+            );
+        };
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+
+        // A reviewer whose agent speaks another protocol version never starts.
+        set_reviewers(&site, "plain", &[("Broken", "version-2")]);
+        review("R1");
+        assert_eq!(wait_for_run(&site, &nudges, "R2")["status"], "failed");
+        let (status, body) = open_other();
+        assert_eq!(status, StatusCode::OK, "nothing runs: {body}");
+
+        let (status, body) = post(
+            &site,
+            "postil://localhost/api/open",
+            &open_request(&repo.root),
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        set_reviewers(
+            &site,
+            "plain",
+            &[("First", "reviewer"), ("Judge", "reviewer")],
+        );
+        let release = site.runner().unwrap().hold_next_stage();
+        review("R1");
+        wait_for_run(&site, &nudges, "R3");
+        let (status, body) = open_other();
+        assert_eq!(status, StatusCode::CONFLICT, "the judge is next: {body}");
+        drop(release);
     }
 
     #[test]

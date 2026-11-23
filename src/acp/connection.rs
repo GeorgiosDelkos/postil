@@ -614,12 +614,14 @@ impl<F: FnMut(Event)> Reader<F> {
     fn run(mut self, stdout: impl Read, stderr_closed: &Receiver<()>) {
         let mut stdout = BufReader::new(stdout);
         let mut line = Vec::new();
-        // `read_until` and `skip_until` retry a read that a signal interrupted, so an error
-        // here is a real one, and ends the agent's output as its end does.
-        let limit = u64::try_from(LINE_LIMIT).expect("the line limit fits in u64");
         loop {
             line.clear();
-            match (&mut stdout).take(limit).read_until(b'\n', &mut line) {
+            // `read_until` and `skip_until` retry a read that a signal interrupted, so an error
+            // here is a real one, and ends the agent's output as its end does.
+            match (&mut stdout)
+                .take(LINE_LIMIT as u64)
+                .read_until(b'\n', &mut line)
+            {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
