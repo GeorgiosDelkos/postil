@@ -1152,19 +1152,26 @@ function deleteButton(item, note) {
   return button;
 }
 
+// Deletes the note, and with it every run none of whose notes is left (src/run.rs,
+// `delete_runs_without`): the runs read before are dropped and the latest is fetched again.
 async function deleteNote(note) {
   const response = await fetch(`api/notes?id=${encodeURIComponent(note.id)}`, {
     method: "DELETE",
   });
+  state.runCache.clear();
+  state.runsAsked.clear();
   if (!response.ok) {
+    // A run log that could not be removed: the note may be gone all the same.
     showToast(await response.text());
-    return;
+    await loadNotes();
+  } else {
+    state.notes = (await response.json()).notes;
+    indexNotes();
+    renderNotes();
+    renderFiles();
+    redecorateRows();
   }
-  state.notes = (await response.json()).notes;
-  indexNotes();
-  renderNotes();
-  renderFiles();
-  redecorateRows();
+  await runs.sync();
 }
 
 async function showNote(note) {

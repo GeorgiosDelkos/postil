@@ -919,6 +919,9 @@ impl Site {
     /// other notes.
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
         let review = notes::delete(&*self.repo()?, id)?;
+        // A run goes with its last note (docs/design.md, "Runs"). The note is deleted by now:
+        // a log that cannot be removed is reported, and tried again at the next delete.
+        self.runner()?.delete_runs_without(&review.ids())?;
         Ok(to_json(&review))
     }
 
@@ -3066,6 +3069,67 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
             assert!(body.contains(words), "{id}: {body}");
         }
+    }
+
+    #[test]
+    fn a_run_is_deleted_with_its_last_note() {
+        let repo = TempRepo::new("run-delete");
+        repo.write("a.txt", "a\nb\nc\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        for (line, body) in [(1, "one"), (2, "two"), (3, "three")] {
+            post_note(&site, "a.txt", line, line, body);
+        }
+        send(&site, &["N1", "N2"]);
+        wait_for(&site, &nudges, "ended");
+        send(&site, &["N3"]);
+        wait_for(&site, &nudges, "ended");
+        let log = |id: &str| repo.root.join(format!(".git/postil/runs/{id}.jsonl"));
+
+        let (status, body) = delete(&site, &format!("{NOTES}?id=N1"));
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(log("R1").exists(), "R1 still has N2");
+
+        delete(&site, &format!("{NOTES}?id=N3"));
+        assert!(!log("R2").exists(), "R2's only note is gone");
+        assert_eq!(
+            get_json(&site, RUN)["id"],
+            "R1",
+            "the latest run left is shown"
+        );
+        assert_eq!(get(&site, &format!("{RUN}?id=R2")).0, StatusCode::NOT_FOUND);
+
+        delete(&site, &format!("{NOTES}?id=N2"));
+        assert!(!log("R1").exists());
+        assert_eq!(
+            get_json(&site, RUN),
+            serde_json::Value::Null,
+            "no run is left"
+        );
+    }
+
+    #[test]
+    fn a_live_run_is_kept_when_its_note_is_deleted_and_goes_at_the_next_delete() {
+        let repo = TempRepo::new("run-delete-live");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "hang");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "running");
+        let log = repo.root.join(".git/postil/runs/R1.jsonl");
+
+        delete(&site, &format!("{NOTES}?id=N1"));
+        assert!(log.exists(), "the live run keeps its log");
+        assert_eq!(get_json(&site, RUN)["status"], "running");
+
+        // Stopped twice, the second time forced, the run ends; the next delete takes it.
+        let cancel = format!("{RUN}/cancel");
+        post(&site, &cancel, "");
+        site.runner().unwrap().backdate_stop();
+        post(&site, &cancel, "");
+        wait_for(&site, &nudges, "failed");
+        delete(&site, &format!("{NOTES}?id=N2"));
+        assert!(!log.exists());
     }
 
     #[test]

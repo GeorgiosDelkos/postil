@@ -350,6 +350,11 @@ enum Anchor {
 }
 
 impl Review {
+    /// The ids of the notes, written `N1`.
+    pub(crate) fn ids(&self) -> Vec<String> {
+        self.notes.iter().map(|note| note.id.to_string()).collect()
+    }
+
     /// Reads the review file, or returns an empty review when there is none yet. Leaves the
     /// file as it is in every case.
     fn load(file: &Path) -> Result<Self> {

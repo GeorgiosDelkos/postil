@@ -361,6 +361,60 @@ impl Runner {
             .map_err(|problem| no_such(&problem))
     }
 
+    /// Deletes the log of every run none of whose notes is among `notes`, the notes left after
+    /// a delete: a run goes with its last note, and an id freed by a delete cannot attach an
+    /// old run to a new note. This window's live run is kept; it goes at a later delete once
+    /// over. A run another window is running loses its log the same way; that window keeps
+    /// writing to the deleted file, and its run shows nowhere once it ends.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadRun`] when the runs directory cannot be listed, [`Error::WriteRun`] when a
+    /// log cannot be removed. Logs before the failing one are removed.
+    pub(crate) fn delete_runs_without(&self, notes: &[String]) -> Result<()> {
+        let dir = self.repo.runs_dir();
+        let numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
+            path: dir.clone(),
+            source,
+        })?;
+        let mut slot = self.slot();
+        let live = slot
+            .run
+            .as_ref()
+            .filter(|run| run.state().live())
+            .map(|run| run.state().header.id.clone());
+        for number in numbers {
+            let id = format!("R{number}");
+            if live.as_deref() == Some(id.as_str()) {
+                continue;
+            }
+            let file = dir.join(format!("{id}.jsonl"));
+            // A log that cannot be read names no notes this check can see: it is left alone,
+            // and the panel says what is wrong with it.
+            let Ok(run) = Run::read(&file) else { continue };
+            if run
+                .state()
+                .header
+                .notes
+                .iter()
+                .any(|note| notes.contains(note))
+            {
+                continue;
+            }
+            fs::remove_file(&file).map_err(|source| Error::WriteRun { path: file, source })?;
+            if slot
+                .run
+                .as_ref()
+                .is_some_and(|run| run.state().header.id == id)
+            {
+                slot.run = None;
+            }
+        }
+        drop(slot);
+        (self.notify)();
+        Ok(())
+    }
+
     /// Stops the agent, running or starting, and ignores anything it would still report: the
     /// project is closing, or the app quits.
     pub(crate) fn close(&self) {
