@@ -6,6 +6,7 @@
 mod files;
 mod notes;
 mod projects;
+mod routes;
 mod runs;
 mod settings;
 

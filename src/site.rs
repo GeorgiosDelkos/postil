@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wry::http::header::CONTENT_TYPE;
-use wry::http::{Method, Request, Response, StatusCode, Uri};
+use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::error::{Error, Result, error_chain};
@@ -514,90 +514,90 @@ impl Site {
         Ok(())
     }
 
+    /// The reply to `request`: a page file, or the API route its path names. Each route is
+    /// listed once, by its path, and takes the methods its arm lists; any other method gets
+    /// 405 with what the route takes.
     pub(crate) fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
         let uri = request.uri();
-        let post = *request.method() == Method::POST;
+        let query = uri.query().unwrap_or("");
+        let body = request.body();
         if let Some(asset) = page_asset(uri.path()) {
             return asset;
         }
+        let method = request.method();
         match uri.path() {
-            "/api/repo" => json_or_error(self.repo_info()),
-            "/api/recent" => json_or_error(Ok(self.recent())),
-            "/api/open" if post => json_or_error(self.open_folder(request.body(), Repo::open)),
-            "/api/init" if post => json_or_error(self.open_folder(request.body(), Repo::init)),
-            "/api/notes" => self.respond_notes(request),
-            "/api/notes/resolve" if post => self.change_note(uri, notes::resolve),
-            "/api/notes/reopen" if post => self.change_note(uri, notes::reopen),
-            "/api/folders" => match *request.method() {
+            "/api/repo" => match *method {
+                Method::GET => json_or_error(self.repo_info()),
+                _ => not_allowed("GET"),
+            },
+            "/api/recent" => match *method {
+                Method::GET => json_or_error(Ok(self.recent())),
+                _ => not_allowed("GET"),
+            },
+            "/api/open" => match *method {
+                Method::POST => json_or_error(self.open_folder(body, Repo::open)),
+                _ => not_allowed("POST {\"path\": ...}"),
+            },
+            "/api/init" => match *method {
+                Method::POST => json_or_error(self.open_folder(body, Repo::init)),
+                _ => not_allowed("POST {\"path\": ...}"),
+            },
+            "/api/file" => match *method {
+                Method::GET => match query_value(query, "path") {
+                    Some(path) => json_or_error(self.file_view(&path)),
+                    None => bad_request("expected ?path=<percent-encoded path>"),
+                },
+                _ => not_allowed("GET"),
+            },
+            "/api/notes" => self.respond_notes(method, query, body),
+            "/api/notes/resolve" => match *method {
+                Method::POST => self.change_note(query, notes::resolve),
+                _ => not_allowed("POST ?id=<note id> with no body"),
+            },
+            "/api/notes/reopen" => match *method {
+                Method::POST => self.change_note(query, notes::reopen),
+                _ => not_allowed("POST ?id=<note id> with no body"),
+            },
+            "/api/folders" => match *method {
                 Method::GET => json_or_error(
                     self.repo()
                         .map(|repo| to_json(&folders::load(&repo.folders_file()))),
                 ),
-                Method::PUT => json_or_error(self.save_folders(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the open folders or PUT them"[..],
-                ),
+                Method::PUT => json_or_error(self.save_folders(body)),
+                _ => not_allowed("GET the open folders or PUT them"),
             },
-            "/api/settings" => match *request.method() {
+            "/api/settings" => match *method {
                 Method::GET => reply(StatusCode::OK, "application/json", self.settings()),
-                Method::PUT => json_or_error(self.save_settings(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the settings or PUT new ones"[..],
-                ),
+                Method::PUT => json_or_error(self.save_settings(body)),
+                _ => not_allowed("GET the settings or PUT new ones"),
             },
-            "/api/runs" => match *request.method() {
+            "/api/settings/reset" => match *method {
+                Method::POST => json_or_error(self.reset_settings()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/agents/rescan" => match *method {
+                Method::POST => {
+                    self.agents.rescan();
+                    reply(StatusCode::OK, "application/json", self.settings())
+                }
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/layout" => match *method {
+                Method::GET => reply(StatusCode::OK, "application/json", self.layout()),
+                Method::PUT => json_or_error(self.save_layout(body)),
+                _ => not_allowed("GET the pane widths or PUT new ones"),
+            },
+            "/api/runs" => match *method {
                 Method::GET => json_or_error(
                     self.runner()
                         .and_then(|runner| runner.ids())
                         .map(|ids| to_json(&serde_json::json!({ "runs": ids }))),
                 ),
-                _ => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
+                _ => not_allowed("GET"),
             },
-            // `respond_run` answers "not found" for a path under it that it does not serve.
             path if path == "/api/run" || path.starts_with("/api/run/") => {
-                self.respond_run(request)
+                self.respond_run(path, method, query, body)
             }
-            "/api/layout" => match *request.method() {
-                Method::GET => reply(StatusCode::OK, "application/json", self.layout()),
-                Method::PUT => json_or_error(self.save_layout(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the pane widths or PUT new ones"[..],
-                ),
-            },
-            "/api/settings/reset" if post => json_or_error(self.reset_settings()),
-            "/api/agents/rescan" if post => {
-                self.agents.rescan();
-                reply(StatusCode::OK, "application/json", self.settings())
-            }
-            "/api/notes/resolve" | "/api/notes/reopen" => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"POST ?id=<note id> with no body"[..],
-            ),
-            "/api/settings/reset" | "/api/agents/rescan" => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"POST with no body"[..],
-            ),
-            "/api/open" | "/api/init" => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"POST {\"path\": ...}"[..],
-            ),
-            "/api/file" => match query_value(uri.query().unwrap_or(""), "path") {
-                Some(path) => json_or_error(self.file_view(&path)),
-                None => reply(
-                    StatusCode::BAD_REQUEST,
-                    "text/plain",
-                    &b"expected ?path=<percent-encoded path>"[..],
-                ),
-            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -703,13 +703,9 @@ impl Site {
     /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
     /// changes the note's state with `change` (`notes::resolve` or `notes::reopen`), and
     /// returns all notes.
-    fn change_note(&self, uri: &Uri, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
-        let Some(id) = query_value(uri.query().unwrap_or(""), "id") else {
-            return reply(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                &b"expected ?id=<note id>"[..],
-            );
+    fn change_note(&self, query: &str, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
+        let Some(id) = query_value(query, "id") else {
+            return bad_request("expected ?id=<note id>");
         };
         json_or_error(
             self.repo()
@@ -720,74 +716,66 @@ impl Site {
 
     /// The replies to `/api/notes`: GET the notes, POST a new one, PATCH `?id=N1` its text, or
     /// DELETE `?id=N1`.
-    fn respond_notes(&self, request: &Request<Vec<u8>>) -> Reply {
-        let id = query_value(request.uri().query().unwrap_or(""), "id");
-        match (request.method(), id) {
+    fn respond_notes(&self, method: &Method, query: &str, body: &[u8]) -> Reply {
+        let id = query_value(query, "id");
+        match (method, id) {
             (&Method::GET, _) => json_or_error(self.notes()),
-            (&Method::POST, _) => json_or_error(self.add_note(request.body())),
+            (&Method::POST, _) => json_or_error(self.add_note(body)),
             (&Method::DELETE, Some(id)) => json_or_error(self.delete_note(&id)),
-            (&Method::PATCH, Some(id)) => json_or_error(self.edit_note(&id, request.body())),
-            (&Method::DELETE | &Method::PATCH, None) => reply(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                &b"expected ?id=<note id>"[..],
-            ),
-            _ => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1"[..],
+            (&Method::PATCH, Some(id)) => json_or_error(self.edit_note(&id, body)),
+            (&Method::DELETE | &Method::PATCH, None) => bad_request("expected ?id=<note id>"),
+            _ => not_allowed(
+                "GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1",
             ),
         }
     }
 
-    /// The replies to `/api/run` and the routes under it.
-    fn respond_run(&self, request: &Request<Vec<u8>>) -> Reply {
-        let uri = request.uri();
-        let post = *request.method() == Method::POST;
-        match uri.path() {
-            "/api/run" => match *request.method() {
-                Method::GET => json_or_error(self.run_view(uri.query().unwrap_or(""))),
-                Method::POST => json_or_error(self.send_run(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the latest run (?after=<entries seen>) or one run (?id=R1), \
-                       or POST a new one"[..],
+    /// The replies to `/api/run` and the routes under it, as [`Site::respond`] gives them.
+    fn respond_run(&self, path: &str, method: &Method, query: &str, body: &[u8]) -> Reply {
+        match path {
+            "/api/run" => match *method {
+                Method::GET => json_or_error(self.run_view(query)),
+                Method::POST => json_or_error(self.send_run(body)),
+                _ => not_allowed(
+                    "GET the latest run (?after=<entries seen>) or one run (?id=R1), or POST a \
+                     new one",
                 ),
             },
-            "/api/run/preview" if *request.method() != Method::GET => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"GET ?notes=N1,N2"[..],
-            ),
-            "/api/run/preview" => match query_value(uri.query().unwrap_or(""), "notes") {
-                Some(ids) => json_or_error(self.preview_run(&ids)),
-                None => reply(
-                    StatusCode::BAD_REQUEST,
-                    "text/plain",
-                    &b"expected ?notes=N1,N2"[..],
-                ),
+            "/api/run/preview" => match *method {
+                Method::GET => match query_value(query, "notes") {
+                    Some(ids) => json_or_error(self.preview_run(&ids)),
+                    None => bad_request("expected ?notes=N1,N2"),
+                },
+                _ => not_allowed("GET ?notes=N1,N2"),
             },
-            "/api/run/changes" if *request.method() == Method::GET => {
-                json_or_error(self.changes(uri.query().unwrap_or("")))
-            }
-            "/api/run/cancel" if post => json_or_error(
-                self.runner()
-                    .and_then(|runner| runner.cancel())
-                    .map(|()| b"{}".to_vec()),
-            ),
-            "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
-            "/api/run/question" if post => json_or_error(self.answer_question(request.body())),
-            "/api/run/review" if post => json_or_error(self.review_run(request.body())),
-            "/api/run/follow" if post => json_or_error(self.follow_up(request.body())),
-            "/api/run/cancel"
-            | "/api/run/permission"
-            | "/api/run/question"
-            | "/api/run/review"
-            | "/api/run/follow" => {
-                reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
-            }
-            "/api/run/changes" => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
+            "/api/run/changes" => match *method {
+                Method::GET => json_or_error(self.changes(query)),
+                _ => not_allowed("GET"),
+            },
+            "/api/run/cancel" => match *method {
+                Method::POST => json_or_error(
+                    self.runner()
+                        .and_then(|runner| runner.cancel())
+                        .map(|()| b"{}".to_vec()),
+                ),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/permission" => match *method {
+                Method::POST => json_or_error(self.answer_permission(body)),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/question" => match *method {
+                Method::POST => json_or_error(self.answer_question(body)),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/review" => match *method {
+                Method::POST => json_or_error(self.review_run(body)),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/follow" => match *method {
+                Method::POST => json_or_error(self.follow_up(body)),
+                _ => not_allowed("POST"),
+            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -1104,6 +1092,20 @@ pub(crate) fn reply(
         .header(CONTENT_TYPE, content_type)
         .body(body.into())
         .expect("a status code and one static header always make a valid response")
+}
+
+/// 405, with what the route takes.
+fn not_allowed(takes: &'static str) -> Reply {
+    reply(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "text/plain",
+        takes.as_bytes(),
+    )
+}
+
+/// 400, saying what the request lacks.
+fn bad_request(problem: &'static str) -> Reply {
+    reply(StatusCode::BAD_REQUEST, "text/plain", problem.as_bytes())
 }
 
 /// Finds `key` in a URL query string and percent-decodes its value.
