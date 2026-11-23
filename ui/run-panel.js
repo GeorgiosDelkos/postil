@@ -18,6 +18,9 @@ import {
   toolRow,
 } from "./run.js";
 
+// How long after the first Stop a second one ends the agent: src/run.rs, FORCE_AFTER.
+const FORCE_AFTER_MS = 3000;
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -33,6 +36,8 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
   let fetching = false;
   let again = false;
   let clock = null;
+  // When this page first saw the run stopping: from FORCE_AFTER_MS on, Stop ends the agent.
+  let stoppingSince = null;
 
   async function fetchRun() {
     // Only the entries not seen yet, unless the run is another one: then all of them.
@@ -77,9 +82,16 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     await sync();
   }
 
+  // Stop asks the agent to stop. Once it has been asked for FORCE_AFTER_MS, Stop ends it
+  // (src/run.rs, "Stopping"); sooner, the Rust process takes it as the same request.
   function stop() {
-    if (!isLive(run) || run.status === "cancelling") return Promise.resolve();
+    if (!isLive(run)) return Promise.resolve();
+    if (run.status === "cancelling" && !forceable()) return Promise.resolve();
     return post("api/run/cancel").catch((error) => onError(error.message));
+  }
+
+  function forceable() {
+    return stoppingSince !== null && Date.now() - stoppingSince >= FORCE_AFTER_MS;
   }
 
   function answer(request, option) {
@@ -146,11 +158,21 @@ export function runPanel({ panelEl, headerEl, statusEl, onChange, onError }) {
     title.append(el("strong", "", run.agent), " · ", time);
     const parts = [title];
     if (isLive(run)) {
-      clock = setInterval(tick, 1000);
+      const stopping = run.status === "cancelling";
+      if (!stopping) stoppingSince = null;
+      else stoppingSince ??= Date.now();
       const button = el("button", "button stop");
       button.type = "button";
-      button.disabled = run.status === "cancelling";
-      button.append("Stop", el("kbd", "", "esc"));
+      const label = () => {
+        const force = stopping && forceable();
+        button.disabled = stopping && !force;
+        button.replaceChildren(force ? "Force stop" : "Stop", el("kbd", "", "esc"));
+      };
+      label();
+      clock = setInterval(() => {
+        tick();
+        label();
+      }, 1000);
       button.addEventListener("click", stop);
       parts.push(button);
     } else {
