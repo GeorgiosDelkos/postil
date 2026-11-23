@@ -3083,9 +3083,14 @@ button.changes-number:focus-visible {
 }
 
 /* Focus mode: the code alone, centered at a readable width (Cmd-\). */
-/* The side columns close to nothing rather than leave the grid, so the change can be eased. */
+/* The side columns shrink rather than leave the grid, so the change can be eased; they keep
+   what centers the code column at 1100 px (1116 px with the two gaps). */
 body.focus-mode {
-  grid-template-columns: 0px minmax(0, 1fr) 0px;
+  grid-template-columns:
+    max(0px, (100% - 1116px) / 2)
+    minmax(0, 1fr)
+    max(0px, (100% - 1116px) / 2);
+  padding: 0;
 }
 
 body.focus-mode > .sidebar,
@@ -3099,19 +3104,25 @@ body.focus-mode > .divider {
   display: none;
 }
 
-body.focus-mode > .code-pane {
-  justify-self: center;
-  width: min(100%, 1100px);
-}
-
 /* Side panes open and close in 160 ms (docs/design.md, "Motion"). Only while focus mode
    changes: a divider dragged by hand must follow the pointer at once. */
 body.panes-moving {
-  transition: grid-template-columns 160ms ease-out;
+  transition:
+    grid-template-columns 160ms ease-out,
+    padding 160ms ease-out;
 }
 
 body.panes-moving > .sidebar,
 body.panes-moving > .tray {
+  overflow: hidden;
+  transition: opacity 160ms ease-out;
+}
+
+/* Visibility is eased only on the way out, so the panes stay seen while they fade. On the way
+   in it turns at once: WebKit keeps an element unfocusable while its visibility eases from
+   hidden, and Cmd-P focuses the filter as focus mode ends. */
+body.panes-moving.focus-mode > .sidebar,
+body.panes-moving.focus-mode > .tray {
   transition:
     opacity 160ms ease-out,
     visibility 160ms;
