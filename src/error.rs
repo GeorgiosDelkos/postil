@@ -175,6 +175,16 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The git index could not be copied to the index a snapshot of the working tree is
+    /// written through.
+    CopyIndex {
+        /// The real index.
+        from: PathBuf,
+        /// Postil's snapshot index.
+        to: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
     /// A run log could not be read.
     ReadRun {
         /// The log, or its directory.
@@ -320,6 +330,13 @@ impl fmt::Display for Error {
                 "cannot write the run log {} (check that the directory is writable)",
                 path.display()
             ),
+            Self::CopyIndex { from, to, .. } => write!(
+                f,
+                "cannot copy the git index {} to {} for a snapshot of the working tree (check \
+                 that both can be read and written)",
+                from.display(),
+                to.display()
+            ),
             Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
             Self::TurnRunning => write!(
                 f,
@@ -362,6 +379,7 @@ impl std::error::Error for Error {
             | Self::WriteSettings { source, .. }
             | Self::StartAgent { source, .. }
             | Self::WriteRun { source, .. }
+            | Self::CopyIndex { source, .. }
             | Self::WriteLayout { source, .. }
             | Self::ReadRun { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),

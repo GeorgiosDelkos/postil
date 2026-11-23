@@ -7,6 +7,7 @@
 
 import { rank } from "./fuzzy.js";
 import { fileIcon, folderIcon } from "./icons.js";
+import { changesView } from "./changes-view.js";
 import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
 import { noteDialog, statusIcon } from "./note-dialog.js";
 import { runPanel } from "./run-panel.js";
@@ -262,6 +263,7 @@ async function openFile(path) {
     state.composer.node.querySelector("textarea").focus();
     return false;
   }
+  changes.close();
   state.composer = null;
   state.wanted = path;
   const reply = await fetchFile(path);
@@ -293,7 +295,9 @@ function showFile(path, reply, { keepView }) {
   }
 
   indexNotes();
-  renderHeader(path);
+  // The changes view holds the header while it is open over the file; a refresh of the file
+  // under it (on focus, or as a run moves on) leaves the header alone.
+  if (!changes.isOpen()) renderHeader(path);
   revealFile(previous, path);
   if (!keepView) codeEl.scrollTop = 0;
   renderCode({ force: true });
@@ -1188,6 +1192,36 @@ const runs = runPanel({
   openNote: (id) => noteDetail.open(id),
   openFile,
   reviewers: () => state.settings?.reviewers ?? [],
+  showChanges: (from, to) => {
+    closeSend();
+    changes.show(from, to);
+  },
+});
+
+// What a run changed, over the open file; Esc, or opening a file, gives the pane back.
+const changes = changesView({
+  viewEl: $("changes-view"),
+  setHeader: (title, meta) => {
+    const close = el("button", "button changes-close", "esc");
+    close.type = "button";
+    close.title = "Back to the file";
+    close.addEventListener("click", () => changes.close());
+    $("crumbs").replaceChildren(el("b", "", title), close);
+    $("file-meta").textContent = meta;
+  },
+  notes: () => state.notes,
+  noteCard: (note) => noteCard(cardOf(note), () => noteDetail.open(note.id)),
+  addNote: async (path, line) => {
+    if (await openFile(path)) openComposer({ start: line - 1, end: line - 1 });
+  },
+  onError: showToast,
+  onClose: () => {
+    if (state.file) renderHeader(state.file.path);
+    else {
+      $("crumbs").replaceChildren();
+      $("file-meta").textContent = "";
+    }
+  },
 });
 
 const noteDialogEl = $("note-dialog");
@@ -1252,6 +1286,7 @@ function openSend(ids = sendable(state.notes)) {
   if (guardDraft("sending")) return;
   if (state.composer) closeComposer({ save: false });
   closeMenu();
+  changes.close();
   state.send = { ticked: new Set(ids), agent: null, sending: false };
   showTab("notes");
   renderNotes();

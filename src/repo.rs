@@ -1,12 +1,15 @@
 //! Reading a repository by running the `git` binary.
 //!
-//! No git library is linked: the app needs a file list and a branch name, and `git` already
-//! knows the ignore rules.
+//! No git library is linked: the app needs a file list, a branch name, snapshots of the
+//! working tree and the diffs between them, and `git` already knows the ignore rules.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, Result};
 
@@ -18,6 +21,13 @@ pub(crate) struct Repo {
     /// This working tree's git directory: `.git`, or `.git/worktrees/<name>` for a linked
     /// worktree, so each worktree keeps its own notes.
     git_dir: PathBuf,
+    /// Held while a snapshot writes its index ([`Repo::snapshot`]): a run's snapshot and the
+    /// changes view's may come at once.
+    snapshotting: Mutex<()>,
+    /// How many times a copy of the real index was started, for tests: git
+    /// replaces the index file on every write, so nothing on disk tells a copy apart.
+    #[cfg(test)]
+    copies: AtomicU64,
 }
 
 impl Repo {
@@ -74,6 +84,9 @@ impl Repo {
         Ok(Self {
             root: PathBuf::from(root),
             git_dir: PathBuf::from(git_dir),
+            snapshotting: Mutex::new(()),
+            #[cfg(test)]
+            copies: AtomicU64::new(0),
         })
     }
 
@@ -147,6 +160,144 @@ impl Repo {
         Ok(files)
     }
 
+    /// Takes a snapshot of the working tree, every tracked file and every untracked file that
+    /// is not ignored, as a git tree, and returns its id. Postil takes one before a run and one
+    /// after it, and the changes view shows the diff between them (docs/design.md, "The
+    /// changes view").
+    ///
+    /// The tree is written through an index of Postil's own, `<git dir>/postil-snapshot.index`
+    /// beside the real one, so the engineer's index, branch and stash are left as they are. It
+    /// is kept between snapshots, so git hashes again only the files whose stat data changed
+    /// since the last one, untracked files included. It starts from a copy of the real index,
+    /// and again whenever the two track different ignored files (one force-added, or one taken
+    /// out of git and added to `.gitignore`), which `git add --all` cannot reconcile; each copy
+    /// hashes the untracked files in full once. A snapshot index git cannot read is copied
+    /// again at once; one that fails `git add` or `write-tree` is removed, so the next snapshot
+    /// starts afresh. `git add` runs the repository's clean filters (git-lfs copies a changed
+    /// file into `.git/lfs`). The tree and its blobs are objects no ref holds, so `git gc` may
+    /// prune them once they are older than its prune period (two weeks by default).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CopyIndex`] when the real index cannot be copied, and the git errors, such as
+    /// another window's snapshot holding git's lock on the index.
+    pub(crate) fn snapshot(&self) -> Result<String> {
+        let _writing = self
+            .snapshotting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let index = self.git_dir.join("postil-snapshot.index");
+        if !index.exists() || self.ignored_differ(&index) {
+            self.copy_index(&index)?;
+        }
+        let tree = run_git(&self.root, Some(&index), &["add", "--all"])
+            .and_then(|_| run_git(&self.root, Some(&index), &["write-tree"]));
+        if tree.is_err() {
+            // An index git cannot use would fail every later snapshot too.
+            drop(fs::remove_file(&index));
+        }
+        Ok(tree?.trim_end().to_owned())
+    }
+
+    /// Copies the real index to `index`, through a file of its own renamed into place: a copy
+    /// cut short, or one made at the same moment by another window or another `Repo` of this
+    /// working tree, never leaves a torn index where git reads it.
+    fn copy_index(&self, index: &Path) -> Result<()> {
+        // A unique name only: nothing is ordered by it.
+        static COPIES: AtomicU64 = AtomicU64::new(0);
+        let real = self.git_dir.join("index");
+        let copy = self.git_dir.join(format!(
+            "postil-snapshot.{}.{}.copy",
+            std::process::id(),
+            COPIES.fetch_add(1, Ordering::Relaxed)
+        ));
+        #[cfg(test)]
+        self.copies.fetch_add(1, Ordering::Relaxed);
+        let copied = match fs::copy(&real, &copy) {
+            // A repository with nothing staged yet has no index: git starts an empty one.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            copied => copied.and_then(|_| fs::rename(&copy, index)),
+        };
+        copied.map_err(|source| {
+            drop(fs::remove_file(&copy));
+            Error::CopyIndex {
+                from: real,
+                to: index.to_owned(),
+                source,
+            }
+        })
+    }
+
+    /// Whether the snapshot index `index` must start again from the real one: the files that
+    /// are tracked, ignored and still on disk differ between them. `git add --all` never adds
+    /// an ignored file (one force-added since the copy), and goes on updating one an index
+    /// already has (one taken out of git and ignored). A deleted file is left out: `git add
+    /// --all` drops it from ours, while the real index keeps it until the deletion is staged,
+    /// so counting it would copy the index again on every snapshot. An index git cannot read
+    /// must start again too.
+    fn ignored_differ(&self, index: &Path) -> bool {
+        let args = [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--ignored",
+            "--exclude-standard",
+        ];
+        let listed = |index: Option<&Path>| -> Option<HashSet<String>> {
+            let list = run_git(&self.root, index, &args).ok()?;
+            // During a merge conflict a path is listed once per stage.
+            Some(list.split_terminator('\0').map(str::to_owned).collect())
+        };
+        match (listed(Some(index)), listed(None)) {
+            (Some(ours), Some(real)) => ours
+                .symmetric_difference(&real)
+                .any(|path| self.root.join(path).symlink_metadata().is_ok()),
+            // The real index unreadable: the copy then says why.
+            _ => true,
+        }
+    }
+
+    /// The changes from snapshot `before` to snapshot `after` ([`Repo::snapshot`]), as
+    /// `git diff` prints them: a unified diff with three lines of context, renames shown as a
+    /// removal and an addition, paths after `a/` and `b/`. The options and settings given
+    /// fix the format whatever the engineer's git config says (`ui/patch.js` reads it):
+    /// prefixes, quoting only of paths with control characters, quotes or backslashes, blank
+    /// context lines kept, and no textconv drivers, whose text would not match the files.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when an id is not a hexadecimal object id (they come from run
+    /// logs, which a hand edit can change), and the git errors, such as a snapshot that
+    /// `git gc` pruned.
+    pub(crate) fn diff(&self, before: &str, after: &str) -> Result<String> {
+        for id in [before, after] {
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::BadRequest(format!(
+                    "snapshot {id:?}: expected a git object id"
+                )));
+            }
+        }
+        git(
+            &self.root,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "-c",
+                "diff.suppressBlankEmpty=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--unified=3",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                before,
+                after,
+            ],
+        )
+    }
+
     /// Reads one file as text. `file` is a path relative to the root, as [`Repo::files`]
     /// returns it.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
@@ -167,6 +318,14 @@ impl Repo {
     }
 }
 
+#[cfg(test)]
+impl Repo {
+    /// How many times [`Repo::snapshot`] started copying the real index.
+    pub(crate) fn index_copies(&self) -> u64 {
+        self.copies.load(Ordering::Relaxed)
+    }
+}
+
 /// Whether `dir` is the home folder or the root of the disk, after resolving links.
 fn is_home_or_root(dir: &Path) -> bool {
     let Ok(dir) = dir.canonicalize() else {
@@ -178,7 +337,14 @@ fn is_home_or_root(dir: &Path) -> bool {
 
 /// Runs `git` in `dir` and returns what it printed.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    run_git(dir, None, args)
+}
+
+/// Runs `git` in `dir`, with `index` as its index file when given, and returns what it
+/// printed.
+fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -190,9 +356,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .map_err(Error::SpawnGit)?;
+        .env_remove("GIT_INDEX_FILE");
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command.output().map_err(Error::SpawnGit)?;
 
     if !output.status.success() {
         return Err(Error::Git {

@@ -75,6 +75,16 @@ const PAGE: &[(&str, &str, &[u8])] = &[
     ),
     ("/run.js", "text/javascript", include_bytes!("../ui/run.js")),
     (
+        "/patch.js",
+        "text/javascript",
+        include_bytes!("../ui/patch.js"),
+    ),
+    (
+        "/changes-view.js",
+        "text/javascript",
+        include_bytes!("../ui/changes-view.js"),
+    ),
+    (
         "/run-panel.js",
         "text/javascript",
         include_bytes!("../ui/run-panel.js"),
@@ -1054,6 +1064,9 @@ impl Site {
                     &b"expected ?notes=N1,N2"[..],
                 ),
             },
+            "/api/run/changes" if *request.method() == Method::GET => {
+                json_or_error(self.changes(uri.query().unwrap_or("")))
+            }
             "/api/run/cancel" if post => json_or_error(
                 self.runner()
                     .and_then(|runner| runner.cancel())
@@ -1070,6 +1083,7 @@ impl Site {
             | "/api/run/follow" => {
                 reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
             }
+            "/api/run/changes" => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -1116,6 +1130,15 @@ impl Site {
             Some(id) => Ok(to_json(&runner.view_of(&id)?)),
             None => Ok(to_json(&runner.view(after_of(query)?)?)),
         }
+    }
+
+    /// The reply to `GET /api/run/changes?from=R1&to=R3`: what runs `from` to `to` changed
+    /// (`Runner::changes`). `to` is `from` when left out.
+    fn changes(&self, query: &str) -> Result<Vec<u8>> {
+        let from = query_value(query, "from")
+            .ok_or_else(|| Error::BadRequest("expected ?from=<run id>".to_owned()))?;
+        let to = query_value(query, "to").unwrap_or_else(|| from.clone());
+        Ok(to_json(&self.runner()?.changes(&from, &to)?))
     }
 
     /// The reply to `POST /api/run`: sends the notes in the body to the agent, and answers
@@ -1344,6 +1367,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }
+                | Error::CopyIndex { .. }
                 | Error::WriteLayout { .. }
                 | Error::ReadRun { .. }
                 | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
@@ -3033,16 +3057,41 @@ mod tests {
         )
     }
 
-    /// The entries' kinds, with a message's text after a colon.
+    /// The kinds of a run's entries, each message with its text after a colon. Snapshots are
+    /// left out, as in [`entries`].
     fn kinds(run: &serde_json::Value) -> Vec<String> {
         run["entries"]
             .as_array()
             .unwrap()
             .iter()
+            .filter(|entry| entry["kind"] != "snapshot")
             .map(|entry| match entry["kind"].as_str().unwrap() {
                 "message" => format!("message:{}", entry["text"].as_str().unwrap()),
                 kind => kind.to_owned(),
             })
+            .collect()
+    }
+
+    /// A run's entries without its snapshots: the tests of snapshots read them on their own,
+    /// and the others count entries by place.
+    fn entries(run: &serde_json::Value) -> Vec<serde_json::Value> {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] != "snapshot")
+            .cloned()
+            .collect()
+    }
+
+    /// The points of a run's snapshots, in order: `["before", "after"]` for a run that ended.
+    fn snapshot_points(run: &serde_json::Value) -> Vec<serde_json::Value> {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "snapshot")
+            .map(|entry| entry["point"].clone())
             .collect()
     }
 
@@ -3166,7 +3215,7 @@ mod tests {
             ["m1", "m2", "m3", "m4"],
             "each part keeps its message's id"
         );
-        let update = &ended["entries"][kinds.iter().position(|kind| kind == "toolUpdate").unwrap()];
+        let update = &entries(&ended)[kinds.iter().position(|kind| kind == "toolUpdate").unwrap()];
         assert_eq!(
             update["output"],
             serde_json::json!([
@@ -3475,7 +3524,7 @@ mod tests {
         let question = kinds.iter().position(|kind| kind == "question").unwrap();
         assert_eq!(kinds[question + 1], "answer", "withdrawn: {ended}");
         assert_eq!(
-            ended["entries"][question + 1]["option"],
+            entries(&ended)[question + 1]["option"],
             serde_json::Value::Null
         );
     }
@@ -3605,6 +3654,15 @@ mod tests {
         assert_eq!(findings["problem"], serde_json::Value::Null);
 
         assert_eq!(judge["review"]["reviewer"], 2);
+        assert!(
+            snapshot_points(&proposer).is_empty(),
+            "a proposer may not edit: {proposer}"
+        );
+        assert_eq!(
+            snapshot_points(&judge),
+            ["before", "after"],
+            "the judge edits: {judge}"
+        );
         assert!(
             kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
             "the judge is given the findings: {judge}"
@@ -3955,6 +4013,234 @@ mod tests {
     }
 
     #[test]
+    fn a_run_s_changes_are_the_diff_between_its_snapshots_and_the_index_is_left_alone() {
+        let repo = TempRepo::new("run-changes");
+        repo.write("a.txt", "a\n");
+        repo.write("secret.txt", "one\n");
+        repo.git(&["add", "a.txt", "secret.txt"]);
+        let (site, nudges) = run_site(&repo, "writes");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let first = wait_for(&site, &nudges, "ended");
+        let snapshots: Vec<&serde_json::Value> = first["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "snapshot")
+            .collect();
+        assert_eq!(snapshots.len(), 2, "one before, one after: {first}");
+        assert_eq!(
+            first["entries"][0]["kind"], "snapshot",
+            "before the agent starts"
+        );
+        let changes = |query: &str| get(&site, &format!("{RUN}/changes?{query}"));
+
+        let (status, body) = changes("from=R1");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let one: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(one["before"], snapshots[0]["tree"]);
+        assert_eq!(one["after"], snapshots[1]["tree"]);
+        let patch = one["patch"].as_str().unwrap();
+        for part in [
+            "+++ b/a.txt",
+            "+prompt 1",
+            "new file mode",
+            "+++ b/new.txt",
+            "+new",
+        ] {
+            assert!(patch.contains(part), "{part:?} in {patch}");
+        }
+
+        // The engineer takes a file out of git and ignores it: snapshots stop following it. And
+        // force-adds an ignored one: snapshots follow it from then on.
+        repo.git(&["rm", "--cached", "--quiet", "secret.txt"]);
+        repo.write(".gitignore", "secret.txt\nforced.txt\n");
+        repo.write("secret.txt", "two\n");
+        repo.write("forced.txt", "kept\n");
+        repo.git(&["add", "--force", "forced.txt"]);
+
+        // A follow-up writes again: R1 to R2 is the whole thread, R2 alone its own change.
+        let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+        assert_eq!(
+            post(&site, &format!("{RUN}/follow"), &body).0,
+            StatusCode::OK
+        );
+        wait_for_run(&site, &nudges, "R2");
+        let patch_of = |query: &str| {
+            let (status, body) = changes(query);
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["patch"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let thread = patch_of("from=R1&to=R2");
+        assert!(
+            thread.contains("+prompt 2") && !thread.contains("prompt 1"),
+            "{thread}"
+        );
+        let second = patch_of("from=R2");
+        assert!(second.contains("-prompt 1\n+prompt 2"), "{second}");
+        assert!(!second.contains("new.txt"), "unchanged by R2: {second}");
+        assert!(
+            !second.contains("+two"),
+            "an ignored file left untracked: {second}"
+        );
+        assert!(
+            thread.contains("+++ b/forced.txt"),
+            "a force-added file: {thread}"
+        );
+
+        // Snapshots go through an index of their own: the engineer's staged files are the same.
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "a.txt\nforced.txt\n"
+        );
+    }
+
+    #[test]
+    fn changes_compare_with_the_files_now_without_a_snapshot_after_and_refuse_bad_logs() {
+        let repo = TempRepo::new("run-changes-logs");
+        repo.write("a.txt", "a\n");
+        let (site, _nudges) = run_site(&repo, "writes");
+        let changes = |query: &str| get(&site, &format!("{RUN}/changes?{query}"));
+        let runs = repo.root.join(".git/postil/runs");
+        fs::create_dir_all(&runs).unwrap();
+        let tree = serde_json::json!(site.repo().unwrap().snapshot().unwrap());
+
+        // A tracked, ignored file deleted but not staged stays in the real index only: the
+        // snapshot index is not copied again for it.
+        repo.write(".gitignore", "gen.lock\n");
+        repo.write("gen.lock", "x\n");
+        repo.git(&["add", "--force", "gen.lock"]);
+        let open = site.repo().unwrap();
+        let copies = open.index_copies();
+        open.snapshot().unwrap();
+        assert_eq!(
+            open.index_copies(),
+            copies + 1,
+            "a force-added ignored file copies the index"
+        );
+        fs::remove_file(repo.root.join("gen.lock")).unwrap();
+        open.snapshot().unwrap();
+        open.snapshot().unwrap();
+        assert_eq!(
+            open.index_copies(),
+            copies + 1,
+            "copied again for a deleted file"
+        );
+
+        // A run with only the snapshot before it is compared with the files now.
+        let log = header("R5").replace(r#""version":1"#, r#""version":4"#);
+        fs::write(
+            runs.join("R5.jsonl"),
+            format!("{log}\n{{\"kind\":\"snapshot\",\"point\":\"before\",\"tree\":{tree}}}\n"),
+        )
+        .unwrap();
+        repo.write("a.txt", "now\n");
+        let (status, body) = changes("from=R5");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(now["after"], serde_json::Value::Null);
+        assert!(now["patch"].as_str().unwrap().contains("+now"), "{now}");
+
+        let old = header("R4").replace(r#""version":1"#, r#""version":3"#);
+        fs::write(runs.join("R4.jsonl"), format!("{old}\n")).unwrap();
+        let blank = header("R7").replace(r#""version":1"#, r#""version":4"#);
+        fs::write(
+            runs.join("R7.jsonl"),
+            format!("{blank}\n{{\"kind\":\"snapshot\",\"point\":\"before\",\"tree\":\"\"}}\n"),
+        )
+        .unwrap();
+        // A tree id is passed to git, so one edited into an option is refused, and so is none.
+        let edited = header("R6").replace(r#""version":1"#, r#""version":4"#);
+        fs::write(
+            runs.join("R6.jsonl"),
+            format!(
+                "{edited}\n{{\"kind\":\"snapshot\",\"point\":\"before\",\"tree\":\"--output=x\"}}\n"
+            ),
+        )
+        .unwrap();
+        for (query, status, why) in [
+            ("from=R4", StatusCode::BAD_REQUEST, "R4 has no snapshot"),
+            (
+                "from=R6",
+                StatusCode::BAD_REQUEST,
+                "expected a git object id",
+            ),
+            (
+                "from=R7",
+                StatusCode::BAD_REQUEST,
+                "expected a git object id",
+            ),
+            (
+                "from=R5&to=R4",
+                StatusCode::BAD_REQUEST,
+                "R4 is older than R5",
+            ),
+            ("to=R1", StatusCode::BAD_REQUEST, "expected ?from="),
+            ("from=R9", StatusCode::NOT_FOUND, "R9"),
+        ] {
+            let (got, body) = changes(query);
+            assert_eq!(got, status, "{query}: {body}");
+            assert!(body.contains(why), "{query}: {body}");
+        }
+        let (status, _) = post(&site, &format!("{RUN}/changes?from=R1"), "");
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_taken_is_the_run_s_problem_and_the_run_goes_on() {
+        let repo = TempRepo::new("run-no-snapshot");
+        repo.write("a.txt", "a\n");
+        repo.git(&["add", "a.txt"]);
+        let index = repo.root.join(".git/index");
+        // The first snapshot starts from a copy of the real index, which cannot be read.
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        send(&site, &["N1"]);
+        let ended = wait_for(&site, &nudges, "ended");
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+        let problem = ended["problem"].as_str().unwrap_or_default();
+        assert!(
+            problem.contains("no snapshot of the files was taken"),
+            "{ended}"
+        );
+        assert!(problem.contains(".git/index"), "{problem}");
+        assert!(
+            kinds(&ended).contains(&"message:prompt 1".to_owned()),
+            "{ended}"
+        );
+        let (status, body) = get(&site, &format!("{RUN}/changes?from=R1"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("R1 has no snapshot from before it"), "{body}");
+
+        // Postil's own index torn: it is copied again from the real one at once.
+        let ours = repo.root.join(".git/postil-snapshot.index");
+        fs::write(&ours, "torn").unwrap();
+        send(&site, &["N1"]);
+        let healed = wait_for_run(&site, &nudges, "R2");
+        assert_eq!(snapshot_points(&healed), ["before", "after"], "{healed}");
+
+        // The real index torn: its copy cannot be used, so the snapshot fails and the copy is
+        // removed rather than failing every snapshot after it.
+        fs::remove_file(&ours).unwrap();
+        fs::write(&index, "torn").unwrap();
+        send(&site, &["N1"]);
+        let torn = wait_for_run(&site, &nudges, "R3");
+        let problem = torn["problem"].as_str().unwrap_or_default();
+        assert!(problem.contains("no snapshot"), "{torn}");
+        assert!(!ours.exists(), "the unusable copy is gone");
+    }
+
+    #[test]
     fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
         let repo = TempRepo::new("run-cancel");
         repo.write("a.txt", "a\n");
@@ -3997,8 +4283,8 @@ mod tests {
             ],
             "the open question, and the ones that crossed the cancel, are answered cancel"
         );
-        assert_eq!(ended["entries"][5]["option"], serde_json::Value::Null);
-        assert_eq!(ended["entries"][9]["reason"], "cancelled");
+        assert_eq!(entries(&ended)[5]["option"], serde_json::Value::Null);
+        assert_eq!(entries(&ended)[9]["reason"], "cancelled");
 
         let late = serde_json::json!({ "request": 0, "content": {} });
         let (status, body) = post(&site, &format!("{RUN}/question"), &late.to_string());
@@ -4017,7 +4303,7 @@ mod tests {
         post_note(&site, "a.txt", 1, 1, "one");
         send(&site, &["N1"]);
         let failed = wait_for(&site, &nudges, "failed");
-        let error = failed["entries"][0]["error"].as_str().unwrap().to_owned();
+        let error = entries(&failed)[0]["error"].as_str().unwrap().to_owned();
         assert!(
             error.contains("Please sign in: run `fake login`"),
             "the agent's own words: {error}"
@@ -4028,13 +4314,13 @@ mod tests {
         send(&site, &["N1"]);
         let failed = wait_for(&site, &nudges, "failed");
         assert_eq!(failed["id"], "R2");
-        let error = failed["entries"][0]["error"].as_str().unwrap().to_owned();
+        let error = entries(&failed)[0]["error"].as_str().unwrap().to_owned();
         assert!(error.contains("needs you to sign in"), "{error}");
 
         set_agents(&site, &[("Ghost", "no-such-agent-program --acp")], "Ghost");
         send(&site, &["N1"]);
         let failed = wait_for(&site, &nudges, "failed");
-        let error = failed["entries"][0]["error"].as_str().unwrap().to_owned();
+        let error = entries(&failed)[0]["error"].as_str().unwrap().to_owned();
         assert!(
             error.contains("cannot find the agent's program no-such-agent-program"),
             "{error}"
@@ -4156,8 +4442,8 @@ mod tests {
             ("\n", "its first line is not a run header"),
             ("not a header\n", "its first line is not a run header"),
             (
-                r#"{"version":4,"id":"R3","newField":1}"#,
-                "it is version 4, and this build of Postil reads versions 1 to 3",
+                r#"{"version":5,"id":"R3","newField":1}"#,
+                "it is version 5, and this build of Postil reads versions 1 to 4",
             ),
             (
                 &*header("R3").replace(
@@ -4257,7 +4543,7 @@ mod tests {
             ended["status"], "ended",
             "at once, not after the start times out"
         );
-        assert_eq!(ended["entries"][1]["reason"], "cancelled");
+        assert_eq!(entries(&ended)[1]["reason"], "cancelled");
         assert_eq!(states(&site), [serde_json::json!({ "kind": "open" })]);
         wait_for_exit(&pid_file);
 
@@ -4418,6 +4704,9 @@ mod tests {
             .clone();
         let error = last["error"].as_str().unwrap();
         assert!(error.contains("did not stop when asked"), "{error}");
+        // Its exit is not reported, so the forced stop takes the snapshot after it.
+        let changes = get_json(&site, &format!("{RUN}/changes?from=R1"));
+        assert!(changes["after"].is_string(), "{changes}");
 
         // The working tree is free again, with a new agent: its first prompt.
         let (status, body) = send(&site, &["N1"]);

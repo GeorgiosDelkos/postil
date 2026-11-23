@@ -42,9 +42,10 @@
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
 //! an agent's start on a thread of its own, and a review's next stage on one more
-//! (`review-next`, [`Runner::advance`]). Two locks, always taken in this order: the
-//! runner's [`Slot`], then a run's state. The page is told about every change through
-//! `notify`, and fetches what it has not seen.
+//! (`review-next`, [`Runner::advance`]). Three locks, always taken in this order: the
+//! runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`], which takes
+//! no other), then a run's state; no snapshot is taken under a run's state. The page is told
+//! about every change through `notify`, and fetches what it has not seen.
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -87,8 +88,9 @@ const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
-/// header). Older logs read as runs of notes.
-const LOG_VERSION: u32 = 3;
+/// header); version 4 the `snapshot` entry. Older logs read as runs of notes, without
+/// snapshots.
+const LOG_VERSION: u32 = 4;
 
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
@@ -216,9 +218,11 @@ impl Runner {
     }
 
     /// Starts a run: sends the notes `ids` to `agent`, starting the agent first unless it is
-    /// the one kept from the last run and still alive. Returns at once, except while another
-    /// window's run holds the run lock: then it waits up to [`LOCK_PATIENCE`] under the
-    /// runner's lock before it refuses. The run reports its progress through its log.
+    /// the one kept from the last run and still alive. Takes the snapshot before the run first
+    /// ([`Repo::snapshot`], `git add --all` through Postil's own index), under the runner's
+    /// lock; otherwise returns at once, except while another window's run holds the run lock:
+    /// then it waits up to [`LOCK_PATIENCE`] under the runner's lock before it refuses. The run
+    /// reports its progress through its log.
     ///
     /// # Errors
     ///
@@ -245,6 +249,7 @@ impl Runner {
             &prompt.text,
             Origin::Notes,
         )?);
+        self.record_snapshot(&run, Point::Before);
         slot.run = Some(Arc::clone(&run));
 
         let replaced = match &slot.agent {
@@ -278,7 +283,7 @@ impl Runner {
     /// gets the thread's earlier prompts and replies before the text. The run carries `of`'s
     /// notes, so it goes with them, and marks none sent. A thread does not fork: `of` must be
     /// its latest run. Reads the log of every run in the thread and the header of every newer
-    /// run, and may wait for the run lock as [`Runner::send`] does.
+    /// run, and takes a snapshot and may wait for the run lock as [`Runner::send`] does.
     ///
     /// # Errors
     ///
@@ -354,6 +359,7 @@ impl Runner {
                 text: text.to_owned(),
             }),
         )?);
+        self.record_snapshot(&run, Point::Before);
         slot.run = Some(Arc::clone(&run));
         let replaced = match &slot.agent {
             Held::Ready(_, live) if same_conversation => {
@@ -430,7 +436,8 @@ impl Runner {
     }
 
     /// Starts a review of run `of` by `reviewers`, in order (`review.rs`): each stage is a run
-    /// of its own, started with a fresh agent when the one before it ends well.
+    /// of its own, started with a fresh agent when the one before it ends well. The judge's
+    /// stage takes snapshots as [`Runner::send`] does; a proposer, which may not edit, none.
     ///
     /// # Errors
     ///
@@ -522,6 +529,9 @@ impl Runner {
             &text,
             Origin::Review(chain.stage.clone()),
         )?);
+        if chain.stage.judges() {
+            self.record_snapshot(&run, Point::Before);
+        }
         slot.run = Some(Arc::clone(&run));
         let replaced = slot.release();
         let pending = Pending {
@@ -591,6 +601,7 @@ impl Runner {
             (state.started, state.cancel_asked)
         };
         let mut released = Held::None;
+        let mut forced = false;
         let mut result = Ok(());
         // A stopped reviewer ends its review: the next stage does not start.
         slot.chain = None;
@@ -608,12 +619,9 @@ impl Runner {
             (true, Some(at)) if at.elapsed() < FORCE_AFTER => {}
             (true, Some(_)) => {
                 // The agent did not stop when asked, so it is ended, and its exit is not
-                // reported over this.
+                // reported over this. The run ends once the agent is gone (below).
                 released = slot.release();
-                run.record(Entry::Failed {
-                    error: "stopped: the agent did not stop when asked, so Postil ended it"
-                        .to_owned(),
-                });
+                forced = true;
             }
             (true, None) => {
                 run.state().cancel_asked = Some(Instant::now());
@@ -636,7 +644,17 @@ impl Runner {
             }
         }
         drop(slot);
+        // Dropping the agent kills it and waits for its process to be reaped.
         drop(released);
+        if forced {
+            // Its exit is not reported, so the snapshot after it is taken here, once nothing
+            // can write any more. The run stays live until then, so a send is refused
+            // (`TurnRunning`) meanwhile.
+            self.record_end_snapshot(&run);
+            run.record(Entry::Failed {
+                error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
+            });
+        }
         (self.notify)();
         result
     }
@@ -717,6 +735,45 @@ impl Runner {
     /// when its log is missing or cannot be read.
     pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
         Ok(self.run_by_id(id)?.view(0))
+    }
+
+    /// What the runs from `from` to `to` changed (docs/design.md, "The changes view"): the
+    /// diff from the snapshot taken before `from` to the one taken after `to`. A run that has
+    /// none after it (it is under way, ended before its agent took the turn, or its snapshot
+    /// failed) is compared with the files as they are now, and `after` is `None`: the diff
+    /// may then hold changes made since.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::view_of`] for both runs; [`Error::BadRequest`] when `from` has no snapshot
+    /// before it (it ran before Postil took them, or its snapshot failed, which its log says)
+    /// or `to` is older than `from`; and the errors of [`Repo::snapshot`] and [`Repo::diff`].
+    pub(crate) fn changes(&self, from: &str, to: &str) -> Result<Changes> {
+        let (first, last) = (self.run_by_id(from)?, self.run_by_id(to)?);
+        if run_number(to) < run_number(from) {
+            return Err(Error::BadRequest(format!("{to} is older than {from}")));
+        }
+        let before = first
+            .state()
+            .snapshot(Point::Before)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::BadRequest(format!(
+                    "{from} has no snapshot from before it: it ran before Postil took them, or \
+                     its log says why one could not be taken"
+                ))
+            })?;
+        let after = last.state().snapshot(Point::After).map(str::to_owned);
+        let now = match &after {
+            Some(after) => after.clone(),
+            None => self.repo.snapshot()?,
+        };
+        let patch = self.repo.diff(&before, &now)?;
+        Ok(Changes {
+            before,
+            after,
+            patch,
+        })
     }
 
     /// The name of the agent that ran run `id`: a follow-up goes to it.
@@ -918,6 +975,34 @@ impl Runner {
         run.record(Entry::Started);
     }
 
+    /// Records a snapshot of the working tree at `point` in `run` ([`Repo::snapshot`]). One
+    /// that cannot be taken is the run's problem: the run goes on, without its changes view.
+    fn record_snapshot(&self, run: &Run, point: Point) {
+        match self.repo.snapshot() {
+            Ok(tree) => run.record_snapshot(point, tree),
+            Err(error) => {
+                run.state().problem.get_or_insert(format!(
+                    "no snapshot of the files was taken: {}",
+                    error_chain(&error)
+                ));
+            }
+        }
+    }
+
+    /// Records the snapshot after `run`, as its turn ends: only while it is live, has the one
+    /// before and not yet one after, so an agent that exits after its run ended adds none.
+    fn record_end_snapshot(&self, run: &Run) {
+        let wanted = {
+            let state = run.state();
+            state.live()
+                && state.snapshot(Point::Before).is_some()
+                && state.snapshot(Point::After).is_none()
+        };
+        if wanted {
+            self.record_snapshot(run, Point::After);
+        }
+    }
+
     /// Marks the notes `ids` sent in `run`. A note that cannot be marked would be sent again
     /// by mistake later, so the run says so.
     fn mark_sent(&self, run: &Run, ids: &[String]) {
@@ -1028,10 +1113,14 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         };
         (run, released, answer, next)
     };
-    if let Some(run) = run
-        && let Some(ids) = run.record_event(event, answer, runner.repo.root())
-    {
-        runner.mark_sent(&run, &ids);
+    if let Some(run) = run {
+        // Before the end is logged, so a reader that sees the end sees what the run changed.
+        if ends_turn {
+            runner.record_end_snapshot(&run);
+        }
+        if let Some(ids) = run.record_event(event, answer, runner.repo.root()) {
+            runner.mark_sent(&run, &ids);
+        }
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
@@ -1316,6 +1405,27 @@ pub(crate) enum Entry {
         findings: Vec<Finding>,
         problem: Option<String>,
     },
+    /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]), taken before the
+    /// agent gets the prompt or as its turn ends.
+    Snapshot { point: Point, tree: String },
+}
+
+/// When a snapshot was taken: before a run, or after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Point {
+    Before,
+    After,
+}
+
+/// What runs changed, as `GET /api/run/changes` gives it: the snapshots compared, and the
+/// diff between them as `git diff` prints it. `after` is `None` when the files as they are
+/// now stood in for it.
+#[derive(Debug, Serialize)]
+pub(crate) struct Changes {
+    before: String,
+    after: Option<String>,
+    patch: String,
 }
 
 /// A file a tool call touches: relative to the repository root when it is inside it.
@@ -1562,6 +1672,15 @@ impl Run {
         self.record_all([entry]);
     }
 
+    /// Records the snapshot at `point` unless the run has one there, checked under the same
+    /// hold of the state: a forced stop and the agent's last event may both end a run.
+    fn record_snapshot(&self, point: Point, tree: String) {
+        let mut state = self.state();
+        if state.live() && state.snapshot(point).is_none() {
+            self.write(&mut state, Entry::Snapshot { point, tree });
+        }
+    }
+
     /// Records `entries` in order, under one hold of the state: a reader sees all or none.
     fn record_all(&self, entries: impl IntoIterator<Item = Entry>) {
         let mut state = self.state();
@@ -1569,19 +1688,24 @@ impl Run {
             return;
         }
         for entry in entries {
-            if let Some(log) = &mut state.log
-                && let Err(error) = log.write_all(&json_line(&entry))
-            {
-                state.log = None;
-                state.problem.get_or_insert(format!(
-                    "the run log {} could not be written, so this run will not be shown whole \
-                     after a restart: {error}",
-                    self.file.display()
-                ));
-            }
-            state.apply(&entry);
-            state.entries.push(entry);
+            self.write(&mut state, entry);
         }
+    }
+
+    /// Appends `entry` to the log and to `state`, which the caller holds.
+    fn write(&self, state: &mut RunState, entry: Entry) {
+        if let Some(log) = &mut state.log
+            && let Err(error) = log.write_all(&json_line(&entry))
+        {
+            state.log = None;
+            state.problem.get_or_insert(format!(
+                "the run log {} could not be written, so this run will not be shown whole after \
+                 a restart: {error}",
+                self.file.display()
+            ));
+        }
+        state.apply(&entry);
+        state.entries.push(entry);
     }
 
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
@@ -1800,8 +1924,17 @@ impl RunState {
             | Entry::ToolUpdate { .. }
             | Entry::Plan { .. }
             | Entry::Unreadable { .. }
-            | Entry::Findings { .. } => {}
+            | Entry::Findings { .. }
+            | Entry::Snapshot { .. } => {}
         }
+    }
+
+    /// The tree of the run's snapshot at `point`, when one was taken.
+    fn snapshot(&self, point: Point) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            Entry::Snapshot { point: at, tree } if *at == point => Some(tree.as_str()),
+            _ => None,
+        })
     }
 
     fn status(&self) -> Status {
@@ -2239,5 +2372,31 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("secret"), "{shown}");
+    }
+
+    #[test]
+    fn a_snapshot_point_is_recorded_once_and_only_while_the_run_is_live() {
+        let dir = std::env::temp_dir().join(format!("postil-run-snap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
+        let points = |run: &Run| {
+            run.state()
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, Entry::Snapshot { .. }))
+                .count()
+        };
+        // A forced stop and the agent's last event may both end a run: one snapshot after.
+        run.record_snapshot(Point::After, "a1".to_owned());
+        run.record_snapshot(Point::After, "a2".to_owned());
+        assert_eq!(points(&run), 1);
+        assert_eq!(run.state().snapshot(Point::After), Some("a1"));
+        run.record(Entry::Ended {
+            reason: StopReason::EndTurn,
+        });
+        run.record_snapshot(Point::Before, "b".to_owned());
+        assert_eq!(points(&run), 1, "an ended run takes no snapshot");
+        drop(run);
+        drop(fs::remove_dir_all(&dir));
     }
 }
