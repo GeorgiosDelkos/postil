@@ -60,6 +60,8 @@ cat >"$staged/Contents/Info.plist" <<PLIST
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>A coding agent Postil started wants to control another app.</string>
 </dict>
 </plist>
 PLIST

@@ -5,8 +5,8 @@
 #
 # Usage: scripts/install.sh [DIR], DIR being where to install instead. Quit Postil first: a
 # running copy keeps running the old build until it is quit. Needs what scripts/bundle.sh
-# needs, and macOS's `trash` and `ditto`. With POSTIL_SIGN_IDENTITY set, it signs (and with the
-# notary variables, notarizes) the bundle through scripts/sign.sh before installing it.
+# needs, and macOS's `trash` and `ditto`. With POSTIL_SIGN_IDENTITY set, it signs (and with
+# POSTIL_NOTARY_PROFILE, notarizes) the bundle through scripts/sign.sh before installing it.
 set -euo pipefail
 
 usage="usage: scripts/install.sh [DIR]"
@@ -33,6 +33,12 @@ elif [[ -w /Applications ]]; then
   dest=/Applications
 else
   dest="$HOME/Applications"
+fi
+
+# A notary profile without a certificate would be ignored, and an unsigned app installed.
+if [[ -n "${POSTIL_NOTARY_PROFILE:-}" && -z "${POSTIL_SIGN_IDENTITY:-}" ]]; then
+  echo "POSTIL_NOTARY_PROFILE is set but POSTIL_SIGN_IDENTITY is not: set both, or neither" >&2
+  exit 2
 fi
 
 "$root/scripts/bundle.sh"

@@ -98,17 +98,23 @@ scripts/install.sh
 ```
 
 To sign the app with a Developer ID certificate and notarize it, so it opens on other Macs
-without a Gatekeeper warning, set these first; `scripts/install.sh` then signs before it
-installs (`scripts/sign.sh` signs a bundle on its own):
+without a Gatekeeper warning, store your App Store Connect API key in the keychain once (keep
+the `.p8` file outside the repository, and delete it after):
+
+```sh
+xcrun notarytool store-credentials postil \
+  --key /path/to/AuthKey_XXXXXXXXXX.p8 --key-id XXXXXXXXXX --issuer xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+Then set these, and `scripts/install.sh` signs and notarizes before it installs
+(`scripts/sign.sh` signs a bundle on its own):
 
 ```sh
 export POSTIL_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export POSTIL_NOTARY_KEY=/path/to/AuthKey_XXXXXXXXXX.p8   # App Store Connect API key
-export POSTIL_NOTARY_KEY_ID=XXXXXXXXXX
-export POSTIL_NOTARY_ISSUER=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export POSTIL_NOTARY_PROFILE=postil
 ```
 
-Without the three notary variables it signs only.
+Without `POSTIL_NOTARY_PROFILE` it signs only.
 
 ## Agents
 

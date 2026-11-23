@@ -8,10 +8,10 @@
 # It reads the credentials from the environment, so none of them is written in the repository:
 #   POSTIL_SIGN_IDENTITY   the certificate's name as `security find-identity -v -p codesigning`
 #                          lists it, such as "Developer ID Application: Name (TEAMID)". Required.
-#   POSTIL_NOTARY_KEY      the App Store Connect API key file (AuthKey_XXXX.p8),
-#   POSTIL_NOTARY_KEY_ID   its key ID, and
-#   POSTIL_NOTARY_ISSUER   its issuer ID. With all three it notarizes and staples; with none it
-#                          signs only and says so; with some, it stops.
+#   POSTIL_NOTARY_PROFILE  a notarytool keychain profile, made once from an App Store Connect
+#                          API key with `xcrun notarytool store-credentials NAME --key
+#                          AuthKey_XXXX.p8 --key-id ID --issuer ISSUER`; the key then lives in
+#                          the keychain, and the .p8 file can go. Without it, it signs only.
 set -euo pipefail
 
 usage="usage: scripts/sign.sh [APP]"
@@ -21,16 +21,18 @@ if [[ $# -gt 1 ]]; then
   echo "$usage" >&2
   exit 2
 fi
-case "${1:-}" in
--h | --help)
-  echo "$usage"
-  exit 0
-  ;;
--*)
-  echo "$usage" >&2
-  exit 2
-  ;;
-esac
+if [[ $# -eq 1 ]]; then
+  case "$1" in
+  -h | --help)
+    echo "$usage"
+    exit 0
+    ;;
+  "" | -*)
+    echo "$usage" >&2
+    exit 2
+    ;;
+  esac
+fi
 app="${1:-$root/target/release/Postil.app}"
 
 if [[ -z "${POSTIL_SIGN_IDENTITY:-}" ]]; then
@@ -42,26 +44,19 @@ if [[ ! -d "$app" ]]; then
   echo "no app at $app: run scripts/bundle.sh first" >&2
   exit 1
 fi
-notary_set=0
-for name in POSTIL_NOTARY_KEY POSTIL_NOTARY_KEY_ID POSTIL_NOTARY_ISSUER; do
-  if [[ -n "${!name:-}" ]]; then
-    notary_set=$((notary_set + 1))
-  fi
-done
-if [[ $notary_set -ne 0 && $notary_set -ne 3 ]]; then
-  echo "set all of POSTIL_NOTARY_KEY, POSTIL_NOTARY_KEY_ID and POSTIL_NOTARY_ISSUER, or none" >&2
-  exit 2
-fi
 
-# The hardened runtime is what notarization requires. Postil needs no exception from it: the
-# webview's JIT runs in WebKit's own processes, and the agents it starts are programs of their
-# own, signed or not by their makers.
-codesign --force --options runtime --timestamp --sign "$POSTIL_SIGN_IDENTITY" "$app"
+# The hardened runtime is what notarization requires. Postil needs one exception from it,
+# assets/Postil.entitlements: macOS holds Postil responsible for the agents it starts, so an
+# agent's `osascript` sends Apple Events as Postil, which the runtime refuses without it. The
+# webview's JIT runs in WebKit's own processes and needs none.
+codesign --force --options runtime --timestamp \
+  --entitlements "$root/assets/Postil.entitlements" \
+  --sign "$POSTIL_SIGN_IDENTITY" "$app"
 codesign --verify --strict --verbose=2 "$app"
 echo "signed $app"
 
-if [[ $notary_set -eq 0 ]]; then
-  echo "not notarized: POSTIL_NOTARY_KEY, POSTIL_NOTARY_KEY_ID and POSTIL_NOTARY_ISSUER are unset"
+if [[ -z "${POSTIL_NOTARY_PROFILE:-}" ]]; then
+  echo "not notarized: POSTIL_NOTARY_PROFILE is unset"
   exit 0
 fi
 
@@ -70,10 +65,17 @@ trap 'trash "$work"' EXIT
 # notarytool takes a zip, a disk image or a package, not a bare bundle.
 ditto -c -k --keepParent "$app" "$work/Postil.zip"
 xcrun notarytool submit "$work/Postil.zip" \
-  --key "$POSTIL_NOTARY_KEY" \
-  --key-id "$POSTIL_NOTARY_KEY_ID" \
-  --issuer "$POSTIL_NOTARY_ISSUER" \
-  --wait
+  --keychain-profile "$POSTIL_NOTARY_PROFILE" \
+  --wait --output-format json >"$work/submission.json"
+# notarytool can exit 0 with a rejected submission, so its status is read, and on a rejection
+# Apple's log says why.
+status="$(plutil -extract status raw -o - "$work/submission.json")"
+if [[ "$status" != "Accepted" ]]; then
+  id="$(plutil -extract id raw -o - "$work/submission.json")"
+  echo "notarization $id: $status" >&2
+  xcrun notarytool log "$id" --keychain-profile "$POSTIL_NOTARY_PROFILE" >&2
+  exit 1
+fi
 # Stapling puts the notarization ticket in the bundle, so Gatekeeper accepts it offline too.
 xcrun stapler staple "$app"
 spctl --assess --type execute --verbose=2 "$app"

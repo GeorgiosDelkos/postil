@@ -724,9 +724,10 @@ retired; the measured numbers above are the baseline to not regress.
    one. `scripts/install.sh` builds the bundle and installs it in `/Applications` (or
    `~/Applications` when that is not writable), moving an older copy to the Trash. Focus mode
    and motion (section "Look and feel") are built. `scripts/sign.sh` signs the bundle with the
-   hardened runtime and notarizes and staples it, from a Developer ID certificate and an App
-   Store Connect API key named in environment variables, so no credential is in the
-   repository; `scripts/install.sh` runs it when they are set. Not yet: a published release.
+   hardened runtime (one exception: Apple Events, which agents Postil starts send as Postil) and
+   notarizes and staples it, from a Developer ID certificate and a notarytool keychain profile
+   holding an App Store Connect API key, both named in environment variables, so no credential
+   is in the repository; `scripts/install.sh` runs it when they are set. Not yet: a published release.
 
 ## Testing
 
