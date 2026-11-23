@@ -35,8 +35,9 @@
 //! The app never rewrites a log. It reads logs to show runs, and deletes one with the last of
 //! its notes (`Runner::delete_runs_without_notes`). `runs/active.lock` also holds the highest
 //! run number ever given, so a deleted run's number is not given again unless a crash loses
-//! the counter (`last_run`). A log with no end is shown as unfinished: the app quit or the
-//! project was closed while it ran, or another window is running it.
+//! the counter (`last_run`). A log with no end is shown as unfinished: the app crashed or was
+//! killed while it ran, or another window is running it. Closing the project or quitting ends
+//! a run under way as failed ([`Runner::close`]).
 //!
 //! # Threads and locks
 //!
@@ -906,15 +907,23 @@ impl Runner {
     }
 
     /// Stops the agent, running or starting, and ignores anything it would still report: the
-    /// project is closing, or the app quits.
+    /// project is closing, or the app quits. A run under way ends as failed, saying so, so it
+    /// does not read as another window's.
     pub(crate) fn close(&self) {
-        let released = {
+        let (released, run) = {
             let mut slot = self.slot();
             slot.closed = true;
             slot.chain = None;
-            slot.release()
+            (slot.release(), slot.run.clone())
         };
+        // The agent is gone first, so nothing it reports lands after the end. `closed` drops
+        // its events anyway.
         drop(released);
+        if let Some(run) = run.filter(|run| run.state().live()) {
+            run.record(Entry::Failed {
+                error: "stopped: Postil closed the project while it ran".to_owned(),
+            });
+        }
     }
 
     fn slot(&self) -> MutexGuard<'_, Slot> {

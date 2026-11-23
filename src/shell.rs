@@ -5084,6 +5084,14 @@ mod tests {
             site_root(&other.root)
         );
         assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
+
+        // The stopped run says it was stopped, so it does not read as another window's.
+        let stopped = fs::read_to_string(repo.root.join(".git/postil/runs/R2.jsonl")).unwrap();
+        let end = stopped.lines().last().unwrap();
+        assert!(
+            end.contains("Postil closed the project while it ran"),
+            "{end}"
+        );
     }
 
     #[test]
