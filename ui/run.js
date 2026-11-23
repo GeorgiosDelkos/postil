@@ -123,6 +123,23 @@ export function openPermission(items) {
 // Which key answers with which option: `a` allows once, `A` (Shift-a) always, `r` rejects.
 // "Always" is offered only when the agent offers it (docs/design.md, "ACP integration"); a
 // reject falls back to "reject always" when the agent offers no plain reject.
+// Whether the agent has not yet reported a tool call finished.
+export function underWay(tool) {
+  return tool.status === "pending" || tool.status === "in_progress";
+}
+
+// The permission key a keydown means: "a", "A" (Shift-a) or "r", or null. The character
+// decides, so every keyboard layout answers with the keys the buttons show, but its case does
+// not: with Caps Lock on, `a` types "A", which must not allow always; only Shift does. A held
+// key answers once.
+export function permissionKey(event) {
+  if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return null;
+  const key = event.key.toLowerCase();
+  if (key === "a") return event.shiftKey ? "A" : "a";
+  if (key === "r" && !event.shiftKey) return "r";
+  return null;
+}
+
 export function permissionKeys(options) {
   const first = (kind) => options.find((option) => option.kind === kind)?.id;
   const keys = new Map();
@@ -170,7 +187,7 @@ export function toolRow(tool, live) {
     const stats = diffStats(tool.output);
     state = stats ? `+${stats.added} -${stats.removed}` : "done";
   } else state = live ? "" : "unfinished";
-  const running = live && (tool.status === "pending" || tool.status === "in_progress");
+  const running = live && underWay(tool);
   return { verb, target, state, running };
 }
 
@@ -181,7 +198,7 @@ export function diffStats(output) {
   let added = 0;
   let removed = 0;
   for (const diff of diffs) {
-    for (const line of diffLines(diff.oldText ?? "", diff.newText)) {
+    for (const line of partLines(diff)) {
       if (line.kind === "add") added += 1;
       else if (line.kind === "del") removed += 1;
     }
@@ -189,44 +206,85 @@ export function diffStats(output) {
   return { added, removed };
 }
 
+// A diff part's lines, computed once per part: a run's entries keep their objects from fetch
+// to fetch, and the panel asks again on every update.
+const computed = new WeakMap();
+export function partLines(part) {
+  let lines = computed.get(part);
+  if (!lines) {
+    lines = diffLines(part.oldText ?? "", part.newText);
+    computed.set(part, lines);
+  }
+  return lines;
+}
+
+// The most edits diffLines looks for before it gives up and counts every line as changed.
+// Its time grows with the lines times the edits, so this bounds it to a few million steps
+// for files of thousands of lines; an agent's edit changes far fewer lines. Arbitrary.
+export const MAX_EDITS = 1000;
+
 // A line diff of two texts: each line `same`, `del` or `add`, in order, with the removed
-// lines of a change before the added ones. From the longest common subsequence of the
-// lines; past a few million line pairs that table would stall the page, so every line is
-// counted as changed instead.
+// lines of a change before the added ones. Myers' O((N+M)D) algorithm ("An O(ND) Difference
+// Algorithm and Its Variations", 1986), keeping each round's frontier for the walk back, so
+// a small change in a large file is cheap where a table of every line pair was not.
 export function diffLines(oldText, newText) {
   const before = splitLines(oldText);
   const after = splitLines(newText);
-  if (before.length * after.length > 4_000_000) {
-    return [
-      ...before.map((text) => ({ kind: "del", text })),
-      ...after.map((text) => ({ kind: "add", text })),
-    ];
-  }
-  // `common[i][j]`: the common subsequence length of before[i..] and after[j..].
-  const common = Array.from({ length: before.length + 1 }, () => new Array(after.length + 1).fill(0));
-  for (let i = before.length - 1; i >= 0; i -= 1) {
-    for (let j = after.length - 1; j >= 0; j -= 1) {
-      common[i][j] =
-        before[i] === after[j] ? common[i + 1][j + 1] + 1 : Math.max(common[i + 1][j], common[i][j + 1]);
+  const n = before.length;
+  const m = after.length;
+  const offset = n + m + 1;
+  const reach = new Int32Array(2 * offset + 1);
+  // trace[d] is the frontier before round d, over diagonals -d-1..d+1.
+  const trace = [];
+  for (let d = 0; d <= Math.min(n + m, MAX_EDITS); d += 1) {
+    trace.push(reach.slice(offset - d - 1, offset + d + 2));
+    for (let k = -d; k <= d; k += 2) {
+      const down = k === -d || (k !== d && reach[offset + k - 1] < reach[offset + k + 1]);
+      let x = down ? reach[offset + k + 1] : reach[offset + k - 1] + 1;
+      let y = x - k;
+      while (x < n && y < m && before[x] === after[y]) {
+        x += 1;
+        y += 1;
+      }
+      reach[offset + k] = x;
+      if (x >= n && y >= m) return walkBack(trace, before, after);
     }
   }
+  return [
+    ...before.map((text) => ({ kind: "del", text })),
+    ...after.map((text) => ({ kind: "add", text })),
+  ];
+}
+
+// The edit script, from the frontiers diffLines kept, read from the end back to the start.
+function walkBack(trace, before, after) {
   const lines = [];
-  let i = 0;
-  let j = 0;
-  while (i < before.length || j < after.length) {
-    if (i < before.length && j < after.length && before[i] === after[j]) {
-      lines.push({ kind: "same", text: before[i] });
-      i += 1;
-      j += 1;
-    } else if (j >= after.length || (i < before.length && common[i + 1][j] >= common[i][j + 1])) {
-      lines.push({ kind: "del", text: before[i] });
-      i += 1;
-    } else {
-      lines.push({ kind: "add", text: after[j] });
-      j += 1;
+  let x = before.length;
+  let y = after.length;
+  for (let d = trace.length - 1; d >= 0; d -= 1) {
+    const frontier = trace[d];
+    const at = (k) => frontier[k + d + 1];
+    const k = x - y;
+    const down = k === -d || (k !== d && at(k - 1) < at(k + 1));
+    const previousK = down ? k + 1 : k - 1;
+    const previousX = at(previousK);
+    const previousY = previousX - previousK;
+    while (x > previousX && y > previousY) {
+      x -= 1;
+      y -= 1;
+      lines.push({ kind: "same", text: before[x] });
+    }
+    if (d > 0) {
+      if (down) {
+        y -= 1;
+        lines.push({ kind: "add", text: after[y] });
+      } else {
+        x -= 1;
+        lines.push({ kind: "del", text: before[x] });
+      }
     }
   }
-  return lines;
+  return lines.reverse();
 }
 
 function splitLines(text) {

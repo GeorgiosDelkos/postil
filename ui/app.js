@@ -840,15 +840,24 @@ async function saveNote(composer) {
 }
 
 // The reply to `api/notes`: { ok, body }, the body the notes or the reason they failed.
+// Every notes reply is numbered as it is asked for, and one older than a reply already shown
+// is dropped: a run's updates read the notes again and again, and an older file must not be
+// painted over a newer one.
+let notesAsked = 0;
+let notesShown = 0;
+
 async function fetchNotes() {
+  const number = ++notesAsked;
   const response = await fetch("api/notes");
   const body = response.ok ? (await response.json()).notes : await response.text();
-  return { ok: response.ok, body };
+  return { ok: response.ok, body, number };
 }
 
 // Takes a reply of `fetchNotes`. A failure (an unreadable review file) is shown in the tray,
 // and the notes drawn so far stay.
 function applyNotes(reply) {
+  if (reply.number < notesShown) return false;
+  notesShown = reply.number;
   if (reply.ok) state.notes = reply.body;
   else notesEl.replaceChildren(el("div", "empty", reply.body));
   return reply.ok;
@@ -1067,7 +1076,7 @@ function renderSendBar() {
   picker.hidden = !state.send;
   picker.replaceChildren(chosenAgent() ?? "Choose an agent", el("span", "chevron", "▴"));
   const button = $("send-button");
-  const count = state.send ? state.send.ticked.size : open;
+  const count = state.send ? tickedIds().length : open;
   const noun = count === 1 ? "1 note" : `${count} notes`;
   button.replaceChildren(state.send ? `Send ${noun}` : `Send ${noun}…`, el("kbd", "", "⌘⇧↵"));
   button.disabled = Boolean(state.send) && (count === 0 || !chosenAgent() || state.send.sending);
@@ -1137,7 +1146,7 @@ async function showPrompt() {
 
 async function sendNotes() {
   const agent = chosenAgent();
-  if (!state.send || state.send.sending || state.send.ticked.size === 0 || !agent) return;
+  if (!state.send || state.send.sending || tickedIds().length === 0 || !agent) return;
   state.send.sending = true;
   renderSendBar();
   const response = await fetch("api/run", {
@@ -1194,6 +1203,8 @@ function showTab(tab) {
   $("note-count").hidden = run;
   $("run-header").hidden = !run;
   renderSendBar();
+  // Measured only now that the panel shows: a run that comes to the front opens at its end.
+  if (run) runs.reveal();
 }
 
 $("tab-notes").addEventListener("click", () => showTab("notes"));
@@ -1225,6 +1236,14 @@ function followRun(run, previous) {
   // (docs/design.md, "Working with the repository").
   if (!fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run))) {
     refresh().catch((error) => showToast(String(error)));
+  } else if (
+    !run.problem &&
+    run.notes.some((id) => state.notes.find((note) => note.id === id && isOpen(note)))
+  ) {
+    // Its notes are marked sent once the agent takes the turn, which is no status change and
+    // no edit: read them until they show it. A run whose notes could not be marked says so
+    // in `problem`, and they are not read on every update after that.
+    loadNotes().catch((error) => showToast(String(error)));
   }
   renderSendBar();
 }
@@ -1489,6 +1508,7 @@ function quit() {
 // the open file, and the notes change while the engineer is in another app, so all three are
 // read again on return and drawn once, so the notes never show on the old text. Not while
 // the composer is open: reading the file again would move its lines under the text.
+let refreshes = 0;
 async function refresh() {
   // A project being opened replaces this page: what a refresh drew would be thrown away,
   // and its requests would already reach the new project.
@@ -1500,13 +1520,16 @@ async function refresh() {
   }
   if (!state.projectOpen || state.composer) return;
   const path = state.wanted;
+  // A later refresh may answer first, as a run's edits come one after another: only the
+  // latest refresh draws, or an older file would be painted over a newer one.
+  const generation = ++refreshes;
   const [repo, notes, file] = await Promise.all([
     fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
     fetchNotes(),
     path ? fetchFile(path) : null,
   ]);
   // The engineer moved on while the replies were in flight: their action wins.
-  if (state.composer || state.wanted !== path) return;
+  if (state.composer || state.wanted !== path || generation !== refreshes) return;
 
   if (repo) showRepo(repo);
   applyNotes(notes);

@@ -70,8 +70,8 @@ use crate::repo::Repo;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long after the first Stop a second one kills the agent. Arbitrary: longer than a double
-/// click or a second Escape, short enough that a hung agent is not waited on. The page keeps a
-/// copy, `FORCE_AFTER_MS` in ui/run-panel.js, to offer Force stop from then on.
+/// click or a second Escape, short enough that a hung agent is not waited on. The page learns
+/// when from [`RunView`]'s `force_in`.
 const FORCE_AFTER: Duration = Duration::from_secs(3);
 
 /// How long a send waits for the run lock before it reports another window's run
@@ -695,6 +695,9 @@ pub(crate) struct RunView {
     /// How many entries the run has; the page asks for the ones after it next time.
     total: usize,
     problem: Option<String>,
+    /// Milliseconds until a second Stop ends the agent, 0 once it would, while this process
+    /// is stopping the run; the page offers Force stop from then on, after a reload too.
+    force_in: Option<u64>,
 }
 
 impl Run {
@@ -919,6 +922,10 @@ impl Run {
             entries: state.entries.get(after..).unwrap_or_default().to_vec(),
             total: state.entries.len(),
             problem: state.problem.clone(),
+            force_in: state.cancel_asked.filter(|_| state.live()).map(|at| {
+                u64::try_from(FORCE_AFTER.saturating_sub(at.elapsed()).as_millis())
+                    .expect("at most FORCE_AFTER, 3 s")
+            }),
         }
     }
 }
