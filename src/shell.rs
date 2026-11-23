@@ -52,6 +52,8 @@ const SETTINGS_DIALOG_JS: &str = include_str!("../ui/settings-dialog.js");
 const RUN_JS: &str = include_str!("../ui/run.js");
 const RUN_PANEL_JS: &str = include_str!("../ui/run-panel.js");
 const PANES_JS: &str = include_str!("../ui/panes.js");
+const STATUS_JS: &str = include_str!("../ui/status.js");
+const NOTE_DIALOG_JS: &str = include_str!("../ui/note-dialog.js");
 const ICONS_SVG: &str = include_str!("../ui/icons.svg");
 const GEIST: &[u8] = include_bytes!("../ui/fonts/Geist-Variable.woff2");
 const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/GeistMono-Variable.woff2");
@@ -768,6 +770,10 @@ impl Site {
             "/run.js" => reply(StatusCode::OK, "text/javascript", RUN_JS.as_bytes()),
             "/panes.js" => reply(StatusCode::OK, "text/javascript", PANES_JS.as_bytes()),
             "/run-panel.js" => reply(StatusCode::OK, "text/javascript", RUN_PANEL_JS.as_bytes()),
+            "/status.js" => reply(StatusCode::OK, "text/javascript", STATUS_JS.as_bytes()),
+            "/note-dialog.js" => {
+                reply(StatusCode::OK, "text/javascript", NOTE_DIALOG_JS.as_bytes())
+            }
             "/icons.svg" => reply(StatusCode::OK, "image/svg+xml", ICONS_SVG.as_bytes()),
             "/fonts/Geist-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST),
             "/fonts/GeistMono-Variable.woff2" => reply(StatusCode::OK, "font/woff2", GEIST_MONO),
@@ -922,14 +928,15 @@ impl Site {
         let post = *request.method() == Method::POST;
         match uri.path() {
             "/api/run" => match *request.method() {
-                Method::GET => json_or_error(
-                    after_of(uri.query().unwrap_or("")).and_then(|after| self.run_view(after)),
-                ),
+                Method::GET => json_or_error(match query_value(uri.query().unwrap_or(""), "id") {
+                    Some(id) => self.runner().and_then(|runner| runner.view_of(&id)).map(|view| to_json(&view)),
+                    None => after_of(uri.query().unwrap_or("")).and_then(|after| self.run_view(after)),
+                }),
                 Method::POST => json_or_error(self.send_run(request.body())),
                 _ => reply(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "text/plain",
-                    &b"GET the latest run (?after=<entries seen>) or POST a new one"[..],
+                    &b"GET the latest run (?after=<entries seen>) or one run (?id=R1), or POST a new one"[..],
                 ),
             },
             "/api/run/preview" if *request.method() != Method::GET => reply(
@@ -1161,7 +1168,9 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsChanged
                 | Error::TurnRunning
                 | Error::RunElsewhere => StatusCode::CONFLICT,
-                Error::NoSuchNote { .. } | Error::NoSuchPermission => StatusCode::NOT_FOUND,
+                Error::NoSuchNote { .. } | Error::NoSuchPermission | Error::NoSuchRun { .. } => {
+                    StatusCode::NOT_FOUND
+                }
                 // The agent, the server behind this one, failed.
                 Error::AgentNotFound { .. }
                 | Error::StartAgent { .. }
@@ -3013,6 +3022,48 @@ mod tests {
             kinds(&third).contains(&"message:prompt 1".to_owned()),
             "{third}"
         );
+    }
+
+    #[test]
+    fn any_run_can_be_read_by_its_id_in_this_window_and_from_disk_in_another() {
+        let repo = TempRepo::new("run-by-id");
+        repo.write("a.txt", "a\nb\n");
+        let (site, nudges) = run_site(&repo, "plain");
+        post_note(&site, "a.txt", 1, 1, "one");
+        post_note(&site, "a.txt", 2, 2, "two");
+        send(&site, &["N1"]);
+        wait_for(&site, &nudges, "ended");
+        send(&site, &["N2"]);
+        let second = wait_for(&site, &nudges, "ended");
+
+        let first = get_json(&site, &format!("{RUN}?id=R1"));
+        assert_eq!(first["id"], "R1");
+        assert_eq!(first["notes"], serde_json::json!(["N1"]));
+        assert!(
+            kinds(&first).contains(&"message:prompt 1".to_owned()),
+            "{first}"
+        );
+        assert_eq!(
+            get_json(&site, &format!("{RUN}?id=R2")),
+            second,
+            "this window's run, whole"
+        );
+
+        // Another window has run nothing: it reads the logs.
+        let (other, _) = run_site(&repo, "plain");
+        assert_eq!(get_json(&other, &format!("{RUN}?id=R1")), first);
+
+        for (id, words) in [
+            ("R3", "no such run log"),
+            ("R01", "a run id is R and a number"),
+            ("R+1", "a run id is R and a number"),
+            ("..%2FR1", "a run id is R and a number"),
+            ("", "a run id is R and a number"),
+        ] {
+            let (status, body) = get(&site, &format!("{RUN}?id={id}"));
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+            assert!(body.contains(words), "{id}: {body}");
+        }
     }
 
     #[test]

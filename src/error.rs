@@ -188,6 +188,13 @@ pub enum Error {
     RunElsewhere,
     /// A permission request was answered that is not open: already answered, or cancelled.
     NoSuchPermission,
+    /// A run was asked for by an id that names no readable run log.
+    NoSuchRun {
+        /// The id asked for, `R2`.
+        id: String,
+        /// Why it cannot be shown: no such log, or what is wrong with it.
+        problem: String,
+    },
 }
 
 // Written by hand instead of with `thiserror` to keep the dependency tree small
@@ -326,6 +333,7 @@ impl fmt::Display for Error {
                 f,
                 "that permission request is no longer open (it was answered or cancelled)"
             ),
+            Self::NoSuchRun { id, problem } => write!(f, "cannot show the run {id}: {problem}"),
         }
     }
 }
@@ -382,7 +390,8 @@ impl std::error::Error for Error {
             | Self::AgentProtocol(_)
             | Self::TurnRunning
             | Self::RunElsewhere
-            | Self::NoSuchPermission => None,
+            | Self::NoSuchPermission
+            | Self::NoSuchRun { .. } => None,
         }
     }
 }

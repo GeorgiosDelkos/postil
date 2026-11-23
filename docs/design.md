@@ -155,6 +155,7 @@ schedule three tasks.
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables. |
 | `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel's drawing. |
+| `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 
 ### Data structures
 
@@ -304,6 +305,7 @@ Built in `src/run.rs`, with the API the page calls:
 | `GET /api/run/preview?notes=N1,N2` | The prompt's text, exactly as the agent receives it. |
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
 | `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
+| `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
 | `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered. |
 | `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
 
@@ -343,6 +345,26 @@ Built in `src/run.rs`, with the API the page calls:
   pending, since an agent streams its reply in many small parts.
 - Closing the project or quitting kills the agent's process group (`npx` leaves `node`
   running), a starting agent's too. A run cut short this way reads as unfinished.
+
+### Notes and their status
+
+The tray shows each note with where it is in the loop, worked out in the page
+(`ui/status.js`) from the note's sent mark and its run: the live run from the run panel, any
+other read once by id (`GET /api/run?id=R2`) and kept, since a finished run does not change.
+One source of run state, the log, so the Rust process has no second summary to keep in step.
+
+- **Statuses:** Open; Starting, Working (or Stopping) and Needs you while its run is live;
+  then Addressed when the agent's reply has a line for the note (`N3: ...`, which the prompt
+  asks for), No word when it has none, Stopped, Failed, or Unfinished. A note whose turn the
+  agent refused is open again. The tray groups them: in the live run, open, and done, newest
+  run first.
+- **The note detail** (`ui/note-dialog.js`) opens from a card: the note, its lines, what the
+  agent said about it, and the run's history for it (tool calls on its file, plan steps that
+  name it). Show in code closes it and scrolls to the note.
+- **Sending one note:** the arrow on a card, or Send in the detail, sends that note alone to
+  the default agent at once and stays on the notes; Shift-click opens the send step with only
+  it ticked. Decided with the owner on 2026-11-23. A run that starts no longer takes the tray
+  to the Run tab unless it came from the send step; one that needs the engineer still does.
 
 ### Agents
 

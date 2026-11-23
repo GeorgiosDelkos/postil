@@ -2170,3 +2170,344 @@ body.resizing * {
   cursor: col-resize !important;
   user-select: none !important;
 }
+
+/* Notes with their status (docs/design.md, "Notes and their status"): the tray's groups, each
+   card's status icon and line, the arrow that sends one note, and the note's detail. */
+
+.note-group {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 2px 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.note-status {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: "Geist", system-ui, sans-serif;
+}
+
+.note-status.attention {
+  color: var(--attention);
+}
+
+.note-status.done {
+  color: var(--added);
+}
+
+.note-status.failed {
+  color: var(--removed);
+}
+
+.note-place {
+  flex: none;
+}
+
+.note.needs {
+  border-color: var(--attention-border);
+}
+
+.note-foot {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.note-foot strong {
+  color: var(--text-soft);
+  font-weight: 600;
+}
+
+.status-icon {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  display: inline-grid;
+  place-items: center;
+  box-sizing: border-box;
+  border: 1.5px solid var(--text-muted);
+  border-radius: 50%;
+  color: var(--canvas);
+  font: 700 9px/1 "Geist", system-ui, sans-serif;
+}
+
+.status-icon.starting,
+.status-icon.working {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: spin 0.9s linear infinite;
+}
+
+.status-icon.needs {
+  border: 0;
+  background: var(--attention);
+}
+
+.status-icon.addressed {
+  border: 0;
+  background: var(--added);
+}
+
+.status-icon.failed {
+  border: 0;
+  background: var(--removed);
+}
+
+.status-icon.silent,
+.status-icon.stopped {
+  border: 0;
+  background: var(--text-muted);
+}
+
+.status-icon.stopped {
+  border-radius: 3px;
+  transform: scale(0.75);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-icon.starting,
+  .status-icon.working {
+    animation: none;
+  }
+}
+
+.note-send {
+  position: absolute;
+  top: 6px;
+  right: 34px;
+  height: 22px;
+  min-width: 22px;
+  padding: 0 6px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--text-strong);
+  font: inherit;
+  font-size: 12px;
+  line-height: 20px;
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.note-item:hover .note-send,
+.note-send:focus-visible {
+  opacity: 1;
+}
+
+.note-send:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.note-item.confirming .note-send {
+  display: none;
+}
+
+.note-dialog {
+  width: min(760px, 100vw - 48px);
+  max-height: min(820px, 100vh - 64px);
+  padding: 0;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  color: var(--text);
+}
+
+.note-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.note-dialog::backdrop {
+  background: rgb(0 0 0 / 35%);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.note-dialog-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.note-dialog-header .status-icon {
+  width: 16px;
+  height: 16px;
+  font-size: 11px;
+}
+
+.note-dialog-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.note-dialog-title.attention {
+  color: var(--attention);
+}
+
+.note-dialog-where {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: 12px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.note-dialog-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.note-dialog-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.note-dialog-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.note-dialog-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.note-dialog-stats {
+  font-family: "Geist Mono", monospace;
+  color: var(--added);
+}
+
+.note-dialog-note {
+  font-size: 13.5px;
+  line-height: 20px;
+  color: var(--text-strong);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.note-dialog-snippet {
+  margin: 0;
+  padding: 8px 0;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--canvas);
+  border-radius: 8px;
+  font: 12px/20px "Geist Mono", monospace;
+}
+
+.note-dialog-snippet .row {
+  display: flex;
+}
+
+.note-dialog-snippet .number {
+  flex: none;
+  width: 44px;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--line-number);
+}
+
+.note-dialog-snippet .text {
+  white-space: pre;
+  padding-right: 12px;
+}
+
+.note-dialog-said {
+  font-size: 13px;
+  line-height: 19px;
+  overflow-wrap: anywhere;
+}
+
+.note-dialog-said.muted {
+  color: var(--text-muted);
+}
+
+.note-dialog-history {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+
+.note-dialog-history li {
+  display: flex;
+  gap: 8px;
+  min-height: 24px;
+  align-items: center;
+}
+
+.note-dialog-history .verb {
+  flex: none;
+  width: 40px;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--text-muted);
+}
+
+.note-dialog-history .target {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.note-dialog-history .tool .target {
+  font: 11.5px "Geist Mono", monospace;
+}
+
+.note-dialog-history .state {
+  margin-left: auto;
+  font: 11.5px "Geist Mono", monospace;
+  color: var(--added);
+}
+
+.note-dialog-history .end {
+  color: var(--text-muted);
+}
+
+.note-dialog-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.note-dialog-footer .spacer {
+  flex: 1;
+}

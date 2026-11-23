@@ -8,10 +8,12 @@
 import { rank } from "./fuzzy.js";
 import { fileIcon, folderIcon } from "./icons.js";
 import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
+import { noteDialog, statusIcon } from "./note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
+import { elapsed, foldRun, isLive, isOpen, promptLines, sendable, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
+import { agentSaid, groupNotes, latestOnFile, noteStatus, planProgress, runOf } from "./status.js";
 import { ancestors, buildTree, folderCounts, visibleRows } from "./tree.js";
 
 const $ = (id) => document.getElementById(id);
@@ -80,6 +82,11 @@ const state = {
   send: null,
   // Which of the tray's tabs shows: "notes" or "run".
   tab: "notes",
+  // The runs notes were sent in, by id, read once each (`GET api/run?id=R1`): only runs that
+  // are over are kept, and they do not change. The live run is the run panel's.
+  runCache: new Map(),
+  // Run ids asked for and not answered yet, or that could not be read: not asked again.
+  runsAsked: new Set(),
 };
 
 function el(tag, className, text) {
@@ -931,6 +938,11 @@ function measureComposer(node) {
   }
 }
 
+// The tray: in the send step, every note with its checkbox, in the prompt's order; otherwise
+// the notes grouped by where they are in the loop (status.js), each card with its status.
+// Drawn again only when what it shows changed: a run updates many times a second, and a
+// redraw would drop a card's hover and a delete waiting for its second click.
+let drawnNotes = null;
 function renderNotes() {
   const count = state.notes.length;
   $("note-count").textContent = state.send
@@ -939,39 +951,177 @@ function renderNotes() {
       ? "1 note"
       : `${count} notes`;
   renderSendBar();
+  noteDetail.draw();
+  fetchRuns();
   if (count === 0) {
+    drawnNotes = null;
     const empty = el("div", "empty", "Select lines, then press ");
     empty.append(el("kbd", "", "c"), " to write a note.");
     notesEl.replaceChildren(empty);
     return;
   }
+  if (state.send) {
+    drawnNotes = null;
+    notesEl.replaceChildren(...state.notes.map(sendItem));
+    return;
+  }
 
-  const items = state.notes.map((note) => {
-    const outdated = note.anchor === "lost";
-    const card = el("button", outdated ? "note outdated" : "note");
-    card.type = "button";
-    const { start, end } = note.lines;
-    const lines = start === end ? start : `${start}-${end}`;
-    const where = el("div", "note-where");
-    const run = sentIn(note);
-    const marks = [note.id, outdated ? "outdated" : null, run ? `sent in ${run}` : null];
-    where.append(
-      el("span", "", `${note.path}:${lines}`),
-      el("span", "note-id", marks.filter(Boolean).join(" · ")),
+  const live = runs.run();
+  const cards = new Map(state.notes.map((note) => [note.id, cardOf(note)]));
+  const key = JSON.stringify([...cards.values(), live?.id, live?.status, live && planProgress(live)]);
+  if (key === drawnNotes) return;
+  drawnNotes = key;
+
+  const groups = groupNotes(state.notes, (note) => cards.get(note.id).status);
+  const parts = [];
+  if (groups.inRun.length && isLive(live)) {
+    const progress = planProgress(live);
+    parts.push(
+      groupHeader(
+        `In ${live.id} · ${live.agent} · ${elapsed(Date.now() / 1000 - live.startedAt)}`,
+        progress ? `${progress.done} of ${progress.total} steps` : "",
+      ),
+      ...groups.inRun.map((note) => noteItem(note, cards.get(note.id))),
     );
-    card.append(where, el("div", "note-body", note.body));
-    // In the send step the code pane shows the prompt, so a card toggles its note instead.
-    card.addEventListener("click", () => {
-      if (state.send) toggleTick(note.id);
-      else showNote(note);
-    });
+  }
+  if (groups.open.length) {
+    parts.push(
+      groupHeader(`Open · ${groups.open.length}`, ""),
+      ...groups.open.map((note) => noteItem(note, cards.get(note.id))),
+    );
+  }
+  if (groups.done.length) {
+    parts.push(
+      groupHeader(`Done · ${groups.done.length}`, "Newest first"),
+      ...groups.done.map((note) => noteItem(note, cards.get(note.id))),
+    );
+  }
+  notesEl.replaceChildren(...parts);
+}
 
-    const item = el("div", run ? "note-item sent" : "note-item");
-    if (state.send) item.append(tickBox(note));
-    item.append(card, deleteButton(item, note));
-    return item;
-  });
-  notesEl.replaceChildren(...items);
+// The run a note's status comes from, or null (status.js, `runOf`).
+function runFor(note) {
+  return runOf(note, state.runCache, runs.run());
+}
+
+// Reads the runs the notes were sent in that are not known yet, then draws them.
+function fetchRuns() {
+  const live = runs.run();
+  const wanted = new Set(
+    state.notes
+      .map(sentIn)
+      .filter((id) => id !== null && id !== live?.id && !state.runCache.has(id) && !state.runsAsked.has(id)),
+  );
+  for (const id of wanted) {
+    state.runsAsked.add(id);
+    fetch(`api/run?id=${encodeURIComponent(id)}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        const run = await response.json();
+        // A run still going (another window's) is asked for again on the next draw.
+        if (isLive(run)) state.runsAsked.delete(id);
+        else state.runCache.set(id, run);
+        renderNotes();
+      })
+      // The card says "Sent in R2" and the detail shows no history: the tray stays usable.
+      .catch((error) => console.warn(`run ${id}:`, error));
+  }
+}
+
+// Everything a note's card shows, as plain data: two cards with equal data look the same.
+function cardOf(note) {
+  const run = runFor(note);
+  const status = noteStatus(note, run);
+  let foot = null;
+  if (run && status.kind === "addressed") foot = { agent: run.agent, text: agentSaid(run, note.id) };
+  else if (run && status.kind === "needs") foot = { text: `${run.agent} is waiting for you · open to see` };
+  else if (run && (status.kind === "working" || status.kind === "starting")) {
+    const tool = latestOnFile(note, run);
+    if (tool) foot = { text: [tool.verb, tool.target, tool.state].filter(Boolean).join(" ") };
+  } else if (run && status.kind === "failed") {
+    foot = { text: run.problem ?? run.entries.findLast((entry) => entry.kind === "failed")?.error ?? "" };
+  }
+  return {
+    id: note.id,
+    path: note.path,
+    lines: note.lines,
+    body: note.body,
+    outdated: note.anchor === "lost",
+    status,
+    foot,
+    sendable: canSendAlone(note, status),
+  };
+}
+
+// Whether the arrow on a card sends its note now: no run under way, the note not in one, and
+// its lines still in the file.
+function canSendAlone(note, status = noteStatus(note, runFor(note))) {
+  return !runs.live() && note.anchor === "found" && !["starting", "working", "needs"].includes(status.kind);
+}
+
+function groupHeader(left, right) {
+  const header = el("div", "note-group");
+  header.append(el("span", "", left), el("span", "", right));
+  return header;
+}
+
+function noteItem(note, card) {
+  const { start, end } = card.lines;
+  const lines = start === end ? start : `${start}-${end}`;
+  const button = el("button", `note ${card.status.kind}${card.outdated ? " outdated" : ""}`);
+  button.type = "button";
+  const head = el("div", "note-where");
+  const label = el("span", `note-status ${card.status.tone}`);
+  label.append(statusIcon(card.status.kind), card.outdated ? `${card.status.label} · outdated` : card.status.label);
+  const place = el("span", "note-place", `${card.path.split("/").at(-1)}:${lines}`);
+  place.title = card.path;
+  head.append(label, place, el("span", "note-id", card.id));
+  button.append(head, el("div", "note-body", card.body));
+  if (card.foot) {
+    const foot = el("div", "note-foot");
+    if (card.foot.agent) foot.append(el("strong", "", card.foot.agent), " ");
+    foot.append(card.foot.text);
+    button.append(foot);
+  }
+  button.addEventListener("click", () => noteDetail.open(note.id));
+
+  const item = el("div", "note-item");
+  item.append(button);
+  if (card.sendable) item.append(sendButton(note));
+  item.append(deleteButton(item, note));
+  return item;
+}
+
+// The arrow on a card: sends the note alone to the default agent, or with Shift opens the
+// send step with only it ticked (decided with the owner on 2026-11-23).
+function sendButton(note) {
+  const button = el("button", "note-send", "↗");
+  button.type = "button";
+  button.setAttribute("aria-label", `Send note ${note.id} alone`);
+  button.title = `Send ${note.id} to ${state.settings?.agent ?? "the agent"} now · Shift-click to see the prompt first`;
+  button.addEventListener("click", (event) => sendAlone(note, { review: event.shiftKey }));
+  return button;
+}
+
+// A card of the send step: its checkbox, and a click that ticks it.
+function sendItem(note) {
+  const outdated = note.anchor === "lost";
+  const card = el("button", outdated ? "note outdated" : "note");
+  card.type = "button";
+  const { start, end } = note.lines;
+  const lines = start === end ? start : `${start}-${end}`;
+  const where = el("div", "note-where");
+  const run = sentIn(note);
+  const marks = [note.id, outdated ? "outdated" : null, run ? `sent in ${run}` : null];
+  where.append(
+    el("span", "", `${note.path}:${lines}`),
+    el("span", "note-id", marks.filter(Boolean).join(" · ")),
+  );
+  card.append(where, el("div", "note-body", note.body));
+  card.addEventListener("click", () => toggleTick(note.id));
+  const item = el("div", run ? "note-item sent" : "note-item");
+  item.append(tickBox(note), card, deleteButton(item, note));
+  return item;
 }
 
 // The checkbox that puts a note in the send, or takes it out.
@@ -1055,6 +1205,19 @@ const runs = runPanel({
   onError: showToast,
 });
 
+const noteDialogEl = $("note-dialog");
+const noteDetail = noteDialog(noteDialogEl, {
+  find: (id) => {
+    const note = state.notes.find((candidate) => candidate.id === id);
+    return note ? { note, run: runFor(note) } : null;
+  },
+  canSend: (note) => canSendAlone(note),
+  showInCode: showNote,
+  send: sendAlone,
+  remove: deleteNote,
+  showRun: () => showTab("run"),
+});
+
 // The agent of this send, or the settings' agent.
 function chosenAgent() {
   return state.send?.agent ?? state.settings?.agent ?? null;
@@ -1082,7 +1245,8 @@ function renderSendBar() {
   button.disabled = Boolean(state.send) && (count === 0 || !chosenAgent() || state.send.sending);
 }
 
-function openSend() {
+// Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
+function openSend(ids = sendable(state.notes)) {
   if (runs.live()) {
     showToast("The agent is still working on the last run: wait for it, or stop it.");
     return;
@@ -1091,7 +1255,7 @@ function openSend() {
   if (guardDraft("sending")) return;
   if (state.composer) closeComposer({ save: false });
   closeMenu();
-  state.send = { ticked: new Set(sendable(state.notes)), agent: null, sending: false };
+  state.send = { ticked: new Set(ids), agent: null, sending: false };
   showTab("notes");
   renderNotes();
   showPrompt();
@@ -1149,19 +1313,35 @@ async function sendNotes() {
   if (!state.send || state.send.sending || tickedIds().length === 0 || !agent) return;
   state.send.sending = true;
   renderSendBar();
-  const response = await fetch("api/run", {
-    method: "POST",
-    body: JSON.stringify({ notes: tickedIds(), agent }),
-  });
-  if (!response.ok) {
-    showToast(await response.text());
+  if (!(await startRun(tickedIds(), agent))) {
     if (state.send) state.send.sending = false;
     renderSendBar();
     return;
   }
   closeSend();
   showTab("run");
+}
+
+// Sends `note` alone to the default agent, and stays on the notes: its card shows the run.
+// With `review`, or with no agent chosen yet, opens the send step with only it ticked.
+async function sendAlone(note, { review }) {
+  const agent = state.settings?.agent;
+  if (review || !agent) {
+    openSend([note.id]);
+    return;
+  }
+  if (await startRun([note.id], agent)) showTab("notes");
+}
+
+// Starts a run of `ids` with `agent`. Returns whether it started; a refusal is shown.
+async function startRun(ids, agent) {
+  const response = await fetch("api/run", { method: "POST", body: JSON.stringify({ notes: ids, agent }) });
+  if (!response.ok) {
+    showToast(await response.text());
+    return false;
+  }
   await runs.sync();
+  return true;
 }
 
 $("send-button").addEventListener("click", () => {
@@ -1227,10 +1407,9 @@ function followRun(run, previous) {
     return;
   }
   const fresh = previous?.id !== run.id;
-  // A run that starts, and a run that needs the engineer, come to the front.
-  if ((fresh && isLive(run)) || (run.status === "waiting" && previous?.status !== "waiting")) {
-    showTab("run");
-  }
+  // A run that needs the engineer comes to the front. One that starts does not: the send
+  // step shows it (`sendNotes`), and a note sent alone from its card is followed on the card.
+  if (run.status === "waiting" && previous?.status !== "waiting") showTab("run");
   // The agent edits files, and the notes are marked sent once it has the prompt: both are
   // read again when the run moves on and when an edit finishes. There is no file watcher
   // (docs/design.md, "Working with the repository").
@@ -1245,7 +1424,7 @@ function followRun(run, previous) {
     // in `problem`, and they are not read on every update after that.
     loadNotes().catch((error) => showToast(String(error)));
   }
-  renderSendBar();
+  renderNotes();
 }
 
 // ---- Panes ----------------------------------------------------------------------------
@@ -1449,7 +1628,7 @@ window.addEventListener("keydown", (event) => {
   // calls `window.postil.menu`. The page leaves them alone, so each shortcut is defined once.
   // The settings dialog and the welcome screen cover the panes: their keys must not act on
   // what cannot be seen. The dialog handles its own keys (Escape closes it).
-  if (settingsEl.open) return;
+  if (settingsEl.open || noteDialogEl.open) return;
   if (!welcomeEl.hidden) {
     if (event.key === "Escape" && state.projectOpen) hideWelcome();
     return;

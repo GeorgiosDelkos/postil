@@ -329,6 +329,38 @@ impl Runner {
         }
     }
 
+    /// The run `id` (`R2`), with all its entries: this window's run when it is that one, else
+    /// the run as its log on disk has it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchRun`] when `id` is not of the form `R<number>`, or its log is missing
+    /// or cannot be read.
+    pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
+        let no_such = |problem: &str| Error::NoSuchRun {
+            id: id.to_owned(),
+            problem: problem.to_owned(),
+        };
+        // Written back and compared, so `R07` or `R+7` cannot name the log of `R7`, nor a path.
+        let number = id
+            .strip_prefix('R')
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .filter(|number| format!("R{number}") == id)
+            .ok_or_else(|| no_such("a run id is R and a number"))?;
+
+        let live = self.slot().run.clone();
+        if let Some(run) = live.filter(|run| run.state().header.id == id) {
+            return Ok(run.view(0));
+        }
+        let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
+        if !file.exists() {
+            return Err(no_such("there is no such run log"));
+        }
+        Run::read(&file)
+            .map(|run| run.view(0))
+            .map_err(|problem| no_such(&problem))
+    }
+
     /// Stops the agent, running or starting, and ignores anything it would still report: the
     /// project is closing, or the app quits.
     pub(crate) fn close(&self) {
