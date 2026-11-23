@@ -42,10 +42,10 @@
 //!
 //! Requests from the page run on the main thread, the agent's events on its reader thread,
 //! and an agent's start on a thread of its own. A review's next stage starts on the reader
-//! thread of the stage that ended ([`Runner::advance`]). Three locks, always taken in this order: the
-//! runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`], which takes
-//! no other), then a run's state; no snapshot is taken under a run's state. The page is told
-//! about every change through `notify`, and fetches what it has not seen.
+//! thread of the stage that ended ([`Runner::advance`]). Three locks, always taken in this
+//! order: the runner's [`Slot`], the repository's snapshot lock (inside [`Repo::snapshot`],
+//! which takes no other), then a run's state; no snapshot is taken under a run's state. The
+//! page is told about every change through `notify`, and fetches what it has not seen.
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -212,6 +212,9 @@ struct NewRun {
     prompt: Prompt,
     origin: Origin,
     conversation: Conversation,
+    /// The review the run is a stage of, which becomes the one under way; `None` ends the
+    /// review under way, if any.
+    review: Option<Chain>,
 }
 
 /// Which agent a launched run goes to.
@@ -278,8 +281,9 @@ impl Runner {
             prompt,
             origin: Origin::Notes,
             conversation,
+            review: None,
         };
-        self.launch(slot, new, None)
+        self.launch(slot, new)
     }
 
     /// Sends `text`, the engineer's follow-up to run `of`, to `agent` as a new run that
@@ -363,8 +367,9 @@ impl Runner {
             } else {
                 Conversation::Fresh
             },
+            review: None,
         };
-        self.launch(slot, new, None)
+        self.launch(slot, new)
     }
 
     /// The runs of the thread that ends with run `of`: the run of notes it started from, then
@@ -502,8 +507,9 @@ impl Runner {
             },
             origin: Origin::Review(chain.stage.clone()),
             conversation: Conversation::Fresh,
+            review: Some(chain),
         };
-        self.launch(slot, new, Some(chain))
+        self.launch(slot, new)
     }
 
     /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
@@ -531,21 +537,16 @@ impl Runner {
         }
     }
 
-    /// Makes `new` this window's run and sends it to its agent, then tells the page; `chain`
-    /// becomes the review under way, and `None` ends one. Takes the snapshot before the run,
-    /// except for a proposer, which may not edit. The slot changes only once the run's log
-    /// exists, so a launch that fails leaves the review and the kept agent as they were.
-    /// The agent it replaces is dropped after `slot` is released.
+    /// Makes `new` this window's run and its review the one under way, sends the run to its
+    /// agent, then tells the page. Takes the snapshot before the run, except for a proposer,
+    /// which may not edit. The slot changes only once the run's log exists, so a launch that
+    /// fails leaves the review and the kept agent as they were. The agent it replaces is
+    /// dropped after `slot` is released.
     ///
     /// # Errors
     ///
     /// [`Error::TurnRunning`] while a run of this window is under way, and as [`Run::create`].
-    fn launch(
-        self: &Arc<Self>,
-        mut slot: MutexGuard<'_, Slot>,
-        new: NewRun,
-        chain: Option<Chain>,
-    ) -> Result<()> {
+    fn launch(self: &Arc<Self>, mut slot: MutexGuard<'_, Slot>, new: NewRun) -> Result<()> {
         if slot.run.as_ref().is_some_and(|run| run.state().live()) {
             return Err(Error::TurnRunning);
         }
@@ -555,6 +556,7 @@ impl Runner {
             prompt,
             origin,
             conversation,
+            review,
         } = new;
         let snapshot = !matches!(&origin, Origin::Review(stage) if !stage.judges());
         // A follow-up and a review mark no note sent: the notes went to the run they follow or
@@ -571,7 +573,7 @@ impl Runner {
             origin,
         )?);
 
-        slot.chain = chain;
+        slot.chain = review;
         if snapshot {
             self.record_snapshot(&run, Point::Before);
         }
