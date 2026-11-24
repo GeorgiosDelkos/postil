@@ -723,8 +723,8 @@ kbd {
 }
 
 /* File tree icons (icons.svg, Material Icon Theme). The sprite is in the page only so rows
-   can refer to its symbols; it takes no space. The icons' colours are toned down a little to
-   sit with the low-contrast palettes, which reserve full colour for code and notes. */
+   can refer to its symbols; it takes no space. The icons' colours are toned down in the file
+   itself, not by a filter here, which made every row's icon a filtered layer. */
 
 .icon-sprite {
   position: absolute;
@@ -738,7 +738,6 @@ kbd {
   width: 16px;
   height: 16px;
   margin-right: 6px;
-  filter: saturate(0.8);
 }
 
 /* The right-click menu on the code, drawn as a macOS menu: a translucent, blurred panel with
