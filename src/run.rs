@@ -30,10 +30,13 @@
 //! [`Repo::snapshot`], which takes no other), a run's state, then the agent connection's
 //! own locks (inside [`Agent`]'s methods, which take none of the others). The record's
 //! `threads.lock` (inside `thread.rs`, which takes no other) may be taken while the slot is
-//! held, so nothing that holds it may take the slot. No snapshot is taken under a run's
-//! state. The slot is held around the agent's calls that answer, cancel
-//! and prompt (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's
-//! worktree: the commit before a run (`git status`, `add`, `commit`, tens of milliseconds
+//! held, so nothing that holds it may take the slot. `runs/active.lock`, the run lock, is
+//! taken under the slot by a launch, which only tries it for a moment; ending or forgetting
+//! a thread takes it first and the slot after, and does so only while this window is not
+//! busy, when no launch can come until that request is answered. No snapshot is taken under
+//! a run's state. The slot is held around the agent's calls that answer, cancel and prompt
+//! (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's worktree: the
+//! commit before a run (`git status`, `add`, `commit`, tens of milliseconds
 //! on a medium repository, as a snapshot is), and a proposer's check and undo as its stage
 //! ends (`status`, `rev-parse`, `reset --hard`, `clean`). Every page request waits for those.
 //! The page is told about every change through `notify`, and fetches what it has not seen.
@@ -1021,7 +1024,8 @@ impl Runner {
     /// once Apply succeeded. The thread is marked ended before its worktree is freed: a free
     /// that fails then leaves an ended thread, whose worktree goes with its last note, and
     /// never an open one whose changes were applied already, which a second Apply would
-    /// write again.
+    /// write again, unless the record itself cannot be written: the thread then stays open,
+    /// and the error says why.
     ///
     /// # Errors
     ///
@@ -1034,11 +1038,12 @@ impl Runner {
     /// thread is marked ended.
     pub(crate) fn end_thread(&self, id: &str, ending: Ending) -> Result<()> {
         let home = self.home.as_deref().ok_or(Error::NoHome)?;
-        {
-            let slot = self.slot();
-            if slot.thread.as_ref().is_some_and(|held| held.id == id) && slot.busy() {
-                return Err(Error::TurnRunning);
-            }
+        // While this window is busy with any run, its own run holds the run lock, or a review
+        // between two stages is about to take it from the reader thread: either would read
+        // as another window's. Not busy, nothing in this window takes the run lock until this
+        // request is answered, so the slot is free to take again under it below.
+        if self.slot().busy() {
+            return Err(Error::TurnRunning);
         }
         let _active = hold_run_lock(&self.repo.runs_dir())?;
         let thread = match thread::find(&self.repo, id)? {
@@ -1066,7 +1071,12 @@ impl Runner {
         // Dropping the agent waits for its process, so after the lock.
         drop(released);
         let ended = thread::update(&self.repo, id, |stored| {
-            stored.tip = tip;
+            // Applied, the engineer's commits past Postil's are in their working tree, and
+            // the branch may go with the thread's note. Discarded, they are nowhere else:
+            // the tip stays Postil's, so deleting the note keeps a branch past it.
+            if ending == Ending::Apply {
+                stored.tip = tip;
+            }
             stored.state = match ending {
                 Ending::Apply => State::Applied,
                 Ending::Discard => State::Discarded,
@@ -1152,7 +1162,7 @@ impl Runner {
             fs::remove_file(&file).map_err(|source| Error::WriteRun { path: file, source })?;
             deleted.push(id);
         }
-        let live_thread = {
+        let busy = {
             let mut slot = self.slot();
             if slot
                 .run
@@ -1161,24 +1171,23 @@ impl Runner {
             {
                 slot.run = None;
             }
-            // Busy, not only live: a review between stages starts its next one in the thread.
-            let busy = slot.busy();
-            slot.thread
-                .as_ref()
-                .filter(|_| busy)
-                .map(|thread| thread.id.clone())
+            // Busy, not only live: a review between stages starts its next one from the
+            // reader thread, taking the run lock under the slot.
+            slot.busy()
         };
-        let forgotten = self.forget_threads(live_thread.as_deref());
+        // While this window is busy, the threads wait for a delete after it is done: its run
+        // holds the run lock, or is about to.
+        let forgotten = if busy { Ok(()) } else { self.forget_threads() };
         (self.notify)();
         forgotten
     }
 
-    /// Forgets every thread whose first run's log is gone, except `busy`, the thread this
-    /// window is working in: frees its worktree, deletes its branch, and removes it from the
-    /// record. Stops a kept agent that works in one. Holds the run lock, so no window's run
-    /// works in a worktree it frees; while a run holds it, in any window, it forgets nothing,
-    /// and the next delete tries again. A follow-up still running when its thread's first log
-    /// went keeps the thread until a delete after it ends.
+    /// Forgets every thread whose first run's log is gone: frees its worktree, deletes its
+    /// branch, and removes it from the record. Stops a kept agent that works in one. For a
+    /// window that is not busy: holds the run lock, then takes the slot, which is safe only
+    /// while no run of this window can take the lock meanwhile. While another window's run
+    /// holds the lock it forgets nothing, and the next delete tries again. A follow-up still
+    /// running when its thread's first log went keeps the thread until a delete after it ends.
     ///
     /// The worktree must pass the check that ending a thread makes: work Postil did not
     /// commit is not deleted with a note. Only a branch under `postil/` is deleted, since the
@@ -1189,7 +1198,7 @@ impl Runner {
     /// As [`thread::all`], [`thread::check`], [`thread::free`], [`Repo::delete_branch_at`] and
     /// [`thread::remove`]. A thread that fails one of them stays in the record, and is tried
     /// again at the next delete.
-    fn forget_threads(&self, busy: Option<&str>) -> Result<()> {
+    fn forget_threads(&self) -> Result<()> {
         let Some(home) = self.home.as_deref() else {
             return Ok(());
         };
@@ -1201,7 +1210,6 @@ impl Runner {
         };
         let gone: Vec<Thread> = thread::all(&self.repo)?
             .into_iter()
-            .filter(|thread| Some(thread.id.as_str()) != busy)
             .filter(|thread| !dir.join(format!("{}.jsonl", thread.id)).exists())
             .collect();
         if gone.is_empty() {

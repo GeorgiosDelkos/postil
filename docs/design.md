@@ -703,7 +703,9 @@ Three things end a thread, each one of the engineer's clicks:
 
 **The safety check:** the worktree has no uncommitted change outside ignored files, and its
 branch is at the commit Postil made last or past it. Past it is a commit the engineer made
-in the worktree, which is theirs to keep: the thread ends at it, and Apply takes it. Failing
+in the worktree, which is theirs to keep: Apply takes it, and it becomes the tip. Discard
+leaves the tip at Postil's commit, so the branch, which then holds the only copy, is kept
+when the thread's last note goes (below). Failing
 either means something Postil did not make, and would lose, is there: Postil shows it and
 asks, and writes nothing and deletes nothing until the engineer answers. Ignored files are
 not checked: they are build output, and every worktree holds cloned ones. Built so far:

@@ -816,3 +816,66 @@ fn a_second_thread_of_one_id_is_refused_and_the_first_is_kept() {
     assert_eq!(thread(&site, "R2")["path"], thread(&site, "R1")["path"]);
     assert!(worktree.is_dir());
 }
+
+#[test]
+fn a_discarded_thread_keeps_the_engineer_s_commit_when_its_note_goes() {
+    let (repo, site, _nudges, worktree) = written("thread-discard-commit");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    // The engineer's commit in the worktree, past Postil's: Discard takes it in, unapplied.
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git_out(&worktree, &["add", "mine.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    assert_eq!(end(&site, "discard", "R1").0, StatusCode::OK);
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("commits past"), "{body}");
+    assert_eq!(
+        git_out(&repo.root, &["log", "-1", "--format=%s", &branch]),
+        "mine"
+    );
+}
+
+#[test]
+fn a_thread_is_not_ended_while_another_run_of_this_window_goes_on() {
+    let repo = TempRepo::new("thread-busy-window");
+    repo.write("src/a.rs", "one\ntwo\n");
+    let (site, nudges) = run_site(&repo, "flood");
+    post_note(&site, "src/a.rs", 1, 1, "one");
+    post_note(&site, "src/a.rs", 2, 2, "two");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "running");
+    assert_eq!(post(&site, &format!("{RUN}/cancel"), "").0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+    send(&site, &["N2"]);
+    wait_for(&site, &nudges, "running");
+
+    // R2 holds the run lock: this window says so in its own words, not another window's.
+    let (status, body) = end(&site, "discard", "R1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("still working"), "{body}");
+    assert_eq!(post(&site, &format!("{RUN}/cancel"), "").0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+}
+
+#[test]
+fn a_thread_record_that_cannot_be_written_fails_the_send() {
+    if skip_as_root() {
+        return;
+    }
+    let (repo, site, _nudges, _worktree) = written("thread-record-locked");
+    let lock = repo.root.join(".git/postil/threads.lock");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
+    post_note(&site, "a.txt", 1, 1, "two");
+
+    let (status, body) = send(&site, &["N2"]);
+
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.contains("cannot write") && body.contains("threads.lock"),
+        "{body}"
+    );
+}
