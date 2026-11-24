@@ -249,8 +249,10 @@ struct NewRun {
 enum Place {
     /// A new thread, started at commit `fork` and named from `title`, its first note's text.
     New { fork: String, title: String },
-    /// An open thread whose worktree is on disk.
-    Open(Thread),
+    /// The open thread of this id, whose worktree is on disk: read again by `launch` once it
+    /// holds the run lock, as ending a thread does, so another window cannot end or forget it
+    /// in between.
+    Open(String),
 }
 
 /// How the engineer ends a thread (docs/design.md, "Ending a thread").
@@ -422,7 +424,9 @@ impl Runner {
             )));
         }
         let first = thread[0].state().header.id.clone();
-        let open = self.open_thread(&first)?;
+        // Refused here, before a run log is made, when the thread is not open; `launch` reads
+        // it again under the run lock.
+        self.open_thread(&first)?;
         let slot = self.slot();
         // The kept agent ran `followed`, the slot's run, so it works in this thread.
         let same_conversation = matches!(
@@ -461,7 +465,7 @@ impl Runner {
                 Conversation::Fresh
             },
             review: None,
-            place: Place::Open(open),
+            place: Place::Open(first),
         };
         self.launch(slot, new)
     }
@@ -588,7 +592,8 @@ impl Runner {
     /// inherits the reviewed agent's conversation; `chain` becomes the review under way. The
     /// stage works in the reviewed run's thread, read again for each stage.
     fn start_stage(self: &Arc<Self>, slot: MutexGuard<'_, Slot>, chain: Chain) -> Result<()> {
-        let open = self.open_thread(&chain.stage.of)?;
+        // Refused here, before a run log is made; `launch` reads it again under the run lock.
+        self.open_thread(&chain.stage.of)?;
         let text = if chain.stage.judges() {
             review::judge_prompt(&chain.work, &chain.findings)
         } else {
@@ -603,8 +608,8 @@ impl Runner {
             },
             origin: Origin::Review(chain.stage.clone()),
             conversation: Conversation::Fresh,
+            place: Place::Open(chain.stage.of.clone()),
             review: Some(chain),
-            place: Place::Open(open),
         };
         self.launch(slot, new)
     }
@@ -675,18 +680,22 @@ impl Runner {
             &prompt.text,
             origin,
         )?);
-        let (mut thread, worktree) = match place {
-            Place::New { fork, title } => match self.new_thread(&run, &fork, &title) {
-                Ok(thread) => (thread, Worktree::Make),
-                Err(error) => {
-                    run.record(Entry::Failed {
-                        error: error_chain(&error),
-                    });
-                    (self.notify)();
-                    return Err(error);
-                }
-            },
-            Place::Open(thread) => (thread, Worktree::Made),
+        // `Run::create` holds the run lock from here: the thread is read under it.
+        let placed = match place {
+            Place::New { fork, title } => self
+                .new_thread(&run, &fork, &title)
+                .map(|thread| (thread, Worktree::Make)),
+            Place::Open(id) => self.open_thread(&id).map(|thread| (thread, Worktree::Made)),
+        };
+        let (mut thread, worktree) = match placed {
+            Ok(placed) => placed,
+            Err(error) => {
+                run.record(Entry::Failed {
+                    error: error_chain(&error),
+                });
+                (self.notify)();
+                return Err(error);
+            }
         };
         match worktree {
             // Its snapshot before is the fork commit, recorded on the start thread once the
@@ -1451,8 +1460,8 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// The errors of [`Repo::commit_all`] and [`thread::update`]: the work then stays
-    /// uncommitted in the worktree.
+    /// The errors of [`Repo::commit_all`], the work then left uncommitted in the worktree, and
+    /// of [`thread::update`], the commit then made but the record's tip left behind it.
     fn commit_worktree(&self, run: &Run, thread: &Thread, point: Point) -> Result<String> {
         let message = commit_message(&run.state().header, point);
         let commit = Repo::open(&thread.path).and_then(|tree| tree.commit_all(&message))?;
@@ -1628,9 +1637,12 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         let run = slot.run.clone();
         // However a proposer's turn ends, what it changed is put back before the end is
         // logged, under the lock, so no run starts in the worktree first.
+        // Only for a live run: a kept proposer's agent that exits after its run ended (the
+        // review found nothing, and the agent stayed) must not reset what the engineer has
+        // committed or edited in the worktree since.
         let undone = run
             .as_deref()
-            .filter(|_| ends_turn)
+            .filter(|run| ends_turn && run.state().live())
             .and_then(|run| undo_proposer(run, thread.as_ref()));
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
@@ -1844,7 +1856,7 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
 }
 
 /// Says on `run` that no snapshot was taken, and why: the run goes on, without its changes
-/// view, and the work stays uncommitted in the worktree.
+/// view ([`Runner::commit_worktree`] says what became of the work).
 fn no_snapshot(run: &Run, error: &Error) {
     run.state().problem.get_or_insert(format!(
         "no snapshot of the files was taken: {}",

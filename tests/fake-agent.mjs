@@ -358,7 +358,8 @@ async function prompt(id, params) {
 }
 
 // These agents say who they are, so a test can check that they are gone.
-if (["silent", "exit-after-turn", "exit-leaving-stderr"].includes(scenario) && extra[0]) {
+const tellsPid = ["silent", "exit-after-turn", "exit-leaving-stderr", "reviewer-silent"];
+if (tellsPid.includes(scenario) && extra[0]) {
   writeFileSync(extra[0], String(process.pid));
 }
 

@@ -2326,3 +2326,49 @@ fn a_reviewer_cut_short_has_its_edits_undone_all_the_same() {
     assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "a\n");
     assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
 }
+
+#[test]
+fn a_kept_reviewer_that_exits_later_leaves_the_engineer_s_work_alone() {
+    let repo = TempRepo::new("run-review-exits-later");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    // A proposer that finds nothing: the review ends with its agent kept, idle.
+    let pid_file = repo.root.join(".git/reviewer.pid");
+    let reviewer = format!("reviewer-silent {}", pid_file.display());
+    set_reviewers(&site, "plain", &[("First", &reviewer)]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+    wait_for_run(&site, &nudges, "R2");
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    // The engineer's work there since, as the refusal to end a thread asks for.
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git_out(&worktree, &["add", "mine.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    fs::write(worktree.join("left.txt"), "left\n").unwrap();
+
+    // The idle reviewer's agent exits on its own.
+    let pid = fs::read_to_string(&pid_file).unwrap();
+    assert!(
+        Command::new("/bin/kill")
+            .arg(&pid)
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for_exit(&pid);
+    // Its exit is reported, then the page is told.
+    nudges.recv_timeout(WAIT).unwrap();
+
+    assert_eq!(git_out(&worktree, &["log", "-1", "--format=%s"]), "mine");
+    assert_eq!(
+        fs::read_to_string(worktree.join("left.txt")).unwrap(),
+        "left\n"
+    );
+}
