@@ -369,9 +369,11 @@ pub(crate) fn forget(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
 }
 
 /// `thread`'s worktree, opened only when it is Postil's: where Postil puts worktrees
-/// ([`check_place`]), with a `.git` that names a worktree record of `repo`. Every git call in a
-/// thread's worktree goes through this: git looks upward from a folder with no `.git` of its
-/// own (an agent may delete it), and would act on whatever repository holds the folder.
+/// ([`check_place`]), with a `.git` that names a worktree record of `repo` which names it back
+/// ([`Repo::worktree_record`]). Every git call in a thread's worktree after [`make`] goes
+/// through this (`make` opens the worktree git has only just written, before any agent): git
+/// looks upward from a folder with no `.git` of its own (an agent may delete it), and would act
+/// on whatever repository holds the folder.
 ///
 /// # Errors
 ///

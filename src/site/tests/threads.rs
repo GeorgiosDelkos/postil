@@ -1015,3 +1015,30 @@ fn a_worktree_that_lost_its_git_file_takes_no_commit_in_the_repository_around_it
         "a commit was made in the repository around it"
     );
 }
+
+#[test]
+fn a_worktree_whose_git_file_names_another_worktree_takes_no_run() {
+    let (repo, site, _nudges, worktree) = written("thread-swapped-git");
+    // The engineer's own linked worktree, on a branch of theirs.
+    let theirs = repo.home().join("theirs");
+    let path = theirs.to_str().unwrap();
+    repo.git(&["worktree", "add", "--quiet", "-b", "mine", path]);
+    let before = git_out(&repo.root, &["rev-parse", "mine"]);
+    // The thread's `.git` rewritten to name that worktree's record.
+    let pointer = fs::read_to_string(theirs.join(".git")).unwrap();
+    fs::write(worktree.join(".git"), pointer).unwrap();
+
+    let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("is not a worktree of this repository"),
+        "{body}"
+    );
+    assert_eq!(
+        git_out(&repo.root, &["rev-parse", "mine"]),
+        before,
+        "their branch moved"
+    );
+}

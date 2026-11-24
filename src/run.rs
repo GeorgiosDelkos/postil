@@ -36,9 +36,11 @@
 //! busy, when no launch can come until that request is answered. No snapshot is taken under
 //! a run's state. The slot is held around the agent's calls that answer, cancel and prompt
 //! (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's worktree: the
-//! commit before a run (`git status`, `add`, `commit`, tens of milliseconds
+//! commit before a run (`add`, `diff --cached`, `commit`, `rev-parse`, tens of milliseconds
 //! on a medium repository, as a snapshot is), and a proposer's check and undo as its stage
-//! ends (`status`, `rev-parse`, `reset --hard`, `clean`). Every page request waits for those.
+//! ends (`status`, `branch`, `rev-parse`, `checkout -B`, `clean`), each after the few
+//! `rev-parse` calls that open the worktree ([`thread::open`]). Every page request waits for
+//! those.
 //! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
@@ -1047,7 +1049,8 @@ impl Runner {
     /// Postil left or past it (a commit the engineer made there). Apply writes the branch's
     /// changes, from the commit the thread started at to the worktree's commit, into the
     /// engineer's working tree, uncommitted, all or nothing. The thread's kept agent is stopped
-    /// once Apply succeeded. The thread is marked ended before its worktree is freed: a free
+    /// once the check passes, and for Apply once the changes are written. The thread is marked
+    /// ended before its worktree is freed: a free
     /// that fails then leaves an ended thread, whose worktree goes with its last note, and
     /// never an open one whose changes were applied already, which a second Apply would
     /// write again, unless the record itself cannot be written: the thread then stays open,

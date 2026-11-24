@@ -403,8 +403,9 @@ impl Repo {
     }
 
     /// The folder in which git keeps its record of the linked worktree at `path`
-    /// (`<common git dir>/worktrees/<name>`): the one the worktree's `.git` file names, or,
-    /// when the worktree's folder is gone, the one whose `gitdir` file names `path`. `None`
+    /// (`<common git dir>/worktrees/<name>`): the one the worktree's `.git` file names, and
+    /// whose own `gitdir` file names `path` back, as git checks; or, when the worktree's
+    /// folder is gone, the one whose `gitdir` file names `path`. `None`
     /// when git has none. Deleting that folder is what `git worktree prune` does for one
     /// worktree, without touching any other whose folder is missing (a disk not mounted).
     ///
@@ -451,6 +452,15 @@ impl Repo {
         // absolute pointer as it is.
         let record = fs::canonicalize(path.join(record)).map_err(|_| not_ours())?;
         if record.parent() != Some(records.as_path()) {
+            return Err(not_ours());
+        }
+        // And the record names this folder back, as git itself checks: a `.git` rewritten to
+        // name another worktree's record (the engineer's own linked worktree) would otherwise
+        // pass, and git would act on that worktree's index and branch.
+        let back = fs::read_to_string(record.join("gitdir")).map_err(|_| not_ours())?;
+        let back = record.join(back.trim_end_matches('\n'));
+        let ours = fs::canonicalize(path.join(".git")).map_err(|_| not_ours())?;
+        if fs::canonicalize(back).ok() != Some(ours) {
             return Err(not_ours());
         }
         Ok(Some(record))
@@ -597,8 +607,9 @@ impl Repo {
     /// The commit runs no hook (`core.hooksPath` emptied: `--no-verify` alone still runs
     /// `prepare-commit-msg` and `post-commit`) and keeps the message as it is
     /// (`--cleanup=verbatim`, so a note's line starting with `#` stays). It is not signed: it
-    /// runs on the page's request thread, where a signer asking for a passphrase would hold
-    /// every request, and it is Postil's snapshot, not the engineer's commit. The author
+    /// runs on the page's request thread or an agent's reader thread, where a signer asking for
+    /// a passphrase would stall every request or the run, and it is Postil's snapshot, not the
+    /// engineer's commit. The author
     /// follows the git config.
     ///
     /// # Errors
