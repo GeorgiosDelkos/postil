@@ -59,7 +59,8 @@ pub(crate) struct Launch<'a> {
 
 /// What the agent reports, in the order it reported it. Delivered on the agent's reader
 /// thread.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum Event {
     /// The session changed: a message, a thought, a tool call, the plan.
     Update(SessionUpdate),
@@ -83,7 +84,8 @@ pub(crate) enum Event {
 }
 
 /// A permission request: the tool call the agent wants to make and the answers it offers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct PermissionRequest {
     /// The request's number: 0 for the agent's first, counting on across turns. The agent's
     /// own request id stays inside [`Agent`], which keeps the only table of open requests.
@@ -94,7 +96,8 @@ pub(crate) struct PermissionRequest {
 
 /// A question: the agent's message and its form. The number counts with the permission
 /// requests (`acp`, "Permission requests").
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct QuestionRequest {
     pub(crate) number: usize,
     pub(crate) message: String,
@@ -105,7 +108,8 @@ pub(crate) struct QuestionRequest {
 }
 
 /// How a turn ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum TurnEnd {
     Stopped(StopReason),
     /// The agent answered the prompt with an error, or with a reply the app cannot read.
@@ -124,7 +128,7 @@ pub(crate) struct Starting {
 
 /// Kills a starting agent's process group from another thread; its [`Starting::open_session`]
 /// then fails with [`Error::AgentExited`]. Stopping an agent that is gone does nothing.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Stopper {
     group: Arc<Mutex<Option<u32>>>,
 }

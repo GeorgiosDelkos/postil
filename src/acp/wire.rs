@@ -199,7 +199,8 @@ pub(crate) struct CancelParams<'a> {
 
 /// A block of a prompt or of a message. The app sends text and links; of what agents send,
 /// it shows text, and names a link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ContentBlock {
     Text {
@@ -221,7 +222,8 @@ pub(crate) struct UpdateParams {
 }
 
 /// One change to the session the agent reports while it works.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub(crate) enum SessionUpdate {
     #[serde(rename_all = "camelCase")]
@@ -251,7 +253,8 @@ pub(crate) enum SessionUpdate {
     clippy::struct_field_names,
     reason = "the fields are named as the protocol names them"
 )]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ToolCall {
     pub(crate) tool_call_id: String,
@@ -267,7 +270,8 @@ pub(crate) struct ToolCall {
 }
 
 /// A change to a tool call: only the fields that changed are present.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ToolCallUpdate {
     pub(crate) tool_call_id: String,
@@ -310,7 +314,8 @@ pub(crate) enum ToolCallStatus {
 }
 
 /// What a tool call produced.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolCallContent {
     Content {
@@ -330,13 +335,15 @@ pub(crate) enum ToolCallContent {
 }
 
 /// A file a tool call touches, and the line when the agent knows it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct Location {
     pub(crate) path: String,
     pub(crate) line: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct PlanEntry {
     pub(crate) content: String,
     pub(crate) status: PlanEntryStatus,
@@ -361,7 +368,8 @@ pub(crate) struct PermissionParams {
 }
 
 /// One answer the agent offers to a permission request.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PermissionOption {
     pub(crate) option_id: String,
