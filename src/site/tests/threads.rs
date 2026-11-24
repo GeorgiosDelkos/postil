@@ -378,7 +378,9 @@ fn a_record_naming_a_branch_outside_postil_s_never_gets_it_deleted() {
 
     let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
 
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // The worktree is not on the branch the record names, so nothing is freed or deleted.
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("not the thread's trunk"), "{body}");
     assert_eq!(
         git_out(&repo.root, &["branch", "--list", "trunk"]),
         "* trunk"
@@ -597,7 +599,7 @@ fn a_record_pointing_into_another_repository_s_worktrees_is_refused() {
 }
 
 #[test]
-fn deleting_a_note_keeps_a_thread_whose_branch_has_the_engineer_s_commits() {
+fn deleting_a_note_frees_the_worktree_and_keeps_a_branch_with_the_engineer_s_commits() {
     let (repo, site, _nudges, worktree) = written("thread-forget-commits");
     let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
     fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
@@ -606,14 +608,32 @@ fn deleting_a_note_keeps_a_thread_whose_branch_has_the_engineer_s_commits() {
 
     let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
 
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("commits past"), "{body}");
-    assert!(worktree.join("mine.txt").exists());
-    // `+`: checked out in a worktree, which is still there.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!worktree.exists());
     assert_eq!(
-        git_out(&repo.root, &["branch", "--list", &branch]),
-        format!("+ {branch}")
+        git_out(&repo.root, &["log", "-1", "--format=%s", &branch]),
+        "mine"
     );
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
+    );
+}
+
+#[test]
+fn a_worktree_off_its_branch_is_not_freed_with_the_commits_made_there() {
+    let (_repo, site, _nudges, worktree) = written("thread-detached");
+    // A commit with HEAD detached is in no branch: freeing the worktree would lose it.
+    git_out(&worktree, &["checkout", "--quiet", "--detach"]);
+    fs::write(worktree.join("loose.txt"), "loose\n").unwrap();
+    git_out(&worktree, &["add", "loose.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "loose"]);
+
+    let (status, body) = end(&site, "discard", "R1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("HEAD is detached"), "{body}");
+    assert!(worktree.join("loose.txt").exists());
 }
 
 #[test]

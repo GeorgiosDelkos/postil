@@ -341,10 +341,11 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
 }
 
 /// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
-/// git would commit (ignored files, such as the cloned build folders, do not count), and its
-/// branch at the commit Postil left or past it. Past it is a commit the engineer made there,
-/// as the refusal tells them to, and it is theirs to keep. Returns the commit the thread ends
-/// at: the worktree's, or the recorded tip when the worktree is not on disk.
+/// git would commit (ignored files, such as the cloned build folders, do not count), the
+/// thread's branch checked out, and that branch at the commit Postil left or past it. Past it
+/// is a commit the engineer made there, as the refusal tells them to, and it is theirs to
+/// keep: it is on the branch, which freeing keeps. Returns the commit the thread ends at: the
+/// worktree's, or the recorded tip when the worktree is not on disk.
 ///
 /// # Errors
 ///
@@ -359,6 +360,20 @@ pub(crate) fn check(thread: &Thread) -> Result<String> {
         return Err(Error::ThreadChanged {
             path: thread.path.clone(),
             found: format!("changed files {}", changed.join(", ")),
+        });
+    }
+    // On the thread's branch: a commit made with `HEAD` detached, or on another branch the
+    // worktree has checked out, is in no ref freeing keeps, and would be lost with it.
+    let current = tree.branch()?;
+    if current != thread.branch {
+        let on = if current.is_empty() {
+            "no branch (HEAD is detached)".to_owned()
+        } else {
+            format!("branch {current}")
+        };
+        return Err(Error::ThreadChanged {
+            path: thread.path.clone(),
+            found: format!("{on}, not the thread's {}", thread.branch),
         });
     }
     match tree.head()? {

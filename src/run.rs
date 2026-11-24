@@ -1123,11 +1123,16 @@ impl Runner {
     /// saved (`send` reads them for the prompt first), so every listed log's notes are seen:
     /// another window's new note, even one given a freed id, keeps its new run.
     ///
+    /// Then, while this window is not busy, forgets every thread whose first run's log is gone
+    /// ([`Runner::forget_threads`]): takes the run lock, stops a kept agent working there,
+    /// frees its worktree, and deletes its branch while it is at Postil's last commit.
+    ///
     /// # Errors
     ///
     /// [`Error::ReadRun`] when the runs directory cannot be listed, as [`notes::ids`] for the
     /// review file, [`Error::WriteRun`] when a log cannot be removed. Some logs may be removed
-    /// by then; the rest are tried again at the next delete.
+    /// by then; the rest are tried again at the next delete. Then as
+    /// [`Runner::forget_threads`], once the logs are removed.
     pub(crate) fn delete_runs_without_notes(&self) -> Result<()> {
         let dir = self.repo.runs_dir();
         let numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
@@ -1189,13 +1194,14 @@ impl Runner {
     /// holds the lock it forgets nothing, and the next delete tries again. A follow-up still
     /// running when its thread's first log went keeps the thread until a delete after it ends.
     ///
-    /// The worktree must pass the check that ending a thread makes: work Postil did not
-    /// commit is not deleted with a note. Only a branch under `postil/` is deleted, since the
-    /// name comes from the record, which a hand edit can change.
+    /// The worktree must pass the check that ending a thread makes ([`thread::free`] makes it):
+    /// work Postil did not commit is not deleted with a note. A branch past Postil's commit
+    /// stays, and only a branch under `postil/` is deleted, since the name comes from the
+    /// record, which a hand edit can change.
     ///
     /// # Errors
     ///
-    /// As [`thread::all`], [`thread::check`], [`thread::free`], [`Repo::delete_branch_at`] and
+    /// As [`thread::all`], [`thread::free`], [`Repo::delete_branch_at`] and
     /// [`thread::remove`]. A thread that fails one of them stays in the record, and is tried
     /// again at the next delete.
     fn forget_threads(&self) -> Result<()> {
@@ -1232,32 +1238,20 @@ impl Runner {
         for thread in gone {
             // In any state: an ended thread whose free failed still has its worktree, which
             // keeps the branch checked out.
-            // A commit the engineer made past Postil's in the worktree is refused, naming the
-            // worktree, where they can move it. One on the branch (made there, or kept by a
-            // Discard) keeps the branch: it is the engineer's work now, the thread is forgotten
-            // and the branch is not, so no delete is refused for good.
-            let forgotten = thread::check_place(&self.repo, home, &thread)
-                .and_then(|()| thread::check(&thread))
-                .and_then(|head| {
-                    if head == thread.tip {
-                        Ok(())
-                    } else {
-                        Err(Error::ThreadChanged {
-                            path: thread.path.clone(),
-                            found: format!("commits past {}, where Postil left it", thread.tip),
-                        })
-                    }
-                })
-                .and_then(|()| thread::free(&self.repo, home, &thread))
-                .and_then(|()| {
-                    if thread.branch.starts_with("postil/") {
-                        self.repo
-                            .delete_branch_at(&thread.branch, &thread.tip)
-                            .map(drop)
-                    } else {
-                        Ok(())
-                    }
-                });
+            // A commit the engineer made past Postil's is on the thread's branch (`free` checks
+            // the worktree has it checked out), which then stays: it is the engineer's work
+            // now. The thread is forgotten and the branch is not, so no delete is refused for
+            // good. Only uncommitted work in the worktree keeps the thread, which `free`
+            // refuses to delete.
+            let forgotten = thread::free(&self.repo, home, &thread).and_then(|()| {
+                if thread.branch.starts_with("postil/") {
+                    self.repo
+                        .delete_branch_at(&thread.branch, &thread.tip)
+                        .map(drop)
+                } else {
+                    Ok(())
+                }
+            });
             match forgotten {
                 Ok(()) => removed.push(thread.id),
                 Err(error) => {
