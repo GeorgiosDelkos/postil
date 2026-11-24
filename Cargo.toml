@@ -67,8 +67,10 @@ panic = "abort"
 baseline = true
 
 [lints.rust]
-# The crate has no unsafe code; keep it that way.
-unsafe_code = "forbid"
+# Unsafe code only in `src/clone.rs`, which calls clonefile(2) and says so with an `expect`.
+# The owner allowed that one module on 2026-11-24: a folder clone takes 3 s where the safe
+# route, `cp -c -R`, takes 34 s (docs/design.md, "Worktrees").
+unsafe_code = "deny"
 # [ref] The rustc baseline: Tokio sets all five; Jon's crates and Cranelift set subsets
 # (missing_docs in nearly every library of all three).
 rust_2018_idioms = { level = "warn", priority = -1 }

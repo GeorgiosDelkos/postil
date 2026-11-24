@@ -634,7 +634,7 @@ fn a_change_gives_up_on_a_lock_another_process_keeps_and_names_it() {
     let (sender, replies) = mpsc::channel();
     let root = repo.root.clone();
     std::thread::spawn(move || {
-        let site = Site::new(None, None, no_agents(), quiet());
+        let site = Site::new(None, None, None, no_agents(), quiet());
         site.open(Repo::open(&root).unwrap(), LiveRun::Stop)
             .unwrap();
         drop(sender.send(post(&site, NOTES, &new_note("a.txt", 1, 1, "x", "Hi."))));

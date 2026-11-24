@@ -238,6 +238,48 @@ pub enum Error {
         /// Why it cannot be shown: no such log, or what is wrong with it.
         problem: String,
     },
+    /// Notes were sent in a repository with no commit: a thread starts from one.
+    NoCommit,
+    /// A thread's worktree, or the folder above it, could not be made or moved.
+    MakeWorktree {
+        /// The folder.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// The record of threads, `threads.json`, cannot be read or parsed.
+    ReadThreads {
+        /// The file's path.
+        path: PathBuf,
+        /// What is wrong with it.
+        problem: String,
+    },
+    /// The record of threads, or its lock, cannot be written.
+    WriteThreads {
+        /// The file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// A thread's worktree holds changes Postil did not commit, or a commit it did not make,
+    /// so ending the thread could lose them.
+    ThreadChanged {
+        /// The worktree's folder.
+        path: PathBuf,
+        /// What is there: the changed files, or the unexpected commit.
+        found: String,
+    },
+    /// A thread's record names a folder git does not list as a worktree of the repository, so
+    /// Postil does not delete it.
+    NotAWorktree {
+        /// The folder.
+        path: PathBuf,
+    },
+    /// A thread's changes do not fit the engineer's working tree, so none were applied.
+    ApplyConflict {
+        /// What `git apply` said, naming the files.
+        stderr: String,
+    },
 }
 
 // Written by hand instead of with `thiserror` to keep the dependency tree small
@@ -408,6 +450,45 @@ impl fmt::Display for Error {
                 "that request is no longer open (it was answered, withdrawn or cancelled)"
             ),
             Self::NoSuchRun { id, problem } => write!(f, "cannot show the run {id}: {problem}"),
+            Self::NoCommit => write!(
+                f,
+                "the repository has no commit yet, and an agent works on a branch that starts \
+                 from one (commit once, then send)"
+            ),
+            Self::MakeWorktree { path, .. } => write!(
+                f,
+                "cannot make or move the worktree folder {} (check that its folder is writable)",
+                path.display()
+            ),
+            Self::ReadThreads { path, problem } => write!(
+                f,
+                "cannot read the threads in {}: {problem} (fix the file, or move it aside: \
+                 Postil then forgets its threads, and their worktrees stay on disk)",
+                path.display()
+            ),
+            Self::WriteThreads { path, .. } => write!(
+                f,
+                "cannot write {} (check that the git directory is writable)",
+                path.display()
+            ),
+            Self::ThreadChanged { path, found } => write!(
+                f,
+                "the worktree {} holds work Postil did not commit: {found} (commit it or \
+                 remove it there, then try again)",
+                path.display()
+            ),
+            Self::NotAWorktree { path } => write!(
+                f,
+                "{} is not a worktree of this repository, so Postil leaves it alone (fix the \
+                 thread's path in threads.json, or delete the folder yourself)",
+                path.display()
+            ),
+            Self::ApplyConflict { stderr } => write!(
+                f,
+                "the thread's changes do not fit your working tree, so none were applied: {} \
+                 (commit or stash your changes to those files, then apply again)",
+                stderr.trim()
+            ),
         }
     }
 }
@@ -440,7 +521,9 @@ impl std::error::Error for Error {
             | Self::CopyIndex { source, .. }
             | Self::WriteFolders { source, .. }
             | Self::WriteLayout { source, .. }
-            | Self::ReadRun { source, .. } => Some(source),
+            | Self::ReadRun { source, .. }
+            | Self::MakeWorktree { source, .. }
+            | Self::WriteThreads { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
             Self::Highlight { source, .. } => Some(source),
             Self::Window(source) => Some(source),
@@ -472,7 +555,12 @@ impl std::error::Error for Error {
             | Self::RunElsewhere
             | Self::RunInOpenProject
             | Self::NoSuchRequest
-            | Self::NoSuchRun { .. } => None,
+            | Self::NoSuchRun { .. }
+            | Self::NoCommit
+            | Self::ReadThreads { .. }
+            | Self::ThreadChanged { .. }
+            | Self::NotAWorktree { .. }
+            | Self::ApplyConflict { .. } => None,
         }
     }
 }

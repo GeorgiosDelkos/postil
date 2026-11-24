@@ -4,13 +4,13 @@
 //! working tree and the diffs between them, and `git` already knows the ignore rules.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -354,6 +354,245 @@ impl Repo {
         )
     }
 
+    /// The commit `HEAD` names, or `None` in a repository with no commit yet.
+    ///
+    /// # Errors
+    ///
+    /// The git errors other than an unborn `HEAD`.
+    pub(crate) fn head(&self) -> Result<Option<String>> {
+        match git(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        ) {
+            Ok(id) => Ok(Some(id.trim_end().to_owned())),
+            // With `--quiet`, a name that resolves to nothing exits 1 and prints nothing: an
+            // unborn `HEAD`. Any other failure prints why.
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Makes a linked worktree at `path`, on a new branch `branch` that starts at commit
+    /// `fork`. Checks every file out, running the repository's smudge filters, so it takes as
+    /// long as a checkout. Leaves this working tree's files, index and branch alone.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as a branch of that name that exists already, or `path` that
+    /// exists and is not empty.
+    pub(crate) fn add_worktree(&self, path: &Path, branch: &str, fork: &str) -> Result<()> {
+        let args = [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--quiet"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            path.as_os_str(),
+            OsStr::new(fork),
+        ];
+        run_git_with(&self.root, None, &args, None).map(drop)
+    }
+
+    /// The folders of this repository's linked worktrees, as git lists them, resolved. The
+    /// main working tree is left out.
+    ///
+    /// # Errors
+    ///
+    /// The git error.
+    pub(crate) fn worktrees(&self) -> Result<Vec<PathBuf>> {
+        let list = run_git_bytes(&self.root, None, &["worktree", "list", "--porcelain", "-z"])?;
+        let main = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        Ok(list
+            .split(|&byte| byte == 0)
+            .filter_map(|field| field.strip_prefix(b"worktree "))
+            .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .filter(|path| *path != main)
+            .collect())
+    }
+
+    /// Drops git's record of every linked worktree whose folder is gone, so its branch can
+    /// be deleted and its name used again.
+    ///
+    /// # Errors
+    ///
+    /// The git error.
+    pub(crate) fn prune_worktrees(&self) -> Result<()> {
+        git(&self.root, &["worktree", "prune"]).map(drop)
+    }
+
+    /// Deletes the local branch `branch`, merged or not. A branch that does not exist (never
+    /// made, or deleted by hand) is already as asked.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as a branch that a worktree still has checked out.
+    pub(crate) fn delete_branch(&self, branch: &str) -> Result<()> {
+        let name = format!("refs/heads/{branch}");
+        match git(&self.root, &["rev-parse", "--verify", "--quiet", &name]) {
+            // As in `head`: nothing on stderr is a name that resolves to nothing.
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        git(&self.root, &["branch", "--quiet", "-D", branch]).map(drop)
+    }
+
+    /// Checks out the submodules `.gitmodules` names, when there is one. A new worktree has
+    /// none checked out. May fetch over the network; never prompts.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as a submodule that cannot be fetched.
+    pub(crate) fn update_submodules(&self) -> Result<()> {
+        if !self.root.join(".gitmodules").exists() {
+            return Ok(());
+        }
+        git(&self.root, &["submodule", "update", "--init", "--quiet"]).map(drop)
+    }
+
+    /// The paths with changes git would commit, as `git status` lists them: tracked files
+    /// changed or deleted, and files that are neither tracked nor ignored. Empty when the
+    /// working tree is clean. Ignored files are not listed.
+    ///
+    /// # Errors
+    ///
+    /// The git error.
+    pub(crate) fn changed(&self) -> Result<Vec<String>> {
+        let status = run_git(
+            &self.root,
+            None,
+            &["status", "--porcelain", "-z", "--untracked-files=all"],
+        )?;
+        let mut paths = Vec::new();
+        let mut entries = status.split_terminator('\0');
+        while let Some(entry) = entries.next() {
+            // `XY path`; a rename or copy (`R`, `C`) is followed by its source path, which is
+            // an entry of its own.
+            let (code, path) = entry.split_at(entry.len().min(3));
+            paths.push(path.to_owned());
+            if code.starts_with(['R', 'C']) {
+                entries.next();
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Commits every change in the working tree with `message`, and returns the commit
+    /// `HEAD` names afterwards: the new one, or the one before when nothing changed. Ignored
+    /// files stay out. Runs `git add --all` and `git commit` on the working tree's own index,
+    /// so it is for a thread's worktree, never the engineer's.
+    ///
+    /// The commit runs no hooks (`--no-verify`) and keeps the message as it is
+    /// (`--cleanup=verbatim`, so a note's line starting with `#` stays). The author and the
+    /// signing follow the git config; with no terminal, a signing key that asks for a
+    /// passphrase fails the commit rather than waiting.
+    ///
+    /// # Errors
+    ///
+    /// The git errors, such as a missing `user.name`, or a working tree with no commit.
+    pub(crate) fn commit_all(&self, message: &str) -> Result<String> {
+        if !self.changed()?.is_empty() {
+            git(&self.root, &["add", "--all"])?;
+            git(
+                &self.root,
+                &[
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "--cleanup=verbatim",
+                    "--message",
+                    message,
+                ],
+            )?;
+        }
+        self.head()?.ok_or_else(|| Error::Git {
+            command: "rev-parse HEAD".to_owned(),
+            stderr: "the worktree has no commit".to_owned(),
+        })
+    }
+
+    /// The changes from commit `from` to commit `to` as a patch `git apply` takes: binary
+    /// files included, renames found. The options fix the format whatever the engineer's git
+    /// config says, as for [`Repo::diff`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Repo::diff`].
+    pub(crate) fn patch(&self, from: &str, to: &str) -> Result<Vec<u8>> {
+        for id in [from, to] {
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(Error::BadRequest(format!(
+                    "commit {id:?}: expected a git object id"
+                )));
+            }
+        }
+        run_git_bytes(
+            &self.root,
+            None,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                "--find-renames",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                from,
+                to,
+            ],
+        )
+    }
+
+    /// Applies `patch` ([`Repo::patch`]) to the working tree's files, leaving the index
+    /// alone. All or nothing: git refuses the whole patch when any part of it does not fit,
+    /// and then nothing changes. An empty patch changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The git error, naming each file that does not fit.
+    pub(crate) fn apply(&self, patch: &[u8]) -> Result<()> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let args = ["apply", "--whitespace=nowarn", "-"].map(OsStr::new);
+        run_git_with(&self.root, None, &args, Some(patch)).map(drop)
+    }
+
+    /// The ignored folders at the top of the working tree that are on disk, such as `target`
+    /// or `node_modules`: folder names, without the trailing `/`. Files, folders below the
+    /// top, and symlinks are left out.
+    ///
+    /// # Errors
+    ///
+    /// The git error.
+    pub(crate) fn ignored_folders(&self) -> Result<Vec<String>> {
+        let list = run_git(
+            &self.root,
+            None,
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ],
+        )?;
+        Ok(list
+            .split_terminator('\0')
+            .filter_map(|entry| entry.strip_suffix('/'))
+            .filter(|name| !name.contains('/'))
+            .filter(|name| {
+                fs::symlink_metadata(self.root.join(name)).is_ok_and(|meta| meta.is_dir())
+            })
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Reads one file as text. `file` is a path relative to the root, as [`Repo::files`]
     /// returns it. A symlink inside the tree is followed, wherever it points: the reader sees
     /// what an editor would show.
@@ -497,11 +736,33 @@ fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
 
 /// [`run_git`], returning the bytes git printed.
 fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    run_git_with(dir, index, &args, None)
+}
+
+/// Runs `git` in `dir` with arguments that may be paths, writes `input` to its standard input
+/// when given, and returns what it printed. Without `input` its standard input is empty, so
+/// a command that would prompt (a credential, a passphrase) fails instead of waiting.
+fn run_git_with(
+    dir: &Path,
+    index: Option<&Path>,
+    args: &[&OsStr],
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(dir)
         .args(args)
+        // Never wait on a terminal prompt: there is none, and a send would hang.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         // Messages in English whatever the user's locale: `Repo::open` matches one of them.
         .env("LC_ALL", "C")
         // The repository is the one `-C` names. These variables, inherited from a terminal
@@ -514,11 +775,22 @@ fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
-    let output = command.output().map_err(Error::SpawnGit)?;
+    let mut child = command.spawn().map_err(Error::SpawnGit)?;
+    let output = std::thread::scope(|scope| {
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // On a thread of its own: git may fill its output pipe before it reads all of the
+            // input, and this thread reads that output. A git that exits early closes the
+            // pipe, and the write fails; its exit status and message then say why.
+            scope.spawn(move || drop(stdin.write_all(input)));
+        }
+        child.wait_with_output()
+    })
+    .map_err(Error::SpawnGit)?;
 
     if !output.status.success() {
+        let command: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
         return Err(Error::Git {
-            command: args.join(" "),
+            command: command.join(" "),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }

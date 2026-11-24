@@ -279,7 +279,7 @@ fn a_settings_file_written_by_hand_may_name_only_what_it_changes() {
 
 #[test]
 fn without_a_configuration_directory_settings_are_the_defaults_and_cannot_be_saved() {
-    let site = Site::new(None, None, no_agents(), quiet());
+    let site = Site::new(None, None, None, no_agents(), quiet());
     let view = get_json(&site, SETTINGS);
     assert_eq!(
         view["problem"],
@@ -307,6 +307,7 @@ fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
     let first_path = bin.clone().into_os_string();
     let site = Site::new(
         Some(&repo.config()),
+        None,
         None,
         Scanner::new(move || {
             let mut scans = counter.lock().unwrap();
@@ -464,7 +465,7 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
     // Another window, or the next start, reads the same widths: they are the Mac's, not
     // the project's.
     let other = TempRepo::new("layout-other");
-    let again = Site::new(Some(&repo.config()), None, no_agents(), quiet());
+    let again = Site::new(Some(&repo.config()), None, None, no_agents(), quiet());
     again
         .open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
         .unwrap();
@@ -520,7 +521,7 @@ fn a_hand_edited_layout_with_a_width_out_of_range_reads_as_the_defaults() {
 
 #[test]
 fn without_a_configuration_directory_widths_are_the_defaults_and_not_kept() {
-    let site = Site::new(None, None, no_agents(), quiet());
+    let site = Site::new(None, None, None, no_agents(), quiet());
     assert_eq!(get_json(&site, LAYOUT)["tray"], 320);
     let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");

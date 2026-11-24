@@ -242,6 +242,11 @@ async function prompt(id, params) {
       update({ sessionUpdate: "tool_call", toolCallId: "x1", title: "Edit a.txt", kind: "edit", status: "completed", content: [{ type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "z" }] });
       say("```json\n[]\n```");
       return send({ id, result: { stopReason: "end_turn" } });
+    case "reviewer-writes":
+      // A proposer that changes a file through a command: it reports no edit at all.
+      writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
+      say("```json\n[]\n```");
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reject-only": {
       // No option allows, so Postil cannot answer it alone: the engineer does.
       const reply = await ask("session/request_permission", {

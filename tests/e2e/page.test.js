@@ -348,3 +348,21 @@ test("c on a file's row writes a note on the file, and Save keeps it without a r
   const count = page.locator('#files .file[data-path="src/b.rs"] .count');
   await count.filter({ hasText: "1" }).waitFor();
 });
+
+test("the run's dialog shows its branch, and Apply ends the thread once the run stops", async (t) => {
+  const { page, api } = await openProject(t);
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  await detail.locator(".run-thread-branch").filter({ hasText: "postil/r1-rename-two" }).waitFor();
+  // A thread whose run goes on cannot end.
+  const apply = detail.getByRole("button", { name: "Apply" });
+  assert.ok(await apply.isDisabled(), "Apply waits for the run");
+
+  await api("api/run/cancel", { method: "POST" });
+  await page.locator("#run-header .stop").waitFor({ state: "detached" });
+  await detail.getByRole("button", { name: "Apply", disabled: false }).click();
+  await detail.locator(".run-thread-state").filter({ hasText: "Applied" }).waitFor();
+  const thread = await api("api/thread?id=R1");
+  assert.equal(thread.state, "applied");
+});

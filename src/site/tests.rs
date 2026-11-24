@@ -10,6 +10,7 @@ mod projects;
 mod routes;
 mod runs;
 mod settings;
+mod threads;
 
 use std::ffi::OsString;
 use std::fs;
@@ -40,8 +41,27 @@ impl TempRepo {
         drop(fs::remove_dir_all(&root));
         fs::create_dir_all(root.join("src")).unwrap();
         let repo = Self { root };
+        drop(fs::remove_dir_all(repo.home()));
         repo.git(&["init", "--quiet", "--initial-branch", "trunk"]);
+        // Postil commits in a thread's worktree, which shares this config: a machine with no
+        // git identity (a CI runner) would fail those commits.
+        repo.git(&["config", "user.name", "Postil Test"]);
+        repo.git(&["config", "user.email", "postil-test@example.invalid"]);
         repo
+    }
+
+    /// Postil's home folder for this repository's sites, where threads' worktrees go: beside
+    /// the repository, on the same volume, so build folders can be cloned.
+    pub(crate) fn home(&self) -> PathBuf {
+        let mut name = self.root.file_name().unwrap().to_owned();
+        name.push("-home");
+        self.root.with_file_name(name)
+    }
+
+    /// Commits every file in the working tree: a thread starts from a commit.
+    pub(crate) fn commit(&self) {
+        self.git(&["add", "--all"]);
+        self.git(&["commit", "--quiet", "--allow-empty", "--message", "base"]);
     }
 
     fn git(&self, args: &[&str]) {
@@ -69,7 +89,7 @@ impl TempRepo {
     /// A site with no project open, its configuration in [`Self::config`] and no agents
     /// installed.
     fn empty_site(&self) -> Site {
-        Site::new(Some(&self.config()), None, no_agents(), quiet())
+        Site::new(Some(&self.config()), None, None, no_agents(), quiet())
     }
 
     /// The configuration directory of this repository's sites: inside its git directory,
@@ -77,6 +97,18 @@ impl TempRepo {
     fn config(&self) -> PathBuf {
         self.root.join(".git/test-config")
     }
+}
+
+/// `git` in `dir`, which must succeed, and what it printed, trimmed.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 /// A page that is never told about runs.
@@ -93,6 +125,7 @@ impl Drop for TempRepo {
     fn drop(&mut self) {
         // Best effort: a leftover directory in the temporary directory fails no test.
         drop(fs::remove_dir_all(&self.root));
+        drop(fs::remove_dir_all(self.home()));
     }
 }
 
@@ -234,11 +267,14 @@ pub(crate) fn run_site(repo: &TempRepo, scenario: &str) -> (Site, mpsc::Receiver
 }
 
 /// A site on `repo` whose agent is the fake agent in `scenario`, called Fake, with this
-/// process's PATH (to find `node`), telling `notify` when a run changes.
+/// process's PATH (to find `node`), telling `notify` when a run changes. Commits the files
+/// as they are first, so a send has a commit to start its thread from.
 fn agent_site(repo: &TempRepo, scenario: &str, notify: Notify) -> Site {
+    repo.commit();
     let path = std::env::var_os("PATH").expect("PATH is set");
     let site = Site::new(
         Some(&repo.config()),
+        Some(&repo.home()),
         None,
         Scanner::new(move || path.clone()),
         notify,

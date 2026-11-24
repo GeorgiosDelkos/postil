@@ -27,6 +27,10 @@ export function runStore({ render, onChange, onLoaded, onError }) {
   const others = new Map();
   const asked = new Set();
   const failed = new Map();
+  // Threads by their first run's id (`api/thread`): the worktree, branch and state, or null
+  // for a run from before threads had worktrees. Read once each, like older runs, and read
+  // again after a thread ends here or the page refreshes.
+  const threads = new Map();
 
   async function fetchRun() {
     // Only the entries not seen yet, unless the run is another one: then all of them.
@@ -124,6 +128,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     }
     for (const id of failed.keys()) asked.delete(id);
     failed.clear();
+    threads.clear();
     listStale = true;
   }
 
@@ -132,8 +137,40 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     others.clear();
     asked.clear();
     failed.clear();
+    threads.clear();
     listStale = true;
     return sync();
+  }
+
+  // The thread whose first run is `id`, once read: undefined until then (a read is started),
+  // null when the run has none. Asked for once until it changes here or the page refreshes.
+  function thread(id) {
+    if (threads.has(id)) return threads.get(id);
+    threads.set(id, undefined);
+    fetch(`api/thread?id=${encodeURIComponent(id)}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        threads.set(id, await response.json());
+        render();
+      })
+      .catch((error) => onError(String(error.message ?? error)));
+    return undefined;
+  }
+
+  // Ends thread `id`: `"apply"` writes its changes into the working tree, `"discard"` drops
+  // them; either frees its worktree. Resolves to whether it ended.
+  function endThread(id, ending) {
+    return post(`api/thread/${ending}`, { thread: id }).then(
+      () => {
+        threads.delete(id);
+        render();
+        return true;
+      },
+      (error) => {
+        onError(error.message);
+        return false;
+      },
+    );
   }
 
   async function post(route, body) {
@@ -180,6 +217,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     answerQuestion,
     answer,
     startReview,
+    thread,
+    endThread,
     knownViews,
     run: () => run,
     ids: () => ids,

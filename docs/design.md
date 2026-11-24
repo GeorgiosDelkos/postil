@@ -155,6 +155,8 @@ schedule three tasks.
 | `src/app.rs` | `App` state and `App::update(Event)`. No drawing, no I/O: testable headless. |
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
+| `src/thread.rs` | Threads: their worktrees, branches, `threads.json`, and freeing them. |
+| `src/clone.rs` | One `clonefile(2)` call that clones a build folder: the crate's one `unsafe`. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
 | `src/layout.rs`, `ui/panes.js` | The pane widths, `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
@@ -372,11 +374,12 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 | `POST /api/run/question` `{request, content}` | Answers a question with the form's values, or skips it (`content` `null`). |
 | `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
 
-- **The agent is kept between runs**, with its session, until a send names another agent or
-  command, the project closes, the agent exits, or a turn fails (its session may be broken);
-  the next send then starts it again. The
-  owner chose this on 2026-11-23 over a fresh agent per send, so milestone 4's follow-up notes
-  reach the same conversation.
+- **The agent is kept between the runs of a thread**, with its session, so a follow-up
+  reaches the same conversation: the owner chose this on 2026-11-23 over a fresh agent per
+  send. It is replaced when a run names another agent or command, and stopped when the project
+  closes, the agent exits, a turn fails (its session may be broken), or its thread ends. A
+  send starts a new thread in a new worktree (section "Worktrees"), so it always starts a
+  fresh agent, since 2026-11-24.
 - **One run at a time** per working tree: a send during a run is refused (409), and a live
   run holds an exclusive lock on `runs/active.lock`, so another window on the same working
   tree is refused too. Milestone 6 moves the rule to each thread, with a lock of its own, and
@@ -506,7 +509,10 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
 
 - **Snapshots.** Postil takes one before each run (before the agent gets the prompt) and one as
   its turn ends, and logs each as a `snapshot` entry with its point (`before`, `after`) and the
-  tree's id (`Repo::snapshot`, run log version 4). A proposing reviewer, which may not edit,
+  tree's id (`Repo::snapshot`, run log version 4). Since 2026-11-24 a run in a thread logs a
+  commit on its thread's branch there instead, and the tree snapshot below is taken only of a
+  worktree with no commit after its run (section "Worktrees", "Commits"); the field keeps
+  its name, `tree`, since `git diff` takes either. A proposing reviewer, which may not edit,
   takes none. A snapshot is every tracked file and every untracked file that is not ignored,
   written as a tree through Postil's own index, `<git dir>/postil/snapshot/index`, kept between
   snapshots. It starts from a copy of the real index, and again whenever the two track
@@ -537,11 +543,17 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
 
 ### Worktrees
 
-Not built: milestone 6. Decided with the owner on 2026-11-24. Two agents in one working tree
+Milestone 6, under way. Decided with the owner on 2026-11-24. Two agents in one working tree
 overwrite each other's edits, so each thread (a run of notes with its follow-ups and reviews)
 runs in a git worktree of its own, on a branch of its own. The engineer's working tree is
 never an agent's working directory; changes reach it only through Apply or a merged pull
 request.
+
+Built (`src/thread.rs`, `src/clone.rs`): a worktree and a branch per thread, the record,
+commits as snapshots, the cloned build folders, Apply and Discard, and finishing deletes left
+in the trash at start. Still one run at a time per window, with one kept agent. Not built yet,
+and marked so below: a runner per thread with its locks, the warning about uncommitted
+changes, sparse-checkout patterns, the startup sweep and the disk bounds, and pull requests.
 
 #### Threads
 
@@ -551,37 +563,51 @@ request.
   as section "Runs" describes for one. The session's `cwd` (`session/new`), the prompt's
   `resource_link`s, and the paths in the run log are all in the thread's worktree, never in
   the engineer's working tree. A follow-up or a review stage uses only its thread's agent.
+  Built so far: the worktree as `cwd`, the links and the log's paths. The window still holds
+  one agent, kept for a follow-up of the run it ran; a send, which starts a new thread,
+  starts a fresh agent.
 - **Locks.** Run logs, notes, and the run-number counter stay in the project's git dir.
   `runs/active.lock` is held only while a run number is taken. One run at a time per thread
   is a lock of its own, `threads/r<n>.lock`, held for the run, plus `git worktree lock`, so
   no cleanup removes a live worktree. `threads.lock` serializes, across windows, everything
-  that makes, ends, or evicts a worktree, and the count of live agents.
-- **The record** is `<git dir>/postil/threads.json`, one entry per thread: the thread's first
-  run, the worktree's absolute path, the branch, the fork commit, the base branch (the one
-  `HEAD` was on at send), the pull request's URL, the time of its last run, and its state
-  (live, idle, evicted, ended). It is written under `threads.lock` before `git worktree add`,
-  so a crash leaves a record pointing at whatever was made. Run logs stay append-only, so
-  this file holds what changes.
+  that makes, ends, or evicts a worktree, and the count of live agents. Built so far:
+  `threads.lock` around every change to the record; `runs/active.lock` is still held for the
+  whole run, which keeps one run at a time per repository.
+- **The record** is `<git dir>/postil/threads.json` (version 1), one entry per thread: `id`,
+  its first run; `path`, the worktree's absolute path; `branch`; `fork`, the commit it starts
+  from; `base`, the branch `HEAD` was on at send; `tip`, the commit Postil left after the last
+  run; `skipped`, what the worktree was not given; and `state`: `open`, `applied` or
+  `discarded`. The later steps add the pull request's URL, the time of the last run, and an
+  evicted state. A change reads the file, changes one thread and writes it whole, under
+  `threads.lock`; a new thread is written before `git worktree add`, so a crash leaves a
+  record pointing at whatever was made. Run logs stay append-only, so this file holds what
+  changes. A file that cannot be read or parsed is reported and never written over.
 - **Based on `HEAD`, not on the engineer's uncommitted edits**, as Cursor, Codex and Claude
   Code do: those edits would otherwise land in the pull request. The fork commit is `HEAD` at
   send. When the checkout has uncommitted changes, the send step says the thread starts from
   the last commit and does not see them; when a noted file is among them, it adds that the
-  note's lines may not match. A repository with no commit cannot send, and the message says
+  note's lines may not match (not built yet). A repository with no commit cannot send (422),
+  and the message says
   it needs one commit first. A detached `HEAD` sends too, with no base branch: the thread can
   be applied but not opened as a pull request.
 - **The branch** is `postil/r<n>-<slug>`, the slug from the first note's text, lowercased to
-  `[a-z0-9-]`, at most 40 characters, and `postil/r<n>` when nothing is left. `git
-  check-ref-format --branch` checks it before use.
+  `[a-z0-9-]`, at most 40 characters, and `postil/r<n>` when nothing is left. Built from
+  those characters only, with no dash at either end, it is always a name
+  `git check-ref-format` accepts. A branch of that name that exists already (two linked
+  worktrees of one repository number their runs apart) fails the run with git's message.
 - **Where:** `~/.postil/worktrees/<repo>-<id>/r<n>`, `<id>` the first 8 hex digits of a hash
   of the repository's canonical path, so two clones with one name stay apart. The record holds
   the path, so nothing recomputes it. A home folder per tool is what Cursor
   (`~/.cursor/worktrees`) and Codex (`~/.codex/worktrees`) use. Inside the repository, as
   Claude Code does, would need a `.gitignore` entry and would put the worktrees in Postil's
   file list. A repository on another volume than the home folder gets its worktrees in
-  `.postil-worktrees/` at that volume's root, so clones stay on one volume.
-- **Making it:** `git worktree add -b <branch> <path> <fork commit>`, then
-  `git submodule update --init` when `.gitmodules` exists, and the checkout's sparse-checkout
-  patterns when it has any.
+  `.postil/worktrees/` at that volume's root, so clones stay on one volume. Paths are
+  resolved (`/tmp` is `/private/tmp` on macOS): an agent reports the paths the system gives
+  it, and Postil strips the worktree's path from them.
+- **Making it:** `git worktree add -b <branch> <path> <fork commit>` on the agent's start
+  thread, before the agent starts there, then `git submodule update --init` when
+  `.gitmodules` exists, and the checkout's sparse-checkout patterns when it has any (not
+  built yet). A worktree that cannot be made fails the run.
 
 #### Warm build folders
 
@@ -596,9 +622,12 @@ working tree into it: `target/`, `node_modules/`, and the like.
   193,000-file `target/`: 3 s and no disk used until a block changes, where `cp -c -R` took
   34 s; cargo 1.100 then built in the clone at its new path with nothing recompiled. Symlinks
   inside a cloned folder stay links, cross-volume ones included (tested the same day). The
-  man page discourages `clonefile` on directories and points to `copyfile(3)`, so a folder
-  whose clone fails is tried once with `copyfile` (`COPYFILE_CLONE | COPYFILE_RECURSIVE`),
-  then skipped, and the thread names what it skipped. A folder the engineer is building into
+  call is the crate's one `unsafe` code (`src/clone.rs`): the crate forbade `unsafe` until
+  then, and the owner allowed this one module on 2026-11-24 over the 34 s of the safe route.
+  The man page discourages `clonefile` on directories and points to `copyfile(3)`, so a
+  folder whose clone fails is tried once with `cp -c -R` (which copies through `copyfile`,
+  cloning file by file where it can), then skipped, and the thread names what it skipped in
+  its record and its dialog. A folder the engineer is building into
   at that moment can be cloned half-written; cargo's fingerprints catch most of that, and
   `cargo clean` in the worktree fixes the rest.
 - **Rejected:** a shared `CARGO_TARGET_DIR`. Cargo's lock on it makes concurrent builds wait,
@@ -608,10 +637,13 @@ working tree into it: `target/`, `node_modules/`, and the like.
 
 After each turn of a run that may edit (a run of notes, a follow-up, a judging reviewer),
 Postil commits everything in the worktree: `git add --all`, then `git commit --no-verify
---cleanup=verbatim` with the engineer's git identity and the notes as the message. A
-proposing reviewer may not edit: if it leaves `git status --porcelain` non-empty, the review
-stops and nothing is committed. When the agent committed its work itself, nothing is left to
-add and Postil makes no commit.
+--cleanup=verbatim` with the engineer's git identity. The message says what was asked:
+`Postil R3: notes N1, N2` and the prompt, `Postil R4: follow-up of R3` and the engineer's
+words, or `Postil R5: reviewer 2 of 2 on R3`. A proposing reviewer may not edit and takes no
+snapshot: if it leaves `git status --porcelain` non-empty, the review stops. When the agent
+committed its work itself, nothing is left to add and Postil makes no commit. Before a run of
+an open thread, anything left in the worktree since the last commit (a commit that failed, a
+hand edit) is committed first, as `Postil: work left in the worktree before R4`.
 
 - **Snapshots are commits.** Before is the branch tip at the start of a run, after is the tip
   at its end, both logged in the existing `snapshot` entry (`git diff` takes a commit id as
@@ -628,13 +660,15 @@ Three things end a thread, each one of the engineer's clicks:
 - **Apply** writes the changes between the fork commit and the tip into the engineer's working
   tree, uncommitted. First the safety check below; then
   `git diff --binary --find-renames <fork> <tip>`, with the options `Repo::diff` pins against
-  the engineer's git config, piped to `git apply --check`, then to `git apply`. Plain `git
-  apply` changes files only and is atomic ("fails the whole patch and does not touch the
-  working tree when some of the hunks do not apply", `git help apply`), so a patch that does
-  not fit is refused with the files that clash. `--3way` was rejected because it stages its
-  result, and Postil leaves the engineer's index alone (section "The changes view").
+  the engineer's git config, piped to `git apply --whitespace=nowarn`. Plain `git apply`
+  changes files only and is atomic ("fails the whole patch and does not touch the working
+  tree when some of the hunks do not apply", `git help apply`), so a patch that does not fit
+  is refused (409) with the files that clash, and the thread stays open. `--3way` was
+  rejected because it stages its result, and Postil leaves the engineer's index alone
+  (section "The changes view").
 - **Discard** ends the thread with nothing applied.
-- **A merged or closed pull request.** Open pull request does not end the thread. It pushes
+- **A merged or closed pull request** (not built yet). Open pull request does not end the
+  thread. It pushes
   the branch (`GIT_TERMINAL_PROMPT=0`) and runs
   `gh pr create --draft --head <branch> --base <base branch>`, the notes as the body, and
   records the URL. It refuses with no base branch, or when the base branch is not on the
@@ -647,21 +681,29 @@ Three things end a thread, each one of the engineer's clicks:
 branch tip is the commit Postil made last. Failing either means something Postil did not
 make is there: Postil shows it and asks, and writes nothing and deletes nothing until the
 engineer answers. Ignored files are not checked: they are build output, and every worktree
-holds cloned ones.
+holds cloned ones. Built so far: Postil refuses (409), naming what is there and the
+worktree's path, so the engineer commits or removes it there; an answer in the dialog that
+ends the thread anyway is not built. A thread whose run is under way, or whose review is
+between two stages, is not ended either (409).
 
 **An ended thread frees its disk at once:**
 
-1. Stop the thread's agent and `git worktree unlock`.
-2. Rename the worktree into `~/.postil/trash/r<n>-<unique>` (instant on one volume), run
-   `git worktree prune`, and delete the folder on a background thread: 193,000 files take
-   seconds. Never the macOS Trash, which keeps the disk in use.
+1. Stop the thread's agent and `git worktree unlock` (no lock is taken yet).
+2. Rename the worktree into `trash/` beside `worktrees/`, as `r<n>-<pid>-<count>` (instant on
+   one volume), run `git worktree prune`, and delete the folder on a background thread:
+   193,000 files take seconds. Never the macOS Trash, which keeps the disk in use. The next
+   start of the app finishes a delete that a quit cut short.
 3. Keep the branch. It costs no real disk, the changes view reads its commits, and after
    Apply it is the only copy until the engineer commits. It goes with the thread's last note
    (section "Runs": a run goes with its last note), with `git branch -D`: `-d` checks
-   ancestry, which a squash merge defeats. A remote branch is GitHub's to delete
-   ("automatically delete head branches"); Postil never deletes one.
+   ancestry, which a squash merge defeats. The thread goes from the record then too, and an
+   open thread's worktree is freed first. A thread whose follow-up still runs when its first
+   run's log goes keeps all of that until a delete after the run ends. A remote branch is
+   GitHub's to delete ("automatically delete head branches"); Postil never deletes one.
 
 #### Keeping the disk in bounds
+
+Not built yet, except finishing the deletes left in the home folder's trash at start.
 
 - **On start,** under `threads.lock`: a worktree whose thread lock is free is unlocked
   (`git worktree unlock`), since a crash leaves git's lock behind; worktrees under Postil's
@@ -933,10 +975,12 @@ retired; the measured numbers above are the baseline to not regress.
    `.github/workflows/release.yml` does the same in CI from a `v*` tag, with the secrets of
    the `release` environment that GeorgiosDelkos/vigil's release uses, and publishes a zip of
    the app (Apple Silicon only, the runner's architecture).
-6. **Threads side by side.** Not built. A worktree and a branch per thread (section
-   "Worktrees"), one pull request each: the design, then the worktree with its branch,
-   commits and clones, then ending a thread and keeping the disk in bounds, then Apply, then
-   Open pull request.
+6. **Threads side by side.** Under way. A worktree and a branch per thread (section
+   "Worktrees"), one pull request per step, so the main branch works after each. The owner
+   chose this order on 2026-11-24, so agents never write to worktrees with no way to bring
+   their changes back: the worktree with its branch, commits and clones, with Apply and
+   Discard (built); then a runner per thread, its locks and the agent cap; then the startup
+   sweep, eviction and the free-space floor; then Open pull request.
 
 ## Testing
 
