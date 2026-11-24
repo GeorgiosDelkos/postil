@@ -319,8 +319,10 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     // A unique name in the trash only: nothing is ordered by it.
     static FREED: AtomicU64 = AtomicU64::new(0);
     check_place(repo, home, thread)?;
-    check(thread)?;
+    // Before any git call in the worktree (`check` runs `git status` there): a folder with no
+    // `.git` of its own would have git look upward, into another repository.
     let record = repo.worktree_record(&thread.path)?;
+    check(repo, home, thread)?;
     if thread.path.symlink_metadata().is_ok() {
         let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
         let trash = trash_for(repo.root(), home);
@@ -366,21 +368,40 @@ pub(crate) fn forget(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     Ok(())
 }
 
+/// `thread`'s worktree, opened only when it is Postil's: where Postil puts worktrees
+/// ([`check_place`]), with a `.git` that names a worktree record of `repo`. Every git call in a
+/// thread's worktree goes through this: git looks upward from a folder with no `.git` of its
+/// own (an agent may delete it), and would act on whatever repository holds the folder.
+///
+/// # Errors
+///
+/// [`Error::NotAWorktree`] for a folder that is not Postil's, or not a worktree of `repo`, and
+/// as [`Repo::open`].
+pub(crate) fn open(repo: &Repo, home: &Path, thread: &Thread) -> Result<Repo> {
+    check_place(repo, home, thread)?;
+    repo.worktree_record(&thread.path)?
+        .ok_or_else(|| Error::NotAWorktree {
+            path: thread.path.clone(),
+        })?;
+    Repo::open(&thread.path)
+}
+
 /// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
 /// git would commit (ignored files, such as the cloned build folders, do not count), the
 /// thread's branch checked out, and that branch at the commit Postil left or past it. Past it
 /// is a commit the engineer made there, as the refusal tells them to, and it is theirs to
 /// keep: it is on the branch, which freeing keeps. Returns the commit the thread ends at: the
-/// worktree's, or the recorded tip when the worktree is not on disk.
+/// worktree's, or the recorded tip when the worktree is not on disk. Opens the worktree only
+/// through [`open`].
 ///
 /// # Errors
 ///
-/// [`Error::ThreadChanged`] naming what is there, and the git errors.
-pub(crate) fn check(thread: &Thread) -> Result<String> {
+/// As [`open`]; [`Error::ThreadChanged`] naming what is there; and the git errors.
+pub(crate) fn check(repo: &Repo, home: &Path, thread: &Thread) -> Result<String> {
     if !thread.path.is_dir() {
         return Ok(thread.tip.clone());
     }
-    let tree = Repo::open(&thread.path)?;
+    let tree = open(repo, home, thread)?;
     let changed = tree.changed()?;
     if !changed.is_empty() {
         return Err(Error::ThreadChanged {

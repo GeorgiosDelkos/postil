@@ -8,9 +8,12 @@
 //! `copyfile(3)`, which walks the tree as `cp` does; the caller falls back to `cp -c -R` when
 //! this call fails for another reason than a volume that cannot clone, and skips the folder
 //! when it cannot.
-#![expect(
-    unsafe_code,
-    reason = "one FFI call to clonefile(2); the owner allowed this module on 2026-11-24"
+#![cfg_attr(
+    target_os = "macos",
+    expect(
+        unsafe_code,
+        reason = "one FFI call to clonefile(2); the owner allowed this module on 2026-11-24"
+    )
 )]
 
 use std::io;
@@ -68,6 +71,7 @@ mod tests {
     use crate::testing::TempDir;
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[cfg_attr(miri, ignore)] // clonefile is an FFI call, which miri cannot run
     fn a_folder_is_cloned_whole_with_its_links_kept_as_links() {
         let dir = TempDir::new("clone-folder");
@@ -96,6 +100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[cfg_attr(miri, ignore)] // clonefile is an FFI call, which miri cannot run
     fn a_clone_onto_an_existing_path_fails_and_changes_nothing() {
         let dir = TempDir::new("clone-exists");

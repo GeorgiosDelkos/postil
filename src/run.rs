@@ -358,9 +358,9 @@ impl Runner {
         let ended = match thread.state {
             State::Open if thread.path.is_dir() => {
                 // The record is a file a hand edit can point anywhere: a commit, an agent and
-                // a proposer's undo go only into a folder where Postil puts worktrees.
+                // a proposer's undo go only into a worktree of Postil's ([`thread::open`]).
                 let home = self.home.as_deref().ok_or(Error::NoHome)?;
-                thread::check_place(&self.repo, home, &thread)?;
+                thread::open(&self.repo, home, &thread)?;
                 return Ok(thread);
             }
             State::Open => {
@@ -393,7 +393,8 @@ impl Runner {
     /// text, a run that is a review, or a run another run already follows; as
     /// [`Runner::view_of`] for `of` and the runs it follows, and [`Error::NoSuchRun`] when one
     /// follows a run that is not older; [`Error::ReadRun`] when the runs directory cannot be
-    /// listed; and [`Error::WriteRun`] when the run log cannot be created.
+    /// listed; [`Error::WriteRun`] when the run log cannot be created; and as
+    /// [`Runner::open_thread`] for the thread, and [`Runner::launch`].
     pub(crate) fn follow_up(
         self: &Arc<Self>,
         of: &str,
@@ -528,8 +529,9 @@ impl Runner {
     /// [`Error::TurnRunning`] while a run of this window is under way, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
     /// reviewers, for a run that is itself a review, or for a follow-up; as
-    /// [`Runner::view_of`] for the reviewed run; and [`Error::WriteRun`] when the first
-    /// stage's log cannot be created.
+    /// [`Runner::view_of`] for the reviewed run; [`Error::WriteRun`] when the first stage's
+    /// log cannot be created; and as [`Runner::open_thread`] for the thread, and
+    /// [`Runner::launch`].
     pub(crate) fn review(self: &Arc<Self>, of: &str, reviewers: Vec<AgentChoice>) -> Result<()> {
         if reviewers.is_empty() {
             return Err(Error::BadRequest(
@@ -650,8 +652,10 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run of this window is under way, as [`Run::create`], and
-    /// for a new thread as [`thread::plan`] and [`thread::add`]: the run then fails too.
+    /// [`Error::TurnRunning`] while a run of this window is under way, as [`Run::create`]; for
+    /// a new thread as [`thread::plan`] and [`thread::add`], and for an open one as
+    /// [`Runner::open_thread`], read again under the run lock: the run then fails too; and
+    /// before a proposer, as [`Runner::commit_worktree`], which also fails the run.
     fn launch(self: &Arc<Self>, mut slot: MutexGuard<'_, Slot>, new: NewRun) -> Result<()> {
         // A worktree still being made counts as a run under way: its agent has not started.
         if slot.making || slot.run.as_ref().is_some_and(|run| run.state().live()) {
@@ -845,7 +849,7 @@ impl Runner {
             // Its exit is not reported, so the snapshot after it is taken here, once nothing
             // can write any more. The run stays live until then, so a send is refused
             // (`TurnRunning`) meanwhile.
-            undo_if_live(&run, thread.as_ref());
+            undo_if_live(self, &run, thread.as_ref());
             self.record_end_snapshot(&run, thread.as_ref());
             run.record(Entry::Failed {
                 error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
@@ -987,7 +991,8 @@ impl Runner {
         match self.thread_of(run)? {
             None => self.repo.snapshot(),
             Some(thread) if thread.state == State::Open && thread.path.is_dir() => {
-                Repo::open(&thread.path)?.snapshot()
+                let home = self.home.as_deref().ok_or(Error::NoHome)?;
+                thread::open(&self.repo, home, &thread)?.snapshot()
             }
             Some(thread) => Err(Error::BadRequest(format!(
                 "{} has no snapshot after it, and the worktree of its thread {} is gone",
@@ -1073,7 +1078,7 @@ impl Runner {
             None => return Err(Error::BadRequest(format!("there is no thread {id}"))),
         };
         thread::check_place(&self.repo, home, &thread)?;
-        let tip = thread::check(&thread)?;
+        let tip = thread::check(&self.repo, home, &thread)?;
         if ending == Ending::Apply {
             let patch = self.repo.patch(&thread.fork, &tip)?;
             self.repo.apply(&patch).map_err(|error| match error {
@@ -1302,7 +1307,7 @@ impl Runner {
             // the run is taken here, or its changes view would stay empty. It runs `git add`
             // on the request thread, quitting included. Both calls do nothing for a run that
             // already ended.
-            undo_if_live(&run, thread.as_ref());
+            undo_if_live(self, &run, thread.as_ref());
             self.record_end_snapshot(&run, thread.as_ref());
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
@@ -1460,11 +1465,13 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// The errors of [`Repo::commit_all`], the work then left uncommitted in the worktree, and
-    /// of [`thread::update`], the commit then made but the record's tip left behind it.
+    /// [`Error::NoHome`]; as [`thread::open`]; the errors of [`Repo::commit_all`], the work then
+    /// left uncommitted in the worktree; and of [`thread::update`], the commit then made but the
+    /// record's tip left behind it.
     fn commit_worktree(&self, run: &Run, thread: &Thread, point: Point) -> Result<String> {
         let message = commit_message(&run.state().header, point);
-        let commit = Repo::open(&thread.path).and_then(|tree| tree.commit_all(&message))?;
+        let home = self.home.as_deref().ok_or(Error::NoHome)?;
+        let commit = thread::open(&self.repo, home, thread)?.commit_all(&message)?;
         thread::update(&self.repo, &thread.id, |stored| {
             stored.tip.clone_from(&commit);
         })?;
@@ -1643,7 +1650,7 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         let undone = run
             .as_deref()
             .filter(|run| ends_turn && run.state().live())
-            .and_then(|run| undo_proposer(run, thread.as_ref()));
+            .and_then(|run| undo_proposer(&runner, run, thread.as_ref()));
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
         // next stage starts once the end is logged.
@@ -1767,26 +1774,28 @@ fn end_stage(
 
 /// [`undo_proposer`] for a run a forced Stop or a close ends, whose end the agent does not
 /// report: only while it is live, and the run says what was undone.
-fn undo_if_live(run: &Run, thread: Option<&Thread>) {
+fn undo_if_live(runner: &Runner, run: &Run, thread: Option<&Thread>) {
     if !run.state().live() {
         return;
     }
-    if let Some(undone) = undo_proposer(run, thread) {
+    if let Some(undone) = undo_proposer(runner, run, thread) {
         run.state().problem.get_or_insert(undone);
     }
 }
 
 /// When `run` is a proposing reviewer's and changed `thread`'s worktree, puts the worktree
-/// back to the thread's tip (`reset --hard`, `clean -d`, ignored files kept) and returns what
-/// the run says about it; `None` for any other run, or a proposer that changed nothing. Called
-/// however the stage's turn ends, a Stop and a close included: edits left there would be
-/// taken in by the next run's commit, and by Apply with it.
+/// back to the thread's branch at its tip ([`Repo::reset_to`], ignored files kept) and returns
+/// what the run says about it; `None` for any other run, or a proposer that changed nothing.
+/// Called however the stage's turn ends, a Stop and a close included: edits left there would
+/// be taken in by the next run's commit, and by Apply with it.
 ///
 /// A proposer may only read, but an agent that edits without asking is not stopped by the
-/// permission rule. An edit made through a command reports no diff, and one it committed
-/// leaves no change, so the worktree is asked for both; one that cannot be asked counts as
-/// changed. Runs git in the worktree: `status` and `rev-parse`, and the reset when needed.
-fn undo_proposer(run: &Run, thread: Option<&Thread>) -> Option<String> {
+/// permission rule. An edit made through a command reports no diff, one it committed leaves
+/// no change, and one on another branch leaves `HEAD` anywhere, so the worktree is asked for
+/// all three: a change, another branch checked out, or the branch moved. A worktree that
+/// cannot be asked counts as changed. Runs git in the worktree, opened by [`thread::open`]:
+/// `status`, `branch`, `rev-parse`, and the reset when needed.
+fn undo_proposer(runner: &Runner, run: &Run, thread: Option<&Thread>) -> Option<String> {
     let reviewer = {
         let state = run.state();
         state
@@ -1797,23 +1806,40 @@ fn undo_proposer(run: &Run, thread: Option<&Thread>) -> Option<String> {
             .reviewer
     };
     let thread = thread?;
-    let moved = Repo::open(&thread.path)
-        .and_then(
-            |tree| Ok(!tree.changed()?.is_empty() || tree.head()? != Some(thread.tip.clone())),
+    let home = runner.home.as_deref()?;
+    let said = |undone: String| {
+        Some(format!(
+            "reviewer {reviewer} changed files, though it may only read: {undone}, and the \
+             review stops here"
+        ))
+    };
+    let tree = match thread::open(&runner.repo, home, thread) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return said(format!(
+                "its worktree could not be opened: {}",
+                error_chain(&error)
+            ));
+        }
+    };
+    let moved = (|| {
+        Ok::<_, Error>(
+            !tree.changed()?.is_empty()
+                || tree.branch()? != thread.branch
+                || tree.head()?.as_deref() != Some(thread.tip.as_str()),
         )
-        .unwrap_or(true);
+    })()
+    .unwrap_or(true);
     if !moved && run.state().work().diffs.is_empty() {
         return None;
     }
-    let undone = Repo::open(&thread.path).and_then(|tree| tree.reset_to(&thread.tip));
-    let undone = match undone {
-        Ok(()) => "its changes were undone".to_owned(),
-        Err(error) => format!("its changes could not be undone: {}", error_chain(&error)),
-    };
-    Some(format!(
-        "reviewer {reviewer} changed files, though it may only read: {undone}, and the review \
-         stops here"
-    ))
+    match tree.reset_to(&thread.branch, &thread.tip) {
+        Ok(()) => said("its changes were undone".to_owned()),
+        Err(error) => said(format!(
+            "its changes could not be undone: {}",
+            error_chain(&error)
+        )),
+    }
 }
 
 /// The id of the first of `options` of the first kind in `kinds` that has one; `None` when

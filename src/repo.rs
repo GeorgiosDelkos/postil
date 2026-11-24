@@ -481,16 +481,21 @@ impl Repo {
         git(&self.root, &["check-ignore", "--quiet", path]).is_ok()
     }
 
-    /// Puts the working tree back to commit `commit`: its branch moves there, tracked files
-    /// are restored, and untracked files that are not ignored are deleted. Ignored files (the
-    /// cloned build folders) stay. For a thread's worktree only: it throws work away.
+    /// Puts the working tree back to branch `branch` at commit `commit`: the branch is checked
+    /// out and moved there, tracked files are restored, and untracked files that are not
+    /// ignored are deleted. Ignored files (the cloned build folders) stay. No hook runs. For a
+    /// thread's worktree only: it throws work away, a commit made on another branch since
+    /// included.
     ///
     /// # Errors
     ///
     /// The git errors.
-    pub(crate) fn reset_to(&self, commit: &str) -> Result<()> {
-        git(&self.root, &["reset", "--hard", "--quiet", commit])?;
-        git(&self.root, &["clean", "-d", "--force", "--quiet"]).map(drop)
+    pub(crate) fn reset_to(&self, branch: &str, commit: &str) -> Result<()> {
+        let no_hooks = ["-c", "core.hooksPath=/dev/null"];
+        let checkout = ["checkout", "--quiet", "--force", "-B", branch, commit];
+        git(&self.root, &[&no_hooks[..], &checkout[..]].concat())?;
+        let clean = ["clean", "-d", "--force", "--quiet"];
+        git(&self.root, &[&no_hooks[..], &clean[..]].concat()).map(drop)
     }
 
     /// Deletes the local branch `branch` while it names commit `expected`, and keeps it when it
@@ -545,7 +550,15 @@ impl Repo {
         if !self.root.join(".gitmodules").exists() {
             return Ok(());
         }
-        git(&self.root, &["submodule", "update", "--init", "--quiet"]).map(drop)
+        let args = [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "submodule",
+            "update",
+            "--init",
+            "--quiet",
+        ];
+        git(&self.root, &args).map(drop)
     }
 
     /// The paths with changes git would commit, as `git status` lists them: tracked files
@@ -592,7 +605,11 @@ impl Repo {
     ///
     /// The git errors, such as a missing `user.name`, or a working tree with no commit.
     pub(crate) fn commit_all(&self, message: &str) -> Result<String> {
-        git(&self.root, &["add", "--all"])?;
+        // No hooks: writing the index runs `post-index-change`.
+        git(
+            &self.root,
+            &["-c", "core.hooksPath=/dev/null", "add", "--all"],
+        )?;
         // What was staged, not what `git status` lists: a submodule or a repository inside
         // the worktree with changes of its own is listed, but `git add` stages nothing for it,
         // and a commit of nothing fails. `diff --cached --quiet` exits 1 when there is any.

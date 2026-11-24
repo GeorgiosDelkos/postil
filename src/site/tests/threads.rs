@@ -987,3 +987,31 @@ fn a_record_pointing_into_the_engineer_s_tree_takes_no_run_there() {
         "uncommitted\n"
     );
 }
+
+#[test]
+fn a_worktree_that_lost_its_git_file_takes_no_commit_in_the_repository_around_it() {
+    let (repo, site, _nudges, worktree) = written("thread-lost-git");
+    // Postil's home folder is itself in a repository (a dotfiles one, say), and the agent
+    // deleted the worktree's `.git`: git would look upward, into that one.
+    git_out(&repo.home(), &["init", "--quiet"]);
+    fs::remove_file(worktree.join(".git")).unwrap();
+
+    let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("is not a worktree of this repository"),
+        "{body}"
+    );
+    let around = Command::new("git")
+        .arg("-C")
+        .arg(repo.home())
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        !around.status.success(),
+        "a commit was made in the repository around it"
+    );
+}
