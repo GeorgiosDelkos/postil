@@ -521,6 +521,8 @@ fn a_worktree_that_cannot_be_made_fails_its_run_and_leaves_no_thread() {
         error.as_str().unwrap().contains("already exists"),
         "{failed}"
     );
+    // No snapshot, so no changes view: it would compare the engineer's own files.
+    assert!(!failed.to_string().contains("\"snapshot\""), "{failed}");
     assert_eq!(
         get(&site, &format!("{THREAD}?id=R1")),
         (StatusCode::OK, "null".to_owned()),
@@ -952,5 +954,36 @@ fn a_commit_with_changes_only_inside_a_repository_it_holds_commits_nothing_and_s
     assert_eq!(
         after, before,
         "nothing to commit is no commit, and no error"
+    );
+}
+
+#[test]
+fn a_record_pointing_into_the_engineer_s_tree_takes_no_run_there() {
+    let (repo, site, _nudges, worktree) = written("thread-decoy-run");
+    repo.write("mine.txt", "uncommitted\n");
+    let trunk = git_out(&repo.root, &["rev-parse", "trunk"]);
+    // A hand edit points the thread into the engineer's own working tree.
+    let record = repo.root.join(".git/postil/threads.json");
+    let text = fs::read_to_string(&record).unwrap();
+    let decoy = repo.root.join("src");
+    let (from, to) = (worktree.to_str().unwrap(), decoy.to_str().unwrap());
+    fs::write(&record, text.replace(from, to)).unwrap();
+
+    let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("is not a worktree of this repository"),
+        "{body}"
+    );
+    assert_eq!(
+        git_out(&repo.root, &["rev-parse", "trunk"]),
+        trunk,
+        "no commit"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("mine.txt")).unwrap(),
+        "uncommitted\n"
     );
 }

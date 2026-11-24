@@ -345,7 +345,8 @@ impl Runner {
     /// # Errors
     ///
     /// [`Error::BadRequest`] when it has no thread (it ran before threads had worktrees), the
-    /// thread ended, or its worktree is gone; as [`thread::find`].
+    /// thread ended, or its worktree is gone; [`Error::NotAWorktree`] when the record puts it
+    /// where Postil puts no worktree; [`Error::NoHome`]; as [`thread::find`].
     fn open_thread(&self, id: &str) -> Result<Thread> {
         let thread = thread::find(&self.repo, id)?.ok_or_else(|| {
             Error::BadRequest(format!(
@@ -353,7 +354,13 @@ impl Runner {
             ))
         })?;
         let ended = match thread.state {
-            State::Open if thread.path.is_dir() => return Ok(thread),
+            State::Open if thread.path.is_dir() => {
+                // The record is a file a hand edit can point anywhere: a commit, an agent and
+                // a proposer's undo go only into a folder where Postil puts worktrees.
+                let home = self.home.as_deref().ok_or(Error::NoHome)?;
+                thread::check_place(&self.repo, home, &thread)?;
+                return Ok(thread);
+            }
             State::Open => {
                 return Err(Error::BadRequest(format!(
                     "the worktree of {id}'s thread is gone ({}): discard the thread, and send \
@@ -666,7 +673,7 @@ impl Runner {
             &prompt.text,
             origin,
         )?);
-        let (thread, worktree) = match place {
+        let (mut thread, worktree) = match place {
             Place::New { fork, title } => match self.new_thread(&run, &fork, &title) {
                 Ok(thread) => (thread, Worktree::Make),
                 Err(error) => {
@@ -679,11 +686,10 @@ impl Runner {
             },
             Place::Open(thread) => (thread, Worktree::Made),
         };
-        let mut thread = thread;
         match worktree {
-            Worktree::Make if snapshot => {
-                run.record_snapshot(Point::Before, thread.fork.clone());
-            }
+            // Its snapshot before is the fork commit, recorded on the start thread once the
+            // worktree is made: a run whose worktree could not be made has no changes view,
+            // which would compare the engineer's own files with the fork.
             Worktree::Make => {}
             // Every run of an open thread starts from a commit of what was left there, a
             // proposer's too: undoing a proposer's edits goes back to that commit, which must
@@ -1333,6 +1339,11 @@ impl Runner {
                     failed(&error);
                     return (runner.notify)();
                 }
+                // A new thread's run is a run of notes, which takes snapshots: the one before
+                // is the commit the worktree was made at.
+                pending
+                    .run
+                    .record_snapshot(Point::Before, pending.thread.fork.clone());
             }
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.

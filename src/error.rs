@@ -240,7 +240,8 @@ pub enum Error {
     },
     /// Notes were sent in a repository with no commit: a thread starts from one.
     NoCommit,
-    /// A thread's worktree, or the folder above it, could not be made or moved.
+    /// A thread's worktree, or the folder above it, could not be made or moved, or git's
+    /// record of it could not be removed.
     MakeWorktree {
         /// The folder.
         path: PathBuf,
