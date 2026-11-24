@@ -2236,3 +2236,58 @@ fn bad_run_requests_name_the_problem_and_make_no_run() {
         "no run, so no request: {body}"
     );
 }
+
+#[test]
+fn a_review_keeps_what_the_engineer_committed_or_left_in_the_worktree() {
+    let repo = TempRepo::new("run-review-keeps");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "writes");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    let worktree = PathBuf::from(
+        get_json(&site, "postil://localhost/api/thread?id=R1")["path"]
+            .as_str()
+            .unwrap(),
+    );
+    // The engineer's own commit there, and an edit not committed.
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git_out(&worktree, &["add", "mine.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    fs::write(worktree.join("left.txt"), "left\n").unwrap();
+    // A proposer that only reads.
+    set_reviewers(&site, "writes", &[("Reviewer", "reviewer-silent")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+
+    let review = wait_for_run(&site, &nudges, "R2");
+
+    let found = review["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "findings")
+        .unwrap()
+        .clone();
+    assert!(
+        !found["problem"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed files"),
+        "the reviewer is not blamed for the engineer's work: {found}"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("left.txt")).unwrap(),
+        "left\n"
+    );
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    assert_eq!(thread["tip"], git_out(&worktree, &["rev-parse", "HEAD"]));
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+}

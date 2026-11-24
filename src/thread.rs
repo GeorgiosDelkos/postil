@@ -315,21 +315,27 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     Ok(())
 }
 
-/// Checks that `thread`'s folder, when it is on disk, is directly in the worktrees folder of
-/// `repo` under Postil's home `home`: the only place Postil puts a worktree, and so the only
-/// one it frees or opens to end a thread. The path comes from `threads.json`, which a hand
-/// edit can point anywhere. A folder that is not on disk passes: there is nothing to delete.
+/// Checks that `thread`'s folder, on disk or not, is where Postil puts this repository's
+/// worktrees, under Postil's home `home`: `<base>/worktrees/<repo>-<id>/<folder>`. Only there
+/// does Postil free a folder, or git's record of one: the path comes from `threads.json`,
+/// which a hand edit can point anywhere, a worktree of the engineer's on a disk not mounted
+/// included. The `<id>` is not checked against the hash of [`worktrees_dir`]: a Rust release
+/// may hash differently, and every thread made before would then fail this check.
 ///
 /// # Errors
 ///
 /// [`Error::NotAWorktree`] for a folder anywhere else.
 pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
-    if thread.path.symlink_metadata().is_err() {
-        return Ok(());
-    }
-    let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
-    let ours = fs::canonicalize(worktrees_dir(repo.root(), &resolved(home))).ok();
-    if path.parent() == ours.as_deref() {
+    let path = resolved(&thread.path);
+    let worktrees = base_for(repo.root(), &resolved(home)).join("worktrees");
+    let name = repo_name(repo.root());
+    let ours = path.parent().is_some_and(|parent| {
+        parent.parent() == Some(worktrees.as_path())
+            && parent
+                .file_name()
+                .is_some_and(|folder| folder.to_string_lossy().starts_with(&format!("{name}-")))
+    });
+    if ours {
         Ok(())
     } else {
         Err(Error::NotAWorktree { path })
@@ -380,10 +386,7 @@ fn base_for(root: &Path, home: &Path) -> PathBuf {
 /// folder `home`, resolved.
 fn worktrees_dir(root: &Path, home: &Path) -> PathBuf {
     let base = base_for(root, home);
-    let name = root.file_name().map_or_else(
-        || "repository".to_owned(),
-        |name| name.to_string_lossy().into_owned(),
-    );
+    let name = repo_name(root);
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
     #[expect(
@@ -392,6 +395,14 @@ fn worktrees_dir(root: &Path, home: &Path) -> PathBuf {
     )]
     let id = hasher.finish() as u32;
     base.join("worktrees").join(format!("{name}-{id:08x}"))
+}
+
+/// The name that starts the folder of the repository at `root`'s worktrees: its folder's.
+fn repo_name(root: &Path) -> String {
+    root.file_name().map_or_else(
+        || "repository".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// `path` with its symbolic links resolved: its nearest ancestor that exists, resolved, and

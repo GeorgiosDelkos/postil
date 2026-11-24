@@ -660,11 +660,14 @@ words, or `Postil R5: reviewer 2 of 2 on R3`. A proposing reviewer may not edit 
 snapshot: if it leaves `git status --porcelain` non-empty, or moves the branch (it
 committed), its changes are undone (`git reset --hard` to the tip, `git clean -d`, ignored
 files kept) and the review stops, so neither the next commit nor Apply takes them. When the
-agent committed its work itself, nothing is left to add and Postil makes no commit. Before a
-run of an open thread, anything left in the worktree since the last commit (a commit that
-failed, a hand edit) is committed first, as `Postil: work left in the worktree before R4`.
-Every commit Postil makes or finds becomes the thread's tip, before a run as after it: a run
-that then never starts takes no snapshot after it.
+agent committed its work itself, nothing is left to add and Postil makes no commit. Before
+every run of an open thread, a proposer's included, anything left in the worktree since the
+last commit (a commit that failed, a hand edit) is committed first, as `Postil: work left in
+the worktree before R4`, and a commit the engineer made there becomes the tip: undoing a
+proposer's edits goes back to that point, so it never takes the engineer's work with it.
+When that commit fails before a proposer, the stage does not start. Every commit Postil
+makes or finds becomes the thread's tip, before a run as after it: a run that then never
+starts takes no snapshot after it.
 
 - **Snapshots are commits.** Before is the branch tip at the start of a run, after is the tip
   at its end, both logged in the existing `snapshot` entry (`git diff` takes a commit id as
@@ -708,13 +711,16 @@ Postil refuses (409), naming what is there and the worktree's path, so the engin
 it there (and it is kept) or removes it; an answer in the dialog that ends the thread anyway
 is not built. A thread whose run is under way in any window, whose review is between two
 stages, or whose worktree is being made is not ended either (409). Deleting a thread's last
-note runs the same check, and a thread that fails it stays, with its worktree and branch,
-until the next delete.
+note runs the same check, and a branch past Postil's commit fails it there too: ending keeps
+the engineer's commits, but forgetting deletes the branch, and them with it. A thread that
+fails it stays, with its worktree and branch, until the next delete.
 
 **Only what Postil made is deleted.** The record is a file a hand edit can change, so a
-worktree is freed only when it sits directly in this repository's worktrees folder, and its
-trash is found from that folder, never from the recorded path. Only branches under `postil/`
-are deleted.
+worktree, or git's record of one, is freed only when its path is
+`<base>/worktrees/<repo>-<id>/<folder>` for this repository, whether it is on disk or not,
+and its trash is found from the base, never from the recorded path. The `<id>` hash is not
+checked: a Rust release may hash a path differently, and every older thread would then fail.
+Only branches under `postil/` are deleted.
 
 **An ended thread frees its disk at once:**
 
@@ -725,8 +731,9 @@ are deleted.
    as `git worktree prune` would; a global prune would also drop the engineer's worktrees on
    a disk not mounted), and delete the folder on a background thread: 193,000 files take
    seconds. Never the macOS Trash, which keeps the disk in use. Opening the repository again
-   finishes a delete that a quit cut short. The thread is marked ended only then, so a free
-   that fails leaves it open, to end again.
+   finishes a delete that a quit cut short. The thread is marked ended before this step, so
+   a free that fails leaves an ended thread, whose worktree goes with its last note, never an
+   open one whose changes were applied already, which a second Apply would write again.
 3. Keep the branch. It costs no real disk, the changes view reads its commits, and after
    Apply it is the only copy until the engineer commits. It goes with the thread's last note
    (section "Runs": a run goes with its last note), with `git branch -D`: `-d` checks

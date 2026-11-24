@@ -548,3 +548,71 @@ fn a_patch_or_record_that_is_not_what_git_wrote_is_refused() {
     let error = tree.worktree_record(&own).unwrap_err();
     assert!(matches!(error, Error::NotAWorktree { .. }), "{error:?}");
 }
+
+#[test]
+fn deleting_a_note_keeps_a_thread_whose_branch_has_the_engineer_s_commits() {
+    let (repo, site, _nudges, worktree) = written("thread-forget-commits");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git_out(&worktree, &["add", "mine.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("commits past"), "{body}");
+    assert!(worktree.join("mine.txt").exists());
+    // `+`: checked out in a worktree, which is still there.
+    assert_eq!(
+        git_out(&repo.root, &["branch", "--list", &branch]),
+        format!("+ {branch}")
+    );
+}
+
+#[test]
+fn a_thread_still_ends_when_its_worktrees_folder_is_named_by_another_hash() {
+    let (repo, site, _nudges, worktree) = written("thread-rehash");
+    // As after a Rust release that hashes the repository's path differently: the folder the
+    // thread lives in is not the one Postil would name now.
+    let folder = worktree.parent().unwrap();
+    let name = folder.file_name().unwrap().to_str().unwrap();
+    let renamed = folder.with_file_name(format!("{}-00000000", name.rsplit_once('-').unwrap().0));
+    fs::create_dir_all(&renamed).unwrap();
+    let moved = renamed.join("r1");
+    let (from, to) = (worktree.to_str().unwrap(), moved.to_str().unwrap());
+    git_out(&repo.root, &["worktree", "move", from, to]);
+    let record = repo.root.join(".git/postil/threads.json");
+    let text = fs::read_to_string(&record).unwrap();
+    fs::write(&record, text.replace(from, to)).unwrap();
+
+    let (status, body) = end(&site, "discard", "R1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!moved.exists());
+    assert_eq!(thread(&site, "R1")["state"], "discarded");
+}
+
+#[test]
+fn an_ended_thread_whose_worktree_could_not_be_freed_is_freed_with_its_note() {
+    let (repo, site, _nudges, worktree) = written("thread-free-later");
+    // The trash cannot be made: a file stands where it goes.
+    let trash = repo.home().join("trash");
+    fs::write(&trash, "in the way").unwrap();
+
+    let (status, body) = end(&site, "discard", "R1");
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("cannot make, move or remove"), "{body}");
+    // Ended, so a second ending, which could apply its changes twice, is refused.
+    assert_eq!(thread(&site, "R1")["state"], "discarded");
+    assert!(worktree.is_dir());
+
+    fs::remove_file(&trash).unwrap();
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!worktree.exists());
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
+    );
+}

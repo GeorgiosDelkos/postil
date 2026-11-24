@@ -204,7 +204,10 @@ pub(crate) fn start_site(
         Some(_) => Scanner::new(OsString::new),
         None => Scanner::new(agents::search_path),
     };
-    let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".postil"));
+    let home = std::env::var_os("HOME")
+        // An empty HOME would put the worktrees in the current folder.
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".postil"));
     let site = Site::new(config.as_deref(), home.as_deref(), bench, agents, notify);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
         site.open(repo, LiveRun::Stop)?;

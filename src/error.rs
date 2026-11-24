@@ -457,7 +457,8 @@ impl fmt::Display for Error {
             ),
             Self::MakeWorktree { path, .. } => write!(
                 f,
-                "cannot make or move the worktree folder {} (check that its folder is writable)",
+                "cannot make, move or remove the worktree folder {} (check that its folder is \
+                 writable)",
                 path.display()
             ),
             Self::ReadThreads { path, problem } => write!(

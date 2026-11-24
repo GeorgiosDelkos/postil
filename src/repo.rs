@@ -500,7 +500,9 @@ impl Repo {
     }
 
     /// Checks out the submodules `.gitmodules` names, when there is one. A new worktree has
-    /// none checked out. May fetch over the network; never prompts.
+    /// none checked out. May fetch over the network. Git asks for no credential
+    /// (`GIT_TERMINAL_PROMPT=0`); an ssh key with a passphrase can still ask on the terminal
+    /// Postil was started from.
     ///
     /// # Errors
     ///
@@ -810,7 +812,9 @@ fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<
 
 /// Runs `git` in `dir` with arguments that may be paths, writes `input` to its standard input
 /// when given, and returns what it printed. Without `input` its standard input is empty, so
-/// a command that would prompt (a credential, a passphrase) fails instead of waiting.
+/// a command that reads a credential from it fails instead of waiting; with
+/// `GIT_TERMINAL_PROMPT=0` neither does git ask on the terminal. ssh can still read a key's
+/// passphrase from the terminal Postil was started from, which the app from the Dock lacks.
 fn run_git_with(
     dir: &Path,
     index: Option<&Path>,

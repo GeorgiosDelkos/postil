@@ -32,8 +32,11 @@
 //! `threads.lock` (inside `thread.rs`, which takes no other) may be taken while the slot is
 //! held, so nothing that holds it may take the slot. No snapshot is taken under a run's
 //! state. The slot is held around the agent's calls that answer, cancel
-//! and prompt (`auto_answer`, [`Runner::cancel`], `begin`). The page is told about every
-//! change through `notify`, and fetches what it has not seen.
+//! and prompt (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's
+//! worktree: the commit before a run (`git status`, `add`, `commit`, tens of milliseconds
+//! on a medium repository, as a snapshot is), and a proposer's check and undo as its stage
+//! ends (`status`, `rev-parse`, `reset --hard`, `clean`). Every page request waits for those.
+//! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
 
@@ -211,7 +214,7 @@ struct Pending {
 }
 
 /// Whether a run's worktree is still to be made, on the start thread, before its agent.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Worktree {
     Make,
     Made,
@@ -665,14 +668,36 @@ impl Runner {
             },
             Place::Open(thread) => (thread, Worktree::Made),
         };
+        let mut thread = thread;
+        match worktree {
+            Worktree::Make if snapshot => {
+                run.record_snapshot(Point::Before, thread.fork.clone());
+            }
+            Worktree::Make => {}
+            // Every run of an open thread starts from a commit of what was left there, a
+            // proposer's too: undoing a proposer's edits goes back to that commit, which must
+            // hold the engineer's own commits and edits.
+            Worktree::Made => match self.commit_worktree(&run, &thread, Point::Before) {
+                Ok(commit) => {
+                    thread.tip.clone_from(&commit);
+                    if snapshot {
+                        run.record_snapshot(Point::Before, commit);
+                    }
+                }
+                Err(error) if !snapshot => {
+                    // A proposer whose start could not be marked would be blamed, and undone,
+                    // for what was left: it does not start.
+                    run.record(Entry::Failed {
+                        error: error_chain(&error),
+                    });
+                    (self.notify)();
+                    return Err(error);
+                }
+                Err(error) => no_snapshot(&run, &error),
+            },
+        }
 
         slot.chain = review;
-        if snapshot {
-            match worktree {
-                Worktree::Make => run.record_snapshot(Point::Before, thread.fork.clone()),
-                Worktree::Made => self.record_snapshot(&run, &thread, Point::Before),
-            }
-        }
         if let Worktree::Make = worktree {
             slot.making = Some(thread.id.clone());
         }
@@ -702,7 +727,12 @@ impl Runner {
                 thread,
                 worktree,
             };
-            self.start(pending);
+            let id = pending.thread.id.clone();
+            if !self.start(pending) && slot.making.take().is_some() {
+                // No thread will make the worktree: the window is free again, and the thread
+                // goes, as one whose worktree could not be made does.
+                drop(thread::remove(&self.repo, std::slice::from_ref(&id)));
+            }
             replaced
         };
         drop(slot);
@@ -973,8 +1003,10 @@ impl Runner {
     /// Postil left or past it (a commit the engineer made there). Apply writes the branch's
     /// changes, from the commit the thread started at to the worktree's commit, into the
     /// engineer's working tree, uncommitted, all or nothing. The thread's kept agent is stopped
-    /// once Apply succeeded. The thread is marked ended only once its worktree is freed, so a
-    /// free that fails leaves it open, to end again.
+    /// once Apply succeeded. The thread is marked ended before its worktree is freed: a free
+    /// that fails then leaves an ended thread, whose worktree goes with its last note, and
+    /// never an open one whose changes were applied already, which a second Apply would
+    /// write again.
     ///
     /// # Errors
     ///
@@ -983,8 +1015,8 @@ impl Runner {
     /// being made, and [`Error::RunElsewhere`] while another window runs one;
     /// [`Error::BadRequest`] when there is no open thread `id`; [`Error::ThreadChanged`] when
     /// the check fails; [`Error::ApplyConflict`] when the changes do not fit the working tree,
-    /// which then stays as it was; and as [`thread::free`]: an applied thread whose worktree
-    /// cannot be freed stays open with its changes written.
+    /// which then stays as it was; as [`thread::update`]; and as [`thread::free`], once the
+    /// thread is marked ended.
     pub(crate) fn end_thread(&self, id: &str, ending: Ending) -> Result<()> {
         let home = self.home.as_deref().ok_or(Error::NoHome)?;
         {
@@ -1018,15 +1050,14 @@ impl Runner {
         };
         // Dropping the agent waits for its process, so after the lock.
         drop(released);
-        let ended = thread::free(&self.repo, home, &thread).and_then(|()| {
-            thread::update(&self.repo, id, |stored| {
-                stored.tip = tip;
-                stored.state = match ending {
-                    Ending::Apply => State::Applied,
-                    Ending::Discard => State::Discarded,
-                };
-            })
-        });
+        let ended = thread::update(&self.repo, id, |stored| {
+            stored.tip = tip;
+            stored.state = match ending {
+                Ending::Apply => State::Applied,
+                Ending::Discard => State::Discarded,
+            };
+        })
+        .and_then(|()| thread::free(&self.repo, home, &thread));
         (self.notify)();
         ended
     }
@@ -1180,7 +1211,19 @@ impl Runner {
             // keeps the branch checked out.
             let forgotten = thread::check_place(&self.repo, home, &thread)
                 .and_then(|()| check_worktree(&thread))
-                .and_then(|_| thread::free(&self.repo, home, &thread))
+                .and_then(|head| {
+                    // Ending a thread keeps a commit the engineer made past Postil's; forgetting
+                    // it deletes the branch, and the commit with it.
+                    if head == thread.tip {
+                        Ok(())
+                    } else {
+                        Err(Error::ThreadChanged {
+                            path: thread.path.clone(),
+                            found: format!("commits past {}, where Postil left it", thread.tip),
+                        })
+                    }
+                })
+                .and_then(|()| thread::free(&self.repo, home, &thread))
                 .and_then(|()| {
                     if thread.branch.starts_with("postil/") {
                         self.repo.delete_branch(&thread.branch)
@@ -1239,8 +1282,9 @@ impl Runner {
 
     /// Starts the agent on its own thread, then sends the prompt, unless the agent was let go
     /// meanwhile (the run cancelled, the project closed). A new thread's worktree is made
-    /// there first ([`thread::make`]), which takes as long as a checkout.
-    fn start(self: &Arc<Self>, pending: Pending) {
+    /// there first ([`thread::make`]), which takes as long as a checkout. Returns whether that
+    /// thread started; when it did not, the run says why.
+    fn start(self: &Arc<Self>, pending: Pending) -> bool {
         let runner = Arc::clone(self);
         let run = Arc::clone(&pending.run);
         let start = move || {
@@ -1323,11 +1367,12 @@ impl Runner {
         let spawned = std::thread::Builder::new()
             .name("agent-start".to_owned())
             .spawn(start);
-        if let Err(error) = spawned {
+        if let Err(error) = &spawned {
             run.record(Entry::Failed {
                 error: format!("cannot start a thread for the agent: {error}"),
             });
         }
+        spawned.is_ok()
     }
 
     /// Makes `thread`'s worktree ([`thread::make`]), and records in the thread what it was not
@@ -1353,31 +1398,23 @@ impl Runner {
         Ok(())
     }
 
-    /// Records the snapshot at `point` in `run`: the commit `thread`'s worktree is at, once
-    /// everything in it is committed ([`Repo::commit_all`]), so a snapshot is a commit on the
-    /// thread's branch. After a run, the commit becomes the thread's tip. One that cannot be
-    /// taken is the run's problem: the run goes on, without its changes view, and the work
-    /// stays uncommitted in the worktree.
-    fn record_snapshot(&self, run: &Run, thread: &Thread, point: Point) {
+    /// Commits everything in `thread`'s worktree for `run` at `point` ([`Repo::commit_all`])
+    /// and returns the commit the worktree is then at, which becomes the thread's tip: a
+    /// snapshot is a commit on the thread's branch. Before a run too, since a commit of work
+    /// left in the worktree moves the branch, and a run that then never starts takes no
+    /// snapshot after it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Repo::commit_all`] and [`thread::update`]: the work then stays
+    /// uncommitted in the worktree.
+    fn commit_worktree(&self, run: &Run, thread: &Thread, point: Point) -> Result<String> {
         let message = commit_message(&run.state().header, point);
-        let committed = Repo::open(&thread.path).and_then(|tree| tree.commit_all(&message));
-        // Before a run too: a commit of work left in the worktree moves the branch, and a run
-        // that then never starts takes no snapshot after it.
-        let commit = committed.and_then(|commit| {
-            thread::update(&self.repo, &thread.id, |stored| {
-                stored.tip.clone_from(&commit);
-            })?;
-            Ok(commit)
-        });
-        match commit {
-            Ok(commit) => run.record_snapshot(point, commit),
-            Err(error) => {
-                run.state().problem.get_or_insert(format!(
-                    "no snapshot of the files was taken: {}",
-                    error_chain(&error)
-                ));
-            }
-        }
+        let commit = Repo::open(&thread.path).and_then(|tree| tree.commit_all(&message))?;
+        thread::update(&self.repo, &thread.id, |stored| {
+            stored.tip.clone_from(&commit);
+        })?;
+        Ok(commit)
     }
 
     /// Records the snapshot after `run`, in `thread`, as its turn ends: only while it is live,
@@ -1391,7 +1428,10 @@ impl Runner {
                 && state.snapshot(Point::After).is_none()
         };
         if let Some(thread) = thread.filter(|_| wanted) {
-            self.record_snapshot(run, thread, Point::After);
+            match self.commit_worktree(run, thread, Point::After) {
+                Ok(commit) => run.record_snapshot(Point::After, commit),
+                Err(error) => no_snapshot(run, &error),
+            }
         }
     }
 
@@ -1695,6 +1735,15 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     write!(prompt, "\nThe engineer now asks:\n\n{text}\n")
         .expect("writing to a String cannot fail");
     prompt
+}
+
+/// Says on `run` that no snapshot was taken, and why: the run goes on, without its changes
+/// view, and the work stays uncommitted in the worktree.
+fn no_snapshot(run: &Run, error: &Error) {
+    run.state().problem.get_or_insert(format!(
+        "no snapshot of the files was taken: {}",
+        error_chain(error)
+    ));
 }
 
 /// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
