@@ -1214,7 +1214,7 @@ fn a_snapshot_that_cannot_be_taken_is_the_run_s_problem_and_the_run_goes_on() {
     assert!(body.contains("R1 has no snapshot from before it"), "{body}");
 
     // Postil's own index torn: it is copied again from the real one at once.
-    let ours = repo.root.join(".git/postil-snapshot.index");
+    let ours = repo.root.join(".git/postil/snapshot/index");
     fs::write(&ours, "torn").unwrap();
     send(&site, &["N1"]);
     let healed = wait_for_run(&site, &nudges, "R2");

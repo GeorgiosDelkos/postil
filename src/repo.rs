@@ -117,18 +117,29 @@ impl Repo {
     /// Where this working tree's notes are stored. Inside the git directory, so the file is
     /// never committed and needs no `.gitignore` entry.
     pub(crate) fn review_file(&self) -> PathBuf {
-        self.git_dir.join("postil").join("review.json")
+        self.postil_dir().join("review.json")
     }
 
     /// Where this working tree's open folders are kept (`folders.rs`): beside the review file.
     pub(crate) fn folders_file(&self) -> PathBuf {
-        self.git_dir.join("postil").join("folders.json")
+        self.postil_dir().join("folders.json")
     }
 
     /// Where this working tree's run logs are stored (`run/log.rs`): beside the review file, for
     /// the same reason.
     pub(crate) fn runs_dir(&self) -> PathBuf {
-        self.git_dir.join("postil").join("runs")
+        self.postil_dir().join("runs")
+    }
+
+    /// The directory that holds every file Postil keeps for this working tree.
+    fn postil_dir(&self) -> PathBuf {
+        self.git_dir.join("postil")
+    }
+
+    /// Where [`Repo::snapshot`] keeps its index and the copies it renames into place: a
+    /// directory of their own, so a snapshot does not depend on writing beside the review file.
+    fn snapshot_dir(&self) -> PathBuf {
+        self.postil_dir().join("snapshot")
     }
 
     /// The directory name of the working tree, for display.
@@ -196,8 +207,8 @@ impl Repo {
     /// after it, and the changes view shows the diff between them (docs/design.md, "The
     /// changes view").
     ///
-    /// The tree is written through an index of Postil's own, `<git dir>/postil-snapshot.index`
-    /// beside the real one, so the engineer's index, branch and stash are left as they are. It
+    /// The tree is written through an index of Postil's own, `<git dir>/postil/snapshot/index`,
+    /// so the engineer's index, branch and stash are left as they are. It
     /// is kept between snapshots, so git hashes again only the files whose stat data changed
     /// since the last one, untracked files included. It starts from a copy of the real index,
     /// and again whenever the two track different ignored files (one force-added, or one taken
@@ -217,7 +228,7 @@ impl Repo {
             .snapshotting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let index = self.git_dir.join("postil-snapshot.index");
+        let index = self.snapshot_dir().join("index");
         if !index.exists() || self.ignored_differ(&index) {
             self.copy_index(&index)?;
         }
@@ -237,14 +248,16 @@ impl Repo {
         // A unique name only: nothing is ordered by it.
         static COPIES: AtomicU64 = AtomicU64::new(0);
         let real = self.git_dir.join("index");
-        let copy = self.git_dir.join(format!(
-            "postil-snapshot.{}.{}.copy",
+        let copy = self.snapshot_dir().join(format!(
+            "{}.{}.copy",
             std::process::id(),
             COPIES.fetch_add(1, Ordering::Relaxed)
         ));
         #[cfg(test)]
         self.copies.fetch_add(1, Ordering::Relaxed);
-        let copied = match fs::copy(&real, &copy) {
+        // Made even when there is no index to copy: git then writes ours there from nothing.
+        let made = fs::create_dir_all(self.snapshot_dir());
+        let copied = match made.and_then(|()| fs::copy(&real, &copy)) {
             // A repository with nothing staged yet has no index: git starts an empty one.
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             copied => copied.and_then(|_| fs::rename(&copy, index)),
