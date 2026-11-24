@@ -719,8 +719,8 @@ commit made with `HEAD` detached, or on another branch there, is in no ref the f
 A branch past Postil's commit (committed to in the worktree, after the thread ended, or
 kept by a Discard) is the engineer's work: it stays, and the thread is forgotten, so no
 delete is refused for good. The branch goes only while it names Postil's commit, checked
-and deleted in one git call (`update-ref -d <ref> <tip>`). A worktree being made, after a Stop or a close too, keeps its
-run live, and with it the run lock, until git is done.
+and deleted in one git call (`update-ref -d <ref> <tip>`). A worktree being made, after a
+Stop or a close too, keeps its run live, and with it the run lock, until git is done.
 
 **Only what Postil made is deleted.** The record is a file a hand edit can change, so a
 worktree, or git's record of one, is freed only when its path is
