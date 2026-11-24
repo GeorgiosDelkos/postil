@@ -1067,7 +1067,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }
-                | Error::Highlight(_)
+                | Error::Highlight { .. }
                 | Error::Window(_)
                 | Error::Webview(_)
                 | Error::SpawnWorker(_)
