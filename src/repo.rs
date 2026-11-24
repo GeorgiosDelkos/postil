@@ -137,7 +137,8 @@ impl Repo {
     }
 
     /// Where [`Repo::snapshot`] keeps its index and the copies it renames into place: a
-    /// directory of their own, so a snapshot does not depend on writing beside the review file.
+    /// directory of their own, so once it exists a `postil/` that cannot be written (where the
+    /// review file is) does not stop snapshots.
     fn snapshot_dir(&self) -> PathBuf {
         self.postil_dir().join("snapshot")
     }
@@ -248,7 +249,8 @@ impl Repo {
         // A unique name only: nothing is ordered by it.
         static COPIES: AtomicU64 = AtomicU64::new(0);
         let real = self.git_dir.join("index");
-        let copy = self.snapshot_dir().join(format!(
+        // Beside `index`, so the rename into place stays within one directory.
+        let copy = index.with_file_name(format!(
             "{}.{}.copy",
             std::process::id(),
             COPIES.fetch_add(1, Ordering::Relaxed)
@@ -256,8 +258,17 @@ impl Repo {
         #[cfg(test)]
         self.copies.fetch_add(1, Ordering::Relaxed);
         // Made even when there is no index to copy: git then writes ours there from nothing.
-        let made = fs::create_dir_all(self.snapshot_dir());
-        let copied = match made.and_then(|()| fs::copy(&real, &copy)) {
+        let dir = index
+            .parent()
+            .expect("the snapshot index is a file in snapshot_dir()");
+        if let Err(source) = fs::create_dir_all(dir) {
+            return Err(Error::CopyIndex {
+                from: real,
+                to: index.to_owned(),
+                source,
+            });
+        }
+        let copied = match fs::copy(&real, &copy) {
             // A repository with nothing staged yet has no index: git starts an empty one.
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             copied => copied.and_then(|_| fs::rename(&copy, index)),

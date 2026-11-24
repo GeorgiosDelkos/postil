@@ -1621,13 +1621,14 @@ fn notes_that_cannot_be_marked_sent_are_named_on_the_run() {
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "ended");
 
-    // The runs directory stays writable; the review file's directory does not.
+    // The runs and snapshot directories stay writable; the review file's directory does not.
     let postil = repo.root.join(".git/postil");
     fs::set_permissions(&postil, fs::Permissions::from_mode(0o555)).unwrap();
     send(&site, &["N1"]);
     let run = wait_for(&site, &nudges, "ended");
     fs::set_permissions(&postil, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(run["id"], "R2");
+    assert_eq!(snapshot_points(&run), ["before", "after"], "{run}");
     let problem = run["problem"].as_str().unwrap();
     assert!(problem.contains("could not be marked sent"), "{problem}");
     assert_eq!(
