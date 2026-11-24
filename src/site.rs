@@ -10,21 +10,22 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wry::http::header::CONTENT_TYPE;
-use wry::http::{Method, Request, Response, StatusCode, Uri};
+use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{Highlighter, Token};
-use crate::layout::{self, Layout};
+use crate::layout::{self, Layout, RawLayout};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
-use crate::run::{AgentChoice, Notify, Runner};
-use crate::settings::{self, Settings};
+use crate::run::{Notify, Runner};
+use crate::settings::{self, RawSettings, Settings};
 
 /// The page's files, served at these paths with these types: compiled into the binary as
 /// they are, so the app needs no files beside it. A module the page imports must be listed
@@ -220,7 +221,7 @@ fn startup_repo(
     if let Some(dir) = dir {
         return Repo::open(dir).map(Some);
     }
-    if !settings.reopen_last_project {
+    if !settings.reopen_last_project() {
         return Ok(None);
     }
     let recent = recent_file.map_or_else(Vec::new, recent::list);
@@ -256,7 +257,7 @@ pub(crate) struct Site {
 }
 
 /// The open project.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Project {
     repo: Arc<Repo>,
     /// The project's runs and the agent kept between them.
@@ -267,7 +268,7 @@ struct Project {
 }
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RepoInfo<'a> {
     name: String,
     root: String,
@@ -278,7 +279,7 @@ struct RepoInfo<'a> {
 }
 
 /// An entry of the reply to `/api/recent`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RecentProject {
     path: String,
     name: String,
@@ -287,7 +288,7 @@ struct RecentProject {
 }
 
 /// The reply to `/api/settings`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView<'a> {
     settings: &'a Settings,
@@ -305,16 +306,16 @@ struct SettingsView<'a> {
 }
 
 /// The body of `PUT /api/settings`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SaveSettings {
     /// The revision of the settings file the change started from.
     revision: String,
-    settings: Settings,
+    settings: RawSettings,
 }
 
 /// An agent as the settings dialog lists it.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentView<'a> {
     name: &'a str,
@@ -325,7 +326,7 @@ struct AgentView<'a> {
 }
 
 /// The reply to `GET /api/layout`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct LayoutView {
     #[serde(flatten)]
     layout: Layout,
@@ -335,14 +336,14 @@ struct LayoutView {
 }
 
 /// The smallest and largest width of each resizable pane, in CSS px.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct LayoutLimits {
     sidebar: [u32; 2],
     tray: [u32; 2],
 }
 
 /// The body of `POST /api/run`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendRun {
     /// The agent's name; the settings' agent when absent.
@@ -352,7 +353,7 @@ struct SendRun {
 }
 
 /// The body of `POST /api/run/permission`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerPermission {
     /// The request's number, as the run's log gives it (the agent's, counting on across the
@@ -363,7 +364,7 @@ struct AnswerPermission {
 }
 
 /// The body of `POST /api/run/review`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewRun {
     /// The run to review, `R3`.
@@ -371,7 +372,7 @@ struct ReviewRun {
 }
 
 /// The body of `PATCH /api/notes?id=N1`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditNote {
     /// The note's new text.
@@ -379,7 +380,7 @@ struct EditNote {
 }
 
 /// The body of `POST /api/run/follow`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FollowRun {
     /// The run to follow up, the latest of its thread: `R3`.
@@ -389,7 +390,7 @@ struct FollowRun {
 }
 
 /// The body of `POST /api/run/question`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerQuestion {
     /// The question's number, as the run's log gives it.
@@ -399,14 +400,14 @@ struct AnswerQuestion {
 }
 
 /// The reply to `/api/run/preview`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct PreviewView {
     /// The prompt's text, exactly as the agent will receive it.
     prompt: String,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FolderRequest {
     path: PathBuf,
@@ -426,7 +427,7 @@ enum LiveRun {
 }
 
 /// The reply to `/api/file`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct FileView<'a> {
     path: &'a str,
     lines: Vec<Vec<Token<'a>>>,
@@ -513,90 +514,90 @@ impl Site {
         Ok(())
     }
 
+    /// The reply to `request`: a page file, or the API route its path names. Each route is
+    /// listed once, by its path, and takes the methods its arm lists; any other method gets
+    /// 405 with what the route takes.
     pub(crate) fn respond(&self, request: &Request<Vec<u8>>) -> Reply {
         let uri = request.uri();
-        let post = *request.method() == Method::POST;
         if let Some(asset) = page_asset(uri.path()) {
             return asset;
         }
+        let method = request.method();
+        let query = uri.query().unwrap_or("");
+        let body = request.body();
         match uri.path() {
-            "/api/repo" => json_or_error(self.repo_info()),
-            "/api/recent" => json_or_error(Ok(self.recent())),
-            "/api/open" if post => json_or_error(self.open_folder(request.body(), Repo::open)),
-            "/api/init" if post => json_or_error(self.open_folder(request.body(), Repo::init)),
-            "/api/notes" => self.respond_notes(request),
-            "/api/notes/resolve" if post => self.change_note(uri, notes::resolve),
-            "/api/notes/reopen" if post => self.change_note(uri, notes::reopen),
-            "/api/folders" => match *request.method() {
+            "/api/repo" => match *method {
+                Method::GET => json_or_error(self.repo_info()),
+                _ => not_allowed("GET"),
+            },
+            "/api/recent" => match *method {
+                Method::GET => json_or_error(Ok(self.recent())),
+                _ => not_allowed("GET"),
+            },
+            "/api/open" => match *method {
+                Method::POST => json_or_error(self.open_folder(body, Repo::open)),
+                _ => not_allowed("POST {\"path\": ...}"),
+            },
+            "/api/init" => match *method {
+                Method::POST => json_or_error(self.open_folder(body, Repo::init)),
+                _ => not_allowed("POST {\"path\": ...}"),
+            },
+            "/api/file" => match *method {
+                Method::GET => match query_value(query, "path") {
+                    Some(path) => json_or_error(self.file_view(&path)),
+                    None => bad_request("expected ?path=<percent-encoded path>"),
+                },
+                _ => not_allowed("GET"),
+            },
+            "/api/notes" => self.respond_notes(method, query, body),
+            "/api/notes/resolve" => match *method {
+                Method::POST => self.change_note(query, notes::resolve),
+                _ => not_allowed("POST ?id=<note id> with no body"),
+            },
+            "/api/notes/reopen" => match *method {
+                Method::POST => self.change_note(query, notes::reopen),
+                _ => not_allowed("POST ?id=<note id> with no body"),
+            },
+            "/api/folders" => match *method {
                 Method::GET => json_or_error(
                     self.repo()
                         .map(|repo| to_json(&folders::load(&repo.folders_file()))),
                 ),
-                Method::PUT => json_or_error(self.save_folders(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the open folders or PUT them"[..],
-                ),
+                Method::PUT => json_or_error(self.save_folders(body)),
+                _ => not_allowed("GET the open folders or PUT them"),
             },
-            "/api/settings" => match *request.method() {
+            "/api/settings" => match *method {
                 Method::GET => reply(StatusCode::OK, "application/json", self.settings()),
-                Method::PUT => json_or_error(self.save_settings(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the settings or PUT new ones"[..],
-                ),
+                Method::PUT => json_or_error(self.save_settings(body)),
+                _ => not_allowed("GET the settings or PUT new ones"),
             },
-            "/api/runs" => match *request.method() {
+            "/api/settings/reset" => match *method {
+                Method::POST => json_or_error(self.reset_settings()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/agents/rescan" => match *method {
+                Method::POST => {
+                    self.agents.rescan();
+                    reply(StatusCode::OK, "application/json", self.settings())
+                }
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/layout" => match *method {
+                Method::GET => reply(StatusCode::OK, "application/json", self.layout()),
+                Method::PUT => json_or_error(self.save_layout(body)),
+                _ => not_allowed("GET the pane widths or PUT new ones"),
+            },
+            "/api/runs" => match *method {
                 Method::GET => json_or_error(
                     self.runner()
                         .and_then(|runner| runner.ids())
                         .map(|ids| to_json(&serde_json::json!({ "runs": ids }))),
                 ),
-                _ => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
+                _ => not_allowed("GET"),
             },
-            // `respond_run` answers "not found" for a path under it that it does not serve.
             path if path == "/api/run" || path.starts_with("/api/run/") => {
-                self.respond_run(request)
+                self.respond_run(path, method, query, body)
             }
-            "/api/layout" => match *request.method() {
-                Method::GET => reply(StatusCode::OK, "application/json", self.layout()),
-                Method::PUT => json_or_error(self.save_layout(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the pane widths or PUT new ones"[..],
-                ),
-            },
-            "/api/settings/reset" if post => json_or_error(self.reset_settings()),
-            "/api/agents/rescan" if post => {
-                self.agents.rescan();
-                reply(StatusCode::OK, "application/json", self.settings())
-            }
-            "/api/notes/resolve" | "/api/notes/reopen" => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"POST ?id=<note id> with no body"[..],
-            ),
-            "/api/settings/reset" | "/api/agents/rescan" => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"POST with no body"[..],
-            ),
-            "/api/open" | "/api/init" => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"POST {\"path\": ...}"[..],
-            ),
-            "/api/file" => match query_value(uri.query().unwrap_or(""), "path") {
-                Some(path) => json_or_error(self.file_view(&path)),
-                None => reply(
-                    StatusCode::BAD_REQUEST,
-                    "text/plain",
-                    &b"expected ?path=<percent-encoded path>"[..],
-                ),
-            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -642,8 +643,7 @@ impl Site {
     /// open project, through `open_repo` (`Repo::open`, or `Repo::init` to make it a
     /// repository first), and answers `{}`. The page then reloads.
     fn open_folder(&self, body: &[u8], open_repo: fn(&Path) -> Result<Repo>) -> Result<Vec<u8>> {
-        let request: FolderRequest = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let request: FolderRequest = parse_body(body, Error::BadRequest)?;
         let live = if request.stop {
             LiveRun::Stop
         } else {
@@ -669,8 +669,7 @@ impl Site {
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
     /// notes.
     fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let new: NewNote = serde_json::from_slice(body)
-            .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
+        let new: NewNote = parse_body(body, Error::InvalidNote)?;
         let review = notes::add(&*self.repo()?, new)?;
         Ok(to_json(&review))
     }
@@ -678,8 +677,7 @@ impl Site {
     /// The reply to `PUT /api/folders` `{"open": ["src"]}`: saves the folders open in the file
     /// list, and answers `{}`.
     fn save_folders(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let open: Folders = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let open: Folders = parse_body(body, Error::BadRequest)?;
         folders::save(&self.repo()?.folders_file(), open)?;
         Ok(b"{}".to_vec())
     }
@@ -687,8 +685,7 @@ impl Site {
     /// The reply to `PATCH /api/notes?id=N1` `{"body": "..."}`: replaces the note's text, saves,
     /// and returns all notes.
     fn edit_note(&self, id: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let edit: EditNote = serde_json::from_slice(body)
-            .map_err(|error| Error::InvalidNote(format!("unreadable request: {error}")))?;
+        let edit: EditNote = parse_body(body, Error::InvalidNote)?;
         let review = notes::edit(&*self.repo()?, id, &edit.body)?;
         Ok(to_json(&review))
     }
@@ -706,13 +703,9 @@ impl Site {
     /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
     /// changes the note's state with `change` (`notes::resolve` or `notes::reopen`), and
     /// returns all notes.
-    fn change_note(&self, uri: &Uri, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
-        let Some(id) = query_value(uri.query().unwrap_or(""), "id") else {
-            return reply(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                &b"expected ?id=<note id>"[..],
-            );
+    fn change_note(&self, query: &str, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
+        let Some(id) = query_value(query, "id") else {
+            return bad_request("expected ?id=<note id>");
         };
         json_or_error(
             self.repo()
@@ -723,74 +716,66 @@ impl Site {
 
     /// The replies to `/api/notes`: GET the notes, POST a new one, PATCH `?id=N1` its text, or
     /// DELETE `?id=N1`.
-    fn respond_notes(&self, request: &Request<Vec<u8>>) -> Reply {
-        let id = query_value(request.uri().query().unwrap_or(""), "id");
-        match (request.method(), id) {
+    fn respond_notes(&self, method: &Method, query: &str, body: &[u8]) -> Reply {
+        let id = query_value(query, "id");
+        match (method, id) {
             (&Method::GET, _) => json_or_error(self.notes()),
-            (&Method::POST, _) => json_or_error(self.add_note(request.body())),
+            (&Method::POST, _) => json_or_error(self.add_note(body)),
             (&Method::DELETE, Some(id)) => json_or_error(self.delete_note(&id)),
-            (&Method::PATCH, Some(id)) => json_or_error(self.edit_note(&id, request.body())),
-            (&Method::DELETE | &Method::PATCH, None) => reply(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                &b"expected ?id=<note id>"[..],
-            ),
-            _ => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1"[..],
+            (&Method::PATCH, Some(id)) => json_or_error(self.edit_note(&id, body)),
+            (&Method::DELETE | &Method::PATCH, None) => bad_request("expected ?id=<note id>"),
+            _ => not_allowed(
+                "GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1",
             ),
         }
     }
 
-    /// The replies to `/api/run` and the routes under it.
-    fn respond_run(&self, request: &Request<Vec<u8>>) -> Reply {
-        let uri = request.uri();
-        let post = *request.method() == Method::POST;
-        match uri.path() {
-            "/api/run" => match *request.method() {
-                Method::GET => json_or_error(self.run_view(uri.query().unwrap_or(""))),
-                Method::POST => json_or_error(self.send_run(request.body())),
-                _ => reply(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "text/plain",
-                    &b"GET the latest run (?after=<entries seen>) or one run (?id=R1), \
-                       or POST a new one"[..],
+    /// The replies to `/api/run` and the routes under it, as [`Site::respond`] gives them.
+    fn respond_run(&self, path: &str, method: &Method, query: &str, body: &[u8]) -> Reply {
+        match path {
+            "/api/run" => match *method {
+                Method::GET => json_or_error(self.run_view(query)),
+                Method::POST => json_or_error(self.send_run(body)),
+                _ => not_allowed(
+                    "GET the latest run (?after=<entries seen>) or one run (?id=R1), or POST a \
+                     new one",
                 ),
             },
-            "/api/run/preview" if *request.method() != Method::GET => reply(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "text/plain",
-                &b"GET ?notes=N1,N2"[..],
-            ),
-            "/api/run/preview" => match query_value(uri.query().unwrap_or(""), "notes") {
-                Some(ids) => json_or_error(self.preview_run(&ids)),
-                None => reply(
-                    StatusCode::BAD_REQUEST,
-                    "text/plain",
-                    &b"expected ?notes=N1,N2"[..],
-                ),
+            "/api/run/preview" => match *method {
+                Method::GET => match query_value(query, "notes") {
+                    Some(ids) => json_or_error(self.preview_run(&ids)),
+                    None => bad_request("expected ?notes=N1,N2"),
+                },
+                _ => not_allowed("GET ?notes=N1,N2"),
             },
-            "/api/run/changes" if *request.method() == Method::GET => {
-                json_or_error(self.changes(uri.query().unwrap_or("")))
-            }
-            "/api/run/cancel" if post => json_or_error(
-                self.runner()
-                    .and_then(|runner| runner.cancel())
-                    .map(|()| b"{}".to_vec()),
-            ),
-            "/api/run/permission" if post => json_or_error(self.answer_permission(request.body())),
-            "/api/run/question" if post => json_or_error(self.answer_question(request.body())),
-            "/api/run/review" if post => json_or_error(self.review_run(request.body())),
-            "/api/run/follow" if post => json_or_error(self.follow_up(request.body())),
-            "/api/run/cancel"
-            | "/api/run/permission"
-            | "/api/run/question"
-            | "/api/run/review"
-            | "/api/run/follow" => {
-                reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"POST"[..])
-            }
-            "/api/run/changes" => reply(StatusCode::METHOD_NOT_ALLOWED, "text/plain", &b"GET"[..]),
+            "/api/run/changes" => match *method {
+                Method::GET => json_or_error(self.changes(query)),
+                _ => not_allowed("GET"),
+            },
+            "/api/run/cancel" => match *method {
+                Method::POST => json_or_error(
+                    self.runner()
+                        .and_then(|runner| runner.cancel())
+                        .map(|()| b"{}".to_vec()),
+                ),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/permission" => match *method {
+                Method::POST => json_or_error(self.answer_permission(body)),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/question" => match *method {
+                Method::POST => json_or_error(self.answer_question(body)),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/review" => match *method {
+                Method::POST => json_or_error(self.review_run(body)),
+                _ => not_allowed("POST"),
+            },
+            "/api/run/follow" => match *method {
+                Method::POST => json_or_error(self.follow_up(body)),
+                _ => not_allowed("POST"),
+            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -814,9 +799,12 @@ impl Site {
     /// The reply to `PUT /api/layout`: saves the widths in the body and answers `{}`; the
     /// page already holds what it sent.
     fn save_layout(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let layout: Layout = serde_json::from_slice(body)
+        let layout: RawLayout = serde_json::from_slice(body)
             .map_err(|error| Error::BadRequest(format!("unreadable layout: {error}")))?;
         let file = self.layout_file.as_deref().ok_or(Error::NoHome)?;
+        // Checked here, not by serde: a serde error would carry a line and column and the
+        // "unreadable layout" prefix, and the page shows this message as it is.
+        let layout = Layout::try_from(layout).map_err(Error::BadRequest)?;
         layout::save(file, &layout)?;
         Ok(b"{}".to_vec())
     }
@@ -831,7 +819,8 @@ impl Site {
     }
 
     /// The reply to `GET /api/run`: with `?id=R2`, that run whole; else the latest run with its
-    /// entries from number `?after=` on, or `null` when the project has none.
+    /// entries from number `?after=` on, without its notes and prompt unless that is 0, or
+    /// `null` when the project has none.
     fn run_view(&self, query: &str) -> Result<Vec<u8>> {
         let runner = self.runner()?;
         match query_value(query, "id") {
@@ -852,9 +841,12 @@ impl Site {
     /// The reply to `POST /api/run`: sends the notes in the body to the agent, and answers
     /// `{}`. The page fetches the run (`GET /api/run`), as after every change.
     fn send_run(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let request: SendRun = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
-        let agent = self.agent_choice(request.agent)?;
+        let request: SendRun = parse_body(body, Error::BadRequest)?;
+        let settings = self.current_settings();
+        let agent = match &request.agent {
+            Some(name) => settings.chosen_agent(name)?,
+            None => settings.default_agent()?,
+        };
         self.runner()?.send(agent, &request.notes)?;
         Ok(b"{}".to_vec())
     }
@@ -868,8 +860,7 @@ impl Site {
 
     /// The reply to `POST /api/run/permission`.
     fn answer_permission(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let answer: AnswerPermission = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let answer: AnswerPermission = parse_body(body, Error::BadRequest)?;
         self.runner()?.answer(answer.request, &answer.option)?;
         Ok(b"{}".to_vec())
     }
@@ -877,16 +868,13 @@ impl Site {
     /// The reply to `POST /api/run/review`: starts the settings' reviewers on the run, in
     /// order, and answers `{}`.
     fn review_run(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let review: ReviewRun = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
-        let names = self
-            .settings_file
-            .as_deref()
-            .map_or_else(Settings::default, |file| settings::load(file).settings)
-            .reviewers;
-        let reviewers = names
-            .into_iter()
-            .map(|name| self.agent_choice(Some(name)))
+        let review: ReviewRun = parse_body(body, Error::BadRequest)?;
+        // Loaded once, so every reviewer is checked against the same revision of the file.
+        let settings = self.current_settings();
+        let reviewers = settings
+            .reviewers()
+            .iter()
+            .map(|name| settings.chosen_agent(name))
             .collect::<Result<Vec<_>>>()?;
         self.runner()?.review(&review.of, reviewers)?;
         Ok(b"{}".to_vec())
@@ -895,52 +883,28 @@ impl Site {
     /// The reply to `POST /api/run/follow`: sends the engineer's follow-up to the agent that
     /// ran the run it follows, and answers `{}`.
     fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let follow: FollowRun = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let follow: FollowRun = parse_body(body, Error::BadRequest)?;
         let runner = self.runner()?;
-        let agent = self.agent_choice(Some(runner.agent_of(&follow.of)?))?;
+        let agent = self
+            .current_settings()
+            .chosen_agent(&runner.agent_of(&follow.of)?)?;
         runner.follow_up(&follow.of, agent, &follow.text)?;
         Ok(b"{}".to_vec())
     }
 
     /// The reply to `POST /api/run/question`.
     fn answer_question(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let answer: AnswerQuestion = serde_json::from_slice(body)
-            .map_err(|error| Error::BadRequest(format!("unreadable request: {error}")))?;
+        let answer: AnswerQuestion = parse_body(body, Error::BadRequest)?;
         self.runner()?.reply(answer.request, answer.content)?;
         Ok(b"{}".to_vec())
     }
 
-    /// The agent called `name`, or the settings' agent, with its command. It must be turned
-    /// on in the settings.
-    fn agent_choice(&self, name: Option<String>) -> Result<AgentChoice> {
-        let settings = self
-            .settings_file
+    /// The settings in effect: the file's, or the defaults when it cannot be used or there is
+    /// no configuration directory. Reads the file each time.
+    fn current_settings(&self) -> Settings {
+        self.settings_file
             .as_deref()
-            .map_or_else(Settings::default, |file| settings::load(file).settings);
-        let name = name.or(settings.agent).ok_or_else(|| {
-            Error::BadRequest("choose the agent notes are sent to in Settings".to_owned())
-        })?;
-        if !settings.enabled_agents.contains(&name) {
-            return Err(Error::BadRequest(format!(
-                "turn {name} on in Settings before sending to it"
-            )));
-        }
-        let built_in = BUILT_IN
-            .iter()
-            .find(|agent| agent.name == name)
-            .map(|agent| agent.command.to_owned());
-        let custom = || {
-            settings
-                .custom_agents
-                .into_iter()
-                .find(|agent| agent.name == name)
-                .map(|agent| agent.command)
-        };
-        let command = built_in
-            .or_else(custom)
-            .ok_or_else(|| Error::BadRequest(format!("there is no agent called {name}")))?;
-        Ok(AgentChoice { name, command })
+            .map_or_else(Settings::default, |file| settings::load(file).settings)
     }
 
     /// The reply to `GET /api/settings`, and to every request that changes them: the
@@ -978,10 +942,11 @@ impl Site {
     /// The reply to `PUT /api/settings`: checks and saves the settings in the body, if the
     /// file is still at the revision the body names.
     fn save_settings(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let request: SaveSettings = serde_json::from_slice(body)
-            .map_err(|error| Error::InvalidSettings(format!("unreadable request: {error}")))?;
+        let request: SaveSettings = parse_body(body, Error::InvalidSettings)?;
         let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
-        settings::save(file, &request.settings, &request.revision)?;
+        // Checked here, not by serde, for the same reason as `save_layout`.
+        let settings = Settings::try_from(request.settings).map_err(Error::InvalidSettings)?;
+        settings::save(file, &settings, &request.revision)?;
         Ok(self.settings())
     }
 
@@ -989,6 +954,21 @@ impl Site {
     fn reset_settings(&self) -> Result<Vec<u8>> {
         settings::reset(self.settings_file.as_deref().ok_or(Error::NoHome)?)?;
         Ok(self.settings())
+    }
+}
+
+impl std::fmt::Debug for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `notify` is left out: it is a closure, which has no `Debug`.
+        f.debug_struct("Site")
+            .field("project", &self.project)
+            .field("highlighter", &self.highlighter)
+            .field("bench", &self.bench)
+            .field("recent_file", &self.recent_file)
+            .field("settings_file", &self.settings_file)
+            .field("layout_file", &self.layout_file)
+            .field("agents", &self.agents)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1019,7 +999,7 @@ fn agent_views<'a>(settings: &'a Settings, search_path: &OsStr) -> Vec<AgentView
         built_in: true,
         found: found(Some(agent.program)),
     });
-    let custom = settings.custom_agents.iter().map(|agent| AgentView {
+    let custom = settings.custom_agents().iter().map(|agent| AgentView {
         name: &agent.name,
         command: &agent.command,
         built_in: false,
@@ -1042,6 +1022,12 @@ fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
         "the reply types are plain structs of strings, numbers, and sequences, which always \
          serialize",
     )
+}
+
+/// The JSON request body `body` as a `T`; when it does not parse, `error` of "unreadable
+/// request" and serde's reason, which names the line and column.
+fn parse_body<T: DeserializeOwned>(body: &[u8], error: fn(String) -> Error) -> Result<T> {
+    serde_json::from_slice(body).map_err(|problem| error(format!("unreadable request: {problem}")))
 }
 
 fn json_or_error(body: Result<Vec<u8>>) -> Reply {
@@ -1082,7 +1068,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }
-                | Error::Highlight(_)
+                | Error::Highlight { .. }
                 | Error::Window(_)
                 | Error::Webview(_)
                 | Error::SpawnWorker(_)
@@ -1122,6 +1108,20 @@ pub(crate) fn reply(
         .header(CONTENT_TYPE, content_type)
         .body(body.into())
         .expect("a status code and one static header always make a valid response")
+}
+
+/// 405, with what the route takes.
+fn not_allowed(takes: &'static str) -> Reply {
+    reply(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "text/plain",
+        takes.as_bytes(),
+    )
+}
+
+/// 400, saying what the request lacks.
+fn bad_request(problem: &'static str) -> Reply {
+    reply(StatusCode::BAD_REQUEST, "text/plain", problem.as_bytes())
 }
 
 /// Finds `key` in a URL query string and percent-decodes its value.

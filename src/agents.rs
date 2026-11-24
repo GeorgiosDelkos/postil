@@ -64,6 +64,13 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
     },
 ];
 
+/// The agent a run goes to: its name in the settings and the command that starts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentChoice {
+    pub(crate) name: String,
+    pub(crate) command: String,
+}
+
 /// How long the login shell may take to print its `PATH`. Arbitrary: a slow shell start-up
 /// (nvm, conda) takes about a second; longer means it is waiting for something that will not
 /// come, and the settings must not hang on it.
@@ -152,8 +159,10 @@ impl Scanner {
             .spawn(finish);
         if spawned.is_err() {
             // Fails only when the process is out of threads or memory. The settings then list
-            // every agent as not found rather than wait for a scan that never runs.
+            // every agent as not found rather than wait for a scan that never runs. A `wait`
+            // blocked on an earlier scan, which this one replaced, is woken to read it.
             state.1 = Some(OsString::new());
+            self.found.notify_all();
         }
     }
 }
@@ -302,46 +311,25 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::testing::TempDir;
 
-    /// A temporary directory removed on drop.
-    struct Dir(PathBuf);
-
-    impl Dir {
-        fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("postil-agents-{name}-{}", std::process::id()));
-            drop(fs::remove_dir_all(&dir));
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-
-        fn file(&self, name: &str, text: &str, mode: u32) -> PathBuf {
-            let path = self.0.join(name);
-            fs::write(&path, text).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-            path
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            drop(fs::remove_dir_all(&self.0));
-        }
+    /// Writes `text` to the file `name` in `dir`, with permissions `mode`.
+    fn file(dir: &TempDir, name: &str, text: &str, mode: u32) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
     }
 
     #[test]
     fn a_program_is_found_only_as_an_executable_file_in_an_absolute_directory() {
-        let first = Dir::new("first");
-        let second = Dir::new("second");
-        first.file("agent", "", 0o644);
-        let wanted = second.file("agent", "", 0o755);
-        fs::create_dir(first.0.join("tool")).unwrap();
-        let path = std::env::join_paths([
-            "relative/dir".as_ref(),
-            first.0.as_path(),
-            second.0.as_path(),
-        ])
-        .unwrap();
+        let first = TempDir::new("agents-first");
+        let second = TempDir::new("agents-second");
+        file(&first, "agent", "", 0o644);
+        let wanted = file(&second, "agent", "", 0o755);
+        fs::create_dir(first.path().join("tool")).unwrap();
+        let path =
+            std::env::join_paths(["relative/dir".as_ref(), first.path(), second.path()]).unwrap();
 
         assert_eq!(
             find_program("agent", &path),
@@ -363,10 +351,11 @@ mod tests {
 
     #[test]
     fn the_login_shell_path_is_read_between_the_markers_whatever_its_start_up_prints() {
-        let dir = Dir::new("shell");
+        let dir = TempDir::new("agents-shell");
         // Stands in for zsh: prints like a noisy .zshrc, then runs the command it was given
         // (`-i -l -c COMMAND`, so the command is the fourth argument) with a known PATH.
-        let shell = dir.file(
+        let shell = file(
+            &dir,
             "fake-shell",
             concat!(
                 "#!/bin/sh\n",
@@ -383,9 +372,10 @@ mod tests {
 
     #[test]
     fn start_up_output_larger_than_the_pipe_does_not_block_the_shell() {
-        let dir = Dir::new("loud-shell");
+        let dir = TempDir::new("agents-loud-shell");
         // 200 kB of noise: three times what the pipe holds on macOS.
-        let shell = dir.file(
+        let shell = file(
+            &dir,
             "loud",
             concat!(
                 "#!/bin/sh\n",
@@ -403,10 +393,11 @@ mod tests {
 
     #[test]
     fn a_background_job_holding_the_output_open_does_not_hold_up_the_path() {
-        let dir = Dir::new("daemon-shell");
+        let dir = TempDir::new("agents-daemon-shell");
         // Like a .zshrc that starts a daemon without redirecting its output: the job keeps
         // the pipe open for 30 s after the shell exits.
-        let shell = dir.file(
+        let shell = file(
+            &dir,
             "daemon",
             concat!(
                 "#!/bin/sh\n",
@@ -439,22 +430,22 @@ mod tests {
 
     #[test]
     fn a_login_shell_that_fails_hangs_or_is_missing_gives_no_path() {
-        let dir = Dir::new("bad-shell");
-        let failing = dir.file("failing", "#!/bin/sh\nexit 3\n", 0o755);
-        let silent = dir.file("silent", "#!/bin/sh\necho no markers here\n", 0o755);
+        let dir = TempDir::new("agents-bad-shell");
+        let failing = file(&dir, "failing", "#!/bin/sh\nexit 3\n", 0o755);
+        let silent = file(&dir, "silent", "#!/bin/sh\necho no markers here\n", 0o755);
         // Like a start-up file whose command hangs: the shell waits on a child that the
         // timeout must not leave running. The child's pid goes to a file for the check below.
-        let pid_file = dir.0.join("hung.pid");
+        let pid_file = dir.path().join("hung.pid");
         let script = format!(
             "#!/bin/sh\nsleep 30 &\necho $! > {}\nwait\n",
             pid_file.display()
         );
-        let hanging = dir.file("hanging", &script, 0o755);
+        let hanging = file(&dir, "hanging", &script, 0o755);
 
         assert_eq!(login_shell_path(&failing, LOGIN_SHELL_TIMEOUT), None);
         assert_eq!(login_shell_path(&silent, LOGIN_SHELL_TIMEOUT), None);
         assert_eq!(
-            login_shell_path(&dir.0.join("absent"), LOGIN_SHELL_TIMEOUT),
+            login_shell_path(&dir.path().join("absent"), LOGIN_SHELL_TIMEOUT),
             None
         );
 

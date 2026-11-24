@@ -66,8 +66,8 @@ profile=(--keychain-profile "$POSTIL_NOTARY_PROFILE")
 if [[ -n "${POSTIL_NOTARY_KEYCHAIN:-}" ]]; then
   profile+=(--keychain "$POSTIL_NOTARY_KEYCHAIN")
 fi
+# Left in $TMPDIR for macOS to delete, not sent to the Trash, as in scripts/bundle.sh.
 work="$(mktemp -d)"
-trap 'trash "$work"' EXIT
 # notarytool takes a zip, a disk image or a package, not a bare bundle.
 ditto -c -k --keepParent "$app" "$work/Postil.zip"
 # notarytool's exit status is not the verdict: it can exit 0 with a rejected submission, and a

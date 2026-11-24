@@ -235,6 +235,10 @@ impl Highlighter {
 
     /// Splits `text` into lines of tokens. `path` picks the grammar by extension; a file with
     /// no known grammar, or over [`MAX_HIGHLIGHTED`] bytes, comes back as plain lines.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Highlight`], naming `path`, when tree-sitter fails on the text.
     pub(crate) fn lines<'a>(&self, path: &str, text: &'a str) -> Result<Vec<Vec<Token<'a>>>> {
         let mut lines = Lines::new(text);
 
@@ -242,15 +246,19 @@ impl Highlighter {
             .configuration(path)
             .filter(|_| text.len() <= MAX_HIGHLIGHTED);
         if let Some(configuration) = grammar {
+            let failed = |source| Error::Highlight {
+                path: path.to_owned(),
+                source,
+            };
             let mut highlighter = tree_sitter_highlight::Highlighter::new();
             let events = highlighter
                 .highlight(configuration, text.as_bytes(), None, None, |_| None)
-                .map_err(Error::Highlight)?;
+                .map_err(failed)?;
 
             // Captures nest (a string inside a macro call); the innermost one colors the text.
             let mut open: Vec<&'static str> = Vec::new();
             for event in events {
-                match event.map_err(Error::Highlight)? {
+                match event.map_err(failed)? {
                     HighlightEvent::HighlightStart(highlight) => open.push(STYLES[highlight.0].1),
                     HighlightEvent::HighlightEnd => {
                         open.pop();
@@ -270,7 +278,17 @@ impl Highlighter {
 
 impl std::fmt::Debug for Highlighter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Highlighter").finish_non_exhaustive()
+        // The grammars built so far, each by its first extension; the configurations
+        // themselves have no `Debug`.
+        let built: Vec<&str> = GRAMMARS
+            .iter()
+            .zip(&self.configurations)
+            .filter(|(_, configuration)| configuration.get().is_some())
+            .map(|(grammar, _)| grammar.extensions[0])
+            .collect();
+        f.debug_struct("Highlighter")
+            .field("built", &built)
+            .finish_non_exhaustive()
     }
 }
 
@@ -424,6 +442,13 @@ mod tests {
                 let lines = highlighter.lines(path, text).unwrap();
                 assert_eq!(rejoin(&lines), normalized(text), "{path} {text:?}");
                 assert_eq!(lines.len(), text.lines().count(), "{path} {text:?}");
+                for (line, source) in lines.iter().zip(text.lines()) {
+                    assert_eq!(
+                        line.is_empty(),
+                        source.is_empty(),
+                        "{path} {text:?}: a blank line, and only one, has no tokens"
+                    );
+                }
                 // Adjacent text of one class is one token: fewer elements for the page.
                 for line in &lines {
                     let repeated = line.windows(2).any(|pair| pair[0].0 == pair[1].0);
@@ -434,14 +459,15 @@ mod tests {
     }
 
     #[test]
-    fn line_count_matches_the_file() {
+    fn debug_names_the_grammars_built_so_far() {
         let highlighter = Highlighter::new();
-        let text = "fn a() {}\n\n/* x\ny */\nfn b() {}\n";
-
-        let lines = highlighter.lines("a.rs", text).unwrap();
-
-        assert_eq!(lines.len(), text.lines().count());
-        assert!(lines[1].is_empty(), "a blank line has no tokens");
+        assert_eq!(format!("{highlighter:?}"), "Highlighter { built: [], .. }");
+        highlighter.lines("a.rs", "fn a() {}\n").unwrap();
+        highlighter.lines("a.txt", "plain\n").unwrap();
+        assert_eq!(
+            format!("{highlighter:?}"),
+            "Highlighter { built: [\"rs\"], .. }"
+        );
     }
 
     #[test]

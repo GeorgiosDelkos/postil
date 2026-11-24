@@ -19,9 +19,13 @@ use std::sync::mpsc::{self, SendError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use tao::dpi::LogicalPosition;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use tao::platform::macos::WindowBuilderExtMacOS;
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Theme, Window, WindowBuilder};
 use wry::http::{Request, StatusCode};
@@ -145,7 +149,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         drop(closed.send_event(AppEvent::SiteClosed));
     })?;
 
-    let window = build_window(&event_loop, settings.theme)?;
+    let window = build_window(&event_loop, settings.theme())?;
 
     // The menu bar lives as long as this function, which is as long as the app.
     #[cfg(target_os = "macos")]
@@ -190,6 +194,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
 }
 
 /// What the event loop's handler ([`on_event`]) reads and changes while the window is open.
+#[derive(Debug)]
 struct App<'a> {
     page: Page<'a>,
     window: &'a Window,
@@ -553,6 +558,16 @@ struct Page<'a> {
     quit: EventLoopProxy<AppEvent>,
 }
 
+impl fmt::Debug for Page<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The webview is left out: wry's `WebView` has no `Debug`.
+        f.debug_struct("Page")
+            .field("committed", &self.committed)
+            .field("quit", &self.quit)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Asks the page to carry out the menu command `id` (`window.postil.menu` in ui/app.js), so
 /// its guards apply, such as a draft note stopping Quit; the page posts `quit` itself when
 /// nothing stops it.
@@ -612,15 +627,11 @@ fn build_window(event_loop: &EventLoop<AppEvent>, theme: settings::Theme) -> Res
     // No title bar: the page draws up to the top edge and the window buttons sit over the
     // sidebar, 14 px in and 16 px down to line up with the sidebar's 44 px top strip.
     #[cfg(target_os = "macos")]
-    let builder = {
-        use tao::dpi::LogicalPosition;
-        use tao::platform::macos::WindowBuilderExtMacOS;
-        builder
-            .with_titlebar_transparent(true)
-            .with_fullsize_content_view(true)
-            .with_title_hidden(true)
-            .with_traffic_light_inset(LogicalPosition::new(14.0, 16.0))
-    };
+    let builder = builder
+        .with_titlebar_transparent(true)
+        .with_fullsize_content_view(true)
+        .with_title_hidden(true)
+        .with_traffic_light_inset(LogicalPosition::new(14.0, 16.0));
 
     builder.build(event_loop).map_err(Error::Window)
 }

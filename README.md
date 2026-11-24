@@ -162,7 +162,7 @@ can read and write them too.
 | `<git dir>/postil/review.json`         | The notes of the working tree                  |
 | `<git dir>/postil/runs/R<n>.jsonl`     | Each run's log: its prompt and every event     |
 | `<git dir>/postil/folders.json`        | The folders open in the file list              |
-| `<git dir>/postil-snapshot.index`      | The index Postil writes snapshots through      |
+| `<git dir>/postil/snapshot/index`      | The index Postil writes snapshots through      |
 | `~/.config/postil/settings.json`       | Agents, the default agent, reviewers, the look |
 | `~/.config/postil/layout.json`         | The widths of the panes                        |
 | `~/.config/postil/recent.json`         | The recent projects                            |
@@ -180,6 +180,10 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked          # Rust tests, and the page's tests through Node
 node --test ui/              # the page's tests alone
 ```
+
+[prek](https://github.com/j178/prek) (`cargo install --locked prek`)
+runs CI's lints (rustfmt, clippy, rustdoc, oxlint, oxfmt) on every commit from
+`.pre-commit-config.yaml`, once `prek install` has been run in the clone.
 
 The Rust tests run end to end: they drive the app's HTTP routes against real git repositories
 in temporary directories and a fake ACP agent (`tests/fake-agent.mjs`) over real pipes. One
@@ -206,7 +210,8 @@ cargo mutants --in-diff /tmp/pr.diff
 
 CI runs formatting, clippy and the tests on macOS for every pull request that is ready for
 review, and `cargo deny` (advisories, licenses, sources) when the dependencies change and every
-night.
+night. Every day it also runs the tests on the nightly toolchain, and after `cargo update` with
+deprecations denied (`.github/workflows/scheduled.yml`).
 
 [`docs/design.md`](docs/design.md) is the design: the loop, the data structures, the ACP
 integration, runs, reviews, follow-ups, the changes view, and the decisions with their reasons.

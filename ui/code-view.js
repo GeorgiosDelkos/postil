@@ -225,10 +225,13 @@ export function codeView({
 
     const note = state.noteByLine.get(index);
     row.classList.toggle("noted", Boolean(note));
-    row.querySelector(".remark")?.remove();
-    if (note && note.lines.end - 1 === index) {
-      row.append(el("span", "remark", `${note.id} · ${note.body}`));
-    }
+    // The remark is replaced only when its text changes: a gutter drag decorates every row on
+    // each mousemove, and adding the remarks again took 0.4 ms of layout each time.
+    const remark = note && note.lines.end - 1 === index ? `${note.id} · ${note.body}` : null;
+    const shown = row.querySelector(".remark");
+    if ((shown?.textContent ?? null) === remark) return;
+    shown?.remove();
+    if (remark !== null) row.append(el("span", "remark", remark));
   }
 
   function redecorateRows() {

@@ -1,5 +1,11 @@
-//! Writing the app's own files: the notes, the recent projects, the settings, the layout and
-//! the open folders.
+//! Reading and writing the app's own files: the notes, the recent projects, the settings, the
+//! layout and the open folders.
+//!
+//! Each is a JSON object with a `version` field, written as pretty JSON ending in a newline by
+//! [`save_json`]. [`version_of`] reads that field alone, so a file in a newer format is told
+//! apart before its new fields fail the parse. The recent projects, the layout and the open
+//! folders are the app's own conveniences and read through [`load_versioned`], which never
+//! fails; the settings and the notes are the engineer's and say why a file cannot be used.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -8,7 +14,68 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
+
+/// What a versioned file holds, as far as this build can tell ([`load_versioned`]).
+#[derive(Debug)]
+pub(crate) enum Stored<T> {
+    /// A file of the version this build writes.
+    Current(T),
+    /// A file a newer build wrote: not read, and not to be replaced.
+    Newer,
+    /// No file, or one that cannot be read or parsed, or of an older version: the next save
+    /// replaces it.
+    Nothing,
+}
+
+/// Reads `file` as a `T` when its `version` is `version`, the one this build writes.
+pub(crate) fn load_versioned<T: DeserializeOwned>(file: &Path, version: u32) -> Stored<T> {
+    let Ok(json) = fs::read_to_string(file) else {
+        return Stored::Nothing;
+    };
+    match version_of(json.as_bytes()) {
+        Ok(stored) if stored > version => Stored::Newer,
+        Ok(stored) if stored == version => {
+            serde_json::from_str(&json).map_or(Stored::Nothing, Stored::Current)
+        }
+        Ok(_) | Err(_) => Stored::Nothing,
+    }
+}
+
+/// The `version` field of the JSON object `json`. Every other field is ignored, so this reads
+/// a file, or a run log's header line, of any version.
+///
+/// # Errors
+///
+/// When `json` is neither an object with a `version` that is a `u32` nor an array whose first
+/// element is one (serde's derive accepts both).
+pub(crate) fn version_of(json: &[u8]) -> serde_json::Result<u32> {
+    // The name shows in serde's message for a value that is not an object ("expected struct
+    // VersionOnly"), which the page shows for a broken review file or run log: renaming it
+    // changes that message.
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u32,
+    }
+    serde_json::from_slice::<VersionOnly>(json).map(|stored| stored.version)
+}
+
+/// Writes `value` to `file` as pretty JSON ending in a newline, through [`write_atomically`].
+///
+/// # Errors
+///
+/// As [`write_atomically`].
+pub(crate) fn save_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
+    let mut json = serde_json::to_vec_pretty(value).expect(
+        "serde_json fails only on a map key that is not a string or a failing Serialize impl, \
+         and the app's files have neither",
+    );
+    json.push(b'\n');
+    write_atomically(file, &json)
+}
 
 /// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`, so
 /// a crash leaves the old file or the new one and never a part. Creates the directory first
@@ -34,7 +101,7 @@ use crate::error::{Error, Result};
 /// Every call writes a temporary file of its own, so calls on one file at once, from this
 /// process or another, never write into each other's; the last rename wins. A crash between
 /// creating the temporary and the rename leaves it behind; readers ignore it.
-pub(crate) fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let real = follow_links(file);
     let written = replace(&real, bytes);
     if real == file {
@@ -169,6 +236,7 @@ fn config_dir_from(xdg_config_home: Option<OsString>, home: Option<OsString>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{TempDir, skip_as_root};
 
     #[test]
     fn config_dir_prefers_an_absolute_xdg_config_home_and_falls_back_to_home() {
@@ -198,33 +266,27 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
-    /// An empty directory in the temporary directory. `name` must differ between tests.
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("postil-files-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn a_link_to_a_missing_file_creates_that_file_and_stays_a_link() {
-        let dir = temp_dir("dangling");
-        let link = dir.join("settings.json");
+        let dir = TempDir::new("files-dangling");
+        let link = dir.path().join("settings.json");
         std::os::unix::fs::symlink("real.json", &link).unwrap();
 
         write_atomically(&link, b"new").unwrap();
 
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("real.json"));
-        assert_eq!(fs::read(dir.join("real.json")).unwrap(), b"new");
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(fs::read(dir.path().join("real.json")).unwrap(), b"new");
     }
 
     #[test]
     fn a_failed_write_through_a_link_names_the_file_it_points_at() {
-        let dir = temp_dir("blocked-target");
-        let target_dir = dir.join("dotfiles");
+        if skip_as_root() {
+            return;
+        }
+        let dir = TempDir::new("files-blocked-target");
+        let target_dir = dir.path().join("dotfiles");
         fs::create_dir(&target_dir).unwrap();
-        let link = dir.join("settings.json");
+        let link = dir.path().join("settings.json");
         std::os::unix::fs::symlink("dotfiles/settings.json", &link).unwrap();
         fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -239,37 +301,98 @@ mod tests {
             "{error}"
         );
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_cycle_of_links_is_refused_and_nothing_is_written() {
-        let dir = temp_dir("cycle");
-        std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
-        std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
+        let dir = TempDir::new("files-cycle");
+        std::os::unix::fs::symlink("b", dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("a", dir.path().join("b")).unwrap();
 
-        let error = write_atomically(&dir.join("a"), b"x").unwrap_err();
+        let error = write_atomically(&dir.path().join("a"), b"x").unwrap_err();
 
         assert!(error.to_string().contains("symbolic links"), "{error}");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "only the two links");
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "only the two links"
+        );
     }
 
     #[test]
     fn leftover_temporaries_with_this_pid_do_not_fail_the_write() {
-        let dir = temp_dir("leftover");
-        let file = dir.join("settings.json");
+        let dir = TempDir::new("files-leftover");
+        let file = dir.path().join("settings.json");
         // Leftovers of a crashed process that had this pid, under the next names this process
         // would use. Tests run in parallel and also take numbers, so a stretch ahead is taken.
         let next = WRITES.load(Ordering::Relaxed);
         for number in next..next + 64 {
             let name = format!("settings.json.{}.{number}.tmp", std::process::id());
-            fs::write(dir.join(name), b"stale").unwrap();
+            fs::write(dir.path().join(name), b"stale").unwrap();
         }
 
         write_atomically(&file, b"new").unwrap();
 
         assert_eq!(fs::read(&file).unwrap(), b"new");
-        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A versioned file of the shape [`load_versioned`] is given in the app.
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Probe {
+        version: u32,
+        value: u32,
+    }
+
+    /// What `load_versioned` makes of `contents` (`None`: no file), for a build at version 2.
+    fn loaded(name: &str, contents: Option<&str>) -> Stored<Probe> {
+        let dir = TempDir::new(&format!("files-{name}"));
+        let file = dir.path().join("probe.json");
+        if let Some(contents) = contents {
+            fs::write(&file, contents).unwrap();
+        }
+        load_versioned(&file, 2)
+    }
+
+    #[test]
+    fn a_file_of_this_version_is_read_and_a_newer_one_is_newer_whatever_its_fields() {
+        assert!(matches!(
+            loaded("current", Some(r#"{"version": 2, "value": 7}"#)),
+            Stored::Current(Probe {
+                version: 2,
+                value: 7
+            })
+        ));
+        for newer in [
+            r#"{"version": 3, "value": 7}"#,
+            r#"{"version": 3, "renamed": [1, 2]}"#,
+        ] {
+            assert!(
+                matches!(loaded("newer", Some(newer)), Stored::Newer),
+                "{newer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_unreadable_broken_or_older_file_is_nothing() {
+        for (name, contents) in [
+            ("missing", None),
+            ("broken", Some("{ not json")),
+            ("no-version", Some(r#"{"value": 7}"#)),
+            ("older", Some(r#"{"version": 1, "value": 7}"#)),
+            (
+                "unknown-field",
+                Some(r#"{"version": 2, "value": 7, "x": 1}"#),
+            ),
+        ] {
+            assert!(matches!(loaded(name, contents), Stored::Nothing), "{name}");
+        }
+
+        // A directory where the file should be: it exists, and reading it fails.
+        let dir = TempDir::new("files-unreadable");
+        let file = dir.path().join("probe.json");
+        fs::create_dir(&file).unwrap();
+        assert!(matches!(load_versioned::<Probe>(&file, 2), Stored::Nothing));
     }
 }

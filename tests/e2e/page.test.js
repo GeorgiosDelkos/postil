@@ -48,8 +48,8 @@ before(async () => {
 });
 after(() => browser?.close());
 
-// A new project on the bridge, `src/a.rs` in a fresh repository, open in a new page. `api` calls
-// its routes from the test, as the page does.
+// A new project on the bridge, `src/a.rs`, `b.rs` and `c.rs` in a fresh repository, open in a
+// new page. `api` calls its routes from the test, as the page does.
 async function openProject(t) {
   const created = await fetch(new URL("new", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);
@@ -164,4 +164,126 @@ test("Esc with Changes open and the focus elsewhere closes Changes, not the run 
   const run = await api("api/run");
   assert.ok(isLive(run), `the run goes on: ${run.status}`);
   assert.ok(!run.entries.some((entry) => entry.kind === "cancelRequested"), "no stop was asked");
+});
+
+test("a click on a line number in Changes opens the composer on that line (JS19)", async (t) => {
+  const { page, api } = await openProject(t);
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  await page.locator("#run .run-entry").click();
+  await page.locator("#run-detail").getByRole("button", { name: "Changes" }).click();
+
+  // The flood's edit, `two` to `2` on line 2 of src/a.rs.
+  await page.locator("#changes-view").getByRole("button", { name: "2", exact: true }).click();
+  await page.locator("#changes-view").waitFor({ state: "hidden" });
+  await page.locator("#code-rows label").filter({ hasText: "Note on line 2" }).waitFor();
+});
+
+test("a note's remark on the code follows an edit and a delete of the note (JS18)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "First.");
+  // The page reads the notes again on focus (ui/app.js, `refresh`).
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  // Opening a file while the notes are read would make that read give way.
+  await page.locator("#notes .note").waitFor();
+  await page.locator("#filter").fill("a.rs");
+  await page.locator("#filter").press("Enter");
+  const remark = page.locator("#code-rows .remark");
+  await remark.filter({ hasText: "N1 · First." }).waitFor();
+
+  // An edit and a delete in the page decorate the rows drawn, which keep their remarks.
+  await page.locator("#notes .note").first().click();
+  const dialog = page.locator("#note-dialog");
+  await dialog.getByRole("button", { name: "Edit" }).click();
+  await dialog.locator("textarea").fill("Second.");
+  await dialog.getByRole("button", { name: /Save/ }).click();
+  await remark.filter({ hasText: "N1 · Second." }).waitFor();
+  assert.equal(await remark.count(), 1);
+
+  await dialog.getByRole("button", { name: "Delete note" }).click();
+  await dialog.getByRole("button", { name: "Click again to delete" }).click();
+  await remark.waitFor({ state: "detached" });
+});
+
+test("Up and Down in the file filter move the highlight, and Enter opens that file (JS17)", async (t) => {
+  const { page } = await openProject(t);
+  const filter = page.locator("#filter");
+  await filter.fill("rs");
+  const highlighted = () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll("#files .file.active")].map((row) => row.dataset.path),
+    );
+  await page.locator("#files .file").nth(2).waitFor();
+  assert.deepEqual(await highlighted(), ["src/a.rs"], "the best match first");
+
+  await filter.press("ArrowUp");
+  assert.deepEqual(await highlighted(), ["src/a.rs"], "the first stays highlighted");
+  for (let press = 0; press < 4; press += 1) await filter.press("ArrowDown");
+  assert.deepEqual(await highlighted(), ["src/c.rs"], "the last stays highlighted");
+  await filter.press("ArrowUp");
+  assert.deepEqual(await highlighted(), ["src/b.rs"]);
+
+  await filter.press("Enter");
+  await page.locator("#code-rows").filter({ hasText: "bee" }).waitFor();
+});
+
+test("a send whose request fails shows the error and leaves Send usable (JS7)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "Rename two.");
+  // The page reads the notes as it loads; this one was written after.
+  await page.reload();
+  await page.locator(".note-item").first().waitFor();
+
+  // The send's request fails before any answer, as a dropped connection would.
+  await page.route("**/api/run", (route) =>
+    route.request().method() === "POST" ? route.abort() : route.continue(),
+  );
+  const send = page.locator("#send-button");
+  await send.click();
+  await send.click();
+
+  // WebKit's message for a request that got no answer.
+  await page.locator("#toast").filter({ hasText: "Load failed" }).waitFor();
+  await page.waitForFunction(() => !document.getElementById("send-button").disabled);
+  const { runs } = await api("api/runs");
+  assert.deepEqual(runs, [], "no run started");
+});
+
+test("a send that fails after its step was closed leaves the next send alone (JS7)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "Rename two.");
+  await page.reload();
+  await page.locator(".note-item").first().waitFor();
+
+  // Every send's request is held here until the test fails it.
+  const held = [];
+  let arrived = () => {};
+  await page.route("**/api/run", (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    held.push(route);
+    arrived();
+  });
+  const sent = (count) =>
+    new Promise((resolve) => {
+      arrived = () => held.length >= count && resolve();
+      arrived();
+    });
+  const send = page.locator("#send-button");
+  const disabled = () => page.evaluate(() => document.getElementById("send-button").disabled);
+
+  await send.click();
+  await send.click();
+  await sent(1);
+  // The step closes while its request runs; a new step sends again.
+  await page.keyboard.press("Escape");
+  await send.click();
+  await send.click();
+  await sent(2);
+  assert.equal(await disabled(), true, "the second send is under way");
+
+  await held[0].abort();
+  await page.locator("#toast").filter({ hasText: "Load failed" }).waitFor();
+  assert.equal(await disabled(), true, "the first send's failure leaves the second alone");
+
+  await held[1].abort();
+  await page.waitForFunction(() => !document.getElementById("send-button").disabled);
 });

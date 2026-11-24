@@ -40,7 +40,12 @@ pub enum Error {
         bytes: u64,
     },
     /// The syntax highlighter failed on a file.
-    Highlight(tree_sitter_highlight::Error),
+    Highlight {
+        /// The file's path in the repository, as the page asked for it.
+        path: String,
+        /// What the highlighter reported.
+        source: tree_sitter_highlight::Error,
+    },
     /// The operating system refused to create the window.
     Window(tao::error::OsError),
     /// The system webview could not be created.
@@ -257,7 +262,7 @@ impl fmt::Display for Error {
                 bytes.div_ceil(1_000_000),
                 crate::repo::MAX_READ / 1_000_000
             ),
-            Self::Highlight(_) => write!(f, "cannot highlight the file"),
+            Self::Highlight { path, .. } => write!(f, "cannot highlight {path}"),
             Self::Window(_) => write!(f, "cannot create the window"),
             Self::Webview(_) => write!(f, "cannot create the webview"),
             Self::SpawnWorker(_) => write!(f, "cannot start the thread that answers the page"),
@@ -407,8 +412,9 @@ impl fmt::Display for Error {
     }
 }
 
-/// The error and its sources on one line, for the page to show.
-pub(crate) fn error_chain(error: &Error) -> String {
+/// The error and its sources on one line, each after a colon, as the page and the `postil`
+/// command show it.
+pub fn error_chain(error: &Error) -> String {
     let mut text = error.to_string();
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
@@ -436,7 +442,7 @@ impl std::error::Error for Error {
             | Self::WriteLayout { source, .. }
             | Self::ReadRun { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
-            Self::Highlight(source) => Some(source),
+            Self::Highlight { source, .. } => Some(source),
             Self::Window(source) => Some(source),
             Self::Webview(source) => Some(source),
             Self::Git { .. }

@@ -6,8 +6,9 @@
 //! The app serves the page on the `postil://` scheme and tells it a run changed by calling
 //! `window.postil.runChanged()` (`shell.rs`). A browser driven by Playwright can do neither,
 //! so this bridge stands in for the window:
-//! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, and answers
-//!   `{"base": "/sN/"}`, `N` counting from 0, so that every test starts from nothing.
+//! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, `src/b.rs` and
+//!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
+//!   starts from nothing.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -142,6 +143,9 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
 fn bridged(number: usize) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
     repo.write("src/a.rs", "one\ntwo\nthree\n");
+    // For the file filter to list several matches.
+    repo.write("src/b.rs", "bee\n");
+    repo.write("src/c.rs", "sea\n");
     let listeners = Listeners::default();
     let notify: Notify = {
         let listeners = Arc::clone(&listeners);

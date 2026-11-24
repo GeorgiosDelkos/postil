@@ -1,0 +1,46 @@
+# From rust-style/templates/.pre-commit-config.yaml, with rustdoc and the page's lints added.
+# Run `prek install` once per clone. Runs check.yml's blocking lints locally on every commit,
+# so a push does not fail on them, with the same commands, settings and versions as check.yml:
+# the Rust lint set comes from Cargo.toml's [lints] table and clippy.toml, the page's from
+# .oxlintrc.json and .oxfmtrc.json. The page's two need network the first time, for npx to
+# fetch them. prek sets unstaged changes aside while the hooks run, so they check what is
+# being committed.
+repos:
+  - repo: local
+    hooks:
+      # rust-toolchain.toml in each `files`: raising the pin can change what rustfmt, clippy
+      # and rustdoc report with no Rust file changed.
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all --check
+        language: system
+        files: '(\.rs|rust-toolchain\.toml)$'
+        pass_filenames: false
+      # CARGO_BUILD_WARNINGS rather than `-D warnings`, as in check.yml: the build stays
+      # shared with `cargo test` instead of compiling the crate again with other flags.
+      - id: cargo-clippy
+        name: cargo clippy, warnings denied
+        entry: env CARGO_BUILD_WARNINGS=deny cargo clippy --locked --all-targets --all-features
+        language: system
+        # Manifest and lint-config changes can introduce warnings without touching a .rs file.
+        files: '(\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml)$'
+        pass_filenames: false
+      # Clippy does not run rustdoc, so a broken intra-doc link would pass it.
+      - id: cargo-doc
+        name: cargo doc, warnings denied
+        entry: env 'RUSTDOCFLAGS=-D warnings' cargo doc --no-deps --locked --all-features
+        language: system
+        files: '(\.rs|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)$'
+        pass_filenames: false
+      - id: oxlint
+        name: oxlint --deny-warnings
+        entry: npx --yes oxlint@1.93.0 --deny-warnings ui/ tests/e2e/
+        language: system
+        files: '^(ui/.*\.js|tests/e2e/.*\.js|\.oxlintrc\.json)$'
+        pass_filenames: false
+      - id: oxfmt
+        name: oxfmt --check
+        entry: npx --yes oxfmt@0.78.0 --check 'ui/**/*.js' 'tests/e2e/*.js'
+        language: system
+        files: '^(ui/.*\.js|tests/e2e/.*\.js|\.oxfmtrc\.json)$'
+        pass_filenames: false

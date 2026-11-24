@@ -218,26 +218,7 @@ fn bad_note_requests_are_refused_and_nothing_is_written() {
     assert!(reply.contains("select the lines again"), "{reply}");
     assert!(!site.repo().unwrap().review_file().exists());
 
-    let request = Request::builder()
-        .method(Method::PUT)
-        .uri(NOTES)
-        .body(Vec::new())
-        .unwrap();
-    assert_eq!(
-        site.respond(&request).status(),
-        StatusCode::METHOD_NOT_ALLOWED
-    );
-}
-
-fn patch(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(Method::PATCH)
-        .uri(uri)
-        .body(body.as_bytes().to_vec())
-        .unwrap();
-    let reply = site.respond(&request);
-    let body = String::from_utf8(reply.body().to_vec()).unwrap();
-    (reply.status(), body)
+    assert_eq!(put(&site, NOTES, "").0, StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[test]
@@ -526,6 +507,41 @@ fn a_review_with_the_highest_id_refuses_another_note_and_is_left_alone() {
     );
     assert!(reply.contains("move it aside"), "{reply}");
     assert_eq!(fs::read_to_string(&file).unwrap(), full);
+}
+
+#[test]
+fn notes_on_several_files_are_each_placed_in_their_own_file() {
+    let repo = TempRepo::new("notes-files");
+    // Each file's lines are in the other: a note placed in the wrong file is found there, at
+    // another line.
+    repo.write("src/a.rs", "x\ny\n");
+    repo.write("src/b.rs", "y\nx\n");
+    let site = repo.site();
+    post_note(&site, "src/a.rs", 1, 1, "On x.");
+    post_note(&site, "src/b.rs", 1, 1, "On y.");
+    post_note(&site, "src/a.rs", 2, 2, "On y.");
+
+    repo.write("src/a.rs", "new\nx\ny\n");
+    assert_eq!(
+        anchors(&get_json(&site, NOTES)),
+        [
+            anchor("N1", 2, 2, "found"),
+            anchor("N2", 1, 1, "found"),
+            anchor("N3", 3, 3, "found"),
+        ]
+    );
+
+    // Adding a note reads its own file first: the other file's notes are placed in theirs.
+    repo.write("src/a.rs", "new\nnew\nx\ny\n");
+    assert_eq!(
+        anchors(&post_note(&site, "src/b.rs", 2, 2, "On x.")),
+        [
+            anchor("N1", 3, 3, "found"),
+            anchor("N2", 1, 1, "found"),
+            anchor("N3", 4, 4, "found"),
+            anchor("N4", 2, 2, "found"),
+        ]
+    );
 }
 
 #[test]

@@ -195,17 +195,17 @@ enum NoteState {
 ```
 
 - **Notes** live in a `Vec<Note>`. A review holds tens of notes, so every operation is a scan.
-  The line numbers are a cache: after a file changes, `relocate` finds the snippet nearest the
-  old line and updates `lines`, or marks the note's anchor `Lost`.
+  The line numbers are a cache: whenever the notes are read, `locate` keeps a note where its
+  snippet still is, moves it to the only other copy, or marks its anchor `Lost`. It never picks
+  the nearest of several copies (see "Notes and their status").
 - **Anchor and state are two fields** because they answer two questions, decided 2026-11-22.
   A sent note whose text the agent replaced is the expected result of a run; an open note whose
   text vanished means the code drifted under it. The verify view shows these differently, and
   one enum would need a variant for every combination.
-- **An open file** is one `String`, a `Vec<u32>` of line start offsets, and a sorted
-  `Vec<(Range<u32>, Style)>` of highlight spans. Read-only text needs no rope. Drawing lines
-  `a..b` is two slices and a binary search.
-- **Shaped lines** are cached per visible line and dropped when the file or the width changes.
-  Only visible lines are ever shaped, so a 50,000-line file costs the same per frame as a
+- **An open file** reaches the page as lines of tokens, each a style class and a slice of the
+  text (`highlight.rs`). Read-only text needs no rope.
+- **Visible lines only**: the code pane is a virtual list (`ui/code-view.js`) that builds rows
+  only for the lines near the viewport, so a 50,000-line file adds no rows beyond those of a
   50-line one.
 - **A run** is an append-only `Vec<Entry>` (message part, thought, tool call, tool call
   change, plan, permission request and answer, end), the same lines as its log on disk. A
@@ -326,7 +326,7 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 |---|---|
 | `GET /api/run/preview?notes=N1,N2` | The prompt's text, exactly as the agent receives it. |
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
-| `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
+| `GET /api/run?after=N` | The latest run, with its entries from number `N` on, and its notes and prompt only when `N` is 0: they never change; `null` when there is none. |
 | `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
 | `GET /api/runs` | The ids of the runs on disk, newest first. |
 | `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
@@ -466,7 +466,7 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
   its turn ends, and logs each as a `snapshot` entry with its point (`before`, `after`) and the
   tree's id (`Repo::snapshot`, run log version 4). A proposing reviewer, which may not edit,
   takes none. A snapshot is every tracked file and every untracked file that is not ignored,
-  written as a tree through Postil's own index, `<git dir>/postil-snapshot.index`, kept between
+  written as a tree through Postil's own index, `<git dir>/postil/snapshot/index`, kept between
   snapshots. It starts from a copy of the real index, and again whenever the two track
   different ignored files (one force-added, or one taken out of git and added to
   `.gitignore`), which `git add --all` cannot reconcile. The engineer's index, branch and
@@ -699,8 +699,9 @@ retired; the measured numbers above are the baseline to not regress.
    the window regains focus; lost notes stay in the tray, dashed and marked outdated, and are
    not drawn on code.
    Notes are deleted from the tray (× then Delete) or from the code's right-click menu, through
-   `DELETE /api/notes?id=N1`; ids are not reused. A + on a hovered line number adds a note on
-   that line, as in GitHub's and GitLab's diff views. A note's text is edited in its dialog
+   `DELETE /api/notes?id=N1`; the next note takes the highest id left plus one, so ids above
+   the highest remaining note are used again (`notes::delete`). A + on a hovered line number
+   adds a note on that line, as in GitHub's and GitLab's diff views. A note's text is edited in its dialog
    (Edit, then Save or Cmd-Enter; `PATCH /api/notes?id=N1 {body}`); its lines, snippet and
    state stay, and a run it was sent in keeps the text it got.
 3. **Send.** The ACP connection, the prompt preview, the run panel, permissions, cancel.

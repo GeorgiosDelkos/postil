@@ -167,6 +167,72 @@ test("a permission request takes its tool's title and is open until answered", (
   assert.equal(openPermission(answeredFirst), null);
 });
 
+// A random run's entries, from a small set of ids so calls, messages and requests repeat.
+// Seeded (mulberry32), so a failure reproduces.
+function randomEntries(seed) {
+  let state = seed;
+  const random = () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = (choices) => choices[Math.floor(random() * choices.length)];
+  const maybe = (value) => pick([value, null, undefined]);
+  const make = [
+    () => ({ kind: "message", text: pick(["a", "b "]), message: pick(["m1", "m2", undefined]) }),
+    () => ({ kind: "thought", text: pick(["t", "u"]) }),
+    () => tool(pick(["t1", "t2"]), { title: pick(["one", "two"]), status: "pending" }),
+    () => ({
+      kind: "toolUpdate",
+      id: pick(["t1", "t2", "t3"]),
+      title: maybe("renamed"),
+      tool: maybe("edit"),
+      status: maybe(pick(["in_progress", "completed"])),
+      places: maybe([{ path: "a", line: 1 }]),
+      output: maybe([{ type: "text", text: "out" }]),
+    }),
+    () => ({ kind: "plan", steps: [{ content: pick(["x", "y"]), status: "pending" }] }),
+    () => ({
+      kind: "permission",
+      request: pick([0, 1, 2]),
+      toolCall: pick(["t1", "t2"]),
+      title: maybe("asks"),
+      options,
+    }),
+    () => ({ kind: "question", request: pick([0, 1, 2]), message: "Which?", fields: {} }),
+    () => ({ kind: "answer", request: pick([0, 1, 2]), option: pick(["once", null]) }),
+    () => ({ kind: "reply", request: pick([0, 1, 2]), content: pick([{ a: 1 }, null]) }),
+    () => ({ kind: "unreadable", problem: "bad" }),
+    () => ({ kind: "failed", error: "gone" }),
+    () => ({ kind: pick(["started", "cancelRequested", "ended"]) }),
+  ];
+  const length = Math.floor(random() * 40);
+  const entries = Array.from({ length }, () => pick(make)());
+  // Where the page's fetches split the run, as `run-store.js` concatenates them.
+  const cuts = entries.map((_, i) => i).filter(() => random() < 0.3);
+  return { entries, cuts };
+}
+
+test("folding a run as it grows gives what folding it at once gives, and keeps earlier folds", () => {
+  for (let seed = 1; seed <= 500; seed += 1) {
+    const { entries, cuts } = randomEntries(seed);
+    // Each fetch's list, and what its fold showed when it was made.
+    const grown = [];
+    let list = [];
+    for (const end of [...cuts, entries.length]) {
+      list = list.concat(entries.slice(list.length, end));
+      grown.push({ list, shown: structuredClone(foldRun(list)) });
+    }
+    for (const { list, shown } of grown) {
+      // Copies of the entries: the same objects would extend the fold made last.
+      const once = foldRun(structuredClone(list));
+      assert.deepEqual(shown, once, `seed ${seed}: the fold of ${list.length} entries`);
+      assert.deepEqual(foldRun(list), shown, `seed ${seed}: changed by a later fold`);
+    }
+  }
+});
+
 test("keys answer with the options the agent offered, and only those", () => {
   const keys = permissionKeys(options);
   assert.deepEqual(

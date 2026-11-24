@@ -10,13 +10,12 @@
 //! Windows on one working tree do not share open folders live: each `PUT` replaces the whole
 //! list, and the last window to save decides what the next one opens with.
 
-use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{Stored, load_versioned, save_json};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -37,26 +36,12 @@ struct FoldersFile {
     open: Vec<String>,
 }
 
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
-}
-
-/// Whether `json` was written by a newer build.
-fn newer(json: &str) -> bool {
-    serde_json::from_str::<VersionOnly>(json).is_ok_and(|stored| stored.version > VERSION)
-}
-
 /// The open folders in `file`, or none when there is no file this build can use (module docs).
 pub(crate) fn load(file: &Path) -> Folders {
-    let Ok(json) = fs::read_to_string(file) else {
-        return Folders::default();
-    };
-    serde_json::from_str::<FoldersFile>(&json)
-        .ok()
-        .filter(|stored| stored.version == VERSION)
-        .map_or_else(Folders::default, |stored| Folders { open: stored.open })
+    match load_versioned::<FoldersFile>(file, VERSION) {
+        Stored::Current(stored) => Folders { open: stored.open },
+        Stored::Newer | Stored::Nothing => Folders::default(),
+    }
 }
 
 /// Saves `folders` to `file`, unless a newer build wrote the file (module docs).
@@ -65,17 +50,14 @@ pub(crate) fn load(file: &Path) -> Folders {
 ///
 /// [`Error::WriteFolders`] when the file cannot be written.
 pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
-    if fs::read_to_string(file).is_ok_and(|json| newer(&json)) {
+    if matches!(load_versioned::<FoldersFile>(file, VERSION), Stored::Newer) {
         return Ok(());
     }
     let stored = FoldersFile {
         version: VERSION,
         open: folders.open,
     };
-    let mut json =
-        serde_json::to_vec_pretty(&stored).expect("a version and a list of strings serialize");
-    json.push(b'\n');
-    write_atomically(file, &json).map_err(|source| Error::WriteFolders {
+    save_json(file, &stored).map_err(|source| Error::WriteFolders {
         path: file.to_owned(),
         source,
     })
@@ -85,16 +67,14 @@ pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn temp_file(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("postil-folders-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        dir.join("postil").join("folders.json")
-    }
+    use std::fs;
+
+    use crate::testing::TempDir;
 
     #[test]
     fn saved_folders_are_read_back_and_a_bad_file_reads_as_none_and_is_replaced() {
-        let file = temp_file("round");
+        let dir = TempDir::new("folders-round");
+        let file = dir.path().join("postil").join("folders.json");
         assert_eq!(load(&file), Folders::default(), "no file");
         let folders = || Folders {
             open: vec!["src".to_owned(), "src/acp".to_owned()],
@@ -117,30 +97,42 @@ mod tests {
             save(&file, folders()).unwrap();
             assert_eq!(load(&file), folders(), "{broken} is replaced");
         }
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
 
     #[test]
     fn folders_that_cannot_be_written_are_a_write_folders_error() {
-        let file = temp_file("unwritable");
+        let dir = TempDir::new("folders-unwritable");
+        let file = dir.path().join("postil").join("folders.json");
         // The path is a directory, so the write over it fails.
         fs::create_dir_all(&file).unwrap();
         match save(&file, Folders::default()) {
             Err(Error::WriteFolders { path, .. }) => assert_eq!(path, file),
             other => panic!("expected WriteFolders, got {other:?}"),
         }
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
 
     #[test]
     fn a_file_from_a_newer_postil_reads_as_none_and_is_never_replaced() {
-        let file = temp_file("newer");
+        let dir = TempDir::new("folders-newer");
+        let file = dir.path().join("postil").join("folders.json");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let newer = r#"{"version": 2, "open": ["src"], "closed": ["docs"]}"#;
         fs::write(&file, newer).unwrap();
         assert_eq!(load(&file), Folders::default());
         save(&file, Folders::default()).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), newer);
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
+    }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let dir = TempDir::new("folders-bytes");
+        let file = dir.path().join("postil").join("folders.json");
+        let folders = Folders {
+            open: vec!["src".to_owned(), "src/acp".to_owned()],
+        };
+        save(&file, folders).unwrap();
+        let expected =
+            "{\n  \"version\": 1,\n  \"open\": [\n    \"src\",\n    \"src/acp\"\n  ]\n}\n";
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
     }
 }

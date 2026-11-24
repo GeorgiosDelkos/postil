@@ -1,6 +1,6 @@
 //! A running agent: its process, the threads around its pipes, and the requests in flight.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -59,7 +59,8 @@ pub(crate) struct Launch<'a> {
 
 /// What the agent reports, in the order it reported it. Delivered on the agent's reader
 /// thread.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum Event {
     /// The session changed: a message, a thought, a tool call, the plan.
     Update(SessionUpdate),
@@ -83,7 +84,8 @@ pub(crate) enum Event {
 }
 
 /// A permission request: the tool call the agent wants to make and the answers it offers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct PermissionRequest {
     /// The request's number: 0 for the agent's first, counting on across turns. The agent's
     /// own request id stays inside [`Agent`], which keeps the only table of open requests.
@@ -94,7 +96,8 @@ pub(crate) struct PermissionRequest {
 
 /// A question: the agent's message and its form. The number counts with the permission
 /// requests (`acp`, "Permission requests").
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct QuestionRequest {
     pub(crate) number: usize,
     pub(crate) message: String,
@@ -105,7 +108,8 @@ pub(crate) struct QuestionRequest {
 }
 
 /// How a turn ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum TurnEnd {
     Stopped(StopReason),
     /// The agent answered the prompt with an error, or with a reply the app cannot read.
@@ -122,9 +126,11 @@ pub(crate) struct Starting {
     timeout: Duration,
 }
 
-/// Kills a starting agent's process group from another thread; its [`Starting::open_session`]
-/// then fails with [`Error::AgentExited`]. Stopping an agent that is gone does nothing.
-#[derive(Debug, Clone)]
+/// Kills an agent's process group from another thread, while its process is not reaped yet.
+/// A starting agent's [`Starting::open_session`] then fails with [`Error::AgentExited`]; the
+/// writer uses one to end an agent it can no longer write to. Stopping an agent whose process
+/// was reaped does nothing.
+#[derive(Debug)]
 pub(crate) struct Stopper {
     group: Arc<Mutex<Option<u32>>>,
 }
@@ -231,8 +237,8 @@ impl Starting {
 }
 
 impl Agent {
-    /// Whether the agent is still there: false once the reader has seen its output end. A
-    /// kept agent that is not alive is started again.
+    /// Whether the agent is still there: false once the reader has seen its output end, or
+    /// the writer could not write to it. A kept agent that is not alive is started again.
     pub(crate) fn is_alive(&self) -> bool {
         !self.process.state().gone
     }
@@ -247,17 +253,20 @@ impl Agent {
     pub(crate) fn prompt(&self, prompt: &[ContentBlock]) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            if state
-                .waiters
-                .values()
-                .any(|waiter| matches!(waiter, Waiter::Turn))
-            {
+            // The id first: `new_id` refuses a gone agent, whose turn may still be set until
+            // the reader ends it. A refusal for a running turn then skips an id, which is
+            // harmless: ids need only be unique.
+            let Some(id) = state.new_id() else {
+                drop(state);
+                return Err(self.process.exited());
+            };
+            if state.turn.is_some() {
                 return Err(Error::TurnRunning);
             }
             state.cancelling = false;
-            state.register(Waiter::Turn)
+            state.turn = Some(id);
+            id
         };
-        let id = id.ok_or_else(|| self.process.exited())?;
         let params = PromptParams {
             session_id: &self.session,
             prompt,
@@ -276,30 +285,22 @@ impl Agent {
     ///
     /// [`Error::AgentExited`] when the process is gone.
     pub(crate) fn cancel(&self) -> Result<Vec<usize>> {
-        let open: Vec<(usize, Open)> = {
+        let open = {
             let mut state = self.process.state();
             // Only while a turn runs: a cancel that comes just after the turn ended must not
             // make the next turn answer its requests `cancelled`.
-            state.cancelling = state
-                .waiters
-                .values()
-                .any(|waiter| matches!(waiter, Waiter::Turn));
-            state
-                .requests
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(number, request)| request.take().map(|open| (number, open)))
-                .collect()
+            state.cancelling = state.turn.is_some();
+            std::mem::take(&mut state.requests)
         };
         let params = CancelParams {
             session_id: &self.session,
         };
         self.process
             .send(&notification("session/cancel", &params))?;
-        for (_, open) in &open {
+        for open in open.values() {
             self.process.send(&cancelled(open))?;
         }
-        Ok(open.into_iter().map(|(number, _)| number).collect())
+        Ok(open.into_keys().collect())
     }
 
     /// Answers the permission request numbered `number` with the option `option_id`, one the
@@ -313,11 +314,10 @@ impl Agent {
     pub(crate) fn answer_permission(&self, number: usize, option_id: &str) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
             let Some(Open {
                 kind: Kind::Permission { offered },
                 ..
-            }) = request.as_ref()
+            }) = state.requests.get(&number)
             else {
                 return Err(Error::NoSuchRequest);
             };
@@ -326,7 +326,11 @@ impl Agent {
                     "the agent did not offer the answer {option_id:?}"
                 )));
             }
-            request.take().expect("checked to be open above").id
+            state
+                .requests
+                .remove(&number)
+                .expect("checked to be open above")
+                .id
         };
         let result = PermissionResult {
             outcome: PermissionOutcome::Selected { option_id },
@@ -343,9 +347,8 @@ impl Agent {
     pub(crate) fn answer_question(&self, number: usize, reply: &ElicitationReply) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            let request = state.requests.get_mut(number).ok_or(Error::NoSuchRequest)?;
             if !matches!(
-                request,
+                state.requests.get(&number),
                 Some(Open {
                     kind: Kind::Question,
                     ..
@@ -353,7 +356,11 @@ impl Agent {
             ) {
                 return Err(Error::NoSuchRequest);
             }
-            request.take().expect("checked to be open above").id
+            state
+                .requests
+                .remove(&number)
+                .expect("checked to be open above")
+                .id
         };
         self.process.send(&response(&id, Outcome::Result(reply)))
     }
@@ -401,11 +408,21 @@ struct Process {
 }
 
 /// What the caller's thread and the reader thread share.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Shared {
     state: Mutex<State>,
     /// The end of standard error, written by the stderr thread.
     stderr: Mutex<Vec<u8>>,
+}
+
+// Sizes only: the agent's stderr can hold a sign-in URL, and the requests' contents are the
+// agent's, so neither is printed.
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("stderr_bytes", &lock(&self.stderr).len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The requests in flight in both directions. One lock: every change is a few map
@@ -414,45 +431,65 @@ struct Shared {
 struct State {
     /// The id of the app's next request.
     next_id: u64,
-    /// Who waits for the reply to each request the app sent.
-    waiters: HashMap<u64, Waiter>,
-    /// The agent's permission requests and questions by number, while open; `None` once
-    /// answered, withdrawn, or closed with the turn.
-    requests: Vec<Option<Open>>,
+    /// The callers blocked in [`Process::call`], by the id of the request each waits on.
+    waiters: HashMap<u64, Caller>,
+    /// The id of the prompt whose turn runs; its reply ends the turn and becomes
+    /// [`Event::TurnEnded`]. One turn at a time: [`Agent::prompt`] refuses while it is set.
+    turn: Option<u64>,
+    /// The number the agent's next permission request or question gets.
+    next_request: usize,
+    /// The agent's permission requests and questions by number, while open: removed once
+    /// answered, withdrawn, or closed with the turn. Ordered, so a cancel answers and reports
+    /// them oldest first.
+    requests: BTreeMap<usize, Open>,
     /// Set by [`Agent::cancel`] until the turn ends: requests that arrive meanwhile are
     /// answered `cancelled` at once.
     cancelling: bool,
     /// Set when the [`Agent`] is dropped: the reader then delivers no more events.
     closed: bool,
-    /// Set when the agent's output ended: every call fails from then on. Checked here, not
-    /// left to the writer, which notices a closed pipe only on its next write.
+    /// Set when the agent's output ended, or a write to it failed: every call fails from then
+    /// on. Checked here, not left to the writer, which notices a closed pipe only on its next
+    /// write.
     gone: bool,
 }
 
-/// Who waits for a reply.
-#[derive(Debug)]
-enum Waiter {
+/// Where a blocked caller receives its reply.
+type Caller = SyncSender<std::result::Result<Value, RpcError>>;
+
+/// Whom a reply from the agent is for.
+enum Addressee {
     /// A caller blocked in [`Process::call`].
-    Call(SyncSender<std::result::Result<Value, RpcError>>),
-    /// The prompt's reply, which ends the turn and becomes [`Event::TurnEnded`].
-    Turn,
+    Caller(Caller),
+    /// The turn, which the reply ends, with the requests that were still open.
+    Turn(BTreeMap<usize, Open>),
 }
 
 impl State {
-    /// A new request id with `waiter` waiting for its reply; `None` once the agent is gone.
-    fn register(&mut self, waiter: Waiter) -> Option<u64> {
+    /// A new id for a request of the app's; `None` once the agent is gone.
+    fn new_id(&mut self) -> Option<u64> {
         if self.gone {
             return None;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.waiters.insert(id, waiter);
+        Some(id)
+    }
+
+    /// A new request id with `caller` waiting for its reply; `None` once the agent is gone.
+    fn register(&mut self, caller: Caller) -> Option<u64> {
+        let id = self.new_id()?;
+        self.waiters.insert(id, caller);
         Some(id)
     }
 }
 
-/// Locks one of [`Shared`]'s mutexes. Poisoning is ignored: every change under these locks is
-/// a single insert, remove, or assignment, so a panic cannot leave one half done.
+/// Locks one of [`Shared`]'s mutexes, or the process group's. Poisoning is ignored because
+/// nothing panics while one is held: the code under [`Shared`]'s locks makes map operations
+/// and assignments, calls nothing outside this file, and each `expect` there follows the check
+/// that makes it hold; under the group's, [`Stopper::stop`] calls `agents::kill_group`, which
+/// ignores every failure and has no panic path. A change can set several fields (the reader's
+/// end clears the waiters, the turn and the requests), so the argument is that no panic
+/// happens midway, not that a change is one step.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -492,8 +529,15 @@ impl Process {
         let stderr = child.stderr.take().expect("stderr was piped");
         let (outbox, lines) = mpsc::channel();
         let (stderr_done, stderr_closed) = mpsc::channel();
+        let group = Arc::new(Mutex::new(Some(child.id())));
 
-        let started = spawn_thread("acp-writer", move || write_lines(stdin, &lines))
+        let writer = Writer {
+            shared: Arc::clone(&shared),
+            stopper: Stopper {
+                group: Arc::clone(&group),
+            },
+        };
+        let started = spawn_thread("acp-writer", move || writer.run(stdin, &lines))
             .and_then(|()| {
                 let shared = Arc::clone(&shared);
                 spawn_thread("acp-stderr", move || {
@@ -511,8 +555,8 @@ impl Process {
                 spawn_thread("acp-reader", move || reader.run(stdout, &stderr_closed))
             });
         let process = Self {
-            group: Arc::new(Mutex::new(Some(child.id()))),
             child,
+            group,
             outbox,
             shared,
         };
@@ -537,10 +581,7 @@ impl Process {
         timeout: Duration,
     ) -> Result<R> {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let id = self
-            .state()
-            .register(Waiter::Call(sender))
-            .ok_or_else(|| self.exited())?;
+        let id = self.state().register(sender).ok_or_else(|| self.exited())?;
         self.send(&request(id, method, params))?;
         match receiver.recv_timeout(timeout) {
             Ok(Ok(result)) => serde_json::from_value(result).map_err(|error| {
@@ -655,10 +696,10 @@ impl<F: FnMut(Event)> Reader<F> {
             // Dropped after the wait, so a blocked caller's "exited" error carries the agent's
             // last words. Dropping the waiters wakes every blocked caller with "exited".
             state.waiters.clear();
-            state
-                .requests
-                .iter_mut()
-                .for_each(|request| *request = None);
+            // No reply ends the turn now, and a prompt must fail as "exited", not as a turn
+            // still running.
+            state.turn = None;
+            state.requests.clear();
             state.closed
         };
         if !closed {
@@ -688,9 +729,16 @@ impl<F: FnMut(Event)> Reader<F> {
 
     /// A reply to one of the app's requests.
     fn reply(&mut self, id: &Value, result: Option<Value>, error: Option<RpcError>) {
-        let waiter = id
-            .as_u64()
-            .and_then(|id| lock(&self.shared.state).waiters.remove(&id));
+        let addressee = id.as_u64().and_then(|id| {
+            let mut state = lock(&self.shared.state);
+            if state.turn == Some(id) {
+                state.turn = None;
+                state.cancelling = false;
+                Some(Addressee::Turn(std::mem::take(&mut state.requests)))
+            } else {
+                state.waiters.remove(&id).map(Addressee::Caller)
+            }
+        });
         let outcome = match (result, error) {
             (_, Some(error)) => Err(error),
             (Some(result), None) => Ok(result),
@@ -698,18 +746,13 @@ impl<F: FnMut(Event)> Reader<F> {
             // fail its own parse below, so this needs no case of its own.
             (None, None) => Ok(Value::Null),
         };
-        match waiter {
+        match addressee {
             // The caller timed out and left: nobody wants the reply.
-            Some(Waiter::Call(sender)) => drop(sender.send(outcome)),
-            Some(Waiter::Turn) => {
-                let open: Vec<Open> = {
-                    let mut state = lock(&self.shared.state);
-                    state.cancelling = false;
-                    state.requests.iter_mut().filter_map(Option::take).collect()
-                };
+            Some(Addressee::Caller(sender)) => drop(sender.send(outcome)),
+            Some(Addressee::Turn(open)) => {
                 // A request still open when its turn ended is answered as a cancel, which
                 // ACP asks of a request its sender gave up on.
-                for open in &open {
+                for open in open.values() {
                     drop(self.outbox.send(cancelled(open)));
                 }
                 let end = match outcome {
@@ -826,8 +869,10 @@ impl<F: FnMut(Event)> Reader<F> {
             self.outbox.send(cancelled(&open)).ok();
             return None;
         }
-        state.requests.push(Some(open));
-        Some(state.requests.len() - 1)
+        let number = state.next_request;
+        state.next_request += 1;
+        state.requests.insert(number, open);
+        Some(number)
     }
 
     /// Answers a request the app cannot read or serve with an error, and says so in the run.
@@ -876,8 +921,8 @@ impl<F: FnMut(Event)> Reader<F> {
             let found = state
                 .requests
                 .iter()
-                .position(|open| open.as_ref().is_some_and(|open| open.id == request_id));
-            found.and_then(|number| state.requests[number].take().map(|open| (number, open)))
+                .find_map(|(number, open)| (open.id == request_id).then_some(*number));
+            found.and_then(|number| state.requests.remove_entry(&number))
         };
         if let Some((number, open)) = closed {
             drop(self.outbox.send(cancelled(&open)));
@@ -902,15 +947,35 @@ impl<F: FnMut(Event)> Reader<F> {
 
 /// The writer thread: sends each queued line, until the agent stops reading or the
 /// [`Process`] is dropped.
-fn write_lines(mut stdin: ChildStdin, lines: &Receiver<String>) {
-    for line in lines {
-        let written = stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush());
-        if written.is_err() {
-            break;
+#[derive(Debug)]
+struct Writer {
+    shared: Arc<Shared>,
+    /// Ends the agent when a write fails.
+    stopper: Stopper,
+}
+
+impl Writer {
+    fn run(self, mut stdin: ChildStdin, lines: &Receiver<String>) {
+        for line in lines {
+            let written = stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.write_all(b"\n"))
+                .and_then(|()| stdin.flush());
+            if written.is_err() {
+                return self.give_up();
+            }
         }
+    }
+
+    /// The agent stopped reading, and may run on: no prompt, answer or cancel can reach it
+    /// any more. It is marked gone at once, so it is not alive and a prompt, or any message
+    /// sent, fails as exited; then it is ended, so its output ends and the reader reports the
+    /// exit, which also ends a turn that waited on a reply the agent never saw. No test
+    /// covers the early mark alone: the reader marks the agent gone too once its output
+    /// ends, milliseconds later.
+    fn give_up(&self) {
+        lock(&self.shared.state).gone = true;
+        self.stopper.stop();
     }
 }
 
@@ -997,6 +1062,7 @@ mod tests {
         Location, PermissionKind, PlanEntry, PlanEntryStatus, ToolCall, ToolCallContent,
         ToolCallStatus, ToolKind,
     };
+    use crate::testing::{TempDir, make_fifo, read_fifo};
 
     /// Long enough for Node to start on a loaded machine; a test that waits this long has
     /// failed (it bounds a hang, it times nothing).
@@ -1299,9 +1365,13 @@ mod tests {
                 stderr: "panicked at the model".to_owned()
             }
         );
-        match agent.prompt(&[text("y")]) {
-            Err(Error::AgentExited { stderr }) => assert_eq!(stderr, "panicked at the model"),
-            other => panic!("expected AgentExited, got {other:?}"),
+        // Twice: a prompt to a gone agent must not leave a turn behind that makes the next
+        // one fail as "a turn is running".
+        for attempt in ["y", "z"] {
+            match agent.prompt(&[text(attempt)]) {
+                Err(Error::AgentExited { stderr }) => assert_eq!(stderr, "panicked at the model"),
+                other => panic!("{attempt}: expected AgentExited, got {other:?}"),
+            }
         }
     }
 
@@ -1407,7 +1477,9 @@ mod tests {
 
     #[test]
     fn a_starting_agent_can_be_stopped_from_another_thread() {
-        let pid_file = std::env::temp_dir().join(format!("postil-silent-{}", std::process::id()));
+        let dir = TempDir::new("acp-silent");
+        let pid_file = dir.path().join("silent.pid");
+        make_fifo(&pid_file);
         let search_path = std::env::var_os("PATH").expect("PATH is set");
         let command = format!("{} {}", command("silent"), pid_file.display());
         let launch = Launch {
@@ -1422,20 +1494,7 @@ mod tests {
         let opening = thread::spawn(move || starting.open_session());
 
         // The agent writes its pid once it runs; then it never answers.
-        let deadline = std::time::Instant::now() + WAIT;
-        let pid = loop {
-            if let Ok(pid) = std::fs::read_to_string(&pid_file)
-                && !pid.is_empty()
-            {
-                break pid;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the agent never started"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
-        drop(std::fs::remove_file(&pid_file));
+        let pid = read_fifo(&pid_file, WAIT);
         stopper.stop();
         assert!(matches!(
             opening.join().unwrap(),
@@ -1451,6 +1510,21 @@ mod tests {
         stopper.stop();
     }
 
+    /// JSON-RPC matches a reply to its request by id, so the ids of one connection must all
+    /// differ, whatever order the app's requests come in.
+    #[test]
+    fn every_request_of_a_connection_gets_an_id_of_its_own() {
+        let mut state = State::default();
+        let (caller, _replies) = mpsc::sync_channel(1);
+        let call = state.register(caller).unwrap();
+        let turn = state.new_id().unwrap();
+        let next = state.new_id().unwrap();
+        assert!(
+            call != turn && turn != next && call != next,
+            "{call} {turn} {next}"
+        );
+    }
+
     #[test]
     fn an_agent_that_exited_is_not_alive() {
         let (agent, events) = start("exit-after-turn").unwrap();
@@ -1462,6 +1536,21 @@ mod tests {
             }
         }
         assert!(!agent.is_alive());
+    }
+
+    #[test]
+    fn an_agent_that_closes_its_input_and_runs_on_is_ended_with_its_turn() {
+        let (agent, events) = start("close-stdin").unwrap();
+        // Queued at once; the writer's write then fails.
+        agent.prompt(&[text("x")]).unwrap();
+        // Nothing can reach the agent any more, so it is ended: its output ends, and so does
+        // the turn, which no reply would ever end.
+        assert!(matches!(next(&events), Event::Exited { .. }));
+        assert!(!agent.is_alive(), "the runner starts a fresh agent");
+        assert!(
+            matches!(agent.prompt(&[text("y")]), Err(Error::AgentExited { .. })),
+            "exited, not a turn still running"
+        );
     }
 
     /// A real agent answers a prompt over a real session. Ignored unless asked for, with

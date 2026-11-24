@@ -84,10 +84,6 @@ fn page_assets_are_served_with_their_types() {
     let cases = [
         ("/", "text/html"),
         ("/app.css", "text/css"),
-        ("/app.js", "text/javascript"),
-        ("/fuzzy.js", "text/javascript"),
-        ("/tree.js", "text/javascript"),
-        ("/icons.js", "text/javascript"),
         ("/icons.svg", "image/svg+xml"),
         ("/fonts/Geist-Variable.woff2", "font/woff2"),
         ("/fonts/GeistMono-Variable.woff2", "font/woff2"),
@@ -106,7 +102,8 @@ fn page_assets_are_served_with_their_types() {
 #[test]
 fn page_only_links_to_assets_that_are_served() {
     // The page is checked by eye, but a renamed asset would only show as a blank window.
-    // The served paths themselves are covered by `page_assets_are_served_with_their_types`.
+    // The served paths themselves are covered by `page_assets_are_served_with_their_types`
+    // and `every_page_module_is_served`.
     for link in ["app.css", "app.js"] {
         assert!(INDEX_HTML.contains(&format!("\"{link}\"")), "{link}");
     }
@@ -208,8 +205,12 @@ fn every_page_module_is_served() {
         if !script || test {
             continue;
         }
-        let (status, body) = get(&site, &format!("postil://localhost/{name}"));
-        assert_eq!(status, StatusCode::OK, "{name}");
-        assert_eq!(body, fs::read_to_string(ui.join(&name)).unwrap(), "{name}");
+        let uri = format!("postil://localhost/{name}");
+        let reply = site.respond(&Request::builder().uri(uri).body(Vec::new()).unwrap());
+        assert_eq!(reply.status(), StatusCode::OK, "{name}");
+        // WebKit refuses to run a module served under another type.
+        assert_eq!(reply.headers()[CONTENT_TYPE], "text/javascript", "{name}");
+        let source = fs::read_to_string(ui.join(&name)).unwrap();
+        assert_eq!(reply.body().as_ref(), source.as_bytes(), "{name}");
     }
 }

@@ -23,11 +23,13 @@
 //!
 //! Requests from the page run on one request thread (`shell.rs`), the agent's events on its
 //! reader thread, and an agent's start on a thread of its own. A review's next stage starts
-//! on the reader thread of the stage that ended ([`Runner::advance`]). Three locks, always
+//! on the reader thread of the stage that ended ([`Runner::advance`]). Locks are always
 //! taken in this order: the runner's [`Slot`], the repository's snapshot lock (inside
-//! [`Repo::snapshot`], which takes no other), then a run's state; no snapshot is taken under
-//! a run's state. The page is told about every change through `notify`, and fetches what it
-//! has not seen.
+//! [`Repo::snapshot`], which takes no other), a run's state, then the agent connection's
+//! own locks (inside [`Agent`]'s methods, which take none of the others). No snapshot is
+//! taken under a run's state. The slot is held around the agent's calls that answer, cancel
+//! and prompt (`auto_answer`, [`Runner::cancel`], `begin`). The page is told about every
+//! change through `notify`, and fetches what it has not seen.
 
 mod log;
 
@@ -43,7 +45,7 @@ use crate::acp::{
     Agent, ContentBlock, ElicitationReply, Event, Launch, PermissionKind, PermissionOption,
     PermissionRequest, StopReason, Stopper, ToolKind, TurnEnd,
 };
-use crate::agents::Scanner;
+use crate::agents::{AgentChoice, Scanner};
 use crate::error::{Error, Result, error_chain};
 use crate::notes::{self, Prompt};
 use crate::repo::Repo;
@@ -67,13 +69,6 @@ const FORCE_AFTER: Duration = Duration::from_secs(3);
 /// Tells the page that a run changed. In the app it wakes the event loop, which calls the
 /// page; tests count the calls.
 pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
-
-/// The agent a run goes to: its name in the settings and the command that starts it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentChoice {
-    pub(crate) name: String,
-    pub(crate) command: String,
-}
 
 /// The runs of the open project, and the agent kept between them.
 pub(crate) struct Runner {
@@ -705,9 +700,9 @@ impl Runner {
         Ok(())
     }
 
-    /// The latest run, with the entries from number `after` on: this window's run, or the
-    /// newest readable log on disk when this window has run nothing yet. `None` when there is
-    /// no run.
+    /// The latest run, with the entries from number `after` on, and its notes and prompt only
+    /// when `after` is 0: this window's run, or the newest readable log on disk when this
+    /// window has run nothing yet. `None` when there is no run.
     ///
     /// # Errors
     ///
@@ -987,6 +982,13 @@ impl Runner {
 
     /// Sends the prompt to a running agent. Its notes are marked sent once the agent shows it
     /// took the turn ([`Run::record_event`]).
+    ///
+    /// A kept agent can send an update for its previous turn after replying to it. One that
+    /// arrives after this prompt was sent counts as the sign, though the agent may not have
+    /// read the prompt yet: ACP's updates carry no turn, so the two cannot be told apart.
+    /// The risk is accepted. The reader reads each line as the agent writes it, and a send
+    /// takes a request from the page, so only an update the agent holds back after its reply
+    /// can land here.
     fn begin(&self, agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt) {
         if !ids.is_empty() {
             run.state().unmarked = Some(ids.to_vec());
@@ -1105,26 +1107,20 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         if slot.let_go(generation) {
             return;
         }
-        // The review stage this run is, while its review goes on.
-        let stage = slot
+        let review = slot
             .run
             .as_ref()
-            .and_then(|run| run.state().header.review.clone())
-            .filter(|stage| {
-                slot.chain
-                    .as_ref()
-                    .is_some_and(|chain| chain.stage == *stage)
-            });
+            .and_then(|run| run.state().header.review.clone());
         // Answered before the request is logged, and logged with it at once: a page that read
         // the request alone would show the run waiting for the engineer.
         // From the run's header, which never changes: a Stop that ends the chain does not lift
         // it for the rest of the proposer's turn.
-        let read_only = slot.run.as_ref().is_some_and(|run| {
-            run.state()
-                .header
-                .review
+        let read_only = review.as_ref().is_some_and(|stage| !stage.judges());
+        // The review stage this run is, while its review goes on.
+        let stage = review.filter(|stage| {
+            slot.chain
                 .as_ref()
-                .is_some_and(|stage| !stage.judges())
+                .is_some_and(|chain| chain.stage == *stage)
         });
         let answer = match (&event, &slot.agent) {
             (Event::Permission(request), Held::Ready(_, agent)) => {
@@ -1203,11 +1199,13 @@ fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> O
         request.tool_call.kind,
         Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think)
     );
-    let option = if read_only && !reads {
-        reject_option(&request.options)
+    // Once, else always. With neither offered the request waits for the engineer.
+    let kinds = if read_only && !reads {
+        [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
     } else {
-        allow_option(&request.options)
-    }?;
+        [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+    };
+    let option = first_option(&request.options, kinds)?;
     agent.answer_permission(request.number, &option).ok()?;
     Some(Entry::Answer {
         request: request.number,
@@ -1257,19 +1255,10 @@ fn end_stage(run: &Run, stage: &Stage, found: usize) -> Option<Vec<Finding>> {
     (!edited).then_some(findings)
 }
 
-/// The option that rejects a permission request: once, else always. `None` when the agent
-/// offers neither; the request then waits for the engineer.
-fn reject_option(options: &[PermissionOption]) -> Option<String> {
-    [PermissionKind::RejectOnce, PermissionKind::RejectAlways]
-        .into_iter()
-        .find_map(|kind| options.iter().find(|option| option.kind == kind))
-        .map(|option| option.option_id.clone())
-}
-
-/// The option that allows a permission request: once, else always. `None` when the agent
-/// offers neither; the request then waits for the engineer, as before auto-allow.
-fn allow_option(options: &[PermissionOption]) -> Option<String> {
-    [PermissionKind::AllowOnce, PermissionKind::AllowAlways]
+/// The id of the first of `options` of the first kind in `kinds` that has one; `None` when
+/// none of `options` is of any of them.
+fn first_option(options: &[PermissionOption], kinds: [PermissionKind; 2]) -> Option<String> {
+    kinds
         .into_iter()
         .find_map(|kind| options.iter().find(|option| option.kind == kind))
         .map(|option| option.option_id.clone())
@@ -1344,8 +1333,11 @@ fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// Locks a runner's or a run's state. Poisoning is ignored: each change under these locks
-/// is a push or an assignment that a panic cannot leave half done.
+/// Locks a runner's or a run's state. Poisoning is ignored, by choice. A change under these
+/// locks can set several fields (`RunState::apply` and `Run::write` update the summary and
+/// the entries; a send sets the slot's agent, run and chain), so a panic midway can leave
+/// them out of step. Treating the lock as poisoned instead would make every later request
+/// that touches the project panic too; a run shown out of step is the smaller harm.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

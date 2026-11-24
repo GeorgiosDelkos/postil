@@ -17,8 +17,10 @@ version="$(cargo pkgid | sed 's/.*[#@]//')"
 
 # The bundle is put together in a temporary directory and moved into place last, so a step
 # that fails leaves the previous bundle as it was, not one without its icon or Info.plist.
+# The directory is in $TMPDIR, and is left there, with the previous bundle moved into it, for
+# macOS to delete once unused for three days. A trap sending it to the Trash, as bash-style
+# asks of temporary files, put the previous bundle and an iconset in the Trash on every build.
 work="$(mktemp -d)"
-trap 'trash "$work"' EXIT
 staged="$work/Postil.app"
 mkdir -p "$staged/Contents/MacOS" "$staged/Contents/Resources"
 cp target/release/postil "$staged/Contents/MacOS/postil"
@@ -69,7 +71,7 @@ plutil -lint "$staged/Contents/Info.plist" >/dev/null
 
 app="target/release/Postil.app"
 if [[ -e "$app" ]]; then
-  trash "$app"
+  mv "$app" "$work/Postil.app.previous"
 fi
 mv "$staged" "$app"
 

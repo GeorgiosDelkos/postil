@@ -38,6 +38,7 @@ use crate::acp::{
     ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::error::{Error, Result};
+use crate::files::version_of;
 use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 
@@ -124,13 +125,6 @@ pub(super) enum Origin {
 pub(super) struct FollowUp {
     pub(super) of: String,
     pub(super) text: String,
-}
-
-/// The one field of a header that every log version has. Unknown fields are ignored here on
-/// purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
 }
 
 /// One thing that happened in a run: a line of its log.
@@ -302,8 +296,13 @@ pub(crate) enum Status {
 pub(crate) struct RunView {
     id: String,
     agent: String,
-    notes: Vec<String>,
-    prompt: String,
+    /// The notes sent and the prompt, left out of a view from a later entry than the first:
+    /// they never change, and the prompt quotes every note with its code, often most of a
+    /// reply the page asks for many times a second (ui/run-store.js keeps them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
     started_at: u64,
     status: Status,
     /// The entries from the number the page asked for on.
@@ -480,7 +479,10 @@ impl Run {
 
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     pub(super) fn record(&self, entry: Entry) {
-        self.record_all([entry]);
+        let mut state = self.state();
+        if state.live() {
+            self.write(&mut state, entry);
+        }
     }
 
     /// Records the snapshot at `point` unless the run has one there, checked under the same
@@ -489,17 +491,6 @@ impl Run {
         let mut state = self.state();
         if state.live() && state.snapshot(point).is_none() {
             self.write(&mut state, Entry::Snapshot { point, tree });
-        }
-    }
-
-    /// Records `entries` in order, under one hold of the state: a reader sees all or none.
-    fn record_all(&self, entries: impl IntoIterator<Item = Entry>) {
-        let mut state = self.state();
-        if !state.live() {
-            return;
-        }
-        for entry in entries {
-            self.write(&mut state, entry);
         }
     }
 
@@ -571,22 +562,33 @@ impl Run {
                     reason: StopReason::Refusal
                 }
         );
-        let live = self.state().live();
-        self.record_all(std::iter::once(entry).chain(answer));
-        if took_turn && live {
-            self.state().unmarked.take()
+        // One hold of the state for the event, its answer and the notes: a reader sees both
+        // entries or neither, and a run that ended meanwhile neither takes the event nor marks
+        // its notes sent.
+        let mut state = self.state();
+        if !state.live() {
+            return None;
+        }
+        for entry in std::iter::once(entry).chain(answer) {
+            self.write(&mut state, entry);
+        }
+        if took_turn {
+            state.unmarked.take()
         } else {
             None
         }
     }
 
+    /// The run as the page gets it, with the entries from number `after` on, and the notes
+    /// and the prompt only when `after` is 0.
     pub(super) fn view(&self, after: usize) -> RunView {
         let state = self.state();
+        let whole = after == 0;
         RunView {
             id: state.header.id.clone(),
             agent: state.header.agent.clone(),
-            notes: state.header.notes.clone(),
-            prompt: state.header.prompt.clone(),
+            notes: whole.then(|| state.header.notes.clone()),
+            prompt: whole.then(|| state.header.prompt.clone()),
             started_at: state.header.started_at,
             status: state.status(),
             entries: state.entries.get(after..).unwrap_or_default().to_vec(),
@@ -816,7 +818,7 @@ pub(super) fn run_number(id: &str) -> Option<u64> {
 /// A run log's first line, its header. The version is read on its own first: a newer header
 /// would otherwise fail on its first new field, with a message that hides the real reason.
 fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
-    let VersionOnly { version } = serde_json::from_slice(first)
+    let version = version_of(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
     if !(1..=LOG_VERSION).contains(&version) {
         return Err(format!(

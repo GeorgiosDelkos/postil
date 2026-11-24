@@ -2,17 +2,10 @@
 
 use super::*;
 
-/// The settings view once the agent scan has finished, waiting at most five seconds.
+/// The settings view once the agent scan has finished.
 fn scanned_settings(site: &Site) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let view = get_json(site, SETTINGS);
-        if !view["agents"].is_null() {
-            return view;
-        }
-        assert!(Instant::now() < deadline, "the agent scan did not finish");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    site.agents.wait();
+    get_json(site, SETTINGS)
 }
 
 /// Settings that pass every rule and differ from the defaults in every field.
@@ -58,6 +51,23 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(stored["version"], 1);
     assert_eq!(stored["settings"], custom_settings());
+}
+
+#[test]
+fn a_refused_save_names_the_broken_rule_and_nothing_else() {
+    let repo = TempRepo::new("settings-refused-message");
+    let site = repo.empty_site();
+    let mut settings = custom_settings();
+    settings["tabWidth"] = 3.into();
+
+    let (status, reply) = save(&site, &settings.to_string());
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The whole message, as the dialog shows it: no serde position, no "unreadable" prefix.
+    assert_eq!(
+        reply,
+        "cannot save the settings: the tab width must be 2, 4 or 8, not 3"
+    );
 }
 
 #[test]
@@ -389,6 +399,9 @@ fn settings_that_cannot_be_read_or_written_say_so() {
         "{reply}"
     );
 
+    if skip_as_root() {
+        return;
+    }
     // A read-only configuration directory: the file is missing, so saving may go ahead,
     // and then the write fails.
     let blocked = TempRepo::new("settings-unwritable");
@@ -461,6 +474,10 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         (300.into(), 460.into())
     );
 
+    // The whole message, as the page shows it: no serde position, no "unreadable" prefix.
+    let (status, reply) = put(&site, LAYOUT, r#"{"sidebar": 248, "tray": 900}"#);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply, "the tray is 900 px wide, outside 280 to 720 px");
     for (body, words) in [
         (r#"{"sidebar": 100, "tray": 320}"#, "outside 200 to 480"),
         (r#"{"sidebar": 248}"#, "unreadable layout"),
@@ -479,6 +496,26 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         "a refused layout changes nothing"
     );
     assert_eq!(post(&site, LAYOUT, "{}").0, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[test]
+fn a_hand_edited_layout_with_a_width_out_of_range_reads_as_the_defaults() {
+    let repo = TempRepo::new("layout-hand-edit");
+    let site = repo.empty_site();
+    fs::create_dir_all(repo.config()).unwrap();
+    fs::write(
+        repo.config().join("layout.json"),
+        r#"{"version": 1, "sidebar": 10, "tray": 460}"#,
+    )
+    .unwrap();
+
+    let layout = get_json(&site, LAYOUT);
+
+    assert_eq!(
+        (layout["sidebar"].clone(), layout["tray"].clone()),
+        (248.into(), 320.into()),
+        "both widths are the defaults, not only the one out of range"
+    );
 }
 
 #[test]

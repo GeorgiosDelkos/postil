@@ -168,6 +168,11 @@ fn sent_notes_reach_the_agent_and_every_step_of_the_run_is_kept_on_disk() {
     let tail = get_json(&site, &format!("{RUN}?after={}", total - 1));
     assert_eq!(tail["entries"], serde_json::json!([last]));
     assert_eq!(tail["total"], total);
+    assert_eq!(tail["status"], "ended");
+    assert!(
+        tail.get("prompt").is_none() && tail.get("notes").is_none(),
+        "the page has the header fields that never change: {tail}"
+    );
 
     drop(site);
     assert_read_back(&repo, &ended);
@@ -736,6 +741,9 @@ fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
 
 #[test]
 fn a_send_that_fails_between_two_stages_leaves_the_review_going() {
+    if skip_as_root() {
+        return;
+    }
     let repo = TempRepo::new("run-review-refused-send");
     repo.write("a.txt", "a\n");
     let (site, nudges) = run_site(&repo, "plain");
@@ -1177,6 +1185,9 @@ fn changes_compare_with_the_files_now_without_a_snapshot_after_and_refuse_bad_lo
 
 #[test]
 fn a_snapshot_that_cannot_be_taken_is_the_run_s_problem_and_the_run_goes_on() {
+    if skip_as_root() {
+        return;
+    }
     let repo = TempRepo::new("run-no-snapshot");
     repo.write("a.txt", "a\n");
     repo.git(&["add", "a.txt"]);
@@ -1203,7 +1214,7 @@ fn a_snapshot_that_cannot_be_taken_is_the_run_s_problem_and_the_run_goes_on() {
     assert!(body.contains("R1 has no snapshot from before it"), "{body}");
 
     // Postil's own index torn: it is copied again from the real one at once.
-    let ours = repo.root.join(".git/postil-snapshot.index");
+    let ours = repo.root.join(".git/postil/snapshot/index");
     fs::write(&ours, "torn").unwrap();
     send(&site, &["N1"]);
     let healed = wait_for_run(&site, &nudges, "R2");
@@ -1345,19 +1356,11 @@ fn closing_the_project_stops_its_agent() {
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "ended");
     let pid = fs::read_to_string(&pid_file).unwrap();
-    let alive = || {
-        Command::new("/bin/kill")
-            .args(["-0", &pid])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    };
-    assert!(alive(), "the agent is kept after its run");
+    assert!(alive(&pid), "the agent is kept after its run");
 
     site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
         .unwrap();
-    assert!(!alive(), "opening another project stopped it");
+    assert!(!alive(&pid), "opening another project stopped it");
     assert_eq!(get(&site, RUN).1, "null", "the new project has no run");
 }
 
@@ -1458,6 +1461,9 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
 
 #[test]
 fn a_run_log_that_cannot_be_created_refuses_the_send() {
+    if skip_as_root() {
+        return;
+    }
     let repo = TempRepo::new("run-readonly");
     repo.write("a.txt", "a\n");
     let (site, _nudges) = run_site(&repo, "plain");
@@ -1471,30 +1477,23 @@ fn a_run_log_that_cannot_be_created_refuses_the_send() {
     assert_eq!(get(&site, RUN).1, "null");
 }
 
-/// Whether the process whose pid is in `file` runs.
-fn alive(file: &Path) -> bool {
-    let pid = fs::read_to_string(file).unwrap();
+/// Whether the process `pid` runs, or has exited and is not reaped yet.
+fn alive(pid: &str) -> bool {
     Command::new("/bin/kill")
-        .args(["-0", &pid])
+        .args(["-0", pid])
         .stderr(std::process::Stdio::null())
         .status()
         .unwrap()
         .success()
 }
 
-/// Waits until the fake agent wrote its pid to `file`.
-fn wait_for_pid(file: &Path) {
+/// Waits until the process `pid` is gone: exited and reaped.
+///
+/// This polls, because no signal exists for it: the agent is the runner's child, not the
+/// test's, so the test cannot wait on it, and the runner reaps it on a thread of its own.
+fn wait_for_exit(pid: &str) {
     let deadline = Instant::now() + WAIT;
-    while fs::read_to_string(file).map_or(true, |pid| pid.is_empty()) {
-        assert!(Instant::now() < deadline, "the agent never started");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Waits until the process whose pid is in `file` is gone.
-fn wait_for_exit(file: &Path) {
-    let deadline = Instant::now() + WAIT;
-    while alive(file) {
+    while alive(pid) {
         assert!(Instant::now() < deadline, "the agent was not stopped");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1505,6 +1504,7 @@ fn a_cancel_while_the_agent_starts_stops_it_and_ends_the_run_at_once() {
     let repo = TempRepo::new("run-cancel-start");
     repo.write("a.txt", "a\n");
     let pid_file = repo.root.join(".git/silent.pid");
+    make_fifo(&pid_file);
     let (site, nudges) = run_site(&repo, "plain");
     let silent = format!("{} {}", fake_agent("silent"), pid_file.display());
     set_agents(
@@ -1515,7 +1515,7 @@ fn a_cancel_while_the_agent_starts_stops_it_and_ends_the_run_at_once() {
     post_note(&site, "a.txt", 1, 1, "one");
 
     send(&site, &["N1"]);
-    wait_for_pid(&pid_file);
+    let pid = read_fifo(&pid_file, WAIT);
     assert_eq!(get_json(&site, RUN)["status"], "starting");
     let (status, body) = post(&site, &format!("{RUN}/cancel"), "");
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1526,7 +1526,7 @@ fn a_cancel_while_the_agent_starts_stops_it_and_ends_the_run_at_once() {
     );
     assert_eq!(entries(&ended)[1]["reason"], "cancelled");
     assert_eq!(states(&site), [serde_json::json!({ "kind": "open" })]);
-    wait_for_exit(&pid_file);
+    wait_for_exit(&pid);
 
     // Another send goes ahead; the stopped start reports nothing over it.
     let other = serde_json::json!({ "notes": ["N1"], "agent": "Fake" });
@@ -1545,16 +1545,17 @@ fn closing_the_project_while_its_agent_starts_stops_the_agent() {
     let other = TempRepo::new("run-close-start-other");
     repo.write("a.txt", "a\n");
     let pid_file = repo.root.join(".git/silent.pid");
+    make_fifo(&pid_file);
     let (site, _nudges) = run_site(&repo, "plain");
     let silent = format!("{} {}", fake_agent("silent"), pid_file.display());
     set_agents(&site, &[("Silent", &silent)], "Silent");
     post_note(&site, "a.txt", 1, 1, "one");
     send(&site, &["N1"]);
-    wait_for_pid(&pid_file);
+    let pid = read_fifo(&pid_file, WAIT);
 
     site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
         .unwrap();
-    wait_for_exit(&pid_file);
+    wait_for_exit(&pid);
 }
 
 #[test]
@@ -1562,16 +1563,17 @@ fn quitting_while_an_agent_starts_stops_the_agent() {
     let repo = TempRepo::new("run-quit-start");
     repo.write("a.txt", "a\n");
     let pid_file = repo.root.join(".git/silent.pid");
+    make_fifo(&pid_file);
     let (site, _nudges) = run_site(&repo, "plain");
     let silent = format!("{} {}", fake_agent("silent"), pid_file.display());
     set_agents(&site, &[("Silent", &silent)], "Silent");
     post_note(&site, "a.txt", 1, 1, "one");
     send(&site, &["N1"]);
-    wait_for_pid(&pid_file);
+    let pid = read_fifo(&pid_file, WAIT);
 
     // The window closing drops the site.
     drop(site);
-    wait_for_exit(&pid_file);
+    wait_for_exit(&pid);
 }
 
 #[test]
@@ -1609,6 +1611,9 @@ fn a_refused_prompt_leaves_the_notes_open_and_the_next_send_starts_a_fresh_agent
 
 #[test]
 fn notes_that_cannot_be_marked_sent_are_named_on_the_run() {
+    if skip_as_root() {
+        return;
+    }
     let repo = TempRepo::new("run-unmarked");
     repo.write("a.txt", "a\n");
     let (site, nudges) = run_site(&repo, "plain");
@@ -1616,13 +1621,14 @@ fn notes_that_cannot_be_marked_sent_are_named_on_the_run() {
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "ended");
 
-    // The runs directory stays writable; the review file's directory does not.
+    // The runs and snapshot directories stay writable; the review file's directory does not.
     let postil = repo.root.join(".git/postil");
     fs::set_permissions(&postil, fs::Permissions::from_mode(0o555)).unwrap();
     send(&site, &["N1"]);
     let run = wait_for(&site, &nudges, "ended");
     fs::set_permissions(&postil, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(run["id"], "R2");
+    assert_eq!(snapshot_points(&run), ["before", "after"], "{run}");
     let problem = run["problem"].as_str().unwrap();
     assert!(problem.contains("could not be marked sent"), "{problem}");
     assert_eq!(
@@ -1883,7 +1889,7 @@ fn a_kept_agent_that_exited_is_started_again() {
     wait_for(&site, &nudges, "ended");
     // The exited agent is reaped when the runner drops it on its exit event, so once it
     // is gone the runner holds no agent.
-    wait_for_exit(&pid_file);
+    wait_for_exit(&fs::read_to_string(&pid_file).unwrap());
 
     send(&site, &["N1"]);
     let second = wait_for(&site, &nudges, "ended");
@@ -1899,6 +1905,9 @@ fn a_send_right_after_the_kept_agent_exited_starts_a_fresh_one() {
     let repo = TempRepo::new("run-dead-at-once");
     repo.write("a.txt", "a\n");
     let pid_file = repo.root.join(".git/agent.pid");
+    // The agent's grandchild writes this once the agent has exited.
+    let exited = repo.root.join(".git/agent.pid.exited");
+    make_fifo(&exited);
     let (site, nudges) = run_site(&repo, "plain");
     let command = format!(
         "{} {}",
@@ -1911,7 +1920,7 @@ fn a_send_right_after_the_kept_agent_exited_starts_a_fresh_one() {
     wait_for(&site, &nudges, "ended");
     // Exited, and not yet reaped: the reader waits out its grace for standard error,
     // which the agent's grandchild holds open, so no exit event has come.
-    wait_for_exited(&pid_file);
+    read_fifo(&exited, WAIT);
 
     send(&site, &["N1"]);
     let second = wait_for_run(&site, &nudges, "R2");
@@ -1920,18 +1929,6 @@ fn a_send_right_after_the_kept_agent_exited_starts_a_fresh_one() {
         kinds(&second).contains(&"message:prompt 1".to_owned()),
         "a new process: {second}"
     );
-}
-
-/// Waits until the fake agent's grandchild saw the agent exit (`exit-leaving-stderr`
-/// writes `<pid file>.exited`). `kill -0` cannot tell: it succeeds on a process that
-/// exited and is not reaped yet.
-fn wait_for_exited(pid_file: &Path) {
-    let exited = pid_file.with_extension("pid.exited");
-    let deadline = Instant::now() + WAIT;
-    while !exited.exists() {
-        assert!(Instant::now() < deadline, "the agent did not exit");
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[test]
