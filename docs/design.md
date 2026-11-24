@@ -753,8 +753,15 @@ retired; the measured numbers above are the baseline to not regress.
   folding a run's log, diffs, the Markdown subset) lives in its own modules
   with tests beside it, run by Node's built-in runner: `node --test ui/`. `cargo test` runs them
   too, through `tests/page_logic.rs`, so Node must be installed to run the suite.
-- **The page's look and input handling** are checked by eye. Pixel tests are not planned for
-  version 1.
+- **The page's clicks during a run** are tested end to end in Playwright's WebKit
+  (`tests/e2e/`): the page talks to real sites over HTTP on localhost
+  (`src/site/tests/page_e2e.rs`), and the fake agent streams a reply part every 20 ms, so a
+  click lost to a node redrawn under the pointer fails a test. Playwright is a dev dependency
+  of those tests only, in `tests/e2e/package.json`; the page itself still has none. Run with
+  `cargo test page_end_to_end -- --ignored` once Playwright's WebKit is installed (README,
+  Development).
+- **The page's look and the rest of its input handling** are checked by eye. Pixel tests are
+  not planned for version 1.
 
 ## Decisions
 

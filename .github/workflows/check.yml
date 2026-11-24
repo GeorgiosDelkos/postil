@@ -4,7 +4,8 @@
 # - clippy: no warnings, blocking. On macOS, because wry builds against GTK on Linux. Then
 #   rustdoc, warnings denied, in the same job so it reuses the build: Cargo.toml denies broken
 #   intra-doc links, and clippy does not run rustdoc, so without it a broken link merges green.
-# - page: oxlint and oxfmt over the page's JavaScript in ui/ (house addition).
+# - page: oxlint and oxfmt over the page's JavaScript in ui/ and its end-to-end tests in
+#   tests/e2e/ (house addition).
 # Dropped from the template: semver and msrv (libraries only), hack (no features), and the
 # beta clippy run: rust-toolchain.toml pins the toolchain, which would override the matrix.
 # A draft PR gets no CI (gh-actions-style): every job carries the draft condition and no job has
@@ -69,6 +70,6 @@ jobs:
         with:
           node-version: "26.13.0"
       - name: oxlint
-        run: npx --yes oxlint@1.93.0 --deny-warnings ui/
+        run: npx --yes oxlint@1.93.0 --deny-warnings ui/ tests/e2e/
       - name: oxfmt --check
-        run: npx --yes oxfmt@0.78.0 --check 'ui/**/*.js'
+        run: npx --yes oxfmt@0.78.0 --check 'ui/**/*.js' 'tests/e2e/*.js'

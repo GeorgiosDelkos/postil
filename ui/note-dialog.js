@@ -57,11 +57,14 @@ export function noteDialog(
   let drawn = null;
   // The note whose dialog body's scroll a redraw keeps.
   let scrolledId = null;
+  // The footer drawn last, `{ key, node }`: a redraw keeps it while its key stays the same.
+  let foot = null;
 
   dialogEl.addEventListener("close", () => {
     shownId = null;
     drawn = null;
     scrolledId = null;
+    foot = null;
     asking = null;
     editing = null;
   });
@@ -106,7 +109,17 @@ export function noteDialog(
       : null;
     const focused = typing ? null : active?.className;
     const scroll = dialogEl.querySelector(".note-dialog-body")?.scrollTop ?? 0;
-    dialogEl.replaceChildren(header(note, run), body(note, run), footer(note, run));
+    // The footer's buttons are kept while what they show and act on stays the same. A reply
+    // that streams a line about the note changes the body on every part, many times a second,
+    // and a footer drawn again with it would drop clicks and disarm the two-click Delete.
+    const footKey = JSON.stringify([note, canSend(note), agent(), run?.id ?? null, isLive(run)]);
+    if (foot?.key === footKey && foot.node.parentNode === dialogEl) {
+      dialogEl.firstElementChild.replaceWith(header(note, run));
+      dialogEl.querySelector(".note-dialog-body").replaceWith(body(note, run));
+    } else {
+      foot = { key: footKey, node: footer(note, run) };
+      dialogEl.replaceChildren(header(note, run), body(note, run), foot.node);
+    }
     typing?.focus();
     if (focused) dialogEl.getElementsByClassName(focused)[0]?.focus();
     // The same note drawn again keeps its place; another note starts at its top.
