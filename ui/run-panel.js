@@ -7,9 +7,9 @@
 // The page's notes read their runs through the same store (`byId`).
 
 import { runDialog } from "./run-dialog.js";
-import { runStore } from "./run-store.js";
+import { MAX_LIVE, runStore } from "./run-store.js";
 import { runTab } from "./run-tab.js";
-import { foldRun, isLive, openPermission, permissionKey, permissionKeys } from "./run.js";
+import { foldRun, openPermission, permissionKey, permissionKeys } from "./run.js";
 
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
 // sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous)` is
@@ -44,21 +44,25 @@ export function runPanel({
     showChanges,
     onError,
   });
-  const tab = runTab({ store, dialog, panelEl, headerEl, statusEl, onError });
+  const tab = runTab({ store, dialog, panelEl, headerEl, statusEl });
 
   // `a`, Shift-`a` and `r` answer the open permission request (`permissionKey`). Returns
   // whether the key was used.
+  // The request answered is the oldest live run's first open one, the one the Run tab shows
+  // first.
   function keydown(event) {
     const key = permissionKey(event);
     if (!key) return false;
-    const run = store.run();
-    const request = run && openPermission(foldRun(run.entries).items);
-    if (!request) return false;
-    const option = permissionKeys(request.options).get(key);
-    if (option === undefined) return false;
-    event.preventDefault();
-    store.answer(request, option);
-    return true;
+    for (const run of store.liveRuns()) {
+      const request = openPermission(foldRun(run.entries).items);
+      if (!request) continue;
+      const option = permissionKeys(request.options).get(key);
+      if (option === undefined) return false;
+      event.preventDefault();
+      store.answer(run.id, request.request, option);
+      return true;
+    }
+    return false;
   }
 
   return {
@@ -73,6 +77,10 @@ export function runPanel({
     forget: store.forget,
     reload: store.reload,
     run: store.run,
-    live: () => isLive(store.run()),
+    liveRuns: store.liveRuns,
+    // Whether any run of this window is under way: Escape stops one.
+    live: () => store.liveRuns().length > 0,
+    // Whether this window runs as many as a repository may: a send would be refused.
+    full: () => store.liveRuns().length >= MAX_LIVE,
   };
 }

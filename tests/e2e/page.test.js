@@ -359,10 +359,31 @@ test("the run's dialog shows its branch, and Apply ends the thread once the run 
   const apply = detail.getByRole("button", { name: "Apply" });
   assert.ok(await apply.isDisabled(), "Apply waits for the run");
 
-  await api("api/run/cancel", { method: "POST" });
+  await api("api/run/cancel", { method: "POST", body: JSON.stringify({ run: "R1" }) });
   await page.locator("#run-header .stop").waitFor({ state: "detached" });
   await detail.getByRole("button", { name: "Apply", disabled: false }).click();
   await detail.locator(".run-thread-state").filter({ hasText: "Applied" }).waitFor();
   const thread = await api("api/thread?id=R1");
   assert.equal(thread.state, "applied");
+});
+
+test("two threads run side by side, and each stops from its own dialog", async (t) => {
+  const { page, api } = await openProject(t);
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  await startRun(page, api, [await addNote(api, "Rename three.")]);
+  assert.deepEqual((await api("api/runs")).live, ["R1", "R2"]);
+
+  // The older run, no longer the latest, still streams into its card's dialog, whose Stop
+  // stops it alone.
+  await page.locator("#run .run-entry").filter({ hasText: "R1" }).click();
+  const detail = page.locator("#run-detail");
+  await detail.getByRole("button", { name: "Stop", exact: true }).click();
+  // Its Stop goes once the run ended: the dialog is drawn again without it.
+  await page.waitForFunction(() => !document.querySelector("#run-detail button.stop"));
+  assert.equal((await api("api/run?id=R1")).status, "ended");
+  assert.deepEqual((await api("api/runs")).live, ["R2"]);
+  assert.equal((await api("api/run")).status, "running");
+
+  await api("api/run/cancel", { method: "POST", body: JSON.stringify({ run: "R2" }) });
+  await page.locator("#run-header .stop").waitFor({ state: "detached" });
 });

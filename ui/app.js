@@ -174,7 +174,7 @@ const noteDetail = noteDialog($("note-dialog"), {
   editNote,
   reopen: (note) => changeNote("reopen", note),
   showRun: () => tray.showTab("run"),
-  answerQuestion: (request, content) => runs.answerQuestion(request, content),
+  answerQuestion: (id, request, content) => runs.answerQuestion(id, request, content),
   reviewOf: (id) => reviewOf(id, runs.knownViews()),
   reviewers: () => state.settings?.reviewers ?? [],
   startReview: (id) => runs.startReview(id),
@@ -324,12 +324,13 @@ async function changeNote(action, note) {
 // ---- Send and run -------------------------------------------------------------------------
 
 // Clears the way for the send step (notes-tray.js, `openSend`). Returns false when it cannot
-// open: a run is under way, or a draft note must be saved first.
+// open: as many runs as a repository may have are under way, or a draft note must be saved
+// first.
 function beforeSend() {
   // The send step lives in the tray, which focus mode hides.
   leaveFocus();
-  if (runs.live()) {
-    showToast("The agent is still working on the last run: wait for it, or stop it.");
+  if (runs.full()) {
+    showToast("Three agents are already working: wait for one to end, or stop one.");
     return false;
   }
   // The prompt covers the code, and with it a note being written.

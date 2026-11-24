@@ -81,6 +81,16 @@ export function runDialog({
     }
   }
 
+  // The run of the thread that starts at run `root` under way in this window, a stage of its
+  // review included; undefined when none is. One at a time per thread (src/run.rs).
+  function liveOf(root) {
+    const views = store.knownViews();
+    return store.liveRuns().find((run) => {
+      if (run.review) return run.review.of === root;
+      return (threadOf(run.id, views)[0]?.id ?? run.id) === root;
+    });
+  }
+
   // A run deleted while its dialog is open closes the dialog.
   function closeIfGone(list) {
     if (detail && !list.includes(detail.id)) detailEl.close();
@@ -104,7 +114,9 @@ export function runDialog({
       // A reviewer's run belongs to the thread of the run it reviews, shown there.
       const record = root.review ? null : store.thread(root.id);
       const shown = [notes, reviewKey(review), reviewers(), record ?? null];
-      stamp = [`run:${root.id}`, threadKey(thread), JSON.stringify(shown), isLive(store.run())];
+      const live = root.review ? (isLive(root) ? root : undefined) : liveOf(root.id);
+      const liveKey = `${live?.id}:${live?.status}`;
+      stamp = [`run:${root.id}`, threadKey(thread), JSON.stringify(shown), liveKey];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, store.knownViews());
@@ -269,6 +281,17 @@ export function runDialog({
         ? `${view.id} · ${view.agent}`
         : `${view.id} to ${latest.id} · ${view.agent}`;
     const actions = [];
+    // Stops the thread's run under way. A second Stop from 3 s after the first ends an agent
+    // that did not stop (src/run.rs, "Stopping"); sooner, it is the same request.
+    const live = view.review ? (isLive(view) ? view : undefined) : liveOf(view.id);
+    if (live) {
+      const stopping = live.status === "cancelling";
+      const button = el("button", "button stop", stopping ? "Force stop" : "Stop");
+      button.type = "button";
+      button.title = `Stop ${live.id}`;
+      button.addEventListener("click", () => store.stop(live.id));
+      actions.push(button);
+    }
     // A run logged before snapshots has no changes view.
     if (view.entries.some((entry) => entry.kind === "snapshot")) {
       const button = el("button", "button run-detail-changes", "Changes");
@@ -413,7 +436,7 @@ export function runDialog({
       let held = "";
       const update = (next) => {
         target = next;
-        const busy = isLive(store.run());
+        const busy = liveOf(root.id) !== undefined;
         input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
         button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
         button.disabled = busy || sending;
@@ -481,7 +504,7 @@ export function runDialog({
     const part = reviewSection(review ? `Review · ${review.findings.length} found` : "Review", {
       reviewed: Boolean(review),
       names: reviewers(),
-      busy: isLive(store.run()) || isLive(view),
+      busy: liveOf(view.id) !== undefined || isLive(view),
       start: () => store.startReview(view.id),
       hintClass: "run-detail-text muted",
     });

@@ -1,10 +1,17 @@
 // The runs the page has read, shared by the Run tab (run-tab.js), the run dialog
 // (run-dialog.js) and the notes (`byId`).
 //
-// The store follows the latest run: the Rust process calls `window.postil.runChanged()`
-// whenever it changes, and `sync` fetches the entries it has not seen. Fetches never overlap:
-// a change that arrives during one is fetched right after it. Older runs are read once each,
-// by id, and kept: a finished run does not change.
+// The store follows the latest run, and this window's other live runs: threads run side by
+// side (src/run.rs). The Rust process calls `window.postil.runChanged()` whenever one changes,
+// and `sync` fetches the entries it has not seen. Fetches never overlap: a change that arrives
+// during one is fetched right after it. Older runs are read once each, by id, and kept: a
+// finished run does not change.
+
+import { isLive } from "./run.js";
+
+// The most runs live at once in one repository (src/run/log.rs, `MAX_LIVE`): a send beyond
+// them is refused, so the page offers none.
+export const MAX_LIVE = 3;
 
 // `render()` is called after anything the store holds changed; `onChange(run, previous)` after
 // every fetch that changed the latest run; `onLoaded()` after an older run was read;
@@ -12,6 +19,10 @@
 export function runStore({ render, onChange, onLoaded, onError }) {
   // The latest run, followed as it changes.
   let run = null;
+  // This window's live runs other than the latest, by id, followed as they change; and the
+  // ids of all its live runs, read with the list.
+  const liveViews = new Map();
+  let liveIds = [];
   let fetching = false;
   let again = false;
   // How long to wait before fetching again after a failed fetch: doubled each failure.
@@ -59,7 +70,45 @@ export function runStore({ render, onChange, onLoaded, onError }) {
       listStale = true;
       throw new Error(await response.text());
     }
-    ids = (await response.json()).runs;
+    const reply = await response.json();
+    ids = reply.runs;
+    liveIds = reply.live ?? [];
+  }
+
+  // Live run `id` again, with only the entries after those of `known`, its view so far.
+  async function fetchLive(id, known) {
+    const after = known?.total ?? 0;
+    const response = await fetch(`api/run?id=${encodeURIComponent(id)}&after=${after}`);
+    if (!response.ok) throw new Error(await response.text());
+    const reply = await response.json();
+    if (!known) return reply;
+    const entries = known.entries.concat(reply.entries);
+    return { ...reply, notes: known.notes, prompt: known.prompt, entries };
+  }
+
+  // Follows the live runs other than the latest. One that ended is kept with the older runs,
+  // final, and the list is read again: its thread changed, and it is live no more.
+  async function followLive(previous) {
+    // The run the latest replaced may still run: a send started another thread.
+    if (previous && previous.id !== run?.id && isLive(previous)) {
+      liveViews.set(previous.id, previous);
+    }
+    for (const id of liveIds) {
+      if (id === run?.id) continue;
+      const view = await fetchLive(id, liveViews.get(id));
+      if (isLive(view)) {
+        liveViews.set(id, view);
+        continue;
+      }
+      liveViews.delete(id);
+      others.set(id, view);
+      asked.add(id);
+      threads.clear();
+      listStale = true;
+    }
+    for (const id of liveViews.keys()) {
+      if (id === run?.id || !liveIds.includes(id)) liveViews.delete(id);
+    }
   }
 
   async function sync() {
@@ -78,7 +127,10 @@ export function runStore({ render, onChange, onLoaded, onError }) {
         const next = await fetchRun();
         if (next === null && previous === null && !listStale) continue;
         run = next;
-        if (listStale || previous?.id !== run?.id) await fetchIds();
+        if (listStale || previous?.id !== run?.id || previous?.status !== run?.status) {
+          await fetchIds();
+        }
+        await followLive(previous);
         // A run that started or ended changed its thread: the worktree was made (`skipped`),
         // its tip moved, or a run elsewhere ended it.
         if (previous?.id !== run?.id || previous?.status !== run?.status) threads.clear();
@@ -102,6 +154,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
   // would fetch it in a loop.
   function byId(id) {
     if (run?.id === id) return run;
+    if (liveViews.has(id)) return liveViews.get(id);
     const known = others.get(id);
     if (known || asked.has(id)) return known ?? null;
     asked.add(id);
@@ -186,10 +239,10 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     await sync();
   }
 
-  // Answers the run's open question with the form's values, or `null` to skip it. Resolves
-  // to whether the answer was taken.
-  function answerQuestion(request, content) {
-    return post("api/run/question", { request, content }).then(
+  // Answers run `id`'s open question `request` with the form's values, or `null` to skip
+  // it. Resolves to whether the answer was taken.
+  function answerQuestion(id, request, content) {
+    return post("api/run/question", { run: id, request, content }).then(
       () => true,
       (error) => {
         onError(error.message);
@@ -198,11 +251,24 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     );
   }
 
-  // Answers permission request `request` with the option `option`.
-  function answer(request, option) {
-    return post("api/run/permission", { request: request.request, option }).catch((error) =>
+  // Answers run `id`'s permission request `request` (its number) with the option `option`.
+  function answer(id, request, option) {
+    return post("api/run/permission", { run: id, request, option }).catch((error) =>
       onError(error.message),
     );
+  }
+
+  // Stops run `id`: asks its agent to stop, or ends it once the Rust process would force it
+  // (src/run.rs, "Stopping").
+  function stop(id) {
+    return post("api/run/cancel", { run: id }).catch((error) => onError(error.message));
+  }
+
+  // This window's live runs, oldest first.
+  function liveRuns() {
+    const live = [...liveViews.values()];
+    if (isLive(run)) live.push(run);
+    return live.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)));
   }
 
   // Starts the settings' reviewers on run `of`.
@@ -212,7 +278,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
 
   // Every run read so far, to find a run's reviews among them.
   function knownViews() {
-    return [...new Set([...ids, run?.id].filter(Boolean))].map(byId).filter(Boolean);
+    const known = [...ids, ...liveViews.keys(), run?.id].filter(Boolean);
+    return [...new Set(known)].map(byId).filter(Boolean);
   }
 
   return {
@@ -223,6 +290,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     post,
     answerQuestion,
     answer,
+    stop,
+    liveRuns,
     startReview,
     thread,
     endThread,
