@@ -13,7 +13,8 @@
 //! that kind, and lost otherwise: a rename is not followed, since nothing tells a renamed
 //! folder from a new one.
 //!
-//! The anchor says only whether the text is still there. It is kept apart from a note's
+//! The anchor says only whether the note's target (its text, or its file or folder) is still
+//! there. It is kept apart from a note's
 //! lifecycle (open, sent, resolved, from milestone 3 on): a sent note whose text the agent
 //! replaced is the expected outcome, while an open note whose text vanished means the code
 //! drifted under it, and the page shows the two differently. One enum would need a variant
@@ -328,7 +329,8 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
         text.push_str(note.body.trim_end());
         text.push('\n');
         // A folder gets no link: agents read a `resource_link` as a file, and the path in the
-        // text already names the folder.
+        // text already names the folder. A symlink to a folder is linked all the same: git and
+        // the file list treat it as a file (`Repo::kind`), and its note is a file note.
         let linked = !matches!(note.target, Target::Path(PathKind::Folder));
         if linked && !files.contains(&note.path) {
             files.push(note.path.clone());
@@ -644,7 +646,7 @@ impl Review {
     /// Reads each file and splits it into lines once, however many notes it has: splitting it
     /// again for each note took 17 ms of a `GET /api/notes` with 200 notes on ten files of
     /// 5000 lines, 2 ms once split. Then compares every position in the file with each of its
-    /// notes' snippets. A file or folder note costs one `stat`, and reads nothing.
+    /// notes' snippets. A file or folder note costs one `lstat`, and reads nothing.
     fn relocate(&mut self, repo: &Repo, mut read: HashMap<String, Option<String>>) {
         for note in &self.notes {
             let lines = matches!(note.target, Target::Lines { .. });

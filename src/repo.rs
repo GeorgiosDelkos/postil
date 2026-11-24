@@ -331,11 +331,13 @@ impl Repo {
     }
 
     /// Reads one file as text. `file` is a path relative to the root, as [`Repo::files`]
-    /// returns it.
+    /// returns it. A symlink inside the tree is followed, wherever it points: the reader sees
+    /// what an editor would show.
     ///
     /// # Errors
     ///
-    /// [`Error::OutsideRepository`] for a path that leaves the root, [`Error::FileTooLarge`]
+    /// [`Error::OutsideRepository`] for a path not written as git writes it (one that leaves
+    /// the root, is absolute, or has an empty, `.` or `..` name), [`Error::FileTooLarge`]
     /// above [`MAX_READ`] bytes, and [`Error::Read`] when the file cannot be read as UTF-8
     /// text.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
@@ -376,7 +378,8 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// [`Error::OutsideRepository`] for a path that leaves the root, as for [`Repo::read`].
+    /// [`Error::OutsideRepository`] for a path not written as git writes it, as for
+    /// [`Repo::read`].
     pub(crate) fn kind(&self, path: &str) -> Result<Option<PathKind>> {
         let full = self.inside(path)?;
         Ok(match fs::symlink_metadata(full) {
@@ -391,8 +394,7 @@ impl Repo {
     /// The path comes from the page. It must be written as git writes paths: names joined by
     /// single `/`, none of them `.` or `..`, with no leading or trailing `/`. So it cannot
     /// climb above the root or be absolute, and each file or folder has one spelling, the one
-    /// a note stores and a prompt shows. A symlink inside the tree is still followed, wherever
-    /// it points: the reader sees what an editor would show.
+    /// a note stores and a prompt shows.
     fn inside(&self, file: &str) -> Result<PathBuf> {
         let plain = !file.is_empty()
             && file
