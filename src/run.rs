@@ -606,7 +606,7 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run of this window is under way, and
+    /// [`Error::TurnRunning`] while a run of the thread is under way in this window, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
     /// reviewers, for a run that is itself a review, or for a follow-up; as
     /// [`Runner::view_of`] for the reviewed run; [`Error::WriteRun`] when the first stage's

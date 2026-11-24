@@ -564,10 +564,11 @@ and pull requests.
   as section "Runs" describes for one. The session's `cwd` (`session/new`), the prompt's
   `resource_link`s, and the paths in the run log are all in the thread's worktree, never in
   the engineer's working tree. A follow-up or a review stage uses only its thread's agent.
-  A window holds at most 3 agents, running or idle: before a fresh one starts, the idle one
+  A window keeps at most 3 agents, running or idle: before a fresh one starts, the idle one
   used least recently goes, and its thread's next follow-up tells a fresh agent the thread
   (section "Follow-ups"). An idle agent is a process of a few hundred MB kept only for that
-  follow-up.
+  follow-up. A busy thread keeps its agent, so a review between two stages, busy with no
+  run, can leave a window one agent over until a later launch.
 - **Locks.** Run logs, notes, and the run-number counter stay in the project's git dir.
   `runs/active.lock` is held only while a run is created: taking its number, counting the
   live runs, and taking its thread's lock are one step across windows, so two windows never
@@ -576,10 +577,11 @@ and pull requests.
   the count reads by trying each one. Ending a thread, or forgetting it with its last note,
   holds its lock, so no window's agent works in a worktree being freed; another window's run
   there refuses the ending (409) and keeps a forgotten thread for the next delete. An ending
-  counts as a live run for its moment, which a count in another window can read: accepted,
-  since telling the two apart would read the record under `runs/active.lock`. A count about
-  to refuse waits for each lock held, as a send does, because a lock released a moment ago
-  stays held in a process this one forked until it runs its program. `threads.lock`
+  counts as a live run while it lasts (seconds for an Apply on a large repository), which a
+  count in another window can read: accepted, since telling the two apart would read the
+  record under `runs/active.lock`. A count at the cap is taken again for up to 200 ms
+  before it refuses, because a lock released a moment ago stays held in a process this one
+  forked until it runs its program. `threads.lock`
   serializes, across windows, every change to the record. The window marks a
   worktree its start thread is still making, and counts it as a run under way: no commit,
   run or ending touches a half-made checkout. `git worktree lock`, so no cleanup removes a
@@ -777,9 +779,10 @@ the cap on live runs.
   send that waited would hold the one request
   thread (`shell.rs`), and with it the answer or the Stop that would free a place.
   Arbitrary: the engineer reads every result, and more at once is more than one person
-  follows. This bounds agent processes, a few hundred MB each; the builds they start can use
-  several GB of memory and disk each, which the cap does not bound. A review's next stage
-  counts when it starts: another window can take the place between two stages, and the
+  follows. This bounds the agents at work, a few hundred MB each; idle agents are bounded per
+  window (section "Threads"), and the builds agents start can use several GB of memory and
+  disk each, which nothing bounds. A review's next stage counts when it starts: another
+  window can take the place, or the thread, between two stages, and the
   review then stops, its last stage saying why.
 - **At most 15 worktrees** per repository, Codex's default; Cursor keeps 20. One Codex report
   found 61 worktrees holding about 100 GB.

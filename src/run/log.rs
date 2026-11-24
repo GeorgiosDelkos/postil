@@ -380,12 +380,17 @@ impl Run {
             InThread::New => None,
         };
         let lock = own.map(|id| hold_thread_lock(dir, id)).transpose()?;
-        let mut live = live_threads(dir, own)?;
-        if live.len() >= MAX_LIVE {
-            // A lock released a moment ago can still look held ([`take_lock`]): before
-            // refusing, each is waited for as a send waits for one.
-            live = still_held(dir, live)?;
-        }
+        // A lock released a moment ago can still look held ([`take_lock`]): a count at the cap
+        // is taken again until it is under it, for up to [`LOCK_PATIENCE`] in all, which only
+        // a send about to be refused waits.
+        let deadline = Instant::now() + LOCK_PATIENCE;
+        let live = loop {
+            let live = live_threads(dir, own)?;
+            if live.len() < MAX_LIVE || Instant::now() >= deadline {
+                break live;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         if live.len() >= MAX_LIVE {
             return Err(Error::TooManyRuns { live });
         }
@@ -897,27 +902,12 @@ pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
     }
 }
 
-/// Those of the threads `ids` whose lock is still held once waited for up to
-/// [`LOCK_PATIENCE`] each, as [`take_lock`] waits: up to 0.6 s with [`MAX_LIVE`] locks
-/// held for real, paid only by a send about to be refused.
-fn still_held(dir: &Path, ids: Vec<String>) -> Result<Vec<String>> {
-    let mut held = Vec::new();
-    for id in ids {
-        match hold_thread_lock(dir, &id) {
-            // Dropping the file releases the lock it took.
-            Ok(_free) => {}
-            Err(Error::RunElsewhere) => held.push(id),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(held)
-}
-
 /// The ids of the threads whose lock a run holds now, in any window, `except` the one the
 /// caller holds; sorted. Each lock is only tried, never waited for, so a lock released a moment
-/// ago can read as held ([`still_held`] looks again). Every count runs under
-/// [`hold_run_lock`], so no other count holds a lock for a moment meanwhile; an ending or a
-/// forgetting can, and reads as a live run for those milliseconds.
+/// ago can read as held ([`Run::create`] counts again). Every count runs under
+/// [`hold_run_lock`], so no other count holds a lock for a moment meanwhile. Ending or
+/// forgetting a thread holds its lock too, and reads as a live run while it lasts: seconds for
+/// an Apply on a large repository.
 fn live_threads(dir: &Path, except: Option<&str>) -> Result<Vec<String>> {
     let threads = threads_dir(dir);
     let entries = match fs::read_dir(&threads) {

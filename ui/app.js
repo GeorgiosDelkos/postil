@@ -178,7 +178,7 @@ const noteDetail = noteDialog($("note-dialog"), {
   reviewOf: (id) => reviewOf(id, runs.knownViews()),
   reviewers: () => state.settings?.reviewers ?? [],
   startReview: (id) => runs.startReview(id),
-  live: () => runs.live(),
+  busy: (id) => runs.busyThread(id),
 });
 
 // A note on a whole file or folder, from the file list.

@@ -2518,3 +2518,64 @@ fn a_kept_reviewer_that_exits_later_leaves_the_engineer_s_work_alone() {
         "left\n"
     );
 }
+
+#[test]
+fn a_window_lets_go_of_an_idle_agent_for_a_new_one_and_never_of_one_at_work() {
+    let repo = TempRepo::new("run-evict");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "hang");
+    set_reviewers(&site, "hang", &[("Plain", "plain")]);
+    for text in ["one", "two", "three"] {
+        post_note(&site, "a.txt", 1, 1, text);
+    }
+    let send_to = |agent: &str, note: &str| {
+        let body = serde_json::json!({ "notes": [note], "agent": agent }).to_string();
+        let (status, body) = post(&site, RUN, &body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    // R1 works on, the oldest; R2 ends, its agent kept and idle.
+    send_to("Fake", "N1");
+    assert_eq!(wait_for(&site, &nudges, "running")["id"], "R1");
+    send_to("Plain", "N2");
+    assert_eq!(wait_for_run(&site, &nudges, "R2")["status"], "ended");
+
+    // A third agent: R2's idle one goes, not R1's, used longer ago but at work.
+    send_to("Plain", "N3");
+    assert_eq!(wait_for_run(&site, &nudges, "R3")["status"], "ended");
+    let follow = serde_json::json!({ "of": "R2", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let fresh = wait_for_run(&site, &nudges, "R4");
+    assert!(
+        kinds(&fresh).contains(&"message:prompt 1".to_owned()),
+        "R2's agent was let go, so a fresh one takes the follow-up: {fresh}"
+    );
+    assert_eq!(
+        get_json(&site, &format!("{RUN}?id=R1"))["status"],
+        "running"
+    );
+}
+
+#[test]
+fn a_follow_up_takes_its_own_thread_s_place_so_two_others_running_leave_room() {
+    let repo = TempRepo::new("run-cap-own");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "hang");
+    set_reviewers(&site, "hang", &[("Plain", "plain")]);
+    for text in ["one", "two", "three"] {
+        post_note(&site, "a.txt", 1, 1, text);
+    }
+    let body = serde_json::json!({ "notes": ["N1"], "agent": "Plain" }).to_string();
+    assert_eq!(post(&site, RUN, &body).0, StatusCode::OK);
+    assert_eq!(wait_for_run(&site, &nudges, "R1")["status"], "ended");
+    for (note, run) in [("N2", "R2"), ("N3", "R3")] {
+        send(&site, &[note]);
+        assert_eq!(wait_for(&site, &nudges, "running")["id"], run);
+    }
+
+    // R1's thread holds its own lock while the follow-up is made: that one is not counted.
+    let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(wait_for_run(&site, &nudges, "R4")["status"], "ended");
+}

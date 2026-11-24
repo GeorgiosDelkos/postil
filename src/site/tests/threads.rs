@@ -164,14 +164,20 @@ fn a_send_needs_a_commit_to_start_its_thread_from() {
 }
 
 #[test]
-fn a_thread_goes_with_its_last_note_worktree_branch_and_record() {
+fn a_thread_goes_with_its_last_note_worktree_branch_record_and_lock() {
     let (repo, site, _nudges, worktree) = written("thread-forget");
     let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    let lock = repo.root.join(".git/postil/threads/R1.lock");
+    assert!(lock.exists(), "its run held it");
 
     let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
     assert_eq!(status, StatusCode::OK, "{body}");
 
     assert!(!worktree.exists());
+    assert!(
+        !lock.exists(),
+        "one lock file per thread ever made would pile up"
+    );
     assert_eq!(git_out(&repo.root, &["branch", "--list", &branch]), "");
     assert_eq!(
         get(&site, &format!("{THREAD}?id=R1")),

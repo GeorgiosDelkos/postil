@@ -373,7 +373,7 @@ test("two threads run side by side, and each stops from its own dialog", async (
   await startRun(page, api, [await addNote(api, "Rename three.")]);
   assert.deepEqual((await api("api/runs")).live, ["R1", "R2"]);
 
-  // The older run, no longer the latest, still streams into its card's dialog, whose Stop
+  // The older run, no longer the latest, is still followed: its card opens its dialog, whose Stop
   // stops it alone.
   await page.locator("#run .run-entry").filter({ hasText: "R1" }).click();
   const detail = page.locator("#run-detail");

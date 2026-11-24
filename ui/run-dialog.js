@@ -7,6 +7,7 @@ import { diffView, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
+import { MAX_LIVE } from "./run-store.js";
 import {
   elapsed,
   foldRun,
@@ -91,6 +92,16 @@ export function runDialog({
     });
   }
 
+  // Why a follow-up or a review of the thread that starts at run `root` cannot start now, or
+  // "" when it can: one of its runs is under way, or as many runs as a repository may have.
+  function busyThread(root) {
+    if (liveOf(root)) return "Wait for the run under way, or stop it.";
+    if (store.liveRuns().length >= MAX_LIVE) {
+      return "Three agents are already working: wait for one to end, or stop one.";
+    }
+    return "";
+  }
+
   // A run deleted while its dialog is open closes the dialog.
   function closeIfGone(list) {
     if (detail && !list.includes(detail.id)) detailEl.close();
@@ -116,7 +127,13 @@ export function runDialog({
       const shown = [notes, reviewKey(review), reviewers(), record ?? null];
       const live = root.review ? (isLive(root) ? root : undefined) : liveOf(root.id);
       const liveKey = `${live?.id}:${live?.status}`;
-      stamp = [`run:${root.id}`, threadKey(thread), JSON.stringify(shown), liveKey];
+      stamp = [
+        `run:${root.id}`,
+        threadKey(thread),
+        JSON.stringify(shown),
+        liveKey,
+        busyThread(root.id),
+      ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, store.knownViews());
@@ -436,12 +453,12 @@ export function runDialog({
       let held = "";
       const update = (next) => {
         target = next;
-        const busy = liveOf(root.id) !== undefined;
+        const busy = busyThread(root.id);
         input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
         button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
-        button.disabled = busy || sending;
+        button.disabled = busy !== "" || sending;
         // The held message wins: it says why the page did not end, which the engineer asked for.
-        why.textContent = held || (busy ? "Wait for the run under way, or stop it." : "");
+        why.textContent = held || busy;
         why.classList.toggle("failed", held !== "");
       };
       const hasDraft = () => input.value.trim() !== "";
@@ -504,7 +521,7 @@ export function runDialog({
     const part = reviewSection(review ? `Review · ${review.findings.length} found` : "Review", {
       reviewed: Boolean(review),
       names: reviewers(),
-      busy: liveOf(view.id) !== undefined || isLive(view),
+      busy: busyThread(view.id) !== "" || isLive(view),
       start: () => store.startReview(view.id),
       hintClass: "run-detail-text muted",
     });
@@ -720,7 +737,7 @@ export function runDialog({
     ];
   }
 
-  return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft };
+  return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft, busyThread };
 }
 
 // The run's steps in order, each with its index among the run's items and its key: every

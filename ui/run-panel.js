@@ -82,5 +82,6 @@ export function runPanel({
     live: () => store.liveRuns().length > 0,
     // Whether this window runs as many as a repository may: a send would be refused.
     full: () => store.liveRuns().length >= MAX_LIVE,
+    busyThread: dialog.busyThread,
   };
 }
