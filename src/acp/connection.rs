@@ -253,19 +253,20 @@ impl Agent {
     pub(crate) fn prompt(&self, prompt: &[ContentBlock]) -> Result<()> {
         let id = {
             let mut state = self.process.state();
-            // Gone first: a gone agent's turn may still be set until the reader ends it.
-            if state.gone {
+            // The id first: `new_id` refuses a gone agent, whose turn may still be set until
+            // the reader ends it. A refusal for a running turn then skips an id, which is
+            // harmless: ids need only be unique.
+            let Some(id) = state.new_id() else {
                 drop(state);
                 return Err(self.process.exited());
-            }
+            };
             if state.turn.is_some() {
                 return Err(Error::TurnRunning);
             }
             state.cancelling = false;
-            state.turn = state.new_id();
-            state.turn
+            state.turn = Some(id);
+            id
         };
-        let id = id.expect("new_id gives an id while the agent is not gone, checked above");
         let params = PromptParams {
             session_id: &self.session,
             prompt,
@@ -407,11 +408,21 @@ struct Process {
 }
 
 /// What the caller's thread and the reader thread share.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Shared {
     state: Mutex<State>,
     /// The end of standard error, written by the stderr thread.
     stderr: Mutex<Vec<u8>>,
+}
+
+// Sizes only: the agent's stderr can hold a sign-in URL, and the requests' contents are the
+// agent's, so neither is printed.
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("stderr_bytes", &lock(&self.stderr).len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The requests in flight in both directions. One lock: every change is a few map
