@@ -159,8 +159,10 @@ impl Scanner {
             .spawn(finish);
         if spawned.is_err() {
             // Fails only when the process is out of threads or memory. The settings then list
-            // every agent as not found rather than wait for a scan that never runs.
+            // every agent as not found rather than wait for a scan that never runs. A `wait`
+            // blocked on an earlier scan, which this one replaced, is woken to read it.
             state.1 = Some(OsString::new());
+            self.found.notify_all();
         }
     }
 }
