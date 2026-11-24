@@ -38,6 +38,7 @@ use crate::acp::{
     ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
 };
 use crate::error::{Error, Result};
+use crate::files::version_of;
 use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 
@@ -124,13 +125,6 @@ pub(super) enum Origin {
 pub(super) struct FollowUp {
     pub(super) of: String,
     pub(super) text: String,
-}
-
-/// The one field of a header that every log version has. Unknown fields are ignored here on
-/// purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
 }
 
 /// One thing that happened in a run: a line of its log.
@@ -816,7 +810,7 @@ pub(super) fn run_number(id: &str) -> Option<u64> {
 /// A run log's first line, its header. The version is read on its own first: a newer header
 /// would otherwise fail on its first new field, with a message that hides the real reason.
 fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
-    let VersionOnly { version } = serde_json::from_slice(first)
+    let version = version_of(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
     if !(1..=LOG_VERSION).contains(&version) {
         return Err(format!(

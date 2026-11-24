@@ -64,6 +64,13 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
     },
 ];
 
+/// The agent a run goes to: its name in the settings and the command that starts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentChoice {
+    pub(crate) name: String,
+    pub(crate) command: String,
+}
+
 /// How long the login shell may take to print its `PATH`. Arbitrary: a slow shell start-up
 /// (nvm, conda) takes about a second; longer means it is waiting for something that will not
 /// come, and the settings must not hang on it.

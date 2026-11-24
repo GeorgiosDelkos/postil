@@ -24,5 +24,5 @@ mod settings;
 mod shell;
 mod site;
 
-pub use crate::error::Error;
+pub use crate::error::{Error, error_chain};
 pub use crate::shell::{BenchReport, bench, run};

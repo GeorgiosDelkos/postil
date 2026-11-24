@@ -8,7 +8,8 @@
 //! so running an older build cannot drop the newer build's settings. A missing file is the
 //! defaults, and the first save creates it.
 //!
-//! The rules ([`Settings::check`]):
+//! The rules, checked when a [`RawSettings`] becomes a [`Settings`] (`TryFrom`), the only way
+//! to make one:
 //! - the code font size is 11 to 20 px and the tab width 2, 4 or 8;
 //! - a custom agent has a name of 1 to 40 characters, unlike any other agent's name
 //!   whatever the case, built-in ones included, and a command of plain words (no quotes)
@@ -24,9 +25,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agents::{self, BUILT_IN};
+use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{save_json, version_of};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -52,56 +53,135 @@ pub(crate) enum Theme {
     Dark,
 }
 
-/// The settings, as the page sends them and the file stores them. A field missing from the
-/// file takes its default, so a file written by hand may name only what it changes.
+/// The settings in effect, each rule in the module docs kept: made only from a
+/// [`RawSettings`] that passes them, so settings that break one never reach the file, the
+/// page, or a run. Serialized as the [`RawSettings`] it holds.
+#[derive(Debug, Serialize)]
+pub(crate) struct Settings(RawSettings);
+
+/// The settings as the page sends them and the file stores them, before the rules are
+/// checked. A field missing from the file takes its default, so a file written by hand may
+/// name only what it changes.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
-pub(crate) struct Settings {
-    pub(crate) theme: Theme,
+pub(crate) struct RawSettings {
+    theme: Theme,
     /// Code text size in CSS px; the line height follows it (`ui/app.js`).
-    pub(crate) code_font_size: u8,
+    code_font_size: u8,
     /// Columns per tab character in the code view.
-    pub(crate) tab_width: u8,
+    tab_width: u8,
     /// Whether a start without a folder opens the most recent project instead of the
     /// welcome screen.
-    pub(crate) reopen_last_project: bool,
+    reopen_last_project: bool,
 
     /// Agents the engineer added, beside the built-in ones.
-    pub(crate) custom_agents: Vec<CustomAgent>,
+    custom_agents: Vec<CustomAgent>,
     /// The names of the agents offered for sending and reviewing. A built-in agent that is
     /// enabled but no longer installed stays listed, marked missing.
-    pub(crate) enabled_agents: Vec<String>,
+    enabled_agents: Vec<String>,
     /// The agent notes are sent to.
-    pub(crate) agent: Option<String>,
+    agent: Option<String>,
     /// The agents that review the agent's work, in order.
-    pub(crate) reviewers: Vec<String>,
+    reviewers: Vec<String>,
 }
 
 impl Settings {
-    /// Checks the rules in the module docs. The error says which rule failed, in words for
-    /// the dialog.
-    pub(crate) fn check(&self) -> std::result::Result<(), String> {
-        if !FONT_SIZES.contains(&self.code_font_size) {
+    pub(crate) fn theme(&self) -> Theme {
+        self.0.theme
+    }
+
+    pub(crate) fn reopen_last_project(&self) -> bool {
+        self.0.reopen_last_project
+    }
+
+    pub(crate) fn custom_agents(&self) -> &[CustomAgent] {
+        &self.0.custom_agents
+    }
+
+    /// The names of the agents that review the agent's work, in order.
+    pub(crate) fn reviewers(&self) -> &[String] {
+        &self.0.reviewers
+    }
+
+    /// The agent notes are sent to, with its command.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when none is chosen.
+    pub(crate) fn default_agent(&self) -> Result<AgentChoice> {
+        let name = self.0.agent.as_deref().ok_or_else(|| {
+            Error::BadRequest("choose the agent notes are sent to in Settings".to_owned())
+        })?;
+        self.chosen_agent(name)
+    }
+
+    /// The agent called `name`, with its command.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when it is not enabled.
+    pub(crate) fn chosen_agent(&self, name: &str) -> Result<AgentChoice> {
+        if !self.0.enabled_agents.iter().any(|enabled| enabled == name) {
+            return Err(Error::BadRequest(format!(
+                "turn {name} on in Settings before sending to it"
+            )));
+        }
+        let built_in = BUILT_IN
+            .iter()
+            .find(|agent| agent.name == name)
+            .map(|agent| agent.command);
+        let custom = || {
+            self.custom_agents()
+                .iter()
+                .find(|agent| agent.name == name)
+                .map(|agent| agent.command.as_str())
+        };
+        let command = built_in
+            .or_else(custom)
+            .expect("an enabled agent is a known one: the settings passed check_choices");
+        Ok(AgentChoice {
+            name: name.to_owned(),
+            command: command.to_owned(),
+        })
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self::try_from(RawSettings::default()).expect("the default settings keep every rule")
+    }
+}
+
+impl TryFrom<RawSettings> for Settings {
+    /// The rule `raw` breaks, in words for the dialog.
+    type Error = String;
+
+    /// Checks the rules in the module docs.
+    fn try_from(raw: RawSettings) -> std::result::Result<Self, Self::Error> {
+        if !FONT_SIZES.contains(&raw.code_font_size) {
             return Err(format!(
                 "the code font size must be {} to {} px, not {}",
                 FONT_SIZES.start(),
                 FONT_SIZES.end(),
-                self.code_font_size
+                raw.code_font_size
             ));
         }
-        if !TAB_WIDTHS.contains(&self.tab_width) {
+        if !TAB_WIDTHS.contains(&raw.tab_width) {
             // Destructured, so a change to the offered widths fails to compile here until
             // the message follows it.
             let [narrow, middle, wide] = TAB_WIDTHS;
             return Err(format!(
                 "the tab width must be {narrow}, {middle} or {wide}, not {}",
-                self.tab_width
+                raw.tab_width
             ));
         }
-        self.check_custom_agents()?;
-        self.check_choices()
+        raw.check_custom_agents()?;
+        raw.check_choices()?;
+        Ok(Self(raw))
     }
+}
 
+impl RawSettings {
     fn check_custom_agents(&self) -> std::result::Result<(), String> {
         let mut names: Vec<&str> = BUILT_IN.iter().map(|agent| agent.name).collect();
         for agent in &self.custom_agents {
@@ -172,7 +252,7 @@ impl Settings {
     }
 }
 
-impl Default for Settings {
+impl Default for RawSettings {
     fn default() -> Self {
         Self {
             theme: Theme::System,
@@ -198,18 +278,12 @@ pub(crate) struct CustomAgent {
     pub(crate) command: String,
 }
 
-/// The file: read with `S` = [`Settings`], written with `S` = `&Settings`.
+/// The file: read with `S` = [`RawSettings`], written with `S` = `&Settings`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsFile<S> {
     version: u32,
     settings: S,
-}
-
-/// The one field every version of the file has; other fields are ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
 }
 
 /// The settings in effect, and why the file was not used when it was not.
@@ -274,24 +348,21 @@ fn revision_of(json: &str) -> String {
 
 fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
     let shown = file.display();
-    match serde_json::from_str::<VersionOnly>(json) {
-        Ok(VersionOnly { version }) if version > VERSION => {
+    match version_of(json.as_bytes()) {
+        Ok(version) if version > VERSION => {
             return Err(format!(
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Ok(VersionOnly { version }) if version != VERSION => {
+        Ok(version) if version != VERSION => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
     }
-    let stored: SettingsFile<Settings> = serde_json::from_str(json)
+    let stored: SettingsFile<RawSettings> = serde_json::from_str(json)
         .map_err(|error| format!("{shown} is not valid settings JSON: {error}"))?;
-    stored
-        .settings
-        .check()
-        .map_err(|problem| format!("{shown} breaks a rule: {problem}"))?;
-    Ok(stored.settings)
+    Settings::try_from(stored.settings)
+        .map_err(|problem| format!("{shown} breaks a rule: {problem}"))
 }
 
 /// Writes `settings` to `file`, if the file is still at `revision`: the one the change
@@ -302,14 +373,12 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidSettings`] when `settings` breaks a rule; nothing is written.
 /// - [`Error::SettingsChanged`] when the file is no longer at `revision`; nothing is
 ///   written.
 /// - [`Error::SettingsLocked`] when the file on disk cannot be used (see the module docs);
 ///   nothing is written.
 /// - [`Error::WriteSettings`] when the file cannot be written.
 pub(crate) fn save(file: &Path, settings: &Settings, revision: &str) -> Result<()> {
-    settings.check().map_err(Error::InvalidSettings)?;
     let (read, current) = read(file);
     if current != revision {
         return Err(Error::SettingsChanged);
@@ -334,9 +403,7 @@ fn write(file: &Path, settings: &Settings) -> Result<()> {
         version: VERSION,
         settings,
     };
-    let mut json = serde_json::to_vec_pretty(&stored).expect("settings always serialize");
-    json.push(b'\n');
-    write_atomically(file, &json).map_err(|source| Error::WriteSettings {
+    save_json(file, &stored).map_err(|source| Error::WriteSettings {
         path: file.to_owned(),
         source,
     })
@@ -352,5 +419,55 @@ mod tests {
         // Curt Noll, the fnv1a_64 vectors).
         assert_eq!(revision_of(""), "cbf29ce484222325");
         assert_eq!(revision_of("a"), "af63dc4c8601ec8c");
+    }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let dir =
+            std::env::temp_dir().join(format!("postil-settings-{}-bytes", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        let file = dir.join("settings.json");
+        let raw: RawSettings = serde_json::from_value(serde_json::json!({
+            "theme": "dark",
+            "codeFontSize": 14,
+            "tabWidth": 2,
+            "reopenLastProject": true,
+            "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
+            "enabledAgents": ["Claude", "Local"],
+            "agent": "Local",
+            "reviewers": ["Claude", "Claude"],
+        }))
+        .unwrap();
+        let settings = Settings::try_from(raw).unwrap();
+
+        save(&file, &settings, "").unwrap();
+
+        let expected = r#"{
+  "version": 1,
+  "settings": {
+    "theme": "dark",
+    "codeFontSize": 14,
+    "tabWidth": 2,
+    "reopenLastProject": true,
+    "customAgents": [
+      {
+        "name": "Local",
+        "command": "local-agent --acp"
+      }
+    ],
+    "enabledAgents": [
+      "Claude",
+      "Local"
+    ],
+    "agent": "Local",
+    "reviewers": [
+      "Claude",
+      "Claude"
+    ]
+  }
+}
+"#;
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        drop(fs::remove_dir_all(&dir));
     }
 }

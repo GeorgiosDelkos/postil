@@ -52,7 +52,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::write_atomically;
+use crate::files::{save_json, version_of};
 use crate::repo::Repo;
 
 /// The format version this build writes. It reads this one and every older one; a file with
@@ -153,18 +153,7 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
 /// it, as [`current`] for reading the file, [`Error::WriteReview`] when the lock or the file
 /// cannot be written, and [`Error::ReviewLocked`] when another process holds the lock.
 pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Review> {
-    let wanted = NoteId::parse(id)
-        .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
-    let file = repo.review_file();
-    let _lock = lock(&file)?;
-    let mut review = current(repo)?;
-    let before = review.notes.len();
-    review.notes.retain(|note| note.id != wanted);
-    if review.notes.len() == before {
-        return Err(Error::NoSuchNote { id: id.to_owned() });
-    }
-    review.save(&file)?;
-    Ok(review)
+    change_notes(repo, id, |notes, index| drop(notes.remove(index)))
 }
 
 /// Marks the note `id` resolved, saves, and returns all notes. A resolved note keeps the run
@@ -220,17 +209,28 @@ pub(crate) fn edit(repo: &Repo, id: &str, body: &str) -> Result<Review> {
 
 /// Changes note `id` with `change` and saves, under the lock.
 fn change_note(repo: &Repo, id: &str, change: impl FnOnce(&mut Note)) -> Result<Review> {
+    change_notes(repo, id, |notes, index| change(&mut notes[index]))
+}
+
+/// Changes the notes with `change`, given the index of note `id` among them, and saves, under
+/// the lock. Ids are unique ([`Review::load`] refuses a file that repeats one), so the index
+/// is the only note with that id.
+fn change_notes(
+    repo: &Repo,
+    id: &str,
+    change: impl FnOnce(&mut Vec<Note>, usize),
+) -> Result<Review> {
     let wanted = NoteId::parse(id)
         .ok_or_else(|| Error::BadRequest(format!("note id {id:?}: expected N and a number")))?;
     let file = repo.review_file();
     let _lock = lock(&file)?;
     let mut review = current(repo)?;
-    let note = review
+    let index = review
         .notes
-        .iter_mut()
-        .find(|note| note.id == wanted)
+        .iter()
+        .position(|note| note.id == wanted)
         .ok_or_else(|| Error::NoSuchNote { id: id.to_owned() })?;
-    change(note);
+    change(&mut review.notes, index);
     review.save(&file)?;
     Ok(review)
 }
@@ -352,13 +352,6 @@ fn parse_ids(ids: &[String]) -> Result<Vec<NoteId>> {
 pub(crate) struct Review {
     version: u32,
     notes: Vec<Note>,
-}
-
-/// The one field of a review file that every format version has. Unknown fields are
-/// ignored here on purpose.
-#[derive(Deserialize)]
-struct VersionOnly {
-    version: u32,
 }
 
 /// A note the engineer wrote on a line range.
@@ -488,7 +481,7 @@ impl Review {
 
         // The version is read on its own first: a newer format would otherwise fail on its
         // first new field, with a message that hides the real reason.
-        let VersionOnly { version } = serde_json::from_str(&json).map_err(parse_error)?;
+        let version = version_of(json.as_bytes()).map_err(parse_error)?;
         if !(1..=VERSION).contains(&version) {
             return Err(invalid(format!(
                 "version {version}, but this build of Postil reads versions 1 to {VERSION}"
@@ -509,12 +502,9 @@ impl Review {
         Ok(review)
     }
 
-    /// Replaces the review file with this review (`write_atomically`).
+    /// Replaces the review file with this review (`files::save_json`).
     fn save(&self, file: &Path) -> Result<()> {
-        let mut json = serde_json::to_vec_pretty(self)
-            .expect("a review is plain structs, strings, and numbers, which always serialize");
-        json.push(b'\n');
-        write_atomically(file, &json).map_err(|source| Error::WriteReview {
+        save_json(file, self).map_err(|source| Error::WriteReview {
             path: file.to_owned(),
             source,
         })
@@ -814,5 +804,53 @@ mod tests {
             assert!(!debug.contains("secret"), "{debug}");
         }
         assert!(format!("{review:?}").contains("NoteId(1)"));
+    }
+
+    #[test]
+    fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("postil-notes-{}-bytes", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        let file = dir.join("review.json");
+        let note = |id, state| Note {
+            id: NoteId(id),
+            path: "src/a.rs".to_owned(),
+            lines: range(2, 3),
+            snippet: "b\nc".to_owned(),
+            body: "Why?".to_owned(),
+            anchor: Anchor::Found,
+            state,
+        };
+        let review = Review {
+            version: VERSION,
+            notes: vec![
+                note(1, NoteState::Open {}),
+                note(
+                    2,
+                    NoteState::Sent {
+                        run: "R1".to_owned(),
+                    },
+                ),
+                note(3, NoteState::Resolved { run: None }),
+            ],
+        };
+
+        review.save(&file).unwrap();
+
+        let note_json = |id: u32, state: &str| {
+            format!(
+                "    {{\n      \"id\": \"N{id}\",\n      \"path\": \"src/a.rs\",\n      \
+                 \"lines\": {{\n        \"start\": 2,\n        \"end\": 3\n      }},\n      \
+                 \"snippet\": \"b\\nc\",\n      \"body\": \"Why?\",\n      \
+                 \"anchor\": \"found\",\n      \"state\": {{\n{state}\n      }}\n    }}"
+            )
+        };
+        let expected = format!(
+            "{{\n  \"version\": 3,\n  \"notes\": [\n{},\n{},\n{}\n  ]\n}}\n",
+            note_json(1, "        \"kind\": \"open\""),
+            note_json(2, "        \"kind\": \"sent\",\n        \"run\": \"R1\""),
+            note_json(3, "        \"kind\": \"resolved\""),
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        drop(fs::remove_dir_all(&dir));
     }
 }

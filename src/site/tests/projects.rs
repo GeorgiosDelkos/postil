@@ -302,10 +302,9 @@ fn the_last_project_reopens_only_when_the_settings_ask_and_it_still_opens() {
     let other = TempRepo::new("settings-reopen-other");
     let recent = repo.config().join("recent.json");
     recent::record(&recent, Path::new(&site_root(&other.root))).unwrap();
-    let reopen = Settings {
-        reopen_last_project: true,
-        ..Settings::default()
-    };
+    let raw: RawSettings =
+        serde_json::from_value(serde_json::json!({ "reopenLastProject": true })).unwrap();
+    let reopen = Settings::try_from(raw).unwrap();
     let root = |found: Option<Repo>| found.map(|repo| repo.root().to_owned());
 
     let opened = startup_repo(None, &reopen, Some(&recent)).unwrap();

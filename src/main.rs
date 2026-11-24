@@ -1,6 +1,5 @@
 //! The `postil` command: opens the review window, on a repository or on the welcome screen.
 
-use std::error::Error as _;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -76,13 +75,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprint!("postil: {error}");
-            let mut source = error.source();
-            while let Some(cause) = source {
-                eprint!(": {cause}");
-                source = cause.source();
-            }
-            eprintln!();
+            eprintln!("postil: {}", postil::error_chain(&error));
             ExitCode::FAILURE
         }
     }
