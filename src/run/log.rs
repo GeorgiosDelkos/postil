@@ -570,10 +570,17 @@ impl Run {
                     reason: StopReason::Refusal
                 }
         );
-        let live = self.state().live();
-        self.record_all(std::iter::once(entry).chain(answer));
-        if took_turn && live {
-            self.state().unmarked.take()
+        // One hold of the state, as `record_all`, which also takes the notes: a run that ended
+        // meanwhile neither takes the event nor marks its notes sent.
+        let mut state = self.state();
+        if !state.live() {
+            return None;
+        }
+        for entry in std::iter::once(entry).chain(answer) {
+            self.write(&mut state, entry);
+        }
+        if took_turn {
+            state.unmarked.take()
         } else {
             None
         }

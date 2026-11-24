@@ -1098,26 +1098,20 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         if slot.let_go(generation) {
             return;
         }
-        // The review stage this run is, while its review goes on.
-        let stage = slot
+        let review = slot
             .run
             .as_ref()
-            .and_then(|run| run.state().header.review.clone())
-            .filter(|stage| {
-                slot.chain
-                    .as_ref()
-                    .is_some_and(|chain| chain.stage == *stage)
-            });
+            .and_then(|run| run.state().header.review.clone());
         // Answered before the request is logged, and logged with it at once: a page that read
         // the request alone would show the run waiting for the engineer.
         // From the run's header, which never changes: a Stop that ends the chain does not lift
         // it for the rest of the proposer's turn.
-        let read_only = slot.run.as_ref().is_some_and(|run| {
-            run.state()
-                .header
-                .review
+        let read_only = review.as_ref().is_some_and(|stage| !stage.judges());
+        // The review stage this run is, while its review goes on.
+        let stage = review.filter(|stage| {
+            slot.chain
                 .as_ref()
-                .is_some_and(|stage| !stage.judges())
+                .is_some_and(|chain| chain.stage == *stage)
         });
         let answer = match (&event, &slot.agent) {
             (Event::Permission(request), Held::Ready(_, agent)) => {
