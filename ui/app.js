@@ -186,7 +186,6 @@ const pathNote = pathNoteDialog($("path-note-dialog"), {
   add: addPathNote,
   send: (note, options) => tray.sendAlone(note, options),
   agent: () => state.settings?.agent ?? null,
-  live: () => runs.live(),
 });
 
 const layout = dividers();
@@ -256,15 +255,18 @@ function indexNotes() {
 // Stores a note on the whole file or folder at `path` (`target` "file" or "folder") and draws
 // the notes the reply holds. Resolves to `{ note }`, the note stored, or `{ error }`.
 async function addPathNote(path, target, body) {
+  // Numbered as a read is: a read sent before the save that answers after it holds the notes
+  // without this one, and `applyNotes` drops it instead of drawing it over them.
+  const number = ++notesAsked;
   const response = await fetch("api/notes", {
     method: "POST",
     body: JSON.stringify({ path, target, body }),
   });
   if (!response.ok) return { error: await response.text() };
-  state.notes = (await response.json()).notes;
-  redrawNotes();
+  const { notes } = await response.json();
+  if (applyNotes({ ok: true, body: notes, number })) redrawNotes();
   // The Rust process adds a note last (src/notes.rs, `add`).
-  return { note: state.notes.at(-1) };
+  return { note: notes.at(-1) };
 }
 
 // Deletes the note, and with it every run none of whose notes is left (src/run.rs,

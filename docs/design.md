@@ -250,7 +250,10 @@ As built in milestone 2 (`src/notes.rs`):
   fields do not fit its target is refused. An older file reads with every note on lines. The
   page adds one with `POST /api/notes {path, target, body}`; the path must be written as git
   writes it (no `.`, `..`, empty names or trailing `/`) and be a file or folder as `target`
-  says now, or the request fails with 400.
+  says now, or the request fails with 400. A symlink is a file wherever it points, as git
+  tracks it and the file list shows it. A folder note's dialog lists the files the run changed
+  below the folder, each with its counts, rather than their diffs, which the run's Changes
+  view shows.
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send

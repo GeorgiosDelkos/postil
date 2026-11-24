@@ -9,6 +9,7 @@ import { keptQuestion } from "./question-form.js";
 import { foldRun, isLive, isResolved, openQuestion, statusLine } from "./run.js";
 import {
   agentSaid,
+  changedFiles,
   fileDiffs,
   fileStats,
   noteDialogKey,
@@ -173,10 +174,13 @@ export function noteDialog(
     if (run) {
       main.append(section(`What ${run.agent} said about ${note.id}`, said(note, run)));
       // What the run did to the note's file, whole: the card only says the note's status.
+      // A folder note lists the files instead (status.js, `changedFiles`).
       const diffs = fileDiffs(note, run);
       if (diffs.length) {
         const stats = fileStats(note, run);
-        const changed = section(`What changed in ${note.path}`, diffsView(diffs));
+        const view =
+          note.target === "folder" ? changedFilesView(changedFiles(note, run)) : diffsView(diffs);
+        const changed = section(`What changed in ${fullPlace(note)}`, view);
         changed.firstChild.append(
           el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`),
         );
@@ -416,6 +420,20 @@ function section(label, content) {
   title.append(el("span", "", label));
   part.append(title, content);
   return part;
+}
+
+// The files changed under a folder, one line each with its own lines added and removed.
+function changedFilesView(files) {
+  const list = el("ol", "note-dialog-history");
+  for (const file of files) {
+    const item = el("li", "tool");
+    item.append(
+      el("span", "target", file.path),
+      el("span", "state", `+${file.added} -${file.removed}`),
+    );
+    list.append(item);
+  }
+  return list;
 }
 
 // Diffs, one block each.

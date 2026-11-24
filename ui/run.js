@@ -477,7 +477,10 @@ export function promptLines(text) {
     .map((line) => {
       if (/^\[N\d+\] /.test(line)) return { kind: "heading", text: line };
       if (line.startsWith("> ")) return { kind: "quote", text: line };
+      // The sentences src/notes.rs `prompt` writes under a note whose target is gone.
       if (line === "(These lines are no longer in the file; they were:)")
+        return { kind: "lost", text: line };
+      if (/^\(This (file|folder) is no longer in the repository\.\)$/.test(line))
         return { kind: "lost", text: line };
       return { kind: "text", text: line };
     });

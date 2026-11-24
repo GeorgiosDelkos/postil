@@ -364,10 +364,13 @@ impl Repo {
     }
 
     /// What `path` is in the working tree now: a file, a folder, or `None` when nothing is
-    /// there or it is neither (a socket, a broken symlink). A symlink is followed, as
-    /// [`Repo::read`] follows it. One `stat`; reads no file.
+    /// there or it is neither (a socket, a FIFO). One `lstat`; reads no file.
     ///
-    /// A `stat` that fails for another reason (no permission to look) also gives `None`: a
+    /// A symlink is a file, wherever it points, and is not followed: git tracks the link
+    /// itself, so [`Repo::files`] lists it and the file list shows it as a file, even when it
+    /// points at a folder.
+    ///
+    /// An `lstat` that fails for another reason (no permission to look) also gives `None`: a
     /// note's caller can only say "not a file or folder" either way, and no error variant
     /// names a failed look at a path that may be a folder.
     ///
@@ -376,8 +379,8 @@ impl Repo {
     /// [`Error::OutsideRepository`] for a path that leaves the root, as for [`Repo::read`].
     pub(crate) fn kind(&self, path: &str) -> Result<Option<PathKind>> {
         let full = self.inside(path)?;
-        Ok(match fs::metadata(full) {
-            Ok(metadata) if metadata.is_file() => Some(PathKind::File),
+        Ok(match fs::symlink_metadata(full) {
+            Ok(metadata) if metadata.is_file() || metadata.is_symlink() => Some(PathKind::File),
             Ok(metadata) if metadata.is_dir() => Some(PathKind::Folder),
             _ => None,
         })

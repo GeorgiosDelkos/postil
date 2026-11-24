@@ -759,6 +759,28 @@ fn a_file_or_folder_note_is_lost_while_its_path_is_gone_or_of_another_kind() {
 }
 
 #[test]
+fn a_symlink_takes_a_file_note_wherever_it_points_as_the_file_list_shows_it() {
+    let repo = TempRepo::new("notes-path-link");
+    repo.write("src/a.rs", "a\n");
+    std::os::unix::fs::symlink("src", repo.root.join("link")).unwrap();
+    std::os::unix::fs::symlink("gone", repo.root.join("dangling")).unwrap();
+    let site = repo.site();
+
+    post_path_note(&site, "link", "file", "Point elsewhere.");
+    let review = post_path_note(&site, "dangling", "file", "Remove.");
+    assert_eq!(
+        targets(&review),
+        [
+            target("N1", "link", "file", "found"),
+            target("N2", "dangling", "file", "found"),
+        ]
+    );
+    let (status, reply) = post(&site, NOTES, &path_note("link", "folder", "b"));
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(reply.contains("link is not a folder"), "{reply}");
+}
+
+#[test]
 fn a_file_or_folder_note_on_a_path_of_another_kind_or_none_is_refused() {
     let repo = TempRepo::new("notes-path-bad");
     repo.write("src/a.rs", "a\n");

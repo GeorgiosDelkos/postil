@@ -78,7 +78,8 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, wri
   }
 
   // Without a filter: the tree, showing the contents of open folders only. A closed folder
-  // carries the count of notes inside it, so collapsing it does not hide that they exist.
+  // carries the count of notes inside it, so collapsing it does not hide that they exist; an
+  // open folder, the count of notes on the folder itself.
   function treeRows() {
     const totals = folderCounts(state.noteCountByPath);
     return visibleRows(state.tree, state.expanded).map((row) => {
@@ -102,7 +103,8 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, wri
       icon(folderIcon(row.name, row.open)),
       el("span", "name", row.name),
     );
-    const count = row.open ? 0 : totals.get(row.path);
+    // Open, its files show their own counts, so it shows only the notes on the folder itself.
+    const count = row.open ? state.noteCountByPath.get(row.path) : totals.get(row.path);
     if (count) button.append(el("span", "count", String(count)));
     return button;
   }

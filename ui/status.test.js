@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   agentSaid,
+  changedFiles,
   fileStats,
   groupNotes,
   noteDialogKey,
@@ -193,6 +194,22 @@ test("a folder note's history is the run's tool calls on any file below its fold
     ["read src/acp/wire.rs", "edit src/acp/deep/x.rs"],
   );
   assert.deepEqual(fileStats(note, r), { added: 1, removed: 0 });
+});
+
+test("a folder note's changed files are listed once each, in the order first changed", () => {
+  const note = { ...sent("N1", "R1", "src"), target: "folder" };
+  const entries = [
+    tool("t1", "edit", "src/b.rs", [diff("src/b.rs", "a\n", "a\nb\n")]),
+    tool("t2", "edit", "src/a.rs", [diff("src/a.rs", "a\nb\n", "c\n")]),
+    tool("t3", "edit", "src/b.rs", [diff("src/b.rs", "a\nb\n", "a\nb\nc\n")]),
+    tool("t4", "edit", "lib/x.rs", [diff("lib/x.rs", null, "x\n")]),
+    // An edit that did not finish changed nothing yet.
+    tool("t5", "edit", "src/c.rs", [diff("src/c.rs", null, "c\n")], "in_progress"),
+  ];
+  assert.deepEqual(changedFiles(note, run("R1", "ended", entries)), [
+    { path: "src/b.rs", added: 2, removed: 0 },
+    { path: "src/a.rs", added: 1, removed: 2 },
+  ]);
 });
 
 test("notes are grouped as in the run, open, done newest run first, and resolved", () => {

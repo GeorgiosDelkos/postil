@@ -313,6 +313,13 @@ test("a right-click on a folder writes a note on all of it, and Send sends it at
   const run = await api("api/run");
   assert.deepEqual(run.notes, ["N1"]);
   assert.match(run.prompt, /\[N1\] src\/ \(folder\)\nSplit this module\.\n$/);
+
+  // The folder's row counts the note on it, closed and open: no file below it carries it.
+  const folder = page.locator('#files .dir[data-path="src"]');
+  await folder.locator(".count").filter({ hasText: "1" }).waitFor();
+  await folder.click();
+  await page.locator('#files .file[data-path="src/a.rs"]').waitFor();
+  await folder.locator(".count").filter({ hasText: "1" }).waitFor();
 });
 
 test("c on a file's row writes a note on the file, and Save keeps it without a run", async (t) => {

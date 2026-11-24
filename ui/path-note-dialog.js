@@ -12,9 +12,12 @@ import { fileIcon, folderIcon } from "./icons.js";
 //   the reason it was refused;
 // - `send(note, { review })` sends a stored note alone (review: open the send step with it
 //   alone ticked instead);
-// - `agent()` names the default agent, or null when none is set;
-// - `live()` says whether a run is under way, which no note can be sent beside.
-export function pathNoteDialog(dialogEl, { add, send, agent, live }) {
+// - `agent()` names the default agent, or null when none is set.
+//
+// Send is never turned off while a run is under way: the dialog would have to follow the run
+// to turn it back on. A send then is refused with the reason, after the note is saved, as the
+// arrow on a card is.
+export function pathNoteDialog(dialogEl, { add, send, agent }) {
   // The path and kind ("file" or "folder") of the note being written, while the dialog is open.
   let writing = null;
 
@@ -24,9 +27,8 @@ export function pathNoteDialog(dialogEl, { add, send, agent, live }) {
   dialogEl.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      // Cmd-Enter sends when it can, as in the note dialog; otherwise it saves.
-      const sending = dialogEl.querySelector(".path-note-send:not(:disabled)");
-      (sending ?? dialogEl.querySelector(".path-note-save"))?.click();
+      // Cmd-Enter sends, as in the note dialog.
+      dialogEl.querySelector(".path-note-send")?.click();
     }
   });
 
@@ -87,9 +89,6 @@ export function pathNoteDialog(dialogEl, { add, send, agent, live }) {
     sendButton.title =
       "Keeps the note in the tray and sends it alone to the default agent. " +
       "Shift-click shows the prompt first.";
-    sendButton.disabled = live();
-    // A disabled button says why beside it, not only in a tooltip.
-    if (sendButton.disabled) why.textContent = "A run is under way: Save keeps it for later.";
     sendButton.addEventListener("click", (event) => submit(input, why, { review: event.shiftKey }));
 
     foot.append(el("span", "hint", "esc discard"), el("span", "spacer"), why, save, sendButton);

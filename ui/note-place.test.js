@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { covers, fullPlace, onLines, shortPlace } from "./note-place.js";
+import { covers, fullPlace, shortPlace } from "./note-place.js";
 
 const lines = (path, start, end) => ({ path, target: "lines", lines: { start, end } });
 const file = (path) => ({ path, target: "file" });
@@ -16,12 +16,6 @@ test("a note's place names its lines, its file, or its folder with a slash", () 
   assert.equal(shortPlace(folder("src/acp")), "acp/");
   assert.equal(fullPlace(folder("src/acp")), "src/acp/");
   assert.equal(shortPlace(folder("src")), "src/");
-});
-
-test("only a line note is on lines", () => {
-  assert.equal(onLines(lines("a.rs", 1, 1)), true);
-  assert.equal(onLines(file("a.rs")), false);
-  assert.equal(onLines(folder("src")), false);
 });
 
 test("a folder note covers every file below its folder, and no file beside it", () => {
