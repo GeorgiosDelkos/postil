@@ -262,6 +262,25 @@ async function prompt(id, params) {
       }
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "flood": {
+      // An edit, then a reply streamed in a part every 20 ms until the engineer stops the
+      // run, as a fast agent writes: the page's end-to-end tests (tests/e2e/) click while the
+      // page redraws many times a second. The reply is one line about the first note sent,
+      // as agents answer, so what the page says the agent said about it changes on every
+      // part. 3000 parts (a minute) bound a run nobody stops.
+      const note = blocks.join("\n").match(/\[(N\d+)\]/)?.[1];
+      if (!note) throw new Error("flood: the prompt names no note");
+      update({ sessionUpdate: "tool_call", toolCallId: "t1", title: "Edit src/a.rs", kind: "edit", status: "pending", locations: [{ path: file, line: 1 }] });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed", content: [{ type: "diff", path: file, oldText: "one\ntwo\nthree\n", newText: "one\n2\nthree\n" }] });
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `[${note}]: ` }, messageId: "reply" });
+      let stopped = false;
+      onCancel.then(() => (stopped = true));
+      for (let part = 0; part < 3000 && !stopped; part += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `part ${part} ` }, messageId: "reply" });
+      }
+      return send({ id, result: { stopReason: stopped ? "cancelled" : "end_turn" } });
+    }
     case "hang":
       // Never ends the turn, and ignores the cancel.
       return;

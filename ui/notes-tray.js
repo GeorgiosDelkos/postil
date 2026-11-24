@@ -149,7 +149,7 @@ export function notesTray({
     const button = el("button", `note ${card.status.kind}${card.outdated ? " outdated" : ""}`);
     button.type = "button";
     const head = el("div", "note-where");
-    const label = el("span", `note-status ${card.status.tone}`);
+    const label = el("span", `note-status tone-${card.status.tone}`);
     const said = card.outdated ? `${card.status.label} · outdated` : card.status.label;
     label.append(statusIcon(card.status.kind), said);
     const place = el("span", "note-place", `${card.path.split("/").at(-1)}:${lines}`);

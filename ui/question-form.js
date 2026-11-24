@@ -103,7 +103,7 @@ function fieldView(field, index, values) {
   const input = field.kind === "text" ? el("textarea") : el("input");
   if (field.kind === "text") input.rows = 2;
   else input.type = "number";
-  input.className = "question-input";
+  input.className = "field question-input";
   input.setAttribute("aria-label", field.title);
   input.addEventListener("input", () => {
     values[field.key] = input.value;

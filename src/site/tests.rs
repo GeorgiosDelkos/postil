@@ -5,6 +5,7 @@
 
 mod files;
 mod notes;
+mod page_e2e;
 mod projects;
 mod routes;
 mod runs;
@@ -216,6 +217,12 @@ pub(crate) fn run_site(repo: &TempRepo, scenario: &str) -> (Site, mpsc::Receiver
     let (sender, nudges) = mpsc::channel();
     // The receiver is gone once the test finished.
     let notify: Notify = Arc::new(move || sender.send(()).unwrap_or_default());
+    (agent_site(repo, scenario, notify), nudges)
+}
+
+/// A site on `repo` whose agent is the fake agent in `scenario`, called Fake, with this
+/// process's PATH (to find `node`), telling `notify` when a run changes.
+fn agent_site(repo: &TempRepo, scenario: &str, notify: Notify) -> Site {
     let path = std::env::var_os("PATH").expect("PATH is set");
     let site = Site::new(
         Some(&repo.config()),
@@ -226,7 +233,7 @@ pub(crate) fn run_site(repo: &TempRepo, scenario: &str) -> (Site, mpsc::Receiver
     site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
         .unwrap();
     set_agents(&site, &[("Fake", &fake_agent(scenario))], "Fake");
-    (site, nudges)
+    site
 }
 
 /// Saves custom agents `agents`, all turned on, with `chosen` as the agent.
