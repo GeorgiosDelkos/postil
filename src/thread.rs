@@ -33,6 +33,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -102,8 +103,8 @@ struct Threads {
 ///
 /// # Errors
 ///
-/// [`Error::NoHome`] when `home` is `None`, and the git error when the branch `HEAD` is on
-/// cannot be read.
+/// [`Error::NoHome`] when `home` is `None`; [`Error::WriteWorktree`] when the worktree's
+/// path would hold a colon; and the git error when the branch `HEAD` is on cannot be read.
 pub(crate) fn plan(
     repo: &Repo,
     home: Option<&Path>,
@@ -116,10 +117,24 @@ pub(crate) fn plan(
     // from them.
     let home = resolved(home.ok_or(Error::NoHome)?);
     let folder = id.to_lowercase();
+    let path = worktrees_dir(repo.root(), &home).join(&folder);
+    // git cannot be kept from searching up out of a folder under one with a colon in its
+    // path (`repo::run_git_with`). `repo_name` drops the colons of the repository's name, so
+    // only Postil's home, or a volume's name, can hold one.
+    if path.as_os_str().as_bytes().contains(&b':') {
+        return Err(Error::WriteWorktree {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the path holds a colon, which git cannot keep agents' git calls inside \
+                 (rename the folder or volume that has it)",
+            ),
+        });
+    }
     let base = Some(repo.branch()?).filter(|branch| !branch.is_empty());
     Ok(Thread {
         id: id.to_owned(),
-        path: worktrees_dir(repo.root(), &home).join(&folder),
+        path,
         branch: branch_name(&folder, title),
         fork: fork.to_owned(),
         base,
@@ -319,8 +334,7 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     // A unique name in the trash only: nothing is ordered by it.
     static FREED: AtomicU64 = AtomicU64::new(0);
     check_place(repo, home, thread)?;
-    // Before any git call in the worktree (`check` runs `git status` there): a folder with no
-    // `.git` of its own would have git look upward, into another repository.
+    // The record to drop below; `check` checks the worktree again through `open`.
     let record = repo.worktree_record(&thread.path)?;
     check(repo, home, thread)?;
     if thread.path.symlink_metadata().is_ok() {
@@ -551,11 +565,12 @@ fn worktrees_dir(root: &Path, home: &Path) -> PathBuf {
     base.join("worktrees").join(format!("{name}-{id:08x}"))
 }
 
-/// The name that starts the folder of the repository at `root`'s worktrees: its folder's.
+/// The name that starts the folder of the repository at `root`'s worktrees: its folder's,
+/// with each colon a dash, which keeps colons out of worktrees' paths ([`plan`]).
 fn repo_name(root: &Path) -> String {
     root.file_name().map_or_else(
         || "repository".to_owned(),
-        |name| name.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().replace(':', "-"),
     )
 }
 
@@ -709,6 +724,23 @@ mod tests {
             io::Error::from_raw_os_error(18).kind(),
             io::ErrorKind::CrossesDevices
         );
+    }
+
+    #[test]
+    fn a_worktree_s_path_never_holds_a_colon() {
+        let dir = TempDir::new("thread-colon");
+        let root = dir.path().join("a:b");
+        fs::create_dir(&root).unwrap();
+        let repo = Repo::init(&root).unwrap();
+
+        // A colon in the repository's name becomes a dash.
+        let thread = plan(&repo, Some(&dir.path().join("home")), "R1", "abc", "t").unwrap();
+        let folder = thread.path.parent().unwrap().file_name().unwrap();
+        assert!(folder.to_string_lossy().starts_with("a-b-"), "{thread:?}");
+
+        // One in Postil's home cannot be changed, so no thread is made there.
+        let error = plan(&repo, Some(&dir.path().join("ho:me")), "R1", "abc", "t").unwrap_err();
+        assert!(matches!(error, Error::WriteWorktree { .. }), "{error:?}");
     }
 
     #[test]

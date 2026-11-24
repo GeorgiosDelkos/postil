@@ -879,15 +879,18 @@ fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<
 }
 
 /// Where git looks for the repository of the folder it runs in.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Search {
-    /// In the folder and every folder above it, as git does by default: only to find the
-    /// working tree that holds a folder the engineer picked ([`Repo::open`]).
+    /// In the folder and every folder above it, as git does by default: only in
+    /// [`Repo::open`], whose callers check the root they get where it matters
+    /// ([`crate::thread::open`]).
     Up,
     /// In the folder alone. Every other call runs in a working tree's top folder, and when
     /// its `.git` is gone (an agent in a thread's worktree may delete it), searching up
     /// would act on whatever repository holds the folder, a dotfiles repository in the
-    /// home folder, say. git then fails instead.
+    /// home folder, say. git then fails instead, except under a folder whose path holds a
+    /// colon (see [`run_git_with`]), which a thread's worktree is never put in
+    /// ([`crate::thread::plan`]).
     Here,
 }
 
@@ -906,8 +909,11 @@ fn run_git_with(
     let mut command = Command::new("git");
     match (search, dir.parent()) {
         // git looks in `dir`, then stops before the ceiling, its parent. It resolves links
-        // in both before comparing them. A parent whose path holds a colon is read as two
-        // paths, neither of them the parent, and git searches up as with `Search::Up`.
+        // in both before comparing them. The variable is a colon-separated list with no
+        // escape, so a parent whose path holds a colon is read as two paths, neither of them
+        // the parent, and git searches up as with `Search::Up`. Refusing instead would stop
+        // Postil in every repository under such a folder; `thread::plan` keeps colons out of
+        // the paths of threads' worktrees, where agents work.
         (Search::Here, Some(parent)) => drop(command.env("GIT_CEILING_DIRECTORIES", parent)),
         (Search::Here, None) | (Search::Up, _) => {}
     }

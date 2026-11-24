@@ -1045,3 +1045,28 @@ fn a_worktree_whose_git_file_names_another_worktree_takes_no_run() {
         "their branch moved"
     );
 }
+
+#[test]
+fn a_worktree_whose_config_moves_its_working_tree_elsewhere_takes_no_run() {
+    let (repo, site, _nudges, worktree) = written("thread-moved-tree");
+    // git honors `core.worktree` from a linked worktree's own config: its calls there would
+    // work on the other folder, here the engineer's main working tree.
+    repo.git(&["config", "extensions.worktreeConfig", "true"]);
+    let root = repo.root.to_str().unwrap();
+    git_out(&worktree, &["config", "--worktree", "core.worktree", root]);
+    repo.write("theirs.txt", "theirs\n");
+
+    let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("is not a worktree of this repository"),
+        "{body}"
+    );
+    // A follow-up commits left-over work first: nothing of the engineer's was committed.
+    assert_eq!(
+        git_out(&repo.root, &["status", "--porcelain"]),
+        "?? theirs.txt"
+    );
+}
