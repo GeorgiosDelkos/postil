@@ -55,6 +55,10 @@ fn apply_writes_the_thread_s_changes_uncommitted_and_frees_its_worktree() {
     // The worktree is gone, from disk and from git; the branch stays with the notes.
     assert!(!worktree.exists(), "{worktree:?}");
     assert!(
+        repo.home().join("trash").is_dir(),
+        "moved into the trash beside it"
+    );
+    assert!(
         !git_out(&repo.root, &["worktree", "list"]).contains("r1"),
         "git forgot the worktree"
     );
@@ -213,6 +217,10 @@ fn another_window_cannot_end_or_forget_a_thread_whose_run_goes_on() {
     // A second window on the same repository: its own slot holds nothing.
     let (other, _quiet) = run_site(&repo, "plain");
 
+    // The window running it says so in its own words.
+    let (status, body) = end(&running, "discard", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("still working on the last prompt"), "{body}");
     let (status, body) = end(&other, "discard", "R1");
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("another Postil window"), "{body}");
@@ -394,6 +402,13 @@ fn an_unreadable_thread_record_fails_the_send_and_is_never_written_over() {
     assert_eq!(fs::read_to_string(&record).unwrap(), "{ not json");
     let failed = wait_for(&site, &nudges, "failed");
     assert_eq!(failed["id"], "R1");
+
+    // A record that cannot be read at all is not an empty one.
+    fs::remove_file(&record).unwrap();
+    fs::create_dir(&record).unwrap();
+    let (status, body) = send(&site, &["N1"]);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("cannot read the threads"), "{body}");
 }
 
 #[test]
@@ -424,4 +439,112 @@ fn the_engineer_s_hooks_run_neither_for_the_checkout_nor_for_postil_s_commits() 
     );
     assert!(!marker.exists(), "post-checkout ran");
     drop(fs::remove_file(marker));
+}
+
+#[test]
+fn a_worktree_deleted_by_hand_takes_no_more_work_and_still_goes_with_its_note() {
+    let (repo, site, nudges, worktree) = written("thread-gone");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    // The follow-up's commit fails (git refuses an empty name): R2 has no snapshot after it,
+    // so its changes are read from the worktree's files as they are.
+    repo.git(&["config", "user.name", ""]);
+    let follow = |of: &str| {
+        let body = serde_json::json!({ "of": of, "text": "more" }).to_string();
+        post(&site, &format!("{RUN}/follow"), &body)
+    };
+    assert_eq!(follow("R1").0, StatusCode::OK);
+    wait_for_run(&site, &nudges, "R2");
+    let changes = get_json(&site, &format!("{RUN}/changes?from=R2"));
+    assert!(
+        changes["patch"].as_str().unwrap().contains("+prompt 2"),
+        "{changes}"
+    );
+    repo.git(&["config", "user.name", "Postil Test"]);
+
+    fs::remove_dir_all(&worktree).unwrap();
+
+    let (status, body) = follow("R2");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("is gone"), "{body}");
+    let (status, body) = get(&site, &format!("{RUN}/changes?from=R2"));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("is gone"), "{body}");
+    // Git still records the worktree, which keeps its branch checked out: deleting the note
+    // removes that record, then the branch.
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(git_out(&repo.root, &["branch", "--list", &branch]), "");
+    assert_eq!(
+        git_out(&repo.root, &["worktree", "list"]).lines().count(),
+        1
+    );
+}
+
+#[test]
+fn a_branch_deleted_by_hand_does_not_keep_its_thread_from_going_with_its_note() {
+    let (repo, site, _nudges, _worktree) = written("thread-branch-gone");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    assert_eq!(end(&site, "discard", "R1").0, StatusCode::OK);
+    repo.git(&["branch", "--quiet", "-D", &branch]);
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
+    );
+}
+
+#[test]
+fn a_worktree_that_cannot_be_made_fails_its_run_and_leaves_no_thread() {
+    let repo = TempRepo::new("thread-no-worktree");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    // The branch the thread would make, there already: `git worktree add -b` refuses.
+    repo.git(&["branch", "postil/r1-one"]);
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+
+    let failed = wait_for(&site, &nudges, "failed");
+
+    let error = failed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "failed")
+        .unwrap()["error"]
+        .clone();
+    assert!(
+        error.as_str().unwrap().contains("already exists"),
+        "{failed}"
+    );
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned()),
+        "a thread that claims the branch would delete it with its note"
+    );
+    assert_eq!(
+        git_out(&repo.root, &["branch", "--list", "postil/r1-one"]),
+        "postil/r1-one"
+    );
+}
+
+#[test]
+fn a_patch_or_record_that_is_not_what_git_wrote_is_refused() {
+    let repo = TempRepo::new("thread-repo-guards");
+    repo.write("a.txt", "a\n");
+    repo.commit();
+    let tree = Repo::open(&repo.root).unwrap();
+    // An id from the record that git would read as an option, which writes a file.
+    let out = repo.root.join("out.txt");
+    let option = format!("--output={}", out.display());
+    let error = tree.patch(&option, "HEAD").unwrap_err();
+    assert!(matches!(error, Error::BadRequest(_)), "{error:?}");
+    assert!(!out.exists());
+    // A folder whose `.git` is a directory is a repository of its own, not a worktree.
+    let own = repo.home().join("own");
+    fs::create_dir_all(own.join(".git")).unwrap();
+    let error = tree.worktree_record(&own).unwrap_err();
+    assert!(matches!(error, Error::NotAWorktree { .. }), "{error:?}");
 }

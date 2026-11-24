@@ -293,6 +293,7 @@ fn each_send_works_in_a_worktree_and_on_a_branch_of_its_own_and_leaves_the_engin
     assert_eq!(one["branch"], "postil/r1-fix-the-first-line");
     assert_eq!(two["branch"], "postil/r2-two");
     assert_eq!(one["state"], "open");
+    assert_eq!(one["base"], "trunk", "the branch HEAD was on");
     let one_path = PathBuf::from(one["path"].as_str().unwrap());
     assert_ne!(one_path, PathBuf::from(two["path"].as_str().unwrap()));
     assert!(

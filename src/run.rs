@@ -271,7 +271,7 @@ impl Runner {
         if let Some(home) = &home {
             // Finishes deleting the worktrees of threads that ended while the app last ran:
             // a quit can cut a background delete short.
-            thread::empty_trash(&thread::trash_for(repo.root(), home));
+            drop(thread::empty_trash(&thread::trash_for(repo.root(), home)));
         }
         Arc::new(Self {
             repo,

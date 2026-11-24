@@ -37,6 +37,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
 
@@ -167,7 +168,7 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
             skipped.push(format!("{name}: a Python virtual environment"));
         } else if to.symlink_metadata().is_ok() {
             // A checkout or a submodule made it: it is the worktree's own.
-        } else if !tree.is_ignored(&format!("{name}/")).unwrap_or(false) {
+        } else if !tree.is_ignored(&format!("{name}/")) {
             // Ignored by a rule the engineer has not committed: the worktree's commit
             // would take the whole folder in.
             skipped.push(format!("{name}: not ignored by the committed .gitignore"));
@@ -302,7 +303,8 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
         );
         let moved = fs::create_dir_all(&trash).and_then(|()| fs::rename(&path, trash.join(&name)));
         moved.map_err(|source| Error::MakeWorktree { path, source })?;
-        empty_trash(&trash);
+        // Runs on: the delete takes seconds, and nothing waits for it.
+        drop(empty_trash(&trash));
     }
     if let Some(record) = record {
         fs::remove_dir_all(&record).map_err(|source| Error::MakeWorktree {
@@ -336,10 +338,12 @@ pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<(
 
 /// Deletes everything in the trash folder `trash` on a background thread: freed worktrees,
 /// which can hold hundreds of thousands of files. A delete cut short by a quit is finished
-/// by the next call. Errors are ignored: what is left is tried again then.
-pub(crate) fn empty_trash(trash: &Path) {
+/// by the next call. Errors are ignored: what is left is tried again then. Returns the
+/// thread, which the app lets run on; `None` when it could not start, and the folder then
+/// stays until the next call, which is no harm.
+pub(crate) fn empty_trash(trash: &Path) -> Option<JoinHandle<()>> {
     let trash = trash.to_owned();
-    let spawned = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("empty-trash".to_owned())
         .spawn(move || {
             let Ok(entries) = fs::read_dir(&trash) else {
@@ -348,9 +352,8 @@ pub(crate) fn empty_trash(trash: &Path) {
             for entry in entries.flatten() {
                 drop(fs::remove_dir_all(entry.path()));
             }
-        });
-    // No thread: the folder stays until the next call, which is no harm.
-    drop(spawned);
+        })
+        .ok()
 }
 
 /// The trash folder where [`free`] moves the worktrees of the repository at `root`, given
@@ -505,6 +508,40 @@ fn change(repo: &Repo, update: impl FnOnce(&mut Vec<Thread>)) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
+
+    #[test]
+    fn a_repository_on_another_volume_keeps_its_folders_at_that_volume_s_root() {
+        let dir = TempDir::new("thread-places");
+        let home = resolved(&dir.path().join(".postil"));
+        let on_home = dir.path().join("repo");
+        assert_eq!(
+            base_for(&on_home, &home),
+            home,
+            "one volume: the home folder"
+        );
+        // `/dev` is its own file system (devfs) on macOS and Linux, apart from the home
+        // folder's, and a repository below it is on that volume.
+        let elsewhere = Path::new("/dev/fd");
+        assert_ne!(device(elsewhere), device(&home));
+        assert_eq!(base_for(elsewhere, &home), Path::new("/dev/.postil"));
+        // A repository that is its volume's root: the folder would be inside it.
+        assert_eq!(base_for(Path::new("/dev"), &home), home);
+        assert_eq!(trash_for(elsewhere, &home), Path::new("/dev/.postil/trash"));
+    }
+
+    #[test]
+    fn emptying_the_trash_deletes_everything_in_it_and_keeps_the_folder() {
+        let dir = TempDir::new("thread-trash");
+        let trash = dir.path().join("trash");
+        fs::create_dir_all(trash.join("r1-1-0/target/debug")).unwrap();
+        fs::write(trash.join("r1-1-0/target/debug/app"), "built\n").unwrap();
+        fs::create_dir_all(trash.join("r2-1-1")).unwrap();
+
+        empty_trash(&trash).unwrap().join().unwrap();
+
+        assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
+    }
 
     #[test]
     fn a_branch_takes_a_clean_slug_from_the_note_and_none_when_nothing_is_left() {

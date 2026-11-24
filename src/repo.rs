@@ -463,18 +463,11 @@ impl Repo {
     }
 
     /// Whether git ignores `path` (relative to the root) in this working tree, by its own
-    /// `.gitignore` files and the repository's exclude rules.
-    ///
-    /// # Errors
-    ///
-    /// The git error.
-    pub(crate) fn is_ignored(&self, path: &str) -> Result<bool> {
-        match git(&self.root, &["check-ignore", "--quiet", path]) {
-            Ok(_) => Ok(true),
-            // Exit 1 with nothing on stderr is "not ignored".
-            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(false),
-            Err(error) => Err(error),
-        }
+    /// `.gitignore` files and the repository's exclude rules. A path git cannot judge counts
+    /// as not ignored: its one caller then leaves the folder out, the safe side.
+    pub(crate) fn is_ignored(&self, path: &str) -> bool {
+        // Exit 0 is "ignored", 1 "not ignored", and anything else an error.
+        git(&self.root, &["check-ignore", "--quiet", path]).is_ok()
     }
 
     /// Puts the working tree back to commit `commit`: its branch moves there, tracked files
