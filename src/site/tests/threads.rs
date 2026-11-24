@@ -536,6 +536,10 @@ fn a_worktree_that_cannot_be_made_fails_its_run_and_leaves_no_thread() {
         (StatusCode::OK, "null".to_owned()),
         "a thread that claims the branch would delete it with its note"
     );
+    assert!(
+        !repo.root.join(".git/postil/threads/R1.lock").exists(),
+        "no record names R1's thread, so nothing would forget its lock file"
+    );
     assert_eq!(
         git_out(&repo.root, &["branch", "--list", "postil/r1-one"]),
         "postil/r1-one"

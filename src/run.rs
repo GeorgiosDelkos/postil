@@ -819,16 +819,9 @@ impl Runner {
             origin,
         };
         let run = Arc::new(Run::create(&self.repo.runs_dir(), opening, in_thread)?);
-        let new_thread = matches!(place, Place::New { .. });
         let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
-                if new_thread {
-                    // No record names the thread, so nothing would ever forget its lock file.
-                    // Removed while the run still holds the lock.
-                    let id = run.state().header.id.clone();
-                    remove_thread_lock(&self.repo.runs_dir(), &id);
-                }
                 run.record(Entry::Failed {
                     error: error_chain(&error),
                 });
@@ -874,17 +867,23 @@ impl Runner {
             let replaced = slot.release();
             let pending = Pending {
                 agent,
-                run,
+                run: Arc::clone(&run),
                 ids: marks,
                 prompt,
                 generation: slot.generation,
                 thread,
                 worktree,
             };
-            if !self.start(pending) && std::mem::take(&mut slot.making) {
+            if let Err(error) = self.start(pending) {
                 // No thread will make the worktree: the thread goes, as one whose worktree
-                // could not be made does.
-                self.drop_new_thread(&id);
+                // could not be made does, before the failure ends the run and with it the
+                // thread's lock, so no window takes the thread meanwhile.
+                if std::mem::take(&mut slot.making) {
+                    self.drop_new_thread(&id);
+                }
+                run.record(Entry::Failed {
+                    error: format!("cannot start a thread for the agent: {error}"),
+                });
             }
             replaced
         };
@@ -908,7 +907,18 @@ impl Runner {
     /// [`Runner::commit_worktree`].
     fn place(&self, run: &Run, place: Place, snapshot: bool) -> Result<(Thread, Worktree)> {
         let (mut thread, worktree) = match place {
-            Place::New { fork, title } => (self.new_thread(run, &fork, &title)?, Worktree::Make),
+            Place::New { fork, title } => match self.new_thread(run, &fork, &title) {
+                Ok(thread) => (thread, Worktree::Make),
+                Err(error) => {
+                    // No record names the thread, so nothing would ever forget its lock file.
+                    // Removed while the run still holds the lock (its failure is recorded
+                    // after this returns), so no window can take the thread, and lock the file
+                    // being removed, meanwhile.
+                    let id = run.state().header.id.clone();
+                    remove_thread_lock(&self.repo.runs_dir(), &id);
+                    return Err(error);
+                }
+            },
             Place::Open(id) => (self.open_thread(&id)?, Worktree::Made),
         };
         match worktree {
@@ -1537,11 +1547,14 @@ impl Runner {
 
     /// Starts the agent on its own thread, then sends the prompt, unless the agent was let go
     /// meanwhile (the run cancelled, the project closed). A new thread's worktree is made
-    /// there first ([`thread::make`]), which takes as long as a checkout. Returns whether that
-    /// thread started; when it did not, the run says why.
-    fn start(self: &Arc<Self>, pending: Pending) -> bool {
+    /// there first ([`thread::make`]), which takes as long as a checkout.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when that thread cannot be spawned; the caller records it in the
+    /// run.
+    fn start(self: &Arc<Self>, pending: Pending) -> std::io::Result<()> {
         let runner = Arc::clone(self);
-        let run = Arc::clone(&pending.run);
         let start = move || {
             let generation = pending.generation;
             let id = pending.thread.id.clone();
@@ -1618,15 +1631,10 @@ impl Runner {
             drop(slots);
             (runner.notify)();
         };
-        let spawned = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("agent-start".to_owned())
-            .spawn(start);
-        if let Err(error) = &spawned {
-            run.record(Entry::Failed {
-                error: format!("cannot start a thread for the agent: {error}"),
-            });
-        }
-        spawned.is_ok()
+            .spawn(start)
+            .map(drop)
     }
 
     /// Makes the worktree of `pending`'s new thread on its start thread, then marks the slot
@@ -1671,7 +1679,9 @@ impl Runner {
 
     /// Takes new thread `id`, whose worktree will not be made, out of the record, and removes
     /// its lock file, which no record then names: nothing would ever forget it. A record that
-    /// cannot be changed stays as it was; the run says why the thread failed.
+    /// cannot be changed stays as it was; the run says why the thread failed. The caller's run
+    /// still holds the thread's lock: a window that took it meanwhile would lock the file
+    /// being removed, and a third one a new file, both working in the thread.
     fn drop_new_thread(&self, id: &str) {
         drop(thread::remove(&self.repo, &[id.to_owned()]));
         remove_thread_lock(&self.repo.runs_dir(), id);

@@ -895,8 +895,9 @@ pub(super) fn hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
 }
 
 /// Deletes thread `id`'s lock file, once no run will work in the thread again: it was
-/// forgotten, or never made it into the record. Another window's count that lists the file as
-/// it goes reads it as free ([`live_threads`]).
+/// forgotten, or never made it into the record. The caller holds its lock, and the record no
+/// longer names the thread, so no window can lock the file being removed. Another window's
+/// count that lists the file as it goes reads it as free ([`live_threads`]).
 pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
     if run_number(id).is_some() {
         // A file left behind is an empty file that locks nothing; nothing reads it.
