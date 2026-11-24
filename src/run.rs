@@ -956,7 +956,10 @@ impl Runner {
 
     /// A snapshot of the files `run` works on as they are now ([`Repo::snapshot`]): its
     /// thread's worktree, or the engineer's working tree for a run from before threads had
-    /// worktrees.
+    /// worktrees. A run whose thread was forgotten, which also has no snapshot after it, is
+    /// taken for one of those too, and compared with the engineer's files: accepted, as it
+    /// takes a failed commit and a deleted log together, and the view says it compares with
+    /// the files as they are.
     ///
     /// # Errors
     ///

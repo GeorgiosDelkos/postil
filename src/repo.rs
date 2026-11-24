@@ -410,9 +410,9 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// [`Error::NotAWorktree`] when `path` has a `.git` that is not a file naming a folder in
-    /// this repository's `worktrees/`, and the git error when the common git dir cannot be
-    /// read.
+    /// [`Error::NotAWorktree`] when `path` exists and has no `.git` file naming a folder in
+    /// this repository's `worktrees/` (no `.git`, one that cannot be read, or one naming
+    /// another place), and the git error when the common git dir cannot be read.
     pub(crate) fn worktree_record(&self, path: &Path) -> Result<Option<PathBuf>> {
         let not_ours = || Error::NotAWorktree {
             path: path.to_owned(),
@@ -493,39 +493,40 @@ impl Repo {
         git(&self.root, &["clean", "-d", "--force", "--quiet"]).map(drop)
     }
 
-    /// Deletes the local branch `branch` while it names commit `expected`, and returns `true`;
-    /// returns `false`, deleting nothing, when it names another commit (one made on it since)
-    /// or a working tree has it checked out (the engineer's own, or any linked worktree):
-    /// either way it is someone's now. The delete itself is `update-ref -d <ref> <expected>`,
-    /// which refuses a branch that moved meanwhile. A branch that does not exist (never made,
-    /// or deleted by hand) is already as asked.
+    /// Deletes the local branch `branch` while it names commit `expected`, and keeps it when it
+    /// names another commit (one made on it since) or a working tree has it checked out (the
+    /// engineer's own, or any linked worktree): either way it is someone's now. The delete
+    /// itself is `update-ref -d <ref> <expected>`, which refuses a branch that moved
+    /// meanwhile. A branch that does not exist (never made, or deleted by hand) is already as
+    /// asked.
     ///
     /// # Errors
     ///
     /// The git errors.
-    pub(crate) fn delete_branch_at(&self, branch: &str, expected: &str) -> Result<bool> {
+    pub(crate) fn delete_branch_at(&self, branch: &str, expected: &str) -> Result<()> {
         let name = format!("refs/heads/{branch}");
         // One line per branch: its commit, then the folder that has it checked out, empty when
         // none does. No line: no such branch.
         let format = "--format=%(objectname) %(worktreepath)";
         let line = git(&self.root, &["for-each-ref", format, &name])?;
         let Some((at, checked_out)) = line.trim_end_matches('\n').split_once(' ') else {
-            return Ok(true);
+            return Ok(());
         };
         if at != expected || !checked_out.is_empty() {
-            return Ok(false);
+            // Kept.
+            return Ok(());
         }
         match git(&self.root, &["update-ref", "-d", &name, expected]) {
-            Ok(_) => Ok(true),
-            // Refused: when the branch moved between the two calls, that is the point; any
-            // other failure is git's to report.
+            Ok(_) => Ok(()),
+            // Refused: when the branch moved between the two calls, it is kept, which is the
+            // point; any other failure is git's to report.
             Err(error) => {
                 let now = git(&self.root, &["rev-parse", "--verify", "--quiet", &name]);
                 match now {
-                    Ok(now) if now.trim_end() != expected => Ok(false),
+                    Ok(now) if now.trim_end() != expected => Ok(()),
                     // Deleted meanwhile: as asked. As in `head`, nothing on stderr is a name
                     // that resolves to nothing.
-                    Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(true),
+                    Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(()),
                     _ => Err(error),
                 }
             }

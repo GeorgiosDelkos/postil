@@ -134,7 +134,8 @@ pub(crate) fn plan(
 /// not given to the worktree, each with the reason: a folder that could not be cloned or
 /// copied, a Python virtual environment (it names its own absolute path, so a clone would
 /// install into the engineer's), or submodules that could not be checked out. Takes as long
-/// as a checkout, plus seconds per large folder.
+/// as a checkout, plus seconds per large folder; checking out submodules may fetch over the
+/// network ([`Repo::update_submodules`]).
 ///
 /// # Errors
 ///
@@ -323,9 +324,14 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     if thread.path.symlink_metadata().is_ok() {
         let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
         let trash = trash_for(repo.root(), home);
+        // From the folder's own name, which `check_place` checked, never from the record's
+        // id: a hand-edited id could name a place outside the trash.
+        let folder = path
+            .file_name()
+            .expect("check_place passed, so the path ends in a folder's name");
         let name = format!(
             "{}-{}-{}",
-            thread.id.to_lowercase(),
+            folder.to_string_lossy(),
             std::process::id(),
             FREED.fetch_add(1, Ordering::Relaxed)
         );
