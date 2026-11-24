@@ -1166,7 +1166,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteLayout { .. }
                 | Error::ReadRun { .. }
                 | Error::NoHome
-                | Error::MakeWorktree { .. }
+                | Error::WriteWorktree { .. }
                 | Error::ReadThreads { .. }
                 | Error::WriteThreads { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             };

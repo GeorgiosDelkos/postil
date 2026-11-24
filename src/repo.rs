@@ -61,7 +61,7 @@ impl Repo {
         }
         // One option per call: git ends each path with a newline, which a path can also hold,
         // so two paths in one output could not be told apart.
-        let root = match rev_parse_path(dir, "--show-toplevel") {
+        let root = match rev_parse_path(dir, Search::Up, "--show-toplevel") {
             Ok(root) => root,
             // `git` runs in the C locale (see `git`), so this message is stable. A folder
             // that has a `.git` of its own is a broken repository (a linked worktree whose
@@ -81,7 +81,7 @@ impl Repo {
             }
             Err(error) => return Err(error),
         };
-        let git_dir = rev_parse_path(dir, "--absolute-git-dir")?;
+        let git_dir = rev_parse_path(dir, Search::Up, "--absolute-git-dir")?;
         Ok(Self {
             root,
             git_dir,
@@ -399,7 +399,7 @@ impl Repo {
             path.as_os_str(),
             OsStr::new(fork),
         ];
-        run_git_with(&self.root, None, &args, None).map(drop)
+        run_git_with(&self.root, Search::Here, None, &args, None).map(drop)
     }
 
     /// The folder in which git keeps its record of the linked worktree at `path`
@@ -418,7 +418,7 @@ impl Repo {
         let not_ours = || Error::NotAWorktree {
             path: path.to_owned(),
         };
-        let common = rev_parse_path(&self.root, "--git-common-dir")?;
+        let common = rev_parse_path(&self.root, Search::Here, "--git-common-dir")?;
         let records = self.root.join(common).join("worktrees");
         let pointer = match fs::read_to_string(path.join(".git")) {
             Ok(pointer) => pointer,
@@ -696,7 +696,7 @@ impl Repo {
             return Ok(());
         }
         let args = ["apply", "--whitespace=nowarn", "-"].map(OsStr::new);
-        run_git_with(&self.root, None, &args, Some(patch)).map(drop)
+        run_git_with(&self.root, Search::Here, None, &args, Some(patch)).map(drop)
     }
 
     /// The ignored folders at the top of the working tree that are on disk, such as `target`
@@ -849,8 +849,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// Runs `git rev-parse <option>` in `dir` and returns the one path it prints, byte for byte:
 /// a path may hold a newline, or bytes that are not UTF-8.
-fn rev_parse_path(dir: &Path, option: &str) -> Result<PathBuf> {
-    let mut path = run_git_bytes(dir, None, &["rev-parse", option])?;
+fn rev_parse_path(dir: &Path, search: Search, option: &str) -> Result<PathBuf> {
+    let args = ["rev-parse", option].map(OsStr::new);
+    let mut path = run_git_with(dir, search, None, &args, None)?;
     // git ends the path with one newline; any other newline is part of the path.
     if path.pop() != Some(b'\n') || path.is_empty() {
         return Err(Error::Git {
@@ -874,7 +875,20 @@ fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
 /// [`run_git`], returning the bytes git printed.
 fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    run_git_with(dir, index, &args, None)
+    run_git_with(dir, Search::Here, index, &args, None)
+}
+
+/// Where git looks for the repository of the folder it runs in.
+#[derive(Debug, Clone, Copy)]
+enum Search {
+    /// In the folder and every folder above it, as git does by default: only to find the
+    /// working tree that holds a folder the engineer picked ([`Repo::open`]).
+    Up,
+    /// In the folder alone. Every other call runs in a working tree's top folder, and when
+    /// its `.git` is gone (an agent in a thread's worktree may delete it), searching up
+    /// would act on whatever repository holds the folder, a dotfiles repository in the
+    /// home folder, say. git then fails instead.
+    Here,
 }
 
 /// Runs `git` in `dir` with arguments that may be paths, writes `input` to its standard input
@@ -884,11 +898,19 @@ fn run_git_bytes(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<
 /// passphrase from the terminal Postil was started from, which the app from the Dock lacks.
 fn run_git_with(
     dir: &Path,
+    search: Search,
     index: Option<&Path>,
     args: &[&OsStr],
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
+    match (search, dir.parent()) {
+        // git looks in `dir`, then stops before the ceiling, its parent. It resolves links
+        // in both before comparing them. A parent whose path holds a colon is read as two
+        // paths, neither of them the parent, and git searches up as with `Search::Up`.
+        (Search::Here, Some(parent)) => drop(command.env("GIT_CEILING_DIRECTORIES", parent)),
+        (Search::Here, None) | (Search::Up, _) => {}
+    }
     command
         .arg("-C")
         .arg(dir)
@@ -935,4 +957,31 @@ fn run_git_with(
     }
 
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TempDir;
+
+    #[test]
+    fn a_working_tree_whose_git_folder_is_gone_fails_instead_of_reaching_the_one_above() {
+        let dir = TempDir::new("repo-no-search-up");
+        git(dir.path(), &["init", "--quiet"]).unwrap();
+        let inner = dir.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+        git(&inner, &["init", "--quiet"]).unwrap();
+        fs::write(inner.join("a.txt"), "a\n").unwrap();
+        let repo = Repo::open(&inner).unwrap();
+        assert_eq!(repo.changed().unwrap(), ["a.txt"]);
+
+        fs::remove_dir_all(inner.join(".git")).unwrap();
+
+        // The outer repository would list `inner/a.txt` as untracked.
+        let error = repo.changed().unwrap_err();
+        assert!(
+            matches!(&error, Error::Git { stderr, .. } if stderr.contains("not a git repository")),
+            "{error:?}"
+        );
+    }
 }

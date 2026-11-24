@@ -242,7 +242,7 @@ pub enum Error {
     NoCommit,
     /// A thread's worktree, or the folder above it, could not be made or moved, or git's
     /// record of it could not be removed.
-    MakeWorktree {
+    WriteWorktree {
         /// The folder.
         path: PathBuf,
         /// The underlying I/O error.
@@ -456,7 +456,7 @@ impl fmt::Display for Error {
                 "the repository has no commit yet, and an agent works on a branch that starts \
                  from one (commit once, then send)"
             ),
-            Self::MakeWorktree { path, .. } => write!(
+            Self::WriteWorktree { path, .. } => write!(
                 f,
                 "cannot make, move or remove {} (check that the folder above it is writable)",
                 path.display()
@@ -523,7 +523,7 @@ impl std::error::Error for Error {
             | Self::WriteFolders { source, .. }
             | Self::WriteLayout { source, .. }
             | Self::ReadRun { source, .. }
-            | Self::MakeWorktree { source, .. }
+            | Self::WriteWorktree { source, .. }
             | Self::WriteThreads { source, .. } => Some(source),
             Self::ParseReview { source, .. } => Some(source),
             Self::Highlight { source, .. } => Some(source),

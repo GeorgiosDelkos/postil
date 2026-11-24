@@ -378,9 +378,12 @@ fn a_record_naming_a_branch_outside_postil_s_never_gets_it_deleted() {
 
     let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
 
-    // The worktree is not on the branch the record names, so nothing is freed or deleted.
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("not the thread's trunk"), "{body}");
+    // The worktree is never opened, so nothing is freed, reset or deleted.
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.contains("names branch trunk, which is not under postil/"),
+        "{body}"
+    );
     assert_eq!(
         git_out(&repo.root, &["branch", "--list", "trunk"]),
         "* trunk"

@@ -139,14 +139,14 @@ pub(crate) fn plan(
 ///
 /// # Errors
 ///
-/// [`Error::MakeWorktree`] when the folder above the worktree cannot be made, and the git
+/// [`Error::WriteWorktree`] when the folder above the worktree cannot be made, and the git
 /// error when the worktree cannot be added.
 pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
     let parent = thread
         .path
         .parent()
         .expect("a worktree's path is <home>/worktrees/<repo>/<folder>");
-    fs::create_dir_all(parent).map_err(|source| Error::MakeWorktree {
+    fs::create_dir_all(parent).map_err(|source| Error::WriteWorktree {
         path: parent.to_owned(),
         source,
     })?;
@@ -312,7 +312,7 @@ pub(crate) fn remove(repo: &Repo, ids: &[String]) -> Result<()> {
 /// # Errors
 ///
 /// [`Error::NotAWorktree`] for a folder anywhere else, or whose `.git` names no worktree
-/// record of this repository; [`Error::ThreadChanged`] as [`check`]; [`Error::MakeWorktree`]
+/// record of this repository; [`Error::ThreadChanged`] as [`check`]; [`Error::WriteWorktree`]
 /// when the folder cannot be moved into the trash or git's record removed; and the git
 /// errors.
 pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
@@ -338,12 +338,12 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
             FREED.fetch_add(1, Ordering::Relaxed)
         );
         let moved = fs::create_dir_all(&trash).and_then(|()| fs::rename(&path, trash.join(&name)));
-        moved.map_err(|source| Error::MakeWorktree { path, source })?;
+        moved.map_err(|source| Error::WriteWorktree { path, source })?;
         // Runs on: the delete takes seconds, and nothing waits for it.
         empty_trash(&trash);
     }
     if let Some(record) = record {
-        fs::remove_dir_all(&record).map_err(|source| Error::MakeWorktree {
+        fs::remove_dir_all(&record).map_err(|source| Error::WriteWorktree {
             path: record,
             source,
         })?;
@@ -370,22 +370,46 @@ pub(crate) fn forget(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
 
 /// `thread`'s worktree, opened only when it is Postil's: where Postil puts worktrees
 /// ([`check_place`]), with a `.git` that names a worktree record of `repo` which names it back
-/// ([`Repo::worktree_record`]). Every git call in a thread's worktree after [`make`] goes
-/// through this (`make` opens the worktree git has only just written, before any agent): git
-/// looks upward from a folder with no `.git` of its own (an agent may delete it), and would act
-/// on whatever repository holds the folder.
+/// ([`Repo::worktree_record`]), and a branch under `postil/`. Every git call in a thread's
+/// worktree after [`make`] goes through this (`make` opens the worktree git has only just
+/// written, before any agent): the worktree is put back on the recorded branch by force
+/// (undoing a reviewer's edits), which must never be the engineer's branch, and a folder
+/// whose `.git` was deleted after this check (an agent may delete it) fails git's calls
+/// instead of reaching a repository above it (`Repo`'s calls search only their own folder).
 ///
 /// # Errors
 ///
-/// [`Error::NotAWorktree`] for a folder that is not Postil's, or not a worktree of `repo`, and
-/// as [`Repo::open`].
+/// [`Error::NotAWorktree`] for a folder that is not Postil's, or not a worktree of `repo`;
+/// [`Error::ReadThreads`] for a branch outside `postil/`; and as [`Repo::open`].
 pub(crate) fn open(repo: &Repo, home: &Path, thread: &Thread) -> Result<Repo> {
+    if !thread.branch.starts_with("postil/") {
+        return Err(Error::ReadThreads {
+            path: threads_file(repo),
+            problem: format!(
+                "thread {} names branch {}, which is not under postil/",
+                thread.id, thread.branch
+            ),
+        });
+    }
     check_place(repo, home, thread)?;
-    repo.worktree_record(&thread.path)?
-        .ok_or_else(|| Error::NotAWorktree {
-            path: thread.path.clone(),
-        })?;
-    Repo::open(&thread.path)
+    let not_ours = || Error::NotAWorktree {
+        path: thread.path.clone(),
+    };
+    repo.worktree_record(&thread.path)?.ok_or_else(not_ours)?;
+    let tree = Repo::open(&thread.path)?;
+    // `Repo::open` searches up from the folder, so a `.git` deleted since the check above
+    // would open the repository that holds it.
+    let same = match (
+        fs::canonicalize(tree.root()),
+        fs::canonicalize(&thread.path),
+    ) {
+        (Ok(root), Ok(path)) => root == path,
+        _ => false,
+    };
+    if !same {
+        return Err(not_ours());
+    }
+    Ok(tree)
 }
 
 /// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
