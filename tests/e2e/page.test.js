@@ -166,6 +166,32 @@ test("Esc with Changes open and the focus elsewhere closes Changes, not the run 
   assert.ok(!run.entries.some((entry) => entry.kind === "cancelRequested"), "no stop was asked");
 });
 
+test("a note's remark on the code follows an edit and a delete of the note (JS18)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "First.");
+  // The page reads the notes again on focus (ui/app.js, `refresh`).
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  // Opening a file while the notes are read would make that read give way.
+  await page.locator("#notes .note").waitFor();
+  await page.locator("#filter").fill("a.rs");
+  await page.locator("#filter").press("Enter");
+  const remark = page.locator("#code-rows .remark");
+  await remark.filter({ hasText: "N1 · First." }).waitFor();
+
+  // An edit and a delete in the page decorate the rows drawn, which keep their remarks.
+  await page.locator("#notes .note").first().click();
+  const dialog = page.locator("#note-dialog");
+  await dialog.getByRole("button", { name: "Edit" }).click();
+  await dialog.locator("textarea").fill("Second.");
+  await dialog.getByRole("button", { name: /Save/ }).click();
+  await remark.filter({ hasText: "N1 · Second." }).waitFor();
+  assert.equal(await remark.count(), 1);
+
+  await dialog.getByRole("button", { name: "Delete note" }).click();
+  await dialog.getByRole("button", { name: "Click again to delete" }).click();
+  await remark.waitFor({ state: "detached" });
+});
+
 test("Up and Down in the file filter move the highlight, and Enter opens that file (JS17)", async (t) => {
   const { page } = await openProject(t);
   const filter = page.locator("#filter");
