@@ -333,7 +333,10 @@ export function notesTray({
   async function sendNotes() {
     const agent = chosenAgent();
     if (!state.send || state.send.sending || tickedIds().length === 0 || !agent) return;
-    state.send.sending = true;
+    // This send step: the engineer may close it, and open another, while the request runs.
+    // What follows touches only this one, never a later step with a request of its own.
+    const send = state.send;
+    send.sending = true;
     renderSendBar();
     // Send is usable again whatever happened, a request that never got an answer included:
     // its error reaches the page's toast (app.js, `unhandledrejection`).
@@ -341,10 +344,11 @@ export function notesTray({
     try {
       started = await startRun(tickedIds(), agent);
     } finally {
-      if (state.send) state.send.sending = false;
-      renderSendBar();
+      send.sending = false;
+      if (state.send === send) renderSendBar();
     }
-    if (!started) return;
+    // A newer step is the engineer's next send: left as it is.
+    if (!started || (state.send && state.send !== send)) return;
     closeSend();
     showTab("run");
   }
