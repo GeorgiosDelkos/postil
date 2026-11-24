@@ -14,7 +14,9 @@ import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
 import { noteDialog } from "./note-dialog.js";
+import { onLines } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
+import { pathNoteDialog } from "./path-note-dialog.js";
 import { runPanel } from "./run-panel.js";
 import { escapeAction, foldRun, isOpen, isResolved } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
@@ -42,11 +44,13 @@ const state = {
   // `node` is built once and moved, never rebuilt, when the rows re-render: a rebuilt
   // textarea would lose its focus, caret, and grown height while the engineer types.
   composer: null,
-  // As `api/notes` returns them: { id, path, lines: { start, end }, snippet, body, anchor },
-  // lines 1-based and inclusive, anchor "found" or "lost". A lost note is shown as outdated.
+  // As `api/notes` returns them: { id, path, target, lines: { start, end }, snippet, body,
+  // anchor, state }, lines 1-based and inclusive, anchor "found" or "lost". `target` is
+  // "lines", "file" or "folder", and only a note on lines has `lines` and `snippet`
+  // (note-place.js). A lost note is shown as outdated.
   notes: [],
   // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
-  // file, and the number of notes in each file.
+  // file, and the number of notes on each file or folder path.
   noteByLine: new Map(),
   noteCountByPath: new Map(),
   // The repository's files as a tree (tree.js), rebuilt when the file list changes, and the
@@ -79,6 +83,8 @@ const files = fileList({
   filterEl,
   codeEl,
   openFile: (path) => code.openFile(path),
+  menu,
+  writeNote: (path, target) => pathNote.open(path, target),
 });
 
 const code = codeView({
@@ -160,7 +166,8 @@ const noteDetail = noteDialog($("note-dialog"), {
   },
   canSend: (note) => tray.canSendAlone() && !isResolved(note),
   agent: () => state.settings?.agent ?? null,
-  showInCode: (note) => code.showNote(note),
+  showInCode: (note) =>
+    note.target === "folder" ? files.showFolder(note.path) : code.showNote(note),
   send: (note, options) => tray.sendAlone(note, options),
   remove: deleteNote,
   resolve: (note) => changeNote("resolve", note),
@@ -171,6 +178,14 @@ const noteDetail = noteDialog($("note-dialog"), {
   reviewOf: (id) => reviewOf(id, runs.knownViews()),
   reviewers: () => state.settings?.reviewers ?? [],
   startReview: (id) => runs.startReview(id),
+  live: () => runs.live(),
+});
+
+// A note on a whole file or folder, from the file list.
+const pathNote = pathNoteDialog($("path-note-dialog"), {
+  add: addPathNote,
+  send: (note, options) => tray.sendAlone(note, options),
+  agent: () => state.settings?.agent ?? null,
   live: () => runs.live(),
 });
 
@@ -231,11 +246,25 @@ function indexNotes() {
   state.noteCountByPath = new Map();
   for (const note of state.notes) {
     state.noteCountByPath.set(note.path, (state.noteCountByPath.get(note.path) ?? 0) + 1);
-    if (note.path !== state.file?.path || note.anchor !== "found") continue;
+    if (!onLines(note) || note.path !== state.file?.path || note.anchor !== "found") continue;
     for (let line = note.lines.start - 1; line < note.lines.end; line += 1) {
       state.noteByLine.set(line, note);
     }
   }
+}
+
+// Stores a note on the whole file or folder at `path` (`target` "file" or "folder") and draws
+// the notes the reply holds. Resolves to `{ note }`, the note stored, or `{ error }`.
+async function addPathNote(path, target, body) {
+  const response = await fetch("api/notes", {
+    method: "POST",
+    body: JSON.stringify({ path, target, body }),
+  });
+  if (!response.ok) return { error: await response.text() };
+  state.notes = (await response.json()).notes;
+  redrawNotes();
+  // The Rust process adds a note last (src/notes.rs, `add`).
+  return { note: state.notes.at(-1) };
 }
 
 // Deletes the note, and with it every run none of whose notes is left (src/run.rs,
@@ -396,7 +425,10 @@ window.addEventListener("keydown", (event) => {
     if (code.copyLines()) event.preventDefault();
   } else if (event.key === "c" && !typing && !event.metaKey && !event.ctrlKey) {
     event.preventDefault();
-    code.openComposer();
+    // On a row of the file list, a note on that whole file or folder.
+    const row = files.focusedRow();
+    if (row) pathNote.open(row.path, row.target);
+    else code.openComposer();
   }
 });
 
@@ -405,7 +437,7 @@ window.addEventListener("keydown", (event) => {
 function guardDraft(action) {
   // A draft in an open dialog (a note's text being edited, a follow-up) keeps its dialog,
   // which says why.
-  if (noteDetail.holdDraft(action) || runs.holdDraft(action)) return true;
+  if ([noteDetail, pathNote, runs].some((dialog) => dialog.holdDraft(action))) return true;
   if (!state.composer?.text.trim()) return false;
   // The note must be in view to be saved or discarded: a dialog over it would make it inert.
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();

@@ -4,6 +4,7 @@
 
 import { diffView, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
+import { fullPlace, onLines } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { foldRun, isLive, isResolved, openQuestion, statusLine } from "./run.js";
 import {
@@ -135,7 +136,8 @@ export function noteDialog(
     close.type = "button";
     close.setAttribute("aria-label", "Close");
     close.addEventListener("click", () => dialogEl.close());
-    const show = el("button", "button note-dialog-show", "Show in code");
+    const shows = note.target === "folder" ? "Show in files" : "Show in code";
+    const show = el("button", "button note-dialog-show", shows);
     show.type = "button";
     show.addEventListener("click", () => {
       dialogEl.close();
@@ -160,8 +162,13 @@ export function noteDialog(
     main.append(noteSection(note));
 
     const lost = note.anchor === "lost";
-    const label = lost ? "Its lines when written; they are no longer in the file" : "Its lines";
-    main.append(section(label, snippetView(note)));
+    if (onLines(note)) {
+      const label = lost ? "Its lines when written; they are no longer in the file" : "Its lines";
+      main.append(section(label, snippetView(note)));
+    } else if (lost) {
+      const gone = `This ${note.target} is no longer in the repository`;
+      main.append(section(gone, el("div", "note-dialog-note", note.path)));
+    }
 
     if (run) {
       main.append(section(`What ${run.agent} said about ${note.id}`, said(note, run)));
@@ -433,8 +440,7 @@ function snippetView(note) {
 }
 
 function where(note) {
-  const { start, end } = note.lines;
-  return `${note.id} · ${note.path}:${start === end ? start : `${start}-${end}`}`;
+  return `${note.id} · ${fullPlace(note)}`;
 }
 
 function history(note, run) {

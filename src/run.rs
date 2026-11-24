@@ -207,13 +207,14 @@ impl Runner {
         })
     }
 
-    /// The prompt the notes `ids` make, as the agent will receive its text.
+    /// The prompt the notes `ids` make, as the agent will receive it: its text and the files
+    /// linked after it.
     ///
     /// # Errors
     ///
     /// As [`notes::prompt`].
-    pub(crate) fn preview(&self, ids: &[String]) -> Result<String> {
-        Ok(notes::prompt(&self.repo, ids)?.text)
+    pub(crate) fn preview(&self, ids: &[String]) -> Result<Prompt> {
+        notes::prompt(&self.repo, ids)
     }
 
     /// Starts a run: sends the notes `ids` to `agent`, starting the agent first unless it is

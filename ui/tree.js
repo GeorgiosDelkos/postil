@@ -78,12 +78,13 @@ export function ancestors(path) {
   return parts.map((_, index) => parts.slice(0, index + 1).join("/"));
 }
 
-// Note counts per folder: each folder's count is the sum over the files below it, at any
-// depth. `counts` maps file paths to their note counts.
+// Note counts below each path: a path's total is the notes on it plus the notes on everything
+// below it, at any depth, so a folder note counts in its own folder. `counts` maps the paths of
+// files and folders to the notes on each; a file's total is its own count.
 export function folderCounts(counts) {
   const totals = new Map();
   for (const [path, count] of counts) {
-    for (const folder of ancestors(path)) {
+    for (const folder of [...ancestors(path), path]) {
       totals.set(folder, (totals.get(folder) ?? 0) + count);
     }
   }

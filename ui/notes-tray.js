@@ -8,6 +8,7 @@
 // (run-panel.js), which takes the front whenever the agent needs the engineer.
 
 import { $, actOnSecondClick, el, showToast, statusIcon } from "./dom.js";
+import { fullPlace, shortPlace } from "./note-place.js";
 import { isLive, isOpen, isResolved, promptLines, sendable } from "./run.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
@@ -51,7 +52,10 @@ export function notesTray({
     if (count === 0) {
       drawnNotes = null;
       const empty = el("div", "empty", "Select lines, then press ");
-      empty.append(el("kbd", "", "c"), " to write a note.");
+      empty.append(
+        el("kbd", "", "c"),
+        " to write a note, or right-click a file or folder for a note on all of it.",
+      );
       notesEl.replaceChildren(empty);
       return;
     }
@@ -120,8 +124,8 @@ export function notesTray({
     const status = noteStatus(note, run);
     return {
       id: note.id,
-      path: note.path,
-      lines: note.lines,
+      place: shortPlace(note),
+      fullPlace: fullPlace(note),
       body: note.body,
       outdated: note.anchor === "lost",
       status,
@@ -144,16 +148,14 @@ export function notesTray({
 
   // A note's card: its status, its place and id, and the note in two lines at most.
   function noteCard(card, onClick) {
-    const { start, end } = card.lines;
-    const lines = start === end ? start : `${start}-${end}`;
     const button = el("button", `note ${card.status.kind}${card.outdated ? " outdated" : ""}`);
     button.type = "button";
     const head = el("div", "note-where");
     const label = el("span", `note-status tone-${card.status.tone}`);
     const said = card.outdated ? `${card.status.label} · outdated` : card.status.label;
     label.append(statusIcon(card.status.kind), said);
-    const place = el("span", "note-place", `${card.path.split("/").at(-1)}:${lines}`);
-    place.title = card.path;
+    const place = el("span", "note-place", card.place);
+    place.title = card.fullPlace;
     head.append(label, place, el("span", "note-id", card.id));
     button.append(head, el("div", "note-body", card.body));
     button.addEventListener("click", onClick);
@@ -315,8 +317,9 @@ export function notesTray({
       return;
     }
 
-    const ticked = state.notes.filter((note) => state.send.ticked.has(note.id));
-    const files = [...new Set(ticked.map((note) => note.path))];
+    // The files linked after the text, as the Rust process links them: a folder note's folder
+    // is named in the text only.
+    const files = reply.files;
     const notes = ids.length === 1 ? "1 note" : `${ids.length} notes`;
     const fileCount = files.length === 1 ? "1 file" : `${files.length} files`;
     $("file-meta").textContent = `${notes} · ${fileCount}`;
@@ -327,7 +330,7 @@ export function notesTray({
     const links = el("div", "prompt-links");
     links.append(el("span", "prompt-links-label", "Linked files"));
     for (const path of files) links.append(el("span", "prompt-link", path));
-    previewEl.replaceChildren(text, links);
+    previewEl.replaceChildren(text, ...(files.length ? [links] : []));
   }
 
   async function sendNotes() {

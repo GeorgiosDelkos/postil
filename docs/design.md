@@ -39,6 +39,12 @@ panel. It is not an editor, not a terminal, and not a PR tool.
    under the selected lines, inside the code, so the eyes do not move. The right-click menu
    also copies the selection (code only, never the line numbers) and its `path:lines`
    reference. `v`/`j`/`k` is not built yet.
+   A note can also be on a whole file or folder: right-click its row in the file list and
+   choose Add Note (or press `c` on a focused row). A dialog takes the text and offers Save,
+   which keeps the note in the tray, and Send to the default agent, which keeps it and sends it
+   alone at once. Both store the note first, so a send that fails leaves it to send again.
+   Asked for by the owner on 2026-11-24, as a modal over the window rather than the inline
+   composer, which belongs to lines of code.
 4. **Collect.** Notes list in the tray on the right, grouped by file. Clicking one jumps to its
    lines. Notes survive restarts.
 5. **Send.** Pick an agent, press `Cmd-Shift-Enter`. The prompt preview shows the exact text the
@@ -171,20 +177,27 @@ schedule three tasks.
 Chosen from what is looked up, iterated, and changed, and how often.
 
 ```rust
-/// A note the engineer wrote on a line range.
+/// A note the engineer wrote on lines, a whole file, or a whole folder.
 struct Note {
     id: NoteId,                    // "N1", "N2": stable, shown in the UI and sent to the agent.
     path: RepoPath,                // Relative to the repository root.
-    lines: LineRange,              // 1-based, inclusive.
-    snippet: String,               // The selected text at the time of writing: the real anchor.
+    target: Target,                // What the note is on. Version 4 on.
     body: String,
-    anchor: Anchor,                // Whether the snippet is still in the file.
+    anchor: Anchor,                // Whether the target is still there.
     state: NoteState,              // Where the note is in the loop. From milestone 3 on.
+}
+
+enum Target {
+    Lines {
+        lines: LineRange,          // 1-based, inclusive.
+        snippet: String,           // The selected text at the time of writing: the real anchor.
+    },
+    Path(PathKind),                // The whole file or folder at `path`.
 }
 
 enum Anchor {
     Found,
-    Lost,                          // The snippet no longer exists in the file.
+    Lost,                          // The snippet, or the file or folder, no longer exists.
 }
 
 enum NoteState {
@@ -197,7 +210,12 @@ enum NoteState {
 - **Notes** live in a `Vec<Note>`. A review holds tens of notes, so every operation is a scan.
   The line numbers are a cache: whenever the notes are read, `locate` keeps a note where its
   snippet still is, moves it to the only other copy, or marks its anchor `Lost`. It never picks
-  the nearest of several copies (see "Notes and their status").
+  the nearest of several copies (see "Notes and their status"). A file or folder note is found
+  while its path is still a file or folder of that kind; a rename is not followed.
+- **The target is an enum** because a file or folder note has no lines and no snippet, and
+  optional fields would let a note have one without the other. Decided 2026-11-24 with the
+  owner, over a separate kind of run that sends a path with no note: a note keeps every view
+  (status, dialogs, reviews, follow-ups) working on it unchanged.
 - **Anchor and state are two fields** because they answer two questions, decided 2026-11-22.
   A sent note whose text the agent replaced is the expected result of a run; an open note whose
   text vanished means the code drifted under it. The verify view shows these differently, and
@@ -227,6 +245,12 @@ As built in milestone 2 (`src/notes.rs`):
   milestone 2 build reading a file with milestone 3's `state` must fail on "version 2", not on
   "unknown field". Milestone 3 therefore writes version 2 and still reads version 1, with
   `state` defaulting to `open`. Milestone 4's resolved state is version 3.
+- **Version 4** adds `target`: `"lines"`, `"file"` or `"folder"`, written for every note. A
+  line note keeps `lines` and `snippet`; a file or folder note has neither, and a note whose
+  fields do not fit its target is refused. An older file reads with every note on lines. The
+  page adds one with `POST /api/notes {path, target, body}`; the path must be written as git
+  writes it (no `.`, `..`, empty names or trailing `/`) and be a file or folder as `target`
+  says now, or the request fails with 400.
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
@@ -301,8 +325,8 @@ How Grok asks a question is not checked yet.
 
 ### The prompt
 
-One text block, then one `resource_link` per file with notes. Every agent must accept both block
-types, so no capability check is needed.
+One text block, then one `resource_link` per file with line or file notes. Every agent must
+accept both block types, so no capability check is needed.
 
 ```text
 These are review notes an engineer wrote while reading this repository.
@@ -313,10 +337,19 @@ When you finish, list each note id with one line on what you did.
 >     let reply = rx.recv().unwrap();
 recv().unwrap() panics when the agent exits mid-request. Return
 AcpError::AgentExited instead.
+
+[N2] src/acp/ (folder)
+Split this module by message kind.
+
+[N3] README.md (file)
+Document the --bench flag.
 ```
 
 The quoted snippet travels with the note because line numbers go stale the moment the agent
-edits the file.
+edits the file. A file or folder note quotes nothing: the agent reads the path itself. A folder
+gets no `resource_link`, because agents read a link as a file; the path in the text names it.
+A file or folder that is gone says so under its heading, as lost lines do. The send step lists
+the linked files as `GET /api/run/preview` returns them (`files`).
 
 ### Runs
 
@@ -395,7 +428,9 @@ One source of run state, the log, so the Rust process has no second summary to k
   run first.
 - **The note detail** (`ui/note-dialog.js`) opens from a card: the note, its lines, what the
   agent said about it, and the run's history for it (tool calls on its file, plan steps that
-  name it). Show in code closes it and scrolls to the note.
+  name it). Show in code closes it and scrolls to the note. For a folder note the history and
+  the diffs are those of every file below the folder, and Show in files opens the folder in the
+  file list (`ui/note-place.js`, `covers`).
 - **Sending one note:** the arrow on a card, or Send in the detail, sends that note alone to
   the default agent at once and stays on the notes; Shift-click opens the send step with only
   it ticked. Decided with the owner on 2026-11-23. A run that starts no longer takes the tray

@@ -1,6 +1,8 @@
 // Reads the unified diff `git diff` prints (src/repo.rs, `Repo::diff`) into files and hunks,
 // for the changes view. Plain functions, apart from the document, so `node --test` runs them.
 
+import { onLines } from "./note-place.js";
+
 // The files of `patch`, in its order. Each is `{ path, status, binary, added, removed, hunks }`:
 // `status` is "added", "deleted" or "modified"; a hunk is `{ header, lines }`, and a line is
 // `{ kind, old, new, text }` with `kind` "context", "add" or "del" and the line numbers it has
@@ -116,7 +118,8 @@ export function unquote(text) {
 
 // Where each of `notes` shows in `file`'s hunks: a map from the new-side line a note's lines
 // end on to the notes there. A note whose lines are not in any hunk is left out: the changes
-// view shows only the changed lines and their context.
+// view shows only the changed lines and their context. A file or folder note has no line to
+// show beside, and is left out too.
 export function notesByLine(file, notes) {
   const shown = new Set(
     file.hunks
@@ -125,7 +128,7 @@ export function notesByLine(file, notes) {
   );
   const placed = new Map();
   for (const note of notes) {
-    if (note.path !== file.path || !shown.has(note.lines.end)) continue;
+    if (!onLines(note) || note.path !== file.path || !shown.has(note.lines.end)) continue;
     placed.set(note.lines.end, [...(placed.get(note.lines.end) ?? []), note]);
   }
   return placed;

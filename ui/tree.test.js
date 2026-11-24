@@ -86,17 +86,19 @@ test("ancestors are the folders to open, outermost first", () => {
   assert.deepEqual(ancestors("README.md"), []);
 });
 
-test("a folder's note count is the sum over every file below it", () => {
+test("a folder's note count is its own notes and the notes on everything below it", () => {
   const counts = new Map([
     ["src/acp/wire.rs", 2],
     ["src/main.rs", 1],
     ["README.md", 4],
+    // Notes on the folders themselves.
+    ["src/acp", 5],
+    ["docs", 1],
   ]);
-  assert.deepEqual(
-    folderCounts(counts),
-    new Map([
-      ["src", 3],
-      ["src/acp", 2],
-    ]),
-  );
+  const totals = folderCounts(counts);
+  assert.equal(totals.get("src"), 8);
+  assert.equal(totals.get("src/acp"), 7);
+  assert.equal(totals.get("docs"), 1);
+  assert.equal(totals.get("README.md"), 4, "a file's total is its own count");
+  assert.equal(totals.get("lib"), undefined);
 });

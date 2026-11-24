@@ -1,5 +1,6 @@
-// The context menu: right-click on the code opens actions for the selected lines, and the
-// send bar's agent picker opens one too. Each action is `{ label, run, detail?, key?,
+// The context menu: right-click on the code opens actions for the selected lines, right-click
+// on a row of the file list opens a note on its file or folder, and the send bar's agent
+// picker opens one too. Each action is `{ label, run, detail?, key?,
 // matches?(event), disabled?, separated? }`.
 
 import { el, showToast } from "./dom.js";

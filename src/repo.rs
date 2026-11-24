@@ -5,10 +5,11 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -338,19 +339,7 @@ impl Repo {
     /// above [`MAX_READ`] bytes, and [`Error::Read`] when the file cannot be read as UTF-8
     /// text.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
-        // The path comes from the page. Only plain components are allowed, so the path itself
-        // cannot climb above the root (`..`) or be absolute. A symlink inside the tree is
-        // still followed, wherever it points: the reader sees what an editor would show.
-        let inside = Path::new(file)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)));
-        if !inside || file.is_empty() {
-            return Err(Error::OutsideRepository {
-                path: file.to_owned(),
-            });
-        }
-
-        let path = self.root.join(file);
+        let path = self.inside(file)?;
         // At most one byte past the limit is read, so a file is refused without reading more
         // than that, whatever its size. Bytes, then text: the limit can cut a character in
         // two, and a large file must be refused as large, not as "not text".
@@ -372,6 +361,62 @@ impl Repo {
             }),
             Err(source) => Err(Error::Read { path, source }),
         }
+    }
+
+    /// What `path` is in the working tree now: a file, a folder, or `None` when nothing is
+    /// there or it is neither (a socket, a broken symlink). A symlink is followed, as
+    /// [`Repo::read`] follows it. One `stat`; reads no file.
+    ///
+    /// A `stat` that fails for another reason (no permission to look) also gives `None`: a
+    /// note's caller can only say "not a file or folder" either way, and no error variant
+    /// names a failed look at a path that may be a folder.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutsideRepository`] for a path that leaves the root, as for [`Repo::read`].
+    pub(crate) fn kind(&self, path: &str) -> Result<Option<PathKind>> {
+        let full = self.inside(path)?;
+        Ok(match fs::metadata(full) {
+            Ok(metadata) if metadata.is_file() => Some(PathKind::File),
+            Ok(metadata) if metadata.is_dir() => Some(PathKind::Folder),
+            _ => None,
+        })
+    }
+
+    /// `file` on disk, once it is known to name something inside the root.
+    ///
+    /// The path comes from the page. It must be written as git writes paths: names joined by
+    /// single `/`, none of them `.` or `..`, with no leading or trailing `/`. So it cannot
+    /// climb above the root or be absolute, and each file or folder has one spelling, the one
+    /// a note stores and a prompt shows. A symlink inside the tree is still followed, wherever
+    /// it points: the reader sees what an editor would show.
+    fn inside(&self, file: &str) -> Result<PathBuf> {
+        let plain = !file.is_empty()
+            && file
+                .split('/')
+                .all(|name| !name.is_empty() && name != "." && name != "..");
+        if !plain {
+            return Err(Error::OutsideRepository {
+                path: file.to_owned(),
+            });
+        }
+        Ok(self.root.join(file))
+    }
+}
+
+/// What a path in the working tree is, as [`Repo::kind`] finds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathKind {
+    File,
+    Folder,
+}
+
+impl fmt::Display for PathKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Folder => "folder",
+        })
     }
 }
 

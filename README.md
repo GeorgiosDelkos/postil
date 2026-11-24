@@ -41,7 +41,9 @@ pull request tool: the agent edits, and you read and write notes.
    JavaScript, TypeScript, Python, Go, JSON and TOML.
 3. **Note** a line range: select lines and press `c` (or right-click, Add note), type, and
    press `Cmd-Enter`. A note keeps the text of its lines, so it follows that text when the file
-   changes.
+   changes. For a note on a whole file or folder, right-click it in the file tree and choose
+   Add Note (or press `c` on its row). The dialog saves the note to the tray, or saves it and
+   sends it to the default agent at once.
 4. **Send** notes to an agent. The send step shows the exact prompt the agent will receive.
    A single note can also be sent from its card or its dialog.
 5. **Watch** the run in the Run tab: the agent's plan, every tool call, its questions and its
@@ -145,7 +147,7 @@ own: if a run fails at start, run the agent's command in a terminal once.
 | `Cmd-O`              | Open a folder                                             |
 | `Cmd-P`              | Find a file                                               |
 | `Cmd-\`              | Focus mode: the code alone, centered                      |
-| `c`                  | Write a note on the selected lines                        |
+| `c`                  | Write a note on the selected lines, or on the focused file or folder in the tree |
 | `Cmd-Enter`          | Save a note; in a dialog, send it or save the edit        |
 | `Cmd-Shift-Enter`    | Open the send step; press again to send                   |
 | `Esc`                | Stop the run; close a dialog, the send step or the view   |
