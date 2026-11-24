@@ -162,7 +162,7 @@ can read and write them too.
 | `<git dir>/postil/review.json`         | The notes of the working tree                  |
 | `<git dir>/postil/runs/R<n>.jsonl`     | Each run's log: its prompt and every event     |
 | `<git dir>/postil/folders.json`        | The folders open in the file list              |
-| `<git dir>/postil-snapshot.index`      | The index Postil writes snapshots through      |
+| `<git dir>/postil/snapshot/index`      | The index Postil writes snapshots through      |
 | `~/.config/postil/settings.json`       | Agents, the default agent, reviewers, the look |
 | `~/.config/postil/layout.json`         | The widths of the panes                        |
 | `~/.config/postil/recent.json`         | The recent projects                            |
