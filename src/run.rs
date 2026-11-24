@@ -902,9 +902,9 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// For a new thread as [`thread::plan`] and [`thread::add`]; for an open one as
-    /// [`Runner::open_thread`]; and without `snapshot` (a proposer), as
-    /// [`Runner::commit_worktree`].
+    /// For a new thread as [`thread::plan`] and [`thread::add`], the thread's lock file then
+    /// removed; for an open one as [`Runner::open_thread`]; and without `snapshot` (a
+    /// proposer), as [`Runner::commit_worktree`].
     fn place(&self, run: &Run, place: Place, snapshot: bool) -> Result<(Thread, Worktree)> {
         let (mut thread, worktree) = match place {
             Place::New { fork, title } => match self.new_thread(run, &fork, &title) {
