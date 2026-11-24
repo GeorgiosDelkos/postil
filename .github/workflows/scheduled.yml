@@ -1,0 +1,61 @@
+# Derived from rust-style/templates/ci/scheduled.yml (jonhoo/rust-ci-conf @ de512da1e85b),
+# adapted for an application that ships on macOS only. Postil can break with no change of its
+# own: a new nightly compiler, or a dependency's new release. Two jobs check for that daily:
+# - nightly: the tests on the latest nightly toolchain (REPO-14), so a rustc regression shows
+#   before it reaches a stable release that rust-toolchain.toml is raised to.
+# - updated: the tests after `cargo update`, with deprecations denied, so a dependency's next
+#   release that breaks Postil, or deprecates what it uses, shows before Dependabot's PR does.
+#   On the pinned toolchain rather than the template's beta, so a failure here comes from the
+#   dependencies and never from the compiler.
+# Both on macOS, because wry builds against GTK on Linux, with the Node.js test.yml pins for the
+# page tests. Unlike the template, they run on the schedule (and by hand) only, not on every
+# push and PR: macOS minutes cost ten times Linux ones, and a PR's own checks are test.yml's.
+permissions:
+  contents: read
+on:
+  schedule:
+    - cron: "7 7 * * *"
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+name: rolling
+jobs:
+  # https://twitter.com/mycoliza/status/1571295690063753218
+  nightly:
+    runs-on: macos-latest
+    name: macos / nightly
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # tag=v7.1.0
+        with:
+          node-version: "26.13.0"
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      # `+nightly` overrides rust-toolchain.toml, which would otherwise pick the pinned release.
+      - name: cargo test --locked
+        run: cargo +nightly test --locked --all-features
+  # https://twitter.com/alcuadrado/status/1571291687837732873
+  updated:
+    runs-on: macos-latest
+    name: macos / updated
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # tag=v7.1.0
+        with:
+          node-version: "26.13.0"
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: cargo update
+        run: cargo update
+      - name: cargo test
+        run: cargo test --locked --all-features
+        env:
+          # Surfaces new deprecations in dependencies before they become removals.
+          RUSTFLAGS: -D deprecated
