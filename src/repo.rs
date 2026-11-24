@@ -368,9 +368,9 @@ impl Repo {
     /// What `path` is in the working tree now: a file, a folder, or `None` when nothing is
     /// there or it is neither (a socket, a FIFO). One `lstat`; reads no file.
     ///
-    /// A symlink is a file, wherever it points, and is not followed: git tracks the link
-    /// itself, so [`Repo::files`] lists it and the file list shows it as a file, even when it
-    /// points at a folder.
+    /// A symlink at `path` is a file, wherever it points, and is not followed: git tracks the
+    /// link itself, so [`Repo::files`] lists it and the file list shows it as a file, even when
+    /// it points at a folder. A symlink earlier in `path` is followed, as for [`Repo::read`].
     ///
     /// An `lstat` that fails for another reason (no permission to look) also gives `None`: a
     /// note's caller can only say "not a file or folder" either way, and no error variant

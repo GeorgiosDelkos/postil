@@ -14,11 +14,10 @@
 //! folder from a new one.
 //!
 //! The anchor says only whether the note's target (its text, or its file or folder) is still
-//! there. It is kept apart from a note's
-//! lifecycle (open, sent, resolved, from milestone 3 on): a sent note whose text the agent
-//! replaced is the expected outcome, while an open note whose text vanished means the code
-//! drifted under it, and the page shows the two differently. One enum would need a variant
-//! for every combination.
+//! there. It is kept apart from a note's lifecycle (open, sent, resolved, from milestone 3
+//! on): a sent note whose text the agent replaced is the expected outcome, while an open note
+//! whose text vanished means the code drifted under it, and the page shows the two
+//! differently. One enum would need a variant for every combination.
 //!
 //! # The file
 //!
