@@ -42,6 +42,8 @@ jobs:
     if: ${{ !github.event.pull_request.draft }}
     runs-on: macos-latest
     name: macos / page e2e
+    # A run takes a few minutes, most of it the build; a hang ends here, not at GitHub's 6 h.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
         with:

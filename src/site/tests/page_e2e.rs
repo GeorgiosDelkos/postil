@@ -7,11 +7,12 @@
 //! `window.postil.runChanged()` (`shell.rs`). A browser driven by Playwright can do neither,
 //! so this bridge stands in for the window:
 //! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, and answers
-//!   `{"base": "/s0/"}`, so that every test starts from nothing.
+//!   `{"base": "/sN/"}`, `N` counting from 0, so that every test starts from nothing.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
-//!   [`Notify`]; the tests' init script calls `runChanged` on each.
+//!   [`Notify`]; the tests' init script calls `runChanged` on each. The app coalesces nudges
+//!   into at most one pending call, so the page here draws at least as often as in the app.
 //!
 //! One thread owns the sites and answers every request, one at a time, as
 //! `spawn_site_worker` does in the app; a thread per connection reads its request.
@@ -45,7 +46,9 @@ fn page_end_to_end() {
     let serving = thread::spawn(move || serve(received));
 
     let status = Command::new("node")
-        .args(["--test", "page.test.js"])
+        // A test that hangs fails after two minutes instead of holding `cargo test`: a test
+        // takes about a second, and each of its waits fails after 10 s.
+        .args(["--test", "--test-timeout=120000", "page.test.js"])
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e"))
         .env("POSTIL_E2E_URL", format!("http://{address}/"))
         .status()
@@ -115,7 +118,10 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
     if rest == "events" {
         let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                     cache-control: no-store\r\n\r\n";
-        if stream.write_all(head.as_bytes()).is_ok() {
+        // A page that stops reading its events without closing them would otherwise block
+        // the agent's thread in `Notify`; a timed-out write drops the stream instead.
+        if stream.set_write_timeout(Some(WAIT)).is_ok() && stream.write_all(head.as_bytes()).is_ok()
+        {
             let mut listeners = bridged
                 .listeners
                 .lock()
