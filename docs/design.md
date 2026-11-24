@@ -746,11 +746,13 @@ worktree record of this repository; Postil writes those pointers absolute
    open one whose changes were applied already, which a second Apply would write again.
 3. Keep the branch. It costs no real disk, the changes view reads its commits, and after
    Apply it is the only copy until the engineer commits. It goes with the thread's last note
-   (section "Runs": a run goes with its last note), with `git branch -D`: `-d` checks
-   ancestry, which a squash merge defeats. The thread goes from the record then too, and its
-   worktree, if it still has one, is freed first. A thread whose follow-up still runs when its first
-   run's log goes keeps all of that until a delete after the run ends. A remote branch is
-   GitHub's to delete ("automatically delete head branches"); Postil never deletes one.
+   (section "Runs": a run goes with its last note), deleted with `update-ref -d` at Postil's
+   commit, which no squash merge defeats (`git branch -d` checks ancestry), and only while no
+   working tree has it checked out: `update-ref` itself does not look, and the engineer may
+   have it checked out in their own. The thread goes from the record then too, and its
+   worktree, if it still has one, is freed first. A thread whose follow-up still runs when its
+   first run's log goes keeps all of that until a delete after the run ends. A remote branch
+   is GitHub's to delete ("automatically delete head branches"); Postil never deletes one.
 
 #### Keeping the disk in bounds
 

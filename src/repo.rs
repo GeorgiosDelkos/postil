@@ -494,31 +494,38 @@ impl Repo {
     }
 
     /// Deletes the local branch `branch` while it names commit `expected`, and returns `true`;
-    /// returns `false`, deleting nothing, when it names another commit (one made on it since).
-    /// The check and the delete are one git call (`update-ref -d <ref> <expected>`), so a
-    /// commit made meanwhile is never deleted. A branch that does not exist (never made, or
-    /// deleted by hand) is already as asked. Does not check that no worktree has it checked
-    /// out: the caller frees the worktree first.
+    /// returns `false`, deleting nothing, when it names another commit (one made on it since)
+    /// or a working tree has it checked out (the engineer's own, or any linked worktree):
+    /// either way it is someone's now. The delete itself is `update-ref -d <ref> <expected>`,
+    /// which refuses a branch that moved meanwhile. A branch that does not exist (never made,
+    /// or deleted by hand) is already as asked.
     ///
     /// # Errors
     ///
     /// The git errors.
     pub(crate) fn delete_branch_at(&self, branch: &str, expected: &str) -> Result<bool> {
         let name = format!("refs/heads/{branch}");
-        let at = match git(&self.root, &["rev-parse", "--verify", "--quiet", &name]) {
-            Ok(at) => at,
-            // As in `head`: nothing on stderr is a name that resolves to nothing.
-            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => return Ok(true),
-            Err(error) => return Err(error),
+        // One line per branch: its commit, then the folder that has it checked out, empty when
+        // none does. No line: no such branch.
+        let format = "--format=%(objectname) %(worktreepath)";
+        let line = git(&self.root, &["for-each-ref", format, &name])?;
+        let Some((at, checked_out)) = line.trim_end_matches('\n').split_once(' ') else {
+            return Ok(true);
         };
-        if at.trim_end() != expected {
+        if at != expected || !checked_out.is_empty() {
             return Ok(false);
         }
         match git(&self.root, &["update-ref", "-d", &name, expected]) {
             Ok(_) => Ok(true),
-            // It moved between the two calls: the delete was refused, which is the point.
-            Err(Error::Git { stderr, .. }) if stderr.contains("but expected") => Ok(false),
-            Err(error) => Err(error),
+            // Refused: when the branch moved between the two calls, that is the point; any
+            // other failure is git's to report.
+            Err(error) => {
+                let now = git(&self.root, &["rev-parse", "--verify", "--quiet", &name]);
+                match now {
+                    Ok(now) if now.trim_end() != expected => Ok(false),
+                    _ => Err(error),
+                }
+            }
         }
     }
 

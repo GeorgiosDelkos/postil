@@ -907,3 +907,22 @@ fn a_thread_record_that_cannot_be_written_fails_the_send() {
         "{body}"
     );
 }
+
+#[test]
+fn deleting_a_note_keeps_a_branch_the_engineer_has_checked_out() {
+    let (repo, site, _nudges, _worktree) = written("thread-branch-checked-out");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    assert_eq!(end(&site, "discard", "R1").0, StatusCode::OK);
+    // Checked out in the engineer's own working tree, with no commit of theirs on it.
+    repo.git(&["checkout", "--quiet", &branch]);
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(git_out(&repo.root, &["branch", "--show-current"]), branch);
+    assert_eq!(git_out(&repo.root, &["status", "--porcelain"]), "");
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
+    );
+}

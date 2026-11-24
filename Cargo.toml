@@ -70,7 +70,8 @@ baseline = true
 [lints.rust]
 # Unsafe code only in `src/clone.rs`, which calls clonefile(2) and says so with an `expect`.
 # The owner allowed that one module on 2026-11-24: a folder clone takes 3 s where the safe
-# route, `cp -c -R`, takes 34 s (docs/design.md, "Worktrees").
+# route, `cp -c -R`, takes 34 s (docs/design.md, "Worktrees"). No Miri job: Miri cannot run
+# that FFI call, the only unsafe code, and its two tests are ignored under Miri.
 unsafe_code = "deny"
 # [ref] The rustc baseline: Tokio sets all five; Jon's crates and Cranelift set subsets
 # (missing_docs in nearly every library of all three).
