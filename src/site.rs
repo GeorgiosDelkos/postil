@@ -819,7 +819,8 @@ impl Site {
     }
 
     /// The reply to `GET /api/run`: with `?id=R2`, that run whole; else the latest run with its
-    /// entries from number `?after=` on, or `null` when the project has none.
+    /// entries from number `?after=` on, without its notes and prompt unless that is 0, or
+    /// `null` when the project has none.
     fn run_view(&self, query: &str) -> Result<Vec<u8>> {
         let runner = self.runner()?;
         match query_value(query, "id") {

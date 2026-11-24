@@ -698,9 +698,9 @@ impl Runner {
         Ok(())
     }
 
-    /// The latest run, with the entries from number `after` on: this window's run, or the
-    /// newest readable log on disk when this window has run nothing yet. `None` when there is
-    /// no run.
+    /// The latest run, with the entries from number `after` on, and its notes and prompt only
+    /// when `after` is 0: this window's run, or the newest readable log on disk when this
+    /// window has run nothing yet. `None` when there is no run.
     ///
     /// # Errors
     ///

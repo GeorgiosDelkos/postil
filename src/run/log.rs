@@ -296,8 +296,13 @@ pub(crate) enum Status {
 pub(crate) struct RunView {
     id: String,
     agent: String,
-    notes: Vec<String>,
-    prompt: String,
+    /// The notes sent and the prompt, left out of a view from a later entry than the first:
+    /// they never change, and the prompt quotes every note with its code, often most of a
+    /// reply the page asks for many times a second (ui/run-store.js keeps them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
     started_at: u64,
     status: Status,
     /// The entries from the number the page asked for on.
@@ -574,13 +579,16 @@ impl Run {
         }
     }
 
+    /// The run as the page gets it, with the entries from number `after` on, and the notes
+    /// and the prompt only when `after` is 0.
     pub(super) fn view(&self, after: usize) -> RunView {
         let state = self.state();
+        let whole = after == 0;
         RunView {
             id: state.header.id.clone(),
             agent: state.header.agent.clone(),
-            notes: state.header.notes.clone(),
-            prompt: state.header.prompt.clone(),
+            notes: whole.then(|| state.header.notes.clone()),
+            prompt: whole.then(|| state.header.prompt.clone()),
             started_at: state.header.started_at,
             status: state.status(),
             entries: state.entries.get(after..).unwrap_or_default().to_vec(),
