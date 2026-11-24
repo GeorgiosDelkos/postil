@@ -3,8 +3,9 @@
 //!
 //! ACP is JSON-RPC 2.0, one JSON object per line, over the agent's standard input and output
 //! (docs/design.md, "ACP integration"). The app is the client and speaks version 1. It
-//! advertises no file or terminal capability, so the only request an agent sends that the
-//! app serves is a permission request.
+//! advertises form elicitation and no file or terminal capability, so the requests an agent
+//! sends that the app serves are permission requests (`session/request_permission`) and
+//! questions (`elicitation/create` or `session/create_elicitation`).
 //!
 //! # Threads
 //!

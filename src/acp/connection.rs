@@ -464,8 +464,11 @@ impl State {
     }
 }
 
-/// Locks one of [`Shared`]'s mutexes. Poisoning is ignored: every change under these locks is
-/// a single insert, remove, or assignment, so a panic cannot leave one half done.
+/// Locks one of [`Shared`]'s mutexes. Poisoning is ignored because nothing panics while one
+/// is held: the code under these locks makes map operations and assignments, calls nothing
+/// outside this file, and each `expect` there follows the check that makes it hold. A change
+/// can set several fields (the reader's end clears the waiters, the turn and the requests),
+/// so the argument is that no panic happens midway, not that a change is one step.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
