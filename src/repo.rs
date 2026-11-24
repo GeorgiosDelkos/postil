@@ -209,11 +209,11 @@ impl Repo {
     /// changes view").
     ///
     /// The tree is written through an index of Postil's own, `<git dir>/postil/snapshot/index`,
-    /// so the engineer's index, branch and stash are left as they are. It
-    /// is kept between snapshots, so git hashes again only the files whose stat data changed
-    /// since the last one, untracked files included. It starts from a copy of the real index,
-    /// and again whenever the two track different ignored files (one force-added, or one taken
-    /// out of git and added to `.gitignore`), which `git add --all` cannot reconcile; each copy
+    /// so the engineer's index, branch and stash are left as they are. It is kept between
+    /// snapshots, so git hashes again only the files whose stat data changed since the last
+    /// one, untracked files included. It starts from a copy of the real index, and again
+    /// whenever the two track different ignored files (one force-added, or one taken out of
+    /// git and added to `.gitignore`), which `git add --all` cannot reconcile; each copy
     /// hashes the untracked files in full once. A snapshot index git cannot read is copied
     /// again at once; one that fails `git add` or `write-tree` is removed, so the next snapshot
     /// starts afresh. `git add` runs the repository's clean filters (git-lfs copies a changed
