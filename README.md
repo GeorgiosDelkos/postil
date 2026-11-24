@@ -181,8 +181,9 @@ cargo test --locked          # Rust tests, and the page's tests through Node
 node --test ui/              # the page's tests alone
 ```
 
-`prek install`, once per clone, runs CI's lints (rustfmt, clippy, oxlint, oxfmt) on every commit
-from `.pre-commit-config.yaml`.
+[prek](https://github.com/j178/prek) (`cargo install --locked prek`)
+runs CI's lints (rustfmt, clippy, rustdoc, oxlint, oxfmt) on every commit from
+`.pre-commit-config.yaml`, once `prek install` has been run in the clone.
 
 The Rust tests run end to end: they drive the app's HTTP routes against real git repositories
 in temporary directories and a fake ACP agent (`tests/fake-agent.mjs`) over real pipes. One
