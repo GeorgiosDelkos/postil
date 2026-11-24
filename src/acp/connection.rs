@@ -1309,9 +1309,13 @@ mod tests {
                 stderr: "panicked at the model".to_owned()
             }
         );
-        match agent.prompt(&[text("y")]) {
-            Err(Error::AgentExited { stderr }) => assert_eq!(stderr, "panicked at the model"),
-            other => panic!("expected AgentExited, got {other:?}"),
+        // Twice: a prompt to a gone agent must not leave a turn behind that makes the next
+        // one fail as "a turn is running".
+        for attempt in ["y", "z"] {
+            match agent.prompt(&[text(attempt)]) {
+                Err(Error::AgentExited { stderr }) => assert_eq!(stderr, "panicked at the model"),
+                other => panic!("{attempt}: expected AgentExited, got {other:?}"),
+            }
         }
     }
 
