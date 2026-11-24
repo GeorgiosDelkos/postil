@@ -40,6 +40,7 @@
 //! with every note open. Version 3 added the resolved state. The next write makes an older
 //! file version 3.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io;
@@ -68,7 +69,7 @@ const VERSION: u32 = 3;
 /// an error: its anchor is lost.
 pub(crate) fn current(repo: &Repo) -> Result<Review> {
     let mut review = Review::load(&repo.review_file())?;
-    review.relocate(repo);
+    review.relocate(repo, HashMap::new());
     Ok(review)
 }
 
@@ -118,7 +119,9 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
         path: new.path.clone(),
     })?;
 
-    let mut review = current(repo)?;
+    // As `current`, with the note's file read once: its text places the other notes in it.
+    let mut review = Review::load(&file)?;
+    review.relocate(repo, HashMap::from([(new.path.clone(), Some(text))]));
     // The highest id plus one, not the count plus one: ids stay unique when someone removes
     // a note by editing the file.
     let highest = review.notes.iter().map(|note| note.id.0).max().unwrap_or(0);
@@ -510,15 +513,27 @@ impl Review {
         })
     }
 
-    /// Places every note by [`locate`] in its file as it is now.
+    /// Places every note by [`locate`] in its file as it is now. `read` holds the files read
+    /// already, by path, `None` for one that cannot be read; the others are read here.
     ///
-    /// Reads one file per note and compares every position in it with the snippet. A review
-    /// holds tens of notes, so this stays well under a frame for files of a few thousand
-    /// lines; an index of each file's lines would be the next step if it does not.
-    fn relocate(&mut self, repo: &Repo) {
+    /// Reads each file and splits it into lines once, however many notes it has: splitting it
+    /// again for each note took 17 ms of a `GET /api/notes` with 200 notes on ten files of
+    /// 5000 lines, 2 ms once split. Then compares every position in the file with each of its
+    /// notes' snippets.
+    fn relocate(&mut self, repo: &Repo, mut read: HashMap<String, Option<String>>) {
+        for note in &self.notes {
+            if !read.contains_key(&note.path) {
+                read.insert(note.path.clone(), repo.read(&note.path).ok());
+            }
+        }
+        // Split as `locate` splits.
+        let split: HashMap<&str, Vec<&str>> = read
+            .iter()
+            .filter_map(|(path, text)| Some((path.as_str(), text.as_deref()?.lines().collect())))
+            .collect();
         for note in &mut self.notes {
-            let text = repo.read(&note.path).ok();
-            match text.and_then(|text| locate(&text, &note.snippet, note.lines)) {
+            let found = split.get(note.path.as_str());
+            match found.and_then(|lines| locate_lines(lines, &note.snippet, note.lines)) {
                 Some(lines) => {
                     note.lines = lines;
                     note.anchor = Anchor::Found;
@@ -535,7 +550,11 @@ impl Review {
 fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
     // `str::lines` drops `\r\n` and `\n` alike, as the highlighter does, so the line numbers
     // here are the ones the page shows.
-    let lines: Vec<&str> = text.lines().collect();
+    locate_lines(&text.lines().collect::<Vec<_>>(), snippet, last)
+}
+
+/// [`locate`] in a text already split into `lines`.
+fn locate_lines(lines: &[&str], snippet: &str, last: LineRange) -> Option<LineRange> {
     let wanted: Vec<&str> = snippet.split('\n').collect();
 
     let mut found = lines

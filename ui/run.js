@@ -34,32 +34,68 @@ export function sentIn(note) {
 // be changed by its callers.
 const folds = new WeakMap();
 
+// The state behind the last fold made, which the next one extends when its entries start with
+// the same entries: the store's list for the latest run grows by one fetch at a time
+// (run-store.js), and folding it whole on every fetch took time quadratic in the run's length.
+let latest = null;
+
 export function foldRun(entries) {
   let fold = folds.get(entries);
   if (!fold) {
-    fold = foldEntries(entries);
+    const base = latest && startsWith(entries, latest.entries) ? latest : emptyFold();
+    latest = foldMore(base, entries);
+    fold = { plan: latest.plan, items: latest.items };
     folds.set(entries, fold);
   }
   return fold;
 }
 
-function foldEntries(entries) {
-  let plan = null;
-  const items = [];
-  const tools = new Map();
-  const permissions = new Map();
-  // A cancel can log a request's answer before the request itself (src/run/log.rs).
-  const early = new Map();
+// Whether `entries` begins with every entry of `prefix`, the same objects in the same order.
+function startsWith(entries, prefix) {
+  return prefix.length <= entries.length && prefix.every((entry, i) => entries[i] === entry);
+}
+
+function emptyFold() {
+  return {
+    entries: [],
+    plan: null,
+    items: [],
+    // Item indices: of each tool call by id, and of each permission request and question by
+    // request number.
+    tools: new Map(),
+    permissions: new Map(),
+    // A cancel can log a request's answer before the request itself (src/run/log.rs).
+    early: new Map(),
+  };
+}
+
+// Folds the entries of `entries` after those of `base` into a copy of `base`'s items. The
+// maps of `base` are taken over and changed, so `base` must not be extended again; its items
+// are not: one is copied before it changes, as a fold already returned must stay as it was
+// (`followRun` in app.js compares the fold before an update with the one after).
+function foldMore(base, entries) {
+  const { tools, permissions, early } = base;
+  const shared = base.items.length;
+  const items = base.items.slice();
+  const copied = new Set();
+  const own = (index) => {
+    if (index < shared && !copied.has(index)) {
+      items[index] = { ...items[index] };
+      copied.add(index);
+    }
+    return items[index];
+  };
+  let plan = base.plan;
 
   // A part joins the item before it when both are of one type and one message: the agent's
   // message id when it sends one, else parts in a row are one message.
   const append = (type, text, message) => {
     const last = items.at(-1);
-    if (last?.type === type && last.message === message) last.text += text;
+    if (last?.type === type && last.message === message) own(items.length - 1).text += text;
     else items.push({ type, text, message });
   };
 
-  for (const entry of entries) {
+  for (const entry of entries.slice(base.entries.length)) {
     switch (entry.kind) {
       case "message":
         append("message", entry.text, entry.message);
@@ -68,7 +104,6 @@ function foldEntries(entries) {
         append("thought", entry.text);
         break;
       case "tool": {
-        const known = tools.get(entry.id);
         const tool = {
           type: "tool",
           id: entry.id,
@@ -79,18 +114,18 @@ function foldEntries(entries) {
           output: entry.output,
         };
         // An agent may report the same call twice; the second report replaces the first.
-        if (known) Object.assign(known, tool);
-        else {
-          tools.set(entry.id, tool);
+        const known = tools.get(entry.id);
+        if (known === undefined) {
+          tools.set(entry.id, items.length);
           items.push(tool);
-        }
+        } else items[known] = tool;
         break;
       }
       case "toolUpdate": {
-        let tool = tools.get(entry.id);
-        if (!tool) {
+        if (!tools.has(entry.id)) {
           // A change to a call the log never started: shown, under its id.
-          tool = {
+          tools.set(entry.id, items.length);
+          items.push({
             type: "tool",
             id: entry.id,
             title: entry.id,
@@ -98,10 +133,9 @@ function foldEntries(entries) {
             status: "pending",
             places: [],
             output: [],
-          };
-          tools.set(entry.id, tool);
-          items.push(tool);
+          });
         }
+        const tool = own(tools.get(entry.id));
         for (const field of ["title", "tool", "status", "places", "output"]) {
           if (entry[field] !== null && entry[field] !== undefined) tool[field] = entry[field];
         }
@@ -111,21 +145,22 @@ function foldEntries(entries) {
         plan = entry.steps;
         break;
       case "permission": {
-        const request = {
+        const call = tools.get(entry.toolCall);
+        permissions.set(entry.request, items.length);
+        items.push({
           type: "permission",
           request: entry.request,
-          title: entry.title ?? tools.get(entry.toolCall)?.title ?? "A tool call",
+          title: entry.title ?? (call === undefined ? null : items[call].title) ?? "A tool call",
           options: entry.options,
           // `undefined` while open; then the chosen option's id, or `null` when cancelled.
           answer: early.get(entry.request),
-        };
-        permissions.set(entry.request, request);
-        items.push(request);
+        });
         break;
       }
-      case "question": {
+      case "question":
         // Numbered with the permission requests (src/acp.rs, "Permission requests").
-        const question = {
+        permissions.set(entry.request, items.length);
+        items.push({
           type: "question",
           request: entry.request,
           message: entry.message,
@@ -133,20 +168,17 @@ function foldEntries(entries) {
           // `undefined` while open; then `{ content }`, the form's values or `null` for a
           // skip, or `null` when closed unanswered (the run stopped, or the agent withdrew it).
           answer: early.get(entry.request),
-        };
-        permissions.set(entry.request, question);
-        items.push(question);
+        });
         break;
-      }
       case "answer": {
         const request = permissions.get(entry.request);
-        if (request) request.answer = entry.option;
-        else early.set(entry.request, entry.option);
+        if (request === undefined) early.set(entry.request, entry.option);
+        else own(request).answer = entry.option;
         break;
       }
       case "reply": {
         const question = permissions.get(entry.request);
-        if (question) question.answer = { content: entry.content };
+        if (question !== undefined) own(question).answer = { content: entry.content };
         break;
       }
       case "unreadable":
@@ -163,7 +195,7 @@ function foldEntries(entries) {
         break;
     }
   }
-  return { plan, items };
+  return { entries, plan, items, tools, permissions, early };
 }
 
 // The open question, if any: the one the engineer is asked to answer.

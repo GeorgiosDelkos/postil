@@ -168,6 +168,11 @@ fn sent_notes_reach_the_agent_and_every_step_of_the_run_is_kept_on_disk() {
     let tail = get_json(&site, &format!("{RUN}?after={}", total - 1));
     assert_eq!(tail["entries"], serde_json::json!([last]));
     assert_eq!(tail["total"], total);
+    assert_eq!(tail["status"], "ended");
+    assert!(
+        tail.get("prompt").is_none() && tail.get("notes").is_none(),
+        "the page has the header fields that never change: {tail}"
+    );
 
     drop(site);
     assert_read_back(&repo, &ended);

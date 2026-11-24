@@ -34,3 +34,36 @@ test("failed fetches keep one retry waiting, not one per failure", async (t) => 
   assert.equal(fetches, 3);
   assert.deepEqual(errors, ["offline", "offline", "offline"]);
 });
+
+test("a later reply updates the run and keeps its notes and prompt, which it leaves out", async (t) => {
+  const replies = {
+    "api/run?after=0": {
+      id: "R1",
+      notes: ["N1"],
+      prompt: "p",
+      status: "running",
+      total: 1,
+      entries: ["a"],
+    },
+    "api/run?after=1": { id: "R1", status: "ended", total: 2, entries: ["b"] },
+    "api/runs": { runs: ["R1"] },
+  };
+  t.mock.method(globalThis, "fetch", async (url) => new Response(JSON.stringify(replies[url])));
+  const store = runStore({
+    render() {},
+    onChange() {},
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+
+  await store.sync();
+  await store.sync();
+  assert.deepEqual(store.run(), {
+    id: "R1",
+    notes: ["N1"],
+    prompt: "p",
+    status: "ended",
+    total: 2,
+    entries: ["a", "b"],
+  });
+});

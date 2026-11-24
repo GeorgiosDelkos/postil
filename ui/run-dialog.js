@@ -113,7 +113,8 @@ export function runDialog({
       const index = steps.findIndex((step) => step.key === detail.key);
       if (index < 0) return;
       const { item } = steps[index];
-      // An answer as JSON: a question's is a new object on every fold (run.js, `foldRun`).
+      // An answer as JSON, compared by its content: a question's is an object, and a fold
+      // made from the whole run again (run.js, `foldRun`) builds a new one.
       const answer = JSON.stringify(item.answer);
       stamp = [
         `${view.id}:${detail.key}`,

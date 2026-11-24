@@ -271,6 +271,8 @@ async function prompt(id, params) {
       const note = blocks.join("\n").match(/\[(N\d+)\]/)?.[1];
       if (!note) throw new Error("flood: the prompt names no note");
       update({ sessionUpdate: "tool_call", toolCallId: "t1", title: "Edit src/a.rs", kind: "edit", status: "pending", locations: [{ path: file, line: 1 }] });
+      // Made for real, so the run's changes have lines (`GET api/run/changes`).
+      writeFileSync(file, "one\n2\nthree\n");
       update({ sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed", content: [{ type: "diff", path: file, oldText: "one\ntwo\nthree\n", newText: "one\n2\nthree\n" }] });
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `[${note}]: ` }, messageId: "reply" });
       let stopped = false;

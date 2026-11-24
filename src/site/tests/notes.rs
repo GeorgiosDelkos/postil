@@ -510,6 +510,41 @@ fn a_review_with_the_highest_id_refuses_another_note_and_is_left_alone() {
 }
 
 #[test]
+fn notes_on_several_files_are_each_placed_in_their_own_file() {
+    let repo = TempRepo::new("notes-files");
+    // Each file's lines are in the other: a note placed in the wrong file is found there, at
+    // another line.
+    repo.write("src/a.rs", "x\ny\n");
+    repo.write("src/b.rs", "y\nx\n");
+    let site = repo.site();
+    post_note(&site, "src/a.rs", 1, 1, "On x.");
+    post_note(&site, "src/b.rs", 1, 1, "On y.");
+    post_note(&site, "src/a.rs", 2, 2, "On y.");
+
+    repo.write("src/a.rs", "new\nx\ny\n");
+    assert_eq!(
+        anchors(&get_json(&site, NOTES)),
+        [
+            anchor("N1", 2, 2, "found"),
+            anchor("N2", 1, 1, "found"),
+            anchor("N3", 3, 3, "found"),
+        ]
+    );
+
+    // Adding a note reads its own file first: the other file's notes are placed in theirs.
+    repo.write("src/a.rs", "new\nnew\nx\ny\n");
+    assert_eq!(
+        anchors(&post_note(&site, "src/b.rs", 2, 2, "On x.")),
+        [
+            anchor("N1", 3, 3, "found"),
+            anchor("N2", 1, 1, "found"),
+            anchor("N3", 4, 4, "found"),
+            anchor("N4", 2, 2, "found"),
+        ]
+    );
+}
+
+#[test]
 fn a_note_goes_where_its_shown_text_is_when_the_file_changed_meanwhile() {
     let repo = TempRepo::new("notes-shown");
     repo.write("a.txt", "a\nb\nc\n");
