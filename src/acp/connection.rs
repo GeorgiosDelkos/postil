@@ -1465,6 +1465,21 @@ mod tests {
         stopper.stop();
     }
 
+    /// JSON-RPC matches a reply to its request by id, so the ids of one connection must all
+    /// differ, whatever order the app's requests come in.
+    #[test]
+    fn every_request_of_a_connection_gets_an_id_of_its_own() {
+        let mut state = State::default();
+        let (caller, _replies) = mpsc::sync_channel(1);
+        let call = state.register(caller).unwrap();
+        let turn = state.new_id().unwrap();
+        let next = state.new_id().unwrap();
+        assert!(
+            call != turn && turn != next && call != next,
+            "{call} {turn} {next}"
+        );
+    }
+
     #[test]
     fn an_agent_that_exited_is_not_alive() {
         let (agent, events) = start("exit-after-turn").unwrap();
