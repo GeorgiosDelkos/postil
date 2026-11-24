@@ -181,6 +181,9 @@ cargo test --locked          # Rust tests, and the page's tests through Node
 node --test ui/              # the page's tests alone
 ```
 
+`prek install`, once per clone, runs CI's lints (rustfmt, clippy, oxlint, oxfmt) on every commit
+from `.pre-commit-config.yaml`.
+
 The Rust tests run end to end: they drive the app's HTTP routes against real git repositories
 in temporary directories and a fake ACP agent (`tests/fake-agent.mjs`) over real pipes. One
 test runs a real agent when `POSTIL_REAL_AGENT` is set.
@@ -206,7 +209,8 @@ cargo mutants --in-diff /tmp/pr.diff
 
 CI runs formatting, clippy and the tests on macOS for every pull request that is ready for
 review, and `cargo deny` (advisories, licenses, sources) when the dependencies change and every
-night.
+night. Every day it also runs the tests on the nightly toolchain, and after `cargo update` with
+deprecations denied (`.github/workflows/scheduled.yml`).
 
 [`docs/design.md`](docs/design.md) is the design: the loop, the data structures, the ACP
 integration, runs, reviews, follow-ups, the changes view, and the decisions with their reasons.

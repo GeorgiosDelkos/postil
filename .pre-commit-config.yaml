@@ -1,0 +1,33 @@
+# From rust-style/templates/.pre-commit-config.yaml, with the page's lints added. Run
+# `prek install` once per clone. Runs check.yml's blocking lints locally on every commit, so a
+# push does not fail on them, with the same flags and versions as check.yml: the Rust lint set
+# comes from Cargo.toml's [lints] table and clippy.toml, the page's from .oxlintrc.json and
+# .oxfmtrc.json. The page's two need network the first time, for npx to fetch them.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --locked --all-targets --all-features -- -D warnings
+        language: system
+        # Manifest and lint-config changes can introduce warnings without touching a .rs file.
+        files: '(\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml)$'
+        pass_filenames: false
+      - id: oxlint
+        name: oxlint --deny-warnings
+        entry: npx --yes oxlint@1.93.0 --deny-warnings ui/ tests/e2e/
+        language: system
+        files: '^(ui/.*\.js|tests/e2e/.*\.js|\.oxlintrc\.json)$'
+        pass_filenames: false
+      - id: oxfmt
+        name: oxfmt --check
+        entry: npx --yes oxfmt@0.78.0 --check 'ui/**/*.js' 'tests/e2e/*.js'
+        language: system
+        files: '^(ui/.*\.js|tests/e2e/.*\.js|\.oxfmtrc\.json)$'
+        pass_filenames: false
