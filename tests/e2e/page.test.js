@@ -48,8 +48,8 @@ before(async () => {
 });
 after(() => browser?.close());
 
-// A new project on the bridge, `src/a.rs` in a fresh repository, open in a new page. `api` calls
-// its routes from the test, as the page does.
+// A new project on the bridge, `src/a.rs`, `b.rs` and `c.rs` in a fresh repository, open in a
+// new page. `api` calls its routes from the test, as the page does.
 async function openProject(t) {
   const created = await fetch(new URL("new", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);
@@ -164,4 +164,26 @@ test("Esc with Changes open and the focus elsewhere closes Changes, not the run 
   const run = await api("api/run");
   assert.ok(isLive(run), `the run goes on: ${run.status}`);
   assert.ok(!run.entries.some((entry) => entry.kind === "cancelRequested"), "no stop was asked");
+});
+
+test("Up and Down in the file filter move the highlight, and Enter opens that file (JS17)", async (t) => {
+  const { page } = await openProject(t);
+  const filter = page.locator("#filter");
+  await filter.fill("rs");
+  const highlighted = () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll("#files .file.active")].map((row) => row.dataset.path),
+    );
+  await page.locator("#files .file").nth(2).waitFor();
+  assert.deepEqual(await highlighted(), ["src/a.rs"], "the best match first");
+
+  await filter.press("ArrowUp");
+  assert.deepEqual(await highlighted(), ["src/a.rs"], "the first stays highlighted");
+  for (let press = 0; press < 4; press += 1) await filter.press("ArrowDown");
+  assert.deepEqual(await highlighted(), ["src/c.rs"], "the last stays highlighted");
+  await filter.press("ArrowUp");
+  assert.deepEqual(await highlighted(), ["src/b.rs"]);
+
+  await filter.press("Enter");
+  await page.locator("#code-rows").filter({ hasText: "bee" }).waitFor();
 });
