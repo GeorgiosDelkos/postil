@@ -1194,16 +1194,14 @@ impl Runner {
     /// holds the lock it forgets nothing, and the next delete tries again. A follow-up still
     /// running when its thread's first log went keeps the thread until a delete after it ends.
     ///
-    /// The worktree must pass the check that ending a thread makes ([`thread::free`] makes it):
-    /// work Postil did not commit is not deleted with a note. A branch past Postil's commit
-    /// stays, and only a branch under `postil/` is deleted, since the name comes from the
-    /// record, which a hand edit can change.
+    /// Each thread goes through [`thread::forget`], which keeps what is not Postil's to delete:
+    /// work Postil did not commit, a branch past Postil's commit or checked out, and any
+    /// branch outside `postil/`.
     ///
     /// # Errors
     ///
-    /// As [`thread::all`], [`thread::free`], [`Repo::delete_branch_at`] and
-    /// [`thread::remove`]. A thread that fails one of them stays in the record, and is tried
-    /// again at the next delete.
+    /// As [`thread::all`], [`thread::forget`] and [`thread::remove`]. A thread that fails one
+    /// of them stays in the record, and is tried again at the next delete.
     fn forget_threads(&self) -> Result<()> {
         let Some(home) = self.home.as_deref() else {
             return Ok(());
@@ -1243,16 +1241,7 @@ impl Runner {
             // now. The thread is forgotten and the branch is not, so no delete is refused for
             // good. Only uncommitted work in the worktree keeps the thread, which `free`
             // refuses to delete.
-            let forgotten = thread::free(&self.repo, home, &thread).and_then(|()| {
-                if thread.branch.starts_with("postil/") {
-                    self.repo
-                        .delete_branch_at(&thread.branch, &thread.tip)
-                        .map(drop)
-                } else {
-                    Ok(())
-                }
-            });
-            match forgotten {
+            match thread::forget(&self.repo, home, &thread) {
                 Ok(()) => removed.push(thread.id),
                 Err(error) => {
                     first_error.get_or_insert(error);

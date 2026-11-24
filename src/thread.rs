@@ -254,7 +254,10 @@ pub(crate) fn add(repo: &Repo, thread: &Thread) -> Result<()> {
         if threads.iter().any(|t| t.id == thread.id) {
             return Err(Error::ReadThreads {
                 path: threads_file(repo),
-                problem: format!("it has a thread {} already", thread.id),
+                problem: format!(
+                    "it has a thread {} already (remove that entry: its run log is gone)",
+                    thread.id
+                ),
             });
         }
         threads.push(thread.clone());
@@ -336,6 +339,23 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
             path: record,
             source,
         })?;
+    }
+    Ok(())
+}
+
+/// Frees `thread`'s worktree ([`free`], with its checks) and deletes its branch while that
+/// still names the thread's tip and no working tree has it checked out
+/// ([`Repo::delete_branch_at`]): what goes with a thread's last note. A branch past the tip
+/// stays, as the engineer's work, and only a branch under `postil/` is deleted at all, since
+/// the name comes from the record, which a hand edit can change. Does not touch the record.
+///
+/// # Errors
+///
+/// As [`free`] and [`Repo::delete_branch_at`].
+pub(crate) fn forget(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
+    free(repo, home, thread)?;
+    if thread.branch.starts_with("postil/") {
+        repo.delete_branch_at(&thread.branch, &thread.tip)?;
     }
     Ok(())
 }

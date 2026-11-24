@@ -926,3 +926,31 @@ fn deleting_a_note_keeps_a_branch_the_engineer_has_checked_out() {
         (StatusCode::OK, "null".to_owned())
     );
 }
+
+#[test]
+fn a_commit_with_changes_only_inside_a_repository_it_holds_commits_nothing_and_succeeds() {
+    let repo = TempRepo::new("thread-inner-repo");
+    repo.write("a.txt", "a\n");
+    // A repository inside, committed as a link to its commit, as a submodule is.
+    let inner = repo.root.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    git_out(&inner, &["init", "--quiet"]);
+    let identity = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"];
+    let commit = ["commit", "--quiet", "--allow-empty", "--message", "inner"];
+    git_out(&inner, &[&identity[..], &commit[..]].concat());
+    repo.commit();
+    let before = git_out(&repo.root, &["rev-parse", "HEAD"]);
+    // Changed inside: `git status` lists `inner`, and `git add` stages nothing for it.
+    fs::write(inner.join("loose.txt"), "loose\n").unwrap();
+    assert!(git_out(&repo.root, &["status", "--porcelain"]).contains("inner"));
+
+    let after = Repo::open(&repo.root)
+        .unwrap()
+        .commit_all("Postil R1")
+        .unwrap();
+
+    assert_eq!(
+        after, before,
+        "nothing to commit is no commit, and no error"
+    );
+}

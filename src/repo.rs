@@ -523,6 +523,9 @@ impl Repo {
                 let now = git(&self.root, &["rev-parse", "--verify", "--quiet", &name]);
                 match now {
                     Ok(now) if now.trim_end() != expected => Ok(false),
+                    // Deleted meanwhile: as asked. As in `head`, nothing on stderr is a name
+                    // that resolves to nothing.
+                    Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(true),
                     _ => Err(error),
                 }
             }
@@ -572,9 +575,10 @@ impl Repo {
     }
 
     /// Commits every change in the working tree with `message`, and returns the commit
-    /// `HEAD` names afterwards: the new one, or the one before when nothing changed. Ignored
-    /// files stay out. Runs `git add --all` and `git commit` on the working tree's own index,
-    /// so it is for a thread's worktree, never the engineer's.
+    /// `HEAD` names afterwards: the new one, or the one before when nothing was staged. Ignored
+    /// files stay out, and so do changes inside a submodule or a repository the working tree
+    /// holds, which `git add` does not stage. Runs `git add --all` and `git commit` on the
+    /// working tree's own index, so it is for a thread's worktree, never the engineer's.
     ///
     /// The commit runs no hook (`core.hooksPath` emptied: `--no-verify` alone still runs
     /// `prepare-commit-msg` and `post-commit`) and keeps the message as it is
@@ -587,8 +591,12 @@ impl Repo {
     ///
     /// The git errors, such as a missing `user.name`, or a working tree with no commit.
     pub(crate) fn commit_all(&self, message: &str) -> Result<String> {
-        if !self.changed()?.is_empty() {
-            git(&self.root, &["add", "--all"])?;
+        git(&self.root, &["add", "--all"])?;
+        // What was staged, not what `git status` lists: a submodule or a repository inside
+        // the worktree with changes of its own is listed, but `git add` stages nothing for it,
+        // and a commit of nothing fails. `diff --cached --quiet` exits 1 when there is any.
+        let staged = git(&self.root, &["diff", "--cached", "--quiet"]).is_err();
+        if staged {
             git(
                 &self.root,
                 &[
