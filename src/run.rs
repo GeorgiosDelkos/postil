@@ -766,6 +766,13 @@ impl Runner {
         // A stopped reviewer ends its review: the next stage does not start.
         slot.chain = None;
         match (started, asked) {
+            (false, _) if slot.making.is_some() => {
+                // Git is still making the worktree, which cannot be cut short. The run, and
+                // with it the run lock that keeps other windows out of the worktree, stays
+                // until git is done: the start thread ends it then.
+                released = slot.release();
+                run.record(Entry::CancelRequested);
+            }
             (false, _) => {
                 // The agent is still starting: it is stopped, and the run ends now.
                 released = slot.release();
@@ -1298,11 +1305,18 @@ impl Runner {
                 let made = runner.make_worktree(&pending.thread);
                 let mut slot = runner.slot();
                 slot.making = None;
+                let gone = slot.let_go(generation);
+                drop(slot);
+                if gone {
+                    // Stopped while git made the worktree: the run ends now that git is done.
+                    // A run the project's close ended already takes no more entries.
+                    pending.run.record(Entry::Ended {
+                        reason: StopReason::Cancelled,
+                    });
+                    return (runner.notify)();
+                }
                 if let Err(error) = made {
-                    if !slot.let_go(generation) {
-                        failed(&error);
-                    }
-                    drop(slot);
+                    failed(&error);
                     return (runner.notify)();
                 }
             }

@@ -78,7 +78,7 @@ pub(crate) struct Thread {
 }
 
 /// Whether a thread is open, or how it ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum State {
     /// Its worktree is on disk (or being made), and its runs can go on.

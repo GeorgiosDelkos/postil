@@ -554,7 +554,7 @@ fn a_patch_or_record_that_is_not_what_git_wrote_is_refused() {
     assert!(matches!(error, Error::NotAWorktree { .. }), "{error:?}");
 
     // A worktree whose pointers are relative (`worktree.useRelativePaths`, git 2.48) is
-    // found all the same, its folder there or gone.
+    // found all the same while its folder is there.
     let relative = repo.home().join("relative");
     let path = relative.to_str().unwrap();
     repo.git(&[
