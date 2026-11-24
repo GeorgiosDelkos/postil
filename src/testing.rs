@@ -15,7 +15,7 @@ pub(crate) struct TempDir(PathBuf);
 impl TempDir {
     /// `name` must differ between tests: they run in parallel in one process.
     pub(crate) fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("postil-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("postil-{}-tmp-{name}", std::process::id()));
         drop(fs::remove_dir_all(&dir));
         fs::create_dir_all(&dir).expect("the temporary directory is writable");
         Self(dir)

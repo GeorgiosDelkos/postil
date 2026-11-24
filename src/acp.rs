@@ -15,7 +15,10 @@
 //! - the writer sends the queued lines to standard input, so no caller blocks on an agent
 //!   that stopped reading. A failed write means the agent closed its standard input, and
 //!   nothing can reach it any more, even if it runs on: the writer marks it gone and kills
-//!   its process group, so the reader reports the exit and a turn under way ends;
+//!   its process group, so the reader reports the exit and a turn under way ends. A write
+//!   fails only once every process holding the pipe's other end closed it: when `npx`
+//!   keeps it open while the `node` it started closes its own, writes still fill the pipe,
+//!   and the turn waits until Stop ends the agent;
 //! - the reader reads standard output, hands each reply to whoever waits for it, and turns
 //!   everything else into an [`Event`] for the callback given to [`Agent::spawn`];
 //! - the stderr thread keeps the end of standard error for error messages, and keeps the

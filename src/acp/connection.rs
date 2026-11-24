@@ -126,8 +126,10 @@ pub(crate) struct Starting {
     timeout: Duration,
 }
 
-/// Kills a starting agent's process group from another thread; its [`Starting::open_session`]
-/// then fails with [`Error::AgentExited`]. Stopping an agent that is gone does nothing.
+/// Kills an agent's process group from another thread, while its process is not reaped yet.
+/// A starting agent's [`Starting::open_session`] then fails with [`Error::AgentExited`]; the
+/// writer uses one to end an agent it can no longer write to. Stopping an agent whose process
+/// was reaped does nothing.
 #[derive(Debug)]
 pub(crate) struct Stopper {
     group: Arc<Mutex<Option<u32>>>,
@@ -251,6 +253,11 @@ impl Agent {
     pub(crate) fn prompt(&self, prompt: &[ContentBlock]) -> Result<()> {
         let id = {
             let mut state = self.process.state();
+            // Gone first: a gone agent's turn may still be set until the reader ends it.
+            if state.gone {
+                drop(state);
+                return Err(self.process.exited());
+            }
             if state.turn.is_some() {
                 return Err(Error::TurnRunning);
             }
@@ -258,7 +265,7 @@ impl Agent {
             state.turn = state.new_id();
             state.turn
         };
-        let id = id.ok_or_else(|| self.process.exited())?;
+        let id = id.expect("new_id gives an id while the agent is not gone, checked above");
         let params = PromptParams {
             session_id: &self.session,
             prompt,
@@ -465,11 +472,13 @@ impl State {
     }
 }
 
-/// Locks one of [`Shared`]'s mutexes. Poisoning is ignored because nothing panics while one
-/// is held: the code under these locks makes map operations and assignments, calls nothing
-/// outside this file, and each `expect` there follows the check that makes it hold. A change
-/// can set several fields (the reader's end clears the waiters, the turn and the requests),
-/// so the argument is that no panic happens midway, not that a change is one step.
+/// Locks one of [`Shared`]'s mutexes, or the process group's. Poisoning is ignored because
+/// nothing panics while one is held: the code under [`Shared`]'s locks makes map operations
+/// and assignments, calls nothing outside this file, and each `expect` there follows the check
+/// that makes it hold; under the group's, [`Stopper::stop`] calls `agents::kill_group`, which
+/// ignores every failure and has no panic path. A change can set several fields (the reader's
+/// end clears the waiters, the turn and the requests), so the argument is that no panic
+/// happens midway, not that a change is one step.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -927,6 +936,7 @@ impl<F: FnMut(Event)> Reader<F> {
 
 /// The writer thread: sends each queued line, until the agent stops reading or the
 /// [`Process`] is dropped.
+#[derive(Debug)]
 struct Writer {
     shared: Arc<Shared>,
     /// Ends the agent when a write fails.
@@ -947,9 +957,11 @@ impl Writer {
     }
 
     /// The agent stopped reading, and may run on: no prompt, answer or cancel can reach it
-    /// any more. It is marked gone at once, so it is not alive and every call fails as
-    /// exited; then it is ended, so its output ends and the reader reports the exit, which
-    /// also ends a turn that waited on a reply the agent never saw.
+    /// any more. It is marked gone at once, so it is not alive and a prompt, or any message
+    /// sent, fails as exited; then it is ended, so its output ends and the reader reports the
+    /// exit, which also ends a turn that waited on a reply the agent never saw. No test
+    /// covers the early mark alone: the reader marks the agent gone too once its output
+    /// ends, milliseconds later.
     fn give_up(&self) {
         lock(&self.shared.state).gone = true;
         self.stopper.stop();
