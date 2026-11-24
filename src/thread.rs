@@ -238,10 +238,20 @@ pub(crate) fn find(repo: &Repo, id: &str) -> Result<Option<Thread>> {
 ///
 /// # Errors
 ///
-/// [`Error::ReadThreads`] when the record cannot be read or parsed, and
-/// [`Error::WriteThreads`] when it cannot be locked or written.
+/// [`Error::ReadThreads`] when the record cannot be read or parsed, or has a thread of that
+/// id already (a crash can give a deleted run's number again, and two entries of one id
+/// would be removed together); [`Error::WriteThreads`] when it cannot be locked or written.
 pub(crate) fn add(repo: &Repo, thread: &Thread) -> Result<()> {
-    change(repo, |threads| threads.push(thread.clone()))
+    change(repo, |threads| {
+        if threads.iter().any(|t| t.id == thread.id) {
+            return Err(Error::ReadThreads {
+                path: threads_file(repo),
+                problem: format!("it has a thread {} already", thread.id),
+            });
+        }
+        threads.push(thread.clone());
+        Ok(())
+    })
 }
 
 /// Changes the stored thread `id` with `edit`, under the record's lock, so a change made
@@ -256,6 +266,7 @@ pub(crate) fn update(repo: &Repo, id: &str, edit: impl FnOnce(&mut Thread)) -> R
         if let Some(stored) = threads.iter_mut().find(|t| t.id == id) {
             edit(stored);
         }
+        Ok(())
     })
 }
 
@@ -269,7 +280,10 @@ pub(crate) fn remove(repo: &Repo, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    change(repo, |threads| threads.retain(|t| !ids.contains(&t.id)))
+    change(repo, |threads| {
+        threads.retain(|t| !ids.contains(&t.id));
+        Ok(())
+    })
 }
 
 /// Frees `thread`'s worktree: renames its folder into the trash beside the worktrees, drops
@@ -279,17 +293,21 @@ pub(crate) fn remove(repo: &Repo, ids: &[String]) -> Result<()> {
 ///
 /// The path comes from `threads.json`, which a hand edit can point anywhere, so a folder is
 /// freed only when it is directly in this repository's worktrees folder under Postil's home
-/// `home`, and the trash is found from that folder, never from the path.
+/// `home` ([`check_place`]), and the trash is found from that folder, never from the path.
+/// And only when it holds nothing freeing would lose ([`check`]), so no caller can forget to
+/// ask.
 ///
 /// # Errors
 ///
 /// [`Error::NotAWorktree`] for a folder anywhere else, or whose `.git` names no worktree
-/// record of this repository; [`Error::MakeWorktree`] when the folder cannot be moved into
-/// the trash or git's record removed; and the git errors.
+/// record of this repository; [`Error::ThreadChanged`] as [`check`]; [`Error::MakeWorktree`]
+/// when the folder cannot be moved into the trash or git's record removed; and the git
+/// errors.
 pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     // A unique name in the trash only: nothing is ordered by it.
     static FREED: AtomicU64 = AtomicU64::new(0);
     check_place(repo, home, thread)?;
+    check(thread)?;
     let record = repo.worktree_record(&thread.path)?;
     if thread.path.symlink_metadata().is_ok() {
         let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
@@ -312,6 +330,40 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
+/// git would commit (ignored files, such as the cloned build folders, do not count), and its
+/// branch at the commit Postil left or past it. Past it is a commit the engineer made there,
+/// as the refusal tells them to, and it is theirs to keep. Returns the commit the thread ends
+/// at: the worktree's, or the recorded tip when the worktree is not on disk.
+///
+/// # Errors
+///
+/// [`Error::ThreadChanged`] naming what is there, and the git errors.
+pub(crate) fn check(thread: &Thread) -> Result<String> {
+    if !thread.path.is_dir() {
+        return Ok(thread.tip.clone());
+    }
+    let tree = Repo::open(&thread.path)?;
+    let changed = tree.changed()?;
+    if !changed.is_empty() {
+        return Err(Error::ThreadChanged {
+            path: thread.path.clone(),
+            found: format!("changed files {}", changed.join(", ")),
+        });
+    }
+    match tree.head()? {
+        Some(head) if tree.is_ancestor(&thread.tip, &head)? => Ok(head),
+        head => Err(Error::ThreadChanged {
+            path: thread.path.clone(),
+            found: format!(
+                "the branch is at {}, which does not follow {}, where Postil left it",
+                head.as_deref().unwrap_or("no commit"),
+                thread.tip
+            ),
+        }),
+    }
 }
 
 /// Checks that `thread`'s folder, on disk or not, is where Postil puts this repository's
@@ -496,8 +548,9 @@ fn read(file: &Path) -> Result<Threads> {
     }
 }
 
-/// Reads the record, lets `update` change its threads, and writes it, under the lock.
-fn change(repo: &Repo, update: impl FnOnce(&mut Vec<Thread>)) -> Result<()> {
+/// Reads the record, lets `update` change its threads, and writes it, under the lock. An
+/// `update` that fails writes nothing.
+fn change(repo: &Repo, update: impl FnOnce(&mut Vec<Thread>) -> Result<()>) -> Result<()> {
     let file = threads_file(repo);
     let lock_path = file.with_extension("lock");
     let error = |source| Error::WriteThreads {
@@ -518,7 +571,7 @@ fn change(repo: &Repo, update: impl FnOnce(&mut Vec<Thread>)) -> Result<()> {
     // is that short. Released when `lock` drops, after the write.
     lock.lock().map_err(error)?;
     let mut threads = read(&file)?;
-    update(&mut threads.threads);
+    update(&mut threads.threads)?;
     save_json(&file, &threads).map_err(|source| Error::WriteThreads { path: file, source })
 }
 

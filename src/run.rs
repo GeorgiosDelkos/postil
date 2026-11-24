@@ -93,6 +93,11 @@ pub(crate) struct Runner {
     /// window no request can otherwise be timed into.
     #[cfg(test)]
     next_stage_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Holds the next worktree's making, once, until a test lets it go
+    /// ([`Runner::hold_making`]): a checkout takes milliseconds in a test, too short to Stop
+    /// or end a thread during it otherwise.
+    #[cfg(test)]
+    making_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 /// What a runner holds now.
@@ -108,11 +113,12 @@ struct Slot {
     /// The thread `run` works in, set with it at each launch: the agent's working directory
     /// is its worktree, and a kept agent is used again only within it.
     thread: Option<Thread>,
-    /// The thread whose worktree the start thread is making (`git worktree add`, the clones),
-    /// from the launch until it is made or fails. Git writes the worktree meanwhile, so a
-    /// commit, a run or an ending there could act on a half-made checkout; the slot counts as
-    /// busy. Making goes on past a Stop: it cannot be cut short.
-    making: Option<String>,
+    /// Whether the start thread is making the worktree of the slot's thread (`git worktree
+    /// add`, the clones), from the launch until it is made or fails. Git writes the worktree
+    /// meanwhile, so a commit, a run or an ending there could act on a half-made checkout: the
+    /// slot counts as busy, and the run stays live, holding the run lock, past a Stop or a
+    /// close, until the start thread ends it. Making cannot be cut short.
+    making: bool,
     /// Set when the project closed: an agent that finishes starting afterwards is stopped.
     closed: bool,
     /// The review under way, while its stages run one after another; cleared when a stage
@@ -182,7 +188,7 @@ impl Slot {
     /// [`Runner::busy`]: a run under way, a review between two stages, or a worktree being
     /// made.
     fn busy(&self) -> bool {
-        if self.making.is_some() {
+        if self.making {
             return true;
         }
         let Some(run) = &self.run else {
@@ -284,6 +290,8 @@ impl Runner {
             slot: Mutex::new(Slot::default()),
             #[cfg(test)]
             next_stage_gate: Mutex::new(None),
+            #[cfg(test)]
+            making_gate: Mutex::new(None),
         })
     }
 
@@ -629,7 +637,7 @@ impl Runner {
     /// for a new thread as [`thread::plan`] and [`thread::add`]: the run then fails too.
     fn launch(self: &Arc<Self>, mut slot: MutexGuard<'_, Slot>, new: NewRun) -> Result<()> {
         // A worktree still being made counts as a run under way: its agent has not started.
-        if slot.making.is_some() || slot.run.as_ref().is_some_and(|run| run.state().live()) {
+        if slot.making || slot.run.as_ref().is_some_and(|run| run.state().live()) {
             return Err(Error::TurnRunning);
         }
         let NewRun {
@@ -699,7 +707,7 @@ impl Runner {
 
         slot.chain = review;
         if let Worktree::Make = worktree {
-            slot.making = Some(thread.id.clone());
+            slot.making = true;
         }
         let same_thread = slot
             .thread
@@ -728,7 +736,7 @@ impl Runner {
                 worktree,
             };
             let id = pending.thread.id.clone();
-            if !self.start(pending) && slot.making.take().is_some() {
+            if !self.start(pending) && std::mem::take(&mut slot.making) {
                 // No thread will make the worktree: the window is free again, and the thread
                 // goes, as one whose worktree could not be made does.
                 drop(thread::remove(&self.repo, std::slice::from_ref(&id)));
@@ -766,7 +774,7 @@ impl Runner {
         // A stopped reviewer ends its review: the next stage does not start.
         slot.chain = None;
         match (started, asked) {
-            (false, _) if slot.making.is_some() => {
+            (false, _) if slot.making => {
                 // Git is still making the worktree, which cannot be cut short. The run, and
                 // with it the run lock that keeps other windows out of the worktree, stays
                 // until git is done: the start thread ends it then.
@@ -1039,7 +1047,7 @@ impl Runner {
             None => return Err(Error::BadRequest(format!("there is no thread {id}"))),
         };
         thread::check_place(&self.repo, home, &thread)?;
-        let tip = check_worktree(&thread)?;
+        let tip = thread::check(&thread)?;
         if ending == Ending::Apply {
             let patch = self.repo.patch(&thread.fork, &tip)?;
             self.repo.apply(&patch).map_err(|error| match error {
@@ -1178,7 +1186,7 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// As [`thread::all`], [`check_worktree`], [`thread::free`], [`Repo::delete_branch`] and
+    /// As [`thread::all`], [`thread::check`], [`thread::free`], [`Repo::delete_branch_at`] and
     /// [`thread::remove`]. A thread that fails one of them stays in the record, and is tried
     /// again at the next delete.
     fn forget_threads(&self, busy: Option<&str>) -> Result<()> {
@@ -1216,26 +1224,30 @@ impl Runner {
         for thread in gone {
             // In any state: an ended thread whose free failed still has its worktree, which
             // keeps the branch checked out.
+            // Ending a thread keeps a commit the engineer made past Postil's, in the worktree or
+            // on the branch since; forgetting it deletes the branch, and the commit with it.
+            let past = || Error::ThreadChanged {
+                path: thread.path.clone(),
+                found: format!("commits past {}, where Postil left it", thread.tip),
+            };
             let forgotten = thread::check_place(&self.repo, home, &thread)
-                .and_then(|()| check_worktree(&thread))
+                .and_then(|()| thread::check(&thread))
                 .and_then(|head| {
-                    // Ending a thread keeps a commit the engineer made past Postil's; forgetting
-                    // it deletes the branch, and the commit with it.
                     if head == thread.tip {
                         Ok(())
                     } else {
-                        Err(Error::ThreadChanged {
-                            path: thread.path.clone(),
-                            found: format!("commits past {}, where Postil left it", thread.tip),
-                        })
+                        Err(past())
                     }
                 })
                 .and_then(|()| thread::free(&self.repo, home, &thread))
                 .and_then(|()| {
-                    if thread.branch.starts_with("postil/") {
-                        self.repo.delete_branch(&thread.branch)
-                    } else {
+                    if !thread.branch.starts_with("postil/") {
+                        return Ok(());
+                    }
+                    if self.repo.delete_branch_at(&thread.branch, &thread.tip)? {
                         Ok(())
+                    } else {
+                        Err(past())
                     }
                 });
             match forgotten {
@@ -1263,10 +1275,12 @@ impl Runner {
             let mut slot = self.slot();
             slot.closed = true;
             slot.chain = None;
-            // A worktree git is still checking out takes no commit: it would commit a half
-            // checkout (every file not yet written, as deleted).
-            let thread = slot.thread.clone().filter(|_| slot.making.is_none());
-            (slot.release(), slot.run.clone(), thread)
+            // A run whose worktree git is still checking out is left to the start thread,
+            // which ends it once git is done: ending it here would release the run lock
+            // that keeps every window out of the half-made worktree, and a commit there
+            // would take a half checkout.
+            let run = slot.run.clone().filter(|_| !slot.making);
+            (slot.release(), run, slot.thread.clone())
         };
         // The agent is gone first, so nothing it reports lands after the end. `closed` drops
         // its events anyway.
@@ -1275,7 +1289,7 @@ impl Runner {
             // As a forced Stop does: the agent's exit is not reported, so the snapshot after
             // the run is taken here, or its changes view would stay empty. It runs `git add`
             // on the request thread, quitting included. Both calls do nothing for a run that
-            // already ended, or one whose worktree is still being made.
+            // already ended.
             self.record_end_snapshot(&run, thread.as_ref());
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
@@ -1304,14 +1318,20 @@ impl Runner {
             if let Worktree::Make = pending.worktree {
                 let made = runner.make_worktree(&pending.thread);
                 let mut slot = runner.slot();
-                slot.making = None;
-                let gone = slot.let_go(generation);
+                slot.making = false;
+                let (gone, closed) = (slot.let_go(generation), slot.closed);
                 drop(slot);
                 if gone {
-                    // Stopped while git made the worktree: the run ends now that git is done.
-                    // A run the project's close ended already takes no more entries.
-                    pending.run.record(Entry::Ended {
-                        reason: StopReason::Cancelled,
+                    // Stopped, or the project closed, while git made the worktree: the run
+                    // ends now that git is done, and with it the run lock.
+                    pending.run.record(if closed {
+                        Entry::Failed {
+                            error: "stopped: Postil closed the project while it ran".to_owned(),
+                        }
+                    } else {
+                        Entry::Ended {
+                            reason: StopReason::Cancelled,
+                        }
                     });
                     return (runner.notify)();
                 }
@@ -1396,6 +1416,8 @@ impl Runner {
     /// that `git worktree add` may not have made, which a thread of another working tree of
     /// the repository may own, and deleting the thread's last note would delete it.
     fn make_worktree(&self, thread: &Thread) -> Result<()> {
+        #[cfg(test)]
+        self.pass_making_gate();
         let skipped = match thread::make(&self.repo, thread) {
             Ok(skipped) => skipped,
             Err(error) => {
@@ -1498,6 +1520,23 @@ impl Runner {
         let gate = lock(&self.next_stage_gate).take();
         if let Some(gate) = gate {
             // A dropped sender lets the stage go as well.
+            gate.recv().ok();
+        }
+    }
+
+    /// Holds the next worktree's making, before `git worktree add`, until the returned sender
+    /// sends or is dropped. Once.
+    pub(crate) fn hold_making(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        *lock(&self.making_gate) = Some(gate);
+        release
+    }
+
+    /// Waits at the gate [`Runner::hold_making`] set, if any.
+    fn pass_making_gate(&self) {
+        let gate = lock(&self.making_gate).take();
+        if let Some(gate) = gate {
+            // A dropped sender lets the making go as well.
             gate.recv().ok();
         }
     }
@@ -1765,40 +1804,6 @@ fn no_snapshot(run: &Run, error: &Error) {
         "no snapshot of the files was taken: {}",
         error_chain(error)
     ));
-}
-
-/// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
-/// git would commit (ignored files, such as the cloned build folders, do not count), and its
-/// branch at the commit Postil left or past it. Past it is a commit the engineer made there,
-/// as the refusal tells them to, and it is theirs to keep. Returns the commit the thread ends
-/// at: the worktree's, or the recorded tip when the worktree is not on disk.
-///
-/// # Errors
-///
-/// [`Error::ThreadChanged`] naming what is there, and the git errors.
-fn check_worktree(thread: &Thread) -> Result<String> {
-    if !thread.path.is_dir() {
-        return Ok(thread.tip.clone());
-    }
-    let tree = Repo::open(&thread.path)?;
-    let changed = tree.changed()?;
-    if !changed.is_empty() {
-        return Err(Error::ThreadChanged {
-            path: thread.path.clone(),
-            found: format!("changed files {}", changed.join(", ")),
-        });
-    }
-    match tree.head()? {
-        Some(head) if tree.is_ancestor(&thread.tip, &head)? => Ok(head),
-        head => Err(Error::ThreadChanged {
-            path: thread.path.clone(),
-            found: format!(
-                "the branch is at {}, which does not follow {}, where Postil left it",
-                head.as_deref().unwrap_or("no commit"),
-                thread.tip
-            ),
-        }),
-    }
 }
 
 /// The message of the commit a snapshot at `point` makes for the run `header` describes: what

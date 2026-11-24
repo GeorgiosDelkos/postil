@@ -719,3 +719,100 @@ fn a_review_does_not_start_when_the_work_left_before_it_cannot_be_committed() {
         "left\n"
     );
 }
+
+#[test]
+fn a_stop_while_the_worktree_is_made_keeps_the_run_and_its_lock_until_git_is_done() {
+    let repo = TempRepo::new("thread-stop-making");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    let release = site.runner().unwrap().hold_making();
+    post_note(&site, "a.txt", 1, 1, "one");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+
+    assert_eq!(post(&site, &format!("{RUN}/cancel"), "").0, StatusCode::OK);
+
+    // Still live, so the run lock still keeps every window out of the half-made worktree.
+    assert!(isnt_over(&get_json(&site, RUN)), "{}", get_json(&site, RUN));
+    let (other, _quiet) = run_site(&repo, "plain");
+    let (status, body) = end(&other, "discard", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("another Postil window"), "{body}");
+    let (status, body) = end(&site, "discard", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("still working"), "{body}");
+
+    drop(release);
+    let ended = wait_for(&site, &nudges, "ended");
+    assert_eq!(ended["id"], "R1");
+    let made = thread(&site, "R1");
+    assert_eq!(made["state"], "open");
+    assert!(PathBuf::from(made["path"].as_str().unwrap()).is_dir());
+}
+
+#[test]
+fn closing_the_project_while_the_worktree_is_made_ends_the_run_once_git_is_done() {
+    let repo = TempRepo::new("thread-close-making");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    let runner = site.runner().unwrap();
+    let release = runner.hold_making();
+    post_note(&site, "a.txt", 1, 1, "one");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+
+    runner.close();
+
+    assert!(isnt_over(&get_json(&site, RUN)), "{}", get_json(&site, RUN));
+    drop(release);
+    let failed = wait_for(&site, &nudges, "failed");
+    assert!(
+        failed.to_string().contains("Postil closed the project"),
+        "{failed}"
+    );
+}
+
+/// Whether the run is still under way: not ended, failed or unfinished.
+fn isnt_over(run: &serde_json::Value) -> bool {
+    !["ended", "failed", "unfinished"].contains(&run["status"].as_str().unwrap_or(""))
+}
+
+#[test]
+fn deleting_a_note_keeps_a_branch_the_engineer_committed_to_after_the_thread_ended() {
+    let (repo, site, _nudges, _worktree) = written("thread-branch-moved");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    assert_eq!(end(&site, "discard", "R1").0, StatusCode::OK);
+    repo.git(&["checkout", "--quiet", &branch]);
+    repo.write("later.txt", "later\n");
+    repo.git(&["add", "later.txt"]);
+    repo.git(&["commit", "--quiet", "--message", "later"]);
+    repo.git(&["checkout", "--quiet", "trunk"]);
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("commits past"), "{body}");
+    assert_eq!(
+        git_out(&repo.root, &["log", "-1", "--format=%s", &branch]),
+        "later"
+    );
+}
+
+#[test]
+fn a_second_thread_of_one_id_is_refused_and_the_first_is_kept() {
+    let (repo, site, _nudges, worktree) = written("thread-duplicate");
+    // As after a crash gave a deleted run's number again: the record has the next id.
+    let record = repo.root.join(".git/postil/threads.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let mut copy = stored["threads"][0].clone();
+    copy["id"] = "R2".into();
+    stored["threads"].as_array_mut().unwrap().push(copy);
+    fs::write(&record, stored.to_string()).unwrap();
+    post_note(&site, "a.txt", 1, 1, "two");
+
+    let (status, body) = send(&site, &["N2"]);
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("has a thread R2 already"), "{body}");
+    assert_eq!(thread(&site, "R2")["path"], thread(&site, "R1")["path"]);
+    assert!(worktree.is_dir());
+}

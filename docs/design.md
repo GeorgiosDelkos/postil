@@ -711,8 +711,12 @@ Postil refuses (409), naming what is there and the worktree's path, so the engin
 it there (and it is kept) or removes it; an answer in the dialog that ends the thread anyway
 is not built. A thread whose run is under way in any window, whose review is between two
 stages, or whose worktree is being made is not ended either (409). Deleting a thread's last
-note runs the same check, and a branch past Postil's commit fails it there too: ending keeps
-the engineer's commits, but forgetting deletes the branch, and them with it. A thread that
+note runs the same check, and a branch past Postil's commit fails it there too, in the
+worktree or on the branch after the thread ended: ending keeps the engineer's commits, but
+forgetting deletes the branch, and them with it. The branch goes only while it names
+Postil's commit, checked and deleted in one git call (`update-ref -d <ref> <tip>`). A
+worktree being made, after a Stop or a close too, keeps its run live, and with it the run
+lock, until git is done. A thread that
 fails it stays, with its worktree and branch, until the next delete.
 
 **Only what Postil made is deleted.** The record is a file a hand edit can change, so a

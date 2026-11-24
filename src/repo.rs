@@ -493,21 +493,33 @@ impl Repo {
         git(&self.root, &["clean", "-d", "--force", "--quiet"]).map(drop)
     }
 
-    /// Deletes the local branch `branch`, merged or not. A branch that does not exist (never
-    /// made, or deleted by hand) is already as asked.
+    /// Deletes the local branch `branch` while it names commit `expected`, and returns `true`;
+    /// returns `false`, deleting nothing, when it names another commit (one made on it since).
+    /// The check and the delete are one git call (`update-ref -d <ref> <expected>`), so a
+    /// commit made meanwhile is never deleted. A branch that does not exist (never made, or
+    /// deleted by hand) is already as asked. Does not check that no worktree has it checked
+    /// out: the caller frees the worktree first.
     ///
     /// # Errors
     ///
-    /// The git error, such as a branch that a worktree still has checked out.
-    pub(crate) fn delete_branch(&self, branch: &str) -> Result<()> {
+    /// The git errors.
+    pub(crate) fn delete_branch_at(&self, branch: &str, expected: &str) -> Result<bool> {
         let name = format!("refs/heads/{branch}");
-        match git(&self.root, &["rev-parse", "--verify", "--quiet", &name]) {
+        let at = match git(&self.root, &["rev-parse", "--verify", "--quiet", &name]) {
+            Ok(at) => at,
             // As in `head`: nothing on stderr is a name that resolves to nothing.
-            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => return Ok(()),
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => return Ok(true),
             Err(error) => return Err(error),
-            Ok(_) => {}
+        };
+        if at.trim_end() != expected {
+            return Ok(false);
         }
-        git(&self.root, &["branch", "--quiet", "-D", branch]).map(drop)
+        match git(&self.root, &["update-ref", "-d", &name, expected]) {
+            Ok(_) => Ok(true),
+            // It moved between the two calls: the delete was refused, which is the point.
+            Err(Error::Git { stderr, .. }) if stderr.contains("but expected") => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Checks out the submodules `.gitmodules` names, when there is one. A new worktree has
