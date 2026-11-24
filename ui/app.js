@@ -622,4 +622,11 @@ async function start() {
   if (state.repo.bench) await runBench(state.repo.bench, { code, codeEl });
 }
 
+// A promise nobody awaits, such as an event handler's async call, would otherwise fail
+// without a word: its error is shown as any other failure is. One listener rather than a
+// `.catch` at each call site, so a call added later is covered too (review item JS7).
+addEventListener("unhandledrejection", (event) => {
+  showToast(String(event.reason?.message ?? event.reason));
+});
+
 start();

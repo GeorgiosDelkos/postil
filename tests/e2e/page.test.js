@@ -225,3 +225,65 @@ test("Up and Down in the file filter move the highlight, and Enter opens that fi
   await filter.press("Enter");
   await page.locator("#code-rows").filter({ hasText: "bee" }).waitFor();
 });
+
+test("a send whose request fails shows the error and leaves Send usable (JS7)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "Rename two.");
+  // The page reads the notes as it loads; this one was written after.
+  await page.reload();
+  await page.locator(".note-item").first().waitFor();
+
+  // The send's request fails before any answer, as a dropped connection would.
+  await page.route("**/api/run", (route) =>
+    route.request().method() === "POST" ? route.abort() : route.continue(),
+  );
+  const send = page.locator("#send-button");
+  await send.click();
+  await send.click();
+
+  // WebKit's message for a request that got no answer.
+  await page.locator("#toast").filter({ hasText: "Load failed" }).waitFor();
+  await page.waitForFunction(() => !document.getElementById("send-button").disabled);
+  const { runs } = await api("api/runs");
+  assert.deepEqual(runs, [], "no run started");
+});
+
+test("a send that fails after its step was closed leaves the next send alone (JS7)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "Rename two.");
+  await page.reload();
+  await page.locator(".note-item").first().waitFor();
+
+  // Every send's request is held here until the test fails it.
+  const held = [];
+  let arrived = () => {};
+  await page.route("**/api/run", (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    held.push(route);
+    arrived();
+  });
+  const sent = (count) =>
+    new Promise((resolve) => {
+      arrived = () => held.length >= count && resolve();
+      arrived();
+    });
+  const send = page.locator("#send-button");
+  const disabled = () => page.evaluate(() => document.getElementById("send-button").disabled);
+
+  await send.click();
+  await send.click();
+  await sent(1);
+  // The step closes while its request runs; a new step sends again.
+  await page.keyboard.press("Escape");
+  await send.click();
+  await send.click();
+  await sent(2);
+  assert.equal(await disabled(), true, "the second send is under way");
+
+  await held[0].abort();
+  await page.locator("#toast").filter({ hasText: "Load failed" }).waitFor();
+  assert.equal(await disabled(), true, "the first send's failure leaves the second alone");
+
+  await held[1].abort();
+  await page.waitForFunction(() => !document.getElementById("send-button").disabled);
+});
