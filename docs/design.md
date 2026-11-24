@@ -326,7 +326,7 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 |---|---|
 | `GET /api/run/preview?notes=N1,N2` | The prompt's text, exactly as the agent receives it. |
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
-| `GET /api/run?after=N` | The latest run, with its entries from number `N` on; `null` when there is none. |
+| `GET /api/run?after=N` | The latest run, with its entries from number `N` on, and its notes and prompt only when `N` is 0: they never change; `null` when there is none. |
 | `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
 | `GET /api/runs` | The ids of the runs on disk, newest first. |
 | `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |

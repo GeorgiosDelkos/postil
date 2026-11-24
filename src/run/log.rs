@@ -479,7 +479,10 @@ impl Run {
 
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     pub(super) fn record(&self, entry: Entry) {
-        self.record_all([entry]);
+        let mut state = self.state();
+        if state.live() {
+            self.write(&mut state, entry);
+        }
     }
 
     /// Records the snapshot at `point` unless the run has one there, checked under the same
@@ -488,17 +491,6 @@ impl Run {
         let mut state = self.state();
         if state.live() && state.snapshot(point).is_none() {
             self.write(&mut state, Entry::Snapshot { point, tree });
-        }
-    }
-
-    /// Records `entries` in order, under one hold of the state: a reader sees all or none.
-    fn record_all(&self, entries: impl IntoIterator<Item = Entry>) {
-        let mut state = self.state();
-        if !state.live() {
-            return;
-        }
-        for entry in entries {
-            self.write(&mut state, entry);
         }
     }
 
@@ -570,8 +562,9 @@ impl Run {
                     reason: StopReason::Refusal
                 }
         );
-        // One hold of the state, as `record_all`, which also takes the notes: a run that ended
-        // meanwhile neither takes the event nor marks its notes sent.
+        // One hold of the state for the event, its answer and the notes: a reader sees both
+        // entries or neither, and a run that ended meanwhile neither takes the event nor marks
+        // its notes sent.
         let mut state = self.state();
         if !state.live() {
             return None;

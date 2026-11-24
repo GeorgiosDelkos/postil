@@ -37,7 +37,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (reply === null) return null;
     if (run && reply.id === run.id) {
       // A reply from a later entry leaves out the notes and the prompt, which never change.
-      return { ...run, ...reply, entries: run.entries.concat(reply.entries) };
+      const entries = run.entries.concat(reply.entries);
+      return { ...reply, notes: run.notes, prompt: run.prompt, entries };
     }
     if (after === 0) return reply;
     const whole = await fetch("api/run");
