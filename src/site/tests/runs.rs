@@ -2618,3 +2618,70 @@ fn a_thread_whose_agent_exited_takes_no_agent_s_place() {
         "R2's agent took the follow-up as its second prompt: {kept}"
     );
 }
+
+#[test]
+fn a_reviewer_that_is_the_thread_s_own_agent_still_starts_fresh() {
+    let repo = TempRepo::new("run-review-own-agent");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "reviewer");
+    let settings = serde_json::json!({
+        "customAgents": [{ "name": "Fake", "command": fake_agent("reviewer") }],
+        "enabledAgents": ["Fake"],
+        "agent": "Fake",
+        "reviewers": ["Fake"],
+    });
+    let (status, body) = save(&site, &settings.to_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    assert_eq!(wait_for_run(&site, &nudges, "R1")["status"], "ended");
+
+    let review = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &review).0,
+        StatusCode::OK
+    );
+    let stage = wait_for_run(&site, &nudges, "R2");
+    assert!(
+        kinds(&stage).contains(&"message:prompt 1".to_owned()),
+        "the thread's kept agent, the same one, did not take the review: {stage}"
+    );
+}
+
+#[test]
+fn the_idle_agent_used_longest_ago_is_the_one_let_go() {
+    let repo = TempRepo::new("run-evict-lru");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    for text in ["one", "two", "three"] {
+        post_note(&site, "a.txt", 1, 1, text);
+    }
+    let follow = |of: &str| {
+        let body = serde_json::json!({ "of": of, "text": "more" }).to_string();
+        let (status, body) = post(&site, &format!("{RUN}/follow"), &body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    send(&site, &["N1"]);
+    wait_for_run(&site, &nudges, "R1");
+    send(&site, &["N2"]);
+    wait_for_run(&site, &nudges, "R2");
+    // R1's thread is used again after R2's, so R2's agent is the one used longest ago.
+    follow("R1");
+    wait_for_run(&site, &nudges, "R3");
+
+    send(&site, &["N3"]);
+    wait_for_run(&site, &nudges, "R4");
+
+    follow("R3");
+    let kept = wait_for_run(&site, &nudges, "R5");
+    assert!(
+        kinds(&kept).contains(&"message:prompt 3".to_owned()),
+        "R1's thread kept its agent: {kept}"
+    );
+    follow("R2");
+    let fresh = wait_for_run(&site, &nudges, "R6");
+    assert!(
+        kinds(&fresh).contains(&"message:prompt 1".to_owned()),
+        "R2's agent was let go: {fresh}"
+    );
+}
