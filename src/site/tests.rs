@@ -151,6 +151,24 @@ pub(crate) fn post_note(
     serde_json::from_str(&reply).unwrap()
 }
 
+/// Adds a note on the whole file or folder at `path` (`target` is `"file"` or `"folder"`), as
+/// the file list's dialog does, and returns every note.
+pub(crate) fn post_path_note(
+    site: &Site,
+    path: &str,
+    target: &str,
+    body: &str,
+) -> serde_json::Value {
+    let (status, reply) = post(site, NOTES, &path_note(path, target, body));
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    serde_json::from_str(&reply).unwrap()
+}
+
+/// A `POST /api/notes` body for a file or folder note, as the page builds it.
+fn path_note(path: &str, target: &str, body: &str) -> String {
+    serde_json::json!({ "path": path, "target": target, "body": body }).to_string()
+}
+
 /// A `POST /api/notes` body, as the page builds it.
 fn new_note(path: &str, start: usize, end: usize, snippet: &str, body: &str) -> String {
     serde_json::json!({

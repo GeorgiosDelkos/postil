@@ -5,6 +5,7 @@
 
 import { diffView, reviewSection } from "./dialog-parts.js";
 import { el, statusIcon } from "./dom.js";
+import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import {
   elapsed,
@@ -174,9 +175,7 @@ export function runDialog({
   function noteLine(id, view) {
     const note = noteOf(id);
     if (!note) return { id, where: "deleted", kind: "stopped", label: "Deleted", tone: "idle" };
-    const { start, end } = note.lines;
-    const where = `${note.path.split("/").at(-1)}:${start === end ? start : `${start}-${end}`}`;
-    return { id, where, ...noteStatus(note, view) };
+    return { id, where: shortPlace(note), ...noteStatus(note, view) };
   }
 
   // The run whole: its question if it asks one, its plan, its notes, every step, and the

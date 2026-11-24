@@ -188,6 +188,58 @@ fn assert_read_back(repo: &TempRepo, run: &serde_json::Value) {
 }
 
 #[test]
+fn file_and_folder_notes_reach_the_agent_by_path_and_only_files_are_linked() {
+    let repo = TempRepo::new("run-paths");
+    fs::create_dir_all(repo.root.join("src/acp")).unwrap();
+    repo.write("src/acp/wire.rs", "wire\n");
+    repo.write("README.md", "# Readme\n");
+    repo.write("old.rs", "old\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_path_note(&site, "src/acp", "folder", "Split this module.");
+    post_path_note(&site, "README.md", "file", "Document the flag.");
+    post_path_note(&site, "old.rs", "file", "Fold into lib.rs.");
+    post_path_note(&site, "src", "folder", "Explain the layout.");
+    fs::remove_file(repo.root.join("old.rs")).unwrap();
+
+    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1,N2,N3"));
+    assert_eq!(
+        preview["prompt"],
+        "These are review notes an engineer wrote while reading this repository.\n\
+         Address every note. Change nothing the notes do not ask for.\n\
+         When you finish, list each note id with one line on what you did.\n\
+         \n\
+         [N1] src/acp/ (folder)\n\
+         Split this module.\n\
+         \n\
+         [N2] README.md (file)\n\
+         Document the flag.\n\
+         \n\
+         [N3] old.rs (file)\n\
+         (This file is no longer in the repository.)\n\
+         Fold into lib.rs.\n"
+    );
+    assert_eq!(
+        preview["files"],
+        serde_json::json!(["README.md", "old.rs"]),
+        "a folder is named in the text, never linked"
+    );
+
+    let (status, body) = send(&site, &["N4"]);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ended = wait_for(&site, &nudges, "ended");
+    let prompt = ended["prompt"].as_str().unwrap();
+    assert!(
+        prompt.ends_with("[N4] src/ (folder)\nExplain the layout.\n"),
+        "{prompt}"
+    );
+    assert_eq!(
+        kinds(&ended)[1],
+        format!("message:got {prompt}"),
+        "the text alone, with no link"
+    );
+}
+
+#[test]
 fn the_prompt_preview_is_the_text_the_agent_receives() {
     let repo = TempRepo::new("run-preview");
     repo.write("src/a.rs", "fn a() {\n    one();\n}\n");

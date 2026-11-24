@@ -2978,6 +2978,16 @@ button.changes-number:focus-visible {
   gap: 8px;
 }
 
+/* The dialog for a note on a whole file or folder: one text box, so narrower than a note's
+   detail. */
+.note-dialog.path-note {
+  width: min(560px, 100vw - 48px);
+}
+
+.path-note-input {
+  resize: vertical;
+}
+
 /* Focus mode: the code alone, centered at a readable width (Cmd-\). */
 /* The side columns shrink rather than leave the grid, so the change can be eased; they keep
    what centers the code column at 1100 px (1116 px with the two gaps). */

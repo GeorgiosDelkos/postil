@@ -391,6 +391,17 @@ test("prompt lines are told apart for coloring", () => {
     lines.map((line) => line.kind),
     ["text", "text", "heading", "lost", "quote", "text", "text"],
   );
+
+  // A file or folder note whose path is gone; a note's own text that only looks alike is not.
+  const gone = promptLines(
+    "[N2] old.rs (file)\n(This file is no longer in the repository.)\nGone.\n" +
+      "[N3] src/acp/ (folder)\n(This folder is no longer in the repository.)\n" +
+      "(This file is no longer in the repository.) Really.\n",
+  );
+  assert.deepEqual(
+    gone.map((line) => line.kind),
+    ["heading", "lost", "text", "heading", "lost", "text"],
+  );
 });
 
 test("markdown blocks: paragraphs, lists, headings and fenced code", () => {

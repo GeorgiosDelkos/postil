@@ -2,6 +2,7 @@
 // right-click menu's actions on the code, and the composer that writes a note.
 
 import { $, el } from "./dom.js";
+import { onLines } from "./note-place.js";
 import { shouldReveal } from "./tree.js";
 
 // `.code-rows` has this much padding above the first and below the last line (app.css).
@@ -124,10 +125,12 @@ export function codeView({
     }
   }
 
+  // Opens a line or file note's file, at the note's lines or at the top. A folder note has no
+  // file: the file list shows it (file-list.js, `showFolder`).
   async function showNote(note) {
     if (state.file?.path !== note.path && !(await openFile(note.path))) return;
     // A third of the way down reads better than the very top edge.
-    const top = lineTop(note.lines.start - 1) - codeEl.clientHeight / 3;
+    const top = onLines(note) ? lineTop(note.lines.start - 1) - codeEl.clientHeight / 3 : 0;
     codeEl.scrollTo({ top, behavior: "smooth" });
   }
 

@@ -16,10 +16,15 @@ const INDENT_BASE = 4;
 
 const rowSelector = (path) => `[data-path="${CSS.escape(path)}"]`;
 
+// What a note on a row's whole path is on: "folder" for a folder's row, "file" otherwise.
+const rowTarget = (row) => (row.classList.contains("dir") ? "folder" : "file");
+
 // `state` is the page's state: the list reads `repo.files`, `tree`, `expanded`,
 // `noteCountByPath` and `file`, and keeps `expanded`. `openFile(path)` opens a file in the code
 // pane and resolves to whether it was shown; `codeEl` takes the focus when the filter is left.
-export function fileList({ state, filesEl, filterEl, codeEl, openFile }) {
+// `menu` is the context menu (context-menu.js), and `writeNote(path, target)` opens the dialog
+// for a note on the whole file or folder (`target` "file" or "folder").
+export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, writeNote }) {
   // The index of the highlighted row while the file filter has text.
   let activeMatch = 0;
 
@@ -73,7 +78,8 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile }) {
   }
 
   // Without a filter: the tree, showing the contents of open folders only. A closed folder
-  // carries the count of notes inside it, so collapsing it does not hide that they exist.
+  // carries the count of notes inside it, so collapsing it does not hide that they exist; an
+  // open folder, the count of notes on the folder itself.
   function treeRows() {
     const totals = folderCounts(state.noteCountByPath);
     return visibleRows(state.tree, state.expanded).map((row) => {
@@ -97,7 +103,8 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile }) {
       icon(folderIcon(row.name, row.open)),
       el("span", "name", row.name),
     );
-    const count = row.open ? 0 : totals.get(row.path);
+    // Open, its files show their own counts, so it shows only the notes on the folder itself.
+    const count = row.open ? state.noteCountByPath.get(row.path) : totals.get(row.path);
     if (count) button.append(el("span", "count", String(count)));
     return button;
   }
@@ -184,6 +191,27 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile }) {
     }
   });
 
+  // Right-click on a row: a note on the whole file or folder, for an agent.
+  filesEl.addEventListener("contextmenu", (event) => {
+    const row = event.target.closest(".file, .dir");
+    if (!row) return;
+    event.preventDefault();
+    const target = rowTarget(row);
+    // The context-menu key gives no pointer position: the menu opens at the row.
+    const box = row.getBoundingClientRect();
+    const x = event.clientX || box.left + 24;
+    const y = event.clientY || box.bottom;
+    menu.open(x, y, [
+      {
+        label: "Add Note…",
+        detail: `on this ${target}`,
+        key: "C",
+        matches: (key) => key.key === "c" && !key.metaKey,
+        run: () => writeNote(row.dataset.path, target),
+      },
+    ]);
+  });
+
   filesEl.addEventListener("focusin", (event) => {
     const row = event.target.closest(".file, .dir");
     if (row && filesEl.getAttribute("role") === "tree") setTabStop(row);
@@ -247,9 +275,30 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile }) {
     }
   });
 
+  // Opens the folders down to the folder `path` and the folder itself, and puts the focus on
+  // its row: where a folder note's dialog shows the folder.
+  function showFolder(path) {
+    // A filter shows matching files only, never a folder's row.
+    filterEl.value = "";
+    for (const folder of [...ancestors(path), path]) state.expanded.add(folder);
+    renderFiles();
+    saveFolders();
+    const row = filesEl.querySelector(`.dir${rowSelector(path)}`);
+    row?.scrollIntoView({ block: "nearest" });
+    row?.focus();
+  }
+
   return {
     render: renderFiles,
     reveal: revealFile,
+    showFolder,
+    // The file or folder of the row that has the focus, for `c`; null when no row has it.
+    focusedRow: () => {
+      const row = filesEl.contains(document.activeElement)
+        ? document.activeElement.closest(".file, .dir")
+        : null;
+      return row ? { path: row.dataset.path, target: rowTarget(row) } : null;
+    },
     loadFolders,
     // A save still waiting would land in the next project: its folders are dropped instead.
     dropPendingSave: () => clearTimeout(foldersTimer),

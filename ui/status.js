@@ -3,6 +3,7 @@
 // view (`GET api/run`, src/run/log.rs `RunView`), kept apart from the document so `node --test`
 // runs them.
 
+import { covers } from "./note-place.js";
 import {
   diffStats,
   foldRun,
@@ -101,15 +102,16 @@ export function planProgress(run) {
   return { done: plan.filter((step) => step.status === "completed").length, total: plan.length };
 }
 
-// The steps of `run` that concern `note`, in order: its tool calls on the note's file, and the
-// plan steps that name the note's id. Each is `{ kind: "tool", verb, target, state, running }`
-// (run.js `toolRow`) or `{ kind: "step", text, status }`.
+// The steps of `run` that concern `note`, in order: its tool calls on the note's file (any file
+// in a folder note's folder, note-place.js `covers`), and the plan steps that name the note's
+// id. Each is `{ kind: "tool", verb, target, state, running }` (run.js `toolRow`) or
+// `{ kind: "step", text, status }`.
 export function noteHistory(note, run) {
   const { plan, items } = foldRun(run.entries);
   const live = isLive(run);
   const steps = [];
   for (const item of items) {
-    if (item.type === "tool" && touches(item, note.path)) {
+    if (item.type === "tool" && touches(item, note)) {
       steps.push({ kind: "tool", ...toolRow(item, live) });
     }
   }
@@ -121,25 +123,37 @@ export function noteHistory(note, run) {
   return steps;
 }
 
-function touches(tool, path) {
+function touches(tool, note) {
   return (
-    tool.places.some((place) => place.path === path) ||
-    tool.output.some((part) => part.type === "diff" && part.path === path)
+    tool.places.some((place) => covers(note, place.path)) ||
+    tool.output.some((part) => part.type === "diff" && covers(note, part.path))
   );
 }
 
-// Lines added and removed on the note's file over the whole run, or null when none.
+// Lines added and removed on the note's file, or in its folder, over the whole run, or null
+// when none.
 export function fileStats(note, run) {
   return diffStats(fileDiffs(note, run));
 }
 
-// The diffs the run's finished tool calls made to the note's file, in order.
+// The diffs the run's finished tool calls made to the note's file, or in its folder, in order.
 export function fileDiffs(note, run) {
   return foldRun(run.entries)
     .items.filter((item) => item.type === "tool" && item.status === "completed")
     .flatMap((tool) =>
-      tool.output.filter((part) => part.type === "diff" && part.path === note.path),
+      tool.output.filter((part) => part.type === "diff" && covers(note, part.path)),
     );
+}
+
+// The files the run's finished tool calls changed under a folder note's folder, each once, in
+// the order first changed: `{ path, added, removed }`. A folder note's dialog lists these
+// rather than the diffs, which would be unlabeled and, for a large folder, unbounded.
+export function changedFiles(note, run) {
+  const byPath = new Map();
+  for (const diff of fileDiffs(note, run)) {
+    byPath.set(diff.path, [...(byPath.get(diff.path) ?? []), diff]);
+  }
+  return [...byPath].map(([path, diffs]) => ({ path, ...diffStats(diffs) }));
 }
 
 // The tray's groups, each in the tray's order: the notes of the live run, the open ones, the

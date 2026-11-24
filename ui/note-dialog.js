@@ -4,10 +4,12 @@
 
 import { diffView, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
+import { fullPlace, onLines } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { foldRun, isLive, isResolved, openQuestion, statusLine } from "./run.js";
 import {
   agentSaid,
+  changedFiles,
   fileDiffs,
   fileStats,
   noteDialogKey,
@@ -135,7 +137,8 @@ export function noteDialog(
     close.type = "button";
     close.setAttribute("aria-label", "Close");
     close.addEventListener("click", () => dialogEl.close());
-    const show = el("button", "button note-dialog-show", "Show in code");
+    const shows = note.target === "folder" ? "Show in files" : "Show in code";
+    const show = el("button", "button note-dialog-show", shows);
     show.type = "button";
     show.addEventListener("click", () => {
       dialogEl.close();
@@ -160,16 +163,24 @@ export function noteDialog(
     main.append(noteSection(note));
 
     const lost = note.anchor === "lost";
-    const label = lost ? "Its lines when written; they are no longer in the file" : "Its lines";
-    main.append(section(label, snippetView(note)));
+    if (onLines(note)) {
+      const label = lost ? "Its lines when written; they are no longer in the file" : "Its lines";
+      main.append(section(label, snippetView(note)));
+    } else if (lost) {
+      const gone = `This ${note.target} is no longer in the repository`;
+      main.append(section(gone, el("div", "note-dialog-note", note.path)));
+    }
 
     if (run) {
       main.append(section(`What ${run.agent} said about ${note.id}`, said(note, run)));
       // What the run did to the note's file, whole: the card only says the note's status.
+      // A folder note lists the files instead (status.js, `changedFiles`).
       const diffs = fileDiffs(note, run);
       if (diffs.length) {
         const stats = fileStats(note, run);
-        const changed = section(`What changed in ${note.path}`, diffsView(diffs));
+        const view =
+          note.target === "folder" ? changedFilesView(changedFiles(note, run)) : diffsView(diffs);
+        const changed = section(`What changed in ${fullPlace(note)}`, view);
         changed.firstChild.append(
           el("span", "note-dialog-stats", `+${stats.added} -${stats.removed}`),
         );
@@ -411,6 +422,20 @@ function section(label, content) {
   return part;
 }
 
+// The files changed under a folder, one line each with its own lines added and removed.
+function changedFilesView(files) {
+  const list = el("ol", "note-dialog-history");
+  for (const file of files) {
+    const item = el("li", "tool");
+    item.append(
+      el("span", "target", file.path),
+      el("span", "state", `+${file.added} -${file.removed}`),
+    );
+    list.append(item);
+  }
+  return list;
+}
+
 // Diffs, one block each.
 function diffsView(diffs) {
   const view = el("div", "note-dialog-diffs");
@@ -433,8 +458,7 @@ function snippetView(note) {
 }
 
 function where(note) {
-  const { start, end } = note.lines;
-  return `${note.id} · ${note.path}:${start === end ? start : `${start}-${end}`}`;
+  return `${note.id} · ${fullPlace(note)}`;
 }
 
 function history(note, run) {

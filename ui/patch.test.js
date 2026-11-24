@@ -102,12 +102,14 @@ test("a character outside the BMP in a quoted path is read whole, not as two hal
 
 test("a note shows at the changed line its lines end on, and only there", () => {
   const [file] = parsePatch(patch);
-  const note = (id, path, end) => ({ id, path, lines: { start: end, end } });
+  const note = (id, path, end) => ({ id, path, target: "lines", lines: { start: end, end } });
   const placed = notesByLine(file, [
     note("N1", "a.txt", 2),
     note("N2", "a.txt", 2),
     note("N3", "a.txt", 9),
     note("N4", "b.txt", 2),
+    // A note on the whole file has no line to show beside.
+    { id: "N5", path: "a.txt", target: "file" },
   ]);
   assert.deepEqual(
     [...placed].map(([line, notes]) => [line, notes.map((n) => n.id)]),

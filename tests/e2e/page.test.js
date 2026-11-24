@@ -287,3 +287,64 @@ test("a send that fails after its step was closed leaves the next send alone (JS
   await held[1].abort();
   await page.waitForFunction(() => !document.getElementById("send-button").disabled);
 });
+
+test("a right-click on a folder writes a note on all of it, and Send sends it at once", async (t) => {
+  const { page, api } = await openProject(t);
+  await page.locator('#files .dir[data-path="src"]').click({ button: "right" });
+  await page
+    .locator("#context-menu")
+    .getByRole("menuitem", { name: /Add Note/ })
+    .click();
+
+  const dialog = page.locator("#path-note-dialog");
+  await dialog.locator(".note-dialog-where").filter({ hasText: "src/" }).waitFor();
+  await dialog.locator("textarea").fill("Split this module.");
+  await dialog.getByRole("button", { name: /Send to Fake/ }).click();
+  await dialog.waitFor({ state: "hidden" });
+
+  // Stored first, then sent alone: the run's prompt names the folder, and its card stays.
+  await page.locator("#notes .note-place").filter({ hasText: "src/" }).waitFor();
+  const { notes } = await api("api/notes");
+  assert.deepEqual(
+    notes.map(({ id, path, target, body }) => [id, path, target, body]),
+    [["N1", "src", "folder", "Split this module."]],
+  );
+  await page.waitForFunction(() => !document.getElementById("tab-run").hidden);
+  const run = await api("api/run");
+  assert.deepEqual(run.notes, ["N1"]);
+  assert.match(run.prompt, /\[N1\] src\/ \(folder\)\nSplit this module\.\n$/);
+
+  // The folder's row counts the note on it, closed and open: no file below it carries it.
+  const folder = page.locator('#files .dir[data-path="src"]');
+  await folder.locator(".count").filter({ hasText: "1" }).waitFor();
+  await folder.click();
+  await page.locator('#files .file[data-path="src/a.rs"]').waitFor();
+  await folder.locator(".count").filter({ hasText: "1" }).waitFor();
+});
+
+test("c on a file's row writes a note on the file, and Save keeps it without a run", async (t) => {
+  const { page, api } = await openProject(t);
+  await page.locator('#files .dir[data-path="src"]').click();
+  await page.locator('#files .file[data-path="src/b.rs"]').focus();
+  await page.keyboard.press("c");
+
+  const dialog = page.locator("#path-note-dialog");
+  await dialog.locator(".note-dialog-where").filter({ hasText: "src/b.rs" }).waitFor();
+  // An empty note is refused in the dialog, which stays open.
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await dialog.locator(".note-dialog-why").filter({ hasText: "Write the note first." }).waitFor();
+  await dialog.locator("textarea").fill("Fold into a.rs.");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await dialog.waitFor({ state: "hidden" });
+
+  await page.locator("#notes .note-place").filter({ hasText: "b.rs" }).waitFor();
+  const { notes } = await api("api/notes");
+  assert.deepEqual(
+    notes.map(({ path, target }) => [path, target]),
+    [["src/b.rs", "file"]],
+  );
+  assert.equal(await api("api/run"), null, "Save sends nothing");
+  // The file's row counts its note.
+  const count = page.locator('#files .file[data-path="src/b.rs"] .count');
+  await count.filter({ hasText: "1" }).waitFor();
+});

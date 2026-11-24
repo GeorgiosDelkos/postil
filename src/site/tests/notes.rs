@@ -44,7 +44,7 @@ fn notes_are_stored_in_the_git_dir_and_survive_a_restart() {
         file.display()
     );
     let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["notes"], review["notes"]);
     assert_eq!(note["state"], serde_json::json!({ "kind": "open" }));
 
@@ -172,14 +172,15 @@ fn notes_written_into_the_file_by_hand_are_read_and_ids_continue_after_them() {
         anchors(&review),
         [anchor("N5", 2, 2, "found"), anchor("N6", 1, 1, "found")]
     );
-    // A version 1 file has no states: its notes read as open, and the write that added
-    // N6 made it version 3.
+    // A version 1 file has no states or targets: its notes read as open and on lines, and
+    // the write that added N6 made it version 4.
     let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(
         stored["notes"][0]["state"],
         serde_json::json!({ "kind": "open" })
     );
+    assert_eq!(stored["notes"][0]["target"], "lines");
 }
 
 #[test]
@@ -394,7 +395,7 @@ fn a_note_is_resolved_with_its_run_and_reopened_to_where_it_was() {
     );
     let stored: serde_json::Value =
         serde_json::from_slice(&fs::read(site.repo().unwrap().review_file()).unwrap()).unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
 }
 
 #[test]
@@ -445,8 +446,8 @@ fn a_broken_review_file_is_reported_and_never_overwritten() {
     let cases = [
         ("{\"version\": 1, \"notes\": [", "cannot parse".to_owned()),
         (
-            r#"{"version": 4, "notes": []}"#,
-            "version 4, but this build of Postil reads versions 1 to 3".to_owned(),
+            r#"{"version": 5, "notes": []}"#,
+            "version 5, but this build of Postil reads versions 1 to 4".to_owned(),
         ),
         (r#"{"version": 0, "notes": []}"#, "version 0".to_owned()),
         (r#"{"notes": []}"#, "cannot parse".to_owned()),
@@ -470,6 +471,25 @@ fn a_broken_review_file_is_reported_and_never_overwritten() {
                 )
             ),
             "unknown field `run`".to_owned(),
+        ),
+        // A target whose fields do not fit it: a hand edit gone wrong, refused, not guessed.
+        (
+            &*format!(
+                r#"{{"version": 4, "notes": [{}]}}"#,
+                note.replace(r#""body":"b""#, r#""body":"b","target":"folder""#)
+            ),
+            "N1: a note on a file or folder has no `lines` or `snippet`".to_owned(),
+        ),
+        (
+            r#"{"version": 4, "notes": [{"id":"N1","path":"a.txt","target":"lines","body":"b"}]}"#,
+            "N1: a note on lines needs `lines` and `snippet`".to_owned(),
+        ),
+        (
+            &*format!(
+                r#"{{"version": 4, "notes": [{}]}}"#,
+                note.replace(r#""body":"b""#, r#""body":"b","target":"dir""#)
+            ),
+            "unknown variant `dir`".to_owned(),
         ),
     ];
     for (contents, expected) in cases {
@@ -632,4 +652,179 @@ fn a_change_gives_up_on_a_lock_another_process_keeps_and_names_it() {
     );
     assert!(reply.starts_with(&expected), "{reply}");
     assert!(!repo.root.join(".git/postil/review.json").exists());
+}
+
+/// The notes' `[id, path, target, anchor]`, and whether each has lines or a snippet.
+fn targets(review: &serde_json::Value) -> Vec<(String, String, String, String, bool)> {
+    review["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| {
+            let field = |name: &str| note[name].as_str().unwrap().to_owned();
+            let placed = note.get("lines").is_some() || note.get("snippet").is_some();
+            (
+                field("id"),
+                field("path"),
+                field("target"),
+                field("anchor"),
+                placed,
+            )
+        })
+        .collect()
+}
+
+fn target(
+    id: &str,
+    path: &str,
+    kind: &str,
+    anchor: &str,
+) -> (String, String, String, String, bool) {
+    let placed = kind == "lines";
+    (
+        id.to_owned(),
+        path.to_owned(),
+        kind.to_owned(),
+        anchor.to_owned(),
+        placed,
+    )
+}
+
+#[test]
+fn notes_on_a_whole_file_or_folder_are_stored_beside_line_notes() {
+    let repo = TempRepo::new("notes-paths");
+    repo.write("src/a.rs", "fn a() {}\n");
+    repo.write("README.md", "# Readme\n");
+    let site = repo.site();
+
+    post_note(&site, "src/a.rs", 1, 1, "On a line.");
+    post_path_note(&site, "src", "folder", "  Split this module.\n");
+    let review = post_path_note(&site, "README.md", "file", "Document the flag.");
+    assert_eq!(
+        targets(&review),
+        [
+            target("N1", "src/a.rs", "lines", "found"),
+            target("N2", "src", "folder", "found"),
+            target("N3", "README.md", "file", "found"),
+        ]
+    );
+    assert_eq!(review["notes"][1]["body"], "Split this module.", "trimmed");
+    assert_eq!(
+        review["notes"][1]["state"],
+        serde_json::json!({ "kind": "open" })
+    );
+
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(site.repo().unwrap().review_file()).unwrap()).unwrap();
+    assert_eq!(stored["notes"], review["notes"]);
+    assert_eq!(
+        get_json(&repo.site(), NOTES),
+        review,
+        "a new process reads them the same"
+    );
+}
+
+#[test]
+fn a_file_or_folder_note_is_lost_while_its_path_is_gone_or_of_another_kind() {
+    let repo = TempRepo::new("notes-path-anchor");
+    fs::create_dir_all(repo.root.join("src/acp")).unwrap();
+    repo.write("src/acp/wire.rs", "wire\n");
+    repo.write("b.rs", "b\n");
+    let site = repo.site();
+    post_path_note(&site, "src/acp", "folder", "Split by message.");
+    post_path_note(&site, "b.rs", "file", "Rename.");
+
+    fs::rename(repo.root.join("src/acp"), repo.root.join("src/protocol")).unwrap();
+    fs::remove_file(repo.root.join("b.rs")).unwrap();
+    // A folder where the file was is not the file the note is on.
+    fs::create_dir(repo.root.join("b.rs")).unwrap();
+    assert_eq!(
+        targets(&get_json(&site, NOTES)),
+        [
+            target("N1", "src/acp", "folder", "lost"),
+            target("N2", "b.rs", "file", "lost"),
+        ]
+    );
+
+    fs::rename(repo.root.join("src/protocol"), repo.root.join("src/acp")).unwrap();
+    fs::remove_dir(repo.root.join("b.rs")).unwrap();
+    repo.write("b.rs", "back\n");
+    assert_eq!(
+        targets(&get_json(&site, NOTES)),
+        [
+            target("N1", "src/acp", "folder", "found"),
+            target("N2", "b.rs", "file", "found"),
+        ]
+    );
+}
+
+#[test]
+fn a_symlink_takes_a_file_note_wherever_it_points_as_the_file_list_shows_it() {
+    let repo = TempRepo::new("notes-path-link");
+    repo.write("src/a.rs", "a\n");
+    std::os::unix::fs::symlink("src", repo.root.join("link")).unwrap();
+    std::os::unix::fs::symlink("gone", repo.root.join("dangling")).unwrap();
+    let site = repo.site();
+
+    post_path_note(&site, "link", "file", "Point elsewhere.");
+    let review = post_path_note(&site, "dangling", "file", "Remove.");
+    assert_eq!(
+        targets(&review),
+        [
+            target("N1", "link", "file", "found"),
+            target("N2", "dangling", "file", "found"),
+        ]
+    );
+    let (status, reply) = post(&site, NOTES, &path_note("link", "folder", "b"));
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(reply.contains("link is not a folder"), "{reply}");
+}
+
+#[test]
+fn a_file_or_folder_note_on_a_path_of_another_kind_or_none_is_refused() {
+    let repo = TempRepo::new("notes-path-bad");
+    repo.write("src/a.rs", "a\n");
+    // Neither a file nor a folder.
+    make_fifo(&repo.root.join("pipe"));
+    let site = repo.site();
+
+    let cases = [
+        (path_note("pipe", "folder", "b"), "pipe is not a folder"),
+        (path_note("pipe", "file", "b"), "pipe is not a file"),
+        (
+            path_note("src/a.rs", "folder", "b"),
+            "src/a.rs is not a folder",
+        ),
+        (path_note("src", "file", "b"), "src is not a file"),
+        (path_note("gone", "folder", "b"), "gone is not a folder"),
+        (path_note("src", "folder", "  "), "no text"),
+        // One spelling per path, as git writes it: the prompt shows the stored path.
+        (path_note("src/", "folder", "b"), "inside the repository"),
+        (path_note("./src", "folder", "b"), "inside the repository"),
+        (path_note("src//a.rs", "file", "b"), "inside the repository"),
+        (path_note("..", "folder", "b"), "inside the repository"),
+        (path_note("", "folder", "b"), "inside the repository"),
+        (path_note("src", "dir", "b"), "unknown variant `dir`"),
+        (
+            serde_json::json!({
+                "path": "src",
+                "target": "folder",
+                "lines": { "start": 1, "end": 1 },
+                "snippet": "a",
+                "body": "b",
+            })
+            .to_string(),
+            "has no `lines` or `snippet`",
+        ),
+        (
+            r#"{"path":"src/a.rs","target":"lines","body":"b"}"#.to_owned(),
+            "needs `lines` and `snippet`",
+        ),
+    ];
+    for (request, expected) in cases {
+        let (status, reply) = post(&site, NOTES, &request);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {reply}");
+        assert!(reply.contains(expected), "{request}: {reply}");
+    }
+    assert!(!site.repo().unwrap().review_file().exists());
 }

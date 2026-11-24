@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   agentSaid,
+  changedFiles,
   fileStats,
   groupNotes,
   noteDialogKey,
@@ -178,6 +179,37 @@ test("a note's history is the run's tool calls on its file and the plan steps na
     output: [diff("src/math.rs", null, "z\n")],
   };
   assert.equal(noteHistory(note, run("R1", "ended", [moved])).length, 1);
+});
+
+test("a folder note's history is the run's tool calls on any file below its folder", () => {
+  const note = { ...sent("N1", "R1", "src/acp"), target: "folder" };
+  const entries = [
+    tool("t1", "read", "src/acp/wire.rs"),
+    tool("t2", "edit", "src/acp.rs", [diff("src/acp.rs", "a\n", "b\n")]),
+    tool("t3", "edit", "src/acp/deep/x.rs", [diff("src/acp/deep/x.rs", "a\n", "a\nb\n")]),
+  ];
+  const r = run("R1", "ended", entries);
+  assert.deepEqual(
+    noteHistory(note, r).map((step) => `${step.verb} ${step.target}`),
+    ["read src/acp/wire.rs", "edit src/acp/deep/x.rs"],
+  );
+  assert.deepEqual(fileStats(note, r), { added: 1, removed: 0 });
+});
+
+test("a folder note's changed files are listed once each, in the order first changed", () => {
+  const note = { ...sent("N1", "R1", "src"), target: "folder" };
+  const entries = [
+    tool("t1", "edit", "src/b.rs", [diff("src/b.rs", "a\n", "a\nb\n")]),
+    tool("t2", "edit", "src/a.rs", [diff("src/a.rs", "a\nb\n", "c\n")]),
+    tool("t3", "edit", "src/b.rs", [diff("src/b.rs", "a\nb\n", "a\nb\nc\n")]),
+    tool("t4", "edit", "lib/x.rs", [diff("lib/x.rs", null, "x\n")]),
+    // An edit that did not finish changed nothing yet.
+    tool("t5", "edit", "src/c.rs", [diff("src/c.rs", null, "c\n")], "in_progress"),
+  ];
+  assert.deepEqual(changedFiles(note, run("R1", "ended", entries)), [
+    { path: "src/b.rs", added: 2, removed: 0 },
+    { path: "src/a.rs", added: 1, removed: 2 },
+  ]);
 });
 
 test("notes are grouped as in the run, open, done newest run first, and resolved", () => {
