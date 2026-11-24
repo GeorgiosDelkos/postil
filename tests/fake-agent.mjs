@@ -8,7 +8,7 @@
 // what the app sent without reading the agent's input itself.
 
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { closeSync, readSync, writeFileSync, writeSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const [scenario, ...extra] = process.argv.slice(2);
@@ -338,7 +338,34 @@ if (["silent", "exit-after-turn", "exit-leaving-stderr"].includes(scenario) && e
   writeFileSync(extra[0], String(process.pid));
 }
 
-createInterface({ input: process.stdin }).on("line", (line) => {
+// "close-stdin": answers `initialize` and `session/new`, then closes its standard input and
+// runs on, so the app's next write fails. It reads and writes the descriptors itself: Node's
+// stdin stream never closes descriptor 0, and its stdout stream may still be writing while
+// the reads here block.
+const closeStdinAndRunOn = () => {
+  let input = "";
+  const readLine = () => {
+    const buffer = Buffer.alloc(4096);
+    while (!input.includes("\n")) {
+      const read = readSync(0, buffer);
+      if (read === 0) process.exit(1);
+      input += buffer.toString("utf8", 0, read);
+    }
+    const end = input.indexOf("\n");
+    const line = input.slice(0, end);
+    input = input.slice(end + 1);
+    return JSON.parse(line);
+  };
+  const reply = (id, result) => writeSync(1, `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
+  reply(readLine().id, { protocolVersion: 1 });
+  const { id } = readLine();
+  // Closed before the session is open, so no write of the app's can still get through.
+  closeSync(0);
+  reply(id, { sessionId: "S1" });
+  setInterval(() => {}, 1000);
+};
+
+const handle = (line) => {
   const message = JSON.parse(line);
   if (message.method === undefined) {
     return answers.get(message.id)?.(message);
@@ -373,4 +400,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     default:
       return send({ id: message.id, error: { code: -32601, message: "no" } });
   }
-});
+};
+
+if (scenario === "close-stdin") closeStdinAndRunOn();
+else createInterface({ input: process.stdin }).on("line", handle);

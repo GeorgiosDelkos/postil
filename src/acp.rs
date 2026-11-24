@@ -13,7 +13,9 @@
 //! exits; the writer ends when the [`Agent`] is dropped, or at its first failed write:
 //!
 //! - the writer sends the queued lines to standard input, so no caller blocks on an agent
-//!   that stopped reading;
+//!   that stopped reading. A failed write means the agent closed its standard input, and
+//!   nothing can reach it any more, even if it runs on: the writer marks it gone and kills
+//!   its process group, so the reader reports the exit and a turn under way ends;
 //! - the reader reads standard output, hands each reply to whoever waits for it, and turns
 //!   everything else into an [`Event`] for the callback given to [`Agent::spawn`];
 //! - the stderr thread keeps the end of standard error for error messages, and keeps the

@@ -235,8 +235,8 @@ impl Starting {
 }
 
 impl Agent {
-    /// Whether the agent is still there: false once the reader has seen its output end. A
-    /// kept agent that is not alive is started again.
+    /// Whether the agent is still there: false once the reader has seen its output end, or
+    /// the writer could not write to it. A kept agent that is not alive is started again.
     pub(crate) fn is_alive(&self) -> bool {
         !self.process.state().gone
     }
@@ -429,8 +429,9 @@ struct State {
     cancelling: bool,
     /// Set when the [`Agent`] is dropped: the reader then delivers no more events.
     closed: bool,
-    /// Set when the agent's output ended: every call fails from then on. Checked here, not
-    /// left to the writer, which notices a closed pipe only on its next write.
+    /// Set when the agent's output ended, or a write to it failed: every call fails from then
+    /// on. Checked here, not left to the writer, which notices a closed pipe only on its next
+    /// write.
     gone: bool,
 }
 
@@ -508,8 +509,15 @@ impl Process {
         let stderr = child.stderr.take().expect("stderr was piped");
         let (outbox, lines) = mpsc::channel();
         let (stderr_done, stderr_closed) = mpsc::channel();
+        let group = Arc::new(Mutex::new(Some(child.id())));
 
-        let started = spawn_thread("acp-writer", move || write_lines(stdin, &lines))
+        let writer = Writer {
+            shared: Arc::clone(&shared),
+            stopper: Stopper {
+                group: Arc::clone(&group),
+            },
+        };
+        let started = spawn_thread("acp-writer", move || writer.run(stdin, &lines))
             .and_then(|()| {
                 let shared = Arc::clone(&shared);
                 spawn_thread("acp-stderr", move || {
@@ -527,8 +535,8 @@ impl Process {
                 spawn_thread("acp-reader", move || reader.run(stdout, &stderr_closed))
             });
         let process = Self {
-            group: Arc::new(Mutex::new(Some(child.id()))),
             child,
+            group,
             outbox,
             shared,
         };
@@ -919,15 +927,32 @@ impl<F: FnMut(Event)> Reader<F> {
 
 /// The writer thread: sends each queued line, until the agent stops reading or the
 /// [`Process`] is dropped.
-fn write_lines(mut stdin: ChildStdin, lines: &Receiver<String>) {
-    for line in lines {
-        let written = stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush());
-        if written.is_err() {
-            break;
+struct Writer {
+    shared: Arc<Shared>,
+    /// Ends the agent when a write fails.
+    stopper: Stopper,
+}
+
+impl Writer {
+    fn run(self, mut stdin: ChildStdin, lines: &Receiver<String>) {
+        for line in lines {
+            let written = stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.write_all(b"\n"))
+                .and_then(|()| stdin.flush());
+            if written.is_err() {
+                return self.give_up();
+            }
         }
+    }
+
+    /// The agent stopped reading, and may run on: no prompt, answer or cancel can reach it
+    /// any more. It is marked gone at once, so it is not alive and every call fails as
+    /// exited; then it is ended, so its output ends and the reader reports the exit, which
+    /// also ends a turn that waited on a reply the agent never saw.
+    fn give_up(&self) {
+        lock(&self.shared.state).gone = true;
+        self.stopper.stop();
     }
 }
 
@@ -1488,6 +1513,21 @@ mod tests {
             }
         }
         assert!(!agent.is_alive());
+    }
+
+    #[test]
+    fn an_agent_that_closes_its_input_and_runs_on_is_ended_with_its_turn() {
+        let (agent, events) = start("close-stdin").unwrap();
+        // Queued at once; the writer's write then fails.
+        agent.prompt(&[text("x")]).unwrap();
+        // Nothing can reach the agent any more, so it is ended: its output ends, and so does
+        // the turn, which no reply would ever end.
+        assert!(matches!(next(&events), Event::Exited { .. }));
+        assert!(!agent.is_alive(), "the runner starts a fresh agent");
+        assert!(
+            matches!(agent.prompt(&[text("y")]), Err(Error::AgentExited { .. })),
+            "exited, not a turn still running"
+        );
     }
 
     /// A real agent answers a prompt over a real session. Ignored unless asked for, with
