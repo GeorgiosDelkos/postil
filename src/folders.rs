@@ -69,16 +69,12 @@ mod tests {
 
     use std::fs;
 
-    fn temp_file(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("postil-folders-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        dir.join("postil").join("folders.json")
-    }
+    use crate::testing::TempDir;
 
     #[test]
     fn saved_folders_are_read_back_and_a_bad_file_reads_as_none_and_is_replaced() {
-        let file = temp_file("round");
+        let dir = TempDir::new("folders-round");
+        let file = dir.path().join("postil").join("folders.json");
         assert_eq!(load(&file), Folders::default(), "no file");
         let folders = || Folders {
             open: vec!["src".to_owned(), "src/acp".to_owned()],
@@ -101,36 +97,36 @@ mod tests {
             save(&file, folders()).unwrap();
             assert_eq!(load(&file), folders(), "{broken} is replaced");
         }
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
 
     #[test]
     fn folders_that_cannot_be_written_are_a_write_folders_error() {
-        let file = temp_file("unwritable");
+        let dir = TempDir::new("folders-unwritable");
+        let file = dir.path().join("postil").join("folders.json");
         // The path is a directory, so the write over it fails.
         fs::create_dir_all(&file).unwrap();
         match save(&file, Folders::default()) {
             Err(Error::WriteFolders { path, .. }) => assert_eq!(path, file),
             other => panic!("expected WriteFolders, got {other:?}"),
         }
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
 
     #[test]
     fn a_file_from_a_newer_postil_reads_as_none_and_is_never_replaced() {
-        let file = temp_file("newer");
+        let dir = TempDir::new("folders-newer");
+        let file = dir.path().join("postil").join("folders.json");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let newer = r#"{"version": 2, "open": ["src"], "closed": ["docs"]}"#;
         fs::write(&file, newer).unwrap();
         assert_eq!(load(&file), Folders::default());
         save(&file, Folders::default()).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), newer);
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
 
     #[test]
     fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
-        let file = temp_file("bytes");
+        let dir = TempDir::new("folders-bytes");
+        let file = dir.path().join("postil").join("folders.json");
         let folders = Folders {
             open: vec!["src".to_owned(), "src/acp".to_owned()],
         };
@@ -138,6 +134,5 @@ mod tests {
         let expected =
             "{\n  \"version\": 1,\n  \"open\": [\n    \"src\",\n    \"src/acp\"\n  ]\n}\n";
         assert_eq!(fs::read_to_string(&file).unwrap(), expected);
-        drop(fs::remove_dir_all(file.parent().unwrap().parent().unwrap()));
     }
 }

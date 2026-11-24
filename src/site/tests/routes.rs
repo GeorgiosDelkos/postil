@@ -65,14 +65,12 @@ const METHODS: [Method; 5] = [
 ];
 
 fn send(site: &Site, method: &Method, path: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(method)
-        .uri(format!("postil://localhost{path}"))
-        .body(Vec::new())
-        .unwrap();
-    let reply = site.respond(&request);
-    let body = String::from_utf8(reply.body().to_vec()).unwrap();
-    (reply.status(), body)
+    call(
+        site,
+        method.clone(),
+        &format!("postil://localhost{path}"),
+        "",
+    )
 }
 
 #[test]

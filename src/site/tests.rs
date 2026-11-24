@@ -20,6 +20,7 @@ use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::testing::{make_fifo, read_fifo, skip_as_root};
 
 // The page's files, as the tests that check its links and colours read them.
 const INDEX_HTML: &str = include_str!("../../ui/index.html");
@@ -35,6 +36,8 @@ impl TempRepo {
     /// `name` must differ between tests: they run in parallel in one process.
     pub(crate) fn new(name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("postil-{}-{name}", std::process::id()));
+        // A leftover of a process that had this pid would hold its files and git history.
+        drop(fs::remove_dir_all(&root));
         fs::create_dir_all(root.join("src")).unwrap();
         let repo = Self { root };
         repo.git(&["init", "--quiet", "--initial-branch", "trunk"]);
@@ -93,11 +96,36 @@ impl Drop for TempRepo {
     }
 }
 
-fn get(site: &Site, uri: &str) -> (StatusCode, String) {
-    let request = Request::builder().uri(uri).body(Vec::new()).unwrap();
+/// Sends `method uri` with `body` as the page does, and returns the reply's status and text.
+fn call(site: &Site, method: Method, uri: &str, body: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(body.as_bytes().to_vec())
+        .unwrap();
     let reply = site.respond(&request);
     let body = String::from_utf8(reply.body().to_vec()).unwrap();
     (reply.status(), body)
+}
+
+fn get(site: &Site, uri: &str) -> (StatusCode, String) {
+    call(site, Method::GET, uri, "")
+}
+
+fn post(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
+    call(site, Method::POST, uri, body)
+}
+
+fn put(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
+    call(site, Method::PUT, uri, body)
+}
+
+fn patch(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
+    call(site, Method::PATCH, uri, body)
+}
+
+fn delete(site: &Site, uri: &str) -> (StatusCode, String) {
+    call(site, Method::DELETE, uri, "")
 }
 
 fn get_json(site: &Site, uri: &str) -> serde_json::Value {
@@ -107,17 +135,6 @@ fn get_json(site: &Site, uri: &str) -> serde_json::Value {
 }
 
 const NOTES: &str = "postil://localhost/api/notes";
-
-fn post(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .body(body.as_bytes().to_vec())
-        .unwrap();
-    let reply = site.respond(&request);
-    let body = String::from_utf8(reply.body().to_vec()).unwrap();
-    (reply.status(), body)
-}
 
 pub(crate) fn post_note(
     site: &Site,
@@ -145,17 +162,6 @@ fn new_note(path: &str, start: usize, end: usize, snippet: &str, body: &str) -> 
     .to_string()
 }
 
-fn delete(site: &Site, uri: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(Method::DELETE)
-        .uri(uri)
-        .body(Vec::new())
-        .unwrap();
-    let reply = site.respond(&request);
-    let body = String::from_utf8(reply.body().to_vec()).unwrap();
-    (reply.status(), body)
-}
-
 /// A plain folder in the temporary directory, outside any repository.
 pub(crate) fn plain_folder(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("postil-{}-plain-{name}", std::process::id()));
@@ -175,17 +181,6 @@ fn site_root(dir: &Path) -> String {
 }
 
 const SETTINGS: &str = "postil://localhost/api/settings";
-
-fn put(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(Method::PUT)
-        .uri(uri)
-        .body(body.as_bytes().to_vec())
-        .unwrap();
-    let reply = site.respond(&request);
-    let body = String::from_utf8(reply.body().to_vec()).unwrap();
-    (reply.status(), body)
-}
 
 /// Saves `settings` (JSON text, possibly malformed) as the page does: naming the
 /// revision of the file it last read.

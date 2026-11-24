@@ -252,6 +252,13 @@ fn a_file_given_as_the_folder_is_named_and_exits_1() {
 fn a_folder_that_cannot_be_looked_at_keeps_git_s_explanation() {
     use std::os::unix::fs::PermissionsExt;
 
+    // Root enters any folder, whatever its mode.
+    let id = Command::new("id").arg("-u").output().expect("id runs");
+    if String::from_utf8_lossy(&id.stdout).trim() == "0" {
+        eprintln!("skipped: running as root, which file modes do not stop");
+        return;
+    }
+
     // A folder inside a parent nobody may enter: it exists, so it is not "not a folder".
     let parent = temp_dir("locked");
     let inside = parent.join("project");

@@ -1014,6 +1014,7 @@ mod tests {
         Location, PermissionKind, PlanEntry, PlanEntryStatus, ToolCall, ToolCallContent,
         ToolCallStatus, ToolKind,
     };
+    use crate::testing::{TempDir, make_fifo, read_fifo};
 
     /// Long enough for Node to start on a loaded machine; a test that waits this long has
     /// failed (it bounds a hang, it times nothing).
@@ -1428,7 +1429,9 @@ mod tests {
 
     #[test]
     fn a_starting_agent_can_be_stopped_from_another_thread() {
-        let pid_file = std::env::temp_dir().join(format!("postil-silent-{}", std::process::id()));
+        let dir = TempDir::new("acp-silent");
+        let pid_file = dir.path().join("silent.pid");
+        make_fifo(&pid_file);
         let search_path = std::env::var_os("PATH").expect("PATH is set");
         let command = format!("{} {}", command("silent"), pid_file.display());
         let launch = Launch {
@@ -1443,20 +1446,7 @@ mod tests {
         let opening = thread::spawn(move || starting.open_session());
 
         // The agent writes its pid once it runs; then it never answers.
-        let deadline = std::time::Instant::now() + WAIT;
-        let pid = loop {
-            if let Ok(pid) = std::fs::read_to_string(&pid_file)
-                && !pid.is_empty()
-            {
-                break pid;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the agent never started"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
-        drop(std::fs::remove_file(&pid_file));
+        let pid = read_fifo(&pid_file, WAIT);
         stopper.stop();
         assert!(matches!(
             opening.join().unwrap(),

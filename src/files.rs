@@ -236,6 +236,7 @@ fn config_dir_from(xdg_config_home: Option<OsString>, home: Option<OsString>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{TempDir, skip_as_root};
 
     #[test]
     fn config_dir_prefers_an_absolute_xdg_config_home_and_falls_back_to_home() {
@@ -265,33 +266,27 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
-    /// An empty directory in the temporary directory. `name` must differ between tests.
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("postil-files-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn a_link_to_a_missing_file_creates_that_file_and_stays_a_link() {
-        let dir = temp_dir("dangling");
-        let link = dir.join("settings.json");
+        let dir = TempDir::new("files-dangling");
+        let link = dir.path().join("settings.json");
         std::os::unix::fs::symlink("real.json", &link).unwrap();
 
         write_atomically(&link, b"new").unwrap();
 
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("real.json"));
-        assert_eq!(fs::read(dir.join("real.json")).unwrap(), b"new");
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(fs::read(dir.path().join("real.json")).unwrap(), b"new");
     }
 
     #[test]
     fn a_failed_write_through_a_link_names_the_file_it_points_at() {
-        let dir = temp_dir("blocked-target");
-        let target_dir = dir.join("dotfiles");
+        if skip_as_root() {
+            return;
+        }
+        let dir = TempDir::new("files-blocked-target");
+        let target_dir = dir.path().join("dotfiles");
         fs::create_dir(&target_dir).unwrap();
-        let link = dir.join("settings.json");
+        let link = dir.path().join("settings.json");
         std::os::unix::fs::symlink("dotfiles/settings.json", &link).unwrap();
         fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -306,38 +301,39 @@ mod tests {
             "{error}"
         );
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_cycle_of_links_is_refused_and_nothing_is_written() {
-        let dir = temp_dir("cycle");
-        std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
-        std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
+        let dir = TempDir::new("files-cycle");
+        std::os::unix::fs::symlink("b", dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("a", dir.path().join("b")).unwrap();
 
-        let error = write_atomically(&dir.join("a"), b"x").unwrap_err();
+        let error = write_atomically(&dir.path().join("a"), b"x").unwrap_err();
 
         assert!(error.to_string().contains("symbolic links"), "{error}");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "only the two links");
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "only the two links"
+        );
     }
 
     #[test]
     fn leftover_temporaries_with_this_pid_do_not_fail_the_write() {
-        let dir = temp_dir("leftover");
-        let file = dir.join("settings.json");
+        let dir = TempDir::new("files-leftover");
+        let file = dir.path().join("settings.json");
         // Leftovers of a crashed process that had this pid, under the next names this process
         // would use. Tests run in parallel and also take numbers, so a stretch ahead is taken.
         let next = WRITES.load(Ordering::Relaxed);
         for number in next..next + 64 {
             let name = format!("settings.json.{}.{number}.tmp", std::process::id());
-            fs::write(dir.join(name), b"stale").unwrap();
+            fs::write(dir.path().join(name), b"stale").unwrap();
         }
 
         write_atomically(&file, b"new").unwrap();
 
         assert_eq!(fs::read(&file).unwrap(), b"new");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A versioned file of the shape [`load_versioned`] is given in the app.
@@ -350,14 +346,12 @@ mod tests {
 
     /// What `load_versioned` makes of `contents` (`None`: no file), for a build at version 2.
     fn loaded(name: &str, contents: Option<&str>) -> Stored<Probe> {
-        let dir = temp_dir(name);
-        let file = dir.join("probe.json");
+        let dir = TempDir::new(&format!("files-{name}"));
+        let file = dir.path().join("probe.json");
         if let Some(contents) = contents {
             fs::write(&file, contents).unwrap();
         }
-        let stored = load_versioned(&file, 2);
-        fs::remove_dir_all(&dir).unwrap();
-        stored
+        load_versioned(&file, 2)
     }
 
     #[test]
@@ -396,10 +390,9 @@ mod tests {
         }
 
         // A directory where the file should be: it exists, and reading it fails.
-        let dir = temp_dir("unreadable");
-        let file = dir.join("probe.json");
+        let dir = TempDir::new("files-unreadable");
+        let file = dir.path().join("probe.json");
         fs::create_dir(&file).unwrap();
         assert!(matches!(load_versioned::<Probe>(&file, 2), Stored::Nothing));
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

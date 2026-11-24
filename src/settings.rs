@@ -423,10 +423,8 @@ mod tests {
 
     #[test]
     fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
-        let dir =
-            std::env::temp_dir().join(format!("postil-settings-{}-bytes", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        let file = dir.join("settings.json");
+        let dir = crate::testing::TempDir::new("settings-bytes");
+        let file = dir.path().join("settings.json");
         let raw: RawSettings = serde_json::from_value(serde_json::json!({
             "theme": "dark",
             "codeFontSize": 14,
@@ -468,6 +466,5 @@ mod tests {
 }
 "#;
         assert_eq!(fs::read_to_string(&file).unwrap(), expected);
-        drop(fs::remove_dir_all(&dir));
     }
 }

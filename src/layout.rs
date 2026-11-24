@@ -128,15 +128,12 @@ mod tests {
 
     use std::fs;
 
-    fn temp_file(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("postil-layout-{}-{name}", std::process::id()));
-        drop(fs::remove_dir_all(&dir));
-        dir.join("layout.json")
-    }
+    use crate::testing::TempDir;
 
     #[test]
     fn a_saved_layout_is_read_back_and_the_file_is_readable_json() {
-        let file = temp_file("round");
+        let dir = TempDir::new("layout-round");
+        let file = dir.path().join("layout.json");
         let layout = Layout::try_from(RawLayout {
             sidebar: 300,
             tray: 460,
@@ -149,12 +146,12 @@ mod tests {
             json,
             serde_json::json!({ "version": 1, "sidebar": 300, "tray": 460 })
         );
-        drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
     #[test]
     fn widths_outside_their_range_are_refused_and_their_limits_allowed() {
-        let file = temp_file("range");
+        let dir = TempDir::new("layout-range");
+        let file = dir.path().join("layout.json");
         let with = |sidebar, tray| Layout::try_from(RawLayout { sidebar, tray });
         for (sidebar, tray, expected) in [
             (
@@ -176,14 +173,13 @@ mod tests {
         assert_eq!(load(&file), with(200, 280).unwrap());
         save(&file, &with(480, 720).unwrap()).unwrap();
         assert_eq!(load(&file), with(480, 720).unwrap());
-        drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
     #[test]
     fn a_missing_broken_or_out_of_range_file_reads_as_the_default_and_is_replaced() {
-        let file = temp_file("broken");
+        let dir = TempDir::new("layout-broken");
+        let file = dir.path().join("layout.json");
         assert_eq!(load(&file), Layout::default(), "no file");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
         for contents in [
             "{ not json",
             r#"{"version": 1, "sidebar": 10, "tray": 320}"#,
@@ -200,39 +196,37 @@ mod tests {
         .unwrap();
         save(&file, &layout).unwrap();
         assert_eq!(load(&file), layout);
-        drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
     #[test]
     fn a_layout_that_cannot_be_written_is_a_write_layout_error() {
-        let file = temp_file("unwritable");
+        let dir = TempDir::new("layout-unwritable");
+        let file = dir.path().join("layout.json");
         // The path is a directory, so the write over it fails.
         fs::create_dir_all(&file).unwrap();
         match save(&file, &Layout::default()) {
             Err(Error::WriteLayout { path, .. }) => assert_eq!(path, file),
             other => panic!("expected WriteLayout, got {other:?}"),
         }
-        drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
     #[test]
     fn a_layout_from_a_newer_build_is_neither_read_nor_replaced() {
-        let file = temp_file("newer");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let dir = TempDir::new("layout-newer");
+        let file = dir.path().join("layout.json");
         let newer = r#"{"version": 2, "panes": [248, 600, 320]}"#;
         fs::write(&file, newer).unwrap();
         assert_eq!(load(&file), Layout::default());
         save(&file, &Layout::default()).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), newer);
-        drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 
     #[test]
     fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
-        let file = temp_file("bytes");
+        let dir = TempDir::new("layout-bytes");
+        let file = dir.path().join("layout.json");
         save(&file, &Layout::default()).unwrap();
         let expected = "{\n  \"version\": 1,\n  \"sidebar\": 248,\n  \"tray\": 320\n}\n";
         assert_eq!(fs::read_to_string(&file).unwrap(), expected);
-        drop(fs::remove_dir_all(file.parent().unwrap()));
     }
 }

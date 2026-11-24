@@ -2,17 +2,10 @@
 
 use super::*;
 
-/// The settings view once the agent scan has finished, waiting at most five seconds.
+/// The settings view once the agent scan has finished.
 fn scanned_settings(site: &Site) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let view = get_json(site, SETTINGS);
-        if !view["agents"].is_null() {
-            return view;
-        }
-        assert!(Instant::now() < deadline, "the agent scan did not finish");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    site.agents.wait();
+    get_json(site, SETTINGS)
 }
 
 /// Settings that pass every rule and differ from the defaults in every field.
@@ -406,6 +399,9 @@ fn settings_that_cannot_be_read_or_written_say_so() {
         "{reply}"
     );
 
+    if skip_as_root() {
+        return;
+    }
     // A read-only configuration directory: the file is missing, so saving may go ahead,
     // and then the write fails.
     let blocked = TempRepo::new("settings-unwritable");

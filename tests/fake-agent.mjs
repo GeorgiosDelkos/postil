@@ -290,15 +290,16 @@ async function prompt(id, params) {
     case "exit-leaving-stderr": {
       // A grandchild keeps standard error open after the agent exits, as one an agent starts
       // can: the reader then waits out its grace for the agent's last words. Once the agent
-      // has exited (the grandchild gets a new parent), it writes `<pid file>.exited`, which a
-      // test cannot learn from the pid: an exited agent stays a zombie until it is reaped.
-      // The agent's pid, not the grandchild's first `ppid`: the agent may be gone by the time
-      // the grandchild runs.
+      // has exited, the grandchild writes `<pid file>.exited`, which a test cannot learn from
+      // the pid: an exited agent stays a zombie until it is reaped. The grandchild learns it
+      // from its standard input, a pipe only the agent writes to: the pipe ends when the
+      // agent exits. It then stays, holding standard error, until its group is killed.
       const exited = JSON.stringify(`${extra[0]}.exited`);
-      const watch = `setInterval(() => {
-          if (process.ppid !== ${process.pid}) require("node:fs").writeFileSync(${exited}, "x");
-        }, 10);`;
-      spawn(process.execPath, ["-e", watch], { stdio: ["ignore", "ignore", "inherit"] });
+      const watch = `process.stdin.on("end", () => {
+          require("node:fs").writeFileSync(${exited}, "x");
+          setInterval(() => {}, 1000);
+        }).resume();`;
+      spawn(process.execPath, ["-e", watch], { stdio: ["pipe", "ignore", "inherit"] });
       send({ id, result: { stopReason: "end_turn" } });
       return process.exit(0);
     }
