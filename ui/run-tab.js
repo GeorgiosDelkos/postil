@@ -143,7 +143,7 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
       statusIcon(iconKind(latest)),
       el("span", "run-id", view.id),
       el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`),
-      el("span", `run-entry-status ${statusLine(latest).tone}`, statusWord(latest)),
+      el("span", `run-entry-status tone-${statusLine(latest).tone}`, statusWord(latest)),
       el("span", "run-chevron", "›"),
     );
     button.title = `${latest.id} · ${view.agent} · ${statusLine(latest).text}`;
@@ -161,7 +161,7 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
     const shown = JSON.stringify([run.agent, text, tone]);
     if (statusEl.dataset.shown === shown) return;
     statusEl.dataset.shown = shown;
-    const dot = el("span", `status-dot ${tone}`);
+    const dot = el("span", `status-dot tone-${tone}`);
     dot.setAttribute("aria-hidden", "true");
     statusEl.replaceChildren(dot, el("span", "status-text", `${run.agent} · ${text}`));
   }
@@ -192,7 +192,7 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
       if (isLive(now)) time.textContent = ` · ${elapsed(Date.now() / 1000 - now.startedAt)}`;
     };
     tick();
-    const word = el("strong", `run-word ${tone}`, statusWord(run));
+    const word = el("strong", `run-word tone-${tone}`, statusWord(run));
     header.title.replaceChildren(statusIcon(iconKind(run)), word, time);
     const stopping = isLive(run) && run.status === "cancelling";
     if (!stopping) forceAt = null;

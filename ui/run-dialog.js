@@ -226,7 +226,7 @@ export function runDialog({
       button.type = "button";
       button.append(
         statusIcon(card.kind),
-        el("span", `run-card-text run-note-status ${card.tone}`, card.label),
+        el("span", `run-card-text run-note-status tone-${card.tone}`, card.label),
         el("span", "run-note-where", card.where),
         el("span", "note-id", card.id),
       );
@@ -340,7 +340,7 @@ export function runDialog({
   function followUpBox(root, latest) {
     if (following?.root !== root.id) {
       const form = el("form", "follow-up");
-      const input = el("textarea", "follow-up-input");
+      const input = el("textarea", "field follow-up-input");
       input.rows = 3;
       input.setAttribute("aria-label", "Follow-up");
       const why = el("span", "note-dialog-why");
@@ -437,7 +437,7 @@ export function runDialog({
         statusIcon(iconKind(stage)),
         el("span", "run-id", stage.id),
         el("span", "run-card-text", `${stage.agent} · ${judges ? "judges and fixes" : "proposes"}`),
-        el("span", `run-entry-status ${statusLine(stage).tone}`, statusWord(stage)),
+        el("span", `run-entry-status tone-${statusLine(stage).tone}`, statusWord(stage)),
         el("span", "run-chevron", "›"),
       );
       button.addEventListener("click", () => openDetail({ kind: "run", id: stage.id }));

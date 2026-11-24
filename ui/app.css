@@ -1,6 +1,7 @@
 /* The look of the app. Two palettes as custom properties: Graphite (dark, the default) and
    Paper (light), chosen by the system appearance. Every color in the rules below is a
-   variable, so a third theme is a new block of variables and nothing else. */
+   variable, so a third theme is a new block of variables and nothing else (ui/app-css.test.js
+   checks it). */
 
 @font-face {
   font-family: "Geist";
@@ -8,10 +9,17 @@
   font-weight: 100 900;
 }
 
+/* Geist Mono's ligatures are off wherever it is used: they change the shape of operators a
+   reviewer is reading closely, and join " --" into one glyph, which hides the space in
+   "gemini --acp" when a command must read exactly as it runs. Set here, on the face, rather
+   than by `font-variant-ligatures: none` on every monospace rule: that property is inherited
+   by Geist text too, whose fi and fl ligatures are kept. WebKit applies this descriptor
+   (measured in the app's WKWebView, 2026-11-24); Chrome ignores it. */
 @font-face {
   font-family: "Geist Mono";
   src: url("fonts/GeistMono-Variable.woff2") format("woff2");
   font-weight: 100 900;
+  font-feature-settings: "liga" 0;
 }
 
 :root {
@@ -27,7 +35,17 @@
   --hover: #23262d;
   --border: #272a31;
   --border-strong: #3a4352;
+  /* Shadows: of a panel (the composer, dialogs, the toast), of the right-click menu, of a
+     small floating control (the focus pill), and of the switch's knob. */
   --shadow: 0 10px 30px rgb(0 0 0 / 35%);
+  --shadow-menu:
+    0 0 0 0.5px rgb(0 0 0 / 25%),
+    0 12px 32px rgb(0 0 0 / 30%);
+  --shadow-small: 0 4px 14px rgb(0 0 0 / 25%);
+  --knob-shadow: 0 1px 2px rgb(0 0 0 / 30%);
+  /* What dims the page behind a dialog. */
+  --scrim: rgb(0 0 0 / 35%);
+  --knob: #ffffff;
 
   --text: #d4d6db;
   --text-strong: #e6e7ea;
@@ -37,6 +55,8 @@
 
   --accent: #9db4d6;
   --accent-text: #12151a;
+  /* A line drawn over the accent fill: a key hint's border, the split button's divider. */
+  --line-on-accent: rgb(0 0 0 / 25%);
   --selection: rgb(157 180 214 / 11%);
   --note: #e2c08d;
   --note-wash: rgb(226 192 141 / 7%);
@@ -57,6 +77,13 @@
   --syntax-constant: #dcc28c;
   --syntax-punctuation: #a9adb6;
 
+  /* ui-monospace (SF Mono on macOS) draws a character Geist Mono lacks before the generic
+     family is tried. */
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+
+  /* How far every disabled control fades. */
+  --disabled-opacity: 0.45;
+
   /* The code view's text size, line height, and tab width. ui/app.js sets all three from the
      settings (applySettings) and places rows by the line height; these are the defaults. */
   --code-font-size: 13px;
@@ -76,7 +103,16 @@
     --hover: #e4e4df;
     --border: #e2e2dd;
     --border-strong: #c9c9c2;
+    /* Paper's shadows and scrim take --shadow's warm grey at a lower strength than
+       Graphite's black, which is heavy on a light page. */
     --shadow: 0 10px 30px rgb(30 30 20 / 14%);
+    --shadow-menu:
+      0 0 0 0.5px rgb(30 30 20 / 16%),
+      0 12px 32px rgb(30 30 20 / 16%);
+    --shadow-small: 0 4px 14px rgb(30 30 20 / 12%);
+    --knob-shadow: 0 1px 2px rgb(30 30 20 / 25%);
+    --scrim: rgb(30 30 20 / 18%);
+    --knob: #ffffff;
 
     --text: #25272c;
     --text-strong: #111214;
@@ -86,6 +122,8 @@
 
     --accent: #2f5fa8;
     --accent-text: #ffffff;
+    /* Paper's accent is dark, so the line over it is light, as its text is. */
+    --line-on-accent: rgb(255 255 255 / 35%);
     --selection: rgb(47 95 168 / 10%);
     --note: #855600;
     --note-wash: rgb(160 110 10 / 8%);
@@ -150,7 +188,7 @@ body {
 }
 
 kbd {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   padding: 1px 5px;
   border: 1px solid var(--border-strong);
   border-radius: 4px;
@@ -159,6 +197,23 @@ kbd {
 .empty {
   padding: 24px 16px;
   color: var(--text-muted);
+}
+
+/* A text field: the file filter, the agent form's inputs, and the text areas of a question,
+   a follow-up and a note's edit. Each field's own rule, later in the file, sets its size. */
+.field {
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 80ms linear;
+}
+
+.field:focus {
+  border-color: var(--accent);
 }
 
 /* Sidebar */
@@ -181,14 +236,8 @@ kbd {
   padding: 4px 16px 12px;
 }
 
-.repo-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
 .repo-branch {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -203,18 +252,6 @@ kbd {
   width: 100%;
   height: 30px;
   padding: 0 10px;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  font: inherit;
-  font-size: 12.5px;
-  outline: none;
-  transition: border-color 80ms linear;
-}
-
-.filter input:focus {
-  border-color: var(--accent);
 }
 
 .files {
@@ -308,7 +345,7 @@ kbd {
 .dir .count {
   margin-left: auto;
   padding-left: 8px;
-  font: 11px "Geist Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--note);
 }
 
@@ -337,11 +374,6 @@ kbd {
   font-size: 12.5px;
 }
 
-.pane-title {
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
 .crumbs {
   color: var(--text-muted);
   white-space: nowrap;
@@ -356,7 +388,7 @@ kbd {
 
 .meta {
   flex: none;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -368,10 +400,11 @@ kbd {
   position: relative;
   overflow: auto;
   outline: none;
-  font: var(--code-font-size) "Geist Mono", ui-monospace, monospace;
+  font: var(--code-font-size) var(--font-mono);
   tab-size: var(--tab-width);
-  /* Ligatures change the shape of operators a reviewer is reading closely. */
-  font-variant-ligatures: none;
+  /* The composer sizes itself by this pane's width (`cqw`): the rows it sits in are as wide
+     as the longest line, and the window's width says nothing of the side panes'. */
+  container-type: inline-size;
 }
 
 /* The line-number gutter's width: 24 px on the left for the + button (6 px in, 16 px wide,
@@ -481,7 +514,11 @@ kbd {
 .composer {
   position: sticky;
   left: var(--gutter-width);
-  width: min(640px, calc(100vw - 700px));
+  /* What the code pane shows right of the gutter, less 16 px clear of its edge, up to 640 px.
+     The pane keeps 420 px (CODE_MIN in ui/panes.js) unless the window is too narrow for it,
+     which leaves 320 px beside the gutter of most files; where it does not, the composer
+     keeps 320 px and the pane scrolls sideways to it. */
+  width: min(640px, 100cqw - var(--gutter-width) - 16px);
   min-width: 320px;
   margin: 8px 0 10px var(--gutter-width);
   display: flex;
@@ -523,6 +560,12 @@ kbd {
   font: inherit;
   font-size: 13.5px;
   line-height: 20px;
+}
+
+/* The text area has no edge of its own: the composer's border shows its focus, as a text
+   field's does (.field). The text area has focus whenever the composer opens. */
+.composer:has(textarea:focus) {
+  border-color: var(--accent);
 }
 
 .composer-actions {
@@ -585,8 +628,9 @@ kbd {
 }
 
 .button:disabled {
-  opacity: 0.5;
+  opacity: var(--disabled-opacity);
   filter: none;
+  pointer-events: none;
 }
 
 /* Tray */
@@ -624,7 +668,7 @@ kbd {
   display: flex;
   justify-content: space-between;
   gap: 8px;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -712,9 +756,7 @@ kbd {
   -webkit-backdrop-filter: blur(24px) saturate(1.6);
   border: 0.5px solid var(--border-strong);
   border-radius: 10px;
-  box-shadow:
-    0 0 0 0.5px rgb(0 0 0 / 25%),
-    0 12px 32px rgb(0 0 0 / 30%);
+  box-shadow: var(--shadow-menu);
 }
 
 .menu-item {
@@ -753,7 +795,7 @@ kbd {
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -834,8 +876,6 @@ body.welcome-mode > .pane {
 
 .welcome-actions .button {
   height: 34px;
-  display: inline-flex;
-  align-items: center;
   gap: 10px;
 }
 
@@ -901,7 +941,7 @@ body.welcome-mode > .pane {
 }
 
 .recent-item:disabled {
-  opacity: 0.5;
+  opacity: var(--disabled-opacity);
 }
 
 .recent-name {
@@ -916,7 +956,7 @@ body.welcome-mode > .pane {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -1012,7 +1052,6 @@ button.repo-name:hover {
   color: var(--text-strong);
 }
 
-
 /* Settings: the button at the foot of the sidebar, and the dialog it opens. */
 
 .sidebar-footer {
@@ -1084,7 +1123,7 @@ button.repo-name:hover {
 }
 
 .settings::backdrop {
-  background: rgb(0 0 0 / 30%);
+  background: var(--scrim);
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
 }
@@ -1212,7 +1251,7 @@ button.repo-name:hover {
   text-overflow: ellipsis;
   direction: rtl;
   text-align: left;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   user-select: text;
 }
 
@@ -1245,18 +1284,13 @@ button.repo-name:hover {
 }
 
 .icon-button:disabled {
-  opacity: 0.35;
+  opacity: var(--disabled-opacity);
 }
 
 .button.danger {
   color: var(--text-strong);
   border-color: var(--text-muted);
   font-weight: 600;
-}
-
-.button:disabled {
-  opacity: 0.45;
-  pointer-events: none;
 }
 
 /* A choice of a few values, drawn as one control with the chosen part raised. */
@@ -1295,7 +1329,7 @@ button.repo-name:hover {
 }
 
 .segment:disabled {
-  opacity: 0.45;
+  opacity: var(--disabled-opacity);
 }
 
 .stepper .segment {
@@ -1307,7 +1341,7 @@ button.repo-name:hover {
 .stepper-value {
   min-width: 56px;
   text-align: center;
-  font: 12.5px "Geist Mono", monospace;
+  font: 12.5px var(--font-mono);
   color: var(--text-strong);
 }
 
@@ -1331,9 +1365,9 @@ button.repo-name:hover {
   left: 2px;
   width: 16px;
   height: 16px;
-  background: #ffffff;
+  background: var(--knob);
   border-radius: 50%;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 30%);
+  box-shadow: var(--knob-shadow);
   transition: transform 120ms ease;
 }
 
@@ -1346,7 +1380,7 @@ button.repo-name:hover {
 }
 
 .switch:disabled {
-  opacity: 0.45;
+  opacity: var(--disabled-opacity);
 }
 
 .segment:focus-visible,
@@ -1427,17 +1461,8 @@ button.repo-name:hover {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font: 11px "Geist Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--text-muted);
-}
-
-/* Geist Mono's ligatures join " --" into one glyph, which hides the space in "gemini --acp":
-   a command must read exactly as it runs. */
-.agent-found,
-.agent-command,
-.agent-field input,
-.settings-file {
-  font-variant-ligatures: none;
 }
 
 .agent-command::before {
@@ -1490,16 +1515,7 @@ button.repo-name:hover {
 .agent-field input {
   height: 30px;
   padding: 0 10px;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  font: 12.5px "Geist Mono", monospace;
-  outline: none;
-}
-
-.agent-field input:focus {
-  border-color: var(--accent);
+  font: 12.5px var(--font-mono);
 }
 
 .agent-form .settings-actions {
@@ -1646,21 +1662,16 @@ button.repo-name:hover {
 }
 
 .send-bar .send kbd {
-  border-color: rgb(0 0 0 / 25%);
+  border-color: var(--line-on-accent);
   color: inherit;
   font-weight: 400;
-}
-
-.send-bar .button:disabled {
-  opacity: 0.5;
-  filter: none;
 }
 
 .send-bar .agent-picker {
   flex: none;
   width: 34px;
   padding: 0;
-  border-left-color: rgb(0 0 0 / 25%);
+  border-left-color: var(--line-on-accent);
   border-radius: 0 7px 7px 0;
 }
 
@@ -1693,8 +1704,7 @@ button.repo-name:hover {
 
 .prompt-text {
   margin: 0;
-  font: 12.5px/21px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 12.5px/21px var(--font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--text);
@@ -1715,8 +1725,7 @@ button.repo-name:hover {
   align-items: center;
   gap: 8px;
   margin-top: 18px;
-  font: 11.5px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px var(--font-mono);
 }
 
 .prompt-links-label {
@@ -1753,7 +1762,7 @@ button.repo-name:hover {
   color: var(--text-muted);
 }
 
-.run-title strong {
+.run-word {
   font-weight: 500;
   color: var(--text-strong);
 }
@@ -1762,42 +1771,13 @@ button.repo-name:hover {
   margin-right: 6px;
 }
 
-.run-title .run-word.done {
-  color: var(--added);
-}
-
-.run-title .run-word.attention {
-  color: var(--attention);
-}
-
-.run-title .run-word.failed {
-  color: var(--removed);
-}
-
 .run-time {
-  font: 11.5px "Geist Mono", monospace;
-}
-
-.run-end {
-  flex: none;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.run-end.done {
-  color: var(--added);
-}
-
-.run-end.failed {
-  color: var(--removed);
+  font: 11.5px var(--font-mono);
 }
 
 .button.stop {
   flex: none;
   height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
   padding: 0 10px;
   font-size: 12px;
 }
@@ -1860,8 +1840,7 @@ button.repo-name:hover {
 }
 
 .run-card.step {
-  font: 11.5px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px var(--font-mono);
   color: var(--text-soft);
 }
 
@@ -1886,24 +1865,9 @@ button.repo-name:hover {
 
 .run-note-where {
   flex: none;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
-
-.run-note-status.done {
-  color: var(--added);
-}
-
-.run-note-status.attention {
-  color: var(--attention);
-}
-
-.run-note-status.failed {
-  color: var(--removed);
-}
-
-
-
 
 .run-detail-nav {
   display: flex;
@@ -1938,7 +1902,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 8px;
-  font: 12px/18px "Geist Mono", monospace;
+  font: 12px/18px var(--font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1978,18 +1942,6 @@ button.repo-name:hover {
   color: var(--note);
 }
 
-.tool-line {
-  height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 8px;
-  border-radius: 6px;
-  font: 11.5px "Geist Mono", monospace;
-  font-variant-ligatures: none;
-  color: var(--text-soft);
-}
-
 .tool-verb {
   flex: none;
   width: 44px;
@@ -2017,15 +1969,6 @@ button.repo-name:hover {
   color: var(--text-muted);
 }
 
-.tool-line.running .tool-target {
-  color: var(--text-strong);
-}
-
-.tool-line.running .tool-state::after {
-  content: "…";
-  color: var(--text-muted);
-}
-
 .tool-diff,
 .tool-output {
   max-height: 240px;
@@ -2034,8 +1977,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 6px;
-  font: 11.5px/18px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px/18px var(--font-mono);
   white-space: pre;
   user-select: text;
 }
@@ -2093,28 +2035,16 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 6px;
-  font: 12px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 12px var(--font-mono);
   color: var(--text-strong);
   overflow-wrap: anywhere;
   user-select: text;
-}
-
-.permission-answer {
-  font-size: 12px;
-  color: var(--text-soft);
 }
 
 .permission-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-}
-
-.permission-actions .button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 .permission-actions kbd {
@@ -2171,8 +2101,7 @@ button.repo-name:hover {
   padding: 0 3px;
   background: var(--canvas);
   border-radius: 4px;
-  font: 12px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 12px var(--font-mono);
 }
 
 .run-code {
@@ -2181,8 +2110,7 @@ button.repo-name:hover {
   padding: 8px 10px;
   background: var(--canvas);
   border-radius: 6px;
-  font: 11.5px/18px "Geist Mono", monospace;
-  font-variant-ligatures: none;
+  font: 11.5px/18px var(--font-mono);
 }
 
 .run-error {
@@ -2232,29 +2160,19 @@ button.repo-name:hover {
   text-overflow: ellipsis;
 }
 
+/* The dot is filled with its text colour, so the shared tone classes colour it. */
 .status-dot {
   flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--text-muted);
+  background: currentColor;
+  color: var(--text-muted);
 }
 
-.status-dot.busy {
-  background: var(--accent);
+.status-dot.tone-busy {
+  color: var(--accent);
   animation: pulse 1.2s ease-in-out infinite;
-}
-
-.status-dot.attention {
-  background: var(--attention);
-}
-
-.status-dot.done {
-  background: var(--added);
-}
-
-.status-dot.failed {
-  background: var(--removed);
 }
 
 @keyframes pulse {
@@ -2264,7 +2182,7 @@ button.repo-name:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .status-dot.busy {
+  .status-dot.tone-busy {
     animation: none;
   }
 }
@@ -2343,18 +2261,6 @@ body.resizing * {
   white-space: nowrap;
   text-overflow: ellipsis;
   font-family: "Geist", system-ui, sans-serif;
-}
-
-.note-status.attention {
-  color: var(--attention);
-}
-
-.note-status.done {
-  color: var(--added);
-}
-
-.note-status.failed {
-  color: var(--removed);
 }
 
 .note-place {
@@ -2480,7 +2386,7 @@ body.resizing * {
 }
 
 .note-dialog::backdrop {
-  background: rgb(0 0 0 / 35%);
+  background: var(--scrim);
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
 }
@@ -2520,7 +2426,7 @@ body.resizing * {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font: 12px "Geist Mono", monospace;
+  font: 12px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -2554,7 +2460,7 @@ body.resizing * {
 }
 
 .note-dialog-stats {
-  font-family: "Geist Mono", monospace;
+  font-family: var(--font-mono);
   color: var(--added);
 }
 
@@ -2573,7 +2479,7 @@ body.resizing * {
   overflow: auto;
   background: var(--canvas);
   border-radius: 8px;
-  font: 12px/20px "Geist Mono", monospace;
+  font: 12px/20px var(--font-mono);
 }
 
 .note-dialog-snippet .row {
@@ -2624,7 +2530,7 @@ body.resizing * {
 .note-dialog-history .verb {
   flex: none;
   width: 40px;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -2634,12 +2540,12 @@ body.resizing * {
 }
 
 .note-dialog-history .tool .target {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
 }
 
 .note-dialog-history .state {
   margin-left: auto;
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--added);
 }
 
@@ -2682,7 +2588,7 @@ body.resizing * {
 /* The Run tab: one card per run, newest first; the run's dialog holds the rest. */
 .run-entry .run-id {
   flex: none;
-  font: 600 12px "Geist Mono", monospace;
+  font: 600 12px var(--font-mono);
   color: var(--text-strong);
 }
 
@@ -2697,15 +2603,19 @@ body.resizing * {
   color: var(--text-soft);
 }
 
-.run-entry-status.done {
+/* A status's tone (`tone` in ui/status.js and ui/run.js), on the words and dots that show
+   it. These rules follow every rule that gives such an element its plain colour, so they win
+   at the same specificity. `busy` and `idle` keep the plain colour, except the status dot's
+   own `busy` rule. */
+.tone-done {
   color: var(--added);
 }
 
-.run-entry-status.attention {
+.tone-attention {
   color: var(--attention);
 }
 
-.run-entry-status.failed {
+.tone-failed {
   color: var(--removed);
 }
 
@@ -2806,18 +2716,7 @@ body.resizing * {
 
 .question-input {
   padding: 6px 8px;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  color: var(--text);
-  font: inherit;
-  font-size: 12.5px;
   resize: vertical;
-}
-
-.question-input:focus {
-  border-color: var(--accent);
-  outline: none;
 }
 
 .question-actions {
@@ -2839,7 +2738,7 @@ body.resizing * {
 }
 
 .question-answers dt {
-  font: 11.5px "Geist Mono", monospace;
+  font: 11.5px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -2894,22 +2793,12 @@ body.resizing * {
   gap: 8px;
 }
 
-.follow-up-input {
+.follow-up-input,
+.note-edit-input {
   min-height: 60px;
   padding: 8px 10px;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  color: var(--text);
-  font: inherit;
-  font-size: 12.5px;
   line-height: 1.5;
   resize: vertical;
-}
-
-.follow-up-input:focus {
-  border-color: var(--accent);
-  outline: none;
 }
 
 .follow-up-actions {
@@ -2932,6 +2821,18 @@ body.resizing * {
   padding: 16px 20px 28px;
   background: var(--surface);
   outline: none;
+}
+
+/* The scrolling panes take focus so the keyboard scrolls them. After a key, focus on one is
+   drawn inside its edge; after the pointer, nothing is (ui/app.js sets `keyboard-input`).
+   The ring's bottom corners follow the pane's (10 px less its 1 px border), which would
+   otherwise cut them. */
+body.keyboard-input .code:focus-visible,
+body.keyboard-input .prompt-preview:focus-visible,
+body.keyboard-input .changes-view:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 0 0 9px 9px;
 }
 
 .changes-notice {
@@ -2960,7 +2861,7 @@ body.resizing * {
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  font-family: "Geist Mono", monospace;
+  font-family: var(--font-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2979,19 +2880,19 @@ body.resizing * {
 
 .changes-stats {
   color: var(--text-muted);
-  font-family: "Geist Mono", monospace;
+  font-family: var(--font-mono);
 }
 
 .changes-hunk {
   padding: 3px 12px;
   color: var(--text-muted);
-  font: 11.5px/1.6 "Geist Mono", monospace;
+  font: 11.5px/1.6 var(--font-mono);
 }
 
 .changes-line {
   display: grid;
   grid-template-columns: 4ch 4ch 2ch 1fr;
-  font: 12.5px/1.6 "Geist Mono", monospace;
+  font: 12.5px/1.6 var(--font-mono);
 }
 
 .changes-line.add {
@@ -3069,21 +2970,7 @@ button.changes-number:focus-visible {
 }
 
 .note-edit-input {
-  min-height: 60px;
-  padding: 8px 10px;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  color: var(--text);
-  font: inherit;
   font-size: 13px;
-  line-height: 1.5;
-  resize: vertical;
-}
-
-.note-edit-input:focus {
-  border-color: var(--accent);
-  outline: none;
 }
 
 .note-edit-actions {
@@ -3163,7 +3050,7 @@ body.focus-mode .code {
   color: var(--text);
   font: inherit;
   font-size: 12.5px;
-  box-shadow: 0 4px 14px rgb(0 0 0 / 25%);
+  box-shadow: var(--shadow-small);
   cursor: pointer;
 }
 
