@@ -209,6 +209,32 @@ impl Slots {
         })
     }
 
+    /// The first of the notes `ids` that a live run of this window carries, with that run's
+    /// id; `None` when no live run carries any of them.
+    fn carrying(&self, ids: &[String]) -> Option<(String, String)> {
+        self.by_thread
+            .values()
+            .filter_map(|slot| slot.run.as_ref())
+            .find_map(|run| {
+                let state = run.state();
+                let note = ids.iter().find(|id| state.header.notes.contains(id))?;
+                state
+                    .live()
+                    .then(|| (note.clone(), state.header.id.clone()))
+            })
+    }
+
+    /// The live run of this window started most recently, if any: the latest run once the
+    /// one before is gone.
+    fn newest_live(&self) -> Option<Arc<Run>> {
+        self.by_thread
+            .values()
+            .filter_map(|slot| slot.run.as_ref())
+            .filter(|run| run.state().live())
+            .max_by_key(|run| run_number(&run.state().header.id))
+            .cloned()
+    }
+
     /// Whether any thread of this window is busy ([`Slot::busy`]).
     fn busy(&self) -> bool {
         self.by_thread.values().any(Slot::busy)
@@ -398,12 +424,20 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// As [`Run::create`]: [`Error::TooManyRuns`] while the most runs a repository may have are
+    /// [`Error::BadRequest`] when a run of this window under way carries one of the notes; as
+    /// [`Run::create`]: [`Error::TooManyRuns`] while the most runs a repository may have are
     /// live, and [`Error::RunElsewhere`] while another window holds `runs/active.lock`; as
     /// [`notes::prompt`]; [`Error::NoCommit`] in a repository with no commit; and the errors
     /// of [`thread::plan`] and [`thread::add`], which fail the run.
     pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
         let slots = self.slots();
+        // A note is marked sent only once its agent takes the turn, so until then it reads as
+        // open: a second send would put it in two threads at once.
+        if let Some((note, run)) = slots.carrying(ids) {
+            return Err(Error::BadRequest(format!(
+                "{note} is in {run}, which is under way: wait for it, or stop it"
+            )));
+        }
         let prompt = notes::prompt(&self.repo, ids)?;
         let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
         let title = notes::body(&self.repo, &ids[0])?;
@@ -784,12 +818,18 @@ impl Runner {
             origin,
         };
         let run = Arc::new(Run::create(&self.repo.runs_dir(), opening, in_thread)?);
+        let new_thread = matches!(place, Place::New { .. });
         let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
                 run.record(Entry::Failed {
                     error: error_chain(&error),
                 });
+                if new_thread {
+                    // No record names the thread, so nothing would ever forget its lock file.
+                    let id = run.state().header.id.clone();
+                    remove_thread_lock(&self.repo.runs_dir(), &id);
+                }
                 (self.notify)();
                 return Err(error);
             }
@@ -1072,19 +1112,22 @@ impl Runner {
         Ok(self.run_by_id(id)?.view(after))
     }
 
-    /// The ids of this window's runs under way, oldest first: the page follows each.
-    pub(crate) fn live(&self) -> Vec<String> {
-        let mut live: Vec<String> = self
+    /// This window's runs under way, oldest first, each as `(run id, thread id)`: the page
+    /// follows each, and tells by its thread what it holds back.
+    pub(crate) fn live(&self) -> Vec<(String, String)> {
+        let mut live: Vec<(String, String)> = self
             .slots()
             .by_thread
-            .values()
-            .filter_map(|slot| slot.run.as_ref())
-            .filter_map(|run| {
+            .iter()
+            .filter_map(|(thread, slot)| Some((thread, slot.run.as_ref()?)))
+            .filter_map(|(thread, run)| {
                 let state = run.state();
-                state.live().then(|| state.header.id.clone())
+                state
+                    .live()
+                    .then(|| (state.header.id.clone(), thread.clone()))
             })
             .collect();
-        live.sort_by_key(|id| run_number(id));
+        live.sort_by_key(|(id, _)| run_number(id));
         live
     }
 
@@ -1322,7 +1365,7 @@ impl Runner {
         let mut deleted = Vec::new();
         for number in numbers {
             let id = format!("R{number}");
-            if live.contains(&id) {
+            if live.iter().any(|(run, _)| *run == id) {
                 continue;
             }
             let file = dir.join(format!("{id}.jsonl"));
@@ -1344,7 +1387,9 @@ impl Runner {
                     .is_some_and(|run| deleted.contains(&run.state().header.id))
             };
             if gone(&slots.latest) {
-                slots.latest = None;
+                // Not the newest log on disk: that one may be another thread's live run, read
+                // without its lock as unfinished.
+                slots.latest = slots.newest_live();
             }
             for slot in slots.by_thread.values_mut() {
                 if gone(&slot.run) {

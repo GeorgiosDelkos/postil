@@ -31,14 +31,14 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
   let views = new Map();
   let drawnRun = null;
 
-  // The header's Stop, and Escape: stops the latest run, or else the newest live one. It asks
-  // the agent to stop. Once the Rust process would force it (forceAt), Stop ends it
-  // (src/run.rs, "Stopping"); sooner, the Rust process takes it as the same request.
+  // The header's Stop, and Escape: stops the latest run, the one the header shows, never one
+  // it does not (another thread's stops from its dialog). It asks the agent to stop. Once the
+  // Rust process would force it (forceAt), Stop ends it (src/run.rs, "Stopping"); sooner, the
+  // Rust process takes it as the same request.
   function stop() {
-    const latest = store.run();
-    const run = isLive(latest) ? latest : store.liveRuns().at(-1);
-    if (!run) return Promise.resolve();
-    if (run === latest && run.status === "cancelling" && !forceable()) return Promise.resolve();
+    const run = store.run();
+    if (!isLive(run)) return Promise.resolve();
+    if (run.status === "cancelling" && !forceable()) return Promise.resolve();
     return store.stop(run.id);
   }
 

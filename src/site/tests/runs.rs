@@ -1964,7 +1964,11 @@ fn a_fourth_live_agent_in_a_repository_is_refused_in_any_window() {
     }
     assert_eq!(
         get_json(&first, RUNS)["live"],
-        serde_json::json!(["R1", "R2", "R3"])
+        serde_json::json!([
+            { "id": "R1", "thread": "R1" },
+            { "id": "R2", "thread": "R2" },
+            { "id": "R3", "thread": "R3" }
+        ])
     );
     let (second, _second_nudges) = run_site(&repo, "plain");
 
@@ -2009,7 +2013,7 @@ fn each_answer_reaches_only_the_run_it_names() {
     assert_eq!(wait_for(&site, &nudges, "waiting")["id"], "R2");
     assert_eq!(
         get_json(&site, RUNS)["live"],
-        serde_json::json!(["R1", "R2"])
+        serde_json::json!([{ "id": "R1", "thread": "R1" }, { "id": "R2", "thread": "R2" }])
     );
     let question = |id: &str| {
         let view = get_json(&site, &format!("{RUN}?id={id}"));
@@ -2684,4 +2688,46 @@ fn the_idle_agent_used_longest_ago_is_the_one_let_go() {
         kinds(&fresh).contains(&"message:prompt 1".to_owned()),
         "R2's agent was let go: {fresh}"
     );
+}
+
+#[test]
+fn a_note_in_a_run_still_starting_is_not_sent_again() {
+    let repo = TempRepo::new("run-send-twice");
+    repo.write("a.txt", "a\n");
+    // Its agent never answers `initialize`, so the run stays starting, its note not marked.
+    let (site, nudges) = run_site(&repo, "silent");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    assert_eq!(wait_for(&site, &nudges, "starting")["id"], "R1");
+    assert_eq!(states(&site), [serde_json::json!({ "kind": "open" })]);
+
+    let (status, body) = send(&site, &["N1"]);
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("N1 is in R1, which is under way"), "{body}");
+    assert_eq!(get_json(&site, RUNS)["runs"], serde_json::json!(["R1"]));
+    assert_eq!(stop(&site).0, StatusCode::OK);
+}
+
+#[test]
+fn the_latest_run_deleted_gives_way_to_the_window_s_run_under_way() {
+    let repo = TempRepo::new("run-latest-deleted");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "hang");
+    set_reviewers(&site, "hang", &[("Plain", "plain")]);
+    post_note(&site, "a.txt", 1, 1, "one");
+    post_note(&site, "a.txt", 1, 1, "two");
+    send(&site, &["N1"]);
+    assert_eq!(wait_for(&site, &nudges, "running")["id"], "R1");
+    let body = serde_json::json!({ "notes": ["N2"], "agent": "Plain" }).to_string();
+    assert_eq!(post(&site, RUN, &body).0, StatusCode::OK);
+    assert_eq!(wait_for_run(&site, &nudges, "R2")["status"], "ended");
+
+    delete(&site, &format!("{NOTES}?id=N2"));
+
+    // Not R1's log read from disk, unfinished: the run this window holds, under way.
+    let latest = get_json(&site, RUN);
+    assert_eq!(latest["id"], "R1");
+    assert_eq!(latest["status"], "running");
+    assert_eq!(stop(&site).0, StatusCode::OK);
 }

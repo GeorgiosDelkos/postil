@@ -112,7 +112,7 @@ export function notesTray({
 
   // The run a note's status comes from, or null (status.js, `runOf`).
   function runFor(note) {
-    return runOf(note, { get: (id) => runs.byId(id) }, runs.run());
+    return runOf(note, { get: (id) => runs.byId(id) }, runs.liveRuns());
   }
 
   // Everything a note's card shows, as plain data: two cards with equal data look the same. A
@@ -129,7 +129,7 @@ export function notesTray({
       body: note.body,
       outdated: note.anchor === "lost",
       status,
-      sendable: canSendAlone() && !isResolved(note),
+      sendable: canSendAlone() && !isResolved(note) && !inLiveRun(note),
     };
   }
 
@@ -279,8 +279,21 @@ export function notesTray({
     pill.disabled = open === 0 || runs.full();
   }
 
-  // Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
-  function openSend(ids = sendable(state.notes)) {
+  // Whether a run of this window under way carries `note`. A note is marked sent only once
+  // its agent takes the turn, so until then it reads as open; sending it again would put it in
+  // two threads at once, which the Rust process refuses.
+  function inLiveRun(note) {
+    return runs.liveRuns().some((run) => !run.review && run.notes.includes(note.id));
+  }
+
+  // The ids of the notes a send takes now (`sendable`), those in a run under way left out.
+  function sendableNow() {
+    return sendable(state.notes.filter((note) => !inLiveRun(note)));
+  }
+
+  // Opens the send step with `ids` ticked: the open notes not in a run under way, or the one
+  // note of a Shift-click.
+  function openSend(ids = sendableNow()) {
     if (!beforeSend()) return;
     state.send = { ticked: new Set(ids), agent: null, sending: false };
     showTab("notes");
@@ -437,6 +450,7 @@ export function notesTray({
     cardOf,
     noteCard,
     canSendAlone,
+    inLiveRun,
     openSend,
     closeSend,
     sendNotes,

@@ -41,12 +41,15 @@ test("a note's run is the one it was sent in, or the live run carrying it", () =
   const r1 = run("R1", "ended");
   const r2 = run("R2", "running", [], ["N2"]);
   const runs = new Map([["R1", r1]]);
-  assert.equal(runOf(sent("N1", "R1"), runs, r2), r1);
-  assert.equal(runOf(sent("N1", "R2"), runs, r2), r2, "the live view wins over the cache");
-  assert.equal(runOf(open("N2"), runs, r2), r2, "not marked sent yet");
-  assert.equal(runOf(open("N3"), runs, r2), null, "not in the run");
-  assert.equal(runOf(open("N2"), runs, run("R2", "ended", [], ["N2"])), null, "a refused turn");
-  assert.equal(runOf(sent("N1", "R9"), runs, r2), null, "not read yet");
+  assert.equal(runOf(sent("N1", "R1"), runs, [r2]), r1);
+  assert.equal(runOf(sent("N1", "R2"), runs, [r2]), r2, "the live view wins over the cache");
+  assert.equal(runOf(open("N2"), runs, [r2]), r2, "not marked sent yet");
+  assert.equal(runOf(open("N3"), runs, [r2]), null, "not in the run");
+  assert.equal(runOf(open("N2"), runs, [run("R2", "ended", [], ["N2"])]), null, "a refused turn");
+  assert.equal(runOf(sent("N1", "R9"), runs, [r2]), null, "not read yet");
+  // Threads run side by side: a note of an older run under way shows that run, not the latest.
+  const r3 = run("R3", "running", [], ["N3"]);
+  assert.equal(runOf(open("N2"), runs, [r2, r3]), r2);
 });
 
 test("a thread is its run of notes and the follow-ups after it, in order", () => {
@@ -78,11 +81,11 @@ test("a thread is its run of notes and the follow-ups after it, in order", () =>
   const live = follow("R3", "R1", "running");
   live.notes = ["N1"];
   assert.equal(
-    runOf(sent("N1", "R1"), new Map(), live),
+    runOf(sent("N1", "R1"), new Map(), [live]),
     live,
     "a follow-up under way shows on its notes",
   );
-  assert.equal(runOf(sent("N2", "R1"), new Map(), live), null);
+  assert.equal(runOf(sent("N2", "R1"), new Map(), [live]), null);
 });
 
 test("a note's status follows its run", () => {
@@ -116,7 +119,7 @@ test("a note's status follows its run", () => {
     "Failed in R1",
     "its run's own status",
   );
-  assert.equal(runOf(resolved("N1", "R1"), new Map([["R1", run("R1", "ended")]]), null)?.id, "R1");
+  assert.equal(runOf(resolved("N1", "R1"), new Map([["R1", run("R1", "ended")]]), [])?.id, "R1");
 });
 
 test("the agent's line about a note is read in the forms agents write", () => {

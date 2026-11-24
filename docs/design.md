@@ -369,7 +369,7 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
 | `GET /api/run?after=N` | The latest run, with its entries from number `N` on, and its notes and prompt only when `N` is 0: they never change; `null` when there is none. |
 | `GET /api/run?id=R2&after=N` | One run: this window's when it is one of its threads' latest, else read from its log; `after` as above, 0 when left out. |
-| `GET /api/runs` | `{runs, live}`: the ids of the runs on disk, newest first, and this window's runs under way, oldest first. |
+| `GET /api/runs` | `{runs, live}`: the ids of the runs on disk, newest first, and this window's runs under way, oldest first, each `{id, thread}`. |
 | `POST /api/run/permission` `{run, request, option}` | Answers run `run`'s permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
 | `POST /api/run/question` `{run, request, content}` | Answers run `run`'s question with the form's values, or skips it (`content` `null`). |
 | `POST /api/run/cancel` `{run}` | Cancels run `run`; open permission requests are answered `cancelled`. |
@@ -383,7 +383,9 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 - **One run at a time per thread**, threads side by side: a follow-up or a review while the
   thread's run goes on is refused (409), and a live run holds an exclusive lock on its
   thread's `threads/<id>.lock`, so another window is refused there too. At most 3 runs are
-  live in a repository (section "Worktrees", "Keeping the disk in bounds").
+  live in a repository (section "Worktrees", "Keeping the disk in bounds"). A send of a note
+  that a run of this window under way carries is refused (400): notes are marked sent only
+  once the agent takes the turn, so the note still reads as open while its agent starts.
 - **Stop** asks the agent to cancel (`session/cancel`), and answers its open permission
   requests `cancelled`, as well as any that arrive until the turn ends. An agent that is
   still starting is killed instead, and the run ends at once. A second Stop from 3 s after
@@ -781,9 +783,9 @@ the cap on live runs.
   Arbitrary: the engineer reads every result, and more at once is more than one person
   follows. This bounds the agents at work, a few hundred MB each; idle agents are bounded per
   window (section "Threads"), and the builds agents start can use several GB of memory and
-  disk each, which nothing bounds. A review's next stage counts when it starts: another
-  window can take the place, or the thread, between two stages, and the
-  review then stops, its last stage saying why.
+  disk each, which nothing bounds. A review's next stage counts when it starts: a send in
+  this window or another can take the place between two stages, and another window the
+  thread, and the review then stops, its last stage saying why.
 - **At most 15 worktrees** per repository, Codex's default; Cursor keeps 20. One Codex report
   found 61 worktrees holding about 100 GB.
 - **A free-space floor of 20 GB** on the worktrees' volume, read as
@@ -819,12 +821,14 @@ and the agent's whole reply. Nothing of a run but its card is in the tab: the ow
 now is the exception, above the runs, for every run under way: a card for an agent's open
 question, which opens the run's dialog with the question at its top (the note's dialog shows
 it too), and a permission request Postil could not answer, named with its run. The tray
-header shows the latest run's status, its time and Stop while it runs; Escape stops the
-latest run, or else the newest one under way. A thread's dialog has a Stop of its own while
-one of its runs goes on, so a run that is no longer the latest stops from there.
+header shows the latest run's status, its time and Stop while it runs; Escape stops that
+run, never one the header does not show. A thread's dialog has a Stop of its own while one
+of its runs goes on, so a run that is no longer the latest stops from there.
 
 The panel follows the latest run and the window's other runs under way (`GET /api/runs`
-names them), each fetched from the entries it has not seen. Older runs are read once each by
+names them, each with its thread), each fetched from the entries it has not seen. A note's
+status comes from whichever of them carries it, and the send step leaves out the notes a run
+under way carries but has not marked sent yet. Older runs are read once each by
 id and kept, which the notes' statuses read too (`byId`): a finished run does not change.
 The dialog is drawn again only when what it shows changes, so it keeps its scroll while the
 run streams.

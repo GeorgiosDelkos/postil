@@ -371,7 +371,10 @@ test("two threads run side by side, and each stops from its own dialog", async (
   const { page, api } = await openProject(t);
   await startRun(page, api, [await addNote(api, "Rename two.")]);
   await startRun(page, api, [await addNote(api, "Rename three.")]);
-  assert.deepEqual((await api("api/runs")).live, ["R1", "R2"]);
+  assert.deepEqual(
+    (await api("api/runs")).live.map((run) => run.id),
+    ["R1", "R2"],
+  );
 
   // The older run, no longer the latest, is still followed: its card opens its dialog, whose Stop
   // stops it alone.
@@ -381,7 +384,10 @@ test("two threads run side by side, and each stops from its own dialog", async (
   // Its Stop goes once the run ended: the dialog is drawn again without it.
   await page.waitForFunction(() => !document.querySelector("#run-detail button.stop"));
   assert.equal((await api("api/run?id=R1")).status, "ended");
-  assert.deepEqual((await api("api/runs")).live, ["R2"]);
+  assert.deepEqual(
+    (await api("api/runs")).live.map((run) => run.id),
+    ["R2"],
+  );
   assert.equal((await api("api/run")).status, "running");
 
   await api("api/run/cancel", { method: "POST", body: JSON.stringify({ run: "R2" }) });

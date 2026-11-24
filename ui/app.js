@@ -164,7 +164,7 @@ const noteDetail = noteDialog($("note-dialog"), {
     const note = state.notes.find((candidate) => candidate.id === id);
     return note ? { note, run: tray.runFor(note) } : null;
   },
-  canSend: (note) => tray.canSendAlone() && !isResolved(note),
+  canSend: (note) => tray.canSendAlone() && !isResolved(note) && !tray.inLiveRun(note),
   agent: () => state.settings?.agent ?? null,
   showInCode: (note) =>
     note.target === "folder" ? files.showFolder(note.path) : code.showNote(note),

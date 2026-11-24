@@ -83,13 +83,10 @@ export function runDialog({
   }
 
   // The run of the thread that starts at run `root` under way in this window, a stage of its
-  // review included; undefined when none is. One at a time per thread (src/run.rs).
+  // review included; undefined when none is. One at a time per thread (src/run.rs), which
+  // `GET api/runs` names for each.
   function liveOf(root) {
-    const views = store.knownViews();
-    return store.liveRuns().find((run) => {
-      if (run.review) return run.review.of === root;
-      return (threadOf(run.id, views)[0]?.id ?? run.id) === root;
-    });
+    return store.liveRuns().find((run) => store.liveThread(run.id) === root);
   }
 
   // Why a follow-up or a review of the thread that starts at run `root` cannot start now, or

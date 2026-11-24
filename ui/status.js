@@ -18,14 +18,17 @@ import {
 
 // The run a note's status comes from, or null: the run it was marked sent in, else the live
 // run when that one carries it (notes are marked sent only once the agent takes the turn).
-// `runs` maps a run id to its view; `live` is the latest run of this window, or null.
-export function runOf(note, runs, live) {
+// `runs` maps a run id to its view; `lives` are this window's runs under way, which threads
+// run side by side (src/run.rs).
+export function runOf(note, runs, lives) {
+  const carries = (run) => isLive(run) && run.notes.includes(note.id);
   // A follow-up under way works on its thread's notes, so they show it while it runs.
-  if (isLive(live) && live.followUp && live.notes.includes(note.id)) return live;
+  const following = lives.find((run) => run.followUp && carries(run));
+  if (following) return following;
   const id = sentIn(note);
-  if (id !== null) return live?.id === id ? live : (runs.get(id) ?? null);
+  if (id !== null) return lives.find((run) => run.id === id) ?? runs.get(id) ?? null;
   // A reviewer's run carries the notes it reviews, but they were not sent in it.
-  return isLive(live) && !live.review && live.notes.includes(note.id) ? live : null;
+  return lives.find((run) => !run.review && carries(run)) ?? null;
 }
 
 // A note's status: `kind` names its icon and group, `label` is its words, `tone` its color.

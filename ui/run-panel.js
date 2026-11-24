@@ -9,7 +9,7 @@
 import { runDialog } from "./run-dialog.js";
 import { MAX_LIVE, runStore } from "./run-store.js";
 import { runTab } from "./run-tab.js";
-import { foldRun, openPermission, permissionKey, permissionKeys } from "./run.js";
+import { foldRun, isLive, openPermission, permissionKey, permissionKeys } from "./run.js";
 
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
 // sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous)` is
@@ -78,8 +78,8 @@ export function runPanel({
     reload: store.reload,
     run: store.run,
     liveRuns: store.liveRuns,
-    // Whether any run of this window is under way: Escape stops one.
-    live: () => store.liveRuns().length > 0,
+    // Whether the latest run, the one the header shows, is under way: Escape stops it.
+    live: () => isLive(store.run()),
     // Whether this window runs as many as a repository may: a send would be refused.
     full: () => store.liveRuns().length >= MAX_LIVE,
     busyThread: dialog.busyThread,

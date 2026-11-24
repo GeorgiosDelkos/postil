@@ -20,9 +20,9 @@ export function runStore({ render, onChange, onLoaded, onError }) {
   // The latest run, followed as it changes.
   let run = null;
   // This window's live runs other than the latest, by id, followed as they change; and the
-  // ids of all its live runs, read with the list.
+  // thread of each of its live runs, by run id, read with the list (`GET api/runs`).
   const liveViews = new Map();
-  let liveIds = [];
+  let liveThreads = new Map();
   let fetching = false;
   let again = false;
   // How long to wait before fetching again after a failed fetch: doubled each failure.
@@ -72,7 +72,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     }
     const reply = await response.json();
     ids = reply.runs;
-    liveIds = reply.live ?? [];
+    liveThreads = new Map((reply.live ?? []).map((live) => [live.id, live.thread]));
   }
 
   // Live run `id` again, with only the entries after those of `known`, its view so far.
@@ -93,7 +93,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (previous && previous.id !== run?.id && isLive(previous)) {
       liveViews.set(previous.id, previous);
     }
-    for (const id of liveIds) {
+    for (const id of liveThreads.keys()) {
       if (id === run?.id) continue;
       const view = await fetchLive(id, liveViews.get(id));
       if (isLive(view)) {
@@ -107,7 +107,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
       listStale = true;
     }
     for (const id of liveViews.keys()) {
-      if (id === run?.id || !liveIds.includes(id)) liveViews.delete(id);
+      if (id === run?.id || !liveThreads.has(id)) liveViews.delete(id);
     }
   }
 
@@ -292,6 +292,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     answer,
     stop,
     liveRuns,
+    // The thread live run `id` works in, by its first run's id; undefined for a run not live.
+    liveThread: (id) => liveThreads.get(id),
     startReview,
     thread,
     endThread,

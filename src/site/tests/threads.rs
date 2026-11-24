@@ -410,6 +410,8 @@ fn an_unreadable_thread_record_fails_the_send_and_is_never_written_over() {
     assert_eq!(fs::read_to_string(&record).unwrap(), "{ not json");
     let failed = wait_for(&site, &nudges, "failed");
     assert_eq!(failed["id"], "R1");
+    // No record names R1's thread, so its lock file goes with the failed run.
+    assert!(!repo.root.join(".git/postil/threads/R1.lock").exists());
 
     // A record that cannot be read at all is not an empty one.
     fs::remove_file(&record).unwrap();

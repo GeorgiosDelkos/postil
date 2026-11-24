@@ -639,7 +639,11 @@ impl Site {
             "/api/runs" => match *method {
                 Method::GET => json_or_error(self.runner().and_then(|runner| {
                     let ids = runner.ids()?;
-                    let live = runner.live();
+                    let live: Vec<_> = runner
+                        .live()
+                        .into_iter()
+                        .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
+                        .collect();
                     Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
                 })),
                 _ => not_allowed("GET"),
