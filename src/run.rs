@@ -1,14 +1,16 @@
 //! Runs: notes sent to the agent as one prompt, and everything the agent reports back.
 //!
-//! A [`Runner`] belongs to the open project. It keeps the agent it started alive between
-//! runs, with its session, so a later prompt reaches the same conversation; the owner chose
-//! this over a fresh agent per send on 2026-11-23, for milestone 4's follow-up notes. The
-//! agent is replaced when a send names another agent or it exited, and stopped when the
-//! project closes or the app quits.
+//! A [`Runner`] belongs to the open project. Each send starts a thread, which works in a
+//! worktree and on a branch of its own (`thread.rs`, docs/design.md "Worktrees"). The runner
+//! keeps the agent it started alive between the runs of its thread, with its session, so a
+//! follow-up reaches the same conversation; the owner chose this over a fresh agent per run
+//! on 2026-11-23. The agent is replaced when a run names another agent, a send starts another
+//! thread, or it exited, and stopped when its thread ends, the project closes or the app
+//! quits.
 //!
-//! One run at a time per working tree: two agents writing one working tree conflict
-//! (docs/design.md, "Not in scope"). A live run holds an exclusive lock on
-//! `runs/active.lock`, so another window on the same working tree cannot start one either.
+//! One run at a time per repository, for now: a live run holds an exclusive lock on
+//! `runs/active.lock`, so another window cannot start one either. Ending or forgetting a
+//! thread takes the same lock, so no window's agent works in a worktree being freed.
 //!
 //! The run log, a run's record in memory and on disk, is in [`log`].
 //!
@@ -26,8 +28,10 @@
 //! on the reader thread of the stage that ended ([`Runner::advance`]). Locks are always
 //! taken in this order: the runner's [`Slot`], the repository's snapshot lock (inside
 //! [`Repo::snapshot`], which takes no other), a run's state, then the agent connection's
-//! own locks (inside [`Agent`]'s methods, which take none of the others). No snapshot is
-//! taken under a run's state. The slot is held around the agent's calls that answer, cancel
+//! own locks (inside [`Agent`]'s methods, which take none of the others). The record's
+//! `threads.lock` (inside `thread.rs`, which takes no other) may be taken while the slot is
+//! held, so nothing that holds it may take the slot. No snapshot is taken under a run's
+//! state. The slot is held around the agent's calls that answer, cancel
 //! and prompt (`auto_answer`, [`Runner::cancel`], `begin`). The page is told about every
 //! change through `notify`, and fetches what it has not seen.
 
@@ -51,8 +55,8 @@ use crate::notes::{self, Prompt};
 use crate::repo::Repo;
 use crate::review::{self, Diff, Finding, Stage, Work};
 use crate::run::log::{
-    Changes, Entry, FollowUp, Header, Origin, Point, Run, RunView, read_header, run_number,
-    run_numbers,
+    Changes, Entry, FollowUp, Header, Origin, Point, Run, RunView, hold_run_lock, read_header,
+    run_number, run_numbers,
 };
 use crate::thread::{self, State, Thread};
 
@@ -101,6 +105,11 @@ struct Slot {
     /// The thread `run` works in, set with it at each launch: the agent's working directory
     /// is its worktree, and a kept agent is used again only within it.
     thread: Option<Thread>,
+    /// The thread whose worktree the start thread is making (`git worktree add`, the clones),
+    /// from the launch until it is made or fails. Git writes the worktree meanwhile, so a
+    /// commit, a run or an ending there could act on a half-made checkout; the slot counts as
+    /// busy. Making goes on past a Stop: it cannot be cut short.
+    making: Option<String>,
     /// Set when the project closed: an agent that finishes starting afterwards is stopped.
     closed: bool,
     /// The review under way, while its stages run one after another; cleared when a stage
@@ -167,8 +176,12 @@ impl Slot {
         self.closed || self.generation != generation
     }
 
-    /// [`Runner::busy`]: a run under way, or a review between two stages.
+    /// [`Runner::busy`]: a run under way, a review between two stages, or a worktree being
+    /// made.
     fn busy(&self) -> bool {
+        if self.making.is_some() {
+            return true;
+        }
         let Some(run) = &self.run else {
             return false;
         };
@@ -255,6 +268,11 @@ impl Runner {
         notify: Notify,
         home: Option<PathBuf>,
     ) -> Arc<Self> {
+        if let Some(home) = &home {
+            // Finishes deleting the worktrees of threads that ended while the app last ran:
+            // a quit can cut a background delete short.
+            thread::empty_trash(&thread::trash_for(repo.root(), home));
+        }
         Arc::new(Self {
             repo,
             agents,
@@ -607,7 +625,8 @@ impl Runner {
     /// [`Error::TurnRunning`] while a run of this window is under way, as [`Run::create`], and
     /// for a new thread as [`thread::plan`] and [`thread::add`]: the run then fails too.
     fn launch(self: &Arc<Self>, mut slot: MutexGuard<'_, Slot>, new: NewRun) -> Result<()> {
-        if slot.run.as_ref().is_some_and(|run| run.state().live()) {
+        // A worktree still being made counts as a run under way: its agent has not started.
+        if slot.making.is_some() || slot.run.as_ref().is_some_and(|run| run.state().live()) {
             return Err(Error::TurnRunning);
         }
         let NewRun {
@@ -653,6 +672,9 @@ impl Runner {
                 Worktree::Make => run.record_snapshot(Point::Before, thread.fork.clone()),
                 Worktree::Made => self.record_snapshot(&run, &thread, Point::Before),
             }
+        }
+        if let Worktree::Make = worktree {
+            slot.making = Some(thread.id.clone());
         }
         let same_thread = slot
             .thread
@@ -941,55 +963,72 @@ impl Runner {
         thread::find(&self.repo, id)
     }
 
-    /// Ends the open thread `id` as `ending` says (docs/design.md, "Ending a thread"), then
+    /// Ends the open thread `id` as `ending` says (docs/design.md, "Ending a thread"), and
     /// frees its worktree: renamed into the trash and deleted in the background. Its branch
-    /// stays, until the thread's last note is deleted. First checks that the worktree holds
-    /// nothing Postil did not commit, and that its branch is at the commit Postil left. Stops
-    /// the thread's kept agent. Apply writes the branch's changes, from the commit the thread
-    /// started at to its tip, into the engineer's working tree, uncommitted, all or nothing.
+    /// stays, until the thread's last note is deleted.
+    ///
+    /// Holds the run lock throughout, so no run, in this window or another, works in the
+    /// worktree meanwhile, and reads the thread only once it holds it. First checks that the
+    /// worktree holds nothing Postil did not commit, and that its branch is at the commit
+    /// Postil left or past it (a commit the engineer made there). Apply writes the branch's
+    /// changes, from the commit the thread started at to the worktree's commit, into the
+    /// engineer's working tree, uncommitted, all or nothing. The thread's kept agent is stopped
+    /// once Apply succeeded. The thread is marked ended only once its worktree is freed, so a
+    /// free that fails leaves it open, to end again.
     ///
     /// # Errors
     ///
-    /// [`Error::BadRequest`] when there is no open thread `id`; [`Error::TurnRunning`] while
-    /// one of its runs is under way, or its review is between two stages;
-    /// [`Error::ThreadChanged`] when the check fails; [`Error::ApplyConflict`] when the
-    /// changes do not fit the working tree, which then stays as it was; and as
-    /// [`thread::free`], once the thread is marked ended.
+    /// [`Error::NoHome`] without Postil's home; [`Error::TurnRunning`] while one of its runs
+    /// is under way in this window, its review is between two stages, or its worktree is
+    /// being made, and [`Error::RunElsewhere`] while another window runs one;
+    /// [`Error::BadRequest`] when there is no open thread `id`; [`Error::ThreadChanged`] when
+    /// the check fails; [`Error::ApplyConflict`] when the changes do not fit the working tree,
+    /// which then stays as it was; and as [`thread::free`]: an applied thread whose worktree
+    /// cannot be freed stays open with its changes written.
     pub(crate) fn end_thread(&self, id: &str, ending: Ending) -> Result<()> {
+        let home = self.home.as_deref().ok_or(Error::NoHome)?;
+        {
+            let slot = self.slot();
+            if slot.thread.as_ref().is_some_and(|held| held.id == id) && slot.busy() {
+                return Err(Error::TurnRunning);
+            }
+        }
+        let _active = hold_run_lock(&self.repo.runs_dir())?;
         let thread = match thread::find(&self.repo, id)? {
             Some(thread) if thread.state == State::Open => thread,
             Some(_) => return Err(Error::BadRequest(format!("thread {id} already ended"))),
             None => return Err(Error::BadRequest(format!("there is no thread {id}"))),
         };
-        check_worktree(&thread)?;
-        let released = {
-            let mut slot = self.slot();
-            let ours = slot
-                .thread
-                .as_ref()
-                .is_some_and(|held| held.id == thread.id);
-            if ours && slot.busy() {
-                return Err(Error::TurnRunning);
-            }
-            if ours { slot.release() } else { Held::None }
-        };
-        // Dropping the agent waits for its process, so after the lock.
-        drop(released);
+        thread::check_place(&self.repo, home, &thread)?;
+        let tip = check_worktree(&thread)?;
         if ending == Ending::Apply {
-            let patch = self.repo.patch(&thread.fork, &thread.tip)?;
+            let patch = self.repo.patch(&thread.fork, &tip)?;
             self.repo.apply(&patch).map_err(|error| match error {
                 Error::Git { stderr, .. } => Error::ApplyConflict { stderr },
                 error => error,
             })?;
         }
-        let state = match ending {
-            Ending::Apply => State::Applied,
-            Ending::Discard => State::Discarded,
+        let released = {
+            let mut slot = self.slot();
+            if slot.thread.as_ref().is_some_and(|held| held.id == id) {
+                slot.release()
+            } else {
+                Held::None
+            }
         };
-        thread::update(&self.repo, id, |stored| stored.state = state)?;
-        let freed = thread::free(&self.repo, &thread);
+        // Dropping the agent waits for its process, so after the lock.
+        drop(released);
+        let ended = thread::free(&self.repo, home, &thread).and_then(|()| {
+            thread::update(&self.repo, id, |stored| {
+                stored.tip = tip;
+                stored.state = match ending {
+                    Ending::Apply => State::Applied,
+                    Ending::Discard => State::Discarded,
+                };
+            })
+        });
         (self.notify)();
-        freed
+        ended
     }
 
     /// The name of the agent that ran run `id`: a follow-up goes to it.
@@ -1076,28 +1115,47 @@ impl Runner {
             {
                 slot.run = None;
             }
-            live.and(slot.thread.as_ref().map(|thread| thread.id.clone()))
+            // Busy, not only live: a review between stages starts its next one in the thread.
+            let busy = slot.busy();
+            slot.thread
+                .as_ref()
+                .filter(|_| busy)
+                .map(|thread| thread.id.clone())
         };
         let forgotten = self.forget_threads(live_thread.as_deref());
         (self.notify)();
         forgotten
     }
 
-    /// Forgets every thread whose first run's log is gone, except `live`, the thread of the
-    /// run under way: frees its worktree if it is open, deletes its branch, and removes it from
-    /// the record. Stops a kept agent that works in one. A follow-up still running when its
-    /// thread's first log went keeps the thread until a delete after it ends.
+    /// Forgets every thread whose first run's log is gone, except `busy`, the thread this
+    /// window is working in: frees its worktree, deletes its branch, and removes it from the
+    /// record. Stops a kept agent that works in one. Holds the run lock, so no window's run
+    /// works in a worktree it frees; while a run holds it, in any window, it forgets nothing,
+    /// and the next delete tries again. A follow-up still running when its thread's first log
+    /// went keeps the thread until a delete after it ends.
+    ///
+    /// The worktree must pass the check that ending a thread makes: work Postil did not
+    /// commit is not deleted with a note. Only a branch under `postil/` is deleted, since the
+    /// name comes from the record, which a hand edit can change.
     ///
     /// # Errors
     ///
-    /// As [`thread::all`], [`thread::free`], [`Repo::delete_branch`] and [`thread::remove`].
-    /// A thread whose worktree or branch could not be removed stays in the record, and is
-    /// tried again at the next delete.
-    fn forget_threads(&self, live: Option<&str>) -> Result<()> {
+    /// As [`thread::all`], [`check_worktree`], [`thread::free`], [`Repo::delete_branch`] and
+    /// [`thread::remove`]. A thread that fails one of them stays in the record, and is tried
+    /// again at the next delete.
+    fn forget_threads(&self, busy: Option<&str>) -> Result<()> {
+        let Some(home) = self.home.as_deref() else {
+            return Ok(());
+        };
         let dir = self.repo.runs_dir();
+        let _active = match hold_run_lock(&dir) {
+            Ok(active) => active,
+            Err(Error::RunElsewhere) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let gone: Vec<Thread> = thread::all(&self.repo)?
             .into_iter()
-            .filter(|thread| Some(thread.id.as_str()) != live)
+            .filter(|thread| Some(thread.id.as_str()) != busy)
             .filter(|thread| !dir.join(format!("{}.jsonl", thread.id)).exists())
             .collect();
         if gone.is_empty() {
@@ -1118,12 +1176,19 @@ impl Runner {
         let mut first_error = None;
         let mut removed = Vec::new();
         for thread in gone {
-            let freed = if thread.state == State::Open {
-                thread::free(&self.repo, &thread)
-            } else {
-                Ok(())
-            };
-            match freed.and_then(|()| self.repo.delete_branch(&thread.branch)) {
+            // In any state: an ended thread whose free failed still has its worktree, which
+            // keeps the branch checked out.
+            let forgotten = thread::check_place(&self.repo, home, &thread)
+                .and_then(|()| check_worktree(&thread))
+                .and_then(|_| thread::free(&self.repo, home, &thread))
+                .and_then(|()| {
+                    if thread.branch.starts_with("postil/") {
+                        self.repo.delete_branch(&thread.branch)
+                    } else {
+                        Ok(())
+                    }
+                });
+            match forgotten {
                 Ok(()) => removed.push(thread.id),
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -1148,7 +1213,10 @@ impl Runner {
             let mut slot = self.slot();
             slot.closed = true;
             slot.chain = None;
-            (slot.release(), slot.run.clone(), slot.thread.clone())
+            // A worktree git is still checking out takes no commit: it would commit a half
+            // checkout (every file not yet written, as deleted).
+            let thread = slot.thread.clone().filter(|_| slot.making.is_none());
+            (slot.release(), slot.run.clone(), thread)
         };
         // The agent is gone first, so nothing it reports lands after the end. `closed` drops
         // its events anyway.
@@ -1157,7 +1225,7 @@ impl Runner {
             // As a forced Stop does: the agent's exit is not reported, so the snapshot after
             // the run is taken here, or its changes view would stay empty. It runs `git add`
             // on the request thread, quitting included. Both calls do nothing for a run that
-            // already ended.
+            // already ended, or one whose worktree is still being made.
             self.record_end_snapshot(&run, thread.as_ref());
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
@@ -1182,13 +1250,17 @@ impl Runner {
                     error: error_chain(error),
                 });
             };
-            if let Worktree::Make = pending.worktree
-                && let Err(error) = runner.make_worktree(&pending.thread)
-            {
-                if !runner.slot().let_go(generation) {
-                    failed(&error);
+            if let Worktree::Make = pending.worktree {
+                let made = runner.make_worktree(&pending.thread);
+                let mut slot = runner.slot();
+                slot.making = None;
+                if let Err(error) = made {
+                    if !slot.let_go(generation) {
+                        failed(&error);
+                    }
+                    drop(slot);
+                    return (runner.notify)();
                 }
-                return (runner.notify)();
             }
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.
@@ -1260,8 +1332,19 @@ impl Runner {
 
     /// Makes `thread`'s worktree ([`thread::make`]), and records in the thread what it was not
     /// given. A record that cannot be written loses that list only.
+    ///
+    /// A worktree that cannot be made takes the thread out of the record: it claims a branch
+    /// that `git worktree add` may not have made, which a thread of another working tree of
+    /// the repository may own, and deleting the thread's last note would delete it.
     fn make_worktree(&self, thread: &Thread) -> Result<()> {
-        let skipped = thread::make(&self.repo, thread)?;
+        let skipped = match thread::make(&self.repo, thread) {
+            Ok(skipped) => skipped,
+            Err(error) => {
+                // The run says why; a record that cannot be changed stays, as it was.
+                drop(thread::remove(&self.repo, std::slice::from_ref(&thread.id)));
+                return Err(error);
+            }
+        };
         if !skipped.is_empty() {
             drop(thread::update(&self.repo, &thread.id, |stored| {
                 stored.skipped = skipped;
@@ -1278,12 +1361,12 @@ impl Runner {
     fn record_snapshot(&self, run: &Run, thread: &Thread, point: Point) {
         let message = commit_message(&run.state().header, point);
         let committed = Repo::open(&thread.path).and_then(|tree| tree.commit_all(&message));
+        // Before a run too: a commit of work left in the worktree moves the branch, and a run
+        // that then never starts takes no snapshot after it.
         let commit = committed.and_then(|commit| {
-            if point == Point::After {
-                thread::update(&self.repo, &thread.id, |stored| {
-                    stored.tip.clone_from(&commit);
-                })?;
-            }
+            thread::update(&self.repo, &thread.id, |stored| {
+                stored.tip.clone_from(&commit);
+            })?;
             Ok(commit)
         });
         match commit {
@@ -1439,8 +1522,7 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         // next stage starts once the end is logged.
         let next = match (&stage, &run) {
             (Some(stage), Some(run)) if ended_well => {
-                let worktree = thread.as_ref().map(|thread| thread.path.as_path());
-                decide(&mut slot, run, stage, worktree).then(|| Arc::clone(run))
+                decide(&mut slot, run, stage, thread.as_ref()).then(|| Arc::clone(run))
             }
             _ => None,
         };
@@ -1469,13 +1551,13 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     }
 }
 
-/// Ends review stage `stage` of `run`, whose turn ended well in `worktree`, and decides
+/// Ends review stage `stage` of `run`, whose turn ended well in `thread`'s worktree, and decides
 /// whether the review goes on: true when the next stage is to start, else false, the chain
 /// then cleared. A proposer's findings are logged here, before the end, while the run still
 /// takes entries.
-fn decide(slot: &mut Slot, run: &Run, stage: &Stage, worktree: Option<&Path>) -> bool {
+fn decide(slot: &mut Slot, run: &Run, stage: &Stage, thread: Option<&Thread>) -> bool {
     let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
-    let findings = end_stage(run, stage, found, worktree);
+    let findings = end_stage(run, stage, found, thread);
     let goes = match (findings, slot.chain.as_mut()) {
         (Some(findings), Some(chain)) => goes_on(chain, findings),
         _ => false,
@@ -1521,15 +1603,15 @@ fn goes_on(chain: &mut Chain, findings: Vec<Finding>) -> bool {
         && !(chain.stage.judges() && chain.findings.is_empty())
 }
 
-/// Ends review stage `stage` of `run`, whose turn ended well in `worktree`, before its end is
-/// logged: a proposer's findings are read from its reply (numbered after the `found` before
-/// it) and logged. Returns them for the next stage; `None` when the review ends here: this
-/// was the judge, or a proposer changed files.
+/// Ends review stage `stage` of `run`, whose turn ended well in `thread`'s worktree, before
+/// its end is logged: a proposer's findings are read from its reply (numbered after the
+/// `found` before it) and logged. Returns them for the next stage; `None` when the review ends
+/// here: this was the judge, or a proposer changed files, which are then put back.
 fn end_stage(
     run: &Run,
     stage: &Stage,
     found: usize,
-    worktree: Option<&Path>,
+    thread: Option<&Thread>,
 ) -> Option<Vec<Finding>> {
     if stage.judges() {
         return None;
@@ -1541,17 +1623,29 @@ fn end_stage(
     };
     // A proposer may only read, but an agent that edits without asking is not stopped by the
     // permission rule: its edits are checked here, and they end the review, so no judge takes
-    // a changed tree for the reviewed one. An edit made through a command reports no diff, so
-    // the worktree is asked too; a worktree that cannot be asked counts as changed.
-    let changed = |path: &Path| {
-        Repo::open(path)
-            .and_then(|tree| tree.changed())
-            .map_or(true, |files| !files.is_empty())
+    // a changed tree for the reviewed one. An edit made through a command reports no diff, and
+    // one it committed leaves no change, so the worktree is asked for both; one that cannot
+    // be asked counts as changed.
+    let moved = |thread: &Thread| {
+        Repo::open(&thread.path)
+            .and_then(|tree| {
+                Ok(!tree.changed()?.is_empty() || tree.head()? != Some(thread.tip.clone()))
+            })
+            .unwrap_or(true)
     };
-    let edited = !run.state().work().diffs.is_empty() || worktree.is_some_and(changed);
+    let edited = !run.state().work().diffs.is_empty() || thread.is_some_and(moved);
     let problem = if edited {
+        // Put back, or the next run's commit would take them in, and Apply with it.
+        let undone = thread.map_or(Ok(()), |thread| {
+            Repo::open(&thread.path).and_then(|tree| tree.reset_to(&thread.tip))
+        });
+        let undone = match undone {
+            Ok(()) => "its changes were undone".to_owned(),
+            Err(error) => format!("its changes could not be undone: {}", error_chain(&error)),
+        };
         Some(format!(
-            "reviewer {} changed files, though it may only read: the review stops here",
+            "reviewer {} changed files, though it may only read: {undone}, and the review \
+             stops here",
             stage.reviewer
         ))
     } else {
@@ -1603,16 +1697,18 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     prompt
 }
 
-/// Checks that `thread`'s worktree holds only what Postil committed: no change git would
-/// commit (ignored files, such as the cloned build folders, do not count), and its branch at
-/// the commit Postil left. A worktree that is not on disk passes: there is nothing in it.
+/// Checks that `thread`'s worktree holds nothing that ending the thread would lose: no change
+/// git would commit (ignored files, such as the cloned build folders, do not count), and its
+/// branch at the commit Postil left or past it. Past it is a commit the engineer made there,
+/// as the refusal tells them to, and it is theirs to keep. Returns the commit the thread ends
+/// at: the worktree's, or the recorded tip when the worktree is not on disk.
 ///
 /// # Errors
 ///
 /// [`Error::ThreadChanged`] naming what is there, and the git errors.
-fn check_worktree(thread: &Thread) -> Result<()> {
+fn check_worktree(thread: &Thread) -> Result<String> {
     if !thread.path.is_dir() {
-        return Ok(());
+        return Ok(thread.tip.clone());
     }
     let tree = Repo::open(&thread.path)?;
     let changed = tree.changed()?;
@@ -1623,11 +1719,11 @@ fn check_worktree(thread: &Thread) -> Result<()> {
         });
     }
     match tree.head()? {
-        Some(head) if head == thread.tip => Ok(()),
+        Some(head) if tree.is_ancestor(&thread.tip, &head)? => Ok(head),
         head => Err(Error::ThreadChanged {
             path: thread.path.clone(),
             found: format!(
-                "the branch is at {}, where Postil left {}",
+                "the branch is at {}, which does not follow {}, where Postil left it",
                 head.as_deref().unwrap_or("no commit"),
                 thread.tip
             ),

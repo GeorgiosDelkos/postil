@@ -381,7 +381,11 @@ impl Repo {
     /// The git error, such as a branch of that name that exists already, or `path` that
     /// exists and is not empty.
     pub(crate) fn add_worktree(&self, path: &Path, branch: &str, fork: &str) -> Result<()> {
+        // No hooks: the checkout runs `post-checkout`, which may install or build, and the
+        // worktree is Postil's, not a checkout the engineer made.
         let args = [
+            OsStr::new("-c"),
+            OsStr::new("core.hooksPath=/dev/null"),
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--quiet"),
@@ -393,32 +397,96 @@ impl Repo {
         run_git_with(&self.root, None, &args, None).map(drop)
     }
 
-    /// The folders of this repository's linked worktrees, as git lists them, resolved. The
-    /// main working tree is left out.
+    /// The folder in which git keeps its record of the linked worktree at `path`
+    /// (`<common git dir>/worktrees/<name>`): the one the worktree's `.git` file names, or,
+    /// when the worktree's folder is gone, the one whose `gitdir` file names `path`. `None`
+    /// when git has none. Deleting that folder is what `git worktree prune` does for one
+    /// worktree, without touching any other whose folder is missing (a disk not mounted).
     ///
     /// # Errors
     ///
-    /// The git error.
-    pub(crate) fn worktrees(&self) -> Result<Vec<PathBuf>> {
-        let list = run_git_bytes(&self.root, None, &["worktree", "list", "--porcelain", "-z"])?;
-        let main = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-        Ok(list
-            .split(|&byte| byte == 0)
-            .filter_map(|field| field.strip_prefix(b"worktree "))
-            .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
-            .map(|path| fs::canonicalize(&path).unwrap_or(path))
-            .filter(|path| *path != main)
-            .collect())
+    /// [`Error::NotAWorktree`] when `path` has a `.git` that is not a file naming a folder in
+    /// this repository's `worktrees/`, and the git error when the common git dir cannot be
+    /// read.
+    pub(crate) fn worktree_record(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let not_ours = || Error::NotAWorktree {
+            path: path.to_owned(),
+        };
+        let common = rev_parse_path(&self.root, "--git-common-dir")?;
+        let records = self.root.join(common).join("worktrees");
+        let pointer = match fs::read_to_string(path.join(".git")) {
+            Ok(pointer) => pointer,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // `gitdir` holds the worktree's `.git` path as `git worktree add` wrote it.
+                let wanted = path.join(".git");
+                let named = |record: &PathBuf| {
+                    fs::read_to_string(record.join("gitdir"))
+                        .is_ok_and(|gitdir| Path::new(gitdir.trim_end_matches('\n')) == wanted)
+                };
+                let Ok(entries) = fs::read_dir(&records) else {
+                    return Ok(None);
+                };
+                return Ok(entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|record| named(record)));
+            }
+            Err(_) => return Err(not_ours()),
+        };
+        let record = pointer
+            .strip_prefix("gitdir: ")
+            .map(|record| PathBuf::from(record.trim_end_matches('\n')))
+            .ok_or_else(not_ours)?;
+        let records = fs::canonicalize(&records).map_err(|_| not_ours())?;
+        let record = fs::canonicalize(&record).map_err(|_| not_ours())?;
+        if record.parent() != Some(records.as_path()) {
+            return Err(not_ours());
+        }
+        Ok(Some(record))
     }
 
-    /// Drops git's record of every linked worktree whose folder is gone, so its branch can
-    /// be deleted and its name used again.
+    /// Whether `commit` is `descendant` or one of its ancestors.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as an id that names no commit.
+    pub(crate) fn is_ancestor(&self, commit: &str, descendant: &str) -> Result<bool> {
+        match git(
+            &self.root,
+            &["merge-base", "--is-ancestor", commit, descendant],
+        ) {
+            Ok(_) => Ok(true),
+            // Exit 1 with nothing on stderr is "not an ancestor"; a bad id prints why.
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether git ignores `path` (relative to the root) in this working tree, by its own
+    /// `.gitignore` files and the repository's exclude rules.
     ///
     /// # Errors
     ///
     /// The git error.
-    pub(crate) fn prune_worktrees(&self) -> Result<()> {
-        git(&self.root, &["worktree", "prune"]).map(drop)
+    pub(crate) fn is_ignored(&self, path: &str) -> Result<bool> {
+        match git(&self.root, &["check-ignore", "--quiet", path]) {
+            Ok(_) => Ok(true),
+            // Exit 1 with nothing on stderr is "not ignored".
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Puts the working tree back to commit `commit`: its branch moves there, tracked files
+    /// are restored, and untracked files that are not ignored are deleted. Ignored files (the
+    /// cloned build folders) stay. For a thread's worktree only: it throws work away.
+    ///
+    /// # Errors
+    ///
+    /// The git errors.
+    pub(crate) fn reset_to(&self, commit: &str) -> Result<()> {
+        git(&self.root, &["reset", "--hard", "--quiet", commit])?;
+        git(&self.root, &["clean", "-d", "--force", "--quiet"]).map(drop)
     }
 
     /// Deletes the local branch `branch`, merged or not. A branch that does not exist (never
@@ -483,10 +551,12 @@ impl Repo {
     /// files stay out. Runs `git add --all` and `git commit` on the working tree's own index,
     /// so it is for a thread's worktree, never the engineer's.
     ///
-    /// The commit runs no hooks (`--no-verify`) and keeps the message as it is
-    /// (`--cleanup=verbatim`, so a note's line starting with `#` stays). The author and the
-    /// signing follow the git config; with no terminal, a signing key that asks for a
-    /// passphrase fails the commit rather than waiting.
+    /// The commit runs no hook (`core.hooksPath` emptied: `--no-verify` alone still runs
+    /// `prepare-commit-msg` and `post-commit`) and keeps the message as it is
+    /// (`--cleanup=verbatim`, so a note's line starting with `#` stays). It is not signed: it
+    /// runs on the page's request thread, where a signer asking for a passphrase would hold
+    /// every request, and it is Postil's snapshot, not the engineer's commit. The author
+    /// follows the git config.
     ///
     /// # Errors
     ///
@@ -497,6 +567,10 @@ impl Repo {
             git(
                 &self.root,
                 &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgSign=false",
                     "commit",
                     "--quiet",
                     "--no-verify",
@@ -518,7 +592,8 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// As [`Repo::diff`].
+    /// [`Error::BadRequest`] when `from` or `to` is not a hexadecimal object id, and the git
+    /// errors, such as an id that names no commit.
     pub(crate) fn patch(&self, from: &str, to: &str) -> Result<Vec<u8>> {
         for id in [from, to] {
             if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {

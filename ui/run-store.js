@@ -79,6 +79,9 @@ export function runStore({ render, onChange, onLoaded, onError }) {
         if (next === null && previous === null && !listStale) continue;
         run = next;
         if (listStale || previous?.id !== run?.id) await fetchIds();
+        // A run that started or ended changed its thread: the worktree was made (`skipped`),
+        // its tip moved, or a run elsewhere ended it.
+        if (previous?.id !== run?.id || previous?.status !== run?.status) threads.clear();
         render();
         onChange(run, previous);
       } while (again);
@@ -153,7 +156,11 @@ export function runStore({ render, onChange, onLoaded, onError }) {
         threads.set(id, await response.json());
         render();
       })
-      .catch((error) => onError(String(error.message ?? error)));
+      .catch((error) => {
+        // Asked again at the next draw that needs it.
+        threads.delete(id);
+        onError(String(error.message ?? error));
+      });
     return undefined;
   }
 

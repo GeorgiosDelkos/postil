@@ -748,19 +748,6 @@ fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// Waits until run `id` is the latest and has ended, and returns it.
-fn wait_for_run(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) -> serde_json::Value {
-    loop {
-        let run = get_json(site, RUN);
-        if run["id"] == id && ["ended", "failed"].contains(&run["status"].as_str().unwrap_or("")) {
-            return run;
-        }
-        nudges
-            .recv_timeout(WAIT)
-            .unwrap_or_else(|_| panic!("no change while waiting for {id}: {run}"));
-    }
-}
-
 #[test]
 fn a_reviewer_sees_the_reviewed_run_s_edits() {
     let repo = TempRepo::new("run-review-edits");
@@ -799,6 +786,8 @@ fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
         ("reviewer-edits", Some("reviewer 1 changed files")),
         // An edit through a command reports nothing; the worktree shows it.
         ("reviewer-writes", Some("reviewer 1 changed files")),
+        // An edit it committed leaves no change; the branch moved.
+        ("reviewer-commits", Some("reviewer 1 changed files")),
     ] {
         let repo = TempRepo::new(&format!("run-review-stop-{scenario}"));
         repo.write("a.txt", "a\n");
@@ -823,6 +812,26 @@ fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
                 found["problem"].as_str().unwrap_or("").contains(problem),
                 "{scenario}: {found}"
             );
+            // Undone, so neither the next run's commit nor Apply takes the reviewer's edit.
+            let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+            let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+            if scenario != "reviewer-silent" {
+                assert_eq!(
+                    git_out(&worktree, &["status", "--porcelain"]),
+                    "",
+                    "{scenario}"
+                );
+                assert_eq!(
+                    git_out(&worktree, &["rev-parse", "HEAD"]),
+                    thread["tip"],
+                    "{scenario}"
+                );
+                assert_eq!(
+                    fs::read_to_string(worktree.join("a.txt")).unwrap(),
+                    "a\n",
+                    "{scenario}"
+                );
+            }
         }
         assert!(
             !site.runner().unwrap().reviewing(),
@@ -1296,8 +1305,10 @@ fn a_commit_that_fails_is_the_run_s_problem_and_its_work_stays_in_the_worktree()
     let repo = TempRepo::new("run-no-commit");
     repo.write("a.txt", "a\n");
     let (site, nudges) = run_site(&repo, "writes");
-    // A signing program that always fails: every commit after this one fails, the worktree's
-    // too, since it shares this config.
+    // An empty name, which git refuses: every commit after this one fails, the worktree's
+    // too, since it shares this config. Signing and hooks cannot fail it: Postil turns both
+    // off for its commits.
+    repo.git(&["config", "user.name", ""]);
     repo.git(&["config", "commit.gpgSign", "true"]);
     repo.git(&["config", "gpg.program", "false"]);
     post_note(&site, "a.txt", 1, 1, "one");
@@ -1338,6 +1349,24 @@ fn a_commit_that_fails_is_the_run_s_problem_and_its_work_stays_in_the_worktree()
         );
     }
     assert_eq!(fs::read_to_string(repo.root.join("a.txt")).unwrap(), "a\n");
+
+    // As the refusal says: committing the work there keeps it with the thread, and Apply
+    // takes the engineer's commit.
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    repo.git(&["config", "user.name", "Postil Test"]);
+    repo.git(&["config", "commit.gpgSign", "false"]);
+    git_out(&worktree, &["add", "--all"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    let (status, body) = post(
+        &site,
+        "postil://localhost/api/thread/apply",
+        r#"{"thread": "R1"}"#,
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("a.txt")).unwrap(),
+        "a\nprompt 1\n"
+    );
 }
 
 /// A snapshot of the files as they are (`Repo::snapshot`), which the changes view takes of a

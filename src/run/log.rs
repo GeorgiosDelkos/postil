@@ -333,22 +333,8 @@ impl Run {
             let path = path.to_owned();
             move |source| Error::WriteRun { path, source }
         };
-        fs::create_dir_all(dir).map_err(error(dir))?;
         let active_path = dir.join("active.lock");
-        let mut active = File::options()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&active_path)
-            .map_err(error(&active_path))?;
-        take_run_lock(&active).map_err(|source| match source {
-            TryLockError::WouldBlock => Error::RunElsewhere,
-            TryLockError::Error(source) => Error::WriteRun {
-                path: active_path.clone(),
-                source,
-            },
-        })?;
+        let mut active = hold_run_lock(dir)?;
 
         // A deleted run's number is not given again (`last_run`): a page that read the old R5
         // would show a new R5 as the old one.
@@ -768,6 +754,40 @@ impl RunState {
         }
         Status::Running
     }
+}
+
+/// Opens `runs/active.lock` in the runs directory `dir`, making both when missing, and takes
+/// its exclusive lock, held until the returned file is dropped. A run holds it while live;
+/// ending or forgetting a thread holds it so that no run, in any window, works in the
+/// worktree meanwhile. This window's own live run holds it too, through another open file,
+/// so it refuses then as well.
+///
+/// # Errors
+///
+/// [`Error::RunElsewhere`] while a run holds it, and [`Error::WriteRun`] when the file cannot
+/// be made or locked.
+pub(super) fn hold_run_lock(dir: &Path) -> Result<File> {
+    let error = |path: &Path| {
+        let path = path.to_owned();
+        move |source| Error::WriteRun { path, source }
+    };
+    fs::create_dir_all(dir).map_err(error(dir))?;
+    let active_path = dir.join("active.lock");
+    let active = File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&active_path)
+        .map_err(error(&active_path))?;
+    take_run_lock(&active).map_err(|source| match source {
+        TryLockError::WouldBlock => Error::RunElsewhere,
+        TryLockError::Error(source) => Error::WriteRun {
+            path: active_path.clone(),
+            source,
+        },
+    })?;
+    Ok(active)
 }
 
 /// Takes the exclusive lock on `runs/active.lock`, or reports that another window holds it.

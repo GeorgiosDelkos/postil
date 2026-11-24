@@ -200,3 +200,228 @@ fn a_record_pointing_outside_the_worktrees_never_gets_that_folder_deleted() {
         "the thread stays in the record, to be fixed"
     );
 }
+
+#[test]
+fn another_window_cannot_end_or_forget_a_thread_whose_run_goes_on() {
+    let repo = TempRepo::new("thread-elsewhere");
+    repo.write("src/a.rs", "one\ntwo\n");
+    let (running, nudges) = run_site(&repo, "flood");
+    post_note(&running, "src/a.rs", 1, 1, "one");
+    send(&running, &["N1"]);
+    wait_for(&running, &nudges, "running");
+    let worktree = PathBuf::from(thread(&running, "R1")["path"].as_str().unwrap());
+    // A second window on the same repository: its own slot holds nothing.
+    let (other, _quiet) = run_site(&repo, "plain");
+
+    let (status, body) = end(&other, "discard", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("another Postil window"), "{body}");
+    // Deleting the thread's note there leaves the worktree to the run: it is forgotten at a
+    // later delete, once no run holds the lock.
+    let (status, body) = delete(&other, "postil://localhost/api/notes?id=N1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(worktree.is_dir());
+    assert_eq!(thread(&other, "R1")["state"], "open");
+
+    assert_eq!(
+        post(&running, &format!("{RUN}/cancel"), "").0,
+        StatusCode::OK
+    );
+    wait_for(&running, &nudges, "ended");
+}
+
+#[test]
+fn a_branch_moved_off_postil_s_commits_is_refused_and_one_moved_past_them_is_taken() {
+    let (repo, site, _nudges, worktree) = written("thread-moved");
+    let record = thread(&site, "R1");
+    let fork = record["fork"].as_str().unwrap();
+    let tip = record["tip"].as_str().unwrap().to_owned();
+
+    // History rewritten in the worktree: Postil's commit is gone from the branch.
+    git_out(&worktree, &["reset", "--quiet", "--hard", fork]);
+    fs::write(worktree.join("a.txt"), "elsewhere\n").unwrap();
+    git_out(
+        &worktree,
+        &["commit", "--quiet", "--all", "--message", "elsewhere"],
+    );
+    let (status, body) = end(&site, "apply", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("does not follow"), "{body}");
+    assert_eq!(fs::read_to_string(repo.root.join("a.txt")).unwrap(), "a\n");
+
+    // Back on Postil's commit, and one more of the engineer's after it: Apply takes both.
+    git_out(&worktree, &["reset", "--quiet", "--hard", &tip]);
+    fs::write(worktree.join("more.txt"), "more\n").unwrap();
+    git_out(&worktree, &["add", "more.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "more"]);
+    let (status, body) = end(&site, "apply", "R1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("more.txt")).unwrap(),
+        "more\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("a.txt")).unwrap(),
+        "a\nprompt 1\n"
+    );
+}
+
+#[test]
+fn work_left_in_the_worktree_is_committed_before_a_run_and_moves_the_tip_even_if_it_fails() {
+    let (repo, site, nudges, worktree) = written("thread-before");
+    fs::write(worktree.join("mine.txt"), "by hand\n").unwrap();
+    // The follow-up's agent never starts, so its run takes no snapshot after it.
+    set_agents(&site, &[("Fake", &fake_agent("exit-on-start"))], "Fake");
+    let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/follow"), &body).0,
+        StatusCode::OK
+    );
+    wait_for_run(&site, &nudges, "R2");
+
+    let record = thread(&site, "R1");
+    assert_eq!(record["tip"], git_out(&worktree, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git_out(&worktree, &["log", "-1", "--format=%s"]),
+        "Postil: work left in the worktree before R2"
+    );
+    let (status, body) = end(&site, "apply", "R1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("mine.txt")).unwrap(),
+        "by hand\n"
+    );
+}
+
+#[test]
+fn a_folder_ignored_only_by_an_uncommitted_rule_is_not_cloned_or_committed() {
+    let repo = TempRepo::new("thread-uncommitted-ignore");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "writes");
+    // Ignored in the engineer's tree, by a rule the commit the thread starts from lacks.
+    repo.write(".gitignore", "target/\n");
+    fs::create_dir_all(repo.root.join("target")).unwrap();
+    repo.write("target/app", "built\n");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+
+    let record = thread(&site, "R1");
+    let worktree = PathBuf::from(record["path"].as_str().unwrap());
+    assert!(!worktree.join("target").exists());
+    assert_eq!(
+        record["skipped"],
+        serde_json::json!(["target: not ignored by the committed .gitignore"])
+    );
+    let committed = git_out(&worktree, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!committed.contains("target/"), "{committed}");
+}
+
+#[test]
+fn apply_carries_edits_deletions_renames_and_binary_files() {
+    let repo = TempRepo::new("thread-reshape");
+    repo.write("a.txt", "a\n");
+    repo.write("b.txt", "b\n");
+    repo.write("c.txt", "c\n");
+    let (site, nudges) = run_site(&repo, "reshapes");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+
+    let (status, body) = end(&site, "apply", "R1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("a.txt")).unwrap(),
+        "a\nedited\n"
+    );
+    assert!(!repo.root.join("b.txt").exists());
+    assert!(!repo.root.join("c.txt").exists());
+    assert_eq!(fs::read_to_string(repo.root.join("d.txt")).unwrap(), "c\n");
+    assert_eq!(
+        fs::read(repo.root.join("bin.dat")).unwrap(),
+        [0, 1, 2, 255, 0, 7]
+    );
+}
+
+#[test]
+fn deleting_the_last_note_of_an_ended_thread_deletes_its_branch_and_record() {
+    let (repo, site, _nudges, _worktree) = written("thread-forget-ended");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    assert_eq!(end(&site, "apply", "R1").0, StatusCode::OK);
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(git_out(&repo.root, &["branch", "--list", &branch]), "");
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
+    );
+}
+
+#[test]
+fn a_record_naming_a_branch_outside_postil_s_never_gets_it_deleted() {
+    let (repo, site, _nudges, _worktree) = written("thread-branch-guard");
+    let record = repo.root.join(".git/postil/threads.json");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    let text = fs::read_to_string(&record).unwrap();
+    fs::write(&record, text.replace(&format!("\"{branch}\""), "\"trunk\"")).unwrap();
+
+    let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        git_out(&repo.root, &["branch", "--list", "trunk"]),
+        "* trunk"
+    );
+}
+
+#[test]
+fn an_unreadable_thread_record_fails_the_send_and_is_never_written_over() {
+    let repo = TempRepo::new("thread-bad-record");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    let record = repo.root.join(".git/postil/threads.json");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, "{ not json").unwrap();
+    post_note(&site, "a.txt", 1, 1, "one");
+
+    let (status, body) = send(&site, &["N1"]);
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("cannot read the threads"), "{body}");
+    assert_eq!(fs::read_to_string(&record).unwrap(), "{ not json");
+    let failed = wait_for(&site, &nudges, "failed");
+    assert_eq!(failed["id"], "R1");
+}
+
+#[test]
+fn the_engineer_s_hooks_run_neither_for_the_checkout_nor_for_postil_s_commits() {
+    let repo = TempRepo::new("thread-hooks");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "writes");
+    let hooks = repo.root.join(".git/hooks");
+    let marker = repo.home().with_extension("checked-out");
+    for (hook, script) in [
+        ("prepare-commit-msg", "#!/bin/sh\nexit 1\n".to_owned()),
+        (
+            "post-checkout",
+            format!("#!/bin/sh\ntouch {}\n", marker.display()),
+        ),
+    ] {
+        fs::write(hooks.join(hook), script).unwrap();
+        fs::set_permissions(hooks.join(hook), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    let ended = wait_for(&site, &nudges, "ended");
+
+    assert_eq!(ended["problem"], serde_json::Value::Null, "{ended}");
+    assert_eq!(
+        thread(&site, "R1")["tip"],
+        git_out(&repo.root, &["rev-parse", "postil/r1-one"])
+    );
+    assert!(!marker.exists(), "post-checkout ran");
+    drop(fs::remove_file(marker));
+}

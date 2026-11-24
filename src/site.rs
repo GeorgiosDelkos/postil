@@ -26,7 +26,6 @@ use crate::recent;
 use crate::repo::Repo;
 use crate::run::{Ending, Notify, Runner};
 use crate::settings::{self, RawSettings, Settings};
-use crate::thread;
 
 /// The page's files, served at these paths with these types: compiled into the binary as
 /// they are, so the app needs no files beside it. A module the page imports must be listed
@@ -206,10 +205,6 @@ pub(crate) fn start_site(
         None => Scanner::new(agents::search_path),
     };
     let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".postil"));
-    if let Some(home) = &home {
-        // Finishes deleting the worktrees of threads that ended while the app last ran.
-        thread::empty_trash(&thread::home_trash(home));
-    }
     let site = Site::new(config.as_deref(), home.as_deref(), bench, agents, notify);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
         site.open(repo, LiveRun::Stop)?;

@@ -318,6 +318,19 @@ pub(crate) fn wait_for(
     }
 }
 
+/// Waits until run `id` is the latest and has ended, and returns it.
+fn wait_for_run(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) -> serde_json::Value {
+    loop {
+        let run = get_json(site, RUN);
+        if run["id"] == id && ["ended", "failed"].contains(&run["status"].as_str().unwrap_or("")) {
+            return run;
+        }
+        nudges
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|_| panic!("no change while waiting for {id}: {run}"));
+    }
+}
+
 pub(crate) fn send(site: &Site, notes: &[&str]) -> (StatusCode, String) {
     post(
         site,

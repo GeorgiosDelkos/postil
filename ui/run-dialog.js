@@ -308,10 +308,20 @@ export function runDialog({
     const apply = el("button", "button primary", "Apply");
     apply.type = "button";
     apply.title = "Write the thread's changes into your working tree, uncommitted";
-    apply.addEventListener("click", () => store.endThread(root.id, "apply"));
     const discard = el("button", "button", "Discard");
     discard.type = "button";
     discard.title = "Drop the thread's changes and free its worktree";
+    // Both wait for the answer, so a second click does not ask again.
+    const end = (ending) => {
+      apply.disabled = true;
+      discard.disabled = true;
+      store.endThread(root.id, ending).then((ended) => {
+        if (ended) return;
+        apply.disabled = false;
+        discard.disabled = false;
+      });
+    };
+    apply.addEventListener("click", () => end("apply"));
     actOnSecondClick(discard, {
       arm: () => {
         discard.textContent = "Click again to discard";
@@ -319,7 +329,7 @@ export function runDialog({
       disarm: () => {
         discard.textContent = "Discard";
       },
-      act: () => store.endThread(root.id, "discard"),
+      act: () => end("discard"),
     });
     apply.disabled = busy;
     discard.disabled = busy;

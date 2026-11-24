@@ -473,8 +473,8 @@ impl fmt::Display for Error {
             ),
             Self::ThreadChanged { path, found } => write!(
                 f,
-                "the worktree {} holds work Postil did not commit: {found} (commit it or \
-                 remove it there, then try again)",
+                "the worktree {} holds work Postil did not commit: {found} (commit it there to \
+                 keep it with the thread, or remove it, then try again)",
                 path.display()
             ),
             Self::NotAWorktree { path } => write!(

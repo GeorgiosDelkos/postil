@@ -23,7 +23,11 @@
 //! another volume gets its worktrees under `.postil` at that volume's root instead, so the
 //! build folders can be cloned (`clone.rs`), which works only within one volume. An ended
 //! thread's worktree is renamed into `trash/` beside `worktrees/` and deleted there on a
-//! background thread; the next start of the app finishes what a quit cut short.
+//! background thread; opening the repository again finishes what a quit cut short.
+//!
+//! Postil deletes only what it made: a folder directly in this repository's worktrees
+//! folder whose `.git` names a worktree record of this repository, and branches under
+//! `postil/`. The record is a file a hand edit can change.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
@@ -49,7 +53,7 @@ const THREADS_VERSION: u32 = 1;
 const SLUG_LENGTH: usize = 40;
 
 /// One thread, as `threads.json` stores it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Thread {
     /// The thread's first run, `R3`.
@@ -63,11 +67,12 @@ pub(crate) struct Thread {
     /// The branch `HEAD` was on at send, or `None` when it was detached: a pull request goes
     /// to this branch.
     pub(crate) base: Option<String>,
-    /// The commit the branch held after the thread's last run ended, `fork` until then.
-    /// Ending the thread checks the worktree still has it.
+    /// The last commit Postil made or found on the branch, before or after a run; `fork`
+    /// until then. Ending the thread checks the worktree is at it, or past it.
     pub(crate) tip: String,
     pub(crate) state: State,
-    /// The ignored folders the worktree was not given (`make`), each with the reason.
+    /// What the worktree was not given ([`make`]): ignored folders, or its submodules, each
+    /// with the reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped: Vec<String>,
 }
@@ -145,9 +150,10 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
         source,
     })?;
     repo.add_worktree(&thread.path, &thread.branch, &thread.fork)?;
+    let tree = Repo::open(&thread.path)?;
 
     let mut skipped = Vec::new();
-    if let Err(error) = Repo::open(&thread.path).and_then(|tree| tree.update_submodules()) {
+    if let Err(error) = tree.update_submodules() {
         skipped.push(format!("submodules: {}", error_chain(&error)));
     }
     let folders = repo.ignored_folders().unwrap_or_else(|error| {
@@ -161,6 +167,10 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
             skipped.push(format!("{name}: a Python virtual environment"));
         } else if to.symlink_metadata().is_ok() {
             // A checkout or a submodule made it: it is the worktree's own.
+        } else if !tree.is_ignored(&format!("{name}/")).unwrap_or(false) {
+            // Ignored by a rule the engineer has not committed: the worktree's commit
+            // would take the whole folder in.
+            skipped.push(format!("{name}: not ignored by the committed .gitignore"));
         } else if let Err(error) = clone_or_copy(&from, &to) {
             skipped.push(format!("{name}: {error}"));
         }
@@ -168,11 +178,25 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
     Ok(skipped)
 }
 
-/// Clones the folder `from` to `to` in one call; when that fails (another volume, a file
-/// system without clones), copies it with `cp -c -R`, which clones file by file where it can.
+/// Clones the folder `from` to `to` in one call. When that fails for another reason than a
+/// volume without clones, copies it with `cp -c -R`, which clones file by file. A volume
+/// that cannot clone at all (another volume, HFS+, exFAT, a network share) is refused: a full
+/// copy of a build folder on every send costs the disk this is meant to save.
 fn clone_or_copy(from: &Path, to: &Path) -> io::Result<()> {
-    if clone_folder(from, to).is_ok() {
-        return Ok(());
+    match clone_folder(from, to) {
+        Ok(()) => return Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+            ) =>
+        {
+            return Err(io::Error::new(
+                error.kind(),
+                "this volume cannot clone it, and a full copy would cost its size",
+            ));
+        }
+        Err(_) => {}
     }
     // A failed clone can leave a part behind; `cp` would copy into it.
     drop(fs::remove_dir_all(to));
@@ -248,42 +272,66 @@ pub(crate) fn remove(repo: &Repo, ids: &[String]) -> Result<()> {
     change(repo, |threads| threads.retain(|t| !ids.contains(&t.id)))
 }
 
-/// Frees `thread`'s worktree: renames its folder into the trash beside the worktrees,
-/// drops git's record of it, and deletes the folder on a background thread. A worktree
-/// that is not on disk (never made, or freed before) only has git's record dropped. Does
-/// not touch the branch or the thread's record.
+/// Frees `thread`'s worktree: renames its folder into the trash beside the worktrees, drops
+/// git's record of that one worktree, and deletes the folder on a background thread. A
+/// worktree that is not on disk (never made, freed before, or deleted by hand) only has git's
+/// record dropped, if git has one. Does not touch the branch or the thread's record.
 ///
-/// Deletes only a folder git lists as one of `repo`'s worktrees: the path comes from
-/// `threads.json`, which a hand edit can point anywhere.
+/// The path comes from `threads.json`, which a hand edit can point anywhere, so a folder is
+/// freed only when it is directly in this repository's worktrees folder under Postil's home
+/// `home`, and the trash is found from that folder, never from the path.
 ///
 /// # Errors
 ///
-/// [`Error::NotAWorktree`] for a folder git does not list, [`Error::MakeWorktree`] when the
-/// folder cannot be moved into the trash, and the git errors.
-pub(crate) fn free(repo: &Repo, thread: &Thread) -> Result<()> {
+/// [`Error::NotAWorktree`] for a folder anywhere else, or whose `.git` names no worktree
+/// record of this repository; [`Error::MakeWorktree`] when the folder cannot be moved into
+/// the trash or git's record removed; and the git errors.
+pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
     // A unique name in the trash only: nothing is ordered by it.
     static FREED: AtomicU64 = AtomicU64::new(0);
+    check_place(repo, home, thread)?;
+    let record = repo.worktree_record(&thread.path)?;
     if thread.path.symlink_metadata().is_ok() {
         let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
-        if !repo.worktrees()?.contains(&path) {
-            return Err(Error::NotAWorktree { path });
-        }
-        let trash = trash_dir(&thread.path);
+        let trash = trash_for(repo.root(), home);
         let name = format!(
             "{}-{}-{}",
             thread.id.to_lowercase(),
             std::process::id(),
             FREED.fetch_add(1, Ordering::Relaxed)
         );
-        let moved =
-            fs::create_dir_all(&trash).and_then(|()| fs::rename(&thread.path, trash.join(&name)));
-        moved.map_err(|source| Error::MakeWorktree {
-            path: thread.path.clone(),
-            source,
-        })?;
+        let moved = fs::create_dir_all(&trash).and_then(|()| fs::rename(&path, trash.join(&name)));
+        moved.map_err(|source| Error::MakeWorktree { path, source })?;
         empty_trash(&trash);
     }
-    repo.prune_worktrees()
+    if let Some(record) = record {
+        fs::remove_dir_all(&record).map_err(|source| Error::MakeWorktree {
+            path: record,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Checks that `thread`'s folder, when it is on disk, is directly in the worktrees folder of
+/// `repo` under Postil's home `home`: the only place Postil puts a worktree, and so the only
+/// one it frees or opens to end a thread. The path comes from `threads.json`, which a hand
+/// edit can point anywhere. A folder that is not on disk passes: there is nothing to delete.
+///
+/// # Errors
+///
+/// [`Error::NotAWorktree`] for a folder anywhere else.
+pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
+    if thread.path.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
+    let ours = fs::canonicalize(worktrees_dir(repo.root(), &resolved(home))).ok();
+    if path.parent() == ours.as_deref() {
+        Ok(())
+    } else {
+        Err(Error::NotAWorktree { path })
+    }
 }
 
 /// Deletes everything in the trash folder `trash` on a background thread: freed worktrees,
@@ -305,29 +353,30 @@ pub(crate) fn empty_trash(trash: &Path) {
     drop(spawned);
 }
 
-/// The trash folder of Postil's home `home`, where [`free`] moves worktrees.
-pub(crate) fn home_trash(home: &Path) -> PathBuf {
-    home.join("trash")
+/// The trash folder where [`free`] moves the worktrees of the repository at `root`, given
+/// Postil's home `home`: `trash/` beside `worktrees/`, on the same volume, so the move is a
+/// rename.
+pub(crate) fn trash_for(root: &Path, home: &Path) -> PathBuf {
+    base_for(root, &resolved(home)).join("trash")
 }
 
-/// The trash folder for the worktree at `path`: `trash/` beside `worktrees/`, on the same
-/// volume, so moving a worktree there is a rename.
-fn trash_dir(path: &Path) -> PathBuf {
-    path.ancestors()
-        .nth(3)
-        .expect("a worktree's path is <base>/worktrees/<repo>/<folder>")
-        .join("trash")
+/// The folder that holds Postil's folders for the repository at `root`: Postil's home `home`
+/// when both are on one volume, else `.postil` at the root of the repository's volume, so
+/// clones stay on one volume. A repository that is its volume's root uses the home folder all
+/// the same: a folder there would be inside the repository.
+fn base_for(root: &Path, home: &Path) -> PathBuf {
+    let volume = volume_root(root);
+    if device(home) == device(root) || volume == root {
+        home.to_owned()
+    } else {
+        volume.join(".postil")
+    }
 }
 
 /// The folder that holds the worktrees of the repository at `root`, given Postil's home
-/// folder `home`: under `home` when both are on one volume, else under `.postil` at the
-/// root of the repository's volume.
+/// folder `home`, resolved.
 fn worktrees_dir(root: &Path, home: &Path) -> PathBuf {
-    let base = if device(home) == device(root) {
-        home.to_owned()
-    } else {
-        volume_root(root).join(".postil")
-    };
+    let base = base_for(root, home);
     let name = root.file_name().map_or_else(
         || "repository".to_owned(),
         |name| name.to_string_lossy().into_owned(),
