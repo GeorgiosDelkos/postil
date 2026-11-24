@@ -2016,6 +2016,14 @@ fn each_answer_reaches_only_the_run_it_names() {
         first_of_kind(&view, "question")["request"].clone()
     };
     let (first, second) = (question("R1"), question("R2"));
+    // A run that does not exist names no live run, though two are live.
+    let missing = serde_json::json!({ "run": "R9" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/cancel"), &missing);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    for id in ["R1", "R2"] {
+        let view = get_json(&site, &format!("{RUN}?id={id}"));
+        assert_eq!(view["status"], "waiting", "{id} was not stopped");
+    }
     let answer = |run: &str, request: &serde_json::Value| {
         let body = serde_json::json!({ "run": run, "request": request, "content": null });
         post(&site, &format!("{RUN}/question"), &body.to_string())
@@ -2578,4 +2586,35 @@ fn a_follow_up_takes_its_own_thread_s_place_so_two_others_running_leave_room() {
     let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(wait_for_run(&site, &nudges, "R4")["status"], "ended");
+}
+
+#[test]
+fn a_thread_whose_agent_exited_takes_no_agent_s_place() {
+    let repo = TempRepo::new("run-evict-count");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    set_reviewers(&site, "plain", &[("Gone", "exit-after-turn")]);
+    for text in ["one", "two", "three"] {
+        post_note(&site, "a.txt", 1, 1, text);
+    }
+    let send_to = |agent: &str, note: &str, run: &str| {
+        let body = serde_json::json!({ "notes": [note], "agent": agent }).to_string();
+        let (status, body) = post(&site, RUN, &body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(wait_for_run(&site, &nudges, run)["status"], "ended");
+    };
+    // R1's agent exits after its turn: its thread keeps a slot, with no agent in it.
+    send_to("Gone", "N1", "R1");
+    send_to("Fake", "N2", "R2");
+    // R3's agent makes two in the window: R2's stays.
+    send_to("Fake", "N3", "R3");
+
+    let follow = serde_json::json!({ "of": "R2", "text": "more" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kept = wait_for_run(&site, &nudges, "R4");
+    assert!(
+        kinds(&kept).contains(&"message:prompt 2".to_owned()),
+        "R2's agent took the follow-up as its second prompt: {kept}"
+    );
 }
