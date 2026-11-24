@@ -335,11 +335,16 @@ export function notesTray({
     if (!state.send || state.send.sending || tickedIds().length === 0 || !agent) return;
     state.send.sending = true;
     renderSendBar();
-    if (!(await startRun(tickedIds(), agent))) {
+    // Send is usable again whatever happened, a request that never got an answer included:
+    // its error reaches the page's toast (app.js, `unhandledrejection`).
+    let started = false;
+    try {
+      started = await startRun(tickedIds(), agent);
+    } finally {
       if (state.send) state.send.sending = false;
       renderSendBar();
-      return;
     }
+    if (!started) return;
     closeSend();
     showTab("run");
   }

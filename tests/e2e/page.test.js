@@ -225,3 +225,24 @@ test("Up and Down in the file filter move the highlight, and Enter opens that fi
   await filter.press("Enter");
   await page.locator("#code-rows").filter({ hasText: "bee" }).waitFor();
 });
+
+test("a send whose request fails shows the error and leaves Send usable (JS7)", async (t) => {
+  const { page, api } = await openProject(t);
+  await addNote(api, "Rename two.");
+  // The page reads the notes as it loads; this one was written after.
+  await page.reload();
+  await page.locator(".note-item").first().waitFor();
+
+  // The send's request fails before any answer, as a dropped connection would.
+  await page.route("**/api/run", (route) =>
+    route.request().method() === "POST" ? route.abort() : route.continue(),
+  );
+  const send = page.locator("#send-button");
+  await send.click();
+  await send.click();
+
+  await page.locator("#toast").filter({ hasText: /\S/ }).waitFor();
+  await page.waitForFunction(() => !document.getElementById("send-button").disabled);
+  const { runs } = await api("api/runs");
+  assert.deepEqual(runs, [], "no run started");
+});
