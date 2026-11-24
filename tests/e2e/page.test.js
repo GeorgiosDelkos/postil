@@ -166,6 +166,18 @@ test("Esc with Changes open and the focus elsewhere closes Changes, not the run 
   assert.ok(!run.entries.some((entry) => entry.kind === "cancelRequested"), "no stop was asked");
 });
 
+test("a click on a line number in Changes opens the composer on that line (JS19)", async (t) => {
+  const { page, api } = await openProject(t);
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  await page.locator("#run .run-entry").click();
+  await page.locator("#run-detail").getByRole("button", { name: "Changes" }).click();
+
+  // The flood's edit, `two` to `2` on line 2 of src/a.rs.
+  await page.locator("#changes-view").getByRole("button", { name: "2", exact: true }).click();
+  await page.locator("#changes-view").waitFor({ state: "hidden" });
+  await page.locator("#code-rows label").filter({ hasText: "Note on line 2" }).waitFor();
+});
+
 test("a note's remark on the code follows an edit and a delete of the note (JS18)", async (t) => {
   const { page, api } = await openProject(t);
   await addNote(api, "First.");
