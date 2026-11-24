@@ -2301,3 +2301,28 @@ fn a_review_keeps_what_the_engineer_committed_or_left_in_the_worktree() {
     assert_eq!(thread["tip"], git_out(&worktree, &["rev-parse", "HEAD"]));
     assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
 }
+
+#[test]
+fn a_reviewer_cut_short_has_its_edits_undone_all_the_same() {
+    let repo = TempRepo::new("run-review-cut");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    set_reviewers(&site, "plain", &[("First", "reviewer-writes-cut")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+
+    let stage = wait_for_run(&site, &nudges, "R2");
+
+    let problem = stage["problem"].as_str().unwrap_or_default();
+    assert!(problem.contains("its changes were undone"), "{stage}");
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+}

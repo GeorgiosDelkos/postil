@@ -635,9 +635,11 @@ impl Runner {
     }
 
     /// Makes `new` this window's run and its review the one under way, sends the run to its
-    /// agent, then tells the page. Takes the snapshot before the run, except for a proposer,
-    /// which may not edit: a new thread's is the commit it starts from, an open thread's the
-    /// commit its worktree is at, after committing anything left there. The slot changes only
+    /// agent, then tells the page. In an open thread, first commits anything left in the
+    /// worktree, a proposer's run included, and takes that commit as the snapshot before the
+    /// run, except for a proposer, which may not edit. A new thread's snapshot before, the
+    /// commit it starts from, is recorded on the start thread once its worktree is made
+    /// ([`Runner::start`]). The slot changes only
     /// once the run's log exists, so a launch that fails leaves the review and the kept agent
     /// as they were. The agent it replaces is dropped after `slot` is released.
     ///
@@ -834,6 +836,7 @@ impl Runner {
             // Its exit is not reported, so the snapshot after it is taken here, once nothing
             // can write any more. The run stays live until then, so a send is refused
             // (`TurnRunning`) meanwhile.
+            undo_if_live(&run, thread.as_ref());
             self.record_end_snapshot(&run, thread.as_ref());
             run.record(Entry::Failed {
                 error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
@@ -1290,6 +1293,7 @@ impl Runner {
             // the run is taken here, or its changes view would stay empty. It runs `git add`
             // on the request thread, quitting included. Both calls do nothing for a run that
             // already ended.
+            undo_if_live(&run, thread.as_ref());
             self.record_end_snapshot(&run, thread.as_ref());
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
@@ -1622,12 +1626,25 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
             Held::None
         };
         let run = slot.run.clone();
+        // However a proposer's turn ends, what it changed is put back before the end is
+        // logged, under the lock, so no run starts in the worktree first.
+        let undone = run
+            .as_deref()
+            .filter(|_| ends_turn)
+            .and_then(|run| undo_proposer(run, thread.as_ref()));
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
         // next stage starts once the end is logged.
         let next = match (&stage, &run) {
             (Some(stage), Some(run)) if ended_well => {
-                decide(&mut slot, run, stage, thread.as_ref()).then(|| Arc::clone(run))
+                decide(&mut slot, run, stage, undone).then(|| Arc::clone(run))
+            }
+            (_, Some(run)) => {
+                // No findings are logged for a turn that did not end well: the run says it.
+                if let Some(undone) = undone {
+                    run.state().problem.get_or_insert(undone);
+                }
+                None
             }
             _ => None,
         };
@@ -1660,9 +1677,9 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
 /// whether the review goes on: true when the next stage is to start, else false, the chain
 /// then cleared. A proposer's findings are logged here, before the end, while the run still
 /// takes entries.
-fn decide(slot: &mut Slot, run: &Run, stage: &Stage, thread: Option<&Thread>) -> bool {
+fn decide(slot: &mut Slot, run: &Run, stage: &Stage, undone: Option<String>) -> bool {
     let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
-    let findings = end_stage(run, stage, found, thread);
+    let findings = end_stage(run, stage, found, undone);
     let goes = match (findings, slot.chain.as_mut()) {
         (Some(findings), Some(chain)) => goes_on(chain, findings),
         _ => false,
@@ -1708,15 +1725,16 @@ fn goes_on(chain: &mut Chain, findings: Vec<Finding>) -> bool {
         && !(chain.stage.judges() && chain.findings.is_empty())
 }
 
-/// Ends review stage `stage` of `run`, whose turn ended well in `thread`'s worktree, before
-/// its end is logged: a proposer's findings are read from its reply (numbered after the
-/// `found` before it) and logged. Returns them for the next stage; `None` when the review ends
-/// here: this was the judge, or a proposer changed files, which are then put back.
+/// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
+/// proposer's findings are read from its reply (numbered after the `found` before it) and
+/// logged. `undone` says why the proposer's edits were put back ([`undo_proposer`]), if it
+/// made any. Returns the findings for the next stage; `None` when the review ends here: this
+/// was the judge, or a proposer changed files.
 fn end_stage(
     run: &Run,
     stage: &Stage,
     found: usize,
-    thread: Option<&Thread>,
+    undone: Option<String>,
 ) -> Option<Vec<Finding>> {
     if stage.judges() {
         return None;
@@ -1726,41 +1744,64 @@ fn end_stage(
         Ok(findings) => (findings, None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
-    // A proposer may only read, but an agent that edits without asking is not stopped by the
-    // permission rule: its edits are checked here, and they end the review, so no judge takes
-    // a changed tree for the reviewed one. An edit made through a command reports no diff, and
-    // one it committed leaves no change, so the worktree is asked for both; one that cannot
-    // be asked counts as changed.
-    let moved = |thread: &Thread| {
-        Repo::open(&thread.path)
-            .and_then(|tree| {
-                Ok(!tree.changed()?.is_empty() || tree.head()? != Some(thread.tip.clone()))
-            })
-            .unwrap_or(true)
-    };
-    let edited = !run.state().work().diffs.is_empty() || thread.is_some_and(moved);
-    let problem = if edited {
-        // Put back, or the next run's commit would take them in, and Apply with it.
-        let undone = thread.map_or(Ok(()), |thread| {
-            Repo::open(&thread.path).and_then(|tree| tree.reset_to(&thread.tip))
-        });
-        let undone = match undone {
-            Ok(()) => "its changes were undone".to_owned(),
-            Err(error) => format!("its changes could not be undone: {}", error_chain(&error)),
-        };
-        Some(format!(
-            "reviewer {} changed files, though it may only read: {undone}, and the review \
-             stops here",
-            stage.reviewer
-        ))
-    } else {
-        problem
-    };
+    // Edits end the review, so no judge takes a changed tree for the reviewed one.
+    let edited = undone.is_some();
     run.record(Entry::Findings {
         findings: findings.clone(),
-        problem,
+        problem: undone.or(problem),
     });
     (!edited).then_some(findings)
+}
+
+/// [`undo_proposer`] for a run a forced Stop or a close ends, whose end the agent does not
+/// report: only while it is live, and the run says what was undone.
+fn undo_if_live(run: &Run, thread: Option<&Thread>) {
+    if !run.state().live() {
+        return;
+    }
+    if let Some(undone) = undo_proposer(run, thread) {
+        run.state().problem.get_or_insert(undone);
+    }
+}
+
+/// When `run` is a proposing reviewer's and changed `thread`'s worktree, puts the worktree
+/// back to the thread's tip (`reset --hard`, `clean -d`, ignored files kept) and returns what
+/// the run says about it; `None` for any other run, or a proposer that changed nothing. Called
+/// however the stage's turn ends, a Stop and a close included: edits left there would be
+/// taken in by the next run's commit, and by Apply with it.
+///
+/// A proposer may only read, but an agent that edits without asking is not stopped by the
+/// permission rule. An edit made through a command reports no diff, and one it committed
+/// leaves no change, so the worktree is asked for both; one that cannot be asked counts as
+/// changed. Runs git in the worktree: `status` and `rev-parse`, and the reset when needed.
+fn undo_proposer(run: &Run, thread: Option<&Thread>) -> Option<String> {
+    let reviewer = {
+        let state = run.state();
+        state
+            .header
+            .review
+            .as_ref()
+            .filter(|stage| !stage.judges())?
+            .reviewer
+    };
+    let thread = thread?;
+    let moved = Repo::open(&thread.path)
+        .and_then(
+            |tree| Ok(!tree.changed()?.is_empty() || tree.head()? != Some(thread.tip.clone())),
+        )
+        .unwrap_or(true);
+    if !moved && run.state().work().diffs.is_empty() {
+        return None;
+    }
+    let undone = Repo::open(&thread.path).and_then(|tree| tree.reset_to(&thread.tip));
+    let undone = match undone {
+        Ok(()) => "its changes were undone".to_owned(),
+        Err(error) => format!("its changes could not be undone: {}", error_chain(&error)),
+    };
+    Some(format!(
+        "reviewer {reviewer} changed files, though it may only read: {undone}, and the review \
+         stops here"
+    ))
 }
 
 /// The id of the first of `options` of the first kind in `kinds` that has one; `None` when

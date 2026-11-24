@@ -247,6 +247,10 @@ async function prompt(id, params) {
       writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
       say("```json\n[]\n```");
       return send({ id, result: { stopReason: "end_turn" } });
+    case "reviewer-writes-cut":
+      // A proposer that changes a file and is cut short: its turn does not end well.
+      writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
+      return send({ id, result: { stopReason: "max_tokens" } });
     case "reviewer-commits":
       // A proposer that edits and commits its edit, which leaves no change behind.
       writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");

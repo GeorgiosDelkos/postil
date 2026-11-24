@@ -6,7 +6,8 @@
 //! `target/`: 3 s, against 34 s for `cp -c -R`, which clones file by file, and no disk used
 //! until a block changes. The man page discourages cloning folders this way and points to
 //! `copyfile(3)`, which walks the tree as `cp` does; the caller falls back to `cp -c -R` when
-//! this call fails.
+//! this call fails for another reason than a volume that cannot clone, and skips the folder
+//! when it cannot.
 #![expect(
     unsafe_code,
     reason = "one FFI call to clonefile(2); the owner allowed this module on 2026-11-24"
@@ -51,7 +52,8 @@ pub(crate) fn clone_folder(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// Off macOS there is no `clonefile`: the caller falls back to `cp`.
+/// Off macOS there is no `clonefile`: the caller skips the folder, as on a volume without
+/// clones.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn clone_folder(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))

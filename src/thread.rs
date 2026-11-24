@@ -650,6 +650,21 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn the_errors_of_a_volume_that_cannot_clone_read_as_the_kinds_clone_or_copy_refuses() {
+        // `clone_or_copy` refuses a full copy by these kinds, and std does not document the
+        // mapping from errno: ENOTSUP and EXDEV on macOS.
+        assert_eq!(
+            io::Error::from_raw_os_error(45).kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            io::Error::from_raw_os_error(18).kind(),
+            io::ErrorKind::CrossesDevices
+        );
+    }
+
+    #[test]
     fn emptying_the_trash_deletes_everything_in_it_and_keeps_the_folder() {
         let dir = TempDir::new("thread-trash");
         let trash = dir.path().join("trash");
