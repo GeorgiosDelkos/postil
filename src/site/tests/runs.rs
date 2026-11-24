@@ -41,9 +41,11 @@ fn snapshot_points(run: &serde_json::Value) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn file_uri_of(repo: &TempRepo, path: &str) -> String {
-    let root = Repo::open(&repo.root).unwrap().root().to_owned();
-    format!("file://{}/{path}", root.display())
+/// The `file://` URI of `path` in the worktree of thread `thread` (its first run, `R1`), as
+/// a prompt links it.
+fn file_uri_of(site: &Site, thread: &str, path: &str) -> String {
+    let thread = get_json(site, &format!("postil://localhost/api/thread?id={thread}"));
+    format!("file://{}/{path}", thread["path"].as_str().unwrap())
 }
 
 /// The run's first entry of `kind`.
@@ -99,8 +101,8 @@ fn sent_notes_reach_the_agent_and_every_step_of_the_run_is_kept_on_disk() {
             "started".to_owned(),
             format!(
                 "message:got {prompt} | {} | {}",
-                file_uri_of(&repo, "b.txt"),
-                file_uri_of(&repo, "src/a.rs")
+                file_uri_of(&site, "R1", "b.txt"),
+                file_uri_of(&site, "R1", "src/a.rs")
             ),
             "message:prompt 1".to_owned(),
         ],
@@ -268,36 +270,83 @@ fn the_prompt_preview_is_the_text_the_agent_receives() {
 }
 
 #[test]
-fn the_agent_is_kept_between_runs_and_replaced_when_another_is_chosen() {
-    let repo = TempRepo::new("run-keep");
+fn each_send_works_in_a_worktree_and_on_a_branch_of_its_own_and_leaves_the_engineer_s_alone() {
+    let repo = TempRepo::new("run-worktrees");
     repo.write("a.txt", "a\nb\n");
-    let (site, nudges) = run_site(&repo, "plain");
-    post_note(&site, "a.txt", 1, 1, "one");
+    let (site, nudges) = run_site(&repo, "writes");
+    // Uncommitted work of the engineer's: a thread starts from the last commit, without it.
+    repo.write("mine.txt", "draft\n");
+    post_note(&site, "a.txt", 1, 1, "Fix the first line");
     post_note(&site, "a.txt", 2, 2, "two");
 
     send(&site, &["N1"]);
     let first = wait_for(&site, &nudges, "ended");
+    send(&site, &["N2"]);
+    let second = wait_for_run(&site, &nudges, "R2");
     assert!(
-        kinds(&first).contains(&"message:prompt 1".to_owned()),
-        "{first}"
-    );
-    let (status, body) = send(&site, &["N2"]);
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let second = wait_for(&site, &nudges, "ended");
-    assert_eq!(second["id"], "R2");
-    assert!(
-        kinds(&second).contains(&"message:prompt 2".to_owned()),
-        "the same agent process: {second}"
+        kinds(&second).contains(&"message:prompt 1".to_owned()),
+        "a new thread's agent is a fresh one: {second}"
     );
 
-    // Another command is another agent, started fresh.
-    set_agents(&site, &[("Other", &fake_agent("plain2"))], "Other");
-    send(&site, &["N1"]);
-    let third = wait_for(&site, &nudges, "ended");
-    assert_eq!(third["agent"], "Other");
+    let thread = |id: &str| get_json(&site, &format!("postil://localhost/api/thread?id={id}"));
+    let (one, two) = (thread("R1"), thread("R2"));
+    assert_eq!(one["branch"], "postil/r1-fix-the-first-line");
+    assert_eq!(two["branch"], "postil/r2-two");
+    assert_eq!(one["state"], "open");
+    assert_eq!(one["base"], "trunk", "the branch HEAD was on");
+    let one_path = PathBuf::from(one["path"].as_str().unwrap());
+    assert_ne!(one_path, PathBuf::from(two["path"].as_str().unwrap()));
     assert!(
-        kinds(&third).contains(&"message:prompt 1".to_owned()),
-        "{third}"
+        one_path.starts_with(repo.home().canonicalize().unwrap()),
+        "{one_path:?} under Postil's home"
+    );
+    // In a folder named after the repository, then a hash of its path.
+    let folder = one_path
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let repo_name = repo.root.file_name().unwrap().to_str().unwrap();
+    assert!(folder.starts_with(&format!("{repo_name}-")), "{folder}");
+    // Each agent wrote in its own worktree, and its turn was committed on its branch.
+    assert_eq!(
+        fs::read_to_string(one_path.join("a.txt")).unwrap(),
+        "a\nprompt 1\n"
+    );
+    assert!(
+        !one_path.join("mine.txt").exists(),
+        "not committed: not there"
+    );
+    let after = first["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "snapshot" && entry["point"] == "after")
+        .unwrap()["tree"]
+        .clone();
+    assert_eq!(
+        git_out(&repo.root, &["rev-parse", "postil/r1-fix-the-first-line"]),
+        after
+    );
+    assert_eq!(one["tip"], after, "the record follows the branch");
+    assert_eq!(
+        git_out(&repo.root, &["log", "-1", "--format=%s", "postil/r2-two"]),
+        "Postil R2: notes N2"
+    );
+    assert_eq!(git_out(&one_path, &["status", "--porcelain"]), "");
+
+    // The engineer's working tree, index and branch are as they were.
+    assert_eq!(
+        fs::read_to_string(repo.root.join("a.txt")).unwrap(),
+        "a\nb\n"
+    );
+    assert!(!repo.root.join("new.txt").exists());
+    assert_eq!(git_out(&repo.root, &["branch", "--show-current"]), "trunk");
+    assert_eq!(
+        git_out(&repo.root, &["status", "--porcelain"]),
+        "?? mine.txt"
     );
 }
 
@@ -547,9 +596,14 @@ fn a_question_left_open_at_the_turn_s_end_is_answered_cancel() {
     post_note(&site, "a.txt", 2, 2, "two");
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "ended");
-    // The same agent, kept: its second turn reports the reply to the first's question.
-    send(&site, &["N2"]);
-    let ended = wait_for(&site, &nudges, "ended");
+    // The same agent, kept for a follow-up: its second turn reports the reply to the first's
+    // question.
+    let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/follow"), &body).0,
+        StatusCode::OK
+    );
+    let ended = wait_for_run(&site, &nudges, "R2");
     assert!(
         kinds(&ended).contains(&"message:left open answered cancel".to_owned()),
         "{ended}"
@@ -705,19 +759,6 @@ fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// Waits until run `id` is the latest and has ended, and returns it.
-fn wait_for_run(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) -> serde_json::Value {
-    loop {
-        let run = get_json(site, RUN);
-        if run["id"] == id && ["ended", "failed"].contains(&run["status"].as_str().unwrap_or("")) {
-            return run;
-        }
-        nudges
-            .recv_timeout(WAIT)
-            .unwrap_or_else(|_| panic!("no change while waiting for {id}: {run}"));
-    }
-}
-
 #[test]
 fn a_reviewer_sees_the_reviewed_run_s_edits() {
     let repo = TempRepo::new("run-review-edits");
@@ -742,7 +783,7 @@ fn a_reviewer_sees_the_reviewed_run_s_edits() {
         .find(|kind| kind.starts_with("message:got "))
         .unwrap();
     assert!(
-        linked.ends_with(&format!(" | {}", file_uri_of(&repo, "src/a.rs"))),
+        linked.ends_with(&format!(" | {}", file_uri_of(&site, "R1", "src/a.rs"))),
         "the edited file is linked once: {linked}"
     );
 }
@@ -754,6 +795,10 @@ fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
         ("reviewer-silent", Some("no ```json block")),
         ("refuse-prompt", None),
         ("reviewer-edits", Some("reviewer 1 changed files")),
+        // An edit through a command reports nothing; the worktree shows it.
+        ("reviewer-writes", Some("reviewer 1 changed files")),
+        // An edit it committed leaves no change; the branch moved.
+        ("reviewer-commits", Some("reviewer 1 changed files")),
     ] {
         let repo = TempRepo::new(&format!("run-review-stop-{scenario}"));
         repo.write("a.txt", "a\n");
@@ -778,6 +823,26 @@ fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
                 found["problem"].as_str().unwrap_or("").contains(problem),
                 "{scenario}: {found}"
             );
+            // Undone, so neither the next run's commit nor Apply takes the reviewer's edit.
+            let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+            let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+            if scenario != "reviewer-silent" {
+                assert_eq!(
+                    git_out(&worktree, &["status", "--porcelain"]),
+                    "",
+                    "{scenario}"
+                );
+                assert_eq!(
+                    git_out(&worktree, &["rev-parse", "HEAD"]),
+                    thread["tip"],
+                    "{scenario}"
+                );
+                assert_eq!(
+                    fs::read_to_string(worktree.join("a.txt")).unwrap(),
+                    "a\n",
+                    "{scenario}"
+                );
+            }
         }
         assert!(
             !site.runner().unwrap().reviewing(),
@@ -919,12 +984,13 @@ fn a_follow_up_goes_to_the_same_conversation_or_tells_a_fresh_agent_the_thread()
         "a follow-up marks no note sent"
     );
 
-    // Another send, R3, goes to the kept agent. Its conversation goes on past R2, so a
-    // follow-up of R2 starts a fresh agent and tells it the thread.
+    // Another send, R3, starts a thread of its own, in its own worktree, so a fresh agent
+    // takes it. The agent that ran R2 is gone, so a follow-up of R2 starts a fresh agent
+    // and tells it the thread.
     send(&site, &["N2"]);
     let other = wait_for_run(&site, &nudges, "R3");
     assert!(
-        kinds(&other).contains(&"message:prompt 3".to_owned()),
+        kinds(&other).contains(&"message:prompt 1".to_owned()),
         "{other}"
     );
     let (status, body) = follow("R2", "again");
@@ -1091,13 +1157,9 @@ fn a_run_s_changes_are_the_diff_between_its_snapshots_and_the_index_is_left_alon
         assert!(patch.contains(part), "{part:?} in {patch}");
     }
 
-    // The engineer takes a file out of git and ignores it: snapshots stop following it. And
-    // force-adds an ignored one: snapshots follow it from then on.
-    repo.git(&["rm", "--cached", "--quiet", "secret.txt"]);
-    repo.write(".gitignore", "secret.txt\nforced.txt\n");
+    // The engineer stages a change of their own meanwhile.
     repo.write("secret.txt", "two\n");
-    repo.write("forced.txt", "kept\n");
-    repo.git(&["add", "--force", "forced.txt"]);
+    repo.git(&["add", "secret.txt"]);
 
     // A follow-up writes again: R1 to R2 is the whole thread, R2 alone its own change.
     let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
@@ -1105,7 +1167,7 @@ fn a_run_s_changes_are_the_diff_between_its_snapshots_and_the_index_is_left_alon
         post(&site, &format!("{RUN}/follow"), &body).0,
         StatusCode::OK
     );
-    wait_for_run(&site, &nudges, "R2");
+    let follow_up = wait_for_run(&site, &nudges, "R2");
     let patch_of = |query: &str| {
         let (status, body) = changes(query);
         assert_eq!(status, StatusCode::OK, "{query}: {body}");
@@ -1123,24 +1185,38 @@ fn a_run_s_changes_are_the_diff_between_its_snapshots_and_the_index_is_left_alon
     assert!(second.contains("-prompt 1\n+prompt 2"), "{second}");
     assert!(!second.contains("new.txt"), "unchanged by R2: {second}");
     assert!(
-        !second.contains("+two"),
-        "an ignored file left untracked: {second}"
-    );
-    assert!(
-        thread.contains("+++ b/forced.txt"),
-        "a force-added file: {thread}"
+        !thread.contains("secret.txt"),
+        "the engineer's own change is not the thread's: {thread}"
     );
 
-    // Snapshots go through an index of their own: the engineer's staged files are the same.
-    let staged = Command::new("git")
-        .arg("-C")
-        .arg(&repo.root)
-        .args(["diff", "--cached", "--name-only"])
-        .output()
-        .unwrap();
+    // Each snapshot after a run is a commit on the thread's branch, the follow-up's last.
+    let after = |run: &serde_json::Value| {
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "snapshot" && entry["point"] == "after")
+            .unwrap()["tree"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let branch = get_json(&site, "postil://localhost/api/thread?id=R1")["branch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(
-        String::from_utf8_lossy(&staged.stdout),
-        "a.txt\nforced.txt\n"
+        git_out(&repo.root, &["rev-parse", &branch]),
+        after(&follow_up)
+    );
+    assert_eq!(
+        git_out(&repo.root, &["rev-parse", &format!("{branch}~1")]),
+        after(&first)
+    );
+    // The engineer's staged files are as they left them.
+    assert_eq!(
+        git_out(&repo.root, &["diff", "--cached", "--name-only"]),
+        "secret.txt"
     );
 }
 
@@ -1236,50 +1312,119 @@ fn changes_compare_with_the_files_now_without_a_snapshot_after_and_refuse_bad_lo
 }
 
 #[test]
-fn a_snapshot_that_cannot_be_taken_is_the_run_s_problem_and_the_run_goes_on() {
-    if skip_as_root() {
-        return;
-    }
-    let repo = TempRepo::new("run-no-snapshot");
+fn a_commit_that_fails_is_the_run_s_problem_and_its_work_stays_in_the_worktree() {
+    let repo = TempRepo::new("run-no-commit");
     repo.write("a.txt", "a\n");
-    repo.git(&["add", "a.txt"]);
-    let index = repo.root.join(".git/index");
-    // The first snapshot starts from a copy of the real index, which cannot be read.
-    fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
-    let (site, nudges) = run_site(&repo, "plain");
+    let (site, nudges) = run_site(&repo, "writes");
+    // An empty name, which git refuses: every commit after this one fails, the worktree's
+    // too, since it shares this config. Signing and hooks cannot fail it: Postil turns both
+    // off for its commits.
+    repo.git(&["config", "user.name", ""]);
+    repo.git(&["config", "commit.gpgSign", "true"]);
+    repo.git(&["config", "gpg.program", "false"]);
     post_note(&site, "a.txt", 1, 1, "one");
     send(&site, &["N1"]);
     let ended = wait_for(&site, &nudges, "ended");
-    fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+
     let problem = ended["problem"].as_str().unwrap_or_default();
     assert!(
-        problem.contains("no snapshot of the files was taken"),
+        problem.contains("no snapshot of the files was taken") && problem.contains("commit"),
         "{ended}"
     );
-    assert!(problem.contains(".git/index"), "{problem}");
     assert!(
         kinds(&ended).contains(&"message:prompt 1".to_owned()),
-        "{ended}"
+        "the run went on: {ended}"
     );
-    let (status, body) = get(&site, &format!("{RUN}/changes?from=R1"));
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.contains("R1 has no snapshot from before it"), "{body}");
+    assert_eq!(snapshot_points(&ended), ["before"], "{ended}");
+    // With no snapshot after it, the run is compared with the worktree's files as they are.
+    let changes = get_json(&site, &format!("{RUN}/changes?from=R1"));
+    assert_eq!(changes["after"], serde_json::Value::Null);
+    assert!(
+        changes["patch"].as_str().unwrap().contains("+prompt 1"),
+        "{changes}"
+    );
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    assert_eq!(thread["tip"], thread["fork"], "nothing was committed");
+
+    // The uncommitted work would be lost by ending the thread, so Postil refuses, naming it.
+    for ending in ["apply", "discard"] {
+        let (status, body) = post(
+            &site,
+            &format!("postil://localhost/api/thread/{ending}"),
+            r#"{"thread": "R1"}"#,
+        );
+        assert_eq!(status, StatusCode::CONFLICT, "{ending}: {body}");
+        assert!(
+            body.contains("holds work Postil did not commit") && body.contains("a.txt"),
+            "{body}"
+        );
+    }
+    assert_eq!(fs::read_to_string(repo.root.join("a.txt")).unwrap(), "a\n");
+
+    // As the refusal says: committing the work there keeps it with the thread, and Apply
+    // takes the engineer's commit.
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    repo.git(&["config", "user.name", "Postil Test"]);
+    repo.git(&["config", "commit.gpgSign", "false"]);
+    git_out(&worktree, &["add", "--all"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    let (status, body) = post(
+        &site,
+        "postil://localhost/api/thread/apply",
+        r#"{"thread": "R1"}"#,
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("a.txt")).unwrap(),
+        "a\nprompt 1\n"
+    );
+}
+
+/// A snapshot of the files as they are (`Repo::snapshot`), which the changes view takes of a
+/// worktree with no commit after its run, heals its own index and drops one git cannot use.
+#[test]
+fn a_snapshot_copies_its_index_again_when_torn_and_drops_a_copy_git_cannot_use() {
+    if skip_as_root() {
+        return;
+    }
+    let repo = TempRepo::new("snapshot-index");
+    repo.write("a.txt", "a\n");
+    repo.git(&["add", "a.txt"]);
+    let index = repo.root.join(".git/index");
+    let tree = Repo::open(&repo.root).unwrap();
+
+    // The first snapshot starts from a copy of the real index, which cannot be read.
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+    let error = tree.snapshot().unwrap_err();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(error_chain(&error).contains(".git/index"), "{error:?}");
 
     // Postil's own index torn: it is copied again from the real one at once.
+    let first = tree.snapshot().unwrap();
     let ours = repo.root.join(".git/postil/snapshot/index");
     fs::write(&ours, "torn").unwrap();
-    send(&site, &["N1"]);
-    let healed = wait_for_run(&site, &nudges, "R2");
-    assert_eq!(snapshot_points(&healed), ["before", "after"], "{healed}");
+    assert_eq!(tree.snapshot().unwrap(), first);
+
+    // A file taken out of git and ignored is no longer followed; an ignored file force-added
+    // is, from then on. `git add --all` alone would do neither.
+    repo.write("secret.txt", "one\n");
+    repo.git(&["add", "secret.txt"]);
+    tree.snapshot().unwrap();
+    repo.git(&["rm", "--cached", "--quiet", "secret.txt"]);
+    repo.write(".gitignore", "secret.txt\nforced.txt\n");
+    repo.write("forced.txt", "kept\n");
+    repo.git(&["add", "--force", "forced.txt"]);
+    let listed = git_out(
+        &repo.root,
+        &["ls-tree", "--name-only", &tree.snapshot().unwrap()],
+    );
+    assert_eq!(listed, ".gitignore\na.txt\nforced.txt");
 
     // The real index torn: its copy cannot be used, so the snapshot fails and the copy is
     // removed rather than failing every snapshot after it.
     fs::remove_file(&ours).unwrap();
     fs::write(&index, "torn").unwrap();
-    send(&site, &["N1"]);
-    let torn = wait_for_run(&site, &nudges, "R3");
-    let problem = torn["problem"].as_str().unwrap_or_default();
-    assert!(problem.contains("no snapshot"), "{torn}");
+    assert!(tree.snapshot().is_err());
     assert!(!ours.exists(), "the unusable copy is gone");
 }
 
@@ -1673,12 +1818,13 @@ fn notes_that_cannot_be_marked_sent_are_named_on_the_run() {
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "ended");
 
-    // The runs and snapshot directories stay writable; the review file's directory does not.
-    let postil = repo.root.join(".git/postil");
-    fs::set_permissions(&postil, fs::Permissions::from_mode(0o555)).unwrap();
+    // The runs and the threads stay writable; the notes' lock, which marking them takes,
+    // does not.
+    let lock = repo.root.join(".git/postil/review.lock");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
     send(&site, &["N1"]);
     let run = wait_for(&site, &nudges, "ended");
-    fs::set_permissions(&postil, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(run["id"], "R2");
     assert_eq!(snapshot_points(&run), ["before", "after"], "{run}");
     let problem = run["problem"].as_str().unwrap();
@@ -2098,5 +2244,167 @@ fn bad_run_requests_name_the_problem_and_make_no_run() {
         status,
         StatusCode::NOT_FOUND,
         "no run, so no request: {body}"
+    );
+}
+
+#[test]
+fn a_review_keeps_what_the_engineer_committed_or_left_in_the_worktree() {
+    let repo = TempRepo::new("run-review-keeps");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "writes");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    let worktree = PathBuf::from(
+        get_json(&site, "postil://localhost/api/thread?id=R1")["path"]
+            .as_str()
+            .unwrap(),
+    );
+    // The engineer's own commit there, and an edit not committed.
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git_out(&worktree, &["add", "mine.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    fs::write(worktree.join("left.txt"), "left\n").unwrap();
+    // A proposer that only reads.
+    set_reviewers(&site, "writes", &[("Reviewer", "reviewer-silent")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+
+    let review = wait_for_run(&site, &nudges, "R2");
+
+    let found = review["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "findings")
+        .unwrap()
+        .clone();
+    assert!(
+        !found["problem"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed files"),
+        "the reviewer is not blamed for the engineer's work: {found}"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("left.txt")).unwrap(),
+        "left\n"
+    );
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    assert_eq!(thread["tip"], git_out(&worktree, &["rev-parse", "HEAD"]));
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_reviewer_cut_short_has_its_edits_undone_all_the_same() {
+    let repo = TempRepo::new("run-review-cut");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    set_reviewers(&site, "plain", &[("First", "reviewer-writes-cut")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+
+    let stage = wait_for_run(&site, &nudges, "R2");
+
+    let problem = stage["problem"].as_str().unwrap_or_default();
+    assert!(problem.contains("its changes were undone"), "{stage}");
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_reviewer_ended_by_force_has_its_edits_undone() {
+    let repo = TempRepo::new("run-review-forced");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    set_reviewers(&site, "plain", &[("First", "reviewer-writes-hangs")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    let deadline = Instant::now() + WAIT;
+    while fs::read_to_string(worktree.join("a.txt")).unwrap() != "rewritten\n" {
+        assert!(Instant::now() < deadline, "the reviewer never wrote");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The second Stop ends the agent, whose end is never reported: the undo runs there.
+    let cancel = format!("{RUN}/cancel");
+    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    site.runner().unwrap().backdate_stop();
+    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+
+    let stage = get_json(&site, &format!("{RUN}?id=R2"));
+    assert_eq!(stage["status"], "failed", "{stage}");
+    let problem = stage["problem"].as_str().unwrap_or_default();
+    assert!(problem.contains("its changes were undone"), "{stage}");
+    assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_kept_reviewer_that_exits_later_leaves_the_engineer_s_work_alone() {
+    let repo = TempRepo::new("run-review-exits-later");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    // A proposer that finds nothing: the review ends with its agent kept, idle.
+    let pid_file = repo.root.join(".git/reviewer.pid");
+    let reviewer = format!("reviewer-silent {}", pid_file.display());
+    set_reviewers(&site, "plain", &[("First", &reviewer)]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+    wait_for_run(&site, &nudges, "R2");
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    // The engineer's work there since, as the refusal to end a thread asks for.
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git_out(&worktree, &["add", "mine.txt"]);
+    git_out(&worktree, &["commit", "--quiet", "--message", "mine"]);
+    fs::write(worktree.join("left.txt"), "left\n").unwrap();
+
+    // The idle reviewer's agent exits on its own.
+    let pid = fs::read_to_string(&pid_file).unwrap();
+    assert!(
+        Command::new("/bin/kill")
+            .arg(&pid)
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for_exit(&pid);
+    // Its exit is reported, then the page is told.
+    nudges.recv_timeout(WAIT).unwrap();
+
+    assert_eq!(git_out(&worktree, &["log", "-1", "--format=%s"]), "mine");
+    assert_eq!(
+        fs::read_to_string(worktree.join("left.txt")).unwrap(),
+        "left\n"
     );
 }

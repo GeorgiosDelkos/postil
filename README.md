@@ -45,14 +45,21 @@ pull request tool: the agent edits, and you read and write notes.
    Add Note (or press `c` on its row). The dialog saves the note to the tray, or saves it and
    sends it to the default agent at once.
 4. **Send** notes to an agent. The send step shows the exact prompt the agent will receive.
-   A single note can also be sent from its card or its dialog.
+   A single note can also be sent from its card or its dialog. Each send starts a thread: the
+   agent works in a git worktree of its own, on a branch `postil/r<n>-<slug>` that starts at
+   your last commit, never in your working tree. The worktree gets your ignored build folders
+   (`target/`, `node_modules/`) as copy-on-write clones, so it builds warm and takes no disk
+   until a build changes them. The repository needs one commit before the first send.
 5. **Watch** the run in the Run tab: the agent's plan, every tool call, its questions and its
    reply. Postil allows the agent's tool calls itself; only a question the agent asks waits for
    you.
 6. **Verify** the result:
    - **Changes:** a run's dialog shows what the run changed as a diff per file, with your notes
-     beside the changed lines. Postil snapshots the working tree before and after each run as a
-     git tree, without touching your index, branch or stash.
+     beside the changed lines. Postil commits the thread's worktree as each run ends, so each
+     run is a commit on the thread's branch.
+   - **Apply or Discard:** Apply in a run's dialog writes the thread's changes into your
+     working tree, uncommitted and unstaged, all or nothing; Discard drops them. Either one
+     deletes the worktree. The branch stays until the thread's last note is deleted.
    - **Follow-ups:** ask the same agent for more from the run's dialog. The follow-up goes to
      the same conversation while the agent is still running.
    - **Reviews:** send a run's work to a chain of reviewer agents. Every reviewer but the last
@@ -156,23 +163,29 @@ own: if a run fails at start, run the agent's command in a terminal once.
 
 ## Where Postil keeps its data
 
-Postil writes nothing into your working tree. Its files are plain JSON, so a script or an agent
-can read and write them too.
+Postil writes nothing into your working tree until you Apply a thread. Its files are plain
+JSON, so a script or an agent can read and write them too.
 
 | File                                   | What it holds                                  |
 | -------------------------------------- | ---------------------------------------------- |
 | `<git dir>/postil/review.json`         | The notes of the working tree                  |
 | `<git dir>/postil/runs/R<n>.jsonl`     | Each run's log: its prompt and every event     |
+| `<git dir>/postil/threads.json`        | Each thread's worktree, branch and state       |
 | `<git dir>/postil/folders.json`        | The folders open in the file list              |
 | `<git dir>/postil/snapshot/index`      | The index Postil writes snapshots through      |
+| `~/.postil/worktrees/<repo>-<id>/r<n>` | Each open thread's worktree                    |
+| `~/.postil/trash/`                     | Worktrees of ended threads, being deleted      |
 | `~/.config/postil/settings.json`       | Agents, the default agent, reviewers, the look |
 | `~/.config/postil/layout.json`         | The widths of the panes                        |
 | `~/.config/postil/recent.json`         | The recent projects                            |
 
 `<git dir>` is the repository's `.git` directory, or the worktree's own git directory for a
 linked worktree, so each worktree keeps its own notes. `~/.config` is `$XDG_CONFIG_HOME` when
-that is set. Snapshots are git objects no ref holds, so `git gc` may prune them after its
-prune period (two weeks by default).
+that is set. A repository on another volume than your home folder keeps its worktrees in
+`.postil/` at that volume's root instead, since clones work only within one volume. A run's
+commits are on its thread's branch. Runs from before threads had worktrees snapshot as git
+trees that no ref holds, so `git gc` may prune them after its prune period (two weeks by
+default).
 
 ## Development
 
@@ -228,6 +241,8 @@ Read it before a change of any size.
 | `src/site.rs`, `src/site/` | The HTTP routes the page calls, and their tests                |
 | `src/acp.rs`, `src/acp/` | The ACP client: starting an agent, prompts, permissions, questions |
 | `src/run.rs`, `src/run/` | Runs: sending notes, the run log, follow-ups, snapshots          |
+| `src/thread.rs`        | Threads: their worktrees, branches, record, Apply and Discard      |
+| `src/clone.rs`         | Copy-on-write clones of build folders (the one `unsafe` call)      |
 | `src/review.rs`        | Review chains: prompts and findings                                |
 | `src/notes.rs`         | Notes and `review.json`                                            |
 | `src/repo.rs`          | git: the file list, snapshots, diffs                               |

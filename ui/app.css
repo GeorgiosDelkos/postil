@@ -1885,6 +1885,37 @@ button.repo-name:hover {
   padding: 0 10px;
 }
 
+/* A thread's branch, and Apply and Discard beside it. */
+.run-thread {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.run-thread-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 11.5px var(--font-mono);
+}
+
+.run-thread-state {
+  color: var(--text-muted);
+}
+
+.run-thread-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.run-thread .button {
+  height: 26px;
+  padding: 0 10px;
+}
+
 .run-detail-text {
   font-size: 13px;
   line-height: 20px;

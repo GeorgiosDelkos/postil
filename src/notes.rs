@@ -338,6 +338,22 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
     Ok(Prompt { text, files })
 }
 
+/// The text of note `id`: a thread's branch is named from its first note's.
+///
+/// # Errors
+///
+/// As [`current`]; [`Error::BadRequest`] when `id` is not a note id, and
+/// [`Error::NoSuchNote`] when no note has it.
+pub(crate) fn body(repo: &Repo, id: &str) -> Result<String> {
+    let wanted = parse_ids(&[id.to_owned()])?;
+    current(repo)?
+        .notes
+        .into_iter()
+        .find(|note| note.id == wanted[0])
+        .map(|note| note.body)
+        .ok_or_else(|| Error::NoSuchNote { id: id.to_owned() })
+}
+
 /// A prompt built from notes. Its `Debug` output leaves out the text, as for [`Note`].
 pub(crate) struct Prompt {
     /// The text the agent receives.

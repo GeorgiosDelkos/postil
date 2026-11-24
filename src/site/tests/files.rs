@@ -193,7 +193,7 @@ fn open_folders_are_kept_per_working_tree_and_read_back() {
 #[test]
 fn every_page_module_is_served() {
     // The page imports its modules by name; one left out of PAGE stops the page.
-    let site = Site::new(None, None, no_agents(), quiet());
+    let site = Site::new(None, None, None, no_agents(), quiet());
     let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
     for entry in fs::read_dir(&ui).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();

@@ -7,8 +7,8 @@
 // What the agent received is echoed back as `agent_message_chunk` text, so a test can check
 // what the app sent without reading the agent's input itself.
 
-import { spawn } from "node:child_process";
-import { closeSync, readSync, writeFileSync, writeSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { closeSync, readSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const [scenario, ...extra] = process.argv.slice(2);
@@ -242,6 +242,32 @@ async function prompt(id, params) {
       update({ sessionUpdate: "tool_call", toolCallId: "x1", title: "Edit a.txt", kind: "edit", status: "completed", content: [{ type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "z" }] });
       say("```json\n[]\n```");
       return send({ id, result: { stopReason: "end_turn" } });
+    case "reviewer-writes":
+      // A proposer that changes a file through a command: it reports no edit at all.
+      writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
+      say("```json\n[]\n```");
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "reviewer-writes-cut":
+      // A proposer that changes a file and is cut short: its turn does not end well.
+      writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
+      return send({ id, result: { stopReason: "max_tokens" } });
+    case "reviewer-writes-hangs":
+      // A proposer that changes a file, then never ends its turn and ignores the cancel.
+      writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
+      return;
+    case "reviewer-commits":
+      // A proposer that edits and commits its edit, which leaves no change behind.
+      writeFileSync(`${process.cwd()}/a.txt`, "rewritten\n");
+      execFileSync("git", ["commit", "--quiet", "--all", "--message", "reviewed"]);
+      say("```json\n[]\n```");
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "reshapes":
+      // Every kind of change a patch carries: an edit, a deletion, a rename, a binary file.
+      writeFileSync(`${process.cwd()}/a.txt`, "a\nedited\n");
+      rmSync(`${process.cwd()}/b.txt`);
+      renameSync(`${process.cwd()}/c.txt`, `${process.cwd()}/d.txt`);
+      writeFileSync(`${process.cwd()}/bin.dat`, Buffer.from([0, 1, 2, 255, 0, 7]));
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reject-only": {
       // No option allows, so Postil cannot answer it alone: the engineer does.
       const reply = await ask("session/request_permission", {
@@ -336,7 +362,8 @@ async function prompt(id, params) {
 }
 
 // These agents say who they are, so a test can check that they are gone.
-if (["silent", "exit-after-turn", "exit-leaving-stderr"].includes(scenario) && extra[0]) {
+const tellsPid = ["silent", "exit-after-turn", "exit-leaving-stderr", "reviewer-silent"];
+if (tellsPid.includes(scenario) && extra[0]) {
   writeFileSync(extra[0], String(process.pid));
 }
 

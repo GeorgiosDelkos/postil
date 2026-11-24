@@ -24,7 +24,7 @@ use crate::layout::{self, Layout, RawLayout};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
-use crate::run::{Notify, Runner};
+use crate::run::{Ending, Notify, Runner};
 use crate::settings::{self, RawSettings, Settings};
 
 /// The page's files, served at these paths with these types: compiled into the binary as
@@ -204,7 +204,11 @@ pub(crate) fn start_site(
         Some(_) => Scanner::new(OsString::new),
         None => Scanner::new(agents::search_path),
     };
-    let site = Site::new(config.as_deref(), bench, agents, notify);
+    let home = std::env::var_os("HOME")
+        // An empty HOME would put the worktrees in the current folder.
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".postil"));
+    let site = Site::new(config.as_deref(), home.as_deref(), bench, agents, notify);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
         site.open(repo, LiveRun::Stop)?;
     }
@@ -260,6 +264,9 @@ pub(crate) struct Site {
     /// Where the pane widths are kept (`layout.rs`); `None`, for the same reason as
     /// `recent_file`, keeps them in each window only, until it closes.
     layout_file: Option<PathBuf>,
+    /// Postil's home folder, `~/.postil`, under which threads' worktrees live (`thread.rs`);
+    /// `None` when the home folder is unknown, which refuses every send.
+    home: Option<PathBuf>,
     /// Where agents' programs are looked for, found in the background.
     agents: Scanner,
     /// Tells the page a run changed (`run.rs`).
@@ -399,6 +406,14 @@ struct FollowRun {
     text: String,
 }
 
+/// The body of `POST /api/thread/apply` and `POST /api/thread/discard`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndThread {
+    /// The thread, by its first run: `R3`.
+    thread: String,
+}
+
 /// The body of `POST /api/run/question`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -450,8 +465,15 @@ pub(crate) type Reply = Response<Cow<'static, [u8]>>;
 
 impl Site {
     /// A site with no project open, keeping its files in `config` (`None` turns the recent
-    /// list and the settings off).
-    fn new(config: Option<&Path>, bench: Option<&str>, agents: Scanner, notify: Notify) -> Self {
+    /// list and the settings off), and threads' worktrees under `home` (`None` refuses every
+    /// send).
+    fn new(
+        config: Option<&Path>,
+        home: Option<&Path>,
+        bench: Option<&str>,
+        agents: Scanner,
+        notify: Notify,
+    ) -> Self {
         Self {
             project: RefCell::new(None),
             highlighter: Highlighter::new(),
@@ -459,6 +481,7 @@ impl Site {
             recent_file: config.map(|dir| dir.join("recent.json")),
             settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
             layout_file: config.map(|dir| dir.join("layout.json")),
+            home: home.map(Path::to_owned),
             agents,
             notify,
         }
@@ -512,6 +535,7 @@ impl Site {
             Arc::clone(&repo),
             self.agents.clone(),
             Arc::clone(&self.notify),
+            self.home.clone(),
         );
         let old = project.replace(Project {
             repo,
@@ -610,6 +634,9 @@ impl Site {
             },
             path if path == "/api/run" || path.starts_with("/api/run/") => {
                 self.respond_run(path, method, query, body)
+            }
+            path if path == "/api/thread" || path.starts_with("/api/thread/") => {
+                self.respond_thread(path, method, query, body)
             }
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
@@ -740,6 +767,33 @@ impl Site {
             _ => not_allowed(
                 "GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1",
             ),
+        }
+    }
+
+    /// The replies to `/api/thread` and the routes under it, as [`Site::respond`] gives them:
+    /// a thread's record, and ending it.
+    fn respond_thread(&self, path: &str, method: &Method, query: &str, body: &[u8]) -> Reply {
+        match path {
+            "/api/thread" => match *method {
+                Method::GET => match query_value(query, "id") {
+                    Some(id) => json_or_error(
+                        self.runner()
+                            .and_then(|runner| runner.thread_record(&id))
+                            .map(|thread| to_json(&thread)),
+                    ),
+                    None => bad_request("expected ?id=<the thread's first run>"),
+                },
+                _ => not_allowed("GET ?id=R1"),
+            },
+            "/api/thread/apply" => match *method {
+                Method::POST => json_or_error(self.end_thread(body, Ending::Apply)),
+                _ => not_allowed("POST"),
+            },
+            "/api/thread/discard" => match *method {
+                Method::POST => json_or_error(self.end_thread(body, Ending::Discard)),
+                _ => not_allowed("POST"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
 
@@ -908,6 +962,14 @@ impl Site {
         Ok(b"{}".to_vec())
     }
 
+    /// The reply to `POST /api/thread/apply` and `POST /api/thread/discard`: ends the thread
+    /// in the body as `ending` says, and answers `{}`.
+    fn end_thread(&self, body: &[u8], ending: Ending) -> Result<Vec<u8>> {
+        let request: EndThread = parse_body(body, Error::BadRequest)?;
+        self.runner()?.end_thread(&request.thread, ending)?;
+        Ok(b"{}".to_vec())
+    }
+
     /// The reply to `POST /api/run/question`.
     fn answer_question(&self, body: &[u8]) -> Result<Vec<u8>> {
         let answer: AnswerQuestion = parse_body(body, Error::BadRequest)?;
@@ -1065,7 +1127,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsChanged
                 | Error::TurnRunning
                 | Error::RunElsewhere
-                | Error::RunInOpenProject => StatusCode::CONFLICT,
+                | Error::RunInOpenProject
+                | Error::ThreadChanged { .. }
+                | Error::NotAWorktree { .. }
+                | Error::ApplyConflict { .. } => StatusCode::CONFLICT,
                 Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
                     StatusCode::NOT_FOUND
                 }
@@ -1078,9 +1143,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AgentProtocol(_) => StatusCode::BAD_GATEWAY,
                 // Well-formed requests for what cannot be done. The page tells a missing
                 // repository apart: it offers to make the folder one.
-                Error::NotARepository { .. } | Error::FileTooLarge { .. } => {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                }
+                Error::NotARepository { .. }
+                | Error::FileTooLarge { .. }
+                | Error::NoCommit
+                | Error::ColonInPath { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }
@@ -1100,7 +1166,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::WriteFolders { .. }
                 | Error::WriteLayout { .. }
                 | Error::ReadRun { .. }
-                | Error::NoHome => StatusCode::INTERNAL_SERVER_ERROR,
+                | Error::NoHome
+                | Error::WriteWorktree { .. }
+                | Error::ReadThreads { .. }
+                | Error::WriteThreads { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             };
             reply(status, "text/plain", error_chain(&error).into_bytes())
         }

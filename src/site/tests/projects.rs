@@ -227,7 +227,7 @@ fn a_recent_list_that_cannot_be_written_warns_and_the_project_still_opens() {
 #[test]
 fn without_a_configuration_directory_the_recent_list_is_off_and_projects_open() {
     let repo = TempRepo::new("recent-off");
-    let site = Site::new(None, None, no_agents(), quiet());
+    let site = Site::new(None, None, None, no_agents(), quiet());
 
     site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
         .unwrap();
@@ -244,7 +244,13 @@ fn a_benchmark_leaves_the_recent_list_alone() {
     let repo = TempRepo::new("recent-bench");
     repo.write("a.rs", "fn a() {}\n");
     let recent = repo.config().join("recent.json");
-    let site = Site::new(Some(&repo.config()), Some("a.rs"), no_agents(), quiet());
+    let site = Site::new(
+        Some(&repo.config()),
+        None,
+        Some("a.rs"),
+        no_agents(),
+        quiet(),
+    );
 
     site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
         .unwrap();
@@ -287,7 +293,13 @@ fn repo_is_found_from_a_subdirectory() {
     let repo = TempRepo::new("subdir");
     repo.write("src/a.rs", "fn a() {}\n");
 
-    let site = Site::new(Some(&repo.config()), Some("src/a.rs"), no_agents(), quiet());
+    let site = Site::new(
+        Some(&repo.config()),
+        None,
+        Some("src/a.rs"),
+        no_agents(),
+        quiet(),
+    );
     site.open(Repo::open(&repo.root.join("src")).unwrap(), LiveRun::Stop)
         .unwrap();
     let info = get_json(&site, "postil://localhost/api/repo");

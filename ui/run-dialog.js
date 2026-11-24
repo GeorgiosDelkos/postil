@@ -4,7 +4,7 @@
 // which ends with the box that sends the next one.
 
 import { diffView, reviewSection } from "./dialog-parts.js";
-import { el, statusIcon } from "./dom.js";
+import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import {
@@ -101,9 +101,11 @@ export function runDialog({
       const root = thread[0] ?? view;
       const notes = root.notes.map((id) => noteLine(id, root));
       const review = root.review ? null : reviewOf(root.id, store.knownViews());
-      const shown = [notes, reviewKey(review), reviewers()];
+      // A reviewer's run belongs to the thread of the run it reviews, shown there.
+      const record = root.review ? null : store.thread(root.id);
+      const shown = [notes, reviewKey(review), reviewers(), record ?? null];
       stamp = [`run:${root.id}`, threadKey(thread), JSON.stringify(shown), isLive(store.run())];
-      draw = () => runDetail(root, stepsOf(root), notes, review, thread);
+      draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, store.knownViews());
       const finding = review?.findings.find((item) => item.id === detail.finding);
@@ -180,7 +182,8 @@ export function runDialog({
 
   // The run whole: its question if it asks one, its plan, its notes, every step, and the
   // agent's reply; then each follow-up in `thread` (the run first), and the box for the next.
-  function runDetail(view, steps, notes, review, thread) {
+  // `record` is the thread's branch and state (`store.thread`).
+  function runDetail(view, steps, notes, review, thread, record) {
     const latest = thread.at(-1) ?? view;
     const body = el("div", "note-dialog-body");
     // A reviewer's run says which run it reviews, and leads back to it.
@@ -238,6 +241,8 @@ export function runDialog({
       noteCards.append(button);
     }
     body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    const branch = threadPart(view, record, latest);
+    if (branch) body.append(branch);
 
     if (steps.length) body.append(stepsSection(view, steps));
 
@@ -284,6 +289,59 @@ export function runDialog({
       where.textContent = status();
     });
     return [head, body];
+  }
+
+  // The thread's branch, and what ends the thread (docs/design.md, "Ending a thread"): Apply
+  // writes its changes into the working tree, uncommitted; Discard, on a second click, drops
+  // them. Either frees its worktree. Null for a run from before threads had worktrees, and
+  // while the record is read.
+  function threadPart(root, record, latest) {
+    if (!record) return null;
+    const line = el("div", "run-thread");
+    line.append(el("code", "run-thread-branch", record.branch));
+    if (record.state !== "open") {
+      const ended = record.state === "applied" ? "Applied to your working tree" : "Discarded";
+      line.append(el("span", "run-thread-state", ended));
+      return section("Branch", line);
+    }
+    const busy = isLive(store.byId(latest.id) ?? latest);
+    const apply = el("button", "button primary", "Apply");
+    apply.type = "button";
+    apply.title = "Write the thread's changes into your working tree, uncommitted";
+    const discard = el("button", "button", "Discard");
+    discard.type = "button";
+    discard.title = "Drop the thread's changes and free its worktree";
+    // Both wait for the answer, so a second click does not ask again.
+    const end = (ending) => {
+      apply.disabled = true;
+      discard.disabled = true;
+      store.endThread(root.id, ending).then((ended) => {
+        if (ended) return;
+        apply.disabled = false;
+        discard.disabled = false;
+      });
+    };
+    apply.addEventListener("click", () => end("apply"));
+    actOnSecondClick(discard, {
+      arm: () => {
+        discard.textContent = "Click again to discard";
+      },
+      disarm: () => {
+        discard.textContent = "Discard";
+      },
+      act: () => end("discard"),
+    });
+    apply.disabled = busy;
+    discard.disabled = busy;
+    const actions = el("span", "run-thread-actions");
+    actions.append(discard, apply);
+    line.append(actions);
+    const part = section("Branch", line);
+    if (record.skipped?.length) {
+      const skipped = `Not given to the worktree: ${record.skipped.join("; ")}`;
+      part.append(el("div", "note-dialog-said muted", skipped));
+    }
+    return part;
   }
 
   // A run's reply, or null before it writes one: its text is written in place as it streams
