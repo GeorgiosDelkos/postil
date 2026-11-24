@@ -73,6 +73,10 @@ pub(super) struct RunState {
     cancel_requested: bool,
     /// When this process asked the agent to stop, for [`FORCE_AFTER`]. Not logged.
     pub(super) cancel_asked: Option<Instant>,
+    /// Set by the first caller that takes the snapshot after the run (the turn's end on the
+    /// reader thread, a forced Stop, a close), so only it commits: two `git commit`s in one
+    /// worktree at once would fail on its index lock. Not logged.
+    pub(super) after_claimed: bool,
     /// The notes sent, until the agent shows it took the turn; then they are marked sent.
     pub(super) unmarked: Option<Vec<String>>,
     end: Option<Status>,
@@ -613,6 +617,7 @@ impl RunState {
             started: false,
             cancel_requested: false,
             cancel_asked: None,
+            after_claimed: false,
             unmarked: None,
             end: None,
             requested: BTreeSet::new(),

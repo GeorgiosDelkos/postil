@@ -37,7 +37,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
 
@@ -304,7 +303,7 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
         let moved = fs::create_dir_all(&trash).and_then(|()| fs::rename(&path, trash.join(&name)));
         moved.map_err(|source| Error::MakeWorktree { path, source })?;
         // Runs on: the delete takes seconds, and nothing waits for it.
-        drop(empty_trash(&trash));
+        empty_trash(&trash);
     }
     if let Some(record) = record {
         fs::remove_dir_all(&record).map_err(|source| Error::MakeWorktree {
@@ -329,11 +328,15 @@ pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<(
     let path = resolved(&thread.path);
     let worktrees = base_for(repo.root(), &resolved(home)).join("worktrees");
     let name = repo_name(repo.root());
+    // `<repo>-` and eight hex digits, so `app` does not take `app-web-1a2b3c4d`.
+    let named = |folder: &std::ffi::OsStr| {
+        folder
+            .to_str()
+            .and_then(|folder| folder.strip_prefix(&format!("{name}-")))
+            .is_some_and(|id| id.len() == 8 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    };
     let ours = path.parent().is_some_and(|parent| {
-        parent.parent() == Some(worktrees.as_path())
-            && parent
-                .file_name()
-                .is_some_and(|folder| folder.to_string_lossy().starts_with(&format!("{name}-")))
+        parent.parent() == Some(worktrees.as_path()) && parent.file_name().is_some_and(named)
     });
     if ours {
         Ok(())
@@ -342,24 +345,27 @@ pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<(
     }
 }
 
-/// Deletes everything in the trash folder `trash` on a background thread: freed worktrees,
-/// which can hold hundreds of thousands of files. A delete cut short by a quit is finished
-/// by the next call. Errors are ignored: what is left is tried again then. Returns the
-/// thread, which the app lets run on; `None` when it could not start, and the folder then
-/// stays until the next call, which is no harm.
-pub(crate) fn empty_trash(trash: &Path) -> Option<JoinHandle<()>> {
+/// Deletes everything in the trash folder `trash` ([`empty`]) on a background thread: freed
+/// worktrees can hold hundreds of thousands of files. A delete cut short by a quit is
+/// finished by the next call.
+pub(crate) fn empty_trash(trash: &Path) {
     let trash = trash.to_owned();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("empty-trash".to_owned())
-        .spawn(move || {
-            let Ok(entries) = fs::read_dir(&trash) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                drop(fs::remove_dir_all(entry.path()));
-            }
-        })
-        .ok()
+        .spawn(move || empty(&trash));
+    // No thread: the folder stays until the next call, which is no harm.
+    drop(spawned);
+}
+
+/// Deletes everything in the folder `trash`, keeping the folder. Errors are ignored: what is
+/// left is tried again at the next call.
+fn empty(trash: &Path) {
+    let Ok(entries) = fs::read_dir(trash) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        drop(fs::remove_dir_all(entry.path()));
+    }
 }
 
 /// The trash folder where [`free`] moves the worktrees of the repository at `root`, given
@@ -549,7 +555,7 @@ mod tests {
         fs::write(trash.join("r1-1-0/target/debug/app"), "built\n").unwrap();
         fs::create_dir_all(trash.join("r2-1-1")).unwrap();
 
-        empty_trash(&trash).unwrap().join().unwrap();
+        empty(&trash);
 
         assert_eq!(fs::read_dir(&trash).unwrap().count(), 0);
     }

@@ -383,9 +383,14 @@ impl Repo {
     pub(crate) fn add_worktree(&self, path: &Path, branch: &str, fork: &str) -> Result<()> {
         // No hooks: the checkout runs `post-checkout`, which may install or build, and the
         // worktree is Postil's, not a checkout the engineer made.
+        // Absolute pointers between the worktree and git's record of it, whatever the
+        // engineer's config says (`worktree.useRelativePaths`, git 2.48): Postil finds the
+        // record from the folder's path when the folder is gone.
         let args = [
             OsStr::new("-c"),
             OsStr::new("core.hooksPath=/dev/null"),
+            OsStr::new("-c"),
+            OsStr::new("worktree.useRelativePaths=false"),
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--quiet"),
@@ -417,6 +422,10 @@ impl Repo {
         let pointer = match fs::read_to_string(path.join(".git")) {
             Ok(pointer) => pointer,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A folder that is there without a `.git` is no worktree: it is not freed.
+                if path.symlink_metadata().is_ok() {
+                    return Err(not_ours());
+                }
                 // `gitdir` holds the worktree's `.git` path as `git worktree add` wrote it.
                 let wanted = path.join(".git");
                 let named = |record: &PathBuf| {
@@ -438,7 +447,9 @@ impl Repo {
             .map(|record| PathBuf::from(record.trim_end_matches('\n')))
             .ok_or_else(not_ours)?;
         let records = fs::canonicalize(&records).map_err(|_| not_ours())?;
-        let record = fs::canonicalize(&record).map_err(|_| not_ours())?;
+        // Relative to the worktree when `worktree.useRelativePaths` wrote it; `join` keeps an
+        // absolute pointer as it is.
+        let record = fs::canonicalize(path.join(record)).map_err(|_| not_ours())?;
         if record.parent() != Some(records.as_path()) {
             return Err(not_ours());
         }

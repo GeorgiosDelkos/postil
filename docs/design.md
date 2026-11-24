@@ -718,9 +718,12 @@ fails it stays, with its worktree and branch, until the next delete.
 **Only what Postil made is deleted.** The record is a file a hand edit can change, so a
 worktree, or git's record of one, is freed only when its path is
 `<base>/worktrees/<repo>-<id>/<folder>` for this repository, whether it is on disk or not,
-and its trash is found from the base, never from the recorded path. The `<id>` hash is not
-checked: a Rust release may hash a path differently, and every older thread would then fail.
-Only branches under `postil/` are deleted.
+and its trash is found from the base, never from the recorded path. The `<id>` must be eight
+hex digits, but is not checked against the hash: a Rust release may hash a path differently,
+and every older thread would then fail. A folder on disk must have a `.git` that names a
+worktree record of this repository; Postil writes those pointers absolute
+(`worktree.useRelativePaths=false`) and reads relative ones too. Only branches under
+`postil/` are deleted.
 
 **An ended thread frees its disk at once:**
 

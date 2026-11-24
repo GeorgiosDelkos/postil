@@ -274,7 +274,7 @@ impl Runner {
         if let Some(home) = &home {
             // Finishes deleting the worktrees of threads that ended while the app last ran:
             // a quit can cut a background delete short.
-            drop(thread::empty_trash(&thread::trash_for(repo.root(), home)));
+            thread::empty_trash(&thread::trash_for(repo.root(), home));
         }
         Arc::new(Self {
             repo,
@@ -1419,15 +1419,22 @@ impl Runner {
 
     /// Records the snapshot after `run`, in `thread`, as its turn ends: only while it is live,
     /// has the one before and not yet one after, so an agent that exits after its run ended
-    /// adds none.
+    /// adds none. The first caller claims it under the run's state, so a forced Stop and the
+    /// turn's end arriving together commit once.
     fn record_end_snapshot(&self, run: &Run, thread: Option<&Thread>) {
-        let wanted = {
-            let state = run.state();
-            state.live()
-                && state.snapshot(Point::Before).is_some()
-                && state.snapshot(Point::After).is_none()
+        let Some(thread) = thread else {
+            return;
         };
-        if let Some(thread) = thread.filter(|_| wanted) {
+        let wanted = {
+            let mut state = run.state();
+            let wanted = state.live()
+                && !state.after_claimed
+                && state.snapshot(Point::Before).is_some()
+                && state.snapshot(Point::After).is_none();
+            state.after_claimed |= wanted;
+            wanted
+        };
+        if wanted {
             match self.commit_worktree(run, thread, Point::After) {
                 Ok(commit) => run.record_snapshot(Point::After, commit),
                 Err(error) => no_snapshot(run, &error),

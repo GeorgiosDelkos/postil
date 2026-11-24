@@ -547,6 +547,53 @@ fn a_patch_or_record_that_is_not_what_git_wrote_is_refused() {
     fs::create_dir_all(own.join(".git")).unwrap();
     let error = tree.worktree_record(&own).unwrap_err();
     assert!(matches!(error, Error::NotAWorktree { .. }), "{error:?}");
+    // A folder that is there with no `.git` at all is not one either.
+    let plain = repo.home().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let error = tree.worktree_record(&plain).unwrap_err();
+    assert!(matches!(error, Error::NotAWorktree { .. }), "{error:?}");
+
+    // A worktree whose pointers are relative (`worktree.useRelativePaths`, git 2.48) is
+    // found all the same, its folder there or gone.
+    let relative = repo.home().join("relative");
+    let path = relative.to_str().unwrap();
+    repo.git(&[
+        "-c",
+        "worktree.useRelativePaths=true",
+        "worktree",
+        "add",
+        "--quiet",
+        path,
+    ]);
+    let pointer = fs::read_to_string(relative.join(".git")).unwrap();
+    assert!(pointer.starts_with("gitdir: .."), "{pointer}");
+    let record = tree.worktree_record(&relative).unwrap().unwrap();
+    assert!(record.ends_with(".git/worktrees/relative"), "{record:?}");
+}
+
+#[test]
+fn a_record_pointing_into_another_repository_s_worktrees_is_refused() {
+    let (repo, site, _nudges, worktree) = written("thread-other-repo");
+    // A repository whose name starts like this one's, and its worktrees beside these.
+    let folder = worktree.parent().unwrap();
+    let name = folder.file_name().unwrap().to_str().unwrap();
+    let other = folder
+        .with_file_name(format!("{name}-web-1a2b3c4d"))
+        .join("r1");
+    fs::create_dir_all(&other).unwrap();
+    let record = repo.root.join(".git/postil/threads.json");
+    let text = fs::read_to_string(&record).unwrap();
+    let (from, to) = (worktree.to_str().unwrap(), other.to_str().unwrap());
+    fs::write(&record, text.replace(from, to)).unwrap();
+
+    let (status, body) = end(&site, "discard", "R1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("is not a worktree of this repository"),
+        "{body}"
+    );
+    assert!(other.is_dir());
 }
 
 #[test]
