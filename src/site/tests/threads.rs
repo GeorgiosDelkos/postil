@@ -663,3 +663,59 @@ fn an_ended_thread_whose_worktree_could_not_be_freed_is_freed_with_its_note() {
         (StatusCode::OK, "null".to_owned())
     );
 }
+
+#[test]
+fn a_worktree_moved_out_of_postil_s_worktrees_folder_is_left_alone() {
+    let (repo, site, _nudges, worktree) = written("thread-moved-out");
+    // Named as this repository's worktrees are, but not in Postil's worktrees folder.
+    let folder = worktree.parent().unwrap().file_name().unwrap().to_owned();
+    let elsewhere = repo.home().join("elsewhere").join(&folder);
+    fs::create_dir_all(&elsewhere).unwrap();
+    let moved = elsewhere.join("r1");
+    let (from, to) = (worktree.to_str().unwrap(), moved.to_str().unwrap());
+    git_out(&repo.root, &["worktree", "move", from, to]);
+    let record = repo.root.join(".git/postil/threads.json");
+    let text = fs::read_to_string(&record).unwrap();
+    fs::write(&record, text.replace(from, to)).unwrap();
+
+    let (status, body) = end(&site, "discard", "R1");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("is not a worktree of this repository"),
+        "{body}"
+    );
+    assert!(moved.join("a.txt").exists());
+}
+
+#[test]
+fn a_review_does_not_start_when_the_work_left_before_it_cannot_be_committed() {
+    let (repo, site, _nudges, worktree) = written("thread-proposer-left");
+    fs::write(worktree.join("left.txt"), "left\n").unwrap();
+    // Git refuses an empty name, so the commit before the stage fails.
+    repo.git(&["config", "user.name", ""]);
+    let custom = serde_json::json!([
+        { "name": "Fake", "command": fake_agent("writes") },
+        { "name": "Reviewer", "command": fake_agent("reviewer-silent") },
+    ]);
+    let settings = serde_json::json!({
+        "customAgents": custom,
+        "enabledAgents": ["Fake", "Reviewer"],
+        "agent": "Fake",
+        "reviewers": ["Reviewer"],
+    });
+    assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
+
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    let (status, reply) = post(&site, &format!("{RUN}/review"), &body);
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+    // It failed as it was launched, so it never became the window's run: read it by id.
+    let stage = get_json(&site, &format!("{RUN}?id=R2"));
+    assert_eq!(stage["status"], "failed", "{stage}");
+    // Had it run, undoing its edits would have reset this away.
+    assert_eq!(
+        fs::read_to_string(worktree.join("left.txt")).unwrap(),
+        "left\n"
+    );
+}

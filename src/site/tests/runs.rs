@@ -300,6 +300,16 @@ fn each_send_works_in_a_worktree_and_on_a_branch_of_its_own_and_leaves_the_engin
         one_path.starts_with(repo.home().canonicalize().unwrap()),
         "{one_path:?} under Postil's home"
     );
+    // In a folder named after the repository, then a hash of its path.
+    let folder = one_path
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let repo_name = repo.root.file_name().unwrap().to_str().unwrap();
+    assert!(folder.starts_with(&format!("{repo_name}-")), "{folder}");
     // Each agent wrote in its own worktree, and its turn was committed on its branch.
     assert_eq!(
         fs::read_to_string(one_path.join("a.txt")).unwrap(),
