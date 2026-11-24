@@ -231,10 +231,7 @@ fn another_window_cannot_end_or_forget_a_thread_whose_run_goes_on() {
     assert!(worktree.is_dir());
     assert_eq!(thread(&other, "R1")["state"], "open");
 
-    assert_eq!(
-        post(&running, &format!("{RUN}/cancel"), "").0,
-        StatusCode::OK
-    );
+    assert_eq!(stop(&running).0, StatusCode::OK);
     wait_for(&running, &nudges, "ended");
 }
 
@@ -754,7 +751,7 @@ fn a_stop_while_the_worktree_is_made_keeps_the_run_and_its_lock_until_git_is_don
     post_note(&site, "a.txt", 1, 1, "one");
     assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
 
-    assert_eq!(post(&site, &format!("{RUN}/cancel"), "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
 
     // Still live, so the run lock still keeps every window out of the half-made worktree.
     assert!(isnt_over(&get_json(&site, RUN)), "{}", get_json(&site, RUN));
@@ -871,7 +868,7 @@ fn a_discarded_thread_keeps_the_engineer_s_commit_when_its_note_goes() {
 }
 
 #[test]
-fn a_thread_is_not_ended_while_another_run_of_this_window_goes_on() {
+fn a_thread_ends_while_another_thread_of_this_window_runs_but_not_while_its_own_does() {
     let repo = TempRepo::new("thread-busy-window");
     repo.write("src/a.rs", "one\ntwo\n");
     let (site, nudges) = run_site(&repo, "flood");
@@ -879,17 +876,22 @@ fn a_thread_is_not_ended_while_another_run_of_this_window_goes_on() {
     post_note(&site, "src/a.rs", 2, 2, "two");
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "running");
-    assert_eq!(post(&site, &format!("{RUN}/cancel"), "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
     wait_for(&site, &nudges, "ended");
     send(&site, &["N2"]);
     wait_for(&site, &nudges, "running");
 
-    // R2 holds the run lock: this window says so in its own words, not another window's.
+    // R2 holds its own thread's lock, not R1's.
     let (status, body) = end(&site, "discard", "R1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(thread(&site, "R1")["state"], "discarded");
+    assert_eq!(get_json(&site, RUN)["status"], "running");
 
+    // Its own thread waits: this window says so in its own words, not another window's.
+    let (status, body) = end(&site, "discard", "R2");
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("still working"), "{body}");
-    assert_eq!(post(&site, &format!("{RUN}/cancel"), "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
     wait_for(&site, &nudges, "ended");
 }
 

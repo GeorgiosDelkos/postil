@@ -2,15 +2,16 @@
 //!
 //! A [`Runner`] belongs to the open project. Each send starts a thread, which works in a
 //! worktree and on a branch of its own (`thread.rs`, docs/design.md "Worktrees"). The runner
-//! keeps the agent it started alive between the runs of its thread, with its session, so a
-//! follow-up reaches the same conversation; the owner chose this over a fresh agent per run
-//! on 2026-11-23. The agent is replaced when a run names another agent, a send starts another
-//! thread, or it exited, and stopped when its thread ends, the project closes or the app
-//! quits.
+//! holds a [`Slot`] per thread, and keeps each thread's agent alive between its runs, with its
+//! session, so a follow-up reaches the same conversation; the owner chose this over a fresh
+//! agent per run on 2026-11-23. An agent is replaced when a run names another agent or it
+//! exited, let go when the window needs its place ([`Slots::make_room`]), and stopped when its
+//! thread ends, the project closes or the app quits.
 //!
-//! One run at a time per repository, for now: a live run holds an exclusive lock on
-//! `runs/active.lock`, so another window cannot start one either. Ending or forgetting a
-//! thread takes the same lock, so no window's agent works in a worktree being freed.
+//! Threads run side by side, one run at a time each: a live run holds an exclusive lock on its
+//! thread's `threads/<id>.lock`, so another window cannot start one there either, and at most
+//! [`MAX_LIVE`] runs are live in a repository, counted across windows. Ending or forgetting a
+//! thread takes its lock, so no window's agent works in a worktree being freed.
 //!
 //! The run log, a run's record in memory and on disk, is in [`log`].
 //!
@@ -26,25 +27,28 @@
 //! Requests from the page run on one request thread (`shell.rs`), the agent's events on its
 //! reader thread, and an agent's start on a thread of its own. A review's next stage starts
 //! on the reader thread of the stage that ended ([`Runner::advance`]). Locks are always
-//! taken in this order: the runner's [`Slot`], the repository's snapshot lock (inside
+//! taken in this order: the runner's [`Slots`], the repository's snapshot lock (inside
 //! [`Repo::snapshot`], which takes no other), a run's state, then the agent connection's
 //! own locks (inside [`Agent`]'s methods, which take none of the others). The record's
-//! `threads.lock` (inside `thread.rs`, which takes no other) may be taken while the slot is
-//! held, so nothing that holds it may take the slot. `runs/active.lock`, the run lock, is
-//! taken under the slot by a launch, which only tries it for a moment; ending or forgetting
-//! a thread takes it first and the slot after, and does so only while this window is not
-//! busy, when no launch can come until that request is answered. No snapshot is taken under
-//! a run's state. The slot is held around the agent's calls that answer, cancel and prompt
-//! (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's worktree: the
-//! commit before a run (`add`, `diff --cached`, `commit`, `rev-parse`, tens of milliseconds
-//! on a medium repository, as a snapshot is), and a proposer's check and undo as its stage
-//! ends (`status`, `branch`, `rev-parse`, `checkout -B`, `clean`), each after the few
-//! `rev-parse` calls that open the worktree ([`thread::open`]). Every page request waits for
-//! those.
+//! `threads.lock` (inside `thread.rs`, which takes no other) may be taken while the slots
+//! are held, so nothing that holds it may take them. A launch takes `runs/active.lock` and a
+//! thread's lock under the slots ([`Run::create`]), and only tries each for a moment; ending
+//! or forgetting a thread takes the thread's lock first and the slots after, and does so only
+//! while the thread is not busy in this window, when no launch there can come until that
+//! request is answered: only a request starts a run in an idle thread. No snapshot is taken
+//! under a run's state. The slots are held around the agent's calls that answer, cancel and
+//! prompt (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's
+//! worktree: the commit before a run (`add`, `diff --cached`, `commit`, `rev-parse`, tens of
+//! milliseconds on a medium repository, as a snapshot is), and a proposer's check and undo as
+//! its stage ends (`status`, `branch`, `rev-parse`, `checkout -B`, `clean`), each after the
+//! few `rev-parse` calls that open the worktree ([`thread::open`]). Every page request, and
+//! every other thread's agent events, wait for those: one lock for all threads keeps the lock
+//! order above, and costs milliseconds.
 //! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
 
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,8 +67,8 @@ use crate::notes::{self, Prompt};
 use crate::repo::Repo;
 use crate::review::{self, Diff, Finding, Stage, Work};
 use crate::run::log::{
-    Changes, Entry, FollowUp, Header, Origin, Point, Run, RunView, hold_run_lock, read_header,
-    run_number, run_numbers,
+    Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
+    hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
 use crate::thread::{self, State, Thread};
 
@@ -92,7 +96,7 @@ pub(crate) struct Runner {
     /// Postil's home folder, `~/.postil`, under which threads' worktrees live
     /// (`thread.rs`); `None` when the home folder is unknown, which refuses every send.
     home: Option<PathBuf>,
-    slot: Mutex<Slot>,
+    slots: Mutex<Slots>,
     /// Holds a review's next stage, once, until a test lets it start
     /// ([`Runner::hold_next_stage`]): between a stage's end and the next stage's start is a
     /// window no request can otherwise be timed into.
@@ -105,27 +109,40 @@ pub(crate) struct Runner {
     making_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
-/// What a runner holds now.
+/// What a runner holds now: a slot per thread this window ran in.
 #[derive(Debug, Default)]
+struct Slots {
+    /// By thread id, its first run's.
+    by_thread: HashMap<String, Slot>,
+    /// This window's latest run, which `GET api/run` follows.
+    latest: Option<Arc<Run>>,
+    /// Counts launches, to tell which kept agent was used least recently ([`Slot::used`]).
+    launches: u64,
+    /// Set when the project closed: an agent that finishes starting afterwards is stopped.
+    closed: bool,
+}
+
+/// One thread's runs in this window, and the agent kept between them.
+#[derive(Debug)]
 struct Slot {
     agent: Held,
-    /// Counts the agents this runner let go. An agent's events and its start carry the number
+    /// Counts the agents this slot let go. An agent's events and its start carry the number
     /// it was started with: when it differs, the agent was replaced, stopped, or its run
     /// cancelled, and what it reports is dropped.
     generation: u64,
-    /// This window's latest run.
+    /// The thread's latest run in this window.
     run: Option<Arc<Run>>,
-    /// The thread `run` works in, set with it at each launch: the agent's working directory
-    /// is its worktree, and a kept agent is used again only within it.
-    thread: Option<Thread>,
-    /// Whether the start thread is making the worktree of the slot's thread (`git worktree
-    /// add`, the clones), from the launch until it is made or fails. Git writes the worktree
-    /// meanwhile, so a commit, a run or an ending there could act on a half-made checkout: the
-    /// slot counts as busy, and the run stays live, holding the run lock, past a Stop or a
-    /// close, until the start thread ends it. Making cannot be cut short.
+    /// The thread, as read at its latest launch: the agent's working directory is its
+    /// worktree.
+    thread: Thread,
+    /// Whether the start thread is making the thread's worktree (`git worktree add`, the
+    /// clones), from the launch until it is made or fails. Git writes the worktree meanwhile,
+    /// so a commit, a run or an ending there could act on a half-made checkout: the slot counts
+    /// as busy, and the run stays live, holding the thread's lock, past a Stop or a close,
+    /// until the start thread ends it. Making cannot be cut short.
     making: bool,
-    /// Set when the project closed: an agent that finishes starting afterwards is stopped.
-    closed: bool,
+    /// [`Slots::launches`] at the slot's latest launch.
+    used: u64,
     /// The review under way, while its stages run one after another; cleared when a stage
     /// does not end well or reports edits it may not make, when the engineer stops it, by a
     /// send, when the project closes, and when the last stage ends; `advance` takes it to
@@ -171,23 +188,83 @@ enum Held {
     Ready(AgentChoice, Agent),
 }
 
+impl Slots {
+    /// Whether the agent started in thread `thread` as number `generation` was let go
+    /// meanwhile: replaced, stopped, its thread ended, or the project closed.
+    fn let_go(&self, thread: &str, generation: u64) -> bool {
+        self.closed
+            || self
+                .by_thread
+                .get(thread)
+                .is_none_or(|slot| slot.generation != generation)
+    }
+
+    /// The slot whose latest run is `run` (`R2`), if that run is live.
+    fn live_slot(&mut self, run: &str) -> Option<&mut Slot> {
+        self.by_thread.values_mut().find(|slot| {
+            slot.run.as_ref().is_some_and(|own| {
+                let state = own.state();
+                state.live() && state.header.id == run
+            })
+        })
+    }
+
+    /// Whether any thread of this window is busy ([`Slot::busy`]).
+    fn busy(&self) -> bool {
+        self.by_thread.values().any(Slot::busy)
+    }
+
+    /// Before a fresh agent starts in `thread`, lets go of the agent of the idle slot used
+    /// least recently when the other threads hold `MAX_LIVE - 1` agents or more, so this
+    /// window holds at most [`MAX_LIVE`]: an idle agent is a process of a few hundred MB kept
+    /// only for its thread's next follow-up, which a fresh agent can take with the
+    /// conversation so far. Runs in other windows hold no agent here, so only this window's
+    /// are counted. A busy slot keeps its agent: a review between two stages is busy with no
+    /// live run, so the window can hold one agent more until a later launch.
+    #[must_use = "drop the released agent after the slots' lock: dropping it waits for its process"]
+    fn make_room(&mut self, thread: &str) -> Held {
+        let others = self
+            .by_thread
+            .iter()
+            .filter(|(id, slot)| id.as_str() != thread && !matches!(slot.agent, Held::None))
+            .count();
+        if others < MAX_LIVE - 1 {
+            return Held::None;
+        }
+        self.by_thread
+            .iter_mut()
+            .filter(|(id, slot)| {
+                id.as_str() != thread && !slot.busy() && !matches!(slot.agent, Held::None)
+            })
+            .min_by_key(|(_, slot)| slot.used)
+            .map_or(Held::None, |(_, slot)| slot.release())
+    }
+}
+
 impl Slot {
+    fn new(thread: Thread) -> Self {
+        Self {
+            agent: Held::None,
+            generation: 0,
+            run: None,
+            thread,
+            making: false,
+            used: 0,
+            chain: None,
+        }
+    }
+
     /// Lets the agent go: a starting one is stopped here, under the caller's lock (that waits
     /// for `/bin/kill`, milliseconds), and anything either would still report is dropped. The
-    /// caller drops the returned agent after releasing the slot's lock, which stops a ready
+    /// caller drops the returned agent after releasing the slots' lock, which stops a ready
     /// one.
-    #[must_use = "drop the released agent after the slot's lock: dropping it waits for its process"]
+    #[must_use = "drop the released agent after the slots' lock: dropping it waits for its process"]
     fn release(&mut self) -> Held {
         if let Held::Starting(stopper) = &self.agent {
             stopper.stop();
         }
         self.generation += 1;
         std::mem::take(&mut self.agent)
-    }
-
-    /// Whether an agent started as number `generation` was let go meanwhile.
-    fn let_go(&self, generation: u64) -> bool {
-        self.closed || self.generation != generation
     }
 
     /// [`Runner::busy`]: a run under way, a review between two stages, or a worktree being
@@ -252,8 +329,8 @@ enum Place {
     /// A new thread, started at commit `fork` and named from `title`, its first note's text.
     New { fork: String, title: String },
     /// The open thread of this id, whose worktree is on disk: read again by `launch` once it
-    /// holds the run lock, as ending a thread does, so another window cannot end or forget it
-    /// in between.
+    /// holds the thread's lock, as ending a thread does, so another window cannot end or forget
+    /// it in between.
     Open(String),
 }
 
@@ -294,7 +371,7 @@ impl Runner {
             agents,
             notify,
             home,
-            slot: Mutex::new(Slot::default()),
+            slots: Mutex::new(Slots::default()),
             #[cfg(test)]
             next_stage_gate: Mutex::new(None),
             #[cfg(test)]
@@ -315,19 +392,20 @@ impl Runner {
     /// Starts a run: sends the notes `ids` to a fresh `agent`, in a new thread (docs/design.md,
     /// "Worktrees"). The thread's record is written, and its branch starts at the commit
     /// `HEAD` names now; its worktree is made on the agent's start thread, before the agent
-    /// starts there. Returns at once, except while another window's run holds the run lock:
+    /// starts there. Returns at once, except while another window holds `runs/active.lock`:
     /// then it waits up to `LOCK_PATIENCE` under the runner's lock before it refuses. The run
     /// reports its progress through its log.
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run of this window is under way, and
-    /// [`Error::RunElsewhere`] while another window's is; as [`notes::prompt`];
+    /// [`Error::TooManyRuns`] while the most runs a repository may have are live, and
+    /// [`Error::RunElsewhere`] while another window holds `runs/active.lock`; as
+    /// [`notes::prompt`];
     /// [`Error::NoCommit`] in a repository with no commit; [`Error::WriteRun`] when the run
     /// log cannot be created; and the errors of [`thread::plan`] and [`thread::add`], which
     /// fail the run.
     pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
-        let slot = self.slot();
+        let slots = self.slots();
         let prompt = notes::prompt(&self.repo, ids)?;
         let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
         let title = notes::body(&self.repo, &ids[0])?;
@@ -341,7 +419,7 @@ impl Runner {
             review: None,
             place: Place::New { fork, title },
         };
-        self.launch(slot, new)
+        self.launch(slots, new)
     }
 
     /// The open thread `id`, whose worktree is on disk.
@@ -386,11 +464,11 @@ impl Runner {
     /// gets the thread's earlier prompts and replies before the text. The run carries `of`'s
     /// notes, so it goes with them, and marks none sent. A thread does not fork: `of` must be
     /// its latest run. Reads the log of every run in the thread and the header of every newer
-    /// run, and takes a snapshot and may wait for the run lock as [`Runner::send`] does.
+    /// run, and takes a snapshot and may wait for a lock as [`Runner::send`] does.
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run of this window is under way, and
+    /// [`Error::TurnRunning`] while a run of this thread is under way in this window, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] for a blank
     /// text, a run that is a review, or a run another run already follows; as
     /// [`Runner::view_of`] for `of` and the runs it follows, and [`Error::NoSuchRun`] when one
@@ -428,17 +506,19 @@ impl Runner {
         }
         let first = thread[0].state().header.id.clone();
         // Refused here, before a run log is made, when the thread is not open; `launch` reads
-        // it again under the run lock.
+        // it again under the thread's lock.
         self.open_thread(&first)?;
-        let slot = self.slot();
-        // The kept agent ran `followed`, the slot's run, so it works in this thread.
-        let same_conversation = matches!(
-            &slot.agent,
-            Held::Ready(kept, live) if *kept == agent && live.is_alive()
-        ) && slot
-            .run
-            .as_ref()
-            .is_some_and(|run| Arc::ptr_eq(run, followed));
+        let slots = self.slots();
+        // The thread's kept agent ran `followed`, the slot's run.
+        let same_conversation = slots.by_thread.get(&first).is_some_and(|slot| {
+            matches!(
+                &slot.agent,
+                Held::Ready(kept, live) if *kept == agent && live.is_alive()
+            ) && slot
+                .run
+                .as_ref()
+                .is_some_and(|run| Arc::ptr_eq(run, followed))
+        });
         let prompt = if same_conversation {
             Prompt {
                 text: text.to_owned(),
@@ -470,7 +550,7 @@ impl Runner {
             review: None,
             place: Place::Open(first),
         };
-        self.launch(slot, new)
+        self.launch(slots, new)
     }
 
     /// The runs of the thread that ends with run `of`: the run of notes it started from, then
@@ -570,15 +650,25 @@ impl Runner {
             files,
             findings: Vec::new(),
         };
-        self.start_stage(self.slot(), chain)
+        self.start_stage(self.slots(), chain)
     }
 
-    /// The run `of`, this window's when it is that one, else read from its log.
+    /// The run `of`, this window's when it is one of its threads' latest, else read from its
+    /// log.
     fn run_by_id(&self, of: &str) -> Result<Arc<Run>> {
         let number = run_number(of)
             .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
-        let own = self.slot().run.clone();
-        if let Some(run) = own.filter(|run| run.state().header.id == of) {
+        let own = {
+            let slots = self.slots();
+            slots
+                .by_thread
+                .values()
+                .filter_map(|slot| slot.run.as_ref())
+                .chain(slots.latest.as_ref())
+                .find(|run| run.state().header.id == of)
+                .cloned()
+        };
+        if let Some(run) = own {
             return Ok(run);
         }
         let no_such = |problem: String| Error::NoSuchRun {
@@ -595,8 +685,9 @@ impl Runner {
     /// Starts `chain`'s current stage as a new run, with a fresh agent, so a reviewer never
     /// inherits the reviewed agent's conversation; `chain` becomes the review under way. The
     /// stage works in the reviewed run's thread, read again for each stage.
-    fn start_stage(self: &Arc<Self>, slot: MutexGuard<'_, Slot>, chain: Chain) -> Result<()> {
-        // Refused here, before a run log is made; `launch` reads it again under the run lock.
+    fn start_stage(self: &Arc<Self>, slots: MutexGuard<'_, Slots>, chain: Chain) -> Result<()> {
+        // Refused here, before a run log is made; `launch` reads it again under the thread's
+        // lock.
         self.open_thread(&chain.stage.of)?;
         let text = if chain.stage.judges() {
             review::judge_prompt(&chain.work, &chain.findings)
@@ -615,7 +706,7 @@ impl Runner {
             place: Place::Open(chain.stage.of.clone()),
             review: Some(chain),
         };
-        self.launch(slot, new)
+        self.launch(slots, new)
     }
 
     /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
@@ -623,16 +714,20 @@ impl Runner {
     /// [`on_event`] does with an agent that exited: [`Agent`]'s drop kills and reaps the
     /// process but never joins its threads, and the reader holds none of the agent's locks
     /// while it delivers an event.
-    fn advance(self: &Arc<Self>, ended: &Arc<Run>) {
-        let mut slot = self.slot();
-        // A send, a stop, or another review meanwhile took the chain, or replaced its run.
+    fn advance(self: &Arc<Self>, thread: &str, ended: &Arc<Run>) {
+        let mut slots = self.slots();
+        // A stop, the thread's end, or another review meanwhile took the chain, or replaced
+        // its run.
+        let Some(slot) = slots.by_thread.get_mut(thread) else {
+            return;
+        };
         if !slot.run.as_ref().is_some_and(|run| Arc::ptr_eq(run, ended)) {
             return;
         }
         let Some(chain) = slot.chain.take() else {
             return;
         };
-        if let Err(error) = self.start_stage(slot, chain) {
+        if let Err(error) = self.start_stage(slots, chain) {
             // The chain went with the stage that could not start, so the review ends, and the
             // stage that ended says why.
             ended.state().problem.get_or_insert(format!(
@@ -643,24 +738,25 @@ impl Runner {
         }
     }
 
-    /// Makes `new` this window's run and its review the one under way, sends the run to its
-    /// agent, then tells the page. In an open thread, first commits anything left in the
-    /// worktree, a proposer's run included, and takes that commit as the snapshot before the
-    /// run, except for a proposer, which may not edit. A new thread's snapshot before, the
-    /// commit it starts from, is recorded on the start thread once its worktree is made
-    /// ([`Runner::start`]). The slot changes only
-    /// once the run's log exists, so a launch that fails leaves the review and the kept agent
-    /// as they were. The agent it replaces is dropped after `slot` is released.
+    /// Makes `new` its thread's run and its review the one under way there, and this window's
+    /// latest run, sends the run to its agent, then tells the page. The thread is placed as
+    /// [`Runner::place`] says. A new thread's snapshot before, the commit it starts from, is
+    /// recorded on the start thread once its worktree is made ([`Runner::start`]). The slot
+    /// changes only once the run's log exists, so a launch that fails leaves the review and the
+    /// kept agent as they were. The agents it replaces or lets go are dropped after `slots` is
+    /// released.
     ///
     /// # Errors
     ///
-    /// [`Error::TurnRunning`] while a run of this window is under way, as [`Run::create`]; for
-    /// a new thread as [`thread::plan`] and [`thread::add`], and for an open one as
-    /// [`Runner::open_thread`], read again under the run lock: the run then fails too; and
-    /// before a proposer, as [`Runner::commit_worktree`], which also fails the run.
-    fn launch(self: &Arc<Self>, mut slot: MutexGuard<'_, Slot>, new: NewRun) -> Result<()> {
+    /// [`Error::TurnRunning`] while a run of the thread is under way in this window, as
+    /// [`Run::create`]; and as [`Runner::place`], which fails the run too.
+    fn launch(self: &Arc<Self>, mut slots: MutexGuard<'_, Slots>, new: NewRun) -> Result<()> {
         // A worktree still being made counts as a run under way: its agent has not started.
-        if slot.making || slot.run.as_ref().is_some_and(|run| run.state().live()) {
+        // Between two review stages the chain has been taken by `advance`, which launches the
+        // next one, so the thread is not busy for it.
+        if let Place::Open(id) = &new.place
+            && slots.by_thread.get(id).is_some_and(Slot::busy)
+        {
             return Err(Error::TurnRunning);
         }
         let NewRun {
@@ -679,21 +775,18 @@ impl Runner {
             Origin::Notes => notes.clone(),
             Origin::Review(_) | Origin::FollowUp(_) => Vec::new(),
         };
-        let run = Arc::new(Run::create(
-            &self.repo.runs_dir(),
-            &agent.name,
-            &notes,
-            &prompt.text,
-            origin,
-        )?);
-        // `Run::create` holds the run lock from here: the thread is read under it.
-        let placed = match place {
-            Place::New { fork, title } => self
-                .new_thread(&run, &fork, &title)
-                .map(|thread| (thread, Worktree::Make)),
-            Place::Open(id) => self.open_thread(&id).map(|thread| (thread, Worktree::Made)),
+        let in_thread = match &place {
+            Place::New { .. } => InThread::New,
+            Place::Open(id) => InThread::Open(id),
         };
-        let (mut thread, worktree) = match placed {
+        let opening = Opening {
+            agent: &agent.name,
+            notes: &notes,
+            prompt: &prompt.text,
+            origin,
+        };
+        let run = Arc::new(Run::create(&self.repo.runs_dir(), opening, in_thread)?);
+        let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
                 run.record(Entry::Failed {
@@ -703,54 +796,41 @@ impl Runner {
                 return Err(error);
             }
         };
-        match worktree {
-            // Its snapshot before is the fork commit, recorded on the start thread once the
-            // worktree is made: a run whose worktree could not be made has no changes view,
-            // which would compare the engineer's own files with the fork.
-            Worktree::Make => {}
-            // Every run of an open thread starts from a commit of what was left there, a
-            // proposer's too: undoing a proposer's edits goes back to that commit, which must
-            // hold the engineer's own commits and edits.
-            Worktree::Made => match self.commit_worktree(&run, &thread, Point::Before) {
-                Ok(commit) => {
-                    thread.tip.clone_from(&commit);
-                    if snapshot {
-                        run.record_snapshot(Point::Before, commit);
-                    }
-                }
-                Err(error) if !snapshot => {
-                    // A proposer whose start could not be marked would be blamed, and undone,
-                    // for what was left: it does not start.
-                    run.record(Entry::Failed {
-                        error: error_chain(&error),
-                    });
-                    (self.notify)();
-                    return Err(error);
-                }
-                Err(error) => no_snapshot(&run, &error),
-            },
-        }
 
+        let id = thread.id.clone();
+        let reuse = matches!(conversation, Conversation::Kept)
+            && slots.by_thread.get(&id).is_some_and(|slot| {
+                matches!(
+                    &slot.agent,
+                    Held::Ready(choice, kept) if *choice == agent && kept.is_alive()
+                )
+            });
+        // A fresh agent may take the place of another thread's idle one.
+        let evicted = if reuse {
+            Held::None
+        } else {
+            slots.make_room(&id)
+        };
+        slots.launches += 1;
+        let used = slots.launches;
+        slots.latest = Some(Arc::clone(&run));
+        let slot = slots
+            .by_thread
+            .entry(id.clone())
+            .or_insert_with(|| Slot::new(thread.clone()));
         slot.chain = review;
         if let Worktree::Make = worktree {
             slot.making = true;
         }
-        let same_thread = slot
-            .thread
-            .as_ref()
-            .is_some_and(|kept| kept.id == thread.id);
         slot.run = Some(Arc::clone(&run));
-        slot.thread = Some(thread.clone());
-        let replaced = if let (Held::Ready(choice, kept), Conversation::Kept) =
-            (&slot.agent, conversation)
-            && same_thread
-            && *choice == agent
-            && kept.is_alive()
-        {
+        slot.thread = thread.clone();
+        slot.used = used;
+        let replaced = if reuse && let Held::Ready(_, kept) = &slot.agent {
             begin(kept, &run, &marks, &prompt, &thread.path);
             Held::None
         } else {
-            // The agent kept from the last run, if any, is stopped when this is dropped.
+            // The thread's agent kept from its last run, if any, is stopped when this is
+            // dropped.
             let replaced = slot.release();
             let pending = Pending {
                 agent,
@@ -761,39 +841,81 @@ impl Runner {
                 thread,
                 worktree,
             };
-            let id = pending.thread.id.clone();
             if !self.start(pending) && std::mem::take(&mut slot.making) {
-                // No thread will make the worktree: the window is free again, and the thread
-                // goes, as one whose worktree could not be made does.
+                // No thread will make the worktree: the thread goes, as one whose worktree
+                // could not be made does.
                 drop(thread::remove(&self.repo, std::slice::from_ref(&id)));
             }
             replaced
         };
-        drop(slot);
+        drop(slots);
         // Dropping an agent waits for its process to be reaped.
         drop(replaced);
+        drop(evicted);
         (self.notify)();
         Ok(())
     }
 
-    /// Stops the run (module docs, "Stopping").
+    /// The thread `run` works in, as `place` says, and whether its worktree is still to be
+    /// made. Called while `run` holds the thread's lock, so the thread is read under it. In an
+    /// open thread, first commits what was left in the worktree and takes that commit as the
+    /// snapshot before the run, when `snapshot`.
     ///
     /// # Errors
     ///
-    /// [`Error::BadRequest`] when no run is under way; [`Error::AgentExited`] when the agent
-    /// is gone (its exit then ends the run).
-    pub(crate) fn cancel(&self) -> Result<()> {
-        let mut slot = self.slot();
-        let run = slot
-            .run
-            .clone()
-            .filter(|run| run.state().live())
-            .ok_or_else(|| Error::BadRequest("no run is under way".to_owned()))?;
+    /// For a new thread as [`thread::plan`] and [`thread::add`]; for an open one as
+    /// [`Runner::open_thread`]; and without `snapshot` (a proposer), as
+    /// [`Runner::commit_worktree`].
+    fn place(&self, run: &Run, place: Place, snapshot: bool) -> Result<(Thread, Worktree)> {
+        let (mut thread, worktree) = match place {
+            Place::New { fork, title } => (self.new_thread(run, &fork, &title)?, Worktree::Make),
+            Place::Open(id) => (self.open_thread(&id)?, Worktree::Made),
+        };
+        match worktree {
+            // Its snapshot before is the fork commit, recorded on the start thread once the
+            // worktree is made: a run whose worktree could not be made has no changes view,
+            // which would compare the engineer's own files with the fork.
+            Worktree::Make => {}
+            // Every run of an open thread starts from a commit of what was left there, a
+            // proposer's too: undoing a proposer's edits goes back to that commit, which must
+            // hold the engineer's own commits and edits.
+            Worktree::Made => match self.commit_worktree(run, &thread, Point::Before) {
+                Ok(commit) => {
+                    thread.tip.clone_from(&commit);
+                    if snapshot {
+                        run.record_snapshot(Point::Before, commit);
+                    }
+                }
+                // A proposer whose start could not be marked would be blamed, and undone, for
+                // what was left: it does not start.
+                Err(error) if !snapshot => return Err(error),
+                Err(error) => no_snapshot(run, &error),
+            },
+        }
+        Ok((thread, worktree))
+    }
+
+    /// Stops run `id` (module docs, "Stopping").
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when it is not under way in this window; [`Error::AgentExited`]
+    /// when the agent is gone (its exit then ends the run).
+    pub(crate) fn cancel(&self, id: &str) -> Result<()> {
+        let mut slots = self.slots();
+        let slot = slots
+            .live_slot(id)
+            .ok_or_else(|| Error::BadRequest(format!("{id} is not under way in this window")))?;
+        let run = Arc::clone(
+            slot.run
+                .as_ref()
+                .expect("live_slot found the slot by its run"),
+        );
         let (started, asked) = {
             let state = run.state();
             (state.started, state.cancel_asked)
         };
-        let thread = slot.thread.clone();
+        let thread = Some(slot.thread.clone());
         let mut released = Held::None;
         let mut forced = false;
         let mut result = Ok(());
@@ -802,8 +924,8 @@ impl Runner {
         match (started, asked) {
             (false, _) if slot.making => {
                 // Git is still making the worktree, which cannot be cut short. The run, and
-                // with it the run lock that keeps other windows out of the worktree, stays
-                // until git is done: the start thread ends it then.
+                // with it the thread's lock that keeps other windows out of the worktree,
+                // stays until git is done: the start thread ends it then.
                 released = slot.release();
                 run.record(Entry::CancelRequested);
             }
@@ -844,7 +966,7 @@ impl Runner {
                 }
             }
         }
-        drop(slot);
+        drop(slots);
         // Dropping the agent kills it and waits for its process to be reaped.
         drop(released);
         if forced {
@@ -861,19 +983,26 @@ impl Runner {
         result
     }
 
-    /// Answers the run's question `request` (its number, as the log gives it) with the form's
+    /// Answers run `id`'s question `request` (its number, as the log gives it) with the form's
     /// values, or with `None` to skip it.
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchRequest`] when no agent is running, and as [`Agent::answer_question`].
+    /// [`Error::NoSuchRequest`] when the run's agent is not running in this window, and as
+    /// [`Agent::answer_question`].
     pub(crate) fn reply(
         &self,
+        id: &str,
         request: usize,
         content: Option<serde_json::Map<String, Value>>,
     ) -> Result<()> {
-        let slot = self.slot();
-        let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
+        let mut slots = self.slots();
+        let Some(Slot {
+            run: Some(run),
+            agent: Held::Ready(_, agent),
+            ..
+        }) = slots.live_slot(id)
+        else {
             return Err(Error::NoSuchRequest);
         };
         let reply = match &content {
@@ -884,21 +1013,26 @@ impl Runner {
         };
         agent.answer_question(request, &reply)?;
         run.record(Entry::Reply { request, content });
-        drop(slot);
+        drop(slots);
         (self.notify)();
         Ok(())
     }
 
-    /// Answers the run's permission request `request` (its number, as the log gives it) with
+    /// Answers run `id`'s permission request `request` (its number, as the log gives it) with
     /// the option `option`.
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchRequest`] when no agent is running, and as
+    /// [`Error::NoSuchRequest`] when the run's agent is not running in this window, and as
     /// [`Agent::answer_permission`], which keeps the table of open requests.
-    pub(crate) fn answer(&self, request: usize, option: &str) -> Result<()> {
-        let slot = self.slot();
-        let (Some(run), Held::Ready(_, agent)) = (&slot.run, &slot.agent) else {
+    pub(crate) fn answer(&self, id: &str, request: usize, option: &str) -> Result<()> {
+        let mut slots = self.slots();
+        let Some(Slot {
+            run: Some(run),
+            agent: Held::Ready(_, agent),
+            ..
+        }) = slots.live_slot(id)
+        else {
             return Err(Error::NoSuchRequest);
         };
         // The agent checks the option against what it offered; only an accepted answer is
@@ -908,35 +1042,52 @@ impl Runner {
             request,
             option: Some(option.to_owned()),
         });
-        drop(slot);
+        drop(slots);
         (self.notify)();
         Ok(())
     }
 
     /// The latest run, with the entries from number `after` on, and its notes and prompt only
-    /// when `after` is 0: this window's run, or the newest readable log on disk when this
-    /// window has run nothing yet. `None` when there is no run.
+    /// when `after` is 0: this window's latest run, or the newest readable log on disk when
+    /// this window has run nothing yet. `None` when there is no run.
     ///
     /// # Errors
     ///
     /// [`Error::ReadRun`] when the runs directory cannot be listed.
     pub(crate) fn view(&self, after: usize) -> Result<Option<RunView>> {
-        let run = self.slot().run.clone();
+        let run = self.slots().latest.clone();
         match run {
             Some(run) => Ok(Some(run.view(after))),
             None => Ok(Run::latest(&self.repo.runs_dir())?.map(|run| run.view(after))),
         }
     }
 
-    /// The run `id` (`R2`), with all its entries: this window's run when it is that one, else
-    /// the run as its log on disk has it.
+    /// The run `id` (`R2`), with the entries from number `after` on, and its notes and prompt
+    /// only when `after` is 0: this window's when it is one of its threads' latest, else the
+    /// run as its log on disk has it.
     ///
     /// # Errors
     ///
     /// [`Error::BadRequest`] when `id` is not of the form `R<number>`; [`Error::NoSuchRun`]
     /// when its log is missing or cannot be read.
-    pub(crate) fn view_of(&self, id: &str) -> Result<RunView> {
-        Ok(self.run_by_id(id)?.view(0))
+    pub(crate) fn view_of(&self, id: &str, after: usize) -> Result<RunView> {
+        Ok(self.run_by_id(id)?.view(after))
+    }
+
+    /// The ids of this window's runs under way, oldest first: the page follows each.
+    pub(crate) fn live(&self) -> Vec<String> {
+        let mut live: Vec<String> = self
+            .slots()
+            .by_thread
+            .values()
+            .filter_map(|slot| slot.run.as_ref())
+            .filter_map(|run| {
+                let state = run.state();
+                state.live().then(|| state.header.id.clone())
+            })
+            .collect();
+        live.sort_by_key(|id| run_number(id));
+        live
     }
 
     /// What the runs from `from` to `to` changed (docs/design.md, "The changes view"): the
@@ -1043,7 +1194,7 @@ impl Runner {
     /// frees its worktree: renamed into the trash and deleted in the background. Its branch
     /// stays, until the thread's last note is deleted.
     ///
-    /// Holds the run lock throughout, so no run, in this window or another, works in the
+    /// Holds the thread's lock throughout, so no run, in this window or another, works in the
     /// worktree meanwhile, and reads the thread only once it holds it. First checks that the
     /// worktree holds nothing Postil did not commit, and that its branch is at the commit
     /// Postil left or past it (a commit the engineer made there). Apply writes the branch's
@@ -1067,14 +1218,15 @@ impl Runner {
     /// thread is marked ended.
     pub(crate) fn end_thread(&self, id: &str, ending: Ending) -> Result<()> {
         let home = self.home.as_deref().ok_or(Error::NoHome)?;
-        // While this window is busy with any run, its own run holds the run lock, or a review
-        // between two stages is about to take it from the reader thread: either would read
-        // as another window's. Not busy, nothing in this window takes the run lock until this
-        // request is answered, so the slot is free to take again under it below.
-        if self.slot().busy() {
+        // While the thread is busy in this window, its run holds the thread's lock, or a
+        // review between two stages is about to take it from the reader thread: either would
+        // read as another window's. Not busy, nothing in this window takes that lock until
+        // this request is answered (only a request starts a run in an idle thread), so the
+        // slots are free to take again under it below.
+        if self.slots().by_thread.get(id).is_some_and(Slot::busy) {
             return Err(Error::TurnRunning);
         }
-        let _active = hold_run_lock(&self.repo.runs_dir())?;
+        let _lock = hold_thread_lock(&self.repo.runs_dir(), id)?;
         let thread = match thread::find(&self.repo, id)? {
             Some(thread) if thread.state == State::Open => thread,
             Some(_) => return Err(Error::BadRequest(format!("thread {id} already ended"))),
@@ -1089,14 +1241,11 @@ impl Runner {
                 error => error,
             })?;
         }
-        let released = {
-            let mut slot = self.slot();
-            if slot.thread.as_ref().is_some_and(|held| held.id == id) {
-                slot.release()
-            } else {
-                Held::None
-            }
-        };
+        let released = self
+            .slots()
+            .by_thread
+            .remove(id)
+            .map_or(Held::None, |mut slot| slot.release());
         // Dropping the agent waits for its process, so after the lock.
         drop(released);
         let ended = thread::update(&self.repo, id, |stored| {
@@ -1152,9 +1301,9 @@ impl Runner {
     /// saved (`send` reads them for the prompt first), so every listed log's notes are seen:
     /// another window's new note, even one given a freed id, keeps its new run.
     ///
-    /// Then, while this window is not busy, forgets every thread whose first run's log is gone
-    /// ([`Runner::forget_threads`]): takes the run lock, stops a kept agent working there,
-    /// frees its worktree, and deletes its branch while it is at Postil's last commit.
+    /// Then forgets every thread whose first run's log is gone and that is not busy in this
+    /// window ([`Runner::forget_threads`]): takes its lock, stops its kept agent, frees its
+    /// worktree, and deletes its branch while it is at Postil's last commit.
     ///
     /// # Errors
     ///
@@ -1169,19 +1318,13 @@ impl Runner {
             source,
         })?;
         let left = notes::ids(&self.repo)?;
-        // Read once: the slot is not held while logs are read, so the agent's events, which
-        // need it, are never kept waiting on the disk.
-        let live = {
-            let slot = self.slot();
-            slot.run
-                .as_ref()
-                .filter(|run| run.state().live())
-                .map(|run| run.state().header.id.clone())
-        };
+        // Read once: the slots are not held while logs are read, so the agents' events, which
+        // need them, are never kept waiting on the disk.
+        let live = self.live();
         let mut deleted = Vec::new();
         for number in numbers {
             let id = format!("R{number}");
-            if live.as_deref() == Some(id.as_str()) {
+            if live.contains(&id) {
                 continue;
             }
             let file = dir.join(format!("{id}.jsonl"));
@@ -1196,32 +1339,32 @@ impl Runner {
             fs::remove_file(&file).map_err(|source| Error::WriteRun { path: file, source })?;
             deleted.push(id);
         }
-        let busy = {
-            let mut slot = self.slot();
-            if slot
-                .run
-                .as_ref()
-                .is_some_and(|run| deleted.contains(&run.state().header.id))
-            {
-                slot.run = None;
+        {
+            let mut slots = self.slots();
+            let gone = |run: &Option<Arc<Run>>| {
+                run.as_ref()
+                    .is_some_and(|run| deleted.contains(&run.state().header.id))
+            };
+            if gone(&slots.latest) {
+                slots.latest = None;
             }
-            // Busy, not only live: a review between stages starts its next one from the
-            // reader thread, taking the run lock under the slot.
-            slot.busy()
-        };
-        // While this window is busy, the threads wait for a delete after it is done: its run
-        // holds the run lock, or is about to.
-        let forgotten = if busy { Ok(()) } else { self.forget_threads() };
+            for slot in slots.by_thread.values_mut() {
+                if gone(&slot.run) {
+                    slot.run = None;
+                }
+            }
+        }
+        let forgotten = self.forget_threads();
         (self.notify)();
         forgotten
     }
 
     /// Forgets every thread whose first run's log is gone: frees its worktree, deletes its
-    /// branch, and removes it from the record. Stops a kept agent that works in one. For a
-    /// window that is not busy: holds the run lock, then takes the slot, which is safe only
-    /// while no run of this window can take the lock meanwhile. While another window's run
-    /// holds the lock it forgets nothing, and the next delete tries again. A follow-up still
-    /// running when its thread's first log went keeps the thread until a delete after it ends.
+    /// branch, and removes it from the record, and its lock file. Stops a kept agent that works
+    /// in one. Only for a thread not busy in this window: holds its lock, then takes the slots,
+    /// which is safe only while no run of this window can take that lock meanwhile. A thread
+    /// whose lock another window's run holds is kept, and the next delete tries again; so is
+    /// one whose follow-up still runs here when its first log went.
     ///
     /// Each thread goes through [`thread::forget`], which keeps what is not Postil's to delete:
     /// work Postil did not commit, a branch past Postil's commit or checked out, and any
@@ -1236,33 +1379,47 @@ impl Runner {
             return Ok(());
         };
         let dir = self.repo.runs_dir();
-        let _active = match hold_run_lock(&dir) {
-            Ok(active) => active,
-            Err(Error::RunElsewhere) => return Ok(()),
-            Err(error) => return Err(error),
-        };
         let gone: Vec<Thread> = thread::all(&self.repo)?
             .into_iter()
             .filter(|thread| !dir.join(format!("{}.jsonl", thread.id)).exists())
             .collect();
-        if gone.is_empty() {
+        let mut held = Vec::new();
+        for thread in gone {
+            // A thread busy in this window waits for a delete after it is done: its run holds
+            // the thread's lock, or is about to. Not busy, no run of this window takes that
+            // lock until this request is answered (module docs, "Threads and locks").
+            if self
+                .slots()
+                .by_thread
+                .get(&thread.id)
+                .is_some_and(Slot::busy)
+            {
+                continue;
+            }
+            match hold_thread_lock(&dir, &thread.id) {
+                Ok(lock) => held.push((thread, lock)),
+                // Another window's run works there; the next delete tries again.
+                Err(Error::RunElsewhere) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if held.is_empty() {
             return Ok(());
         }
-        let released = {
-            let mut slot = self.slot();
-            let kept = slot.thread.as_ref().map(|thread| thread.id.clone());
-            if kept.is_some_and(|kept| gone.iter().any(|thread| thread.id == kept)) {
-                slot.thread = None;
-                slot.release()
-            } else {
-                Held::None
-            }
+        let released: Vec<Held> = {
+            let mut slots = self.slots();
+            held.iter()
+                .filter_map(|(thread, _)| slots.by_thread.remove(&thread.id))
+                .map(|mut slot| slot.release())
+                .collect()
         };
-        // Dropping the agent waits for its process, so after the lock.
+        // Dropping the agents waits for their processes, so after the lock.
         drop(released);
         let mut first_error = None;
         let mut removed = Vec::new();
-        for thread in gone {
+        let mut locks = Vec::new();
+        for (thread, lock) in held {
+            locks.push(lock);
             // In any state: an ended thread whose free failed still has its worktree, which
             // keeps the branch checked out.
             // A commit the engineer made past Postil's is on the thread's branch (`free` checks
@@ -1278,48 +1435,59 @@ impl Runner {
             }
         }
         thread::remove(&self.repo, &removed)?;
+        for id in &removed {
+            remove_thread_lock(&dir, id);
+        }
+        // Released only now, so no window starts a run in a thread being forgotten.
+        drop(locks);
         first_error.map_or(Ok(()), Err)
     }
 
     /// Whether this window has a run under way, or a review between two stages, whose next
     /// stage starts with no request from the page.
     pub(crate) fn busy(&self) -> bool {
-        self.slot().busy()
+        self.slots().busy()
     }
 
-    /// Stops the agent, running or starting, and ignores anything it would still report: the
-    /// project is closing, or the app quits. A run under way ends as failed, saying so, so it
-    /// does not read as another window's.
+    /// Stops every agent, running or starting, and ignores anything they would still report:
+    /// the project is closing, or the app quits. A run under way ends as failed, saying so, so
+    /// it does not read as another window's.
     pub(crate) fn close(&self) {
-        let (released, run, thread) = {
-            let mut slot = self.slot();
-            slot.closed = true;
-            slot.chain = None;
-            // A run whose worktree git is still checking out is left to the start thread,
-            // which ends it once git is done: ending it here would release the run lock
-            // that keeps every window out of the half-made worktree, and a commit there
-            // would take a half checkout.
-            let run = slot.run.clone().filter(|_| !slot.making);
-            (slot.release(), run, slot.thread.clone())
-        };
-        // The agent is gone first, so nothing it reports lands after the end. `closed` drops
-        // its events anyway.
+        let mut released = Vec::new();
+        let mut runs = Vec::new();
+        {
+            let mut slots = self.slots();
+            slots.closed = true;
+            for slot in slots.by_thread.values_mut() {
+                slot.chain = None;
+                // A run whose worktree git is still checking out is left to the start thread,
+                // which ends it once git is done: ending it here would release the thread's
+                // lock that keeps every window out of the half-made worktree, and a commit
+                // there would take a half checkout.
+                if let Some(run) = slot.run.clone().filter(|_| !slot.making) {
+                    runs.push((run, slot.thread.clone()));
+                }
+                released.push(slot.release());
+            }
+        }
+        // The agents are gone first, so nothing they report lands after the end. `closed`
+        // drops their events anyway.
         drop(released);
-        if let Some(run) = run {
+        for (run, thread) in runs {
             // As a forced Stop does: the agent's exit is not reported, so the snapshot after
             // the run is taken here, or its changes view would stay empty. It runs `git add`
             // on the request thread, quitting included. Both calls do nothing for a run that
             // already ended.
-            undo_if_live(self, &run, thread.as_ref());
-            self.record_end_snapshot(&run, thread.as_ref());
+            undo_if_live(self, &run, Some(&thread));
+            self.record_end_snapshot(&run, Some(&thread));
             run.record(Entry::Failed {
                 error: "stopped: Postil closed the project while it ran".to_owned(),
             });
         }
     }
 
-    fn slot(&self) -> MutexGuard<'_, Slot> {
-        lock(&self.slot)
+    fn slots(&self) -> MutexGuard<'_, Slots> {
+        lock(&self.slots)
     }
 
     /// Starts the agent on its own thread, then sends the prompt, unless the agent was let go
@@ -1331,45 +1499,21 @@ impl Runner {
         let run = Arc::clone(&pending.run);
         let start = move || {
             let generation = pending.generation;
+            let id = pending.thread.id.clone();
             let failed = |error: &Error| {
                 pending.run.record(Entry::Failed {
                     error: error_chain(error),
                 });
             };
-            if let Worktree::Make = pending.worktree {
-                let made = runner.make_worktree(&pending.thread);
-                let mut slot = runner.slot();
-                slot.making = false;
-                let (gone, closed) = (slot.let_go(generation), slot.closed);
-                drop(slot);
-                if gone {
-                    // Stopped, or the project closed, while git made the worktree: the run
-                    // ends now that git is done, and with it the run lock.
-                    pending.run.record(if closed {
-                        Entry::Failed {
-                            error: "stopped: Postil closed the project while it ran".to_owned(),
-                        }
-                    } else {
-                        Entry::Ended {
-                            reason: StopReason::Cancelled,
-                        }
-                    });
-                    return (runner.notify)();
-                }
-                if let Err(error) = made {
-                    failed(&error);
-                    return (runner.notify)();
-                }
-                // A new thread's run is a run of notes, which takes snapshots: the one before
-                // is the commit the worktree was made at.
-                pending
-                    .run
-                    .record_snapshot(Point::Before, pending.thread.fork.clone());
+            if let Worktree::Make = pending.worktree
+                && !runner.make_for(&pending)
+            {
+                return (runner.notify)();
             }
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.
             let search_path = runner.agents.wait();
-            if runner.slot().let_go(generation) {
+            if runner.slots().let_go(&id, generation) {
                 return;
             }
             let launch = Launch {
@@ -1380,11 +1524,14 @@ impl Runner {
             };
             // Weak: the runner owns the agent, whose reader thread owns this callback.
             let events = Arc::downgrade(&runner);
-            let spawned = Agent::spawn(&launch, move |event| on_event(&events, generation, event));
+            let thread = id.clone();
+            let spawned = Agent::spawn(&launch, move |event| {
+                on_event(&events, &thread, generation, event);
+            });
             let starting = match spawned {
                 Ok(starting) => starting,
                 Err(error) => {
-                    if !runner.slot().let_go(generation) {
+                    if !runner.slots().let_go(&id, generation) {
                         failed(&error);
                     }
                     return (runner.notify)();
@@ -1394,22 +1541,24 @@ impl Runner {
             // Stoppable from here on; a cancel or close that came first wins, and dropping
             // `starting` stops it.
             {
-                let mut slot = runner.slot();
-                if slot.let_go(generation) {
+                let mut slots = runner.slots();
+                if slots.let_go(&id, generation) {
                     return;
                 }
+                let slot = slots.by_thread.get_mut(&id).expect("let_go found the slot");
                 slot.agent = Held::Starting(starting.stopper());
             }
             let opened = starting.open_session();
 
-            let mut slot = runner.slot();
-            if slot.let_go(generation) {
+            let mut slots = runner.slots();
+            if slots.let_go(&id, generation) {
                 // The run already says why. An agent that started after all is stopped by
                 // dropping it, after the lock: dropping it waits for its process.
-                drop(slot);
+                drop(slots);
                 drop(opened);
                 return;
             }
+            let slot = slots.by_thread.get_mut(&id).expect("let_go found the slot");
             match opened {
                 Err(error) => {
                     slot.agent = Held::None;
@@ -1421,7 +1570,7 @@ impl Runner {
                     slot.agent = Held::Ready(pending.agent, agent);
                 }
             }
-            drop(slot);
+            drop(slots);
             (runner.notify)();
         };
         let spawned = std::thread::Builder::new()
@@ -1433,6 +1582,46 @@ impl Runner {
             });
         }
         spawned.is_ok()
+    }
+
+    /// Makes the worktree of `pending`'s new thread on its start thread, then marks the slot
+    /// done making. Returns whether the agent is to start: not when the worktree could not be
+    /// made, nor when the run was stopped or the project closed meanwhile; the run then ends
+    /// here, saying why, and with it the thread's lock.
+    fn make_for(&self, pending: &Pending) -> bool {
+        let id = &pending.thread.id;
+        let made = self.make_worktree(&pending.thread);
+        let (gone, closed) = {
+            let mut slots = self.slots();
+            if let Some(slot) = slots.by_thread.get_mut(id) {
+                slot.making = false;
+            }
+            (slots.let_go(id, pending.generation), slots.closed)
+        };
+        if gone {
+            pending.run.record(if closed {
+                Entry::Failed {
+                    error: "stopped: Postil closed the project while it ran".to_owned(),
+                }
+            } else {
+                Entry::Ended {
+                    reason: StopReason::Cancelled,
+                }
+            });
+            return false;
+        }
+        if let Err(error) = made {
+            pending.run.record(Entry::Failed {
+                error: error_chain(&error),
+            });
+            return false;
+        }
+        // A new thread's run is a run of notes, which takes snapshots: the one before is the
+        // commit the worktree was made at.
+        pending
+            .run
+            .record_snapshot(Point::Before, pending.thread.fork.clone());
+        true
     }
 
     /// Makes `thread`'s worktree ([`thread::make`]), and records in the thread what it was not
@@ -1532,7 +1721,10 @@ impl Runner {
 impl Runner {
     /// Whether a review is under way: decided as each stage ends, before its end is logged.
     pub(crate) fn reviewing(&self) -> bool {
-        self.slot().chain.is_some()
+        self.slots()
+            .by_thread
+            .values()
+            .any(|slot| slot.chain.is_some())
     }
 
     /// Holds the next review stage after the current one ends, until the returned sender
@@ -1569,10 +1761,15 @@ impl Runner {
         }
     }
 
-    /// Moves the run's first Stop back by [`FORCE_AFTER`], so a test can force a stop without
-    /// waiting that long.
+    /// Moves every live run's first Stop back by [`FORCE_AFTER`], so a test can force a stop
+    /// without waiting that long.
     pub(crate) fn backdate_stop(&self) {
-        if let Some(run) = &self.slot().run {
+        let slots = self.slots();
+        for run in slots
+            .by_thread
+            .values()
+            .filter_map(|slot| slot.run.as_ref())
+        {
             let mut state = run.state();
             state.cancel_asked = state.cancel_asked.map(|at| {
                 at.checked_sub(FORCE_AFTER)
@@ -1586,7 +1783,7 @@ impl fmt::Debug for Runner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runner")
             .field("root", &self.repo.root())
-            .field("slot", &*self.slot())
+            .field("slots", &*self.slots())
             .finish_non_exhaustive()
     }
 }
@@ -1595,7 +1792,7 @@ impl fmt::Debug for Runner {
 /// was let go. An agent that exited, or whose turn failed, is let go: the next send starts a
 /// fresh one, since a failed turn can mean a broken session (an adapter whose backend died,
 /// a sign-in that expired), and a lost conversation costs less than a stuck one.
-fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
+fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
     };
@@ -1605,11 +1802,12 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     );
     let ends_turn = matches!(event, Event::TurnEnded(_) | Event::Exited { .. });
     let (run, thread, released, answer, next) = {
-        let mut slot = runner.slot();
-        if slot.let_go(generation) {
+        let mut slots = runner.slots();
+        if slots.let_go(id, generation) {
             return;
         }
-        let thread = slot.thread.clone();
+        let slot = slots.by_thread.get_mut(id).expect("let_go found the slot");
+        let thread = Some(slot.thread.clone());
         let review = slot
             .run
             .as_ref()
@@ -1659,7 +1857,7 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
         // next stage starts once the end is logged.
         let next = match (&stage, &run) {
             (Some(stage), Some(run)) if ended_well => {
-                decide(&mut slot, run, stage, undone).then(|| Arc::clone(run))
+                decide(slot, run, stage, undone).then(|| Arc::clone(run))
             }
             (_, Some(run)) => {
                 // No findings are logged for a turn that did not end well: the run says it.
@@ -1691,7 +1889,7 @@ fn on_event(runner: &Weak<Runner>, generation: u64, event: Event) {
     if let Some(ended) = next {
         #[cfg(test)]
         runner.pass_next_stage_gate();
-        runner.advance(&ended);
+        runner.advance(id, &ended);
     }
 }
 

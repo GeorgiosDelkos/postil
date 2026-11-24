@@ -223,8 +223,14 @@ pub enum Error {
     },
     /// A prompt was sent while the agent's previous turn is still running.
     TurnRunning,
-    /// A run was asked for while another window runs one on the same working tree.
+    /// A run, or a thread's end, was asked for while another window runs an agent in the
+    /// thread.
     RunElsewhere,
+    /// A run was asked for while the most runs a repository may have at once are live.
+    TooManyRuns {
+        /// The threads whose runs are live, in any window.
+        live: Vec<String>,
+    },
     /// Another project was asked to be opened while the open one has a run or a review under
     /// way, without asking to stop it.
     RunInOpenProject,
@@ -444,8 +450,15 @@ impl fmt::Display for Error {
             ),
             Self::RunElsewhere => write!(
                 f,
-                "another Postil window is running an agent on this working tree (wait for it, \
-                 or stop it there)"
+                "another Postil window is running an agent in this thread (wait for it, or stop \
+                 it there)"
+            ),
+            Self::TooManyRuns { live } => write!(
+                f,
+                "{} agents already work in this repository, in the threads of {} (wait for \
+                 one to end, or stop one)",
+                live.len(),
+                live.join(", ")
             ),
             Self::RunInOpenProject => write!(
                 f,
@@ -566,6 +579,7 @@ impl std::error::Error for Error {
             | Self::AgentProtocol(_)
             | Self::TurnRunning
             | Self::RunElsewhere
+            | Self::TooManyRuns { .. }
             | Self::RunInOpenProject
             | Self::NoSuchRequest
             | Self::NoSuchRun { .. }

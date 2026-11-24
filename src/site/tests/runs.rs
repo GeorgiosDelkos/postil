@@ -461,10 +461,9 @@ fn a_live_run_is_kept_when_its_note_is_deleted_and_goes_at_the_next_delete() {
     assert_eq!(get_json(&site, RUN)["status"], "running");
 
     // Stopped twice, the second time forced, the run ends; the next delete takes it.
-    let cancel = format!("{RUN}/cancel");
-    post(&site, &cancel, "");
+    stop(&site);
     site.runner().unwrap().backdate_stop();
-    post(&site, &cancel, "");
+    stop(&site);
     wait_for(&site, &nudges, "failed");
     delete(&site, &format!("{NOTES}?id=N2"));
     assert!(!log.exists());
@@ -496,7 +495,8 @@ fn a_question_waits_for_the_engineer_and_reaches_the_agent_answered_or_skipped()
         "the form as the agent sent it"
     );
     let request = question["request"].clone();
-    let (status, body) = answer(serde_json::json!({ "request": 99, "content": {} }));
+    let (status, body) =
+        answer(serde_json::json!({ "run": waiting["id"], "request": 99, "content": {} }));
     assert_eq!(status, StatusCode::NOT_FOUND, "no such question: {body}");
     let (status, _) = get(&site, &format!("{RUN}/question"));
     assert_eq!(
@@ -507,7 +507,8 @@ fn a_question_waits_for_the_engineer_and_reaches_the_agent_answered_or_skipped()
     let (status, body) = post(
         &site,
         &format!("{RUN}/permission"),
-        &serde_json::json!({ "request": request, "option": "once" }).to_string(),
+        &serde_json::json!({ "run": waiting["id"], "request": request, "option": "once" })
+            .to_string(),
     );
     assert_eq!(
         status,
@@ -516,7 +517,8 @@ fn a_question_waits_for_the_engineer_and_reaches_the_agent_answered_or_skipped()
     );
 
     let content = serde_json::json!({ "question_0": "Yes", "question_0_custom": "and log it" });
-    let (status, body) = answer(serde_json::json!({ "request": request, "content": content }));
+    let (status, body) =
+        answer(serde_json::json!({ "run": waiting["id"], "request": request, "content": content }));
     assert_eq!(status, StatusCode::OK, "{body}");
     let ended = wait_for(&site, &nudges, "ended");
     let accepted = serde_json::json!({ "action": "accept", "content": content });
@@ -530,7 +532,8 @@ fn a_question_waits_for_the_engineer_and_reaches_the_agent_answered_or_skipped()
     send(&site, &["N2"]);
     let waiting = wait_for(&site, &nudges, "waiting");
     let request = first_of_kind(&waiting, "question")["request"].clone();
-    let (status, body) = answer(serde_json::json!({ "request": request, "content": null }));
+    let (status, body) =
+        answer(serde_json::json!({ "run": waiting["id"], "request": request, "content": null }));
     assert_eq!(status, StatusCode::OK, "{body}");
     let ended = wait_for(&site, &nudges, "ended");
     assert!(
@@ -620,7 +623,8 @@ fn a_permission_request_with_no_allow_option_waits_for_the_engineer() {
     let waiting = wait_for(&site, &nudges, "waiting");
     let request = first_of_kind(&waiting, "permission")["request"].clone();
     let choose = |option: &str| {
-        let body = serde_json::json!({ "request": request, "option": option });
+        let body =
+            serde_json::json!({ "run": waiting["id"], "request": request, "option": option });
         post(&site, &format!("{RUN}/permission"), &body.to_string())
     };
     let (status, body) = choose("sure");
@@ -984,26 +988,38 @@ fn a_follow_up_goes_to_the_same_conversation_or_tells_a_fresh_agent_the_thread()
         "a follow-up marks no note sent"
     );
 
-    // Another send, R3, starts a thread of its own, in its own worktree, so a fresh agent
-    // takes it. The agent that ran R2 is gone, so a follow-up of R2 starts a fresh agent
-    // and tells it the thread.
+    // Another send, R3, starts a thread of its own, in its own worktree, with an agent of its
+    // own. The first thread keeps its agent, so a follow-up of R2 still reaches it.
     send(&site, &["N2"]);
     let other = wait_for_run(&site, &nudges, "R3");
     assert!(
         kinds(&other).contains(&"message:prompt 1".to_owned()),
         "{other}"
     );
-    let (status, body) = follow("R2", "again");
+    let (status, body) = follow("R2", "still there?");
     assert_eq!(status, StatusCode::OK, "{body}");
-    let fresh = wait_for_run(&site, &nudges, "R4");
+    let kept = wait_for_run(&site, &nudges, "R4");
+    assert_eq!(
+        kinds(&kept)[1..3],
+        ["message:got still there?", "message:prompt 3"],
+        "{kept}"
+    );
+
+    // A third thread makes the window's third agent: the idle one used least recently, R3's,
+    // goes. A follow-up of R3 then starts a fresh agent and tells it the thread.
+    post_note(&site, "a.txt", 1, 2, "three");
+    send(&site, &["N3"]);
+    wait_for_run(&site, &nudges, "R5");
+    let (status, body) = follow("R3", "again");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let fresh = wait_for_run(&site, &nudges, "R6");
     let got = kinds(&fresh)
         .into_iter()
         .find(|kind| kind.starts_with("message:got "))
         .unwrap();
     for part in [
         "its conversation is gone",
-        "R1 was asked:\n\nThese are review notes",
-        "R2 was asked:\n\nand more\n\nIt answered:\n\ngot and more\n\nprompt 2",
+        "R3 was asked:\n\nThese are review notes",
         "The engineer now asks:\n\nagain",
     ] {
         assert!(got.contains(part), "{part:?} in {got}");
@@ -1429,13 +1445,13 @@ fn a_snapshot_copies_its_index_again_when_torn_and_drops_a_copy_git_cannot_use()
 }
 
 #[test]
-fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
+fn a_run_can_be_cancelled_and_its_thread_takes_one_run_at_a_time() {
     let repo = TempRepo::new("run-cancel");
     repo.write("a.txt", "a\n");
     let (site, nudges) = run_site(&repo, "cancel");
     post_note(&site, "a.txt", 1, 1, "one");
-    let cancel = format!("{RUN}/cancel");
-    let (status, body) = post(&site, &cancel, "");
+    let cancel = serde_json::json!({ "run": "R1" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/cancel"), &cancel);
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
@@ -1444,18 +1460,12 @@ fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
 
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "waiting");
-    let (status, body) = send(&site, &["N1"]);
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("still working"), "{body}");
     let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
     let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "a follow-up waits too: {body}"
-    );
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("still working"), "{body}");
 
-    let (status, body) = post(&site, &cancel, "");
+    let (status, body) = stop(&site);
     assert_eq!(status, StatusCode::OK, "{body}");
     let ended = wait_for(&site, &nudges, "ended");
     assert_eq!(
@@ -1474,7 +1484,7 @@ fn a_run_can_be_cancelled_and_one_runs_at_a_time() {
     assert_eq!(entries(&ended)[5]["option"], serde_json::Value::Null);
     assert_eq!(entries(&ended)[9]["reason"], "cancelled");
 
-    let late = serde_json::json!({ "request": 0, "content": {} });
+    let late = serde_json::json!({ "run": "R1", "request": 0, "content": {} });
     let (status, body) = post(&site, &format!("{RUN}/question"), &late.to_string());
     assert_eq!(
         status,
@@ -1714,7 +1724,7 @@ fn a_cancel_while_the_agent_starts_stops_it_and_ends_the_run_at_once() {
     send(&site, &["N1"]);
     let pid = read_fifo(&pid_file, WAIT);
     assert_eq!(get_json(&site, RUN)["status"], "starting");
-    let (status, body) = post(&site, &format!("{RUN}/cancel"), "");
+    let (status, body) = stop(&site);
     assert_eq!(status, StatusCode::OK, "{body}");
     let ended = get_json(&site, RUN);
     assert_eq!(
@@ -1856,12 +1866,11 @@ fn a_second_stop_ends_an_agent_that_does_not_stop() {
     post_note(&site, "a.txt", 1, 1, "one");
     send(&site, &["N1"]);
     wait_for(&site, &nudges, "running");
-    let cancel = format!("{RUN}/cancel");
-    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
     let stopping = get_json(&site, RUN);
     assert_eq!(stopping["status"], "cancelling");
     assert!(stopping["forceIn"].as_u64().unwrap() > 0, "{stopping}");
-    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
     assert_eq!(
         get_json(&site, RUN)["status"],
         "cancelling",
@@ -1874,7 +1883,7 @@ fn a_second_stop_ends_an_agent_that_does_not_stop() {
         0,
         "the page is told the agent had its time"
     );
-    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
     let failed = get_json(&site, RUN);
     assert_eq!(
         failed["forceIn"],
@@ -1910,26 +1919,76 @@ fn a_second_stop_ends_an_agent_that_does_not_stop() {
 }
 
 #[test]
-fn another_window_cannot_start_a_run_on_the_same_working_tree() {
+fn another_window_cannot_start_a_run_in_a_thread_whose_agent_works_here() {
     let repo = TempRepo::new("run-two-windows");
     repo.write("a.txt", "a\n");
     let (first, nudges) = run_site(&repo, "hang");
     post_note(&first, "a.txt", 1, 1, "one");
+    post_note(&first, "a.txt", 1, 1, "two");
     send(&first, &["N1"]);
     wait_for(&first, &nudges, "running");
     // Made after the first send: both windows read the one settings file.
-    let (second, _second_nudges) = run_site(&repo, "plain");
+    let (second, second_nudges) = run_site(&repo, "plain");
+    let follow = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
 
-    let (status, body) = send(&second, &["N1"]);
+    let (status, body) = post(&second, &format!("{RUN}/follow"), &follow);
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("another Postil window"), "{body}");
+    // A thread of its own runs beside it.
+    let (status, body) = send(&second, &["N2"]);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        wait_for_run(&second, &second_nudges, "R2")["status"],
+        "ended"
+    );
 
-    // Once the first window's run ends, the second may run.
-    let cancel = format!("{RUN}/cancel");
-    post(&first, &cancel, "");
+    // Once the first window's run ends, the second may run in its thread.
+    stop(&first);
     first.runner().unwrap().backdate_stop();
-    post(&first, &cancel, "");
-    let (status, body) = send(&second, &["N1"]);
+    stop(&first);
+    let (status, body) = post(&second, &format!("{RUN}/follow"), &follow);
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[test]
+fn a_fourth_live_agent_in_a_repository_is_refused_in_any_window() {
+    let repo = TempRepo::new("run-cap");
+    repo.write("a.txt", "a\n");
+    let (first, nudges) = run_site(&repo, "hang");
+    for text in ["one", "two", "three", "four"] {
+        post_note(&first, "a.txt", 1, 1, text);
+    }
+    for (note, run) in [("N1", "R1"), ("N2", "R2"), ("N3", "R3")] {
+        send(&first, &[note]);
+        assert_eq!(wait_for(&first, &nudges, "running")["id"], run);
+    }
+    assert_eq!(
+        get_json(&first, RUNS)["live"],
+        serde_json::json!(["R1", "R2", "R3"])
+    );
+    let (second, _second_nudges) = run_site(&repo, "plain");
+
+    for window in [&first, &second] {
+        let (status, body) = send(window, &["N4"]);
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("3 agents already work in this repository, in the threads of R1, R2, R3"),
+            "{body}"
+        );
+    }
+
+    // A run that ends frees its place.
+    let body = serde_json::json!({ "run": "R2" }).to_string();
+    assert_eq!(
+        post(&first, &format!("{RUN}/cancel"), &body).0,
+        StatusCode::OK
+    );
+    first.runner().unwrap().backdate_stop();
+    assert_eq!(
+        post(&first, &format!("{RUN}/cancel"), &body).0,
+        StatusCode::OK
+    );
+    let (status, body) = send(&second, &["N4"]);
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
@@ -1991,7 +2050,8 @@ fn opening_during_a_run_keeps_it_for_the_same_project_and_asks_first_for_another
     assert_eq!(get_json(&site, RUN)["status"], "waiting");
     let request = first_of_kind(&waiting, "question")["request"].clone();
     let content = serde_json::json!({ "question_0": "Yes" });
-    let body = serde_json::json!({ "request": request, "content": content }).to_string();
+    let body = serde_json::json!({ "run": waiting["id"], "request": request, "content": content })
+        .to_string();
     let (status, body) = post(&site, &format!("{RUN}/question"), &body);
     assert_eq!(
         status,
@@ -2238,7 +2298,7 @@ fn bad_run_requests_name_the_problem_and_make_no_run() {
         post(&site, &format!("{RUN}/preview?notes=N1"), "").0,
         StatusCode::METHOD_NOT_ALLOWED
     );
-    let answer = r#"{"request": 0, "option": "once"}"#;
+    let answer = r#"{"run": "R1", "request": 0, "option": "once"}"#;
     let (status, body) = post(&site, &format!("{RUN}/permission"), answer);
     assert_eq!(
         status,
@@ -2350,10 +2410,9 @@ fn a_reviewer_ended_by_force_has_its_edits_undone() {
     }
 
     // The second Stop ends the agent, whose end is never reported: the undo runs there.
-    let cancel = format!("{RUN}/cancel");
-    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
     site.runner().unwrap().backdate_stop();
-    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    assert_eq!(stop(&site).0, StatusCode::OK);
 
     let stage = get_json(&site, &format!("{RUN}?id=R2"));
     assert_eq!(stage["status"], "failed", "{stage}");

@@ -373,11 +373,21 @@ struct SendRun {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerPermission {
+    /// The run that asks, `R3`.
+    run: String,
     /// The request's number, as the run's log gives it (the agent's, counting on across the
     /// turns of a kept agent).
     request: usize,
     /// The id of the option chosen, one the agent offered.
     option: String,
+}
+
+/// The body of `POST /api/run/cancel`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelRun {
+    /// The run to stop, `R3`.
+    run: String,
 }
 
 /// The body of `POST /api/run/review`.
@@ -418,6 +428,8 @@ struct EndThread {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerQuestion {
+    /// The run that asks, `R3`.
+    run: String,
     /// The question's number, as the run's log gives it.
     request: usize,
     /// The form's values by field, or `null` to skip the question.
@@ -625,11 +637,11 @@ impl Site {
                 _ => not_allowed("GET the pane widths or PUT new ones"),
             },
             "/api/runs" => match *method {
-                Method::GET => json_or_error(
-                    self.runner()
-                        .and_then(|runner| runner.ids())
-                        .map(|ids| to_json(&serde_json::json!({ "runs": ids }))),
-                ),
+                Method::GET => json_or_error(self.runner().and_then(|runner| {
+                    let ids = runner.ids()?;
+                    let live = runner.live();
+                    Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
+                })),
                 _ => not_allowed("GET"),
             },
             path if path == "/api/run" || path.starts_with("/api/run/") => {
@@ -820,11 +832,7 @@ impl Site {
                 _ => not_allowed("GET"),
             },
             "/api/run/cancel" => match *method {
-                Method::POST => json_or_error(
-                    self.runner()
-                        .and_then(|runner| runner.cancel())
-                        .map(|()| b"{}".to_vec()),
-                ),
+                Method::POST => json_or_error(self.cancel_run(body)),
                 _ => not_allowed("POST"),
             },
             "/api/run/permission" => match *method {
@@ -885,15 +893,23 @@ impl Site {
             .ok_or(Error::NoProject)
     }
 
-    /// The reply to `GET /api/run`: with `?id=R2`, that run whole; else the latest run with its
-    /// entries from number `?after=` on, without its notes and prompt unless that is 0, or
-    /// `null` when the project has none.
+    /// The reply to `GET /api/run`: with `?id=R2`, that run, else the latest run, or `null`
+    /// when the project has none; either with its entries from number `?after=` on, without
+    /// its notes and prompt unless that is 0.
     fn run_view(&self, query: &str) -> Result<Vec<u8>> {
         let runner = self.runner()?;
+        let after = after_of(query)?;
         match query_value(query, "id") {
-            Some(id) => Ok(to_json(&runner.view_of(&id)?)),
-            None => Ok(to_json(&runner.view(after_of(query)?)?)),
+            Some(id) => Ok(to_json(&runner.view_of(&id, after)?)),
+            None => Ok(to_json(&runner.view(after)?)),
         }
+    }
+
+    /// The reply to `POST /api/run/cancel`: stops the run in the body, and answers `{}`.
+    fn cancel_run(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: CancelRun = parse_body(body, Error::BadRequest)?;
+        self.runner()?.cancel(&request.run)?;
+        Ok(b"{}".to_vec())
     }
 
     /// The reply to `GET /api/run/changes?from=R1&to=R3`: what runs `from` to `to` changed
@@ -931,7 +947,8 @@ impl Site {
     /// The reply to `POST /api/run/permission`.
     fn answer_permission(&self, body: &[u8]) -> Result<Vec<u8>> {
         let answer: AnswerPermission = parse_body(body, Error::BadRequest)?;
-        self.runner()?.answer(answer.request, &answer.option)?;
+        self.runner()?
+            .answer(&answer.run, answer.request, &answer.option)?;
         Ok(b"{}".to_vec())
     }
 
@@ -973,7 +990,8 @@ impl Site {
     /// The reply to `POST /api/run/question`.
     fn answer_question(&self, body: &[u8]) -> Result<Vec<u8>> {
         let answer: AnswerQuestion = parse_body(body, Error::BadRequest)?;
-        self.runner()?.reply(answer.request, answer.content)?;
+        self.runner()?
+            .reply(&answer.run, answer.request, answer.content)?;
         Ok(b"{}".to_vec())
     }
 
@@ -1127,6 +1145,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsChanged
                 | Error::TurnRunning
                 | Error::RunElsewhere
+                | Error::TooManyRuns { .. }
                 | Error::RunInOpenProject
                 | Error::ThreadChanged { .. }
                 | Error::NotAWorktree { .. }
