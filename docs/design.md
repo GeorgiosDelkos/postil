@@ -386,6 +386,9 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   live in a repository (section "Worktrees", "Keeping the disk in bounds"). A send of a note
   that a run of this window under way carries is refused (400): notes are marked sent only
   once the agent takes the turn, so the note still reads as open while its agent starts.
+  Another window does not know this window's runs, and can still send such a note in those
+  seconds: accepted, as two windows on one working tree are rare and the lock files carry no
+  notes.
 - **Stop** asks the agent to cancel (`session/cancel`), and answers its open permission
   requests `cancelled`, as well as any that arrive until the turn ends. An agent that is
   still starting is killed instead, and the run ends at once. A second Stop from 3 s after

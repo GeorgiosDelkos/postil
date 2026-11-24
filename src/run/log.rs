@@ -894,7 +894,9 @@ pub(super) fn hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
     Ok(file)
 }
 
-/// Deletes thread `id`'s lock file, once the thread is forgotten. The caller holds its lock.
+/// Deletes thread `id`'s lock file, once no run will work in the thread again: it was
+/// forgotten, or never made it into the record. Another window's count that lists the file as
+/// it goes reads it as free ([`live_threads`]).
 pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
     if run_number(id).is_some() {
         // A file left behind is an empty file that locks nothing; nothing reads it.
@@ -933,10 +935,17 @@ fn live_threads(dir: &Path, except: Option<&str>) -> Result<Vec<String>> {
         if run_number(id).is_none() || Some(id) == except {
             continue;
         }
-        let file = File::open(entry.path()).map_err(|source| Error::ReadRun {
-            path: entry.path(),
-            source,
-        })?;
+        let file = match File::open(entry.path()) {
+            Ok(file) => file,
+            // Removed since the listing ([`remove_thread_lock`]): no run holds it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::ReadRun {
+                    path: entry.path(),
+                    source,
+                });
+            }
+        };
         match file.try_lock() {
             // Dropping the file releases the lock it took.
             Ok(()) => {}

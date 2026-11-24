@@ -418,9 +418,10 @@ impl Runner {
     /// Starts a run: sends the notes `ids` to a fresh `agent`, in a new thread (docs/design.md,
     /// "Worktrees"). The thread's record is written, and its branch starts at the commit
     /// `HEAD` names now; its worktree is made on the agent's start thread, before the agent
-    /// starts there. Returns at once, except while another window holds `runs/active.lock`:
-    /// then it waits up to `LOCK_PATIENCE` under the runner's lock before it refuses. The run
-    /// reports its progress through its log.
+    /// starts there. Returns at once, except while another window holds `runs/active.lock`,
+    /// when it waits up to `LOCK_PATIENCE` for it, and when the count of live runs is at the
+    /// cap, when it waits up to `LOCK_PATIENCE` more for one to end, both under the runner's
+    /// lock, before it refuses. The run reports its progress through its log.
     ///
     /// # Errors
     ///
@@ -822,14 +823,15 @@ impl Runner {
         let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
-                run.record(Entry::Failed {
-                    error: error_chain(&error),
-                });
                 if new_thread {
                     // No record names the thread, so nothing would ever forget its lock file.
+                    // Removed while the run still holds the lock.
                     let id = run.state().header.id.clone();
                     remove_thread_lock(&self.repo.runs_dir(), &id);
                 }
+                run.record(Entry::Failed {
+                    error: error_chain(&error),
+                });
                 (self.notify)();
                 return Err(error);
             }
@@ -882,7 +884,7 @@ impl Runner {
             if !self.start(pending) && std::mem::take(&mut slot.making) {
                 // No thread will make the worktree: the thread goes, as one whose worktree
                 // could not be made does.
-                drop(thread::remove(&self.repo, std::slice::from_ref(&id)));
+                self.drop_new_thread(&id);
             }
             replaced
         };
@@ -1667,6 +1669,14 @@ impl Runner {
         true
     }
 
+    /// Takes new thread `id`, whose worktree will not be made, out of the record, and removes
+    /// its lock file, which no record then names: nothing would ever forget it. A record that
+    /// cannot be changed stays as it was; the run says why the thread failed.
+    fn drop_new_thread(&self, id: &str) {
+        drop(thread::remove(&self.repo, &[id.to_owned()]));
+        remove_thread_lock(&self.repo.runs_dir(), id);
+    }
+
     /// Makes `thread`'s worktree ([`thread::make`]), and records in the thread what it was not
     /// given. A record that cannot be written loses that list only.
     ///
@@ -1679,8 +1689,7 @@ impl Runner {
         let skipped = match thread::make(&self.repo, thread) {
             Ok(skipped) => skipped,
             Err(error) => {
-                // The run says why; a record that cannot be changed stays, as it was.
-                drop(thread::remove(&self.repo, std::slice::from_ref(&thread.id)));
+                self.drop_new_thread(&thread.id);
                 return Err(error);
             }
         };
