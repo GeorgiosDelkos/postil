@@ -43,7 +43,7 @@ use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 
 /// How long a send waits for the run lock or a thread's lock before it reports another
-/// window's run ([`take_run_lock`]). Arbitrary: far longer than a fork-to-exec window, short
+/// window's run ([`take_lock`]). Arbitrary: far longer than a fork-to-exec window, short
 /// enough that a refused send answers at once.
 const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
@@ -357,9 +357,11 @@ impl Run {
     ///
     /// # Errors
     ///
-    /// [`Error::RunElsewhere`] when another window's run works in the thread;
-    /// [`Error::TooManyRuns`] when [`MAX_LIVE`] runs are live in the repository; and
-    /// [`Error::WriteRun`] when a file cannot be written.
+    /// [`Error::RunElsewhere`] when another window's run works in the thread, or another
+    /// window holds a lock this takes past [`LOCK_PATIENCE`]; [`Error::TooManyRuns`] when
+    /// [`MAX_LIVE`] runs are live in the repository; [`Error::BadRequest`] for a thread id
+    /// that is not a run's; [`Error::ReadRun`] when the thread locks cannot be listed or
+    /// opened; and [`Error::WriteRun`] when a file cannot be written.
     pub(super) fn create(dir: &Path, opening: Opening<'_>, thread: InThread<'_>) -> Result<Self> {
         let Opening {
             agent,
@@ -380,7 +382,7 @@ impl Run {
         let lock = own.map(|id| hold_thread_lock(dir, id)).transpose()?;
         let mut live = live_threads(dir, own)?;
         if live.len() >= MAX_LIVE {
-            // A lock released a moment ago can still look held ([`take_run_lock`]): before
+            // A lock released a moment ago can still look held ([`take_lock`]): before
             // refusing, each is waited for as a send waits for one.
             live = still_held(dir, live)?;
         }
@@ -838,7 +840,7 @@ fn hold_run_lock(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(&active_path)
         .map_err(error(&active_path))?;
-    take_run_lock(&active).map_err(|source| match source {
+    take_lock(&active).map_err(|source| match source {
         TryLockError::WouldBlock => Error::RunElsewhere,
         TryLockError::Error(source) => Error::WriteRun {
             path: active_path.clone(),
@@ -880,7 +882,7 @@ pub(super) fn hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
             path: path.clone(),
             source,
         })?;
-    take_run_lock(&file).map_err(|source| match source {
+    take_lock(&file).map_err(|source| match source {
         TryLockError::WouldBlock => Error::RunElsewhere,
         TryLockError::Error(source) => Error::WriteRun { path, source },
     })?;
@@ -896,7 +898,7 @@ pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
 }
 
 /// Those of the threads `ids` whose lock is still held once waited for up to
-/// [`LOCK_PATIENCE`] each, as [`take_run_lock`] waits: up to 0.6 s with [`MAX_LIVE`] locks
+/// [`LOCK_PATIENCE`] each, as [`take_lock`] waits: up to 0.6 s with [`MAX_LIVE`] locks
 /// held for real, paid only by a send about to be refused.
 fn still_held(dir: &Path, ids: Vec<String>) -> Result<Vec<String>> {
     let mut held = Vec::new();
@@ -973,10 +975,10 @@ fn threads_dir(dir: &Path) -> PathBuf {
 /// a moment ago can so look held for microseconds, which a send right after a run ends hit in
 /// the tests. The lock is therefore tried for up to [`LOCK_PATIENCE`]; a window that really
 /// runs an agent holds it far longer.
-fn take_run_lock(active: &File) -> std::result::Result<(), TryLockError> {
+fn take_lock(file: &File) -> std::result::Result<(), TryLockError> {
     let deadline = Instant::now() + LOCK_PATIENCE;
     loop {
-        match active.try_lock() {
+        match file.try_lock() {
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }

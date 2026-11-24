@@ -223,8 +223,8 @@ pub enum Error {
     },
     /// A prompt was sent while the agent's previous turn is still running.
     TurnRunning,
-    /// A run, or a thread's end, was asked for while another window runs an agent in the
-    /// thread.
+    /// A run, or a thread's end, was asked for while another window holds a lock it takes:
+    /// it runs an agent in the thread, ends or forgets the thread, or starts a run.
     RunElsewhere,
     /// A run was asked for while the most runs a repository may have at once are live.
     TooManyRuns {
@@ -450,8 +450,8 @@ impl fmt::Display for Error {
             ),
             Self::RunElsewhere => write!(
                 f,
-                "another Postil window is running an agent in this thread (wait for it, or stop \
-                 it there)"
+                "another Postil window is running an agent in this thread, or starting or ending \
+                 one (wait for it, or stop it there)"
             ),
             Self::TooManyRuns { live } => write!(
                 f,

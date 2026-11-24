@@ -398,12 +398,10 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::TooManyRuns`] while the most runs a repository may have are live, and
-    /// [`Error::RunElsewhere`] while another window holds `runs/active.lock`; as
-    /// [`notes::prompt`];
-    /// [`Error::NoCommit`] in a repository with no commit; [`Error::WriteRun`] when the run
-    /// log cannot be created; and the errors of [`thread::plan`] and [`thread::add`], which
-    /// fail the run.
+    /// As [`Run::create`]: [`Error::TooManyRuns`] while the most runs a repository may have are
+    /// live, and [`Error::RunElsewhere`] while another window holds `runs/active.lock`; as
+    /// [`notes::prompt`]; [`Error::NoCommit`] in a repository with no commit; and the errors
+    /// of [`thread::plan`] and [`thread::add`], which fail the run.
     pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
         let slots = self.slots();
         let prompt = notes::prompt(&self.repo, ids)?;

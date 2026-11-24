@@ -1988,8 +1988,59 @@ fn a_fourth_live_agent_in_a_repository_is_refused_in_any_window() {
         post(&first, &format!("{RUN}/cancel"), &body).0,
         StatusCode::OK
     );
+    for id in ["R1", "R3"] {
+        let view = get_json(&first, &format!("{RUN}?id={id}"));
+        assert_eq!(view["status"], "running", "only R2 was stopped: {id}");
+    }
     let (status, body) = send(&second, &["N4"]);
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[test]
+fn each_answer_reaches_only_the_run_it_names() {
+    let repo = TempRepo::new("run-answer-routing");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "ask");
+    post_note(&site, "a.txt", 1, 1, "one");
+    post_note(&site, "a.txt", 1, 1, "two");
+    send(&site, &["N1"]);
+    assert_eq!(wait_for(&site, &nudges, "waiting")["id"], "R1");
+    send(&site, &["N2"]);
+    assert_eq!(wait_for(&site, &nudges, "waiting")["id"], "R2");
+    assert_eq!(
+        get_json(&site, RUNS)["live"],
+        serde_json::json!(["R1", "R2"])
+    );
+    let question = |id: &str| {
+        let view = get_json(&site, &format!("{RUN}?id={id}"));
+        first_of_kind(&view, "question")["request"].clone()
+    };
+    let (first, second) = (question("R1"), question("R2"));
+    let answer = |run: &str, request: &serde_json::Value| {
+        let body = serde_json::json!({ "run": run, "request": request, "content": null });
+        post(&site, &format!("{RUN}/question"), &body.to_string())
+    };
+
+    let (status, body) = answer("R2", &second);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(wait_for_run(&site, &nudges, "R2")["status"], "ended");
+    assert_eq!(
+        get_json(&site, &format!("{RUN}?id=R1"))["status"],
+        "waiting",
+        "R2's answer left R1's question open"
+    );
+    // R2's agent has no question open: R1's number names none there.
+    let (status, body) = answer("R2", &first);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = answer("R1", &first);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // R1 is no longer the latest run, which `wait_for` follows: it is read by id.
+    let deadline = Instant::now() + WAIT;
+    while get_json(&site, &format!("{RUN}?id=R1"))["status"] != "ended" {
+        assert!(Instant::now() < deadline, "R1 never ended");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

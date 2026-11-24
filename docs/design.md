@@ -575,8 +575,12 @@ and pull requests.
   `<git dir>/postil/threads/R<n>.lock`, held for the run; a lock held is a live run, which
   the count reads by trying each one. Ending a thread, or forgetting it with its last note,
   holds its lock, so no window's agent works in a worktree being freed; another window's run
-  there refuses the ending (409) and keeps a forgotten thread for the next delete.
-  `threads.lock` serializes, across windows, every change to the record. The window marks a
+  there refuses the ending (409) and keeps a forgotten thread for the next delete. An ending
+  counts as a live run for its moment, which a count in another window can read: accepted,
+  since telling the two apart would read the record under `runs/active.lock`. A count about
+  to refuse waits for each lock held, as a send does, because a lock released a moment ago
+  stays held in a process this one forked until it runs its program. `threads.lock`
+  serializes, across windows, every change to the record. The window marks a
   worktree its start thread is still making, and counts it as a run under way: no commit,
   run or ending touches a half-made checkout. `git worktree lock`, so no cleanup removes a
   live worktree, comes with the startup sweep that unlocks it (not built yet).
@@ -774,7 +778,9 @@ the cap on live runs.
   thread (`shell.rs`), and with it the answer or the Stop that would free a place.
   Arbitrary: the engineer reads every result, and more at once is more than one person
   follows. This bounds agent processes, a few hundred MB each; the builds they start can use
-  several GB of memory and disk each, which the cap does not bound.
+  several GB of memory and disk each, which the cap does not bound. A review's next stage
+  counts when it starts: another window can take the place between two stages, and the
+  review then stops, its last stage saying why.
 - **At most 15 worktrees** per repository, Codex's default; Cursor keeps 20. One Codex report
   found 61 worktrees holding about 100 GB.
 - **A free-space floor of 20 GB** on the worktrees' volume, read as
