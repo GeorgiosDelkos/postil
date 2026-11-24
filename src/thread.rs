@@ -150,7 +150,15 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
         source,
     })?;
     repo.add_worktree(&thread.path, &thread.branch, &thread.fork)?;
-    let tree = Repo::open(&thread.path)?;
+    // The worktree is made from here on: what fails now is something it was not given, not a
+    // failed make, which would drop the thread and leave the worktree with no owner.
+    let tree = match Repo::open(&thread.path) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let why = error_chain(&error);
+            return Ok(vec![format!("submodules and ignored folders: {why}")]);
+        }
+    };
 
     let mut skipped = Vec::new();
     if let Err(error) = tree.update_submodules() {

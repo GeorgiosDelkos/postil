@@ -1232,30 +1232,30 @@ impl Runner {
         for thread in gone {
             // In any state: an ended thread whose free failed still has its worktree, which
             // keeps the branch checked out.
-            // Ending a thread keeps a commit the engineer made past Postil's, in the worktree or
-            // on the branch since; forgetting it deletes the branch, and the commit with it.
-            let past = || Error::ThreadChanged {
-                path: thread.path.clone(),
-                found: format!("commits past {}, where Postil left it", thread.tip),
-            };
+            // A commit the engineer made past Postil's in the worktree is refused, naming the
+            // worktree, where they can move it. One on the branch (made there, or kept by a
+            // Discard) keeps the branch: it is the engineer's work now, the thread is forgotten
+            // and the branch is not, so no delete is refused for good.
             let forgotten = thread::check_place(&self.repo, home, &thread)
                 .and_then(|()| thread::check(&thread))
                 .and_then(|head| {
                     if head == thread.tip {
                         Ok(())
                     } else {
-                        Err(past())
+                        Err(Error::ThreadChanged {
+                            path: thread.path.clone(),
+                            found: format!("commits past {}, where Postil left it", thread.tip),
+                        })
                     }
                 })
                 .and_then(|()| thread::free(&self.repo, home, &thread))
                 .and_then(|()| {
-                    if !thread.branch.starts_with("postil/") {
-                        return Ok(());
-                    }
-                    if self.repo.delete_branch_at(&thread.branch, &thread.tip)? {
-                        Ok(())
+                    if thread.branch.starts_with("postil/") {
+                        self.repo
+                            .delete_branch_at(&thread.branch, &thread.tip)
+                            .map(drop)
                     } else {
-                        Err(past())
+                        Ok(())
                     }
                 });
             match forgotten {

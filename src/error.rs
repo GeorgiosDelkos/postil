@@ -269,8 +269,8 @@ pub enum Error {
         /// What is there: the changed files, or the unexpected commit.
         found: String,
     },
-    /// A thread's record names a folder git does not list as a worktree of the repository, so
-    /// Postil does not delete it.
+    /// A thread's record names a folder outside Postil's worktrees folder for the repository,
+    /// or one whose `.git` names no worktree record of it, so Postil does not delete it.
     NotAWorktree {
         /// The folder.
         path: PathBuf,

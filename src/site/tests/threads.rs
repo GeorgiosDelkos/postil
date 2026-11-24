@@ -788,11 +788,16 @@ fn deleting_a_note_keeps_a_branch_the_engineer_committed_to_after_the_thread_end
 
     let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
 
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("commits past"), "{body}");
+    // The branch is the engineer's work now: it stays, and the thread is forgotten, so no
+    // later delete is refused for it.
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         git_out(&repo.root, &["log", "-1", "--format=%s", &branch]),
         "later"
+    );
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
     );
 }
 
@@ -829,11 +834,14 @@ fn a_discarded_thread_keeps_the_engineer_s_commit_when_its_note_goes() {
 
     let (status, body) = delete(&site, "postil://localhost/api/notes?id=N1");
 
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("commits past"), "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         git_out(&repo.root, &["log", "-1", "--format=%s", &branch]),
         "mine"
+    );
+    assert_eq!(
+        get(&site, &format!("{THREAD}?id=R1")),
+        (StatusCode::OK, "null".to_owned())
     );
 }
 
