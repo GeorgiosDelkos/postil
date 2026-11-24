@@ -257,7 +257,7 @@ pub(crate) struct Site {
 }
 
 /// The open project.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Project {
     repo: Arc<Repo>,
     /// The project's runs and the agent kept between them.
@@ -268,7 +268,7 @@ struct Project {
 }
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RepoInfo<'a> {
     name: String,
     root: String,
@@ -279,7 +279,7 @@ struct RepoInfo<'a> {
 }
 
 /// An entry of the reply to `/api/recent`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RecentProject {
     path: String,
     name: String,
@@ -288,7 +288,7 @@ struct RecentProject {
 }
 
 /// The reply to `/api/settings`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView<'a> {
     settings: &'a Settings,
@@ -306,7 +306,7 @@ struct SettingsView<'a> {
 }
 
 /// The body of `PUT /api/settings`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SaveSettings {
     /// The revision of the settings file the change started from.
@@ -315,7 +315,7 @@ struct SaveSettings {
 }
 
 /// An agent as the settings dialog lists it.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentView<'a> {
     name: &'a str,
@@ -326,7 +326,7 @@ struct AgentView<'a> {
 }
 
 /// The reply to `GET /api/layout`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct LayoutView {
     #[serde(flatten)]
     layout: Layout,
@@ -336,14 +336,14 @@ struct LayoutView {
 }
 
 /// The smallest and largest width of each resizable pane, in CSS px.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct LayoutLimits {
     sidebar: [u32; 2],
     tray: [u32; 2],
 }
 
 /// The body of `POST /api/run`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendRun {
     /// The agent's name; the settings' agent when absent.
@@ -353,7 +353,7 @@ struct SendRun {
 }
 
 /// The body of `POST /api/run/permission`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerPermission {
     /// The request's number, as the run's log gives it (the agent's, counting on across the
@@ -364,7 +364,7 @@ struct AnswerPermission {
 }
 
 /// The body of `POST /api/run/review`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewRun {
     /// The run to review, `R3`.
@@ -372,7 +372,7 @@ struct ReviewRun {
 }
 
 /// The body of `PATCH /api/notes?id=N1`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditNote {
     /// The note's new text.
@@ -380,7 +380,7 @@ struct EditNote {
 }
 
 /// The body of `POST /api/run/follow`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FollowRun {
     /// The run to follow up, the latest of its thread: `R3`.
@@ -390,7 +390,7 @@ struct FollowRun {
 }
 
 /// The body of `POST /api/run/question`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerQuestion {
     /// The question's number, as the run's log gives it.
@@ -400,14 +400,14 @@ struct AnswerQuestion {
 }
 
 /// The reply to `/api/run/preview`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct PreviewView {
     /// The prompt's text, exactly as the agent will receive it.
     prompt: String,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FolderRequest {
     path: PathBuf,
@@ -427,7 +427,7 @@ enum LiveRun {
 }
 
 /// The reply to `/api/file`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct FileView<'a> {
     path: &'a str,
     lines: Vec<Vec<Token<'a>>>,
@@ -956,6 +956,21 @@ impl Site {
     }
 }
 
+impl std::fmt::Debug for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `notify` is left out: it is a closure, which has no `Debug`.
+        f.debug_struct("Site")
+            .field("project", &self.project)
+            .field("highlighter", &self.highlighter)
+            .field("bench", &self.bench)
+            .field("recent_file", &self.recent_file)
+            .field("settings_file", &self.settings_file)
+            .field("layout_file", &self.layout_file)
+            .field("agents", &self.agents)
+            .finish_non_exhaustive()
+    }
+}
+
 // The request thread drops the site on `Job::Close`, while the event loop still runs. The
 // event loop exits on `AppEvent::SiteClosed`, or at `QUIT_WAIT` without it. A runner whose
 // agent is still starting is also held by its start thread, so dropping the project alone
@@ -1052,7 +1067,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }
-                | Error::Highlight(_)
+                | Error::Highlight { .. }
                 | Error::Window(_)
                 | Error::Webview(_)
                 | Error::SpawnWorker(_)

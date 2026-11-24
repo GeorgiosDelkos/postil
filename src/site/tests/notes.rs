@@ -218,26 +218,7 @@ fn bad_note_requests_are_refused_and_nothing_is_written() {
     assert!(reply.contains("select the lines again"), "{reply}");
     assert!(!site.repo().unwrap().review_file().exists());
 
-    let request = Request::builder()
-        .method(Method::PUT)
-        .uri(NOTES)
-        .body(Vec::new())
-        .unwrap();
-    assert_eq!(
-        site.respond(&request).status(),
-        StatusCode::METHOD_NOT_ALLOWED
-    );
-}
-
-fn patch(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(Method::PATCH)
-        .uri(uri)
-        .body(body.as_bytes().to_vec())
-        .unwrap();
-    let reply = site.respond(&request);
-    let body = String::from_utf8(reply.body().to_vec()).unwrap();
-    (reply.status(), body)
+    assert_eq!(put(&site, NOTES, "").0, StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[test]

@@ -23,6 +23,8 @@ mod run;
 mod settings;
 mod shell;
 mod site;
+#[cfg(test)]
+mod testing;
 
 pub use crate::error::{Error, error_chain};
 pub use crate::shell::{BenchReport, bench, run};

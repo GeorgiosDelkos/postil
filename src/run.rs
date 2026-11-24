@@ -23,11 +23,13 @@
 //!
 //! Requests from the page run on one request thread (`shell.rs`), the agent's events on its
 //! reader thread, and an agent's start on a thread of its own. A review's next stage starts
-//! on the reader thread of the stage that ended ([`Runner::advance`]). Three locks, always
+//! on the reader thread of the stage that ended ([`Runner::advance`]). Locks are always
 //! taken in this order: the runner's [`Slot`], the repository's snapshot lock (inside
-//! [`Repo::snapshot`], which takes no other), then a run's state; no snapshot is taken under
-//! a run's state. The page is told about every change through `notify`, and fetches what it
-//! has not seen.
+//! [`Repo::snapshot`], which takes no other), a run's state, then the agent connection's
+//! own locks (inside [`Agent`]'s methods, which take none of the others). No snapshot is
+//! taken under a run's state. The slot is held around the agent's calls that answer, cancel
+//! and prompt (`auto_answer`, [`Runner::cancel`], `begin`). The page is told about every
+//! change through `notify`, and fetches what it has not seen.
 
 mod log;
 
@@ -980,6 +982,13 @@ impl Runner {
 
     /// Sends the prompt to a running agent. Its notes are marked sent once the agent shows it
     /// took the turn ([`Run::record_event`]).
+    ///
+    /// A kept agent can send an update for its previous turn after replying to it. One that
+    /// arrives after this prompt was sent counts as the sign, though the agent may not have
+    /// read the prompt yet: ACP's updates carry no turn, so the two cannot be told apart.
+    /// The risk is accepted. The reader reads each line as the agent writes it, and a send
+    /// takes a request from the page, so only an update the agent holds back after its reply
+    /// can land here.
     fn begin(&self, agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt) {
         if !ids.is_empty() {
             run.state().unmarked = Some(ids.to_vec());
@@ -1330,8 +1339,11 @@ fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// Locks a runner's or a run's state. Poisoning is ignored: each change under these locks
-/// is a push or an assignment that a panic cannot leave half done.
+/// Locks a runner's or a run's state. Poisoning is ignored, by choice. A change under these
+/// locks can set several fields (`RunState::apply` and `Run::write` update the summary and
+/// the entries; a send sets the slot's agent, run and chain), so a panic midway can leave
+/// them out of step. Treating the lock as poisoned instead would make every later request
+/// that touches the project panic too; a run shown out of step is the smaller harm.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
