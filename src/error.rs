@@ -248,6 +248,12 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// A thread's worktree would sit under a folder whose path holds a colon, which
+    /// `GIT_CEILING_DIRECTORIES` cannot name, so git there could search above it.
+    ColonInPath {
+        /// The worktree's path.
+        path: PathBuf,
+    },
     /// The record of threads, `threads.json`, cannot be read or parsed.
     ReadThreads {
         /// The file's path.
@@ -461,6 +467,12 @@ impl fmt::Display for Error {
                 "cannot make, move or remove {} (check that the folder above it is writable)",
                 path.display()
             ),
+            Self::ColonInPath { path } => write!(
+                f,
+                "cannot put an agent's worktree at {}: git cannot be kept from searching above \
+                 a folder whose path holds a colon (rename the folder or volume that has it)",
+                path.display()
+            ),
             Self::ReadThreads { path, problem } => write!(
                 f,
                 "cannot read the threads in {}: {problem} (fix the file, or move it aside: \
@@ -558,6 +570,7 @@ impl std::error::Error for Error {
             | Self::NoSuchRequest
             | Self::NoSuchRun { .. }
             | Self::NoCommit
+            | Self::ColonInPath { .. }
             | Self::ReadThreads { .. }
             | Self::ThreadChanged { .. }
             | Self::NotAWorktree { .. }

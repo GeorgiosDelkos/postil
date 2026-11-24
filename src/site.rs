@@ -1143,9 +1143,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AgentProtocol(_) => StatusCode::BAD_GATEWAY,
                 // Well-formed requests for what cannot be done. The page tells a missing
                 // repository apart: it offers to make the folder one.
-                Error::NotARepository { .. } | Error::FileTooLarge { .. } | Error::NoCommit => {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                }
+                Error::NotARepository { .. }
+                | Error::FileTooLarge { .. }
+                | Error::NoCommit
+                | Error::ColonInPath { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                 Error::SpawnGit(_)
                 | Error::Git { .. }
                 | Error::Read { .. }

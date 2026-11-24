@@ -2346,7 +2346,7 @@ fn a_reviewer_ended_by_force_has_its_edits_undone() {
     let deadline = Instant::now() + WAIT;
     while fs::read_to_string(worktree.join("a.txt")).unwrap() != "rewritten\n" {
         assert!(Instant::now() < deadline, "the reviewer never wrote");
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     // The second Stop ends the agent, whose end is never reported: the undo runs there.

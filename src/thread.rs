@@ -103,7 +103,7 @@ struct Threads {
 ///
 /// # Errors
 ///
-/// [`Error::NoHome`] when `home` is `None`; [`Error::WriteWorktree`] when the worktree's
+/// [`Error::NoHome`] when `home` is `None`; [`Error::ColonInPath`] when the worktree's
 /// path would hold a colon; and the git error when the branch `HEAD` is on cannot be read.
 pub(crate) fn plan(
     repo: &Repo,
@@ -119,17 +119,10 @@ pub(crate) fn plan(
     let folder = id.to_lowercase();
     let path = worktrees_dir(repo.root(), &home).join(&folder);
     // git cannot be kept from searching up out of a folder under one with a colon in its
-    // path (`repo::run_git_with`). `repo_name` drops the colons of the repository's name, so
-    // only Postil's home, or a volume's name, can hold one.
+    // path (`repo::run_git_with`). `repo_name` turns the colons of the repository's name into
+    // dashes, so only Postil's home, or a volume's name, can hold one.
     if path.as_os_str().as_bytes().contains(&b':') {
-        return Err(Error::WriteWorktree {
-            path,
-            source: io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the path holds a colon, which git cannot keep agents' git calls inside \
-                 (rename the folder or volume that has it)",
-            ),
-        });
+        return Err(Error::ColonInPath { path });
     }
     let base = Some(repo.branch()?).filter(|branch| !branch.is_empty());
     Ok(Thread {
@@ -740,7 +733,7 @@ mod tests {
 
         // One in Postil's home cannot be changed, so no thread is made there.
         let error = plan(&repo, Some(&dir.path().join("ho:me")), "R1", "abc", "t").unwrap_err();
-        assert!(matches!(error, Error::WriteWorktree { .. }), "{error:?}");
+        assert!(matches!(error, Error::ColonInPath { .. }), "{error:?}");
     }
 
     #[test]
