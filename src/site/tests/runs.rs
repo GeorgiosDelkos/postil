@@ -2328,6 +2328,42 @@ fn a_reviewer_cut_short_has_its_edits_undone_all_the_same() {
 }
 
 #[test]
+fn a_reviewer_ended_by_force_has_its_edits_undone() {
+    let repo = TempRepo::new("run-review-forced");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    set_reviewers(&site, "plain", &[("First", "reviewer-writes-hangs")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    let deadline = Instant::now() + WAIT;
+    while fs::read_to_string(worktree.join("a.txt")).unwrap() != "rewritten\n" {
+        assert!(Instant::now() < deadline, "the reviewer never wrote");
+        std::thread::yield_now();
+    }
+
+    // The second Stop ends the agent, whose end is never reported: the undo runs there.
+    let cancel = format!("{RUN}/cancel");
+    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+    site.runner().unwrap().backdate_stop();
+    assert_eq!(post(&site, &cancel, "").0, StatusCode::OK);
+
+    let stage = get_json(&site, &format!("{RUN}?id=R2"));
+    assert_eq!(stage["status"], "failed", "{stage}");
+    let problem = stage["problem"].as_str().unwrap_or_default();
+    assert!(problem.contains("its changes were undone"), "{stage}");
+    assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
 fn a_kept_reviewer_that_exits_later_leaves_the_engineer_s_work_alone() {
     let repo = TempRepo::new("run-review-exits-later");
     repo.write("a.txt", "a\n");
