@@ -15,6 +15,8 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+#[cfg(test)]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -129,22 +131,36 @@ impl QuotaReport {
 type ProbeFn = Arc<dyn Fn(&str, &OsStr) -> QuotaReport + Send + Sync>;
 
 /// Manages cached and in-flight provider quota probes across requests.
-#[derive(Clone)]
+///
+/// # Invariants
+///
+/// Each cache entry names the id of the latest probe started for it, and only that probe may
+/// store its result. Ids are never reused, so a slow probe that a newer one replaced (after
+/// [`LOADING_TIMEOUT`], or a Refresh of a finished entry) cannot overwrite the newer result,
+/// whichever finishes last.
 pub(crate) struct QuotaPoller {
     probe: ProbeFn,
     state: Arc<Mutex<PollerState>>,
+    /// How long a probe may stay in flight before the next poll replaces it. Always
+    /// [`LOADING_TIMEOUT`] outside tests.
+    loading_timeout: Duration,
+    /// Every probe thread started, so a test can wait for the probes it started.
+    #[cfg(test)]
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Default)]
 struct PollerState {
-    generation: u64,
+    /// The id the next probe gets.
+    next_probe: u64,
     entries: HashMap<String, CachedQuota>,
 }
 
 struct CachedQuota {
     report: QuotaReport,
     updated: Instant,
-    generation: u64,
+    /// Id of the latest probe started for this entry.
+    probe: u64,
 }
 
 impl QuotaPoller {
@@ -158,6 +174,9 @@ impl QuotaPoller {
         Self {
             probe: Arc::new(probe),
             state: Arc::new(Mutex::new(PollerState::default())),
+            loading_timeout: LOADING_TIMEOUT,
+            #[cfg(test)]
+            threads: Mutex::new(Vec::new()),
         }
     }
 
@@ -171,8 +190,8 @@ impl QuotaPoller {
         self.query(names, search_path, false)
     }
 
-    /// Invalidates cached quota reports, bumps the generation so in-flight older probes are
-    /// dropped, and starts fresh probes for all named agents.
+    /// Starts fresh probes for all named agents, except one whose probe is still in flight
+    /// within [`LOADING_TIMEOUT`]: that probe's result is the fresh one.
     pub(crate) fn refresh(
         &self,
         names: &[&str],
@@ -191,77 +210,92 @@ impl QuotaPoller {
         let mut results = HashMap::with_capacity(names.len());
         {
             let mut state = lock(&self.state);
-            if force {
-                state.generation += 1;
-                state.entries.clear();
-            }
-            let generation = state.generation;
             for &name in names {
-                let fresh = state.entries.get(name).is_some_and(|entry| {
-                    entry.generation == generation
-                        && match entry.report.status {
-                            QuotaStatus::Loading => entry.updated.elapsed() < LOADING_TIMEOUT,
-                            QuotaStatus::Ok | QuotaStatus::Unavailable | QuotaStatus::Error => {
-                                entry.updated.elapsed() < CACHE_TTL
-                            }
+                let keep = state.entries.get(name).is_some_and(|entry| {
+                    let age = entry.updated.elapsed();
+                    match entry.report.status {
+                        QuotaStatus::Loading => age < self.loading_timeout,
+                        QuotaStatus::Ok | QuotaStatus::Unavailable | QuotaStatus::Error => {
+                            !force && age < CACHE_TTL
                         }
-                });
-                if fresh {
-                    results.insert(name.to_owned(), state.entries[name].report.clone());
-                } else {
-                    let loading = QuotaReport::loading();
-                    state.entries.insert(
-                        name.to_owned(),
-                        CachedQuota {
-                            report: loading.clone(),
-                            updated: Instant::now(),
-                            generation,
-                        },
-                    );
-                    results.insert(name.to_owned(), loading);
-                    to_spawn.push((name.to_owned(), generation));
-                }
-            }
-        }
-
-        let path = search_path.to_owned();
-        for (name, generation) in to_spawn {
-            let probe = Arc::clone(&self.probe);
-            let shared = Arc::clone(&self.state);
-            let path = path.clone();
-            let agent_name = name.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("quota-{name}"))
-                .spawn(move || {
-                    let report = probe(&agent_name, &path);
-                    let mut state = lock(&shared);
-                    if state.generation == generation {
-                        state.entries.insert(
-                            agent_name,
-                            CachedQuota {
-                                report,
-                                updated: Instant::now(),
-                                generation,
-                            },
-                        );
                     }
                 });
-            if spawned.is_err() {
-                let mut state = lock(&self.state);
-                if state.generation == generation {
-                    state.entries.insert(
-                        name,
-                        CachedQuota {
-                            report: QuotaReport::error("could not start quota check thread"),
-                            updated: Instant::now(),
-                            generation,
-                        },
-                    );
+                if keep {
+                    results.insert(name.to_owned(), state.entries[name].report.clone());
+                    continue;
                 }
+
+                let probe = state.next_probe;
+                state.next_probe += 1;
+                let loading = QuotaReport::loading();
+                state.entries.insert(
+                    name.to_owned(),
+                    CachedQuota {
+                        report: loading.clone(),
+                        updated: Instant::now(),
+                        probe,
+                    },
+                );
+                results.insert(name.to_owned(), loading);
+                to_spawn.push((name.to_owned(), probe));
             }
         }
 
+        for (name, probe) in to_spawn {
+            self.spawn_probe(&name, probe, search_path);
+        }
         results
+    }
+
+    /// Starts probe number `probe` for agent `name` on its own thread.
+    fn spawn_probe(&self, name: &str, probe: u64, search_path: &OsStr) {
+        let probe_fn = Arc::clone(&self.probe);
+        let shared = Arc::clone(&self.state);
+        let path = search_path.to_owned();
+        let agent_name = name.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name(format!("quota-{name}"))
+            .spawn(move || {
+                let report = probe_fn(&agent_name, &path);
+                store(&shared, &agent_name, probe, report);
+            });
+        match spawned {
+            Ok(handle) => {
+                #[cfg(test)]
+                lock(&self.threads).push(handle);
+                // Outside tests nothing waits for a probe: it reports through `store`.
+                #[cfg(not(test))]
+                drop(handle);
+            }
+            Err(_) => store(
+                &self.state,
+                name,
+                probe,
+                QuotaReport::error("could not start quota check thread"),
+            ),
+        }
+    }
+
+    /// Replaces how long a probe may stay in flight, so a test can start a second probe for
+    /// an entry while the first still runs.
+    #[cfg(test)]
+    fn with_loading_timeout(mut self, timeout: Duration) -> Self {
+        self.loading_timeout = timeout;
+        self
+    }
+
+    /// Takes the handles of every probe thread started so far, in start order.
+    #[cfg(test)]
+    fn take_probes(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut *lock(&self.threads))
+    }
+
+    /// Waits until every probe thread started so far has stored or dropped its result.
+    #[cfg(test)]
+    pub(crate) fn join_probes(&self) {
+        for handle in self.take_probes() {
+            handle.join().expect("a quota probe thread panicked");
+        }
     }
 }
 
@@ -269,9 +303,21 @@ impl fmt::Debug for QuotaPoller {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = lock(&self.state);
         f.debug_struct("QuotaPoller")
-            .field("generation", &state.generation)
+            .field("probes_started", &state.next_probe)
             .field("cached", &state.entries.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Stores `report` as agent `name`'s result when probe number `probe` is still the latest
+/// probe for that entry, and drops it otherwise.
+fn store(state: &Mutex<PollerState>, name: &str, probe: u64, report: QuotaReport) {
+    let mut state = lock(state);
+    if let Some(entry) = state.entries.get_mut(name)
+        && entry.probe == probe
+    {
+        entry.report = report;
+        entry.updated = Instant::now();
     }
 }
 
@@ -1180,46 +1226,77 @@ mod tests {
         assert!((report.windows[1].used_percent - 25.0).abs() < 1e-6);
     }
 
-    #[test]
-    fn poller_drops_stale_probe_results_after_refresh() {
+    /// A probe whose first call waits until `release` is sent to it, and that reports which
+    /// call each result came from.
+    fn gated_poller() -> (QuotaPoller, mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (release, gate) = mpsc::channel::<()>();
         let (entered, started) = mpsc::channel::<()>();
         let gate = Mutex::new(Some((gate, entered)));
-        let poller = QuotaPoller::new(move |name, _| {
+        let calls = Mutex::new(0_u32);
+        let poller = QuotaPoller::new(move |_, _| {
+            let call = {
+                let mut calls = lock(&calls);
+                *calls += 1;
+                *calls
+            };
             let first = lock(&gate).take();
-            match first {
-                Some((gate, entered)) => {
-                    entered.send(()).unwrap();
-                    gate.recv().unwrap();
-                    QuotaReport::unavailable(format!("old-{name}"))
-                }
-                None => QuotaReport::unavailable(format!("new-{name}")),
+            if let Some((gate, entered)) = first {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
             }
+            QuotaReport::unavailable(format!("call {call}"))
         });
+        (poller, started, release)
+    }
 
-        let initial = poller.snapshot(&["Claude"], OsStr::new(""));
-        assert_eq!(initial["Claude"].status, QuotaStatus::Loading);
-        started.recv().unwrap();
+    fn message(report: &HashMap<String, QuotaReport>) -> Option<&str> {
+        report["Claude"].message.as_deref()
+    }
 
-        let _ = poller.refresh(&["Claude"], OsStr::new(""));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let snap = poller.snapshot(&["Claude"], OsStr::new(""));
-            if snap["Claude"].status != QuotaStatus::Loading {
-                assert_eq!(snap["Claude"].message.as_deref(), Some("new-Claude"));
-                break;
-            }
-            assert!(Instant::now() < deadline, "new probe did not finish");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        release.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        let final_snap = poller.snapshot(&["Claude"], OsStr::new(""));
+    #[test]
+    fn poller_drops_the_result_of_a_probe_that_a_newer_one_replaced() {
+        let (poller, started, release) = gated_poller();
+        let poller = poller.with_loading_timeout(Duration::ZERO);
+        let path = OsStr::new("");
+
         assert_eq!(
-            final_snap["Claude"].message.as_deref(),
-            Some("new-Claude"),
-            "older probe result was dropped"
+            poller.snapshot(&["Claude"], path)["Claude"].status,
+            QuotaStatus::Loading
         );
+        started.recv().unwrap();
+        // The first probe is still in flight, and a zero loading timeout lets this poll
+        // start a second one.
+        let _ = poller.snapshot(&["Claude"], path);
+        let mut probes = poller.take_probes();
+        assert_eq!(probes.len(), 2);
+        probes.pop().unwrap().join().unwrap();
+
+        release.send(()).unwrap();
+        probes.pop().unwrap().join().unwrap();
+        assert_eq!(
+            message(&poller.snapshot(&["Claude"], path)),
+            Some("call 2"),
+            "the replaced first probe finished last and must not overwrite the second"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_a_probe_in_flight_and_reprobes_a_finished_entry() {
+        let (poller, started, release) = gated_poller();
+        let path = OsStr::new("");
+
+        let _ = poller.snapshot(&["Claude"], path);
+        started.recv().unwrap();
+        let during = poller.refresh(&["Claude"], path);
+        assert_eq!(during["Claude"].status, QuotaStatus::Loading);
+        release.send(()).unwrap();
+        poller.join_probes();
+        assert_eq!(message(&poller.snapshot(&["Claude"], path)), Some("call 1"));
+
+        let after = poller.refresh(&["Claude"], path);
+        assert_eq!(after["Claude"].status, QuotaStatus::Loading);
+        poller.join_probes();
+        assert_eq!(message(&poller.snapshot(&["Claude"], path)), Some("call 2"));
     }
 
     #[test]
