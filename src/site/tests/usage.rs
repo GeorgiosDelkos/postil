@@ -91,6 +91,46 @@ fn usage_lists_installed_built_in_agents_with_live_quotas_and_refresh() {
 }
 
 #[test]
+fn a_built_in_agent_with_history_but_no_program_is_not_probed_and_says_not_installed() {
+    let repo = TempRepo::new("usage-uninstalled");
+    let bin = repo.root.join(".git/empty-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let config = repo.config();
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("usage.jsonl"),
+        concat!(
+            r#"{"version":1,"runId":"R1","repo":"/elsewhere","agent":"Claude","#,
+            r#""origin":"notes","status":"ended","startedAt":1,"endedAt":2}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe_calls = Arc::clone(&calls);
+    let poller = QuotaPoller::new(move |_, _| {
+        probe_calls.fetch_add(1, Ordering::SeqCst);
+        QuotaReport::unavailable("probed")
+    });
+    let search = OsString::from(&bin);
+    let scanner = Scanner::new(move || search.clone());
+    let _ = scanner.wait();
+    let site = Site::new(Some(&config), None, None, scanner, quiet()).with_quota_poller(poller);
+
+    let body = get_json(&site, "postil://localhost/api/usage?scope=all&range=all");
+    let claude = &body["agents"][0];
+    assert_eq!(claude["name"], "Claude", "{body}");
+    assert_eq!(claude["builtIn"], true);
+    assert_eq!(claude["quota"]["message"], "Not installed on PATH");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an absent program is never probed"
+    );
+}
+
+#[test]
 fn a_finished_run_records_model_tokens_and_cost_that_survive_note_deletion() {
     let repo = TempRepo::new("usage-run");
     repo.write("src/a.rs", "one\ntwo\nthree\n");

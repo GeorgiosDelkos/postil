@@ -161,34 +161,34 @@ impl QuotaPoller {
         }
     }
 
-    /// Returns the latest quota report for each requested `(name, built_in)` agent, starting
-    /// background probes for any built-in agent whose cache entry is missing or stale.
+    /// Returns the latest quota report for each named agent, starting background probes for
+    /// any agent whose cache entry is missing or stale.
     pub(crate) fn snapshot(
         &self,
-        agents: &[(&str, bool)],
+        names: &[&str],
         search_path: &OsStr,
     ) -> HashMap<String, QuotaReport> {
-        self.query(agents, search_path, false)
+        self.query(names, search_path, false)
     }
 
     /// Invalidates cached quota reports, bumps the generation so in-flight older probes are
-    /// dropped, and starts fresh probes for all requested built-in agents.
+    /// dropped, and starts fresh probes for all named agents.
     pub(crate) fn refresh(
         &self,
-        agents: &[(&str, bool)],
+        names: &[&str],
         search_path: &OsStr,
     ) -> HashMap<String, QuotaReport> {
-        self.query(agents, search_path, true)
+        self.query(names, search_path, true)
     }
 
     fn query(
         &self,
-        agents: &[(&str, bool)],
+        names: &[&str],
         search_path: &OsStr,
         force: bool,
     ) -> HashMap<String, QuotaReport> {
         let mut to_spawn: Vec<(String, u64)> = Vec::new();
-        let mut results = HashMap::with_capacity(agents.len());
+        let mut results = HashMap::with_capacity(names.len());
         {
             let mut state = lock(&self.state);
             if force {
@@ -196,14 +196,7 @@ impl QuotaPoller {
                 state.entries.clear();
             }
             let generation = state.generation;
-            for &(name, built_in) in agents {
-                if !built_in {
-                    results.insert(
-                        name.to_owned(),
-                        QuotaReport::unavailable("Custom agent — no provider quota source"),
-                    );
-                    continue;
-                }
+            for &name in names {
                 let fresh = state.entries.get(name).is_some_and(|entry| {
                     entry.generation == generation
                         && match entry.report.status {
@@ -1238,15 +1231,14 @@ mod tests {
             }
         });
 
-        let initial = poller.snapshot(&[("Claude", true), ("Custom", false)], OsStr::new(""));
+        let initial = poller.snapshot(&["Claude"], OsStr::new(""));
         assert_eq!(initial["Claude"].status, QuotaStatus::Loading);
-        assert_eq!(initial["Custom"].status, QuotaStatus::Unavailable);
         started.recv().unwrap();
 
-        let _ = poller.refresh(&[("Claude", true)], OsStr::new(""));
+        let _ = poller.refresh(&["Claude"], OsStr::new(""));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snap = poller.snapshot(&[("Claude", true)], OsStr::new(""));
+            let snap = poller.snapshot(&["Claude"], OsStr::new(""));
             if snap["Claude"].status != QuotaStatus::Loading {
                 assert_eq!(snap["Claude"].message.as_deref(), Some("new-Claude"));
                 break;
@@ -1256,7 +1248,7 @@ mod tests {
         }
         release.send(()).unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        let final_snap = poller.snapshot(&[("Claude", true)], OsStr::new(""));
+        let final_snap = poller.snapshot(&["Claude"], OsStr::new(""));
         assert_eq!(
             final_snap["Claude"].message.as_deref(),
             Some("new-Claude"),
@@ -1267,12 +1259,12 @@ mod tests {
     #[test]
     fn poller_recovers_if_a_probe_thread_panics() {
         let poller = QuotaPoller::new(|_, _| panic!("simulated probe panic"));
-        let initial = poller.snapshot(&[("Claude", true)], OsStr::new(""));
+        let initial = poller.snapshot(&["Claude"], OsStr::new(""));
         assert_eq!(initial["Claude"].status, QuotaStatus::Loading);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snap = poller.snapshot(&[("Claude", true)], OsStr::new(""));
+            let snap = poller.snapshot(&["Claude"], OsStr::new(""));
             if snap["Claude"].status != QuotaStatus::Loading {
                 assert_eq!(snap["Claude"].status, QuotaStatus::Error);
                 break;

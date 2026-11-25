@@ -1289,27 +1289,27 @@ impl Site {
             }
         }
 
-        let probe_targets: Vec<(&str, bool)> = entries
+        // Only an installed built-in agent has a provider quota source to probe.
+        let probe_names: Vec<&str> = entries
             .iter()
-            .map(|(name, built_in, found)| (name.as_str(), *built_in && found.is_some()))
+            .filter(|(_, built_in, found)| *built_in && found.is_some())
+            .map(|(name, _, _)| name.as_str())
             .collect();
         let mut quotas = if refresh {
-            self.quotas.refresh(&probe_targets, search_path)
+            self.quotas.refresh(&probe_names, search_path)
         } else {
-            self.quotas.snapshot(&probe_targets, search_path)
+            self.quotas.snapshot(&probe_names, search_path)
         };
 
         entries
             .into_iter()
             .map(|(name, built_in, found)| {
                 let enabled = settings.is_enabled(&name);
-                let quota = quotas.remove(&name).unwrap_or_else(|| {
-                    if built_in {
-                        QuotaReport::unavailable("Not installed on PATH")
-                    } else {
-                        QuotaReport::unavailable("Custom agent — no provider quota source")
-                    }
-                });
+                let quota = match quotas.remove(&name) {
+                    Some(quota) => quota,
+                    None if built_in => QuotaReport::unavailable("Not installed on PATH"),
+                    None => QuotaReport::unavailable("Custom agent — no provider quota source"),
+                };
                 let activity = activities.remove(&name).unwrap_or_default();
                 UsageAgentView {
                     name,
