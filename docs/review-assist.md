@@ -499,7 +499,8 @@ Postil is an MCP client itself: `src/memory.rs` starts one `hippius-mem` process
 on first use and calls `recall`, `get`, `history`, `refresh` and `remember` over its pipes,
 with hand-written serde types as for ACP. The calls run on a thread of their own, never on
 the one thread that answers the page: a slow recall would otherwise freeze every view. A
-route answers "pending" and the page is nudged when the result is in, as the agent scan does.
+route answers "pending" and the page asks again until the result is in. (The agent scan's
+page polls every 250 ms; how memory's page learns it is the plan's open item 7.)
 
 - **A Memory tab in the tray** (Notes, Run, Memory) lists the memories recalled for the open
   file: one card each with the summary, the author and the age. The query is the file's path

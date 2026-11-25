@@ -20,9 +20,11 @@ Found while reading the code. Each is applied to `docs/review-assist.md` with th
    lookup, the per-thread lock that counts live runs, `undo_proposer` (it resets to
    `thread.branch` and `thread.tip`), `thread::open` (it refuses a branch outside `postil/`),
    and `free_disk` (it counts `threads.json`). A shared detached worktree needs a second
-   variant of each. A read-only thread reuses all of them: an ask's follow-ups, eviction and
-   the caps then work with no new code. The cost accepted: one `git worktree add` per ask
-   (no build folders are cloned for a read-only thread).
+   variant of each. A read-only thread reuses all of them: eviction and the caps then work
+   with no new code. Follow-ups need one change: `launch` takes read-only from the thread's
+   mode, since `Runner::follow_up` carries nothing of the kind (step 7.6). The cost
+   accepted: one `git worktree add` per ask (no build folders are cloned for a read-only
+   thread).
 2. **Evidence needs data the log does not keep.** `ToolCall` in `src/acp/wire.rs` declares no
    `rawInput`, so an execute call's command line is dropped at parse, and no exit status is
    kept: only `status` completed or failed. Step 7.2 keeps the command and the exit code:
@@ -40,7 +42,10 @@ Found while reading the code. Each is applied to `docs/review-assist.md` with th
    pressed.
 6. **Memory calls never run on the request thread.** `page-requests` is one thread
    (`src/shell.rs:345`), so a slow `recall` would freeze the page. Memory uses the
-   `Scanner` pattern (`src/agents.rs:88`): a worker, a pending reply, a nudge.
+   `Scanner` pattern (`src/agents.rs:88`): a worker and a pending reply. `Scanner` sends the
+   page no nudge: the settings dialog asks again every 250 ms (`ui/settings-dialog.js:23`),
+   and the only nudge is `RunChanged`, which syncs runs alone. How the page learns a result
+   is in is open ("What this plan leaves open", 7).
 7. **Findings are drawn beside changed lines.** The changes view shows only notes today. The
    memory flag and a disputed risk rating both need a finding beside its line (step 7.5).
 
@@ -77,6 +82,9 @@ step named.
 
   `settings::parse` refuses every version but the current one, older ones included
   (`src/settings.rs:349`). Step 8.2 changes it to read older versions first.
+  `files::load_versioned` drops older versions too (`src/files.rs:44`), and `layout::load`
+  then falls back to the default widths: step 8.3 reads a version 1 `layout.json` itself,
+  with `map` defaulted, and tests `a_version_1_layout_keeps_its_widths`.
 - **A new run log entry kind** touches a fixed list: the `Entry` variant, `RunState::apply`
   (`log.rs:767`), `RunView` when the page needs it, and on the page the redraw keys
   `threadKey` and `noteDialogKey` (`ui/status.js:330`, `:375`) and the card signature
@@ -169,12 +177,16 @@ step named.
   engineer's words alone.
 - New `src/report.rs`: `Report`, `Step`, `Risk`, `Check`, and
   `read(reply: &str, root: &Path) -> Result<Report, String>` over `last_json_block`.
-- `src/run.rs`, `on_event` (`:1954`): today `decide` runs only for a review stage. Add the
-  branch for a run that ended well and whose header has no `review`: read the report and
-  `run.record(Entry::Report { .. })` before `record_event` logs `Ended` (`:2041`), which
-  drops the log handle.
+- `src/run.rs`, `on_event` (`:1954`): for a run that ended well whose header has no
+  `review` (and, from 7.6, is not read-only), read the report and
+  `run.record(Entry::Report { .. })` after the `Slots` lock is dropped, beside
+  `record_end_snapshot` (`:2033`) and before `record_event` logs `Ended`, which drops the log
+  handle. Not inside the `slots()` block where `decide` runs: reading the report may read
+  files, and that lock is the whole runner's. The reply is `run.state().reply()`, as
+  `end_stage` reads it.
 - `src/run/log.rs`: `Entry::Report { report: Option<Report>, problem: Option<String> }`,
-  `RunView.report`, `LOG_VERSION` 6.
+  `LOG_VERSION` 6. No `RunView` field: the page reads the last entry of kind `report`, as it
+  reads `findings` (`ui/status.js:270`).
 - `src/review.rs`, `context` (`:137`): the reviewers' prompt includes the report, and
   `propose_prompt` asks for a finding on a hunk rated too low.
 - `src/site/tests/page_e2e.rs`: `POST /new` takes `scenario` and `files`.
@@ -189,14 +201,19 @@ step named.
   reply that quotes the prompt's instructions cannot match, because the prompt holds no
   example block.
 - A step whose `path` is absolute or inside the worktree: made relative as `Place` paths are
-  (`log.rs:1125`). A path that leaves the repository is dropped and counted.
-- `lines` missing (a deleted file has no new side): the step covers the whole file. `lines`
-  reversed, zero, or past the end: the step is dropped and counted.
+  (`log.rs:1125`). A path that leaves the repository is dropped and counted: after
+  `relative`, one that is still absolute or has a `..` component (`relative` returns a path
+  outside the root unchanged). The unit table holds `../x`, `src/../../x` and `/etc/x`.
+- A deleted file has no new side: how its `lines` are read is open ("What this plan leaves
+  open", 12). `lines` reversed or zero: the step is dropped and counted; past the end, open
+  item 13. A step that names a binary or non-UTF-8 file keeps its path.
 - An unknown `risk`: `eyes`. The safe reading of a rating Postil does not know.
 - Limits: 200 steps, 50 checks, 300 characters of `why`: more is cut and counted. The numbers
   are arbitrary and guard the dialog, not the agent.
 - The reply still holds the block: the run dialog's `replyPart` (`ui/run-dialog.js:391`)
-  draws the reply without it, through a pure `withoutReport(text)`.
+  draws the reply without it, through a pure `withoutReport(text)` that finds the block by
+  `last_json_block`'s rule (a fence that starts a line, the last that parses), and only when
+  the run has a report entry: a reply with a json block and no report keeps the block.
 - `agentSaid` (`ui/status.js:85`) reads `N3: ...` lines: a report after them must not change
   a note's Addressed status.
 - The run dialog tells a kept agent's follow-up from a fresh agent's by
@@ -214,8 +231,9 @@ step named.
 - Unit, `report::read`: a table of the path and line cases above; a property test that no
   input panics and that every kept step's range is ordered.
 - `a_follow_up_asks_for_a_report_again`: catches the reminder missing from the kept-agent path.
-- Page: `withoutReport` (block last, block absent, two blocks), `threadKey` changes when a
-  report arrives, `agentSaid` with a report after the note lines.
+- Page: `withoutReport` (block last, block absent, two blocks, text after the block: spike S2
+  saw it in 3 of 10 Grok runs, a later block that is not an object), `threadKey` changes
+  when a report arrives, `agentSaid` with a report after the note lines.
 
 ### 7.4 Evidence on the run
 
@@ -226,6 +244,9 @@ step named.
   `failed` whatever the item's status (Grok ends a failure as `completed`). A claim matches
   the last execute item whose command equals it after trimming and collapsing spaces; with no
   command kept, whose title equals it or equals it wrapped in backticks.
+- `ui/run.js`, `foldMore`: a tool item gains `endedAt`, the index of the entry that gave it
+  a final status. Items keep the order calls started, so without it an edit started before a
+  check and finished after it could not mark the check stale.
 - `ui/run-dialog.js`, `runDetail` (`:212`): a Checks section after Steps, each row opening
   its step (`openDetail({kind: "step", ...})`), then the run's other commands.
 - `ui/run.js`, `toolRow`: a step with a non-zero `exit` shows as failed. It reads `status`
@@ -237,18 +258,21 @@ step named.
 
 - The same command run three times: the last run is the evidence.
 - A command still pending or in progress when the turn ended: `unfinished`.
-- An edit, delete or move call that completed after the check: `stale`. A formatter that
+- An edit, delete or move call whose `endedAt` is after the check's: `stale`. A formatter that
   rewrites files is an execute call Postil cannot see into: accepted, and the section's hint
   says "an edit after it" so the claim is exact.
 - The claim says passed and the log says failed: the log's state shows, with "the author
   says passed" beside it.
+- A check that failed and was edited after, and the card's worst-state order: open ("What
+  this plan leaves open", 14). Checks on a follow-up's turn: open item 16.
 - No report: the section lists the commands the run ran, with no claims.
 - A run with no command: "No command was run".
 
 **Tests** (`ui/run.test.js`): one per state; the last of repeated commands wins; a claim that
 differs only in spacing matches; a claim that is a prefix of a command does not (catches
-`cargo test` matching `cargo test --no-run`); stale needs an edit after, not before. One e2e:
-the Checks row opens its step.
+`cargo test` matching `cargo test --no-run`); stale needs an edit after, not before; an edit
+started before the check and finished after it is stale. One e2e: the Checks row opens its
+step.
 
 ### 7.5 Walkthrough, risk, and findings in the changes view
 
@@ -263,33 +287,44 @@ the Checks row opens its step.
   and findings from its caller (`ui/app.js:123`).
 - Findings beside lines: `findingsByLine(file, findings)` in `patch.js`, drawn as cards under
   the line as notes are (`:100`).
-- Keys `n` and `p` in the view's keydown (`:152`), which handles only Escape today.
+- Keys `n` and `p` in the view's keydown (`:152`), which handles only Escape today. The
+  header controls sit in the pane's `.pane-header`, outside `#changes-view`
+  (`ui/index.html:39`), so each gives focus back to the view after acting.
+- A second header control, All or Eyes first (the design, "Guided walkthrough and risk"):
+  it reorders steps and never hides one.
 
 **Edge cases**
 
 - A hunk two steps overlap: it belongs to the first, and the second says "shown in step N".
 - A step no hunk overlaps (the agent named unchanged lines): listed at the end as "names no
   changed lines", so a wrong report is visible.
-- A deleted file's hunk has no new-side lines: a step matches it by path alone.
+- A hunk with no new-side lines (a deleted file, or a modified file emptied, `+0,0`): a step
+  matches it by path alone.
 - A binary file has no hunks: one row per file in whichever group names its path.
 - The 400-line limit (`LINES_SHOWN`, `:14`) is per file today. In walkthrough order it is
   per hunk group, with the same "Show the other N lines".
 - `mechanical` hunks start folded. A note or a finding on a folded hunk opens it: nothing a
   reviewer wrote is hidden.
-- A finding that disputes a rating: the hunk shows as `eyes` whatever the report said.
-- A finding with a line outside every hunk: listed under the file's header.
+- A finding that disputes a rating: the hunk shows as `eyes` whatever the report said. How a
+  finding is known to dispute one is open ("What this plan leaves open", 15).
+- A finding with a line outside every hunk, or no line: listed under the file's header; in
+  walkthrough order, in the group of the first step that names its file, else under "Not in
+  the walkthrough". A finding with no path: at the top of the view.
 - A thread of several runs keeps Files order (design). The control is disabled there with a
   hint, not hidden.
-- `n` at the last step and `p` at the first do nothing. Neither fires while typing in a
-  composer inside the view.
+- `n` at the last step and `p` at the first do nothing, and neither fires with a modifier
+  held. (No composer opens inside the view: a click on a line number closes it first,
+  `ui/changes-view.js:145`.)
 - Reduce Motion: `n` and `p` jump without the scroll spring.
 
 **Tests**
 
-- `ui/patch.test.js`: hunk ranges for added, deleted and one-line files (`@@ -0,0 +1 @@`);
+- `ui/patch.test.js`: hunk ranges for added, deleted, emptied (`+0,0`) and one-line files
+  (`@@ -0,0 +1 @@`);
   `walkthrough` for each case above; a property test that every hunk is in exactly one group
   or in `rest` (catches a hunk lost or drawn twice).
-- e2e (`report` scenario): `n` moves to step 2; a folded hunk opens on click; a click on a
+- e2e (`report` scenario): `n` moves to step 2, and still does after a click on Walkthrough;
+  a folded hunk opens on click; a click on a
   line number inside a walkthrough hunk opens the composer (the existing behavior, which the
   restructure can break).
 
@@ -302,21 +337,37 @@ the Checks row opens its step.
   pull request are refused for `Read` (400).
 - `src/run/log.rs`: the header gains `readOnly: bool` (version 7).
 - `src/run.rs`: `read_only` (`:1978`) becomes `header.read_only || non-judging stage`.
-  `undo_proposer` (`:2158`) keys on the same value. New `Runner::ask(agent, id)`: a run of
-  one note in a new `Read` thread.
+  `undo_proposer` (`:2158`) keys on the same value, and its notice says "the agent changed
+  files" for a run that is not a review stage. New `Runner::ask(agent, id)`: a run of one
+  note in a new `Read` thread. `launch` sets the header's `readOnly` from the thread's mode,
+  not from `Runner::ask`: `Runner::follow_up` carries no such value, and a follow-up to an
+  ask would otherwise get edit rights and commit to the thread's branch. `launch` takes no
+  snapshot when `readOnly`, or the run dialog would offer Changes for an ask
+  (`ui/run-dialog.js:309`).
+- The undo notice of a run that is not a review stage is kept only in `RunState.problem`
+  (`run.rs:2019`), which is never logged, so a restart loses it. How it is logged is open
+  ("What this plan leaves open", 10).
 - `src/notes.rs`: `Note.intent: Intent { Change, Ask }` (version 5; older notes are
   `Change`). `StoredNote`, the hand-written `Serialize` (`:828`), `NewNote`. A second prompt
-  for an ask: answer the question about the quoted lines, change nothing.
-- `src/site.rs`: `POST /api/notes` takes `intent`; `POST /api/run/ask {note}`; `send_run`
-  refuses a note with intent `Ask` (400).
+  for an ask: answer the question about the quoted lines, change nothing. `notes::prompt`
+  refuses a note with intent `Ask` (400), as it refuses a resolved one: both
+  `POST /api/run` and `GET /api/run/preview` build their prompt there (`run.rs:446`, `:475`).
+  `Runner::ask` builds its own prompt and does not call it.
+- `src/site.rs`: `POST /api/notes` takes `intent`; `POST /api/run/ask {note}`.
 - Page: the composer's ask mode (`q`, and Ask in `codeActions`, `ui/code-view.js:490`);
-  `sendable` (`ui/run.js:8`) leaves asks out; `runStatus` (`ui/status.js:44`) gives
-  `answered` to an ask whose run ended well; the note dialog shows the reply as the answer,
-  with Make it a note.
+  `runStatus` (`ui/status.js:44`) gives `answered` to an ask whose run ended well; the note
+  dialog shows the reply as the answer, with Make it a note. One predicate, `isAsk(note)`,
+  keeps asks out of everything that sends: `sendable` (`ui/run.js:8`), the send step's
+  checkboxes and send buttons and its open counts (`ui/notes-tray.js:179`, `:199`, `:246`,
+  `:276`), and the note dialog's Send (`ui/note-dialog.js:360`). A `Read` thread's run dialog
+  has no Apply, Open pull request or Review (`ui/run-dialog.js:348`, `:411`, `:566`).
+- The ask composer shows the uncommitted-changes warning that #52 built for the send step
+  (`Repo::uncommitted`, `PreviewView.uncommitted`), read the same way.
 
 **Edge cases**
 
-- The cap of 3 live runs is reached: 409, and the composer keeps the question.
+- The cap of 3 live runs is reached: 409, and the composer keeps the question. Whether the
+  note was saved before the refusal is open ("What this plan leaves open", 11).
 - A repository with no commit: 422 with the message a send gets.
 - Uncommitted edits in the checkout: the composer says the agent reads the last commit, and
   when the asked file is among them, that the lines may differ.
@@ -325,8 +376,12 @@ the Checks row opens its step.
 - The agent edits without asking: the worktree is reset, and the answer shows under the
   problem notice.
 - An ask on a file or a folder: the same path, no snippet, as path notes.
-- Resolve or Delete on an ask ends its thread and frees its worktree. A live ask refuses the
-  delete (409), as a live run does today.
+- Resolve or Delete on an ask ends its thread and frees its worktree: `change_note` and
+  `delete_note` call `Runner::end_thread(thread, Discard)` for an ask's note; today neither
+  reaches the runner (`site.rs:759`, `:770`). A delete during a live run succeeds today and
+  its log goes at the next delete (`a_live_run_is_kept_when_its_note_is_deleted_...`,
+  `tests/e2e/page.test.js:112`); what a delete or resolve of a live ask does is open ("What
+  this plan leaves open", 9).
 - An ask's thread is evicted when idle like any thread; a follow-up then gets a fresh agent
   with the history (`fresh_follow_up`).
 - Review on an ask's run is refused (400): there is no work to review.
@@ -338,10 +393,16 @@ the Checks row opens its step.
 
 **Tests**
 
-- `an_ask_runs_read_only_in_a_thread_of_its_own` (site, `reviewer-edits`-style scenario):
-  catches an ask given edit rights.
-- `an_ask_that_edits_is_undone_and_says_so`.
-- `a_send_refuses_an_ask`, `the_prompt_of_an_ask_asks_for_no_change`.
+- `an_ask_runs_read_only_in_a_thread_of_its_own` (site, a new scenario `asks-to-edit` that
+  asks permission for an edit, then a read, and says each answer: `reviewer-edits` asks for
+  nothing): catches an ask given edit rights.
+- `a_follow_up_of_an_ask_is_read_only`: catches a follow-up that edits and commits.
+- `an_ask_logs_no_report`, and a page test that a reply with a json block and no report
+  keeps it.
+- `an_ask_that_edits_is_undone_and_says_so` (`reviewer-edits`), and that the notice survives
+  reopening the project.
+- `a_send_refuses_an_ask`, `a_preview_refuses_an_ask`,
+  `the_prompt_of_an_ask_asks_for_no_change`.
 - `resolving_an_ask_frees_its_worktree`, `a_read_thread_clones_no_build_folders`,
   `a_read_thread_cannot_be_applied`.
 - `a_version_4_review_reads_every_note_as_a_change`, the byte-for-byte tests of both files,
@@ -349,7 +410,8 @@ the Checks row opens its step.
   reads (`Ok(1 | 2 | THREADS_VERSION)`, `src/thread.rs:836`): version 3 joins that list, and
   `threads.json` has no byte-for-byte test yet, so this step adds one.
 - `an_ask_at_the_cap_is_refused` (with `hang`).
-- Page: `runStatus` for an ask (ended, stopped, failed), `sendable`, `groupNotes`.
+- Page: `runStatus` for an ask (ended, stopped, failed), `isAsk` in the send step's counts,
+  `groupNotes`.
 - e2e: `q` on a selection opens the composer in ask mode and `Cmd-Enter` shows Answered.
 
 ### 7.7 Jump to definition
@@ -359,33 +421,40 @@ the Checks row opens its step.
 - `Cargo.toml`: `tree-sitter-tags` 0.27.2, justified in `docs/design.md`, "Dependencies",
   with the measured crate count and binary size.
 - `src/highlight.rs`: `Grammar` (`:46`) gains `tags: Option<fn() -> TagsConfiguration>`,
-  set for Rust, JavaScript, TypeScript, TSX, Python and Go.
+  set for Rust, JavaScript, TypeScript, TSX, Python and Go. `MAX_HIGHLIGHTED` becomes
+  `pub(crate)`.
 - New `src/definitions.rs`: `Index { by_name: HashMap<String, Vec<Definition>>, seen:
   HashMap<String, Stamp> }`, built on a thread named `index-definitions` started by
   `Site::open` (`site.rs:527`), owned by `Project`, and shared the way `Scanner` shares its
   result.
-- `GET /api/definitions?name=x&from=path`: the ranked list, or `{state: "building"}`.
-  The request first re-stats the listed files and reparses those whose size or mtime
-  changed, so no watcher is needed.
+- `GET /api/definitions?name=x&from=path`: the ranked list, or `{state: "building"}`. The
+  request only reads the index. When the window regains focus or a run ends,
+  `index-definitions` re-stats the files and reparses those whose size or mtime changed, as
+  the design says; a lookup meanwhile answers from the index as it was. Reparsing inside the
+  request would hold `page-requests`, the one thread that answers the page
+  (`src/shell.rs:344`), for a whole pull's worth of files.
 - Page: a `mousedown` with `metaKey` on `.c` in `ui/code-view.js`; Go to Definition in
-  `codeActions`; `Cmd-[` and `Cmd-]` over a history of at most 50 places.
+  `codeActions`, whose contextmenu handler finds the word at the event's point and passes it
+  (`codeActions(line, word)`; it gets the line alone today, `:486`), shown only when there
+  is a word; `Cmd-[` and `Cmd-]` over a history of at most 50 places.
 
 **Edge cases**
 
 - The `Cmd`-mousedown must not start a text drag (`code-view.js:318`) or clear the selection
   on mouseup (`:341`): it calls `preventDefault` and is skipped by both, as `.add-note` is.
 - The word under the pointer: `caretRangeFromPoint`, widened over identifier characters
-  (Unicode `ID_Continue`, and `$` for JavaScript). A click on whitespace, punctuation or a
-  string does nothing.
+  (Unicode `ID_Continue`, and `$` for JavaScript). A click on whitespace, punctuation, a
+  string (`.s`) or a keyword (`.k`) does nothing; a click in a comment (`.m`) is open
+  ("What this plan leaves open", 8).
 - One definition and it is the clicked line: a toast "this is the definition".
 - Several: ranked same file, same folder, then by path; at most 50 listed, with the count.
-- The index is still building: the page waits for the nudge and asks once more.
+- The index is still building: the page asks again until it is built, by the mechanism
+  open item 7 settles (no nudge exists for it today).
 - Files over 2 MB (`MAX_HIGHLIGHTED`), files that are not UTF-8, and languages without a
   tags query are skipped; a click in a `.json` file says "no definitions for this file type".
-- A file deleted or renamed since it was indexed: its entries go on the next request.
-- A repository of 50,000 files: the first build is measured in the pull request, and the
-  re-stat per request with it. Over 20 ms per request, the re-stat moves to the window-focus
-  refresh.
+- A file deleted or renamed since it was indexed: its entries go at the next refresh.
+- A repository of 50,000 files: the first build and a refresh are measured in the pull
+  request.
 - A history entry whose file is gone is skipped. Opening another project clears the history.
 - The changes view and the prompt preview do not jump in version 1.
 
@@ -865,14 +934,16 @@ event source: "next" moves the walkthrough; "send" twice sends.
 7.1 -> 7.2 -> 7.3 -> 7.4
               7.3 -> 7.5
 7.1 -> 7.6 (read-only threads)  -> 8.2 -> 8.5, 8.7
-7.7 (independent)
+7.3 -> 7.7 (only for the e2e bridge's files: `POST /new {files}`)
 8.1 -> 8.2 -> 8.3 -> 8.4 -> 8.6
 9.1 -> 9.2 -> 9.4, 9.5        9.3 needs only 9.1
 10.1 -> 10.2 -> 10.3          10.3 uses 7.5 and 7.7 for two commands
 ```
 
-7.6 comes before the map because analysis runs are read-only threads. 7.7, 9.1 and 10.1 have
-no dependency and can run beside the main line, each in a worktree of its own.
+7.6 comes before the map because analysis runs are read-only threads. 9.1 and 10.1 have no
+dependency and can run beside the main line, each in a worktree of its own; so can 7.7 once
+7.3 lets the e2e bridge write files with definitions (`src/site/tests/page_e2e.rs:143`
+writes three plain files today), or 7.7 makes that bridge change itself if it lands first.
 
 ## What this plan leaves open
 
@@ -886,3 +957,38 @@ The owner has not confirmed these; each is the design's assumption carried into 
 5. Read-only runs in threads of their own, correction 1 above, which replaces the shared
    reading worktree the design proposed.
 6. The forced update only when history moved forward, correction 5 above.
+
+Found when the plan's review was checked against the code on 2026-11-25 (#51). Each names
+its options; the first is recommended.
+
+7. **How the page learns a background result is in** (7.7, 9.2). No nudge exists but
+   `RunChanged`. (a) The page asks again on a timer while a result is pending, as the
+   settings dialog does every 250 ms. (b) A general nudge, `AppEvent::Changed(kind)` calling
+   `window.postil.changed(kind)`, which widens the shell-to-page interface and the e2e bridge.
+8. **Cmd-click in a comment** (7.7). (a) Does nothing, as in a string. (b) Jumps: a name in a
+   doc comment is often worth following.
+9. **Delete and Resolve of a live ask** (7.6). Delete: (a) succeeds as for any run today, the
+   thread ending when the run does; (b) 409 for an ask only, which changes the route and two
+   tests. Resolve: (a) refused with 409 while the ask runs; (b) resolves the note and ends the
+   thread when the run ends.
+10. **Logging the undo notice** (7.6, run log 7). (a) A new entry, `Entry::Undone { text }`;
+    (b) a `problem` field on the `ended` entry.
+11. **An ask refused at the cap** (7.6). (a) `POST /api/run/ask` takes the new note and saves
+    it only when the run starts, so a 409 leaves nothing; (b) the page deletes the note on
+    refusal (a crash between leaves it); (c) the ask stays open with an Ask button.
+12. **A report step's `lines` for a deleted file** (7.3). (a) `lines` stays required, and is
+    ignored when the path no longer exists: the step covers the whole file, and the S2
+    wording, tested 10 of 10, stays as it is. (b) `lines` becomes optional and the prompt says
+    to leave it out for a deleted file.
+13. **Lines past the end of the file** (7.3). (a) Not checked in Rust: the walkthrough (7.5)
+    already lists a step that names no changed lines, and `report::read` then reads no file.
+    (b) Checked in `report::read`: lines counted from the bytes, each file read once, missing
+    files as deleted.
+14. **Evidence precedence** (7.4). A check that failed and was edited after: (a) failed wins;
+    (b) "failed, edited after it". The card's worst state, proposed: failed, then not-seen,
+    then stale, then unfinished, then passed.
+15. **A finding that disputes a rating** (7.5). `Finding` has no field for it. (a) Any finding
+    on a `routine` or `mechanical` hunk shows the hunk as `eyes`; (b) a `disputes` field on
+    `Finding`, which changes the findings entry.
+16. **Checks on follow-ups** (7.4). (a) Each turn's Checks under its own Steps
+    (`followUpPart`); (b) only the latest turn's, for the card's icon.
