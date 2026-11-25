@@ -20,8 +20,8 @@ use crate::acp::wire::{
     ElicitationCapabilities, ElicitationParams, ElicitationReply, Empty, FsCapabilities, Incoming,
     InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, Notification, Outcome,
     PermissionOption, PermissionOutcome, PermissionParams, PermissionResult, PromptParams,
-    PromptResult, Request, Response, RpcError, SessionUpdate, StopReason, ToolCallUpdate,
-    UpdateParams,
+    PromptResult, PromptUsage, Request, Response, RpcError, SessionUpdate, StopReason,
+    ToolCallUpdate, UpdateParams,
 };
 use crate::agents;
 use crate::error::{Error, Result};
@@ -60,7 +60,7 @@ pub(crate) struct Launch<'a> {
 /// What the agent reports, in the order it reported it. Delivered on the agent's reader
 /// thread.
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) enum Event {
     /// The session changed: a message, a thought, a tool call, the plan.
     Update(SessionUpdate),
@@ -111,7 +111,10 @@ pub(crate) struct QuestionRequest {
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum TurnEnd {
-    Stopped(StopReason),
+    Stopped {
+        reason: StopReason,
+        usage: Option<PromptUsage>,
+    },
     /// The agent answered the prompt with an error, or with a reply the app cannot read.
     Failed(String),
 }
@@ -153,6 +156,8 @@ impl Stopper {
 pub(crate) struct Agent {
     process: Process,
     session: String,
+    /// The active model id reported in `session/new`, when the agent sent one.
+    model: Option<String>,
 }
 
 impl Agent {
@@ -229,14 +234,21 @@ impl Starting {
             mcp_servers: [],
         };
         let reply: NewSessionResult = process.call("session/new", &session, self.timeout)?;
+        let model = reply.current_model();
         Ok(Agent {
             process,
             session: reply.session_id,
+            model,
         })
     }
 }
 
 impl Agent {
+    /// The active model id reported when the session opened, when known.
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     /// Whether the agent is still there: false once the reader has seen its output end, or
     /// the writer could not write to it. A kept agent that is not alive is started again.
     pub(crate) fn is_alive(&self) -> bool {
@@ -757,7 +769,10 @@ impl<F: FnMut(Event)> Reader<F> {
                 }
                 let end = match outcome {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
-                        Ok(result) => TurnEnd::Stopped(result.stop_reason),
+                        Ok(result) => TurnEnd::Stopped {
+                            reason: result.stop_reason,
+                            usage: result.usage,
+                        },
                         Err(error) => {
                             TurnEnd::Failed(format!("unreadable reply to the prompt: {error}"))
                         }
@@ -1127,9 +1142,35 @@ mod tests {
         }
     }
 
+    fn assert_turn_usage(events: &Receiver<Event>) {
+        assert!(matches!(
+            next(events),
+            Event::Update(SessionUpdate::UsageUpdate {
+                used: Some(10),
+                size: Some(100),
+                cost: Some(_),
+            })
+        ));
+    }
+
+    fn assert_turn_ended_with_usage(events: &Receiver<Event>) {
+        let Event::TurnEnded(TurnEnd::Stopped {
+            reason: StopReason::EndTurn,
+            usage: Some(usage),
+        }) = next(events)
+        else {
+            panic!("expected end_turn with usage");
+        };
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (Some(120), Some(30), Some(160))
+        );
+    }
+
     #[test]
     fn a_turn_delivers_every_update_in_order_and_ends_with_the_stop_reason() {
         let (agent, events) = start("turn").unwrap();
+        assert_eq!(agent.model(), Some("m"));
         let link = ContentBlock::ResourceLink {
             uri: "file:///repo/src/a.rs".to_owned(),
             name: "src/a.rs".to_owned(),
@@ -1138,8 +1179,7 @@ mod tests {
 
         assert_eq!(said(&events), "got fix N1 | file:///repo/src/a.rs");
         assert_eq!(said(&events), "prompt 1");
-        // The agent's own notifications and the usage update are not events; the file read
-        // the app does not serve is refused with "method not found".
+        assert_turn_usage(&events);
         assert_eq!(said(&events), "fs answered -32601");
         assert_eq!(
             next(&events),
@@ -1157,7 +1197,7 @@ mod tests {
                 content: Vec::new(),
                 locations: vec![Location {
                     path: in_checkout("src/a.rs"),
-                    line: Some(3),
+                    line: Some(3)
                 }],
                 raw_input: None,
                 raw_output: None,
@@ -1187,13 +1227,10 @@ mod tests {
         );
         agent.answer_permission(request.number, "always").unwrap();
         assert_eq!(said(&events), "chose always");
-        assert!(
-            matches!(
-                agent.answer_permission(request.number, "once"),
-                Err(Error::NoSuchRequest)
-            ),
-            "a request is answered once"
-        );
+        assert!(matches!(
+            agent.answer_permission(request.number, "once"),
+            Err(Error::NoSuchRequest)
+        ));
 
         let Event::Update(SessionUpdate::ToolCallUpdate(done)) = next(&events) else {
             panic!("expected the tool call's update");
@@ -1217,10 +1254,7 @@ mod tests {
                 }]
             })
         );
-        assert_eq!(
-            next(&events),
-            Event::TurnEnded(TurnEnd::Stopped(StopReason::EndTurn))
-        );
+        assert_turn_ended_with_usage(&events);
 
         // The session stays open for the next prompt.
         agent.prompt(&[text("again")]).unwrap();
@@ -1295,7 +1329,10 @@ mod tests {
         assert_eq!(said(&events), "late question cancel");
         assert_eq!(
             next(&events),
-            Event::TurnEnded(TurnEnd::Stopped(StopReason::Cancelled))
+            Event::TurnEnded(TurnEnd::Stopped {
+                reason: StopReason::Cancelled,
+                usage: None,
+            })
         );
         assert!(matches!(
             agent.answer_question(question.number, &ElicitationReply::Decline),
@@ -1323,7 +1360,10 @@ mod tests {
         assert_eq!(said(&events), "bad permission answered -32602");
         assert_eq!(
             next(&events),
-            Event::TurnEnded(TurnEnd::Stopped(StopReason::EndTurn))
+            Event::TurnEnded(TurnEnd::Stopped {
+                reason: StopReason::EndTurn,
+                usage: None,
+            })
         );
     }
 
@@ -1585,7 +1625,16 @@ mod tests {
                 | Event::Unreadable(_) => {}
             }
         };
-        assert_eq!(end, TurnEnd::Stopped(StopReason::EndTurn), "{reply}");
+        assert!(
+            matches!(
+                end,
+                TurnEnd::Stopped {
+                    reason: StopReason::EndTurn,
+                    ..
+                }
+            ),
+            "{end:?}: {reply}"
+        );
         assert!(reply.to_lowercase().contains("pong"), "{reply}");
     }
 }

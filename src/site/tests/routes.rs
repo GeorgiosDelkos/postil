@@ -35,6 +35,8 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     ),
     ("/api/settings/reset", &[Method::POST], "POST with no body"),
     ("/api/agents/rescan", &[Method::POST], "POST with no body"),
+    ("/api/usage", &[Method::GET], "GET"),
+    ("/api/usage/refresh", &[Method::POST], "POST"),
     ("/api/runs", &[Method::GET], "GET"),
     (
         "/api/layout",

@@ -23,6 +23,7 @@ import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
+import { usageDialog } from "./usage-dialog.js";
 import { welcomeScreen } from "./welcome.js";
 
 const filesEl = $("files");
@@ -550,6 +551,7 @@ window.postil = {
     else if (command === "switch-project") welcome.show();
     else if (command === "go-to-file") goToFile();
     else if (command === "settings") settings.open();
+    else if (command === "usage") usage.open();
     else if (command === "focus-mode") toggleFocus();
     else if (command === "close-window" || command === "quit") quit();
   },
@@ -632,6 +634,20 @@ function applySettings(settings) {
 
 const settings = settingsDialog($("settings"), { apply: applySettings });
 $("open-settings").addEventListener("click", () => settings.open());
+
+const usage = usageDialog($("usage"), {
+  openSettings: () => {
+    $("usage").close();
+    settings.open();
+  },
+  onTone: (tone) => {
+    const dot = $("usage-warn-dot");
+    dot.hidden = tone === null;
+    dot.classList.toggle("is-critical", tone === "critical");
+    dot.classList.toggle("is-warn", tone === "warn");
+  },
+});
+$("open-usage").addEventListener("click", () => usage.open());
 
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.

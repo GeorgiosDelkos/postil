@@ -13,6 +13,7 @@ mod routes;
 mod runs;
 mod settings;
 mod threads;
+mod usage;
 
 use std::ffi::OsString;
 use std::fs;

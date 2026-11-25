@@ -161,6 +161,44 @@ pub(crate) struct NewSessionParams<'a> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NewSessionResult {
     pub(crate) session_id: String,
+    #[serde(default)]
+    pub(crate) models: Option<SessionModels>,
+    /// Extra metadata an agent attaches to `session/new` (Grok places its model info here).
+    #[serde(default, rename = "_meta")]
+    pub(crate) meta: Option<Value>,
+}
+
+/// The active model an agent reports in `session/new`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionModels {
+    #[serde(default)]
+    pub(crate) current_model_id: Option<String>,
+}
+
+impl NewSessionResult {
+    /// The active model id, when the agent reported one in `models.currentModelId` or `_meta`.
+    pub(crate) fn current_model(&self) -> Option<String> {
+        let from_models = self
+            .models
+            .as_ref()
+            .and_then(|models| models.current_model_id.as_deref());
+        let from_meta = || {
+            let meta = self.meta.as_ref()?;
+            meta.get("currentModelId")
+                .or_else(|| meta.get("model"))
+                .or_else(|| {
+                    meta.get("models")
+                        .and_then(|models| models.get("currentModelId"))
+                })
+                .and_then(Value::as_str)
+        };
+        from_models
+            .or_else(from_meta)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 /// `session/prompt` params.
@@ -175,6 +213,39 @@ pub(crate) struct PromptParams<'a> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PromptResult {
     pub(crate) stop_reason: StopReason,
+    /// Token counts the agent reports when a prompt turn ends (optional in ACP).
+    #[serde(default)]
+    pub(crate) usage: Option<PromptUsage>,
+}
+
+/// Token counts reported on a `session/prompt` reply.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields are named as the protocol names them"
+)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptUsage {
+    #[serde(default)]
+    pub(crate) input_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) output_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) thought_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) cached_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) cached_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) total_tokens: Option<u64>,
+}
+
+/// Cost reported on an ACP `usage_update` session update.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UsageCost {
+    pub(crate) amount: f64,
+    pub(crate) currency: String,
 }
 
 /// Why a turn ended.
@@ -223,7 +294,7 @@ pub(crate) struct UpdateParams {
 
 /// One change to the session the agent reports while it works.
 #[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[cfg_attr(test, derive(PartialEq))]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub(crate) enum SessionUpdate {
     #[serde(rename_all = "camelCase")]
@@ -242,7 +313,17 @@ pub(crate) enum SessionUpdate {
         #[serde(default, deserialize_with = "null_as_default")]
         entries: Vec<PlanEntry>,
     },
-    /// The echo of the prompt, the command list, mode and usage changes, and kinds added
+    /// Context window and optional cumulative cost reported while a session runs.
+    #[serde(rename_all = "camelCase")]
+    UsageUpdate {
+        #[serde(default)]
+        used: Option<u64>,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        cost: Option<UsageCost>,
+    },
+    /// The echo of the prompt, the command list, mode changes, and kinds added
     /// after the pinned schema: none of them changes what the run panel shows.
     #[serde(other)]
     Other,

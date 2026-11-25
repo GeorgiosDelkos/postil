@@ -115,7 +115,8 @@ async function prompt(id, params) {
     case "turn": {
       // Agents send notifications and update kinds the app does not use.
       send({ method: "_x.ai/session/setup", params: { phase: "auth" } });
-      update({ sessionUpdate: "usage_update", used: 10, size: 100 });
+      update({ sessionUpdate: "current_mode_update", currentModeId: "default" });
+      update({ sessionUpdate: "usage_update", used: 10, size: 100, cost: { amount: 0.02, currency: "USD" } });
       const fs = await ask("fs/read_text_file", { sessionId: "S1", path: "/etc/hosts" });
       say(`fs answered ${fs.error?.code}`);
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hmm" } });
@@ -148,7 +149,19 @@ async function prompt(id, params) {
         sessionUpdate: "plan",
         entries: [{ content: "Fix N1", priority: "high", status: "completed" }],
       });
-      return send({ id, result: { stopReason: "end_turn" } });
+      return send({
+        id,
+        result: {
+          stopReason: "end_turn",
+          usage: {
+            inputTokens: 120,
+            outputTokens: 30,
+            cachedReadTokens: 40,
+            thoughtTokens: 10,
+            totalTokens: 160,
+          },
+        },
+      });
     }
     case "cancel": {
       // A question waits for the engineer, so the run is waiting when the cancel comes.

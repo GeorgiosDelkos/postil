@@ -98,6 +98,11 @@ impl Settings {
         &self.0.custom_agents
     }
 
+    /// Whether the agent called `name` is turned on in the settings.
+    pub(crate) fn is_enabled(&self, name: &str) -> bool {
+        self.0.enabled_agents.iter().any(|enabled| enabled == name)
+    }
+
     /// The names of the agents that review the agent's work, in order.
     pub(crate) fn reviewers(&self) -> &[String] {
         &self.0.reviewers

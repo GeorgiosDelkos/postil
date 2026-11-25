@@ -30,6 +30,7 @@ mod site;
 #[cfg(test)]
 mod testing;
 mod thread;
+mod usage;
 
 pub use crate::error::{Error, error_chain};
 pub use crate::shell::{BenchReport, bench, run};

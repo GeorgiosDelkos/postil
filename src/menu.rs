@@ -16,17 +16,19 @@ pub(crate) enum Command {
     GoToFile,
     CloseWindow,
     Settings,
+    Usage,
     Quit,
     FocusMode,
 }
 
 impl Command {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
         Self::CloseWindow,
         Self::Settings,
+        Self::Usage,
         Self::Quit,
         Self::FocusMode,
     ];
@@ -39,6 +41,7 @@ impl Command {
             Self::GoToFile => "go-to-file",
             Self::CloseWindow => "close-window",
             Self::Settings => "settings",
+            Self::Usage => "usage",
             Self::Quit => "quit",
             Self::FocusMode => "focus-mode",
         }
@@ -124,6 +127,7 @@ fn build() -> muda::Result<Menu> {
         "View",
         true,
         &[
+            &Command::Usage.item("Usage…", shift_command(Code::KeyU)),
             &Command::FocusMode.item("Focus Mode", command(Code::Backslash)),
             &separator(),
             &PredefinedMenuItem::fullscreen(None),

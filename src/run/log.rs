@@ -34,13 +34,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::acp::{
-    ContentBlock, Event, Location, PermissionKind, PlanEntryStatus, SessionUpdate, StopReason,
-    ToolCallContent, ToolCallStatus, ToolKind, TurnEnd,
+    ContentBlock, Event, Location, PermissionKind, PlanEntryStatus, PromptUsage, SessionUpdate,
+    StopReason, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd, UsageCost,
 };
 use crate::error::{Error, Result};
 use crate::files::version_of;
 use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
+use crate::usage::{
+    ledger::{self, LedgerRecord, LedgerSink, RECORD_VERSION},
+    now_secs,
+};
 
 /// How long a send waits for the run lock or a thread's lock before it reports another
 /// window's run ([`take_lock`]). Arbitrary: far longer than a fork-to-exec window, short
@@ -83,7 +87,64 @@ const LOG_VERSION: u32 = 5;
 /// One run and its log.
 pub(crate) struct Run {
     file: PathBuf,
+    /// Where a summary record is appended once this run finishes, when configured.
+    usage: Option<LedgerSink>,
     state: Mutex<RunState>,
+}
+
+/// Token and cost totals collected in memory while a run is live.
+#[derive(Debug, Default)]
+struct RunUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_read_tokens: Option<u64>,
+    cached_write_tokens: Option<u64>,
+    thought_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    context_used: Option<u64>,
+    context_size: Option<u64>,
+    cost_amount: Option<f64>,
+    cost_currency: Option<String>,
+}
+
+impl RunUsage {
+    fn record_update(&mut self, used: Option<u64>, size: Option<u64>, cost: Option<UsageCost>) {
+        if let Some(used) = used {
+            self.context_used = Some(used);
+        }
+        if let Some(size) = size {
+            self.context_size = Some(size);
+        }
+        if let Some(cost) = cost
+            && cost.amount.is_finite()
+            && cost.amount >= 0.0
+            && !cost.currency.is_empty()
+        {
+            self.cost_amount = Some(cost.amount);
+            self.cost_currency = Some(cost.currency);
+        }
+    }
+
+    fn record_prompt(&mut self, usage: PromptUsage) {
+        if let Some(val) = usage.input_tokens {
+            self.input_tokens = Some(val);
+        }
+        if let Some(val) = usage.output_tokens {
+            self.output_tokens = Some(val);
+        }
+        if let Some(val) = usage.cached_read_tokens {
+            self.cached_read_tokens = Some(val);
+        }
+        if let Some(val) = usage.cached_write_tokens {
+            self.cached_write_tokens = Some(val);
+        }
+        if let Some(val) = usage.thought_tokens {
+            self.thought_tokens = Some(val);
+        }
+        if let Some(val) = usage.total_tokens {
+            self.total_tokens = Some(val);
+        }
+    }
 }
 
 pub(super) struct RunState {
@@ -106,6 +167,10 @@ pub(super) struct RunState {
     pub(super) after_claimed: bool,
     /// The notes sent, until the agent shows it took the turn; then they are marked sent.
     pub(super) unmarked: Option<Vec<String>>,
+    /// The underlying model id the agent reported for its session, if any.
+    model: Option<String>,
+    /// Usage metrics reported by the agent during this run.
+    usage: RunUsage,
     end: Option<Status>,
     // Sets: a cancel can log a request's answer before the request itself.
     requested: BTreeSet<usize>,
@@ -379,7 +444,12 @@ impl Run {
     /// [`MAX_LIVE`] runs are live in the repository; [`Error::BadRequest`] for a thread id
     /// that is not a run's; [`Error::ReadRun`] when the thread locks cannot be listed or
     /// opened; and [`Error::WriteRun`] when a file cannot be written.
-    pub(super) fn create(dir: &Path, opening: Opening<'_>, thread: InThread<'_>) -> Result<Self> {
+    pub(super) fn create(
+        dir: &Path,
+        opening: Opening<'_>,
+        thread: InThread<'_>,
+        usage: Option<LedgerSink>,
+    ) -> Result<Self> {
         let Opening {
             agent,
             notes,
@@ -463,6 +533,7 @@ impl Run {
         };
         Ok(Self {
             file,
+            usage,
             state: Mutex::new(RunState::new(header, Some(log), Some(lock))),
         })
     }
@@ -538,6 +609,7 @@ impl Run {
         }
         Ok(Self {
             file: file.to_owned(),
+            usage: None,
             state: Mutex::new(state),
         })
     }
@@ -546,12 +618,25 @@ impl Run {
         lock(&self.state)
     }
 
+    /// Records the underlying model id reported by the agent's session, when known.
+    pub(super) fn set_model(&self, model: Option<&str>) {
+        if let Some(model) = model {
+            self.state().model = Some(model.to_owned());
+        }
+    }
+
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     pub(super) fn record(&self, entry: Entry) {
-        let mut state = self.state();
-        if state.live() {
+        let finished = {
+            let mut state = self.state();
+            if !state.live() {
+                return;
+            }
+            let status = end_status(&entry);
             self.write(&mut state, entry);
-        }
+            status.and_then(|status| self.usage_record(&state, status))
+        };
+        self.write_usage(finished);
     }
 
     /// Records the snapshot at `point` unless the run has one there, checked under the same
@@ -592,59 +677,115 @@ impl Run {
         // One hold of the state for the event, its answer and the notes: a reader sees both
         // entries or neither, and a run that ended meanwhile neither takes the event nor marks
         // its notes sent. Taken first, since an update is read by the kind of its call.
-        let mut state = self.state();
-        if !state.live() {
-            return None;
-        }
-        let entry = match event {
-            Event::Update(update) => entry_of(update, root, &state.kinds)?,
-            Event::Permission(request) => Entry::Permission {
-                request: request.number,
-                tool_call: request.tool_call.tool_call_id,
-                title: request.tool_call.title,
-                options: request
-                    .options
-                    .into_iter()
-                    .map(|option| Choice {
-                        id: option.option_id,
-                        name: option.name,
-                        kind: option.kind,
-                    })
-                    .collect(),
-            },
-            Event::Question(question) => Entry::Question {
-                request: question.number,
-                message: question.message,
-                fields: question.schema,
-                tool_call: question.tool_call,
-            },
-            Event::Withdrawn { number } => Entry::Answer {
-                request: number,
-                option: None,
-            },
-            Event::TurnEnded(TurnEnd::Stopped(reason)) => Entry::Ended { reason },
-            Event::TurnEnded(TurnEnd::Failed(error)) => Entry::Failed { error },
-            Event::Unreadable(problem) => Entry::Unreadable { problem },
-            Event::Exited { stderr } => Entry::Failed {
-                error: Error::AgentExited { stderr }.to_string(),
-            },
-        };
-        // A refusal is the model declining the work: its notes stay open, as for an error.
-        let took_turn = !matches!(
-            entry,
-            Entry::Failed { .. }
-                | Entry::Unreadable { .. }
-                | Entry::Ended {
-                    reason: StopReason::Refusal
+        let (notes, finished) = {
+            let mut state = self.state();
+            if !state.live() {
+                return None;
+            }
+            let entry = match event {
+                Event::Update(SessionUpdate::UsageUpdate { used, size, cost }) => {
+                    state.usage.record_update(used, size, cost);
+                    return None;
                 }
-        );
-        for entry in std::iter::once(entry).chain(answer) {
-            self.write(&mut state, entry);
-        }
-        if took_turn {
-            state.unmarked.take()
+                Event::Update(update) => entry_of(update, root, &state.kinds)?,
+                Event::Permission(request) => Entry::Permission {
+                    request: request.number,
+                    tool_call: request.tool_call.tool_call_id,
+                    title: request.tool_call.title,
+                    options: request
+                        .options
+                        .into_iter()
+                        .map(|option| Choice {
+                            id: option.option_id,
+                            name: option.name,
+                            kind: option.kind,
+                        })
+                        .collect(),
+                },
+                Event::Question(question) => Entry::Question {
+                    request: question.number,
+                    message: question.message,
+                    fields: question.schema,
+                    tool_call: question.tool_call,
+                },
+                Event::Withdrawn { number } => Entry::Answer {
+                    request: number,
+                    option: None,
+                },
+                Event::TurnEnded(TurnEnd::Stopped { reason, usage }) => {
+                    if let Some(usage) = usage {
+                        state.usage.record_prompt(usage);
+                    }
+                    Entry::Ended { reason }
+                }
+                Event::TurnEnded(TurnEnd::Failed(error)) => Entry::Failed { error },
+                Event::Unreadable(problem) => Entry::Unreadable { problem },
+                Event::Exited { stderr } => Entry::Failed {
+                    error: Error::AgentExited { stderr }.to_string(),
+                },
+            };
+            // A refusal is the model declining the work: its notes stay open, as for an error.
+            let took_turn = !matches!(
+                entry,
+                Entry::Failed { .. }
+                    | Entry::Unreadable { .. }
+                    | Entry::Ended {
+                        reason: StopReason::Refusal
+                    }
+            );
+            let status = end_status(&entry);
+            for entry in std::iter::once(entry).chain(answer) {
+                self.write(&mut state, entry);
+            }
+            let finished = status.and_then(|status| self.usage_record(&state, status));
+            let notes = if took_turn {
+                state.unmarked.take()
+            } else {
+                None
+            };
+            (notes, finished)
+        };
+        self.write_usage(finished);
+        notes
+    }
+
+    fn usage_record(&self, state: &RunState, status: &'static str) -> Option<LedgerRecord> {
+        let sink = self.usage.as_ref()?;
+        let origin = if state.header.review.is_some() {
+            "review"
+        } else if state.header.follow_up.is_some() {
+            "follow_up"
         } else {
-            None
+            "notes"
+        };
+        Some(LedgerRecord {
+            version: RECORD_VERSION,
+            run_id: state.header.id.clone(),
+            repo: sink.repo.clone(),
+            agent: state.header.agent.clone(),
+            model: state.model.clone(),
+            origin: origin.to_owned(),
+            status: status.to_owned(),
+            started_at: state.header.started_at,
+            ended_at: now_secs().max(state.header.started_at),
+            input_tokens: state.usage.input_tokens,
+            output_tokens: state.usage.output_tokens,
+            cached_read_tokens: state.usage.cached_read_tokens,
+            cached_write_tokens: state.usage.cached_write_tokens,
+            thought_tokens: state.usage.thought_tokens,
+            total_tokens: state.usage.total_tokens,
+            context_used: state.usage.context_used,
+            context_size: state.usage.context_size,
+            cost_amount: state.usage.cost_amount,
+            cost_currency: state.usage.cost_currency.clone(),
+            tool_calls: state.kinds.len() as u64,
+        })
+    }
+
+    fn write_usage(&self, record: Option<LedgerRecord>) {
+        if let (Some(sink), Some(record)) = (&self.usage, record) {
+            // Best effort: a read-only config dir never fails or stalls a run.
+            drop(ledger::append(&sink.file, &record));
         }
     }
 
@@ -698,6 +839,8 @@ impl RunState {
             cancel_asked: None,
             after_claimed: false,
             unmarked: None,
+            model: None,
+            usage: RunUsage::default(),
             end: None,
             requested: BTreeSet::new(),
             answered: BTreeSet::new(),
@@ -1178,12 +1321,25 @@ fn entry_of(
                 })
                 .collect(),
         },
-        // An image or a link in a message, and updates the panel does not show.
+        // An image or a link in a message, usage updates (tracked on RunState), and unknown updates.
         SessionUpdate::AgentMessageChunk { .. }
         | SessionUpdate::AgentThoughtChunk { .. }
+        | SessionUpdate::UsageUpdate { .. }
         | SessionUpdate::Other => return None,
     };
     Some(entry)
+}
+
+/// The ledger status string when `entry` ends a run; `None` for any other entry.
+fn end_status(entry: &Entry) -> Option<&'static str> {
+    match entry {
+        Entry::Ended {
+            reason: StopReason::Cancelled,
+        } => Some("cancelled"),
+        Entry::Ended { .. } => Some("ended"),
+        Entry::Failed { .. } => Some("failed"),
+        _ => None,
+    }
 }
 
 /// The most bytes of a command the log keeps. A heredoc can be megabytes, and a log is read
@@ -1288,7 +1444,7 @@ mod tests {
             prompt,
             origin: Origin::Notes,
         };
-        Run::create(dir, opening, InThread::New).unwrap()
+        Run::create(dir, opening, InThread::New, None).unwrap()
     }
 
     #[test]

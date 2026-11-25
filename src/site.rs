@@ -26,6 +26,11 @@ use crate::recent;
 use crate::repo::Repo;
 use crate::run::{Ending, Notify, Runner};
 use crate::settings::{self, RawSettings, Settings};
+use crate::usage::{
+    ledger::{self, AgentActivity, Range, Scope, UsageSummary},
+    now_secs,
+    quota::{QuotaPoller, QuotaReport, QuotaStatus},
+};
 
 /// The page's files, served at these paths with these types: compiled into the binary as
 /// they are, so the app needs no files beside it. A module the page imports must be listed
@@ -58,6 +63,16 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/settings-dialog.js",
         "text/javascript",
         include_bytes!("../ui/settings-dialog.js"),
+    ),
+    (
+        "/usage.js",
+        "text/javascript",
+        include_bytes!("../ui/usage.js"),
+    ),
+    (
+        "/usage-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/usage-dialog.js"),
     ),
     ("/run.js", "text/javascript", include_bytes!("../ui/run.js")),
     (
@@ -264,11 +279,15 @@ pub(crate) struct Site {
     /// Where the pane widths are kept (`layout.rs`); `None`, for the same reason as
     /// `recent_file`, keeps them in each window only, until it closes.
     layout_file: Option<PathBuf>,
+    /// Where completed runs' usage records are appended (`usage/ledger.rs`).
+    usage_file: Option<PathBuf>,
     /// Postil's home folder, `~/.postil`, under which threads' worktrees live (`thread.rs`);
     /// `None` when the home folder is unknown, which refuses every send.
     home: Option<PathBuf>,
     /// Where agents' programs are looked for, found in the background.
     agents: Scanner,
+    /// On-demand background probes for live provider quotas (`usage/quota.rs`).
+    quotas: QuotaPoller,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
 }
@@ -340,6 +359,35 @@ struct AgentView<'a> {
     built_in: bool,
     /// Where the agent's program is; `None` when it is not installed.
     found: Option<String>,
+}
+
+/// The reply to `GET /api/usage` and `POST /api/usage/refresh`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageView {
+    scope: Scope,
+    has_project: bool,
+    project_name: Option<String>,
+    range: Range,
+    scanning: bool,
+    polling: bool,
+    ledger_file: Option<String>,
+    summary: UsageSummary,
+    /// Installed built-in agents, installed/used custom agents, and any other agent with
+    /// recorded usage in the selected window; `None` while the agent scan runs.
+    agents: Option<Vec<UsageAgentView>>,
+}
+
+/// One agent's live quota and filtered Postil activity in [`UsageView`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageAgentView {
+    name: String,
+    built_in: bool,
+    found: Option<String>,
+    enabled: bool,
+    quota: QuotaReport,
+    activity: AgentActivity,
 }
 
 /// The reply to `GET /api/layout`.
@@ -501,10 +549,18 @@ impl Site {
             recent_file: config.map(|dir| dir.join("recent.json")),
             settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
             layout_file: config.map(|dir| dir.join("layout.json")),
+            usage_file: config.map(|dir| dir.join("usage.jsonl")),
             home: home.map(Path::to_owned),
             agents,
+            quotas: QuotaPoller::live(),
             notify,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_quota_poller(mut self, quotas: QuotaPoller) -> Self {
+        self.quotas = quotas;
+        self
     }
 
     /// The open project's repository.
@@ -556,6 +612,7 @@ impl Site {
             self.agents.clone(),
             Arc::clone(&self.notify),
             self.home.clone(),
+            self.usage_file.clone(),
         );
         let old = project.replace(Project {
             repo,
@@ -638,6 +695,14 @@ impl Site {
                     reply(StatusCode::OK, "application/json", self.settings())
                 }
                 _ => not_allowed("POST with no body"),
+            },
+            "/api/usage" => match *method {
+                Method::GET => json_or_error(self.usage_view(query, false)),
+                _ => not_allowed("GET"),
+            },
+            "/api/usage/refresh" => match *method {
+                Method::POST => json_or_error(self.usage_view(query, true)),
+                _ => not_allowed("POST"),
             },
             "/api/layout" => match *method {
                 Method::GET => reply(StatusCode::OK, "application/json", self.layout()),
@@ -1117,6 +1182,143 @@ impl Site {
         settings::reset(self.settings_file.as_deref().ok_or(Error::NoHome)?)?;
         Ok(self.settings())
     }
+
+    /// The reply to `GET /api/usage` and `POST /api/usage/refresh`.
+    fn usage_view(&self, query: &str, refresh: bool) -> Result<Vec<u8>> {
+        let project = self.project.borrow().clone();
+        let has_project = project.is_some();
+        let project_name = project.as_ref().map(|proj| proj.repo.name());
+        let project_root = project
+            .as_ref()
+            .map(|proj| proj.repo.root().to_string_lossy().into_owned());
+
+        let requested_scope = match query_value(query, "scope") {
+            Some(value) => Scope::parse(&value).ok_or_else(|| {
+                Error::BadRequest(format!("scope={value:?}: expected project or all"))
+            })?,
+            None if has_project => Scope::Project,
+            None => Scope::All,
+        };
+        let scope = if requested_scope == Scope::Project && !has_project {
+            Scope::All
+        } else {
+            requested_scope
+        };
+        let range = match query_value(query, "range") {
+            Some(value) => Range::parse(&value).ok_or_else(|| {
+                Error::BadRequest(format!("range={value:?}: expected today, 7d, 30d or all"))
+            })?,
+            None => Range::SevenDays,
+        };
+
+        let records = self
+            .usage_file
+            .as_deref()
+            .map_or_else(Vec::new, ledger::read);
+        let (summary, mut activities) =
+            ledger::aggregate(&records, scope, project_root.as_deref(), range, now_secs());
+        let ledger_file = self
+            .usage_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+
+        let Some(search_path) = self.agents.path() else {
+            return Ok(to_json(&UsageView {
+                scope,
+                has_project,
+                project_name,
+                range,
+                scanning: true,
+                polling: false,
+                ledger_file,
+                summary,
+                agents: None,
+            }));
+        };
+
+        let settings = self.current_settings();
+        let agents = self.usage_agents(&settings, &search_path, &mut activities, refresh);
+        let polling = agents
+            .iter()
+            .any(|agent| agent.quota.status == QuotaStatus::Loading);
+
+        Ok(to_json(&UsageView {
+            scope,
+            has_project,
+            project_name,
+            range,
+            scanning: false,
+            polling,
+            ledger_file,
+            summary,
+            agents: Some(agents),
+        }))
+    }
+
+    fn usage_agents(
+        &self,
+        settings: &Settings,
+        search_path: &OsStr,
+        activities: &mut std::collections::BTreeMap<String, AgentActivity>,
+        refresh: bool,
+    ) -> Vec<UsageAgentView> {
+        let mut entries: Vec<(String, bool, Option<String>)> = Vec::new();
+        for agent in BUILT_IN {
+            let found = agents::find_program(agent.program, search_path)
+                .map(|path| path.to_string_lossy().into_owned());
+            if found.is_some() || activities.contains_key(agent.name) {
+                entries.push((agent.name.to_owned(), true, found));
+            }
+        }
+        for agent in settings.custom_agents() {
+            let found = agents::program_of(&agent.command)
+                .and_then(|program| agents::find_program(program, search_path))
+                .map(|path| path.to_string_lossy().into_owned());
+            if found.is_some() || activities.contains_key(&agent.name) {
+                entries.push((agent.name.clone(), false, found));
+            }
+        }
+        // Any historical agent removed from settings that still has activity in this window.
+        let known: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
+        for name in activities.keys() {
+            if !known.iter().any(|existing| existing == name) {
+                entries.push((name.clone(), false, None));
+            }
+        }
+
+        let probe_targets: Vec<(&str, bool)> = entries
+            .iter()
+            .map(|(name, built_in, found)| (name.as_str(), *built_in && found.is_some()))
+            .collect();
+        let mut quotas = if refresh {
+            self.quotas.refresh(&probe_targets, search_path)
+        } else {
+            self.quotas.snapshot(&probe_targets, search_path)
+        };
+
+        entries
+            .into_iter()
+            .map(|(name, built_in, found)| {
+                let enabled = settings.is_enabled(&name);
+                let quota = quotas.remove(&name).unwrap_or_else(|| {
+                    if built_in {
+                        QuotaReport::unavailable("Not installed on PATH")
+                    } else {
+                        QuotaReport::unavailable("Custom agent — no provider quota source")
+                    }
+                });
+                let activity = activities.remove(&name).unwrap_or_default();
+                UsageAgentView {
+                    name,
+                    built_in,
+                    found,
+                    enabled,
+                    quota,
+                    activity,
+                }
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for Site {
@@ -1129,7 +1331,9 @@ impl std::fmt::Debug for Site {
             .field("recent_file", &self.recent_file)
             .field("settings_file", &self.settings_file)
             .field("layout_file", &self.layout_file)
+            .field("usage_file", &self.usage_file)
             .field("agents", &self.agents)
+            .field("quotas", &self.quotas)
             .finish_non_exhaustive()
     }
 }
