@@ -86,6 +86,11 @@ test("a new custom agent is trimmed, enabled, and checked as the Rust process ch
   assert.match(refused({ name: "grok", command: "x" }), /already an agent called grok/);
   assert.match(refused({ name: "LOCAL", command: "x" }), /already an agent called LOCAL/);
   assert.match(refused({ name: "New", command: "   " }), /Give the command/);
+  assert.match(
+    refused({ name: "New", command: "./bin/agent --acp" }),
+    /on PATH or an absolute path, not \.\/bin\/agent/,
+  );
+  assert.equal(refused({ name: "New", command: "/opt/bin/agent --acp" }), undefined);
   for (const command of ['run "a b"', "run 'a'", "run a\\ b"]) {
     assert.match(refused({ name: "New", command }), /cannot hold quotes/, command);
   }

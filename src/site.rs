@@ -55,9 +55,24 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/settings.js"),
     ),
     (
+        "/settings-controls.js",
+        "text/javascript",
+        include_bytes!("../ui/settings-controls.js"),
+    ),
+    (
         "/settings-dialog.js",
         "text/javascript",
         include_bytes!("../ui/settings-dialog.js"),
+    ),
+    (
+        "/wizard.js",
+        "text/javascript",
+        include_bytes!("../ui/wizard.js"),
+    ),
+    (
+        "/wizard-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/wizard-dialog.js"),
     ),
     ("/run.js", "text/javascript", include_bytes!("../ui/run.js")),
     (
@@ -315,11 +330,24 @@ struct SettingsView<'a> {
     revision: String,
     /// The settings file, for the dialog to name; `None` without a home directory.
     file: Option<String>,
+    /// Whether no settings file exists yet (and settings can be saved), so the startup wizard
+    /// opens automatically on first launch.
+    first_run: bool,
     /// Every agent, built-in ones first; `None` while the agent scan runs.
     agents: Option<Vec<AgentView<'a>>>,
+    /// External tools found on the search path; `None` while the agent scan runs.
+    tools: Option<ToolsView>,
     /// The smallest and largest code font size.
     font_sizes: [u8; 2],
     tab_widths: [u8; 3],
+}
+
+/// External tools found on the search path, for the startup wizard's readiness check.
+#[derive(Debug, Serialize)]
+struct ToolsView {
+    git: Option<String>,
+    npx: Option<String>,
+    gh: Option<String>,
 }
 
 /// The body of `PUT /api/settings`.
@@ -1082,20 +1110,24 @@ impl Site {
                     settings: Settings::default(),
                     problem: Some(format!("settings are off: {}", Error::NoHome)),
                     revision: String::new(),
+                    first_run: false,
                 },
                 None,
             ),
         };
-        let agents = self
-            .agents
-            .path()
-            .map(|path| agent_views(&loaded.settings, &path));
+        let search_path = self.agents.path();
+        let agents = search_path
+            .as_deref()
+            .map(|path| agent_views(&loaded.settings, path));
+        let tools = search_path.as_deref().map(tools_view);
         to_json(&SettingsView {
             settings: &loaded.settings,
             problem: loaded.problem,
             revision: loaded.revision,
             file,
+            first_run: loaded.first_run,
             agents,
+            tools,
             font_sizes: [*settings::FONT_SIZES.start(), *settings::FONT_SIZES.end()],
             tab_widths: settings::TAB_WIDTHS,
         })
@@ -1168,6 +1200,19 @@ fn agent_views<'a>(settings: &'a Settings, search_path: &OsStr) -> Vec<AgentView
         found: found(agents::program_of(&agent.command)),
     });
     built_in.chain(custom).collect()
+}
+
+/// Where external tools Postil relies on live on `search_path`: `git` for repositories, `npx`
+/// for the Claude and Codex adapters, and `gh` for optional draft pull requests.
+fn tools_view(search_path: &OsStr) -> ToolsView {
+    let find = |program| {
+        agents::find_program(program, search_path).map(|path| path.to_string_lossy().into_owned())
+    };
+    ToolsView {
+        git: find("git"),
+        npx: find("npx"),
+        gh: find("gh"),
+    }
 }
 
 /// The `after` of `GET /api/run?after=N`: the number of entries the page has; 0 without it.

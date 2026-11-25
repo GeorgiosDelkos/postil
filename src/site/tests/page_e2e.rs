@@ -97,9 +97,10 @@ fn serve(requests: mpsc::Receiver<Asked>) {
 
 fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: TcpStream) {
     let path = request.uri().path();
-    if path == "/new" {
+    if path == "/new" || path == "/new-fresh" {
         let base = format!("/s{}/", sites.len());
-        sites.push(bridged(sites.len()));
+        let fresh = path == "/new-fresh";
+        sites.push(bridged(sites.len(), fresh));
         let body = serde_json::json!({ "base": base }).to_string();
         write_reply(
             &mut stream,
@@ -139,8 +140,9 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
     write_reply(&mut stream, &bridged.site.respond(&request));
 }
 
-/// A new site on a fresh repository, the `number`th the bridge opened.
-fn bridged(number: usize) -> Bridged {
+/// A new site on a fresh repository, the `number`th the bridge opened. When `fresh` is true,
+/// no `settings.json` is written beforehand so the startup wizard opens on first load.
+fn bridged(number: usize, fresh: bool) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
     repo.write("src/a.rs", "one\ntwo\nthree\n");
     // For the file filter to list several matches.
@@ -156,8 +158,21 @@ fn bridged(number: usize) -> Bridged {
             listeners.retain_mut(|stream| stream.write_all(b"data: run\n\n").is_ok());
         })
     };
+    let site = if fresh {
+        // Empty search path so ambient agents on the developer's or runner's PATH never alter
+        // the wizard's first-run defaults during the e2e test.
+        Site::new(
+            Some(&repo.config()),
+            Some(&repo.home()),
+            None,
+            no_agents(),
+            notify,
+        )
+    } else {
+        agent_site(&repo, "flood", notify)
+    };
     Bridged {
-        site: agent_site(&repo, "flood", notify),
+        site,
         listeners,
         _repo: repo,
     }

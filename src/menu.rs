@@ -16,17 +16,19 @@ pub(crate) enum Command {
     GoToFile,
     CloseWindow,
     Settings,
+    SetupWizard,
     Quit,
     FocusMode,
 }
 
 impl Command {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
         Self::CloseWindow,
         Self::Settings,
+        Self::SetupWizard,
         Self::Quit,
         Self::FocusMode,
     ];
@@ -39,6 +41,7 @@ impl Command {
             Self::GoToFile => "go-to-file",
             Self::CloseWindow => "close-window",
             Self::Settings => "settings",
+            Self::SetupWizard => "setup-wizard",
             Self::Quit => "quit",
             Self::FocusMode => "focus-mode",
         }
@@ -52,6 +55,10 @@ impl Command {
 
     fn item(self, text: &str, accelerator: Accelerator) -> MenuItem {
         MenuItem::with_id(self.id(), text, true, Some(accelerator))
+    }
+
+    fn plain_item(self, text: &str) -> MenuItem {
+        MenuItem::with_id(self.id(), text, true, None)
     }
 }
 
@@ -86,6 +93,7 @@ fn build() -> muda::Result<Menu> {
             &PredefinedMenuItem::about(Some("About Postil"), Some(about)),
             &separator(),
             &Command::Settings.item("Settings…", command(Code::Comma)),
+            &Command::SetupWizard.plain_item("Setup Wizard…"),
             &separator(),
             &PredefinedMenuItem::services(None),
             &separator(),
