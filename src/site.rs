@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -378,6 +379,15 @@ struct UsageView {
     agents: Option<Vec<UsageAgentView>>,
 }
 
+/// Whether a usage reply serves the cached provider quotas or probes them again.
+#[derive(Debug, Clone, Copy)]
+enum QuotaFetch {
+    /// `GET /api/usage`: cached reports, probing only missing or stale ones.
+    Cached,
+    /// `POST /api/usage/refresh`: probe again, unless a probe is still in flight.
+    Refresh,
+}
+
 /// One agent's live quota and filtered Postil activity in [`UsageView`].
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -697,11 +707,11 @@ impl Site {
                 _ => not_allowed("POST with no body"),
             },
             "/api/usage" => match *method {
-                Method::GET => json_or_error(self.usage_view(query, false)),
+                Method::GET => json_or_error(self.usage_view(query, QuotaFetch::Cached)),
                 _ => not_allowed("GET"),
             },
             "/api/usage/refresh" => match *method {
-                Method::POST => json_or_error(self.usage_view(query, true)),
+                Method::POST => json_or_error(self.usage_view(query, QuotaFetch::Refresh)),
                 _ => not_allowed("POST"),
             },
             "/api/layout" => match *method {
@@ -1184,7 +1194,7 @@ impl Site {
     }
 
     /// The reply to `GET /api/usage` and `POST /api/usage/refresh`.
-    fn usage_view(&self, query: &str, refresh: bool) -> Result<Vec<u8>> {
+    fn usage_view(&self, query: &str, fetch: QuotaFetch) -> Result<Vec<u8>> {
         let project = self.project.borrow().clone();
         let has_project = project.is_some();
         let project_name = project.as_ref().map(|proj| proj.repo.name());
@@ -1240,7 +1250,7 @@ impl Site {
         };
 
         let settings = self.current_settings();
-        let agents = self.usage_agents(&settings, &search_path, &mut activities, refresh);
+        let agents = self.usage_agents(&settings, &search_path, &mut activities, fetch);
         let polling = agents
             .iter()
             .any(|agent| agent.quota.status == QuotaStatus::Loading);
@@ -1262,8 +1272,8 @@ impl Site {
         &self,
         settings: &Settings,
         search_path: &OsStr,
-        activities: &mut std::collections::BTreeMap<String, AgentActivity>,
-        refresh: bool,
+        activities: &mut BTreeMap<String, AgentActivity>,
+        fetch: QuotaFetch,
     ) -> Vec<UsageAgentView> {
         let mut entries: Vec<(String, bool, Option<String>)> = Vec::new();
         for agent in BUILT_IN {
@@ -1295,10 +1305,9 @@ impl Site {
             .filter(|(_, built_in, found)| *built_in && found.is_some())
             .map(|(name, _, _)| name.as_str())
             .collect();
-        let mut quotas = if refresh {
-            self.quotas.refresh(&probe_names, search_path)
-        } else {
-            self.quotas.snapshot(&probe_names, search_path)
+        let mut quotas = match fetch {
+            QuotaFetch::Cached => self.quotas.snapshot(&probe_names, search_path),
+            QuotaFetch::Refresh => self.quotas.refresh(&probe_names, search_path),
         };
 
         entries

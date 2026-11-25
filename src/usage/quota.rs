@@ -1,7 +1,7 @@
 //! On-demand background probes for live provider account quotas and rate-limit windows.
 //!
-//! Each probe runs on a short-lived thread with a hard timeout and kills its process group
-//! when done, matching `agents::Scanner`. Results are cached briefly in memory so reopening
+//! Each probe runs on a short-lived thread; every subprocess it starts has a hard timeout,
+//! and its process group is killed when done, matching `agents::Scanner`. Results are cached briefly in memory so reopening
 //! the Usage dialog does not spam provider endpoints, and nothing runs while the dialog is
 //! closed. Secrets (OAuth tokens) are piped to `/usr/bin/curl` over stdin (`--config -`),
 //! never passed in process arguments.
@@ -26,13 +26,21 @@ use crate::agents;
 use crate::usage::now_secs;
 
 /// How long a fetched quota snapshot stays fresh before the next open re-probes it.
+/// Arbitrary: provider windows move over minutes and hours, so a minute-old figure is
+/// current enough, and closing and reopening the dialog within it sends no request.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Hard limit on any single provider probe (subprocess or HTTP).
+/// Hard limit on one subprocess a probe runs (`security`, `curl`, or `codex app-server`).
+/// A probe runs up to two of them one after the other (Claude: the Keychain read, then the
+/// usage request; Gemini: two requests), so a probe can take up to twice this. Arbitrary:
+/// long enough for a slow network round trip, short enough that the dialog does not show
+/// "Loading" for long.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Maximum time an in-flight `Loading` entry stays fresh before a subsequent poll may retry it.
-const LOADING_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long an in-flight `Loading` entry stays fresh before a later poll replaces its probe.
+/// Two [`PROBE_TIMEOUT`]s (the longest a probe should take) plus 4 s of margin, so only a
+/// probe that is stuck past its own timeouts is replaced.
+const LOADING_TIMEOUT: Duration = Duration::from_secs(2 * PROBE_TIMEOUT.as_secs() + 4);
 
 /// State of a live quota probe for one agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,7 +53,8 @@ pub(crate) enum QuotaStatus {
 }
 
 /// One rolling or per-model quota window reported by a provider.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QuotaWindow {
     pub(crate) label: String,
@@ -61,7 +70,8 @@ pub(crate) struct QuotaWindow {
 }
 
 /// Extra spend or credit balance reported alongside quota windows.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreditInfo {
     pub(crate) label: String,
@@ -77,7 +87,8 @@ pub(crate) struct CreditInfo {
 }
 
 /// Normalized live quota report for one agent.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QuotaReport {
     pub(crate) status: QuotaStatus,
@@ -339,8 +350,6 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
     }
 }
 
-// ---- Claude -------------------------------------------------------------------------------
-
 fn probe_claude() -> QuotaReport {
     let creds = match read_claude_credentials() {
         Ok(creds) => creds,
@@ -569,8 +578,6 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
     }
 }
 
-// ---- Codex --------------------------------------------------------------------------------
-
 fn probe_codex(search_path: &OsStr) -> QuotaReport {
     let Some(program) = agents::find_program("codex", search_path) else {
         return QuotaReport::unavailable("Codex CLI not found on PATH");
@@ -614,7 +621,9 @@ fn read_codex_replies(child: &mut Child) -> Result<(Option<Value>, Option<Value>
         .take()
         .expect("probe_codex starts codex app-server with a piped stdout");
     let requests = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"postil","version":"0.1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"postil","version":""#,
+        env!("CARGO_PKG_VERSION"),
+        r#""}}}"#,
         "\n",
         r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
         "\n",
@@ -813,8 +822,6 @@ fn parse_codex_credits(bucket: &Value) -> Option<CreditInfo> {
     })
 }
 
-// ---- Gemini -------------------------------------------------------------------------------
-
 enum GeminiCreds {
     Token(String),
     Expired,
@@ -1004,8 +1011,6 @@ fn parse_gemini_quota(body: &str, plan: Option<String>) -> QuotaReport {
     }
 }
 
-// ---- Subprocess helpers (macOS security & curl) -------------------------------------------
-
 /// Reads a generic password secret from the macOS Keychain, bounded by [`PROBE_TIMEOUT`].
 #[cfg(target_os = "macos")]
 fn read_keychain_secret(service: &str) -> Option<String> {
@@ -1050,6 +1055,12 @@ fn curl_json(
         config.push_str(&format!("data-raw = {}\n", curl_quote(body)));
     }
 
+    // One second under the hard kill, so curl normally stops itself and exits with code 28
+    // ("the provider did not answer in time") before `run_timed` kills it.
+    let curl_max_time = PROBE_TIMEOUT
+        .saturating_sub(Duration::from_secs(1))
+        .as_secs()
+        .to_string();
     let output = run_timed(
         Command::new("/usr/bin/curl")
             .args([
@@ -1059,7 +1070,7 @@ fn curl_json(
                 "--disable",
                 "--silent",
                 "--max-time",
-                "7",
+                &curl_max_time,
                 "--write-out",
                 &format!("{STATUS_MARK}%{{http_code}}"),
                 "--config",
@@ -1099,6 +1110,8 @@ fn curl_failure(code: Option<i32>) -> String {
     }
 }
 
+/// `value` as one double-quoted curl config value: `\` and `"` are escaped, and a line break
+/// becomes a space, so a token cannot end the value or start a new option line.
 fn curl_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -1610,6 +1623,17 @@ mod tests {
         let limits = serde_json::json!({ "id": 3, "error": { "message": at_bound } });
         let report = parse_codex_quota(None, Some(&limits));
         assert_eq!(report.message.as_deref(), Some(at_bound.as_str()));
+    }
+
+    #[test]
+    fn curl_quote_keeps_a_hostile_token_inside_one_config_value() {
+        let token = "a\"b\\c\nurl = \"https://evil.example\"\r";
+        let quoted = curl_quote(token);
+        assert_eq!(quoted, r#""a\"b\\c url = \"https://evil.example\" ""#);
+        assert!(
+            !quoted.contains(['\n', '\r']),
+            "a newline would start a new option"
+        );
     }
 
     #[test]
