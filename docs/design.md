@@ -7,6 +7,13 @@ is designed. Section "Decisions" lists what is settled and what is still assumed
 Mockups: https://claude.ai/code/artifact/68e1a720-a3d5-4d71-92d4-9acd76ea9d5e (private to the
 owner until shared).
 
+What comes after milestone 6 is designed in `docs/review-assist.md` (2026-11-25): reviewer
+aids, the map of a repository, team memory and voice, as milestones 7 to 10. Where that
+document changes a rule of this one (a second accent color, a second module with `unsafe`,
+third-party JavaScript in the page, `mcpServers` no longer empty, a middle pane split into
+diagram and code), it says so, and this
+document is amended when each is built.
+
 ## The problem in one sentence
 
 An engineer opens a local repository, reads code, attaches notes to line ranges, sends the
@@ -1132,6 +1139,9 @@ retired; the measured numbers above are the baseline to not regress.
    their changes back: the worktree with its branch, commits and clones, with Apply and
    Discard (built); then a runner per thread, its locks and the agent cap (built); then the
    startup sweep, eviction and the free-space floor (built); then Open pull request (built).
+
+Milestones 7 to 10 (reviewer aids, the map, team memory, voice) are in
+`docs/review-assist.md`.
 
 ## Testing
 
