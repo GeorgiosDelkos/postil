@@ -218,30 +218,33 @@ pub(crate) struct PromptResult {
     pub(crate) usage: Option<PromptUsage>,
 }
 
-/// Token counts reported on a `session/prompt` reply.
+/// Token counts reported on a `session/prompt` reply. Also the token part of a usage ledger
+/// record (`usage/ledger.rs`), which stores them as received.
 #[expect(
     clippy::struct_field_names,
     reason = "the fields are named as the protocol names them"
 )]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PromptUsage {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) input_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thought_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_read_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_write_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) total_tokens: Option<u64>,
 }
 
 /// Cost reported on an ACP `usage_update` session update.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UsageCost {
     pub(crate) amount: f64,

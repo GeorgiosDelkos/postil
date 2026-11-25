@@ -150,7 +150,7 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
       ["all", "All projects", false],
     ];
     const ranges = [
-      ["today", "Today", false],
+      ["24h", "24h", false],
       ["7d", "7d", false],
       ["30d", "30d", false],
       ["all", "All", false],
@@ -326,7 +326,11 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
       const tokens = el("span", "usage-col-num", formatTokens(model.totalTokens));
       const breakdown = tokenBreakdownTitle(model);
       if (breakdown) tokens.title = breakdown;
-      const cost = el("span", "usage-col-num", formatCost(model.costAmount, model.costCurrency));
+      const cost = el(
+        "span",
+        "usage-col-num",
+        formatCost(model.cost?.amount, model.cost?.currency),
+      );
       const time = el("span", "usage-col-num", formatDuration(model.durationSecs));
       row.append(name, runs, tokens, cost, time);
       table.append(row);

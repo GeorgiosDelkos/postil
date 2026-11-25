@@ -107,8 +107,11 @@ export function summaryItems(summary, agentCount) {
     { label: summary.runs === 1 ? "run" : "runs", value: String(summary.runs) },
     { label: "tokens", value: formatTokens(summary.totalTokens) },
   ];
-  if (summary.costAmount != null && summary.costCurrency) {
-    items.push({ label: "reported", value: formatCost(summary.costAmount, summary.costCurrency) });
+  if (summary.cost) {
+    items.push({
+      label: "reported",
+      value: formatCost(summary.cost.amount, summary.cost.currency),
+    });
   }
   if (summary.durationSecs > 0) {
     items.push({ label: "active", value: formatDuration(summary.durationSecs) });
@@ -118,7 +121,7 @@ export function summaryItems(summary, agentCount) {
 }
 
 export function rangeLabel(range) {
-  return { today: "Today", "7d": "7d", "30d": "30d", all: "All time" }[range] ?? range;
+  return { "24h": "24h", "7d": "7d", "30d": "30d", all: "All time" }[range] ?? range;
 }
 
 export function usageUrl(base, scope, range) {
@@ -131,6 +134,9 @@ export function tokenBreakdownTitle(row) {
   if (row.inputTokens > 0) parts.push(`Input: ${row.inputTokens.toLocaleString()}`);
   if (row.outputTokens > 0) parts.push(`Output: ${row.outputTokens.toLocaleString()}`);
   if (row.cachedReadTokens > 0) parts.push(`Cached: ${row.cachedReadTokens.toLocaleString()}`);
+  if (row.cachedWriteTokens > 0) {
+    parts.push(`Cache writes: ${row.cachedWriteTokens.toLocaleString()}`);
+  }
   if (row.thoughtTokens > 0) parts.push(`Thought: ${row.thoughtTokens.toLocaleString()}`);
   return parts.join(" · ");
 }

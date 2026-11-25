@@ -82,7 +82,7 @@ test("highestQuotaTone flags >=90% as warn and >=95% as critical", () => {
 
 test("summaryItems, usageUrl, and tokenBreakdownTitle format view metadata", () => {
   const items = summaryItems(
-    { runs: 1, totalTokens: 160, costAmount: 0.02, costCurrency: "USD", durationSecs: 12 },
+    { runs: 1, totalTokens: 160, cost: { amount: 0.02, currency: "USD" }, durationSecs: 12 },
     2,
   );
   assert.deepEqual(items, [

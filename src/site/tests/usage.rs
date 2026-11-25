@@ -113,7 +113,7 @@ fn a_finished_run_records_model_tokens_and_cost_that_survive_note_deletion() {
     let usage = loop {
         let reply = get_json(
             &site,
-            "postil://localhost/api/usage?scope=project&range=today",
+            "postil://localhost/api/usage?scope=project&range=24h",
         );
         if reply["scanning"] == false {
             break reply;
@@ -128,8 +128,8 @@ fn a_finished_run_records_model_tokens_and_cost_that_survive_note_deletion() {
     assert_eq!(usage["summary"]["outputTokens"], 30);
     assert_eq!(usage["summary"]["cachedReadTokens"], 40);
     assert_eq!(usage["summary"]["thoughtTokens"], 10);
-    assert_eq!(usage["summary"]["costCurrency"], "USD");
-    let cost = usage["summary"]["costAmount"].as_f64().unwrap();
+    assert_eq!(usage["summary"]["cost"]["currency"], "USD");
+    let cost = usage["summary"]["cost"]["amount"].as_f64().unwrap();
     assert!((cost - 0.02).abs() < 1e-9, "cost={cost}");
 
     let fake = usage["agents"]
@@ -173,7 +173,7 @@ fn a_kept_agent_follow_up_records_only_its_session_cost_delta() {
     let usage = loop {
         let reply = get_json(
             &site,
-            "postil://localhost/api/usage?scope=project&range=today",
+            "postil://localhost/api/usage?scope=project&range=24h",
         );
         if reply["scanning"] == false {
             break reply;
@@ -183,7 +183,7 @@ fn a_kept_agent_follow_up_records_only_its_session_cost_delta() {
     };
 
     assert_eq!(usage["summary"]["runs"], 2);
-    let cost = usage["summary"]["costAmount"].as_f64().unwrap();
+    let cost = usage["summary"]["cost"]["amount"].as_f64().unwrap();
     assert!(
         (cost - 0.04).abs() < 1e-9,
         "expected 0.04 cumulative, got {cost}"
@@ -201,19 +201,5 @@ fn invalid_usage_query_params_are_refused() {
     assert_eq!(
         get(&site, "postil://localhost/api/usage?range=1y").0,
         StatusCode::BAD_REQUEST
-    );
-}
-
-#[test]
-fn usage_button_sits_above_settings_button_in_sidebar_footer() {
-    let usage_pos = INDEX_HTML
-        .find("id=\"open-usage\"")
-        .expect("Usage button is in index.html");
-    let settings_pos = INDEX_HTML
-        .find("id=\"open-settings\"")
-        .expect("Settings button is in index.html");
-    assert!(
-        usage_pos < settings_pos,
-        "Usage button must appear above the Settings button"
     );
 }

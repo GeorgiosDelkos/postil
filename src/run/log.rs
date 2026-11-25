@@ -41,10 +41,8 @@ use crate::error::{Error, Result};
 use crate::files::version_of;
 use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
-use crate::usage::{
-    ledger::{self, LedgerRecord, LedgerSink, RECORD_VERSION},
-    now_secs,
-};
+use crate::usage::ledger::{self, LedgerRecord, LedgerSink, RECORD_VERSION, RunOrigin, RunOutcome};
+use crate::usage::now_secs;
 
 /// How long a send waits for the run lock or a thread's lock before it reports another
 /// window's run ([`take_lock`]). Arbitrary: far longer than a fork-to-exec window, short
@@ -92,22 +90,17 @@ pub(crate) struct Run {
     state: Mutex<RunState>,
 }
 
-/// Token and cost totals collected in memory while a run is live.
+/// What the agent reported about a live run's usage, kept in memory until the run ends.
 #[derive(Debug, Default)]
 struct RunUsage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cached_read_tokens: Option<u64>,
-    cached_write_tokens: Option<u64>,
-    thought_tokens: Option<u64>,
-    total_tokens: Option<u64>,
+    /// The token counts of the prompt reply, which ends the turn.
+    tokens: Option<PromptUsage>,
     context_used: Option<u64>,
     context_size: Option<u64>,
-    /// Cumulative session cost before this turn began (for a kept agent reused on a follow-up).
-    cost_baseline: Option<(f64, String)>,
-    /// Latest cumulative session cost reported by the agent during this turn.
-    cost_amount: Option<f64>,
-    cost_currency: Option<String>,
+    /// The session's cumulative cost before this turn began (a kept agent on a follow-up).
+    cost_baseline: Option<UsageCost>,
+    /// The session's latest cumulative cost reported during this turn.
+    cost: Option<UsageCost>,
 }
 
 impl RunUsage {
@@ -123,53 +116,31 @@ impl RunUsage {
             && cost.amount >= 0.0
             && !cost.currency.is_empty()
         {
-            self.cost_amount = Some(cost.amount);
-            self.cost_currency = Some(cost.currency);
+            self.cost = Some(cost);
         }
     }
 
-    /// Cost attributable to this turn alone: the delta from `cost_baseline` when this run
-    /// continued an earlier turn on the same kept session with the same currency.
-    fn turn_cost(&self) -> (Option<f64>, Option<String>) {
-        let (Some(raw), Some(currency)) = (self.cost_amount, self.cost_currency.as_ref()) else {
-            return (None, None);
-        };
-        let amount = match &self.cost_baseline {
-            Some((base, base_currency)) if base_currency == currency && raw >= *base => {
-                (raw - *base).max(0.0)
+    /// What this turn alone cost: the session's cost less `cost_baseline`. `None` when the
+    /// two cannot be compared (another currency, or a cumulative cost that went down, as a
+    /// rounded or reset meter does): recording the whole session's cost would count the
+    /// earlier turns twice.
+    fn turn_cost(&self) -> Option<UsageCost> {
+        let cost = self.cost.as_ref()?;
+        match &self.cost_baseline {
+            None => Some(cost.clone()),
+            Some(base) if base.currency == cost.currency && cost.amount >= base.amount => {
+                Some(UsageCost {
+                    amount: cost.amount - base.amount,
+                    currency: cost.currency.clone(),
+                })
             }
-            _ => raw,
-        };
-        (Some(amount), Some(currency.clone()))
+            Some(_) => None,
+        }
     }
 
     /// Latest known cumulative session cost for a follow-up that reuses this session.
-    fn session_cost(&self) -> Option<(f64, String)> {
-        if let (Some(amount), Some(currency)) = (self.cost_amount, self.cost_currency.as_ref()) {
-            return Some((amount, currency.clone()));
-        }
-        self.cost_baseline.clone()
-    }
-
-    fn record_prompt(&mut self, usage: PromptUsage) {
-        if let Some(val) = usage.input_tokens {
-            self.input_tokens = Some(val);
-        }
-        if let Some(val) = usage.output_tokens {
-            self.output_tokens = Some(val);
-        }
-        if let Some(val) = usage.cached_read_tokens {
-            self.cached_read_tokens = Some(val);
-        }
-        if let Some(val) = usage.cached_write_tokens {
-            self.cached_write_tokens = Some(val);
-        }
-        if let Some(val) = usage.thought_tokens {
-            self.thought_tokens = Some(val);
-        }
-        if let Some(val) = usage.total_tokens {
-            self.total_tokens = Some(val);
-        }
+    fn session_cost(&self) -> Option<UsageCost> {
+        self.cost.clone().or_else(|| self.cost_baseline.clone())
     }
 }
 
@@ -653,12 +624,12 @@ impl Run {
 
     /// Records the cumulative session cost already accounted for by earlier turns on a kept
     /// agent, so this run logs only its incremental cost.
-    pub(super) fn set_cost_baseline(&self, baseline: Option<(f64, String)>) {
+    pub(super) fn set_cost_baseline(&self, baseline: Option<UsageCost>) {
         self.state().usage.cost_baseline = baseline;
     }
 
     /// The latest cumulative session cost reported on this run (or its baseline if none).
-    pub(super) fn session_cost(&self) -> Option<(f64, String)> {
+    pub(super) fn session_cost(&self) -> Option<UsageCost> {
         self.state().usage.session_cost()
     }
 
@@ -669,9 +640,8 @@ impl Run {
             if !state.live() {
                 return;
             }
-            let status = end_status(&entry);
-            self.write(&mut state, entry);
-            status.and_then(|status| self.usage_record(&state, status))
+            let outcome = self.write(&mut state, entry);
+            outcome.and_then(|outcome| self.usage_record(&state, outcome))
         };
         self.write_usage(finished);
     }
@@ -685,8 +655,9 @@ impl Run {
         }
     }
 
-    /// Appends `entry` to the log and to `state`, which the caller holds.
-    fn write(&self, state: &mut RunState, entry: Entry) {
+    /// Appends `entry` to the log and to `state`, which the caller holds. Returns how the run
+    /// ended when `entry` ended it.
+    fn write(&self, state: &mut RunState, entry: Entry) -> Option<RunOutcome> {
         if let Some(log) = &mut state.log
             && let Err(error) = log.write_all(&json_line(&entry))
         {
@@ -697,8 +668,9 @@ impl Run {
                 self.file.display()
             ));
         }
-        state.apply(&entry);
+        let outcome = state.apply(&entry);
         state.entries.push(entry);
+        outcome
     }
 
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
@@ -750,8 +722,8 @@ impl Run {
                     option: None,
                 },
                 Event::TurnEnded(TurnEnd::Stopped { reason, usage }) => {
-                    if let Some(usage) = usage {
-                        state.usage.record_prompt(usage);
+                    if usage.is_some() {
+                        state.usage.tokens = usage;
                     }
                     Entry::Ended { reason }
                 }
@@ -770,11 +742,11 @@ impl Run {
                         reason: StopReason::Refusal
                     }
             );
-            let status = end_status(&entry);
+            let mut outcome = None;
             for entry in std::iter::once(entry).chain(answer) {
-                self.write(&mut state, entry);
+                outcome = outcome.or(self.write(&mut state, entry));
             }
-            let finished = status.and_then(|status| self.usage_record(&state, status));
+            let finished = outcome.and_then(|outcome| self.usage_record(&state, outcome));
             let notes = if took_turn {
                 state.unmarked.take()
             } else {
@@ -786,44 +758,45 @@ impl Run {
         notes
     }
 
-    fn usage_record(&self, state: &RunState, status: &'static str) -> Option<LedgerRecord> {
+    fn usage_record(&self, state: &RunState, outcome: RunOutcome) -> Option<LedgerRecord> {
         let sink = self.usage.as_ref()?;
         let origin = if state.header.review.is_some() {
-            "review"
+            RunOrigin::Review
         } else if state.header.follow_up.is_some() {
-            "follow_up"
+            RunOrigin::FollowUp
         } else {
-            "notes"
+            RunOrigin::Notes
         };
-        let (cost_amount, cost_currency) = state.usage.turn_cost();
         Some(LedgerRecord {
             version: RECORD_VERSION,
             run_id: state.header.id.clone(),
             repo: sink.repo.clone(),
             agent: state.header.agent.clone(),
             model: state.model.clone(),
-            origin: origin.to_owned(),
-            status: status.to_owned(),
+            origin,
+            outcome,
             started_at: state.header.started_at,
             ended_at: now_secs().max(state.header.started_at),
-            input_tokens: state.usage.input_tokens,
-            output_tokens: state.usage.output_tokens,
-            cached_read_tokens: state.usage.cached_read_tokens,
-            cached_write_tokens: state.usage.cached_write_tokens,
-            thought_tokens: state.usage.thought_tokens,
-            total_tokens: state.usage.total_tokens,
+            tokens: state.usage.tokens.unwrap_or_default(),
             context_used: state.usage.context_used,
             context_size: state.usage.context_size,
-            cost_amount,
-            cost_currency,
+            cost: state.usage.turn_cost(),
             tool_calls: state.kinds.len() as u64,
         })
     }
 
+    /// Appends the finished run's usage record to the ledger. A failure does not fail the
+    /// run, which has ended, but becomes the run's problem, so the engineer learns why the
+    /// Usage report is missing it.
     fn write_usage(&self, record: Option<LedgerRecord>) {
-        if let (Some(sink), Some(record)) = (&self.usage, record) {
-            // Best effort: a read-only config dir never fails or stalls a run.
-            drop(ledger::append(&sink.file, &record));
+        let (Some(sink), Some(record)) = (&self.usage, record) else {
+            return;
+        };
+        if let Err(error) = ledger::append(&sink.file, &record) {
+            self.state().problem.get_or_insert(format!(
+                "this run's usage was not recorded in {}: {error}",
+                sink.file.display()
+            ));
         }
     }
 
@@ -962,8 +935,9 @@ impl RunState {
         self.lock.is_some()
     }
 
-    /// Keeps the fields that sum up the entries current with one more.
-    fn apply(&mut self, entry: &Entry) {
+    /// Keeps the fields that sum up the entries current with one more. Returns how the run
+    /// ended when `entry` ended it.
+    fn apply(&mut self, entry: &Entry) -> Option<RunOutcome> {
         match entry {
             Entry::Started => self.started = true,
             Entry::CancelRequested => self.cancel_requested = true,
@@ -973,15 +947,17 @@ impl RunState {
             Entry::Answer { request, .. } | Entry::Reply { request, .. } => {
                 self.answered.insert(*request);
             }
-            Entry::Ended { .. } | Entry::Failed { .. } => {
-                self.end = Some(if matches!(entry, Entry::Ended { .. }) {
-                    Status::Ended
+            Entry::Ended { reason } => {
+                self.finish(Status::Ended);
+                return Some(if matches!(reason, StopReason::Cancelled) {
+                    RunOutcome::Cancelled
                 } else {
-                    Status::Failed
+                    RunOutcome::Ended
                 });
-                self.log = None;
-                // Another window may start a run in the thread now, or end it.
-                self.lock = None;
+            }
+            Entry::Failed { .. } => {
+                self.finish(Status::Failed);
+                return Some(RunOutcome::Failed);
             }
             Entry::Tool { id, tool, .. }
             | Entry::ToolUpdate {
@@ -999,6 +975,14 @@ impl RunState {
             | Entry::Findings { .. }
             | Entry::Snapshot { .. } => {}
         }
+        None
+    }
+
+    fn finish(&mut self, end: Status) {
+        self.end = Some(end);
+        self.log = None;
+        // Another window may start a run in the thread now, or end it.
+        self.lock = None;
     }
 
     /// The tree of the run's snapshot at `point`, when one was taken.
@@ -1359,25 +1343,14 @@ fn entry_of(
                 })
                 .collect(),
         },
-        // An image or a link in a message, usage updates (tracked on RunState), and unknown updates.
+        // An image or a link in a message, usage updates (kept in `RunState.usage` by
+        // `record_event`, never shown), and updates the panel does not show.
         SessionUpdate::AgentMessageChunk { .. }
         | SessionUpdate::AgentThoughtChunk { .. }
         | SessionUpdate::UsageUpdate { .. }
         | SessionUpdate::Other => return None,
     };
     Some(entry)
-}
-
-/// The ledger status string when `entry` ends a run; `None` for any other entry.
-fn end_status(entry: &Entry) -> Option<&'static str> {
-    match entry {
-        Entry::Ended {
-            reason: StopReason::Cancelled,
-        } => Some("cancelled"),
-        Entry::Ended { .. } => Some("ended"),
-        Entry::Failed { .. } => Some("failed"),
-        _ => None,
-    }
 }
 
 /// The most bytes of a command the log keeps. A heredoc can be megabytes, and a log is read
@@ -1538,6 +1511,91 @@ mod tests {
         );
         drop(state);
         drop(fs::remove_dir_all(dir.parent().unwrap()));
+    }
+
+    /// A run like [`create`]'s whose usage record goes to `ledger`.
+    fn create_with_ledger(dir: &Path, ledger: &Path) -> Run {
+        let opening = Opening {
+            agent: "Fake",
+            notes: &["N1".to_owned()],
+            prompt: "p",
+            origin: Origin::Notes,
+        };
+        let sink = LedgerSink {
+            file: ledger.to_owned(),
+            repo: "/repo".to_owned(),
+        };
+        Run::create(dir, opening, InThread::New, Some(sink)).unwrap()
+    }
+
+    #[test]
+    fn a_cancelled_run_is_recorded_as_cancelled_once() {
+        let temp = crate::testing::TempDir::new("run-ledger");
+        let runs = temp.path().join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        let file = temp.path().join("usage.jsonl");
+        let run = create_with_ledger(&runs, &file);
+
+        run.record(Entry::Ended {
+            reason: StopReason::Cancelled,
+        });
+        // A second end (a forced stop racing the agent's own) records nothing more.
+        run.record(Entry::Failed {
+            error: "late".to_owned(),
+        });
+
+        let records = ledger::read(&file);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, RunOutcome::Cancelled);
+        assert_eq!(records[0].origin, RunOrigin::Notes);
+    }
+
+    #[test]
+    fn a_usage_record_that_cannot_be_written_becomes_the_run_s_problem() {
+        let temp = crate::testing::TempDir::new("run-ledger-refused");
+        let runs = temp.path().join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        // A directory where the ledger file should be: opening it for appending fails.
+        let file = temp.path().join("usage.jsonl");
+        fs::create_dir_all(&file).unwrap();
+        let run = create_with_ledger(&runs, &file);
+
+        run.record(Entry::Failed {
+            error: "agent exited".to_owned(),
+        });
+
+        let problem = run
+            .state()
+            .problem
+            .clone()
+            .expect("the refusal is reported");
+        assert!(problem.contains("usage was not recorded"), "{problem}");
+    }
+
+    #[test]
+    fn a_turn_s_cost_is_the_session_cost_less_what_earlier_turns_cost() {
+        let usd = |amount| UsageCost {
+            amount,
+            currency: "USD".to_owned(),
+        };
+        let turn = |baseline, cost| {
+            RunUsage {
+                cost_baseline: baseline,
+                cost: Some(cost),
+                ..RunUsage::default()
+            }
+            .turn_cost()
+            .map(|cost| cost.amount)
+        };
+        assert_eq!(turn(None, usd(1.5)), Some(1.5));
+        assert_eq!(turn(Some(usd(1.0)), usd(1.5)), Some(0.5));
+        // A meter that went down cannot say what this turn cost.
+        assert_eq!(turn(Some(usd(1.2)), usd(1.0)), None);
+        let euros = UsageCost {
+            amount: 2.0,
+            currency: "EUR".to_owned(),
+        };
+        assert_eq!(turn(Some(usd(1.0)), euros), None);
     }
 
     #[test]

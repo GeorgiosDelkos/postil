@@ -402,7 +402,7 @@ test("Usage button opens the usage report, switches filters, and Refresh settles
 
   await dialog.locator(".usage-summary").waitFor();
   await dialog.getByRole("radio", { name: "All projects" }).click();
-  await dialog.getByRole("radio", { name: "Today" }).click();
+  await dialog.getByRole("radio", { name: "24h" }).click();
   const refresh = dialog.getByRole("button", { name: "Refresh" });
   await refresh.click();
   // Even when the reply matches the previous view, Refresh must settle back to enabled.

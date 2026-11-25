@@ -27,7 +27,7 @@ use crate::repo::Repo;
 use crate::run::{Ending, Notify, Runner};
 use crate::settings::{self, RawSettings, Settings};
 use crate::usage::{
-    ledger::{self, AgentActivity, Range, Scope, UsageSummary},
+    ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
     quota::{QuotaPoller, QuotaReport, QuotaStatus},
 };
@@ -372,7 +372,7 @@ struct UsageView {
     scanning: bool,
     polling: bool,
     ledger_file: Option<String>,
-    summary: UsageSummary,
+    summary: Totals,
     /// Installed built-in agents, installed/used custom agents, and any other agent with
     /// recorded usage in the selected window; `None` while the agent scan runs.
     agents: Option<Vec<UsageAgentView>>,
@@ -1206,7 +1206,7 @@ impl Site {
         };
         let range = match query_value(query, "range") {
             Some(value) => Range::parse(&value).ok_or_else(|| {
-                Error::BadRequest(format!("range={value:?}: expected today, 7d, 30d or all"))
+                Error::BadRequest(format!("range={value:?}: expected 24h, 7d, 30d or all"))
             })?,
             None => Range::SevenDays,
         };
@@ -1215,8 +1215,11 @@ impl Site {
             .usage_file
             .as_deref()
             .map_or_else(Vec::new, ledger::read);
-        let (summary, mut activities) =
-            ledger::aggregate(&records, scope, project_root.as_deref(), range, now_secs());
+        let only_repo = match scope {
+            Scope::Project => project_root.as_deref(),
+            Scope::All => None,
+        };
+        let (summary, mut activities) = ledger::aggregate(&records, only_repo, range, now_secs());
         let ledger_file = self
             .usage_file
             .as_ref()
