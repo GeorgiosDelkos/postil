@@ -160,18 +160,11 @@ fn a_finished_run_records_model_tokens_and_cost_that_survive_note_deletion() {
     let (status, body) = delete(&site, &format!("{NOTES}?id=N1"));
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let usage = loop {
-        let reply = get_json(
-            &site,
-            "postil://localhost/api/usage?scope=project&range=24h",
-        );
-        if reply["scanning"] == false {
-            break reply;
-        }
-        assert!(Instant::now() < deadline, "agent scan did not finish");
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    site.agents.wait();
+    let usage = get_json(
+        &site,
+        "postil://localhost/api/usage?scope=project&range=24h",
+    );
 
     assert_eq!(usage["summary"]["runs"], 1);
     assert_eq!(usage["summary"]["totalTokens"], 160);
@@ -190,6 +183,11 @@ fn a_finished_run_records_model_tokens_and_cost_that_survive_note_deletion() {
         .find(|agent| agent["name"] == "Fake")
         .expect("custom agent Fake is listed");
     assert_eq!(fake["builtIn"], false);
+    assert_eq!(fake["enabled"], true);
+    assert_eq!(
+        fake["quota"]["message"],
+        "Custom agent — no provider quota source"
+    );
     assert_eq!(fake["activity"]["runs"], 1);
     assert_eq!(fake["activity"]["models"][0]["model"], "m");
     assert_eq!(fake["activity"]["models"][0]["totalTokens"], 160);
@@ -220,18 +218,11 @@ fn a_kept_agent_follow_up_records_only_its_session_cost_delta() {
     let second = wait_for_run(&site, &nudges, "R2");
     assert_eq!(second["status"], "ended");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let usage = loop {
-        let reply = get_json(
-            &site,
-            "postil://localhost/api/usage?scope=project&range=24h",
-        );
-        if reply["scanning"] == false {
-            break reply;
-        }
-        assert!(Instant::now() < deadline, "agent scan did not finish");
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    site.agents.wait();
+    let usage = get_json(
+        &site,
+        "postil://localhost/api/usage?scope=project&range=24h",
+    );
 
     assert_eq!(usage["summary"]["runs"], 2);
     let cost = usage["summary"]["cost"]["amount"].as_f64().unwrap();
@@ -239,6 +230,18 @@ fn a_kept_agent_follow_up_records_only_its_session_cost_delta() {
         (cost - 0.04).abs() < 1e-9,
         "expected 0.04 cumulative, got {cost}"
     );
+}
+
+#[test]
+fn an_unreadable_ledger_is_an_error_naming_the_file() {
+    let repo = TempRepo::new("usage-unreadable");
+    // A directory where the ledger should be: it exists, and reading it fails.
+    fs::create_dir_all(repo.config().join("usage.jsonl")).unwrap();
+    let site = repo.empty_site();
+    let (status, body) = get(&site, "postil://localhost/api/usage");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("cannot read the usage ledger"), "{body}");
+    assert!(body.contains("usage.jsonl"), "{body}");
 }
 
 #[test]
@@ -252,5 +255,78 @@ fn invalid_usage_query_params_are_refused() {
     assert_eq!(
         get(&site, "postil://localhost/api/usage?range=1y").0,
         StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn usage_without_a_project_covers_every_project_whatever_scope_is_asked() {
+    let repo = TempRepo::new("usage-scope");
+    let site = repo.empty_site();
+    for query in ["", "?scope=project", "?scope=all"] {
+        let body = get_json(&site, &format!("postil://localhost/api/usage{query}"));
+        assert_eq!(body["scope"], "all", "{query}: {body}");
+        assert_eq!(body["hasProject"], false);
+    }
+
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+    let body = get_json(&site, "postil://localhost/api/usage");
+    assert_eq!(
+        body["scope"], "project",
+        "a project defaults to itself: {body}"
+    );
+    let body = get_json(&site, "postil://localhost/api/usage?scope=all");
+    assert_eq!(body["scope"], "all", "{body}");
+}
+
+#[test]
+fn usage_lists_an_agent_only_when_it_is_installed_or_has_history() {
+    let repo = TempRepo::new("usage-listed");
+    let bin = repo.root.join(".git/fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    make_executable(&bin, "installed-tool");
+    let config = repo.config();
+    fs::create_dir_all(&config).unwrap();
+    let record = |agent: &str| {
+        serde_json::json!({
+            "version": 1, "runId": "R1", "repo": "/elsewhere", "agent": agent,
+            "origin": "notes", "outcome": "ended", "startedAt": 1, "endedAt": 2,
+        })
+        .to_string()
+    };
+    fs::write(
+        config.join("usage.jsonl"),
+        format!("{}\n{}\n", record("Used"), record("Removed")),
+    )
+    .unwrap();
+
+    let search = OsString::from(&bin);
+    let scanner = Scanner::new(move || search.clone());
+    let _ = scanner.wait();
+    let site = Site::new(Some(&config), None, None, scanner, quiet())
+        .with_quota_poller(QuotaPoller::new(|_, _| QuotaReport::unavailable("probed")));
+    let settings = serde_json::json!({
+        "customAgents": [
+            { "name": "Installed", "command": "installed-tool --acp" },
+            { "name": "Used", "command": "missing-tool" },
+            { "name": "Idle", "command": "missing-tool" },
+        ],
+        "enabledAgents": ["Installed"],
+        "agent": "Installed",
+    });
+    assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
+
+    let body = get_json(&site, "postil://localhost/api/usage?scope=all&range=all");
+    let listed: Vec<(&str, bool)> = body["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| (agent["name"].as_str().unwrap(), agent["enabled"] == true))
+        .collect();
+    // Idle is neither installed nor used; Removed is no longer in the settings but has runs.
+    assert_eq!(
+        listed,
+        [("Installed", true), ("Used", false), ("Removed", false)],
+        "{body}"
     );
 }

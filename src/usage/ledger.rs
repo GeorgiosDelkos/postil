@@ -47,7 +47,7 @@ impl Scope {
 
 /// Which time window the report aggregates over. The windows roll back from now: the page has
 /// the local time zone, the process does not, so a calendar day is not offered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) enum Range {
     #[serde(rename = "24h")]
     Day,
@@ -89,7 +89,8 @@ pub(crate) struct LedgerSink {
 }
 
 /// How a run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunOutcome {
     Ended,
@@ -98,7 +99,8 @@ pub(crate) enum RunOutcome {
 }
 
 /// What started a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunOrigin {
     Notes,
@@ -299,18 +301,24 @@ pub(crate) fn append(file: &Path, record: &LedgerRecord) -> io::Result<()> {
     out.write_all(&line)
 }
 
-/// Reads every valid v1 record from `file`. Missing, unreadable, torn, or newer-version lines
-/// are skipped so the report never fails on a partial crash write.
-pub(crate) fn read(file: &Path) -> Vec<LedgerRecord> {
-    let Ok(bytes) = fs::read(file) else {
-        return Vec::new();
+/// Reads every valid v1 record from `file`; a missing file has none. Torn and newer-version
+/// lines are skipped, so the report never fails on a partial crash write.
+///
+/// # Errors
+///
+/// Returns the I/O error if the file exists but cannot be read.
+pub(crate) fn read(file: &Path) -> io::Result<Vec<LedgerRecord>> {
+    let bytes = match fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    bytes
+    Ok(bytes
         .split(|&byte| byte == b'\n')
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_slice::<LedgerRecord>(line).ok())
         .filter(|record| record.version == RECORD_VERSION)
-        .collect()
+        .collect())
 }
 
 /// Totals the `records` that started in `range` (relative to `now`), overall and per agent,
@@ -429,7 +437,7 @@ mod tests {
         let second = with_usage(sample("R3", "/b", "Codex", None, 2000), 50, 10, None);
         append(&file, &second).unwrap();
 
-        let read_back = read(&file);
+        let read_back = read(&file).unwrap();
         assert_eq!(read_back.len(), 2);
         assert_eq!(read_back[0].run_id, "R1");
         assert_eq!(read_back[1].run_id, "R3");
@@ -449,10 +457,102 @@ mod tests {
         append(&file, &sample("R3", "/a", "Claude", None, 1002)).unwrap();
 
         let ids: Vec<_> = read(&file)
+            .unwrap()
             .into_iter()
             .map(|record| record.run_id)
             .collect();
         assert_eq!(ids, ["R1", "R3"]);
+    }
+
+    #[test]
+    fn an_append_after_a_zero_filled_tail_keeps_every_whole_record() {
+        let dir = TempDir::new("usage-ledger-zeros");
+        let file = dir.path().join("usage.jsonl");
+        append(&file, &sample("R1", "/a", "Claude", None, 1000)).unwrap();
+        append(&file, &sample("R2", "/a", "Claude", None, 1001)).unwrap();
+        // A crash after the file grew but before its data reached the disk: the new length
+        // reads back as zero bytes.
+        let mut whole = fs::read(&file).unwrap();
+        whole.extend([0; 16]);
+        fs::write(&file, &whole).unwrap();
+
+        append(&file, &sample("R3", "/a", "Claude", None, 1002)).unwrap();
+
+        let ids: Vec<_> = read(&file)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.run_id)
+            .collect();
+        assert_eq!(ids, ["R1", "R2", "R3"]);
+    }
+
+    #[test]
+    fn a_missing_ledger_is_empty_but_an_unreadable_one_is_an_error() {
+        let dir = TempDir::new("usage-ledger-unreadable");
+        assert!(read(&dir.path().join("usage.jsonl")).unwrap().is_empty());
+        // A directory where the file should be: it exists, and reading it fails.
+        let error = read(dir.path()).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn each_range_keeps_the_runs_started_at_or_after_its_cutoff() {
+        // Spelled out rather than `DAY_SECS`, so a wrong constant fails this test.
+        let day = 86_400;
+        let now = 100 * day;
+        let started = [
+            now - day,
+            now - day - 1,
+            now - 7 * day,
+            now - 7 * day - 1,
+            now - 30 * day,
+            now - 30 * day - 1,
+        ];
+        let records: Vec<_> = started
+            .iter()
+            .map(|&at| sample("R", "/a", "Claude", None, at))
+            .collect();
+        let runs = |range| aggregate(&records, None, range, now).0.runs;
+        let parsed = |value| Range::parse(value).expect("a known range");
+        assert_eq!(runs(parsed("24h")), 1);
+        assert_eq!(runs(parsed("7d")), 3);
+        assert_eq!(runs(parsed("30d")), 5);
+        assert_eq!(runs(parsed("all")), 6);
+        assert!(Range::parse("1y").is_none());
+    }
+
+    #[test]
+    fn totals_count_each_outcome_and_skip_costs_that_cannot_be_summed() {
+        let cost = |amount: f64, currency: &str| {
+            Some(UsageCost {
+                amount,
+                currency: currency.to_owned(),
+            })
+        };
+        let records: Vec<_> = [
+            (RunOutcome::Ended, cost(0.0, "USD")),
+            (RunOutcome::Ended, cost(-1.0, "USD")),
+            (RunOutcome::Failed, cost(f64::NAN, "USD")),
+            (RunOutcome::Failed, cost(f64::INFINITY, "USD")),
+            (RunOutcome::Failed, cost(1.0, "")),
+            (RunOutcome::Cancelled, None),
+        ]
+        .into_iter()
+        .map(|(outcome, cost)| LedgerRecord {
+            outcome,
+            cost,
+            ..sample("R", "/a", "Claude", None, 1000)
+        })
+        .collect();
+
+        let (summary, _) = aggregate(&records, None, Range::All, 2000);
+        assert_eq!((summary.runs, summary.ended, summary.failed), (6, 2, 3));
+        // Only the zero cost is valid: it still makes the total known, unlike no cost at all.
+        let CostTotal::Same(total) = &summary.cost else {
+            panic!("a zero cost counts: {:?}", summary.cost);
+        };
+        assert!(total.amount.abs() < 1e-9, "{total:?}");
+        assert_eq!(total.currency, "USD");
     }
 
     #[test]

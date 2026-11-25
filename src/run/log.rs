@@ -744,7 +744,9 @@ impl Run {
             );
             let mut outcome = None;
             for entry in std::iter::once(entry).chain(answer) {
-                outcome = outcome.or(self.write(&mut state, entry));
+                // Every entry is written; only the first one that ends the run sets the outcome.
+                let ended = self.write(&mut state, entry);
+                outcome = outcome.or(ended);
             }
             let finished = outcome.and_then(|outcome| self.usage_record(&state, outcome));
             let notes = if took_turn {
@@ -1544,7 +1546,7 @@ mod tests {
             error: "late".to_owned(),
         });
 
-        let records = ledger::read(&file);
+        let records = ledger::read(&file).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].outcome, RunOutcome::Cancelled);
         assert_eq!(records[0].origin, RunOrigin::Notes);

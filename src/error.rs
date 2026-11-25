@@ -214,6 +214,13 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The usage ledger exists but could not be read.
+    ReadUsage {
+        /// The ledger file.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
     /// A run log could not be read.
     ReadRun {
         /// The log, or its directory.
@@ -474,6 +481,9 @@ impl fmt::Display for Error {
                 "cannot save the open folders to {} (check that the git directory is writable)",
                 path.display()
             ),
+            Self::ReadUsage { path, .. } => {
+                write!(f, "cannot read the usage ledger {}", path.display())
+            }
             Self::ReadRun { path, .. } => write!(f, "cannot read the run log {}", path.display()),
             Self::TurnRunning => write!(
                 f,
@@ -609,6 +619,7 @@ impl std::error::Error for Error {
             | Self::CopyIndex { source, .. }
             | Self::WriteFolders { source, .. }
             | Self::WriteLayout { source, .. }
+            | Self::ReadUsage { source, .. }
             | Self::ReadRun { source, .. }
             | Self::WriteWorktree { source, .. }
             | Self::WriteThreads { source, .. } => Some(source),

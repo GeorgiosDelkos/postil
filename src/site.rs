@@ -1212,10 +1212,13 @@ impl Site {
             None => Range::SevenDays,
         };
 
-        let records = self
-            .usage_file
-            .as_deref()
-            .map_or_else(Vec::new, ledger::read);
+        let records = match self.usage_file.as_deref() {
+            Some(file) => ledger::read(file).map_err(|source| Error::ReadUsage {
+                path: file.to_owned(),
+                source,
+            })?,
+            None => Vec::new(),
+        };
         let only_repo = match scope {
             Scope::Project => project_root.as_deref(),
             Scope::All => None,
@@ -1283,9 +1286,8 @@ impl Site {
             }
         }
         // Any historical agent removed from settings that still has activity in this window.
-        let known: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
         for name in activities.keys() {
-            if !known.iter().any(|existing| existing == name) {
+            if !entries.iter().any(|(existing, _, _)| existing == name) {
                 entries.push((name.clone(), false, None));
             }
         }
@@ -1459,6 +1461,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::CopyIndex { .. }
                 | Error::WriteFolders { .. }
                 | Error::WriteLayout { .. }
+                | Error::ReadUsage { .. }
                 | Error::ReadRun { .. }
                 | Error::NoHome
                 | Error::WriteWorktree { .. }
