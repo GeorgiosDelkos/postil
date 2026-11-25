@@ -204,9 +204,12 @@ step named.
   (`log.rs:1125`). A path that leaves the repository is dropped and counted: after
   `relative`, one that is still absolute or has a `..` component (`relative` returns a path
   outside the root unchanged). The unit table holds `../x`, `src/../../x` and `/etc/x`.
-- A deleted file has no new side: how its `lines` are read is open ("What this plan leaves
-  open", 12). `lines` reversed or zero: the step is dropped and counted; past the end, open
-  item 13. A step that names a binary or non-UTF-8 file keeps its path.
+- A deleted file has no new side: `lines` stays required and is ignored when the path no
+  longer exists, so the step covers the whole file and the S2 wording stays (owner,
+  2026-11-25). `lines` reversed or zero: the step is dropped and counted. `report::read`
+  reads no file: lines past the end are not checked there, and the walkthrough (7.5) lists
+  a step that names no changed lines (owner, 2026-11-25). Whether a path exists is one
+  `lstat` per step.
 - An unknown `risk`: `eyes`. The safe reading of a rating Postil does not know.
 - Limits: 200 steps, 50 checks, 300 characters of `why`: more is cut and counted. The numbers
   are arbitrary and guard the dialog, not the agent.
@@ -263,8 +266,9 @@ step named.
   says "an edit after it" so the claim is exact.
 - The claim says passed and the log says failed: the log's state shows, with "the author
   says passed" beside it.
-- A check that failed and was edited after, and the card's worst-state order: open ("What
-  this plan leaves open", 14). Checks on a follow-up's turn: open item 16.
+- A check that failed and was edited after shows failed. The card's worst state, in order:
+  failed, not seen, stale, unfinished, passed (owner, 2026-11-25). Checks on a follow-up's
+  turn: open ("What this plan leaves open", 16).
 - No report: the section lists the commands the run ran, with no claims.
 - A run with no command: "No command was run".
 
@@ -305,8 +309,8 @@ step.
   per hunk group, with the same "Show the other N lines".
 - `mechanical` hunks start folded. A note or a finding on a folded hunk opens it: nothing a
   reviewer wrote is hidden.
-- A finding that disputes a rating: the hunk shows as `eyes` whatever the report said. How a
-  finding is known to dispute one is open ("What this plan leaves open", 15).
+- A finding on a `routine` or `mechanical` hunk shows the hunk as `eyes`, whatever the report
+  said: `Finding` gets no field for a dispute (owner, 2026-11-25).
 - A finding with a line outside every hunk, or no line: listed under the file's header; in
   walkthrough order, in the group of the first step that names its file, else under "Not in
   the walkthrough". A finding with no path: at the top of the view.
@@ -976,19 +980,10 @@ its options; the first is recommended.
 11. **An ask refused at the cap** (7.6). (a) `POST /api/run/ask` takes the new note and saves
     it only when the run starts, so a 409 leaves nothing; (b) the page deletes the note on
     refusal (a crash between leaves it); (c) the ask stays open with an Ask button.
-12. **A report step's `lines` for a deleted file** (7.3). (a) `lines` stays required, and is
-    ignored when the path no longer exists: the step covers the whole file, and the S2
-    wording, tested 10 of 10, stays as it is. (b) `lines` becomes optional and the prompt says
-    to leave it out for a deleted file.
-13. **Lines past the end of the file** (7.3). (a) Not checked in Rust: the walkthrough (7.5)
-    already lists a step that names no changed lines, and `report::read` then reads no file.
-    (b) Checked in `report::read`: lines counted from the bytes, each file read once, missing
-    files as deleted.
-14. **Evidence precedence** (7.4). A check that failed and was edited after: (a) failed wins;
-    (b) "failed, edited after it". The card's worst state, proposed: failed, then not-seen,
-    then stale, then unfinished, then passed.
-15. **A finding that disputes a rating** (7.5). `Finding` has no field for it. (a) Any finding
-    on a `routine` or `mechanical` hunk shows the hunk as `eyes`; (b) a `disputes` field on
-    `Finding`, which changes the findings entry.
+12. to 15. Settled by the owner on 2026-11-25, each as (a): a deleted file's `lines` stay
+    required and are ignored (7.3); lines past the end are not checked in Rust (7.3); a check
+    that failed and was edited after shows failed, and the card ranks failed, not seen,
+    stale, unfinished, passed (7.4); any finding on a `routine` or `mechanical` hunk shows it
+    as `eyes`, with no new field (7.5).
 16. **Checks on follow-ups** (7.4). (a) Each turn's Checks under its own Steps
     (`followUpPart`); (b) only the latest turn's, for the card's icon.
