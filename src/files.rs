@@ -227,8 +227,9 @@ const LOCK_RETRY: Duration = Duration::from_millis(20);
 /// The lock is released when the returned file is dropped. Blocks the calling thread while it
 /// waits.
 ///
-/// Run and thread locks do not use it (`run/log.rs`, `take_lock`): a forked agent child holds
-/// their descriptor until it execs, so they wait 200 ms at most, not seconds.
+/// Run and thread locks do not use it (`run/log.rs`, `take_lock`): a window that runs an
+/// agent holds them for the whole run, so a send waits only out a forked child's copy (fork
+/// to exec), 200 ms at most, and then reports the other run.
 ///
 /// # Errors
 ///

@@ -7,9 +7,8 @@
 //! A line note is anchored by its snippet: the text of its lines when it was written. Its
 //! line numbers are a hint. Whenever the notes are read, each one is placed by [`locate`]
 //! (`anchor.rs` gives the rule), and a note it cannot place becomes [`Anchor::Lost`]. A file
-//! or folder note is found while its path is still a file or a folder of
-//! that kind, and lost otherwise: a rename is not followed, since nothing tells a renamed
-//! folder from a new one.
+//! or folder note is found while its path is still a file or a folder of that kind, and lost
+//! otherwise: a rename is not followed, since nothing tells a renamed folder from a new one.
 //!
 //! The anchor says only whether the note's target (its text, or its file or folder) is still
 //! there. It is kept apart from a note's lifecycle (open, sent, resolved, from milestone 3
