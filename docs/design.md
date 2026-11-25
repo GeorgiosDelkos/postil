@@ -370,7 +370,7 @@ gets no `resource_link`, because agents read a link as a file; the path in the t
 A file or folder that is gone says so under its heading, as lost lines do. The send step lists
 the linked files as `GET /api/run/preview` returns them (`files`).
 
-The paragraph that asks for the author's report (`notes::REPORT_ASK`, shortened above) gives
+The paragraph that asks for the author's report (`report::ASK`, shortened above) gives
 its shape in words, never as an example block, which a reply quoting the prompt would hand
 back. As a run of notes or a follow-up ends well, Postil reads the report from the reply and
 logs it as a `report` entry (run log version 6; `docs/review-assist.md`, "The author's

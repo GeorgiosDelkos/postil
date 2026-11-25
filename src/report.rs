@@ -1,12 +1,12 @@
 //! The author's report: the reading order and the checks that the agent which made a run's
 //! changes gives at the end of its reply (docs/review-assist.md, "The author's report").
 //!
-//! The prompt asks for it in words (`notes::REPORT_ASK`), never with an example block, so a
-//! reply that quotes the prompt holds nothing that reads as a report. [`read`] takes the last
-//! json block that is an object, and keeps what it can use: a step or check it cannot read
-//! is left out and counted in [`Report::cut`], never guessed. It reads no file: a step's lines
-//! are not checked against the file, and the walkthrough shows a step that names no changed
-//! lines (decided with the owner on 2026-11-25).
+//! The prompt asks for it in words ([`ASK`]), never with an example block, so a reply that
+//! quotes the prompt holds nothing that reads as a report. [`read`] takes the last json block
+//! that is an object, and keeps what it can use: a step or check it cannot read is left out
+//! and counted in [`Report::cut`], never guessed. It reads no file: a step's lines are not
+//! checked against the file, and the walkthrough shows a step that names no changed lines
+//! (decided with the owner on 2026-11-25).
 
 use std::path::{Component, Path};
 
@@ -14,7 +14,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::anchor::LineRange;
-use crate::review::last_json_block;
+use crate::review::last_json_block_in;
+
+/// What the prompt of notes asks of the agent's last words (`notes::prompt`). In words, never
+/// as an example block, which a reply quoting the prompt would hand back as a report. Tried
+/// on Claude and Grok, 10 runs each, on 2026-11-25: every reply held a report that reads
+/// (docs/review-assist.md, "Open questions", 11).
+pub(crate) const ASK: &str = "Then end your reply with a report for the engineer who reviews \
+     your changes: one JSON object in a code block fenced as json, the last thing in your \
+     reply. Its field steps is the order in which to read your changes, cause before effect \
+     and the core change before its callers. Each step is an object with path (the file, \
+     relative to the repository root), lines (the first and last line on the new side of the \
+     diff, as an array of two numbers), why (one line) and risk (eyes when the change needs \
+     the engineer's judgment, routine, or mechanical for a rename, formatting or generated \
+     code). Its field checks lists each command you ran to verify the work, each an object \
+     with command (exactly as you ran it) and result (passed or failed). Use an empty array \
+     when there is nothing to list.\n";
+
+/// The line a follow-up's prompt ends with (`run.rs`, `follow_up`): its prompt is otherwise
+/// the engineer's words alone, and a fresh agent's holds [`ASK`] only as history.
+pub(crate) const ASK_AGAIN: &str = "When you finish, end your reply with the report the first \
+     request asked for, one JSON object in a code block fenced as json with steps and checks, \
+     for what you changed in this turn.\n";
 
 /// The most steps a report keeps. Arbitrary: it guards the dialog, not the agent.
 const MAX_STEPS: usize = 200;
@@ -34,10 +55,16 @@ pub(crate) struct Report {
     pub(crate) steps: Vec<Step>,
     /// The commands the agent says it ran to check its work.
     pub(crate) checks: Vec<Check>,
-    /// How many steps and checks the agent wrote that were left out or shortened: a path
-    /// that leaves the repository, lines that are not a range, a field missing, a limit
-    /// passed.
+    /// How many steps and checks the agent wrote that were left out or shortened: a step
+    /// whose path is missing or leaves the repository, or whose lines on a file that is
+    /// there are missing or no range; a check with no command or no claim; a `why` cut; a
+    /// limit passed. A missing `why` is kept empty and a missing `risk` read as `eyes`,
+    /// uncounted.
     pub(crate) cut: usize,
+    /// The block as the reply holds it, from its fence to its closing fence: the page leaves
+    /// exactly this out of the reply it draws, rather than finding the block again by a rule
+    /// of its own that could pick another.
+    pub(crate) block: String,
 }
 
 /// One step of the reading order.
@@ -92,8 +119,8 @@ pub(crate) enum Claimed {
 /// nor `checks`, or with either not a list.
 pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
     // A map and not a struct: serde reads a struct from an array too, by position.
-    let block: Map<String, Value> = last_json_block(reply)?;
-    let list = |key: &str| match block.get(key) {
+    let (object, span): (Map<String, Value>, _) = last_json_block_in(reply)?;
+    let list = |key: &str| match object.get(key) {
         None => Ok(None),
         Some(Value::Array(items)) => Ok(Some(items.as_slice())),
         Some(_) => Err(format!("the report's {key} are not a list")),
@@ -108,12 +135,18 @@ pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
     let mut cut = 0;
     let mut kept_steps = Vec::new();
     for value in steps {
+        // Before `step`, which asks the file system: a reply of a million steps asks it 200
+        // times.
+        if kept_steps.len() == MAX_STEPS {
+            cut += 1;
+            continue;
+        }
         match step(value, root) {
-            Some((step, shortened)) if kept_steps.len() < MAX_STEPS => {
+            Some((step, shortened)) => {
                 cut += usize::from(shortened);
                 kept_steps.push(step);
             }
-            Some(_) | None => cut += 1,
+            None => cut += 1,
         }
     }
     let mut kept_checks = Vec::new();
@@ -127,6 +160,7 @@ pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
         steps: kept_steps,
         checks: kept_checks,
         cut,
+        block: reply[span].to_owned(),
     })
 }
 
@@ -147,11 +181,10 @@ fn step(value: &Value, root: &Path) -> Option<(Step, bool)> {
     } else {
         why.to_owned()
     };
-    let risk = match value.get("risk").and_then(Value::as_str) {
-        Some("routine") => Risk::Routine,
-        Some("mechanical") => Risk::Mechanical,
-        _ => Risk::Eyes,
-    };
+    let risk = value
+        .get("risk")
+        .and_then(|risk| Risk::deserialize(risk).ok())
+        .unwrap_or(Risk::Eyes);
     let step = Step {
         path,
         lines,
@@ -163,11 +196,7 @@ fn step(value: &Value, root: &Path) -> Option<(Step, bool)> {
 
 fn check(value: &Value) -> Option<Check> {
     let command = value.get("command")?.as_str()?.trim();
-    let result = match value.get("result")?.as_str()? {
-        "passed" => Claimed::Passed,
-        "failed" => Claimed::Failed,
-        _ => return None,
-    };
+    let result = Claimed::deserialize(value.get("result")?).ok()?;
     (!command.is_empty()).then(|| Check {
         command: command.to_owned(),
         result,
@@ -175,19 +204,21 @@ fn check(value: &Value) -> Option<Check> {
 }
 
 /// `raw` relative to `root`, as the run log makes tool paths relative (`run/log.rs`,
-/// `relative`); `None` when it is empty or leaves the repository. A path outside `root` comes
-/// back from `strip_prefix` unchanged, so one that is still absolute, or climbs with `..`, is
-/// outside.
+/// `relative`), written as git writes paths (`./a.txt` and `src//a.rs` become `a.txt` and
+/// `src/a.rs`, so a step matches the diff's path); `None` when it is empty or leaves the
+/// repository. A path outside `root` comes back from `strip_prefix` unchanged, so one that is
+/// still absolute, or climbs with `..`, is outside.
 fn repo_path(raw: &str, root: &Path) -> Option<String> {
     let path = Path::new(raw).strip_prefix(root).unwrap_or(Path::new(raw));
-    let outside = path.components().any(|part| {
-        matches!(
-            part,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    });
-    let path = path.to_str()?;
-    (!outside && !path.is_empty()).then(|| path.to_owned())
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => parts.push(name.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// `[first, last]`, 1-based with `first <= last`.
@@ -265,6 +296,18 @@ mod tests {
                 json!({"path": absolute, "lines": [1, 1]}),
                 kept("a.txt", Some((1, 1))),
             ),
+            // Written as git writes it, so it matches the diff's path.
+            (
+                "a dot",
+                json!({"path": "./a.txt", "lines": [1, 1]}),
+                kept("a.txt", Some((1, 1))),
+            ),
+            (
+                "a doubled slash",
+                json!({"path": ".//a.txt", "lines": [1, 1]}),
+                kept("a.txt", Some((1, 1))),
+            ),
+            ("only a dot", json!({"path": ".", "lines": [1, 1]}), None),
             (
                 "a deleted file",
                 json!({"path": "gone.txt", "lines": [5, 9]}),
@@ -393,59 +436,97 @@ mod tests {
         assert_eq!((report.steps.len(), report.checks.len()), (0, 0));
     }
 
-    /// Replies of random shapes, from a seeded generator so a failure repeats: `read` never
-    /// panics, and every step it keeps has lines `1 <= start <= end` or none.
+    /// Lists of steps of random shapes, from a seeded generator so a failure repeats. Against
+    /// a model of what `read` promises: every step is kept or counted, never both or neither;
+    /// a kept path is relative, inside the repository, and written as git writes it; kept
+    /// lines are ordered from 1.
     #[test]
-    fn no_reply_panics_and_every_kept_range_is_ordered() {
+    fn every_step_is_kept_or_counted_and_what_is_kept_is_inside_and_ordered() {
         let dir = root("report-random");
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move |below: u64| {
+        let mut next = move |below: usize| {
             // xorshift64: a generator with no crate, enough to vary the shapes.
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            state % below
+            usize::try_from(state % below as u64).expect("below a usize")
         };
+        let numbers = [
+            json!(0),
+            json!(1),
+            json!(7),
+            json!(-3),
+            json!(u64::MAX),
+            json!(1.5),
+            json!("2"),
+            Value::Null,
+        ];
+        let paths = [
+            json!("a.txt"),
+            json!("./a.txt"),
+            json!("gone.txt"),
+            json!("src/../../a.txt"),
+            json!("../a.txt"),
+            json!("/a.txt"),
+            json!(""),
+            json!(7),
+        ];
         for _ in 0..2000 {
-            let mut pick = |values: &[Value]| {
-                let index = usize::try_from(next(values.len() as u64)).expect("below the length");
-                values[index].clone()
-            };
-            let numbers = [
-                json!(0),
-                json!(1),
-                json!(7),
-                json!(-3),
-                json!(u64::MAX),
-                json!(1.5),
-                json!("2"),
-                Value::Null,
-            ];
-            let lines = json!([pick(&numbers), pick(&numbers)]);
-            let paths = [
-                json!("a.txt"),
-                json!("gone.txt"),
-                json!("../a.txt"),
-                json!("/a.txt"),
-                json!(""),
-                json!(7),
-            ];
-            let step =
-                json!({"path": pick(&paths), "lines": pick(&[lines, json!([]), json!("1-2")])});
-            let block = pick(&[
-                json!({"steps": [step]}),
-                json!({"steps": step}),
-                json!([step]),
-                json!({"checks": [step]}),
-            ]);
-            let Ok(report) = read(&reply(&block), dir.path()) else {
-                continue;
-            };
+            let steps: Vec<Value> = (0..next(6))
+                .map(|_| {
+                    let lines = match next(3) {
+                        0 => json!([numbers[next(numbers.len())], numbers[next(numbers.len())]]),
+                        1 => json!([]),
+                        _ => json!("1-2"),
+                    };
+                    json!({"path": paths[next(paths.len())], "lines": lines, "why": "w"})
+                })
+                .collect();
+            let block = json!({ "steps": steps });
+            let report = read(&reply(&block), dir.path()).unwrap();
+            assert_eq!(report.steps.len() + report.cut, steps.len(), "{block}");
             for step in report.steps {
+                let path = Path::new(&step.path);
+                assert!(
+                    path.components()
+                        .all(|part| matches!(part, Component::Normal(_))),
+                    "{block}"
+                );
                 if let Some(lines) = step.lines {
                     assert!(1 <= lines.start && lines.start <= lines.end, "{block}");
                 }
             }
         }
+    }
+
+    /// The page leaves out exactly the text the entry keeps (`ui/status.js`), however the
+    /// agent closed the block.
+    #[test]
+    fn the_report_keeps_its_block_as_the_reply_holds_it() {
+        let dir = root("report-block");
+        let block = |reply: &str| read(reply, dir.path()).unwrap().block;
+        let object = "{\"checks\": []}";
+        assert_eq!(
+            block(&format!(
+                "Done.\n\n```json\n{object}\n```\nThen I ran ruff."
+            )),
+            format!("```json\n{object}\n```"),
+            "closed on a line of its own, text after"
+        );
+        assert_eq!(
+            block(&format!("Done.\n```json\n{object}```")),
+            format!("```json\n{object}```"),
+            "closed on the value's line"
+        );
+        assert_eq!(
+            block(&format!("Done.\n```json\n{object}\nThen I ran ruff.")),
+            format!("```json\n{object}"),
+            "never closed: the value alone"
+        );
+        assert_eq!(
+            block(&format!("```json\n{object}\n```json\n[1]\n```")),
+            format!("```json\n{object}"),
+            "a fence that opens another block does not close this one"
+        );
     }
 }

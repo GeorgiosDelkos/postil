@@ -598,7 +598,7 @@ impl Runner {
             // After the words, so the page tells this prompt from a fresh agent's by its start
             // (`ui/status.js`, `freshAgent`).
             Prompt {
-                text: format!("{text}\n\n{REPORT_AGAIN}"),
+                text: format!("{text}\n\n{}", report::ASK_AGAIN),
                 files: Vec::new(),
             }
         } else {
@@ -2243,17 +2243,12 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     }
     write!(
         prompt,
-        "\nThe engineer now asks:\n\n{text}\n\n{REPORT_AGAIN}"
+        "\nThe engineer now asks:\n\n{text}\n\n{}",
+        report::ASK_AGAIN
     )
     .expect("writing to a String cannot fail");
     prompt
 }
-
-/// The line a follow-up's prompt ends with: the first prompt asked for the author's report
-/// (`notes::REPORT_ASK`), and a follow-up's prompt is otherwise the engineer's words alone.
-pub(crate) const REPORT_AGAIN: &str = "When you finish, end your reply with the report the first request \
-                            asked for, one JSON object in a code block fenced as json with \
-                            steps and checks, for what you changed in this turn.\n";
 
 /// Logs the author's report of `run`, read from its reply in `root` (`report::read`), when
 /// its turn ended well: before the end is logged, which closes the log. A review stage logs
@@ -2262,6 +2257,8 @@ pub(crate) const REPORT_AGAIN: &str = "When you finish, end your reply with the 
 fn record_report(run: &Run, root: &Path) {
     let reply = {
         let state = run.state();
+        // `Run::record` refuses an ended run too; checked here as well so a run that a
+        // forced stop or a close ended reads no file for nothing.
         if state.header.review.is_some() || !state.live() {
             return;
         }

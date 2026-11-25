@@ -717,14 +717,37 @@ impl RunState {
     /// The agent's reply: its message parts joined, a blank line between messages.
     pub(super) fn reply(&self) -> String {
         let mut reply = String::new();
-        let mut last: Option<&Option<String>> = None;
+        // The message the next part joins: the last part's, until a step comes between.
+        let mut joins: Option<&Option<String>> = None;
         for entry in &self.entries {
-            if let Entry::Message { text, message } = entry {
-                if last.is_some_and(|last| last != message) {
-                    reply.push_str("\n\n");
+            match entry {
+                Entry::Message { text, message } => {
+                    if !reply.is_empty() && joins != Some(message) {
+                        reply.push_str("\n\n");
+                    }
+                    reply.push_str(text);
+                    joins = Some(message);
                 }
-                reply.push_str(text);
-                last = Some(message);
+                // A step drawn between two parts ends the message, as the page folds them
+                // (`ui/run.js`, `foldRun`): an agent with no message ids would otherwise run
+                // a report's fence on from the text before a tool call, and no block would
+                // start a line.
+                Entry::Thought { .. }
+                | Entry::Tool { .. }
+                | Entry::Permission { .. }
+                | Entry::Question { .. }
+                | Entry::Unreadable { .. }
+                | Entry::Failed { .. } => joins = None,
+                Entry::Started
+                | Entry::ToolUpdate { .. }
+                | Entry::Plan { .. }
+                | Entry::Answer { .. }
+                | Entry::Reply { .. }
+                | Entry::CancelRequested
+                | Entry::Ended { .. }
+                | Entry::Findings { .. }
+                | Entry::Report { .. }
+                | Entry::Snapshot { .. } => {}
             }
         }
         reply
@@ -1387,6 +1410,10 @@ mod tests {
             text: text.to_owned(),
             message: Some(id.to_owned()),
         };
+        let unnamed = |text: &str| Entry::Message {
+            text: text.to_owned(),
+            message: None,
+        };
         for entry in [
             tool("t1", ToolCallStatus::Pending, Vec::new()),
             tool("t2", ToolCallStatus::Completed, vec![diff("second")]),
@@ -1403,6 +1430,12 @@ mod tests {
             message("one ", "m1"),
             message("part", "m1"),
             message("two", "m2"),
+            // An agent that sends no message ids: parts in a row are one message, and a step
+            // between two parts ends it.
+            unnamed("three "),
+            unnamed("joined"),
+            tool("t3", ToolCallStatus::Completed, Vec::new()),
+            unnamed("```json"),
         ] {
             run.record(entry);
         }
@@ -1410,7 +1443,7 @@ mod tests {
         let work = run.state().work();
         let afters: Vec<_> = work.diffs.iter().map(|diff| diff.after.as_str()).collect();
         assert_eq!(afters, ["first", "second"], "the update reached t1 only");
-        assert_eq!(work.reply, "one part\n\ntwo");
+        assert_eq!(work.reply, "one part\n\ntwo\n\nthree joined\n\n```json");
         drop(run);
         drop(fs::remove_dir_all(dir.parent().unwrap()));
     }

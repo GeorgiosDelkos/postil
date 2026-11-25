@@ -340,35 +340,23 @@ export function reportNotice(run) {
   return `${cut} ${cut === 1 ? "part" : "parts"} of the agent's report could not be used`;
 }
 
-// `text` without the author's report block, which the run dialog does not show as prose. The
-// block is found as src/review.rs `last_json_block` finds it: the last ```json fence that
-// starts a line and whose body is a JSON object. A body ends at the first line that is only a
-// fence: a JSON string cannot hold a line break, so no such line is inside the value. Call it
-// only for a run with a report: a reply with a json example and no report keeps it.
-export function withoutReport(text) {
-  const fences = [...text.matchAll(/^[ \t]*```json/gm)].reverse();
-  for (const fence of fences) {
-    const bodyStart = fence.index + fence[0].length;
-    const close = /^[ \t]*```[ \t]*$/m.exec(text.slice(bodyStart));
-    const bodyEnd = close ? bodyStart + close.index : text.length;
-    let value;
-    try {
-      value = JSON.parse(text.slice(bodyStart, bodyEnd));
-    } catch {
-      continue;
-    }
-    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
-    const before = text.slice(0, fence.index).trimEnd();
-    const after = close ? text.slice(bodyEnd + close[0].length).trim() : "";
-    return [before, after].filter(Boolean).join("\n\n");
-  }
-  return text;
+// `text` without the author's report block, which the run dialog does not show as prose:
+// `block` is the block's text as src/report.rs read it from the reply, so the page removes
+// exactly what was read and never finds another block by a rule of its own. Its last
+// occurrence, as the report is the last block; the text as it was when it is not there.
+export function withoutReport(text, block) {
+  const at = text.lastIndexOf(block);
+  if (!block || at === -1) return text;
+  const before = text.slice(0, at).trimEnd();
+  const after = text.slice(at + block.length).trim();
+  return [before, after].filter(Boolean).join("\n\n");
 }
 
 // The reply as the run dialog shows it: without the report block when the run has a report.
 export function replyShown(run) {
   const text = replyText(run);
-  return reportOf(run)?.report ? withoutReport(text) : text;
+  const report = reportOf(run)?.report;
+  return report ? withoutReport(text, report.block) : text;
 }
 
 // Whether follow-up `turn` went to a fresh agent, told the thread first, rather than to the

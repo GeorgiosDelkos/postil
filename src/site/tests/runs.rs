@@ -10,7 +10,7 @@ fn prompt_start() -> String {
         "These are review notes an engineer wrote while reading this repository.\n\
          Address every note. Change nothing the notes do not ask for.\n\
          When you finish, list each note id with one line on what you did.\n{}",
-        crate::notes::REPORT_ASK
+        crate::report::ASK
     )
 }
 
@@ -869,6 +869,43 @@ fn a_reviewer_sees_the_reviewed_run_s_edits() {
     );
 }
 
+/// The reviewed run's report reaches its reviewer: the changes it rated as needing no judgment
+/// are named for the reviewer to check, and the author's ask for a report is not passed on.
+#[test]
+fn a_reviewer_is_asked_to_check_the_report_s_low_ratings() {
+    let repo = TempRepo::new("run-review-report");
+    repo.write("a.txt", "a\n");
+    repo.write("b.txt", "1\n2\n3\n4\n");
+    let (site, nudges) = run_site(&repo, "report");
+    post_note(&site, "a.txt", 1, 1, "change a");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    set_reviewers(&site, "report", &[("Reviewer", "reviewer")]);
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+    let proposer = wait_for_run(&site, &nudges, "R2");
+    let prompt = proposer["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("- a.txt:1-2 (routine)\n- b.txt (mechanical)\n"),
+        "{prompt}"
+    );
+    // The notes as quoted, before the author's reply: the fake author echoes its own prompt
+    // in its reply, which reviewers are shown whole.
+    let quoted = prompt
+        .split_once("as the agent received them:")
+        .and_then(|(_, rest)| rest.split_once("The agent's reply:"))
+        .unwrap()
+        .0;
+    assert!(quoted.contains("change a"), "{quoted}");
+    assert!(
+        !quoted.contains(crate::report::ASK),
+        "a reviewer ends with its findings, not a report: {quoted}"
+    );
+}
+
 #[test]
 fn a_review_stops_at_a_reviewer_that_fails_finds_nothing_readable_or_edits() {
     for (scenario, problem) in [
@@ -1053,7 +1090,7 @@ fn a_follow_up_goes_to_the_same_conversation_or_tells_a_fresh_agent_the_thread()
     );
     // The engineer's words, then the reminder to end with a report: the words alone would
     // leave a kept agent's follow-up without one.
-    let reminded = |words: &str| format!("message:got {words}\n\n{}", crate::run::REPORT_AGAIN);
+    let reminded = |words: &str| format!("message:got {words}\n\n{}", crate::report::ASK_AGAIN);
     assert_eq!(
         kinds(&second)[1..3],
         [reminded("and more"), "message:prompt 2".to_owned()],
@@ -1812,8 +1849,24 @@ fn a_run_ends_with_its_report() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let ended = wait_for(&site, &nudges, "ended");
 
+    // The block as the reply holds it, for the page to leave out.
+    let mut entry = report_entry(&ended);
+    let block = entry["report"]
+        .as_object_mut()
+        .unwrap()
+        .remove("block")
+        .unwrap();
+    let block = block.as_str().unwrap();
+    assert!(
+        block.starts_with("```json\n{") && block.ends_with("}\n```"),
+        "{block}"
+    );
+    let replied = kinds(&ended)
+        .into_iter()
+        .any(|kind| kind == format!("message:{block}"));
+    assert!(replied, "the agent's own message: {ended}");
     assert_eq!(
-        report_entry(&ended),
+        entry,
         serde_json::json!({
             "kind": "report",
             "report": {
@@ -1884,6 +1937,11 @@ fn the_last_report_block_wins() {
             "steps": [],
             "checks": [{ "command": "second", "result": "failed" }],
             "cut": 0,
+            "block": concat!(
+                "```json\n",
+                r#"{"checks": [{"command": "second", "result": "failed"}]}"#,
+                "\n```",
+            ),
         })
     );
 }
@@ -1914,7 +1972,8 @@ fn a_stopped_run_reads_no_report() {
 }
 
 /// A log written before reports were kept reads: a run that ended well with no report entry,
-/// its command kept.
+/// its command kept. Catches a version bump that lists the versions it reads and leaves the
+/// last one out (as `thread::read` lists them).
 #[test]
 fn a_version_5_log_reads_without_a_report() {
     let repo = TempRepo::new("run-version-5");

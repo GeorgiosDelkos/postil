@@ -383,29 +383,31 @@ test("the run dialog keeps its key while the agent streams its reply and thought
 const fenced = (json) => "```json\n" + json + "\n```";
 const reportEntry = (report, problem = null) => ({ kind: "report", report, problem });
 
-test("the report block is left out of the reply where the agent put it", () => {
-  const report = fenced('{"steps": [], "checks": []}');
-  assert.equal(withoutReport(`N1: done\n\n${report}`), "N1: done", "block last");
-  assert.equal(withoutReport("N1: done"), "N1: done", "no block");
+// The block as src/report.rs keeps it, closed in whichever way the agent closed it.
+const report = fenced('{"steps": [], "checks": []}');
+
+test("the report block the server read is left out of the reply, and only it", () => {
+  assert.equal(withoutReport(`N1: done\n\n${report}`, report), "N1: done", "block last");
   // Spike S2 saw Grok go on working after its report in 3 of 10 runs.
   assert.equal(
-    withoutReport(`N1: done\n\n${report}\nThen I ran the linter.`),
+    withoutReport(`N1: done\n\n${report}\nThen I ran the linter.`, report),
     "N1: done\n\nThen I ran the linter.",
     "text after the block stays",
   );
-  const first = fenced('{"checks": [{"command": "first", "result": "passed"}]}');
+  // An example the agent showed before its report stays, whatever its shape.
+  const config = fenced('{"port": 80}');
   assert.equal(
-    withoutReport(`${first}\nMore.\n\n${report}`),
-    `${first}\nMore.`,
-    "two blocks: the last is the report",
+    withoutReport(`Use this:\n\n${config}\n\n${report}`, report),
+    `Use this:\n\n${config}`,
   );
-  const example = fenced("[1, 2]");
+  assert.equal(withoutReport(`${report}\nAgain:\n${report}`, report), `${report}\nAgain:`);
+  const unclosed = '```json\n{"checks": []}';
   assert.equal(
-    withoutReport(`N1: done\n\n${report}\n\n${example}`),
-    `N1: done\n\n${example}`,
-    "a later block that is no object is not the report",
+    withoutReport(`Done.\n${unclosed}\nThen I ran ruff.`, unclosed),
+    "Done.\n\nThen I ran ruff.",
+    "a block never closed",
   );
-  assert.equal(withoutReport("I answer in ```json {} inline"), "I answer in ```json {} inline");
+  assert.equal(withoutReport("N1: done", report), "N1: done", "a reply that does not hold it");
 });
 
 test("the reply keeps its json block when the run has no report", () => {
@@ -413,7 +415,8 @@ test("the reply keeps its json block when the run has no report", () => {
   const ran = (entries) => streaming("R1", "ended", [said(text), ...entries]);
   assert.equal(replyShown(ran([])), text, "a run from before reports");
   assert.equal(replyShown(ran([reportEntry(null, "no steps and no checks")])), text);
-  const found = reportEntry({ steps: [], checks: [], cut: 0 });
+  const block = fenced('{"port": 80}');
+  const found = reportEntry({ steps: [], checks: [], cut: 0, block });
   assert.equal(replyShown(ran([found])), "Here is the config:");
 });
 

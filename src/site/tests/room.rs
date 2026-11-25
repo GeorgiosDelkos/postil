@@ -125,7 +125,7 @@ fn a_follow_up_in_a_thread_another_window_evicted_makes_its_worktree_again() {
         prompt.contains("R1 was asked")
             && prompt.ends_with(&format!(
                 "now asks:\n\nmore\n\n{}",
-                crate::run::REPORT_AGAIN
+                crate::report::ASK_AGAIN
             )),
         "the fresh agent is told the thread so far: {prompt}"
     );

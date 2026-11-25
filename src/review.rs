@@ -10,12 +10,13 @@
 //! (`run.rs`) starts each stage as a run of its own, in order.
 
 use std::fmt::{self, Write as _};
+use std::ops::Range;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::report::{Report, Risk, Step};
+use crate::report::{self, Report, Risk, Step};
 
 /// Where a review run stands: it reviews run `of` as reviewer `reviewer` (from 1) of `reviewers`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,12 +174,18 @@ fn rated_low(text: &mut String, work: &Work) {
     text.push_str("\nReport as a finding any of them that does need the engineer's judgment.\n\n");
 }
 
-/// The reviewed work, as every reviewer reads it.
+/// The reviewed work, as every reviewer reads it. The prompt is quoted without its ask for
+/// the author's report ([`report::ASK`]): a reviewer that obeyed it would end with that object
+/// instead of its findings.
 fn context(text: &mut String, work: &Work) {
+    let notes = work
+        .prompt
+        .replace(report::ASK, "")
+        .replace(report::ASK_AGAIN, "");
     write!(
         text,
         "The engineer's notes, as the agent received them:\n\n{}\n\nThe agent's reply:\n\n{}\n\n",
-        work.prompt.trim_end(),
+        notes.trim_end(),
         work.reply.trim(),
     )
     .expect("writing to a String cannot fail");
@@ -224,6 +231,18 @@ pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, Str
 /// Why no block could be read: the reply has none, or none parses as a `T` (the last block's
 /// problem is given).
 pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, String> {
+    last_json_block_in(reply).map(|(value, _)| value)
+}
+
+/// [`last_json_block`], and where in `reply` the block is: from its fence to the end of its
+/// closing fence, or of the value when no fence closes it on a line after it.
+///
+/// # Errors
+///
+/// As [`last_json_block`].
+pub(crate) fn last_json_block_in<T: DeserializeOwned>(
+    reply: &str,
+) -> Result<(T, Range<usize>), String> {
     const FENCE: &str = "```json";
     // A fence opens a block only at the start of a line, after blanks at most. JSON strings
     // cannot hold a raw line break, so a fence that a string quotes never starts a line, and
@@ -238,12 +257,13 @@ pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, Str
         .rmatch_indices(FENCE)
         .filter(|(at, _)| opens_block(*at))
     {
-        let body = &reply[start + FENCE.len()..];
-        match serde_json::Deserializer::from_str(body)
-            .into_iter::<T>()
-            .next()
-        {
-            Some(Ok(value)) => return Ok(value),
+        let body_start = start + FENCE.len();
+        let mut values = serde_json::Deserializer::from_str(&reply[body_start..]).into_iter::<T>();
+        match values.next() {
+            Some(Ok(value)) => {
+                let value_end = body_start + values.byte_offset();
+                return Ok((value, start..block_end(reply, value_end)));
+            }
             Some(Err(error)) => {
                 problem.get_or_insert_with(|| {
                     format!("the reply's last ```json block does not parse: {error}")
@@ -255,6 +275,23 @@ pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, Str
         }
     }
     Err(problem.unwrap_or_else(|| "the reply has no ```json block".to_owned()))
+}
+
+/// Where a block whose value ends at `value_end` ends: after its closing fence when only
+/// blanks come between the two and the fence ends its line, else at the value.
+fn block_end(reply: &str, value_end: usize) -> usize {
+    let rest = &reply[value_end..];
+    let fence_at = rest.len() - rest.trim_start().len();
+    let after_fence = &rest[fence_at..];
+    let closes = after_fence.strip_prefix("```").is_some_and(|tail| {
+        let line = tail.split('\n').next().unwrap_or_default();
+        line.trim().is_empty()
+    });
+    if closes {
+        value_end + fence_at + "```".len()
+    } else {
+        value_end
+    }
 }
 
 /// The findings `entries` hold, numbered from `F{first}` on.
@@ -285,7 +322,10 @@ mod tests {
 
     fn work() -> Work {
         Work {
-            prompt: "[N1] src/a.rs:2\n> one();\nrename one\n".to_owned(),
+            prompt: format!(
+                "Address every note.\n{}\n[N1] src/a.rs:2\n> one();\nrename one\n",
+                report::ASK
+            ),
             reply: "Renamed it.\n\nN1: renamed one to two".to_owned(),
             diffs: vec![Diff {
                 path: "src/a.rs".to_owned(),
@@ -300,6 +340,7 @@ mod tests {
                 ],
                 checks: Vec::new(),
                 cut: 0,
+                block: String::new(),
             }),
         }
     }
@@ -376,6 +417,17 @@ mod tests {
             prompt.contains("Report as a finding any of them"),
             "{prompt}"
         );
+
+        // The author was asked for a report; a reviewer told the same would end with an object
+        // and not its findings.
+        let follow_up = Work {
+            prompt: format!("and more\n\n{}", report::ASK_AGAIN),
+            ..work()
+        };
+        for quoted in [propose_prompt(&work()), judge_prompt(&follow_up, &[])] {
+            assert!(!quoted.contains("end your reply with"), "{quoted}");
+        }
+        assert!(propose_prompt(&work()).contains("Address every note.\n\n[N1]"));
 
         let no_report = Work {
             report: None,
