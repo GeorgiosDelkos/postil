@@ -74,6 +74,7 @@ use crate::agents::{AgentChoice, Scanner};
 use crate::error::{Error, Result, error_chain};
 use crate::notes::{self, Prompt};
 use crate::repo::Repo;
+use crate::report;
 use crate::review::{self, Diff, Finding, Stage, Work};
 use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
@@ -594,8 +595,10 @@ impl Runner {
                     .is_some_and(|run| Arc::ptr_eq(run, followed))
             });
         let prompt = if same_conversation {
+            // After the words, so the page tells this prompt from a fresh agent's by its start
+            // (`ui/status.js`, `freshAgent`).
             Prompt {
-                text: text.to_owned(),
+                text: format!("{text}\n\n{REPORT_AGAIN}"),
                 files: Vec::new(),
             }
         } else {
@@ -2028,14 +2031,18 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         (run, thread, released, answer, next)
     };
     if let Some(run) = run {
-        // Before the end is logged, so a reader that sees the end sees what the run changed.
-        if ends_turn {
-            runner.record_end_snapshot(&run, thread.as_ref());
-        }
         // The agent names files in the worktree it works in.
         let root = thread
             .as_ref()
             .map_or(runner.repo.root(), |thread| thread.path.as_path());
+        // Before the end is logged, so a reader that sees the end sees what the run changed,
+        // and its report.
+        if ends_turn {
+            runner.record_end_snapshot(&run, thread.as_ref());
+        }
+        if ended_well {
+            record_report(&run, root);
+        }
         if let Some(ids) = run.record_event(event, answer, root) {
             runner.mark_sent(&run, &ids);
         }
@@ -2234,9 +2241,37 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
         )
         .expect("writing to a String cannot fail");
     }
-    write!(prompt, "\nThe engineer now asks:\n\n{text}\n")
-        .expect("writing to a String cannot fail");
+    write!(
+        prompt,
+        "\nThe engineer now asks:\n\n{text}\n\n{REPORT_AGAIN}"
+    )
+    .expect("writing to a String cannot fail");
     prompt
+}
+
+/// The line a follow-up's prompt ends with: the first prompt asked for the author's report
+/// (`notes::REPORT_ASK`), and a follow-up's prompt is otherwise the engineer's words alone.
+pub(crate) const REPORT_AGAIN: &str = "When you finish, end your reply with the report the first request \
+                            asked for, one JSON object in a code block fenced as json with \
+                            steps and checks, for what you changed in this turn.\n";
+
+/// Logs the author's report of `run`, read from its reply in `root` (`report::read`), when
+/// its turn ended well: before the end is logged, which closes the log. A review stage logs
+/// findings instead. Asks the file system whether each step's path exists, so it is never
+/// called under the `Slots` lock.
+fn record_report(run: &Run, root: &Path) {
+    let reply = {
+        let state = run.state();
+        if state.header.review.is_some() || !state.live() {
+            return;
+        }
+        state.reply()
+    };
+    let (report, problem) = match report::read(&reply, root) {
+        Ok(report) => (Some(report), None),
+        Err(problem) => (None, Some(problem)),
+    };
+    run.record(Entry::Report { report, problem });
 }
 
 /// Says on `run` that no snapshot was taken, and why: the run goes on, without its changes
@@ -2363,6 +2398,7 @@ mod tests {
                 prompt: "secret note".to_owned(),
                 reply: "secret reply".to_owned(),
                 diffs: Vec::new(),
+                report: None,
             },
             notes: vec!["N1".to_owned()],
             files: Vec::new(),

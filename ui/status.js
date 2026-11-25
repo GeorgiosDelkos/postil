@@ -323,6 +323,65 @@ export function replyText(run) {
     .join("\n\n");
 }
 
+// The run's author's report entry (src/report.rs), logged as its turn ended well, or null:
+// `{report, problem}`, with `report` null when none could be read.
+export function reportOf(run) {
+  return run.entries.findLast((entry) => entry.kind === "report") ?? null;
+}
+
+// What the run dialog says about a run's report, or null when there is nothing to say: that
+// the agent gave none, or that parts of it were left out.
+export function reportNotice(run) {
+  const entry = reportOf(run);
+  if (!entry) return null;
+  if (!entry.report) return `No report from the agent: ${entry.problem}`;
+  const { cut } = entry.report;
+  if (cut === 0) return null;
+  return `${cut} ${cut === 1 ? "part" : "parts"} of the agent's report could not be used`;
+}
+
+// `text` without the author's report block, which the run dialog does not show as prose. The
+// block is found as src/review.rs `last_json_block` finds it: the last ```json fence that
+// starts a line and whose body is a JSON object. A body ends at the first line that is only a
+// fence: a JSON string cannot hold a line break, so no such line is inside the value. Call it
+// only for a run with a report: a reply with a json example and no report keeps it.
+export function withoutReport(text) {
+  const fences = [...text.matchAll(/^[ \t]*```json/gm)].reverse();
+  for (const fence of fences) {
+    const bodyStart = fence.index + fence[0].length;
+    const close = /^[ \t]*```[ \t]*$/m.exec(text.slice(bodyStart));
+    const bodyEnd = close ? bodyStart + close.index : text.length;
+    let value;
+    try {
+      value = JSON.parse(text.slice(bodyStart, bodyEnd));
+    } catch {
+      continue;
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    const before = text.slice(0, fence.index).trimEnd();
+    const after = close ? text.slice(bodyEnd + close[0].length).trim() : "";
+    return [before, after].filter(Boolean).join("\n\n");
+  }
+  return text;
+}
+
+// The reply as the run dialog shows it: without the report block when the run has a report.
+export function replyShown(run) {
+  const text = replyText(run);
+  return reportOf(run)?.report ? withoutReport(text) : text;
+}
+
+// Whether follow-up `turn` went to a fresh agent, told the thread first, rather than to the
+// thread's kept agent. A kept agent's prompt is the engineer's words, then a blank line and a
+// reminder to end with a report (src/run.rs, `follow_up`); a log from before the reminder has
+// the words alone. A fresh agent's prompt starts with a fixed sentence about the thread
+// (`fresh_follow_up`), which words that are themselves that whole sentence would match: no
+// engineer writes that.
+export function freshAgent(turn) {
+  const words = turn.followUp.text;
+  return turn.prompt !== words && !turn.prompt.startsWith(`${words}\n\n`);
+}
+
 // What the run dialog shows of a thread (`threadOf`), as one string, but for the text the
 // agent streams: its replies and thoughts, which the dialog writes in place. The dialog is
 // built again only when this changes, so while the agent writes its step cards, Changes and
@@ -343,12 +402,14 @@ function turnShown(turn) {
     turn.problem ?? null,
     turn.review ?? null,
     turn.followUp ?? null,
-    turn.prompt === turn.followUp?.text,
+    turn.followUp ? freshAgent(turn) : null,
     plan,
     items.map((item) => itemShown(item, live)),
     // Whether the reply shows at all: its text is written in place.
     replyText(turn) !== "",
     turn.entries.some((entry) => entry.kind === "snapshot"),
+    // Arrives as the turn ends: the reply is drawn without its block, and a notice may show.
+    reportOf(turn),
   ];
 }
 

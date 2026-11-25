@@ -15,6 +15,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::report::{Report, Risk, Step};
+
 /// Where a review run stands: it reviews run `of` as reviewer `reviewer` (from 1) of `reviewers`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,13 +49,15 @@ pub(crate) struct Finding {
     pub(crate) fix: Option<String>,
 }
 
-/// What is reviewed: the run's prompt (the notes as the agent got them), its reply, and the
-/// diffs its edits made, in order. Its `Debug` shows sizes and paths only, never the text:
-/// notes and code stay out of debug output, as for a run.
+/// What is reviewed: the run's prompt (the notes as the agent got them), its reply, the
+/// diffs its edits made, in order, and the author's report when it gave one. Its `Debug`
+/// shows sizes and paths only, never the text: notes and code stay out of debug output, as
+/// for a run.
 pub(crate) struct Work {
     pub(crate) prompt: String,
     pub(crate) reply: String,
     pub(crate) diffs: Vec<Diff>,
+    pub(crate) report: Option<Report>,
 }
 
 /// One edit of a file: its text before (none for a new file) and after.
@@ -73,6 +77,10 @@ impl fmt::Debug for Work {
                 "diffs",
                 &self.diffs.iter().map(|diff| &diff.path).collect::<Vec<_>>(),
             )
+            .field(
+                "report_steps",
+                &self.report.as_ref().map(|report| report.steps.len()),
+            )
             .finish()
     }
 }
@@ -84,6 +92,7 @@ pub(crate) fn propose_prompt(work: &Work) -> String {
          any file: you may only read and search.\n\n",
     );
     context(&mut text, work);
+    rated_low(&mut text, work);
     text.push_str(
         "Review the changes against the notes: wrong behaviour, a note not addressed, a change \
          the notes did not ask for, missing tests. Read the files as they are now where you \
@@ -130,6 +139,38 @@ pub(crate) fn judge_prompt(work: &Work, findings: &[Finding]) -> String {
          `F2: rejected - why`.\n",
     );
     text
+}
+
+/// The steps the author's report rated as needing no judgment, for a proposer to check: the
+/// engineer reads those last, so a rating too low is a finding (docs/review-assist.md, "The
+/// reviewer checks the ratings"). Nothing when the report has none, or there is no report.
+fn rated_low(text: &mut String, work: &Work) {
+    let low: Vec<(&Step, &str)> = work
+        .report
+        .iter()
+        .flat_map(|report| &report.steps)
+        .filter_map(|step| match step.risk {
+            Risk::Eyes => None,
+            Risk::Routine => Some((step, "routine")),
+            Risk::Mechanical => Some((step, "mechanical")),
+        })
+        .collect();
+    if low.is_empty() {
+        return;
+    }
+    text.push_str("The agent's report rates these changes as needing no judgment:\n\n");
+    for (step, risk) in low {
+        match step.lines {
+            Some(lines) => writeln!(
+                text,
+                "- {}:{}-{} ({risk})",
+                step.path, lines.start, lines.end
+            ),
+            None => writeln!(text, "- {} ({risk})", step.path),
+        }
+        .expect("writing to a String cannot fail");
+    }
+    text.push_str("\nReport as a finding any of them that does need the engineer's judgment.\n\n");
 }
 
 /// The reviewed work, as every reviewer reads it.
@@ -240,6 +281,7 @@ fn numbered(entries: &[Value], first: usize) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anchor::LineRange;
 
     fn work() -> Work {
         Work {
@@ -250,6 +292,24 @@ mod tests {
                 before: Some("    one();\n".to_owned()),
                 after: "    two();\n".to_owned(),
             }],
+            report: Some(Report {
+                steps: vec![
+                    step("src/a.rs", Some((2, 2)), Risk::Mechanical),
+                    step("src/b.rs", None, Risk::Routine),
+                    step("src/c.rs", Some((1, 4)), Risk::Eyes),
+                ],
+                checks: Vec::new(),
+                cut: 0,
+            }),
+        }
+    }
+
+    fn step(path: &str, lines: Option<(usize, usize)>, risk: Risk) -> Step {
+        Step {
+            path: path.to_owned(),
+            lines: lines.map(|(start, end)| LineRange { start, end }),
+            why: "secret why".to_owned(),
+            risk,
         }
     }
 
@@ -297,6 +357,35 @@ mod tests {
             ..work()
         };
         assert!(propose_prompt(&empty).contains("No edit diffs were reported"));
+    }
+
+    /// The reviewer checks the author's ratings: the changes it rated as needing no judgment
+    /// are named, the others are not.
+    #[test]
+    fn a_proposer_is_asked_to_check_the_changes_the_author_rated_low() {
+        let prompt = propose_prompt(&work());
+        assert!(
+            prompt.contains(
+                "rates these changes as needing no judgment:\n\n- src/a.rs:2-2 (mechanical)\n\
+                 - src/b.rs (routine)\n"
+            ),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("src/c.rs"), "an eyes step: {prompt}");
+        assert!(
+            prompt.contains("Report as a finding any of them"),
+            "{prompt}"
+        );
+
+        let no_report = Work {
+            report: None,
+            ..work()
+        };
+        assert!(!propose_prompt(&no_report).contains("needing no judgment"));
+        assert!(
+            !judge_prompt(&work(), &[]).contains("needing no judgment"),
+            "the judge judges findings"
+        );
     }
 
     #[test]

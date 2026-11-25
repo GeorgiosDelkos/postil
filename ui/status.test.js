@@ -5,6 +5,10 @@ import {
   agentSaid,
   changedFiles,
   fileStats,
+  freshAgent,
+  replyShown,
+  reportNotice,
+  withoutReport,
   groupNotes,
   noteDialogKey,
   noteHistory,
@@ -374,4 +378,72 @@ test("the run dialog keeps its key while the agent streams its reply and thought
     "the reply shows",
   );
   assert.equal(replyText(streaming("R1", "ended", start)), "Done");
+});
+
+const fenced = (json) => "```json\n" + json + "\n```";
+const reportEntry = (report, problem = null) => ({ kind: "report", report, problem });
+
+test("the report block is left out of the reply where the agent put it", () => {
+  const report = fenced('{"steps": [], "checks": []}');
+  assert.equal(withoutReport(`N1: done\n\n${report}`), "N1: done", "block last");
+  assert.equal(withoutReport("N1: done"), "N1: done", "no block");
+  // Spike S2 saw Grok go on working after its report in 3 of 10 runs.
+  assert.equal(
+    withoutReport(`N1: done\n\n${report}\nThen I ran the linter.`),
+    "N1: done\n\nThen I ran the linter.",
+    "text after the block stays",
+  );
+  const first = fenced('{"checks": [{"command": "first", "result": "passed"}]}');
+  assert.equal(
+    withoutReport(`${first}\nMore.\n\n${report}`),
+    `${first}\nMore.`,
+    "two blocks: the last is the report",
+  );
+  const example = fenced("[1, 2]");
+  assert.equal(
+    withoutReport(`N1: done\n\n${report}\n\n${example}`),
+    `N1: done\n\n${example}`,
+    "a later block that is no object is not the report",
+  );
+  assert.equal(withoutReport("I answer in ```json {} inline"), "I answer in ```json {} inline");
+});
+
+test("the reply keeps its json block when the run has no report", () => {
+  const text = `Here is the config:\n\n${fenced('{"port": 80}')}`;
+  const ran = (entries) => streaming("R1", "ended", [said(text), ...entries]);
+  assert.equal(replyShown(ran([])), text, "a run from before reports");
+  assert.equal(replyShown(ran([reportEntry(null, "no steps and no checks")])), text);
+  const found = reportEntry({ steps: [], checks: [], cut: 0 });
+  assert.equal(replyShown(ran([found])), "Here is the config:");
+});
+
+test("the run dialog says when the report is missing or partly left out", () => {
+  const ran = (entries) => streaming("R1", "ended", entries);
+  assert.equal(reportNotice(ran([])), null, "a run from before reports");
+  assert.equal(
+    reportNotice(ran([reportEntry(null, "the reply has no ```json block")])),
+    "No report from the agent: the reply has no ```json block",
+  );
+  assert.equal(reportNotice(ran([reportEntry({ steps: [], checks: [], cut: 0 })])), null);
+  assert.match(reportNotice(ran([reportEntry({ steps: [], checks: [], cut: 2 })])), /^2 parts/);
+});
+
+test("a report arriving redraws the run dialog, and note lines before it still count", () => {
+  const start = [said("N1: renamed it")];
+  const key = (entries) => threadKey([streaming("R1", "ended", entries)]);
+  const report = reportEntry({ steps: [], checks: [], cut: 0 });
+  assert.notEqual(key([...start, report]), key(start), "the report arrives");
+  const withBlock = [said(`N1: renamed it\n\n${fenced('{"steps": [{"why": "N1: not this"}]}')}`)];
+  assert.equal(agentSaid(streaming("R1", "ended", withBlock), "N1"), "renamed it");
+});
+
+test("a follow-up went to a fresh agent only when its prompt told the thread first", () => {
+  const turn = (prompt) => ({ prompt, followUp: { of: "R1", text: "and more" } });
+  assert.equal(freshAgent(turn("and more")), false, "a log from before the reminder");
+  assert.equal(freshAgent(turn("and more\n\nWhen you finish, end your reply…")), false);
+  assert.equal(
+    freshAgent(turn("You are continuing work another coding agent did…\n\nand more")),
+    true,
+  );
+  assert.equal(freshAgent(turn("and more, and then")), true, "words that only start alike");
 });

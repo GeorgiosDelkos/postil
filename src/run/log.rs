@@ -39,6 +39,7 @@ use crate::acp::{
 };
 use crate::error::{Error, Result};
 use crate::files::version_of;
+use crate::report::Report;
 use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 
@@ -76,9 +77,10 @@ pub(super) enum InThread<'a> {
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
-/// on the `tool` and `toolUpdate` entries. Every older version reads: a log before version 4
-/// has no snapshots, and one before version 5 no commands or exit codes.
-const LOG_VERSION: u32 = 5;
+/// on the `tool` and `toolUpdate` entries; version 6 the `report` entry. Every older version
+/// reads: a log before version 4 has no snapshots, one before version 5 no commands or exit
+/// codes, and one before version 6 no report.
+const LOG_VERSION: u32 = 6;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -253,6 +255,12 @@ pub(crate) enum Entry {
     /// (`review::findings_in`); `problem` says why none could be read.
     Findings {
         findings: Vec<Finding>,
+        problem: Option<String>,
+    },
+    /// The author's report, read from the reply of a run that is not a review stage when its
+    /// turn ended well (`report::read`); `problem` says why none could be read.
+    Report {
+        report: Option<Report>,
         problem: Option<String>,
     },
     /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]), taken before the
@@ -722,8 +730,9 @@ impl RunState {
         reply
     }
 
-    /// The run's work as a reviewer reads it: its prompt, its reply, and the diffs of its
-    /// finished tool calls, each call's last report, in the order the calls were made.
+    /// The run's work as a reviewer reads it: its prompt, its reply, the diffs of its
+    /// finished tool calls, each call's last report, in the order the calls were made, and
+    /// the author's report when it gave one.
     pub(super) fn work(&self) -> Work {
         let mut calls: Vec<(&str, &[Output], bool)> = Vec::new();
         for entry in &self.entries {
@@ -769,10 +778,15 @@ impl RunState {
                 Output::Text { .. } => None,
             })
             .collect();
+        let report = self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Report { report, .. } => report.clone(),
+            _ => None,
+        });
         Work {
             prompt: self.header.prompt.clone(),
             reply: self.reply(),
             diffs,
+            report,
         }
     }
 
@@ -816,6 +830,7 @@ impl RunState {
             | Entry::Plan { .. }
             | Entry::Unreadable { .. }
             | Entry::Findings { .. }
+            | Entry::Report { .. }
             | Entry::Snapshot { .. } => {}
         }
     }

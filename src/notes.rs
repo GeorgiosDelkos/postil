@@ -266,6 +266,21 @@ fn change_notes(
     Ok(review)
 }
 
+/// What the prompt asks of the agent's last words: the author's report (`report.rs`). In
+/// words, never as an example block, which a reply quoting the prompt would hand back as a
+/// report. This wording was tried on Claude and Grok, 10 runs each, on 2026-11-25: every
+/// reply held a report that reads (docs/review-assist.md, "Open questions", 11).
+pub(crate) const REPORT_ASK: &str = "Then end your reply with a report for the engineer who reviews your changes: one JSON \
+     object in a code block fenced as json, the last thing in your reply. Its field steps is \
+     the order in which to read your changes, cause before effect and the core change before \
+     its callers. Each step is an object with path (the file, relative to the repository \
+     root), lines (the first and last line on the new side of the diff, as an array of two \
+     numbers), why (one line) and risk (eyes when the change needs the engineer's judgment, \
+     routine, or mechanical for a rename, formatting or generated code). Its field checks \
+     lists each command you ran to verify the work, each an object with command (exactly as \
+     you ran it) and result (passed or failed). Use an empty array when there is nothing to \
+     list.\n";
+
 /// The prompt that sends the notes `ids` to an agent, in that order (docs/design.md, "The
 /// prompt"): an introduction, then each note's heading, a line note's quoted snippet, and its
 /// body. The quoted snippet travels with a line note because line numbers go stale the moment
@@ -284,6 +299,7 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
          Address every note. Change nothing the notes do not ask for.\n\
          When you finish, list each note id with one line on what you did.\n",
     );
+    text.push_str(REPORT_ASK);
     let mut files: Vec<String> = Vec::new();
     for id in &wanted {
         let note = review

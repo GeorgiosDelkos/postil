@@ -122,7 +122,11 @@ fn a_follow_up_in_a_thread_another_window_evicted_makes_its_worktree_again() {
     assert_eq!(thread(&a, "R1")["state"], "open");
     let prompt = run["prompt"].as_str().unwrap();
     assert!(
-        prompt.contains("R1 was asked") && prompt.ends_with("now asks:\n\nmore\n"),
+        prompt.contains("R1 was asked")
+            && prompt.ends_with(&format!(
+                "now asks:\n\nmore\n\n{}",
+                crate::run::REPORT_AGAIN
+            )),
         "the fresh agent is told the thread so far: {prompt}"
     );
 }
