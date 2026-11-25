@@ -112,7 +112,7 @@ fn a_built_in_agent_with_history_but_no_program_is_not_probed_and_says_not_insta
         config.join("usage.jsonl"),
         concat!(
             r#"{"version":1,"runId":"R1","repo":"/elsewhere","agent":"Claude","#,
-            r#""origin":"notes","status":"ended","startedAt":1,"endedAt":2}"#,
+            r#""origin":"notes","outcome":"ended","startedAt":1,"endedAt":2}"#,
             "\n",
         ),
     )
