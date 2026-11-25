@@ -1227,10 +1227,13 @@ mod tests {
         );
         agent.answer_permission(request.number, "always").unwrap();
         assert_eq!(said(&events), "chose always");
-        assert!(matches!(
-            agent.answer_permission(request.number, "once"),
-            Err(Error::NoSuchRequest)
-        ));
+        assert!(
+            matches!(
+                agent.answer_permission(request.number, "once"),
+                Err(Error::NoSuchRequest)
+            ),
+            "a request is answered once"
+        );
 
         let Event::Update(SessionUpdate::ToolCallUpdate(done)) = next(&events) else {
             panic!("expected the tool call's update");
