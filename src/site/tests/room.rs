@@ -297,7 +297,7 @@ fn apply_on_an_evicted_thread_takes_the_engineer_s_commit_on_its_branch() {
 }
 
 #[test]
-fn a_record_of_version_1_is_read_and_written_back_as_version_2() {
+fn a_record_of_version_1_is_read_and_written_back_as_the_current_version() {
     let (repo, site, nudges, _first) = written("room-version");
     let file = repo.root.join(".git/postil/threads.json");
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
@@ -314,7 +314,7 @@ fn a_record_of_version_1_is_read_and_written_back_as_version_2() {
 
     assert_eq!(run["status"], "ended", "{run}");
     let record: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    assert_eq!(record["version"], 2);
+    assert_eq!(record["version"], 3);
     assert!(
         record["threads"][0]["lastRun"].as_u64().unwrap() > 0,
         "{record}"

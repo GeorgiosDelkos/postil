@@ -54,9 +54,10 @@ use crate::error::{Error, Result, error_chain};
 use crate::files::{save_json, version_of};
 use crate::repo::{Checkout, Repo};
 
-/// The format version of `threads.json`. Version 2 added `lastRun` and the evicted state;
-/// version 1 is still read, as threads with no time of a last run.
-const THREADS_VERSION: u32 = 2;
+/// The format version of `threads.json`. Version 2 added `lastRun` and the evicted state,
+/// version 3 `pullRequest`; versions 1 and 2 are still read, version 1 as threads with no time
+/// of a last run.
+const THREADS_VERSION: u32 = 3;
 
 /// The longest slug a branch name takes from a note, in characters. Arbitrary: long enough to
 /// tell threads apart in `git branch`, short enough for a pull request's head.
@@ -89,6 +90,26 @@ pub(crate) struct Thread {
     /// with the reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped: Vec<String>,
+    /// The pull request opened from the thread's branch, once one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pull_request: Option<PullRequest>,
+}
+
+/// A thread's pull request on GitHub, as Postil last read it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PullRequest {
+    pub(crate) url: String,
+    pub(crate) state: PullState,
+}
+
+/// Whether a pull request is open, or how it closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PullState {
+    Open,
+    Merged,
+    Closed,
 }
 
 /// Whether a thread is open, or how it ended.
@@ -151,6 +172,7 @@ pub(crate) fn plan(
         last_run: now(),
         state: State::Open,
         skipped: Vec::new(),
+        pull_request: None,
     })
 }
 
@@ -515,6 +537,7 @@ pub(crate) fn sweep(repo: &Repo, home: &Path) -> Result<()> {
             last_run: 0,
             state: State::Open,
             skipped: Vec::new(),
+            pull_request: None,
         };
         if let Ok(Some(trashed)) = free(repo, &home, &orphan) {
             trashed.delete_later();
@@ -808,9 +831,9 @@ fn read(file: &Path) -> Result<Threads> {
         Err(error) => return Err(problem(error.to_string())),
     };
     match version_of(&json) {
-        // Version 1 has no `lastRun`, which reads as 0, and no thread evicted; it is written
-        // back as version 2 at the next change.
-        Ok(1 | THREADS_VERSION) => {
+        // Version 1 has no `lastRun`, which reads as 0, and no thread evicted; neither 1 nor 2
+        // has a pull request. Both are written back as the current version at the next change.
+        Ok(1 | 2 | THREADS_VERSION) => {
             let mut threads: Threads =
                 serde_json::from_slice(&json).map_err(|e| problem(e.to_string()))?;
             threads.version = THREADS_VERSION;

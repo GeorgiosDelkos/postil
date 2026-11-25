@@ -301,15 +301,9 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
             )));
         }
         let lost = note.anchor == Anchor::Lost;
+        text.push_str(&format!("\n[{}] {}\n", note.id, note.place()));
         match &note.target {
-            Target::Lines { lines, snippet } => {
-                let LineRange { start, end } = *lines;
-                let lines = if start == end {
-                    start.to_string()
-                } else {
-                    format!("{start}-{end}")
-                };
-                text.push_str(&format!("\n[{}] {}:{lines}\n", note.id, note.path));
+            Target::Lines { snippet, .. } => {
                 if lost {
                     text.push_str("(These lines are no longer in the file; they were:)\n");
                 }
@@ -318,8 +312,6 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
                 }
             }
             Target::Path(kind) => {
-                let slash = if *kind == PathKind::Folder { "/" } else { "" };
-                text.push_str(&format!("\n[{}] {}{slash} ({kind})\n", note.id, note.path));
                 if lost {
                     text.push_str(&format!("(This {kind} is no longer in the repository.)\n"));
                 }
@@ -336,6 +328,32 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
         }
     }
     Ok(Prompt { text, files })
+}
+
+/// The notes `ids` that are still there, as Markdown for a pull request's description: each
+/// note's id, its place and its text, with no snippet of the code it is on. A snippet can hold
+/// what must not leave the machine (a key a note asks to remove), and the pull request's diff
+/// shows the code. Notes deleted since are left out.
+///
+/// # Errors
+///
+/// As [`current`], and [`Error::InvalidNote`] for an id that is not `N` and a number.
+pub(crate) fn listed(repo: &Repo, ids: &[String]) -> Result<String> {
+    let wanted = parse_ids(ids)?;
+    let review = current(repo)?;
+    let mut text = String::new();
+    for note in wanted
+        .iter()
+        .filter_map(|id| review.notes.iter().find(|note| note.id == *id))
+    {
+        text.push_str(&format!(
+            "**{}**, `{}`\n\n{}\n\n",
+            note.id,
+            note.place(),
+            note.body.trim_end()
+        ));
+    }
+    Ok(text)
 }
 
 /// The text of note `id`: a thread's branch is named from its first note's.
@@ -438,6 +456,27 @@ struct Note {
     /// Recomputed on every read.
     anchor: Anchor,
     state: NoteState,
+}
+
+impl Note {
+    /// Where the note is, as a prompt names it: `src/a.rs:3-5`, `src/a.rs:3`, `src/ (folder)`
+    /// or `a.rs (file)`.
+    fn place(&self) -> String {
+        match &self.target {
+            Target::Lines { lines, .. } => {
+                let LineRange { start, end } = *lines;
+                if start == end {
+                    format!("{}:{start}", self.path)
+                } else {
+                    format!("{}:{start}-{end}", self.path)
+                }
+            }
+            Target::Path(kind) => {
+                let slash = if *kind == PathKind::Folder { "/" } else { "" };
+                format!("{}{slash} ({kind})", self.path)
+            }
+        }
+    }
 }
 
 /// Where a note is in the loop. Kept apart from [`Anchor`] (module docs). Always an object

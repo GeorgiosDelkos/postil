@@ -75,6 +75,7 @@ export function runPanel({
     answerQuestion: store.answerQuestion,
     holdDraft: dialog.holdDraft,
     forget: store.forget,
+    checkPullRequests: store.checkPullRequests,
     reload: store.reload,
     run: store.run,
     liveRuns: store.liveRuns,

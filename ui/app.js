@@ -493,6 +493,9 @@ async function refresh() {
 }
 
 window.addEventListener("focus", () => {
+  // Before `refresh`, whose `forget` drops the threads read: the engineer may have merged a
+  // pull request on GitHub while away.
+  runs.checkPullRequests();
   refresh().catch((error) => notesEl.replaceChildren(el("div", "empty", String(error))));
 });
 

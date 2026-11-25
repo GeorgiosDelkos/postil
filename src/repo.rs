@@ -32,6 +32,14 @@ pub(crate) enum Checkout<'a> {
     Existing { branch: &'a str },
 }
 
+/// A local branch's branch on a remote ([`Repo::upstream`]).
+#[derive(Debug)]
+pub(crate) struct Upstream {
+    pub(crate) remote: String,
+    /// Its name there: `develop` for a local `dev` that tracks `origin/develop`.
+    pub(crate) branch: String,
+}
+
 /// A git working tree on disk.
 #[derive(Debug)]
 pub(crate) struct Repo {
@@ -495,7 +503,103 @@ impl Repo {
     ///
     /// The git error, such as a repository git cannot read.
     pub(crate) fn branch_commit(&self, branch: &str) -> Result<Option<String>> {
-        let name = format!("refs/heads/{branch}^{{commit}}");
+        self.ref_commit(&format!("refs/heads/{branch}"))
+    }
+
+    /// The commit `refs/remotes/<remote>/<branch>` names: the branch on `remote` as this
+    /// repository last fetched or pushed it. `None` when it has none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Repo::branch_commit`].
+    pub(crate) fn remote_branch_commit(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        self.ref_commit(&format!("refs/remotes/{remote}/{branch}"))
+    }
+
+    /// Where local branch `branch` lives on a remote: the remote and branch it tracks
+    /// (`branch.<name>.remote` and `.merge`), else the branch of the same name on `origin`
+    /// when there is one. `None` when there is neither.
+    ///
+    /// # Errors
+    ///
+    /// The git error when the config or the remotes cannot be read.
+    pub(crate) fn upstream(&self, branch: &str) -> Result<Option<Upstream>> {
+        let remote = self.config_value(&format!("branch.{branch}.remote"))?;
+        // `.` is this repository itself: a branch tracking another local branch.
+        if let Some(remote) = remote.filter(|remote| remote != ".") {
+            let merge = self.config_value(&format!("branch.{branch}.merge"))?;
+            let name = merge
+                .as_deref()
+                .and_then(|merge| merge.strip_prefix("refs/heads/"))
+                .unwrap_or(branch);
+            return Ok(Some(Upstream {
+                remote,
+                branch: name.to_owned(),
+            }));
+        }
+        let remotes = git(&self.root, &["remote"])?;
+        Ok(remotes
+            .lines()
+            .any(|remote| remote == "origin")
+            .then(|| Upstream {
+                remote: "origin".to_owned(),
+                branch: branch.to_owned(),
+            }))
+    }
+
+    /// The value of config `key`, or `None` when it is not set or empty.
+    fn config_value(&self, key: &str) -> Result<Option<String>> {
+        match git(&self.root, &["config", "--get", key]) {
+            Ok(value) => Ok(Some(value.trim().to_owned()).filter(|value| !value.is_empty())),
+            // `git config --get` exits 1, printing nothing, for a key that is not set.
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// At most `most` of the commits reachable from `to` and not from `from`, newest first,
+    /// each as its short id and subject: `"a1b2c3d Fix the parser"`.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as an id that names no commit.
+    pub(crate) fn commits_between(&self, from: &str, to: &str, most: usize) -> Result<Vec<String>> {
+        let range = format!("{from}..{to}");
+        let count = format!("--max-count={most}");
+        let log = git(&self.root, &["log", &count, "--format=%h %s", &range])?;
+        Ok(log.lines().map(str::to_owned).collect())
+    }
+
+    /// Pushes local branch `branch` to the branch of the same name on `remote`, with the login
+    /// shell's `search_path` as `PATH`: git runs the credential helpers the engineer set up
+    /// (`gh auth git-credential`, `osxkeychain`) and their `pre-push` hook by it, and the app
+    /// started from the Dock has a minimal `PATH`. The hook runs, unlike for Postil's own
+    /// commits: this is the engineer's push to their remote, which a hook may guard (a secret
+    /// scanner). Takes as long as the push and the hook.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as a remote that refuses the push or a missing credential.
+    pub(crate) fn push_branch(
+        &self,
+        remote: &str,
+        branch: &str,
+        search_path: &OsStr,
+    ) -> Result<()> {
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let args = ["push", "--quiet", remote, refspec.as_str()].map(OsStr::new);
+        let mut command = git_command(&self.root, Search::Here);
+        command.args(args).env("PATH", search_path);
+        output_of(command, &args, None).map(drop)
+    }
+
+    /// The commit the full ref name `name` resolves to, or `None` when it names nothing.
+    fn ref_commit(&self, name: &str) -> Result<Option<String>> {
+        let name = format!("{name}^{{commit}}");
         match git(&self.root, &["rev-parse", "--verify", "--quiet", &name]) {
             Ok(id) => Ok(Some(id.trim_end().to_owned())),
             // As in `head`: with `--quiet`, a name that resolves to nothing prints nothing.
@@ -944,6 +1048,17 @@ fn run_git_with(
     args: &[&OsStr],
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    let mut command = git_command(dir, search);
+    command.args(args);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    output_of(command, args, input)
+}
+
+/// `git -C <dir>`, set to find the repository at `dir` as `search` says and never to prompt
+/// ([`run_git_with`]), with no arguments yet.
+fn git_command(dir: &Path, search: Search) -> Command {
     let mut command = Command::new("git");
     match (search, dir.parent()) {
         // git looks in `dir`, then stops before the ceiling, its parent. It resolves links
@@ -958,16 +1073,8 @@ fn run_git_with(
     command
         .arg("-C")
         .arg(dir)
-        .args(args)
         // Never wait on a terminal prompt: there is none, and a send would hang.
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         // Messages in English whatever the user's locale: `Repo::open` matches one of them.
         .env("LC_ALL", "C")
         // The repository is the one `-C` names. These variables, inherited from a terminal
@@ -977,9 +1084,20 @@ fn run_git_with(
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_INDEX_FILE");
-    if let Some(index) = index {
-        command.env("GIT_INDEX_FILE", index);
-    }
+    command
+}
+
+/// Runs `command`, a [`git_command`] given its `args`, writing `input` to its standard input
+/// when given (empty otherwise), and returns what it printed.
+fn output_of(mut command: Command, args: &[&OsStr], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(Error::SpawnGit)?;
     let output = std::thread::scope(|scope| {
         if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
