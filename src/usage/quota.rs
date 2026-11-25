@@ -474,11 +474,8 @@ fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
 /// when a Keychain item contains newlines or non-ASCII bytes.
 fn decode_hex_utf8(hex: &str) -> Option<String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.len() < 2 || !hex.len().is_multiple_of(2) {
-        return None;
-    }
     let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-    if !remainder.is_empty() {
+    if pairs.is_empty() || !remainder.is_empty() {
         return None;
     }
     let mut bytes = Vec::with_capacity(pairs.len());
@@ -1539,6 +1536,167 @@ mod tests {
     }
 
     #[test]
+    fn hex_decoding_takes_either_case_and_refuses_partial_input() {
+        assert_eq!(decode_hex_utf8("4a6b").as_deref(), Some("Jk"));
+        assert_eq!(decode_hex_utf8("0x4A6B").as_deref(), Some("Jk"));
+        assert_eq!(decode_hex_utf8("7E").as_deref(), Some("~"));
+        assert_eq!(decode_hex_utf8(""), None);
+        assert_eq!(decode_hex_utf8("4"), None);
+        assert_eq!(decode_hex_utf8("4a6"), None);
+        assert_eq!(decode_hex_utf8("4g"), None);
+        assert_eq!(decode_hex_utf8("ff"), None, "not UTF-8");
+    }
+
+    #[test]
+    fn rfc3339_refuses_each_malformed_field_and_takes_each_boundary() {
+        for valid in [
+            "2026-11-25t12:30:45z",
+            "2026-12-31T23:59:60Z",
+            "2026-11-25T12:30:45+23:59",
+            "2026-11-25T12:30:45-00:30",
+        ] {
+            assert!(parse_rfc3339_secs(valid).is_some(), "{valid}");
+        }
+        for invalid in [
+            "2026-11-25T12:30:4Z",
+            "2026/11-25T12:30:45Z",
+            "2026-11/25T12:30:45Z",
+            "2026-11-25 12:30:45Z",
+            "2026-11-25T12-30:45Z",
+            "2026-11-25T12:30-45Z",
+            "2026-00-25T12:30:45Z",
+            "2026-13-25T12:30:45Z",
+            "2026-11-00T12:30:45Z",
+            "2026-11-25T24:30:45Z",
+            "2026-11-25T12:60:45Z",
+            "2026-11-25T12:30:61Z",
+            "2026-11-25T12:30:45.Z",
+            "2026-11-25T12:30:45",
+            "2026-11-25T12:30:45ZZ",
+            "2026-11-25T12:30:45*02:00",
+            "2026-11-25T12:30:45+02-00",
+            "2026-11-25T12:30:45+24:00",
+            "2026-11-25T12:30:45+02:60",
+        ] {
+            assert_eq!(parse_rfc3339_secs(invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            parse_rfc3339_secs("1970-01-01T00:00:01+00:01"),
+            None,
+            "before 1970 in UTC"
+        );
+    }
+
+    #[test]
+    fn claude_extra_usage_alone_is_a_quota_with_what_remains() {
+        let extra = |enabled: bool| {
+            serde_json::json!({
+                "extra_usage": { "is_enabled": enabled, "used_credits": 420, "monthly_limit": 5000 }
+            })
+            .to_string()
+        };
+        let report = parse_claude_quota(&extra(true), None);
+        assert_eq!(report.status, QuotaStatus::Ok);
+        assert_eq!(report.windows.len(), 0);
+        let credits = report.credits.unwrap();
+        assert!((credits.remaining.unwrap() - 45.8).abs() < 1e-6);
+        assert!(!credits.unlimited);
+
+        let report = parse_claude_quota(&extra(false), None);
+        assert_eq!(report.status, QuotaStatus::Unavailable);
+    }
+
+    #[test]
+    fn codex_names_each_window_by_its_length() {
+        let window =
+            |mins: u64| serde_json::json!({ "usedPercent": 1.0, "windowDurationMins": mins });
+        let labels = |bucket: Value| {
+            let mut out = Vec::new();
+            collect_codex_bucket(&bucket, None, &mut out);
+            out.into_iter().map(|win| win.label).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(serde_json::json!({ "primary": window(45), "secondary": window(2880) })),
+            ["45-min window", "2-day window"]
+        );
+        assert_eq!(
+            labels(serde_json::json!({ "primary": window(90), "secondary": window(0) })),
+            ["1-hour window", "7-day window"]
+        );
+    }
+
+    #[test]
+    fn codex_lists_per_model_buckets_but_not_a_second_copy_of_the_main_one() {
+        let bucket = |used: f64| serde_json::json!({ "primary": { "usedPercent": used } });
+        let by_id = serde_json::json!({
+            "codex": bucket(10.0),
+            "gpt-5": { "limitName": "GPT-5", "primary": { "usedPercent": 20.0 } },
+            "o3": { "limitName": "", "primary": { "usedPercent": 30.0 } },
+        });
+        let labels = |result: Value| {
+            let limits = serde_json::json!({ "result": result });
+            parse_codex_quota(None, Some(&limits))
+                .windows
+                .into_iter()
+                .map(|win| win.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(serde_json::json!({ "rateLimits": bucket(10.0), "rateLimitsByLimitId": by_id })),
+            [
+                "5-hour window",
+                "GPT-5 (5-hour window)",
+                "o3 (5-hour window)"
+            ]
+        );
+        assert_eq!(
+            labels(serde_json::json!({ "rateLimitsByLimitId": by_id })),
+            [
+                "codex (5-hour window)",
+                "GPT-5 (5-hour window)",
+                "o3 (5-hour window)"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_credits_show_when_held_or_unlimited() {
+        let credits = |has: bool, unlimited: bool| {
+            parse_codex_credits(&serde_json::json!({
+                "credits": { "hasCredits": has, "unlimited": unlimited }
+            }))
+        };
+        assert!(credits(false, false).is_none());
+        assert!(credits(true, false).is_some_and(|info| !info.unlimited));
+        assert!(credits(false, true).is_some_and(|info| info.unlimited));
+    }
+
+    #[test]
+    fn gemini_load_reads_the_project_and_the_paid_or_current_tier() {
+        let load = |body: Value| parse_gemini_load(&body.to_string());
+        assert_eq!(
+            load(serde_json::json!({
+                "cloudaicompanionProject": "proj-1",
+                "paidTier": { "name": "Google AI Pro" },
+                "currentTier": { "name": "Free" },
+            })),
+            (Some("proj-1".to_owned()), Some("Google AI Pro".to_owned()))
+        );
+        assert_eq!(
+            load(serde_json::json!({ "currentTier": { "name": "Free" } })),
+            (None, Some("Free".to_owned()))
+        );
+        assert_eq!(
+            load(serde_json::json!({
+                "cloudaicompanionProject": "",
+                "currentTier": { "name": "" },
+            })),
+            (None, None)
+        );
+        assert_eq!(parse_gemini_load("not json"), (None, None));
+    }
+
+    #[test]
     fn parse_gemini_creds_detects_expired_token() {
         let now = 1_795_000_000;
         let expired = r#"{"access_token":"tok","expiry_date":1794000000000}"#;
@@ -1683,6 +1841,10 @@ mod tests {
         fs::write(&unreadable, "{}").unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
         let error = read_credentials_file(&unreadable).unwrap_err();
+        assert!(error.starts_with("cannot read "), "{error}");
+        // A path through a file fails before the file is opened, and is not "missing" either.
+        let through_a_file = unreadable.join("credentials.json");
+        let error = read_credentials_file(&through_a_file).unwrap_err();
         assert!(error.starts_with("cannot read "), "{error}");
     }
 

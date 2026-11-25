@@ -329,4 +329,8 @@ fn usage_lists_an_agent_only_when_it_is_installed_or_has_history() {
         [("Installed", true), ("Used", false), ("Removed", false)],
         "{body}"
     );
+
+    // The runs started in 1970: the last 24 hours, counted back from the clock, have none.
+    let body = get_json(&site, "postil://localhost/api/usage?scope=all&range=24h");
+    assert_eq!(body["summary"]["runs"], 0, "{body}");
 }
