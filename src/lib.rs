@@ -9,6 +9,7 @@ mod acp;
 mod agents;
 mod clone;
 mod dialog;
+mod disk;
 mod error;
 mod files;
 mod folders;

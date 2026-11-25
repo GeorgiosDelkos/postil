@@ -1150,6 +1150,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::TurnRunning
                 | Error::RunElsewhere
                 | Error::TooManyRuns { .. }
+                | Error::TooManyWorktrees { .. }
                 | Error::RunInOpenProject
                 | Error::ThreadChanged { .. }
                 | Error::NotAWorktree { .. }
@@ -1157,6 +1158,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
                     StatusCode::NOT_FOUND
                 }
+                Error::DiskFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
                 // The agent, the server behind this one, failed.
                 Error::AgentNotFound { .. }
                 | Error::StartAgent { .. }

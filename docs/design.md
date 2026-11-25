@@ -554,12 +554,12 @@ runs in a git worktree of its own, on a branch of its own. The engineer's workin
 never an agent's working directory; changes reach it only through Apply or a merged pull
 request.
 
-Built (`src/thread.rs`, `src/clone.rs`): a worktree and a branch per thread, the record,
-commits as snapshots, the cloned build folders, Apply and Discard, and finishing deletes left
-in a repository's trash when it opens; a runner per thread with its locks, and the cap of 3
-live runs. Not built yet, and marked so below: `git worktree lock`, the warning about
-uncommitted changes, sparse-checkout patterns, the startup sweep and the other disk bounds,
-and pull requests.
+Built (`src/thread.rs`, `src/clone.rs`, `src/run/room.rs`, `src/disk.rs`): a worktree and a
+branch per thread, the record, commits as snapshots, the cloned build folders, Apply and
+Discard, a runner per thread with its locks, the cap of 3 live runs, `git worktree lock`, the
+startup sweep, the cap of 15 worktrees, the free-space floor and eviction. Not built yet, and
+marked so below: the warning about uncommitted changes, sparse-checkout patterns, and pull
+requests.
 
 #### Threads
 
@@ -589,15 +589,21 @@ and pull requests.
   forked until it runs its program. `threads.lock`
   serializes, across windows, every change to the record. The window marks a
   worktree its start thread is still making, and counts it as a run under way: no commit,
-  run or ending touches a half-made checkout. `git worktree lock`, so no cleanup removes a
-  live worktree, comes with the startup sweep that unlocks it (not built yet).
-- **The record** is `<git dir>/postil/threads.json` (version 1), one entry per thread: `id`,
+  run or ending touches a half-made checkout. Eviction takes an idle thread under its lock
+  too, as an ending does.
+- **`git worktree lock`** for a worktree's whole life (`git worktree add --lock`), so the
+  engineer's `git worktree remove` and a `git worktree prune` leave it alone. Postil frees a
+  worktree by deleting git's record of it, the lock with it, so it never unlocks one. Chosen
+  2026-11-25 over locking only while a run is live, which the design said before: that takes
+  two git calls per run and a sweep to unlock what a crash left locked, and guards less.
+- **The record** is `<git dir>/postil/threads.json` (version 2), one entry per thread: `id`,
   its first run; `path`, the worktree's absolute path; `branch`; `fork`, the commit it starts
   from; `base`, the branch `HEAD` was on at send; `tip`, the last commit Postil made or found,
-  before or after a run; `skipped`, what the worktree was not given; and `state`: `open`,
-  `applied` or
-  `discarded`. The later steps add the pull request's URL, the time of the last run, and an
-  evicted state. A change reads the file, changes one thread and writes it whole, under
+  before or after a run; `lastRun`, when its latest run started, in milliseconds since the
+  Unix epoch; `skipped`, what the worktree was not given; and `state`: `open`, `evicted`,
+  `applied` or `discarded`. Version 1 had no `lastRun` and no evicted state; it is still read,
+  its threads as having run at time 0, and written back as version 2. The last step adds the
+  pull request's URL. A change reads the file, changes one thread and writes it whole, under
   `threads.lock`; a new thread is written before `git worktree add`, so a crash leaves a
   record pointing at whatever was made. Run logs stay append-only, so this file holds what
   changes. A file that cannot be read or parsed is reported and never written over.
@@ -748,8 +754,8 @@ worktree record of this repository; Postil writes those pointers absolute
 
 **An ended thread frees its disk at once:**
 
-1. Stop the thread's agent, once Apply succeeded, and `git worktree unlock` (no lock is
-   taken yet).
+1. Stop the thread's agent, once Apply succeeded. The worktree stays locked in git: step 2
+   deletes git's record of it, and the lock with it.
 2. Rename the worktree into `trash/` beside `worktrees/`, as `r<n>-<pid>-<count>` (instant on
    one volume), delete git's record of that one worktree (`<common git dir>/worktrees/<name>`,
    as `git worktree prune` would; a global prune would also drop the engineer's worktrees on
@@ -770,14 +776,16 @@ worktree record of this repository; Postil writes those pointers absolute
 
 #### Keeping the disk in bounds
 
-Not built yet, except finishing the deletes left in a repository's trash when it opens, and
-the cap on live runs.
+Built (`src/run/room.rs`).
 
-- **On start,** under `threads.lock`: a worktree whose thread lock is free is unlocked
-  (`git worktree unlock`), since a crash leaves git's lock behind; worktrees under Postil's
-  folders that no record names are removed if they pass the safety check, and kept and
-  listed otherwise; `git worktree prune` drops entries whose folder is gone; and deletes left
-  in `~/.postil/trash/` are finished.
+- **When a repository opens,** on a background thread: deletes left in its trash are
+  finished, and each folder in its worktrees folder that no thread names is freed when it is a
+  worktree of the repository that passes the safety check (a thread taken out of the record
+  by hand leaves one); any other folder is kept, untouched. Its branch stays. The folders are
+  listed before the record is read: a thread is written to the record before its worktree is
+  made, so the folder of a thread being made is named there. No `git worktree prune`: it
+  would drop the engineer's worktrees on a disk not mounted, and Postil drops git's record of
+  its own worktrees one at a time as it frees them.
 - **At most 3 live runs** per repository, counted across windows (built): the thread locks
   held (section "Threads", "Locks"). A send, follow-up or review beyond that is refused (409)
   with the live threads named, and the page offers no Send while its own window runs 3: a
@@ -790,20 +798,44 @@ the cap on live runs.
   this window or another can take the place between two stages, and another window the
   thread, and the review then stops, its last stage saying why.
 - **At most 15 worktrees** per repository, Codex's default; Cursor keeps 20. One Codex report
-  found 61 worktrees holding about 100 GB.
-- **A free-space floor of 20 GB** on the worktrees' volume, read as
-  `NSURLVolumeAvailableCapacityForImportantUsageKey` (it counts space macOS can purge, which
-  `statfs` does not), and checked before each worktree is made and each run starts.
-  Arbitrary: a few release builds of a Tauri app. Free space is the measure, not `du`,
-  which counts a block shared by clones once per clone.
-- **Eviction** takes idle threads only: no live agent and a clean worktree. A thread with an
-  open pull request qualifies, since its branch is pushed. They go in order of their last run,
-  oldest first. Under the floor, a thread loses its build folders, the space is measured
-  again, and its worktree goes only if still short.
-  Over the cap, whole worktrees go until the count fits. An evicted thread keeps its branch
-  and record. A follow-up or a review remakes its worktree at a new path from the branch,
-  with fresh clones and a new session. If eviction frees too little, the send is refused,
-  naming the free space and the threads that hold the most.
+  found 61 worktrees holding about 100 GB. Counted from the record: open threads whose
+  worktree is on disk.
+- **A free-space floor of 20 GB** on the worktrees' volume, read through `NSURL` as the larger
+  of `NSURLVolumeAvailableCapacityForImportantUsageKey` (it counts space macOS can purge, which
+  `statfs` does not) and `NSURLVolumeAvailableCapacityKey` (as `statfs` counts it): the first
+  reads 0 in a process sandboxed away from the service that computes it, as one under Claude
+  Code's sandbox was on 2026-11-25, and is never below the second. Space that cannot be
+  measured, or off macOS, counts as enough. Arbitrary: a few release builds of a Tauri app.
+  Free space is the measure, not `du`, which counts a block shared by clones once per clone.
+- **When they are checked:** on the run's start thread, before a new or evicted thread's
+  worktree is made, so the seconds a delete takes keep no request waiting. A run in a
+  worktree already on disk adds no worktree and evicts nothing, even under the floor: a
+  follow-up that reuses its thread's agent starts on the request thread, where no delete may
+  wait, and evicting every idle thread for a run that frees nothing was the most harm for the
+  least gain (review of PR #49, 2026-11-25). A run refused there fails, naming each thread it
+  could not evict and why; a new thread's then goes from the record, as one whose worktree
+  could not be made does. Windows check apart, so two making worktrees at once can each see
+  room for one: the cap can be passed by the worktrees being made, at most 2.
+- **Eviction** takes idle threads only: its thread lock free (no run in any window), not busy
+  in this window, and a worktree that passes the safety check. A thread with an open pull
+  request qualifies, since its branch is pushed. They go in order of their last run, oldest
+  first. Under the floor, a thread loses its build folders (the worktree's ignored top-level
+  folders, deleted before the space is measured again), and its worktree goes only if still
+  short. Over the cap, whole worktrees go until the count fits; a thread another window
+  freed meanwhile counts as gone. Under the thread's lock the folders are only moved into the
+  trash and the record changed, milliseconds; the delete comes after the lock is let go,
+  because a held thread lock counts as a live run for the cap of 3. The agent this window
+  keeps for an evicted thread is stopped; another window's kept agent is not reachable, and
+  that window starts a fresh one for the thread's next run. The thread is marked `evicted`,
+  keeping its branch and record. Apply and Discard work on it from the branch, Apply taking
+  the branch's commit when it follows the tip, so a commit the engineer made in the worktree
+  before the eviction is applied too. A follow-up or a review makes its worktree again at the
+  same path from the branch, locked, with fresh clones and a fresh agent told the thread so
+  far; the thread is
+  marked open before git makes it, and evicted again if it cannot be made. The same path,
+  rather than a new one: the old folder is gone by then, and every run log already names that
+  path. If eviction frees too little, the run is refused (`TooManyWorktrees`, `DiskFull`),
+  naming the free space and the threads it could not evict.
 
 ### Cards and dialogs
 
@@ -1058,8 +1090,8 @@ retired; the measured numbers above are the baseline to not regress.
    "Worktrees"), one pull request per step, so the main branch works after each. The owner
    chose this order on 2026-11-24, so agents never write to worktrees with no way to bring
    their changes back: the worktree with its branch, commits and clones, with Apply and
-   Discard (built); then a runner per thread, its locks and the agent cap; then the startup
-   sweep, eviction and the free-space floor; then Open pull request.
+   Discard (built); then a runner per thread, its locks and the agent cap (built); then the
+   startup sweep, eviction and the free-space floor (built); then Open pull request.
 
 ## Testing
 

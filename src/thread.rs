@@ -10,7 +10,8 @@
 //!
 //! `<git dir>/postil/threads.json` lists every thread with its worktree's path, its branch,
 //! the commit it started from (`fork`) and the last commit Postil made or found on it
-//! (`tip`), and whether it is open or how it ended. It is written before the worktree is
+//! (`tip`), when its latest run started (`lastRun`), and whether it is open, evicted, or how
+//! it ended. It is written before the worktree is
 //! made, so a crash leaves a record naming whatever was made. Every change reads the file,
 //! changes one thread, and writes it whole, under an exclusive lock on `threads.lock` beside
 //! it, so two windows on one repository keep each other's changes. A file that cannot be read
@@ -23,7 +24,12 @@
 //! another volume gets its worktrees under `.postil` at that volume's root instead, so the
 //! build folders can be cloned (`clone.rs`), which works only within one volume. An ended
 //! thread's worktree is renamed into `trash/` beside `worktrees/` and deleted there on a
-//! background thread; opening the repository again finishes what a quit cut short.
+//! background thread; opening the repository again finishes what a quit cut short, and frees
+//! the clean worktrees in this repository's worktrees folder that no thread names ([`sweep`]).
+//!
+//! Each worktree is locked in git (`git worktree add --lock`) for its whole life, so neither
+//! the engineer's `git worktree remove` nor a `git worktree prune` takes it. Postil frees one
+//! by deleting git's record of it, lock included, so the lock never stands in its way.
 //!
 //! Postil deletes only what it made: a folder directly in this repository's worktrees
 //! folder whose `.git` names a worktree record of this repository, and branches under
@@ -38,16 +44,19 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use crate::clone::clone_folder;
+use crate::disk;
 use crate::error::{Error, Result, error_chain};
 use crate::files::{save_json, version_of};
-use crate::repo::Repo;
+use crate::repo::{Checkout, Repo};
 
-/// The format version of `threads.json`.
-const THREADS_VERSION: u32 = 1;
+/// The format version of `threads.json`. Version 2 added `lastRun` and the evicted state;
+/// version 1 is still read, as threads with no time of a last run.
+const THREADS_VERSION: u32 = 2;
 
 /// The longest slug a branch name takes from a note, in characters. Arbitrary: long enough to
 /// tell threads apart in `git branch`, short enough for a pull request's head.
@@ -71,6 +80,10 @@ pub(crate) struct Thread {
     /// The last commit Postil made or found on the branch, before or after a run; `fork`
     /// until then. Ending the thread checks the worktree is at it, or past it.
     pub(crate) tip: String,
+    /// When the thread's latest run started, in milliseconds since the Unix epoch; 0 in a
+    /// record of version 1. Eviction takes the thread whose latest run is oldest first.
+    #[serde(default)]
+    pub(crate) last_run: u64,
     pub(crate) state: State,
     /// What the worktree was not given ([`make`]): ignored folders, or its submodules, each
     /// with the reason.
@@ -84,6 +97,9 @@ pub(crate) struct Thread {
 pub(crate) enum State {
     /// Its worktree is on disk (or being made), and its runs can go on.
     Open,
+    /// Its worktree was freed to keep the disk in bounds; its branch and record stay, and its
+    /// next run makes the worktree again from the branch.
+    Evicted,
     /// Its changes were written into the engineer's working tree; the worktree is gone.
     Applied,
     /// It ended with nothing applied; the worktree is gone.
@@ -132,13 +148,16 @@ pub(crate) fn plan(
         fork: fork.to_owned(),
         base,
         tip: fork.to_owned(),
+        last_run: now(),
         state: State::Open,
         skipped: Vec::new(),
     })
 }
 
-/// Makes `thread`'s worktree on its branch, checks out its submodules, and clones the
-/// engineer's ignored top-level folders (`target`, `node_modules`) into it. Returns what was
+/// Makes `thread`'s worktree, locked in git, on its branch: a new branch at the fork commit for
+/// an open thread, its existing branch for an evicted one. Then checks out its submodules,
+/// and clones the engineer's ignored top-level folders (`target`, `node_modules`) into it.
+/// Returns what was
 /// not given to the worktree, each with the reason: a folder that could not be cloned or
 /// copied, a Python virtual environment (it names its own absolute path, so a clone would
 /// install into the engineer's), or submodules that could not be checked out. Takes as long
@@ -158,7 +177,16 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
         path: parent.to_owned(),
         source,
     })?;
-    repo.add_worktree(&thread.path, &thread.branch, &thread.fork)?;
+    let checkout = match thread.state {
+        State::Evicted => Checkout::Existing {
+            branch: &thread.branch,
+        },
+        State::Open | State::Applied | State::Discarded => Checkout::New {
+            branch: &thread.branch,
+            fork: &thread.fork,
+        },
+    };
+    repo.add_worktree(&thread.path, checkout)?;
     // The worktree is made from here on: what fails now is something it was not given, not a
     // failed make, which would drop the thread and leave the worktree with no owner.
     let tree = match Repo::open(&thread.path) {
@@ -306,10 +334,51 @@ pub(crate) fn remove(repo: &Repo, ids: &[String]) -> Result<()> {
     })
 }
 
+/// A folder moved into the trash, on disk until it is deleted. Moving is a rename, instant on
+/// one volume; deleting takes seconds for a build folder, so the caller chooses when, once it
+/// holds no lock another window waits on.
+#[derive(Debug)]
+#[must_use = "delete it now or later; a folder left in the trash goes when the project opens"]
+pub(crate) struct Trashed(PathBuf);
+
+impl Trashed {
+    /// Deletes the folder before returning, so the space it frees can be measured: eviction,
+    /// on a run's start thread, where no request waits. Errors are ignored: what is left goes
+    /// with the next delete of the trash.
+    pub(crate) fn delete_now(self) {
+        drop(fs::remove_dir_all(&self.0));
+    }
+
+    /// Deletes everything in the trash on a background thread ([`empty_trash`]): an ending or
+    /// a forgotten thread answers the page at once.
+    pub(crate) fn delete_later(self) {
+        if let Some(trash) = self.0.parent() {
+            empty_trash(trash);
+        }
+    }
+}
+
+/// Moves the folder at `path` into `repo`'s trash under Postil's home `home`, named from
+/// `name` and a count unique to this process.
+fn move_to_trash(repo: &Repo, home: &Path, path: &Path, name: &str) -> io::Result<Trashed> {
+    // A unique name in the trash only: nothing is ordered by it.
+    static TRASHED: AtomicU64 = AtomicU64::new(0);
+    let trash = trash_for(repo.root(), home);
+    let to = trash.join(format!(
+        "{name}-{}-{}",
+        std::process::id(),
+        TRASHED.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&trash)?;
+    fs::rename(path, &to)?;
+    Ok(Trashed(to))
+}
+
 /// Frees `thread`'s worktree: renames its folder into the trash beside the worktrees, drops
-/// git's record of that one worktree, and deletes the folder on a background thread. A
-/// worktree that is not on disk (never made, freed before, or deleted by hand) only has git's
-/// record dropped, if git has one. Does not touch the branch or the thread's record.
+/// git's record of that one worktree, and returns the folder in the trash for the caller to
+/// delete. A worktree that is not on disk (never made, freed before, or deleted by hand) only
+/// has git's record dropped, if git has one, and gives `None`. Does not touch the branch or
+/// the thread's record.
 ///
 /// The path comes from `threads.json`, which a hand edit can point anywhere, so a folder is
 /// freed only when it is directly in this repository's worktrees folder under Postil's home
@@ -323,31 +392,23 @@ pub(crate) fn remove(repo: &Repo, ids: &[String]) -> Result<()> {
 /// record of this repository; [`Error::ThreadChanged`] as [`check`]; [`Error::WriteWorktree`]
 /// when the folder cannot be moved into the trash or git's record removed; and the git
 /// errors.
-pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
-    // A unique name in the trash only: nothing is ordered by it.
-    static FREED: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<Option<Trashed>> {
     check_place(repo, home, thread)?;
     // The record to drop below; `check` checks the worktree again through `open`.
     let record = repo.worktree_record(&thread.path)?;
     check(repo, home, thread)?;
+    let mut trashed = None;
     if thread.path.symlink_metadata().is_ok() {
         let path = fs::canonicalize(&thread.path).unwrap_or_else(|_| thread.path.clone());
-        let trash = trash_for(repo.root(), home);
         // From the folder's own name, which `check_place` checked, never from the record's
         // id: a hand-edited id could name a place outside the trash.
         let folder = path
             .file_name()
-            .expect("check_place passed, so the path ends in a folder's name");
-        let name = format!(
-            "{}-{}-{}",
-            folder.to_string_lossy(),
-            std::process::id(),
-            FREED.fetch_add(1, Ordering::Relaxed)
-        );
-        let moved = fs::create_dir_all(&trash).and_then(|()| fs::rename(&path, trash.join(&name)));
-        moved.map_err(|source| Error::WriteWorktree { path, source })?;
-        // Runs on: the delete takes seconds, and nothing waits for it.
-        empty_trash(&trash);
+            .expect("check_place passed, so the path ends in a folder's name")
+            .to_string_lossy()
+            .into_owned();
+        let moved = move_to_trash(repo, home, &path, &folder);
+        trashed = Some(moved.map_err(|source| Error::WriteWorktree { path, source })?);
     }
     if let Some(record) = record {
         fs::remove_dir_all(&record).map_err(|source| Error::WriteWorktree {
@@ -355,7 +416,7 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
             source,
         })?;
     }
-    Ok(())
+    Ok(trashed)
 }
 
 /// Frees `thread`'s worktree ([`free`], with its checks) and deletes its branch while that
@@ -368,11 +429,108 @@ pub(crate) fn free(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
 ///
 /// As [`free`] and [`Repo::delete_branch_at`].
 pub(crate) fn forget(repo: &Repo, home: &Path, thread: &Thread) -> Result<()> {
-    free(repo, home, thread)?;
+    if let Some(trashed) = free(repo, home, thread)? {
+        trashed.delete_later();
+    }
     if thread.branch.starts_with("postil/") {
         repo.delete_branch_at(&thread.branch, &thread.tip)?;
     }
     Ok(())
+}
+
+/// Moves the ignored top-level folders of `thread`'s worktree (the cloned `target` and
+/// `node_modules`, and whatever the agent's builds made) into the trash, and returns them for
+/// the caller to delete: build output a build makes again, and most of a worktree's size. A
+/// symlink is not followed, and a folder that cannot be moved is left where it is. Opens the
+/// worktree only through [`open`].
+///
+/// # Errors
+///
+/// As [`open`], and the git error when the ignored folders cannot be listed.
+pub(crate) fn trash_build_folders(
+    repo: &Repo,
+    home: &Path,
+    thread: &Thread,
+) -> Result<Vec<Trashed>> {
+    let tree = open(repo, home, thread)?;
+    Ok(tree
+        .ignored_folders()?
+        .into_iter()
+        .filter_map(|name| move_to_trash(repo, home, &thread.path.join(&name), &name).ok())
+        .collect())
+}
+
+/// The free space, in bytes, on the volume that holds the worktrees of `repo`
+/// ([`disk::available`]), or `None` when it cannot be measured.
+pub(crate) fn available_space(repo: &Repo, home: &Path) -> Option<u64> {
+    let base = base_for(repo.root(), &resolved(home));
+    // Postil's folders may not be made yet; the volume is the same.
+    let existing = base.ancestors().find(|ancestor| ancestor.exists())?;
+    disk::available(existing).ok()
+}
+
+/// Frees each folder in this repository's worktrees folder that no thread of the record names,
+/// when it is a worktree of this repository that [`free`] would free: no work Postil did not
+/// commit, on a branch under `postil/`. A thread taken out of the record by hand leaves one,
+/// and nothing else would ever free it. Any other folder is left as it is. Deletes on a
+/// background thread.
+///
+/// The folders are listed before the record is read: a thread is written to the record before
+/// its worktree is made, so a listed folder whose thread is live is named in the record read
+/// after.
+///
+/// # Errors
+///
+/// As [`all`]. A folder that cannot be freed is not an error: it is kept.
+pub(crate) fn sweep(repo: &Repo, home: &Path) -> Result<()> {
+    let home = resolved(home);
+    let Ok(entries) = fs::read_dir(worktrees_dir(repo.root(), &home)) else {
+        return Ok(());
+    };
+    let folders: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    let named: Vec<PathBuf> = all(repo)?.iter().map(|t| resolved(&t.path)).collect();
+    for path in folders {
+        if named.contains(&resolved(&path)) {
+            continue;
+        }
+        // A folder whose `.git` names no record of this repository is not known to be
+        // Postil's; checked before `Repo::open`, which would search up out of it.
+        if !matches!(repo.worktree_record(&path), Ok(Some(_))) {
+            continue;
+        }
+        let Ok(tree) = Repo::open(&path) else {
+            continue;
+        };
+        let (Ok(branch), Ok(Some(head))) = (tree.branch(), tree.head()) else {
+            continue;
+        };
+        // A thread with no record, at the commit it is at: `free` checks it as any other.
+        let orphan = Thread {
+            id: String::new(),
+            path,
+            branch,
+            fork: head.clone(),
+            base: None,
+            tip: head,
+            last_run: 0,
+            state: State::Open,
+            skipped: Vec::new(),
+        };
+        if let Ok(Some(trashed)) = free(repo, &home, &orphan) {
+            trashed.delete_later();
+        }
+    }
+    Ok(())
+}
+
+/// Milliseconds since the Unix epoch, for [`Thread::last_run`]: seconds would make two runs
+/// started in one second equally old. 0 on a clock set before the epoch.
+pub(crate) fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).expect("u64 milliseconds last 584 million years")
+        })
 }
 
 /// `thread`'s worktree, opened only when it is Postil's: where Postil puts worktrees
@@ -424,15 +582,21 @@ pub(crate) fn open(repo: &Repo, home: &Path, thread: &Thread) -> Result<Repo> {
 /// thread's branch checked out, and that branch at the commit Postil left or past it. Past it
 /// is a commit the engineer made there, as the refusal tells them to, and it is theirs to
 /// keep: it is on the branch, which freeing keeps. Returns the commit the thread ends at: the
-/// worktree's, or the recorded tip when the worktree is not on disk. Opens the worktree only
-/// through [`open`].
+/// worktree's; with no worktree on disk, the branch's when it is the tip or past it, and the
+/// recorded tip otherwise. Opens the worktree only through [`open`].
 ///
 /// # Errors
 ///
 /// As [`open`]; [`Error::ThreadChanged`] naming what is there; and the git errors.
 pub(crate) fn check(repo: &Repo, home: &Path, thread: &Thread) -> Result<String> {
     if !thread.path.is_dir() {
-        return Ok(thread.tip.clone());
+        // No worktree (evicted, or deleted by hand): the branch holds the thread's commits,
+        // the engineer's past Postil's included, which eviction keeps. A branch gone, or
+        // moved off the tip, leaves the tip, as before the thread had a branch to read.
+        return match repo.branch_commit(&thread.branch)? {
+            Some(commit) if repo.is_ancestor(&thread.tip, &commit)? => Ok(commit),
+            _ => Ok(thread.tip.clone()),
+        };
     }
     let tree = open(repo, home, thread)?;
     let changed = tree.changed()?;
@@ -644,7 +808,14 @@ fn read(file: &Path) -> Result<Threads> {
         Err(error) => return Err(problem(error.to_string())),
     };
     match version_of(&json) {
-        Ok(THREADS_VERSION) => serde_json::from_slice(&json).map_err(|e| problem(e.to_string())),
+        // Version 1 has no `lastRun`, which reads as 0, and no thread evicted; it is written
+        // back as version 2 at the next change.
+        Ok(1 | THREADS_VERSION) => {
+            let mut threads: Threads =
+                serde_json::from_slice(&json).map_err(|e| problem(e.to_string()))?;
+            threads.version = THREADS_VERSION;
+            Ok(threads)
+        }
         Ok(version) => Err(problem(format!(
             "version {version}, and this Postil reads version {THREADS_VERSION}"
         ))),

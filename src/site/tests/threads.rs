@@ -7,19 +7,19 @@ use super::*;
 const THREAD: &str = "postil://localhost/api/thread";
 
 /// The thread whose first run is `id`, as `/api/thread` gives it.
-fn thread(site: &Site, id: &str) -> serde_json::Value {
+pub(super) fn thread(site: &Site, id: &str) -> serde_json::Value {
     get_json(site, &format!("{THREAD}?id={id}"))
 }
 
 /// Ends thread `id` by `ending` (`apply` or `discard`), as the page does.
-fn end(site: &Site, ending: &str, id: &str) -> (StatusCode, String) {
+pub(super) fn end(site: &Site, ending: &str, id: &str) -> (StatusCode, String) {
     let body = serde_json::json!({ "thread": id }).to_string();
     post(site, &format!("{THREAD}/{ending}"), &body)
 }
 
 /// A repository with `a.txt`, a site whose agent writes `a.txt` and `new.txt`, and one run of
 /// a note on `a.txt`, ended. Returns its worktree.
-fn written(name: &str) -> (TempRepo, Site, mpsc::Receiver<()>, PathBuf) {
+pub(super) fn written(name: &str) -> (TempRepo, Site, mpsc::Receiver<()>, PathBuf) {
     let repo = TempRepo::new(name);
     repo.write("a.txt", "a\n");
     let (site, nudges) = run_site(&repo, "writes");
@@ -661,7 +661,8 @@ fn a_thread_still_ends_when_its_worktrees_folder_is_named_by_another_hash() {
     fs::create_dir_all(&renamed).unwrap();
     let moved = renamed.join("r1");
     let (from, to) = (worktree.to_str().unwrap(), moved.to_str().unwrap());
-    git_out(&repo.root, &["worktree", "move", from, to]);
+    // Twice forced: git refuses to move a locked worktree otherwise.
+    git_out(&repo.root, &["worktree", "move", "-f", "-f", from, to]);
     let record = repo.root.join(".git/postil/threads.json");
     let text = fs::read_to_string(&record).unwrap();
     fs::write(&record, text.replace(from, to)).unwrap();
@@ -707,7 +708,8 @@ fn a_worktree_moved_out_of_postil_s_worktrees_folder_is_left_alone() {
     fs::create_dir_all(&elsewhere).unwrap();
     let moved = elsewhere.join("r1");
     let (from, to) = (worktree.to_str().unwrap(), moved.to_str().unwrap());
-    git_out(&repo.root, &["worktree", "move", from, to]);
+    // Twice forced: git refuses to move a locked worktree otherwise.
+    git_out(&repo.root, &["worktree", "move", "-f", "-f", from, to]);
     let record = repo.root.join(".git/postil/threads.json");
     let text = fs::read_to_string(&record).unwrap();
     fs::write(&record, text.replace(from, to)).unwrap();

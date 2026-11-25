@@ -231,6 +231,25 @@ pub enum Error {
         /// The threads whose runs are live, in any window.
         live: Vec<String>,
     },
+    /// A thread's worktree was to be made while the repository has the most worktrees it may
+    /// have, and no idle thread's could be freed.
+    TooManyWorktrees {
+        /// The most worktrees a repository may have.
+        cap: usize,
+        /// The threads whose worktrees could not be freed, each with why: `R1 (at work in
+        /// another run)`.
+        kept: Vec<String>,
+    },
+    /// A run was to start while the worktrees' volume has less free space than the floor,
+    /// after every idle thread's worktree that could be freed was.
+    DiskFull {
+        /// The bytes free.
+        free: u64,
+        /// The bytes Postil keeps free.
+        floor: u64,
+        /// As in [`Error::TooManyWorktrees`].
+        kept: Vec<String>,
+    },
     /// Another project was asked to be opened while the open one has a run or a review under
     /// way, without asking to stop it.
     RunInOpenProject,
@@ -450,8 +469,22 @@ impl fmt::Display for Error {
             ),
             Self::RunElsewhere => write!(
                 f,
-                "another Postil window is running an agent in this thread, or starting or ending \
-                 one (wait for it, or stop it there)"
+                "another Postil window is running an agent in this thread, or Postil is \
+                 starting, ending or freeing it (wait for it, or stop it there)"
+            ),
+            Self::TooManyWorktrees { cap, kept } => write!(
+                f,
+                "this repository has {cap} worktrees, the most Postil keeps, and none could be \
+                 freed{} (end a thread: Apply or Discard)",
+                held_by(kept)
+            ),
+            Self::DiskFull { free, floor, kept } => write!(
+                f,
+                "{} GB is free on the worktrees' disk, under the {} GB Postil keeps free, after \
+                 freeing the idle threads' worktrees{} (end a thread, or free space on the disk)",
+                free / 1_000_000_000,
+                floor / 1_000_000_000,
+                held_by(kept)
             ),
             Self::TooManyRuns { live } => write!(
                 f,
@@ -519,6 +552,16 @@ impl fmt::Display for Error {
     }
 }
 
+/// `"; kept: R1 (at work in another run); R4 (...)"` for the threads `kept`, each with why
+/// its worktree could not be freed, or nothing when there are none.
+fn held_by(kept: &[String]) -> String {
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("; kept: {}", kept.join("; "))
+    }
+}
+
 /// The error and its sources on one line, each after a colon, as the page and the `postil`
 /// command show it.
 pub fn error_chain(error: &Error) -> String {
@@ -580,6 +623,8 @@ impl std::error::Error for Error {
             | Self::TurnRunning
             | Self::RunElsewhere
             | Self::TooManyRuns { .. }
+            | Self::TooManyWorktrees { .. }
+            | Self::DiskFull { .. }
             | Self::RunInOpenProject
             | Self::NoSuchRequest
             | Self::NoSuchRun { .. }

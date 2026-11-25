@@ -330,13 +330,14 @@ export function runDialog({
 
   // The thread's branch, and what ends the thread (docs/design.md, "Ending a thread"): Apply
   // writes its changes into the working tree, uncommitted; Discard, on a second click, drops
-  // them. Either frees its worktree. Null for a run from before threads had worktrees, and
-  // while the record is read.
+  // them. Either frees its worktree. An evicted thread, whose worktree was freed for disk
+  // space, ends the same way from its branch. Null for a run from before threads had
+  // worktrees, and while the record is read.
   function threadPart(root, record, latest) {
     if (!record) return null;
     const line = el("div", "run-thread");
     line.append(el("code", "run-thread-branch", record.branch));
-    if (record.state !== "open") {
+    if (record.state === "applied" || record.state === "discarded") {
       const ended = record.state === "applied" ? "Applied to your working tree" : "Discarded";
       line.append(el("span", "run-thread-state", ended));
       return section("Branch", line);
@@ -374,7 +375,11 @@ export function runDialog({
     actions.append(discard, apply);
     line.append(actions);
     const part = section("Branch", line);
-    if (record.skipped?.length) {
+    if (record.state === "evicted") {
+      const freed =
+        "Its worktree was freed to keep disk space; a follow-up makes it again from the branch";
+      part.append(el("div", "note-dialog-said muted", freed));
+    } else if (record.skipped?.length) {
       const skipped = `Not given to the worktree: ${record.skipped.join("; ")}`;
       part.append(el("div", "note-dialog-said muted", skipped));
     }

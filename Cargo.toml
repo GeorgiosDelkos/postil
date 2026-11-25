@@ -30,16 +30,20 @@ tree-sitter-json = "0.24.8"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-bash = "0.25.1"
 
-# The native Open Folder dialog (NSOpenPanel). wry and tao already build these three crates,
-# at these versions and with these features, so depending on them adds no crate. Their
-# default features bind all of Foundation and AppKit, hence the explicit lists.
+# The native Open Folder dialog (NSOpenPanel), and the free space on a volume (NSURL's
+# resource values, `src/disk.rs`). wry and tao already build these three crates, at these
+# versions and with these features, so depending on them adds no crate. Their default features
+# bind all of Foundation and AppKit, hence the explicit lists.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSArray",
+    "NSDictionary",
+    "NSError",
     "NSString",
     "NSURL",
+    "NSValue",
 ] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "std",
