@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 #[cfg(test)]
 use std::thread::JoinHandle;
@@ -342,7 +342,10 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
 // ---- Claude -------------------------------------------------------------------------------
 
 fn probe_claude() -> QuotaReport {
-    let creds = read_claude_credentials();
+    let creds = match read_claude_credentials() {
+        Ok(creds) => creds,
+        Err(message) => return QuotaReport::error(message),
+    };
     let Some((token, plan)) = creds else {
         if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|val| !val.is_empty()) {
             return QuotaReport::unavailable("API key mode — no subscription quota window");
@@ -372,16 +375,28 @@ fn probe_claude() -> QuotaReport {
     }
 }
 
-fn read_claude_credentials() -> Option<(String, Option<String>)> {
+/// Claude Code's OAuth token and plan, from the Keychain or else its credentials file.
+/// `Ok(None)` means not signed in; an error means the file exists but cannot be read.
+fn read_claude_credentials() -> Result<Option<(String, Option<String>)>, String> {
     if let Some(raw) = read_keychain_secret("Claude Code-credentials")
         && let Some(parsed) = parse_claude_credentials(&raw)
     {
-        return Some(parsed);
+        return Ok(Some(parsed));
     }
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return Ok(None);
+    };
     let path = PathBuf::from(home).join(".claude/.credentials.json");
-    let raw = fs::read_to_string(path).ok()?;
-    parse_claude_credentials(&raw)
+    Ok(read_credentials_file(&path)?.and_then(|raw| parse_claude_credentials(&raw)))
+}
+
+/// Reads the credentials file at `path`, or `Ok(None)` when it does not exist.
+fn read_credentials_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
 }
 
 fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
@@ -534,69 +549,86 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
         }
     };
 
-    let pid = child.id();
-    let result = (|| {
-        let mut stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
-        let requests = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"postil","version":"0.1.0"}}}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"account/read","params":{}}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":3,"method":"account/rateLimits/read","params":{}}"#,
-            "\n",
-        );
-        if stdin.write_all(requests.as_bytes()).is_err() || stdin.flush().is_err() {
-            return None;
-        }
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let reader = std::thread::Builder::new()
-            .name("codex-quota-read".to_owned())
-            .spawn(move || {
-                let mut init_error = None;
-                let mut account = None;
-                let mut limits = None;
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-                    match msg.get("id").and_then(Value::as_u64) {
-                        Some(1) if msg.get("error").is_some() => {
-                            init_error = msg
-                                .get("error")
-                                .and_then(|err| err.get("message"))
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                                .or_else(|| Some("codex app-server refused initialize".to_owned()));
-                            break;
-                        }
-                        Some(2) => account = Some(msg),
-                        Some(3) => limits = Some(msg),
-                        _ => {}
-                    }
-                    if account.is_some() && limits.is_some() {
-                        break;
-                    }
-                }
-                drop(sender.send((init_error, account, limits)));
-            });
-        reader.ok()?;
-        receiver.recv_timeout(PROBE_TIMEOUT).ok()
-    })();
-
-    agents::kill_group(pid);
+    let result = read_codex_replies(&mut child);
+    agents::kill_group(child.id());
     drop(child.kill());
     drop(child.wait());
 
-    let Some((init_error, account, limits)) = result else {
-        return QuotaReport::error("Codex quota probe timed out");
-    };
-    if let Some(error) = init_error {
-        return QuotaReport::error(error);
+    match result {
+        Ok((account, limits)) => parse_codex_quota(account.as_ref(), limits.as_ref()),
+        Err(message) => QuotaReport::error(message),
     }
-    parse_codex_quota(account.as_ref(), limits.as_ref())
+}
+
+/// Sends the `initialize`, `account/read` and `account/rateLimits/read` requests to a running
+/// `codex app-server`, and returns the account and rate-limit replies (each `None` when the
+/// server closed its output first). Waits at most [`PROBE_TIMEOUT`]; does not stop the server.
+fn read_codex_replies(child: &mut Child) -> Result<(Option<Value>, Option<Value>), String> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("probe_codex starts codex app-server with a piped stdin");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("probe_codex starts codex app-server with a piped stdout");
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"postil","version":"0.1.0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"account/read","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"account/rateLimits/read","params":{}}"#,
+        "\n",
+    );
+    stdin
+        .write_all(requests.as_bytes())
+        .and_then(|()| stdin.flush())
+        .map_err(|error| format!("cannot write to codex app-server: {error}"))?;
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("codex-quota-read".to_owned())
+        .spawn(move || drop(sender.send(collect_codex_replies(stdout))))
+        .map_err(|error| format!("cannot start a thread to read codex app-server: {error}"))?;
+    receiver.recv_timeout(PROBE_TIMEOUT).map_err(|_| {
+        format!(
+            "codex app-server did not answer within {} s",
+            PROBE_TIMEOUT.as_secs()
+        )
+    })?
+}
+
+/// Reads `codex app-server` replies until both the account and the rate-limit reply arrived,
+/// the output ends, or `initialize` failed.
+fn collect_codex_replies(stdout: ChildStdout) -> Result<(Option<Value>, Option<Value>), String> {
+    let mut account = None;
+    let mut limits = None;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match msg.get("id").and_then(Value::as_u64) {
+            Some(1) if msg.get("error").is_some() => {
+                return Err(msg
+                    .get("error")
+                    .and_then(|err| err.get("message"))
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || "codex app-server refused initialize".to_owned(),
+                        str::to_owned,
+                    ));
+            }
+            Some(2) => account = Some(msg),
+            Some(3) => limits = Some(msg),
+            _ => {}
+        }
+        if account.is_some() && limits.is_some() {
+            break;
+        }
+    }
+    Ok((account, limits))
 }
 
 fn parse_codex_quota(account: Option<&Value>, limits: Option<&Value>) -> QuotaReport {
@@ -746,6 +778,8 @@ enum GeminiCreds {
     Token(String),
     Expired,
     Missing,
+    /// The credentials file exists but cannot be read; the message says why.
+    Unreadable(String),
 }
 
 fn probe_gemini() -> QuotaReport {
@@ -764,6 +798,7 @@ fn probe_gemini() -> QuotaReport {
                 "Not signed in — run `gemini` in a terminal to sign in",
             );
         }
+        GeminiCreds::Unreadable(message) => return QuotaReport::error(message),
     };
 
     let headers = [
@@ -816,10 +851,11 @@ fn read_gemini_creds(now: u64) -> GeminiCreds {
         return GeminiCreds::Missing;
     };
     let path = PathBuf::from(home).join(".gemini/oauth_creds.json");
-    let Ok(raw) = fs::read_to_string(path) else {
-        return GeminiCreds::Missing;
-    };
-    parse_gemini_creds(&raw, now)
+    match read_credentials_file(&path) {
+        Ok(Some(raw)) => parse_gemini_creds(&raw, now),
+        Ok(None) => GeminiCreds::Missing,
+        Err(message) => GeminiCreds::Unreadable(message),
+    }
 }
 
 fn parse_gemini_creds(raw: &str, now: u64) -> GeminiCreds {
@@ -938,7 +974,9 @@ fn read_keychain_secret(service: &str) -> Option<String> {
             .stdin(Stdio::null()),
         None,
         PROBE_TIMEOUT,
-    )?;
+    )
+    // The credentials file is the fallback, whatever stopped the Keychain read.
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -986,8 +1024,7 @@ fn curl_json(
             .stdin(Stdio::piped()),
         Some(config.as_bytes()),
         PROBE_TIMEOUT,
-    )
-    .ok_or_else(|| "quota request timed out".to_owned())?;
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Some((response_body, status_text)) = stdout.rsplit_once(STATUS_MARK) else {
@@ -1021,40 +1058,43 @@ fn curl_quote(value: &str) -> String {
 }
 
 /// Runs `cmd` in its own process group with optional stdin bytes and a hard `timeout`,
-/// killing the entire process group if the timeout elapses.
+/// killing the entire process group if the timeout elapses. The error says which step
+/// failed: starting the program, writing its stdin, or waiting for it.
 fn run_timed(
     cmd: &mut Command,
     stdin_bytes: Option<&[u8]>,
     timeout: Duration,
-) -> Option<std::process::Output> {
+) -> Result<Output, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|error| format!("cannot start {program}: {error}"))?;
     let pid = child.id();
-    if let (Some(bytes), Some(mut stdin)) = (stdin_bytes, child.stdin.take()) {
-        drop(stdin.write_all(bytes));
-        drop(stdin);
+    if let (Some(bytes), Some(mut stdin)) = (stdin_bytes, child.stdin.take())
+        && let Err(error) = stdin.write_all(bytes)
+    {
+        agents::kill_group(pid);
+        drop(child.wait());
+        return Err(format!("cannot write to {program}: {error}"));
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let waiter = std::thread::Builder::new()
         .name("quota-wait".to_owned())
-        .spawn(move || {
-            let output = child.wait_with_output().ok();
-            drop(sender.send(output));
-        });
-    if waiter.is_err() {
+        .spawn(move || drop(sender.send(child.wait_with_output())));
+    if let Err(error) = waiter {
         agents::kill_group(pid);
-        return None;
+        return Err(format!(
+            "cannot start a thread to wait for {program}: {error}"
+        ));
     }
-    if let Ok(output) = receiver.recv_timeout(timeout) {
-        output
-    } else {
+    let Ok(output) = receiver.recv_timeout(timeout) else {
         agents::kill_group(pid);
-        None
-    }
+        return Err(format!("{program} timed out after {timeout:?}"));
+    };
+    output.map_err(|error| format!("cannot read from {program}: {error}"))
 }
 
 fn clamp_percent(value: f64) -> f64 {
@@ -1364,5 +1404,60 @@ mod tests {
         assert_eq!(report.plan.as_deref(), Some("Plus"));
         assert_eq!(report.windows.len(), 1);
         assert!((report.windows[0].used_percent - 33.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn probe_codex_reports_the_error_initialize_returned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("codex-init-error");
+        let script = dir.path().join("codex");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "read -r line\n",
+                "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"too old\"}}\\n'\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = probe_codex(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Error);
+        assert_eq!(report.message.as_deref(), Some("too old"));
+    }
+
+    #[test]
+    fn run_timed_says_whether_the_program_did_not_start_or_timed_out() {
+        let missing = run_timed(
+            &mut Command::new("/nonexistent/postil-test-program"),
+            None,
+            PROBE_TIMEOUT,
+        )
+        .unwrap_err();
+        assert!(
+            missing.starts_with("cannot start /nonexistent/"),
+            "{missing}"
+        );
+
+        let slow = run_timed(
+            Command::new("/bin/sh").args(["-c", "sleep 5"]),
+            None,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(slow, "/bin/sh timed out after 50ms");
+    }
+
+    #[test]
+    fn a_missing_credentials_file_is_not_signed_in_but_an_unreadable_one_is_an_error() {
+        let dir = crate::testing::TempDir::new("quota-creds");
+        assert_eq!(
+            read_credentials_file(&dir.path().join("absent.json")),
+            Ok(None)
+        );
+        let error = read_credentials_file(dir.path()).unwrap_err();
+        assert!(error.starts_with("cannot read "), "{error}");
     }
 }
