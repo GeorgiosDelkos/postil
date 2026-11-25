@@ -141,6 +141,17 @@ impl QuotaReport {
 /// Function that probes one built-in agent's live provider quota.
 type ProbeFn = Arc<dyn Fn(&str, &OsStr) -> QuotaReport + Send + Sync>;
 
+/// Which cached quota reports [`QuotaPoller::query`] serves and which it probes again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum QuotaFetch {
+    /// Serve cached reports; probe only an entry that is missing, older than
+    /// [`CACHE_TTL`], or in flight past [`LOADING_TIMEOUT`]. `GET /api/usage`.
+    Cached,
+    /// Probe every finished entry again, but keep a probe still in flight within
+    /// [`LOADING_TIMEOUT`]: its result is the fresh one. `POST /api/usage/refresh`.
+    Refresh,
+}
+
 /// Manages cached and in-flight provider quota probes across requests.
 ///
 /// # Invariants
@@ -191,31 +202,14 @@ impl QuotaPoller {
         }
     }
 
-    /// Returns the latest quota report for each named agent, starting background probes for
-    /// any agent whose cache entry is missing or stale.
-    pub(crate) fn snapshot(
+    /// Returns the latest quota report for each named agent, and starts background probes
+    /// for the entries `fetch` asks to probe again (see [`QuotaFetch`]). Does not wait for
+    /// a probe: a probe in flight reports [`QuotaStatus::Loading`].
+    pub(crate) fn query(
         &self,
         names: &[&str],
         search_path: &OsStr,
-    ) -> HashMap<String, QuotaReport> {
-        self.query(names, search_path, false)
-    }
-
-    /// Starts fresh probes for all named agents, except one whose probe is still in flight
-    /// within [`LOADING_TIMEOUT`]: that probe's result is the fresh one.
-    pub(crate) fn refresh(
-        &self,
-        names: &[&str],
-        search_path: &OsStr,
-    ) -> HashMap<String, QuotaReport> {
-        self.query(names, search_path, true)
-    }
-
-    fn query(
-        &self,
-        names: &[&str],
-        search_path: &OsStr,
-        force: bool,
+        fetch: QuotaFetch,
     ) -> HashMap<String, QuotaReport> {
         let mut to_spawn: Vec<(String, u64)> = Vec::new();
         let mut results = HashMap::with_capacity(names.len());
@@ -227,7 +221,7 @@ impl QuotaPoller {
                     match entry.report.status {
                         QuotaStatus::Loading => age < self.loading_timeout,
                         QuotaStatus::Ok | QuotaStatus::Unavailable | QuotaStatus::Error => {
-                            !force && age < CACHE_TTL
+                            matches!(fetch, QuotaFetch::Cached) && age < CACHE_TTL
                         }
                     }
                 });
@@ -278,11 +272,11 @@ impl QuotaPoller {
                 #[cfg(not(test))]
                 drop(handle);
             }
-            Err(_) => store(
+            Err(error) => store(
                 &self.state,
                 name,
                 probe,
-                QuotaReport::error("could not start quota check thread"),
+                QuotaReport::error(format!("cannot start a quota check thread: {error}")),
             ),
         }
     }
@@ -1084,8 +1078,8 @@ fn curl_json(
         Some(config.as_bytes()),
         PROBE_TIMEOUT,
     )?;
-    // curl's stderr is never shown: it can echo request details, and the page gets a fixed
-    // message per failure instead.
+    // `run_timed` discards curl's stderr, which can echo request details; the page gets a
+    // fixed message per failure instead.
     if !output.status.success() {
         return Err(curl_failure(output.status.code()));
     }
@@ -1143,7 +1137,8 @@ fn run_timed(
     let mut child = cmd
         .process_group(0)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Discarded: no caller shows it, and curl's can echo request details.
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("cannot start {program}: {error}"))?;
     let pid = child.id();
@@ -1362,10 +1357,8 @@ mod tests {
     #[test]
     fn rfc3339_rejects_a_day_past_the_end_of_its_month() {
         assert_eq!(parse_rfc3339_secs("2026-02-31T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_secs("2026-02-29T00:00:00Z"), None);
-        assert!(parse_rfc3339_secs("2028-02-29T00:00:00Z").is_some());
-        assert_eq!(parse_rfc3339_secs("2100-02-29T00:00:00Z"), None);
-        assert!(parse_rfc3339_secs("2000-02-29T00:00:00Z").is_some());
+        // Every month end from 1970 to 2100, so leap years (2000, 2028) and century
+        // non-leap years (2100) are covered.
         for year in 1970..2101 {
             for month in 1..=12 {
                 let (next_year, next_month) = if month == 12 {
@@ -1477,24 +1470,27 @@ mod tests {
         (poller, started, release)
     }
 
-    fn message(report: &HashMap<String, QuotaReport>) -> Option<&str> {
-        report["Claude"].message.as_deref()
+    /// Claude's report from one `query` of `poller`.
+    fn claude(poller: &QuotaPoller, fetch: QuotaFetch) -> QuotaReport {
+        let mut reports = poller.query(&["Claude"], OsStr::new(""), fetch);
+        reports
+            .remove("Claude")
+            .expect("query answers for every name")
     }
 
     #[test]
     fn poller_drops_the_result_of_a_probe_that_a_newer_one_replaced() {
         let (poller, started, release) = gated_poller();
         let poller = poller.with_loading_timeout(Duration::ZERO);
-        let path = OsStr::new("");
 
         assert_eq!(
-            poller.snapshot(&["Claude"], path)["Claude"].status,
+            claude(&poller, QuotaFetch::Cached).status,
             QuotaStatus::Loading
         );
         started.recv().unwrap();
         // The first probe is still in flight, and a zero loading timeout lets this poll
         // start a second one.
-        let _ = poller.snapshot(&["Claude"], path);
+        let _ = claude(&poller, QuotaFetch::Cached);
         let mut probes = poller.take_probes();
         assert_eq!(probes.len(), 2);
         probes.pop().unwrap().join().unwrap();
@@ -1502,7 +1498,7 @@ mod tests {
         release.send(()).unwrap();
         probes.pop().unwrap().join().unwrap();
         assert_eq!(
-            message(&poller.snapshot(&["Claude"], path)),
+            claude(&poller, QuotaFetch::Cached).message.as_deref(),
             Some("call 2"),
             "the replaced first probe finished last and must not overwrite the second"
         );
@@ -1511,20 +1507,21 @@ mod tests {
     #[test]
     fn refresh_keeps_a_probe_in_flight_and_reprobes_a_finished_entry() {
         let (poller, started, release) = gated_poller();
-        let path = OsStr::new("");
 
-        let _ = poller.snapshot(&["Claude"], path);
+        let _ = claude(&poller, QuotaFetch::Cached);
         started.recv().unwrap();
-        let during = poller.refresh(&["Claude"], path);
-        assert_eq!(during["Claude"].status, QuotaStatus::Loading);
+        let during = claude(&poller, QuotaFetch::Refresh);
+        assert_eq!(during.status, QuotaStatus::Loading);
         release.send(()).unwrap();
         poller.join_probes();
-        assert_eq!(message(&poller.snapshot(&["Claude"], path)), Some("call 1"));
+        let first = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(first.message.as_deref(), Some("call 1"));
 
-        let after = poller.refresh(&["Claude"], path);
-        assert_eq!(after["Claude"].status, QuotaStatus::Loading);
+        let after = claude(&poller, QuotaFetch::Refresh);
+        assert_eq!(after.status, QuotaStatus::Loading);
         poller.join_probes();
-        assert_eq!(message(&poller.snapshot(&["Claude"], path)), Some("call 2"));
+        let second = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(second.message.as_deref(), Some("call 2"));
     }
 
     #[test]

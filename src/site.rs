@@ -30,7 +30,7 @@ use crate::settings::{self, RawSettings, Settings};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
-    quota::{QuotaPoller, QuotaReport, QuotaStatus},
+    quota::{QuotaFetch, QuotaPoller, QuotaReport, QuotaStatus},
 };
 
 /// The page's files, served at these paths with these types: compiled into the binary as
@@ -377,15 +377,6 @@ struct UsageView {
     /// Installed built-in agents, installed/used custom agents, and any other agent with
     /// recorded usage in the selected window; `None` while the agent scan runs.
     agents: Option<Vec<UsageAgentView>>,
-}
-
-/// Whether a usage reply serves the cached provider quotas or probes them again.
-#[derive(Debug, Clone, Copy)]
-enum QuotaFetch {
-    /// `GET /api/usage`: cached reports, probing only missing or stale ones.
-    Cached,
-    /// `POST /api/usage/refresh`: probe again, unless a probe is still in flight.
-    Refresh,
 }
 
 /// One agent's live quota and filtered Postil activity in [`UsageView`].
@@ -1305,10 +1296,7 @@ impl Site {
             .filter(|(_, built_in, found)| *built_in && found.is_some())
             .map(|(name, _, _)| name.as_str())
             .collect();
-        let mut quotas = match fetch {
-            QuotaFetch::Cached => self.quotas.snapshot(&probe_names, search_path),
-            QuotaFetch::Refresh => self.quotas.refresh(&probe_names, search_path),
-        };
+        let mut quotas = self.quotas.query(&probe_names, search_path, fetch);
 
         entries
             .into_iter()
