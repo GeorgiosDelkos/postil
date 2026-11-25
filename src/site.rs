@@ -330,8 +330,8 @@ struct SettingsView<'a> {
     revision: String,
     /// The settings file, for the dialog to name; `None` without a home directory.
     file: Option<String>,
-    /// Whether no settings file exists yet (and settings can be saved), so the startup wizard
-    /// opens automatically on first launch.
+    /// Whether there is a configuration directory but no settings file in it yet, so the
+    /// startup wizard opens on first launch.
     first_run: bool,
     /// Every agent, built-in ones first; `None` while the agent scan runs.
     agents: Option<Vec<AgentView<'a>>>,
