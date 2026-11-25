@@ -1,0 +1,691 @@
+# Postil: review assist
+
+Status: 2026-11-25. Designed, not built. This document adds to `docs/design.md`, which stays
+the reference for everything built so far. `docs/review-assist-plan.md` turns it into pull
+requests, with the edge cases and tests of each. Section "Decisions" lists what the owner settled on
+2026-11-25; section "Open questions" lists what this document assumes and the owner has not
+confirmed.
+
+Mockups: https://claude.ai/code/artifact/61c79ac1-1498-4f37-9ec0-f2824cf3f92f (private to the owner until shared).
+
+## The problem in one sentence
+
+Agents write the changes and the engineer only reviews, so Postil must shorten the time from
+"a run ended" to "I know whether this change is right, and why".
+
+Four things serve that sentence:
+
+1. **Reviewer aids** order and rate a run's changes, show what was verified, answer questions,
+   and follow a name to its definition.
+2. **The map** is an agent's analysis of the repository, drawn as diagrams that start from
+   the system's architecture. Every node links to lines of code, with the link visible in
+   the code too.
+3. **Team memory** (hippius-mem) gives agents and the engineer the team's recorded decisions,
+   and checks a run against them.
+4. **Voice** dictates text and gives commands, so a review needs fewer keystrokes.
+
+Postil stays a reader with a notes tray and an agent panel. It does not become an editor.
+
+## Not in scope
+
+- An LSP. Jump to definition matches names with tree-sitter tags and says so.
+- Static analysis as the source of diagrams. The owner chose an agent, with its citations
+  checked, over a tree-sitter graph and over a hybrid.
+- Mermaid, or any renderer that owns the look. Postil draws its own SVG.
+- A speech model in the binary, a network speech service, or an always-open microphone.
+- Editing, forgetting or redacting team memories. The terminal does that in version 1.
+- An analysis shared between clones. Each clone holds its own.
+
+## What exists already and is reused
+
+| Need | Reused from `docs/design.md` |
+|---|---|
+| Link a diagram node to code that keeps moving | A note's `Target::Lines` with its snippet, and `locate` ("Data structures") |
+| An agent that may read and not edit | A proposing reviewer ("Reviews") |
+| A structured result at the end of a reply | The reviewers' fenced `json` block, read as the run ends |
+| A second view inside the code pane | The changes view |
+| Finding an installed program | The agent catalog's search of the login shell's `PATH` ("Agents") |
+| JSON-RPC over a child's pipes | `src/acp/connection.rs` |
+| Small card, full dialog | "Cards and dialogs" |
+
+## Where read-only agents run
+
+Three features start an agent that must not edit: Ask, Analyze, and drafting a memory from a
+finished thread. `docs/design.md` says the engineer's working tree is never an agent's working
+directory, and that rule holds here.
+
+- **A read-only run gets a thread of its own,** marked read-only in `threads.json`, with a
+  worktree at `HEAD` like any thread. One shared reading worktree was the first design; it
+  was dropped on 2026-11-25 after reading the code, because the run machinery is keyed by
+  thread everywhere (the agent slots, the per-thread lock that counts live runs, the check
+  for a reviewer's edits, eviction). A read-only thread reuses all of it; a shared worktree
+  needs a second variant of each. The cost accepted: one `git worktree add` per ask.
+- **A read-only thread clones no build folders,** cannot be applied or opened as a pull
+  request, and is freed when its work is done: an analysis's as its run ends, an ask's when
+  its note is resolved or deleted.
+- **Read-only as reviewers are.** Postil rejects every tool call but reads, searches, fetches
+  and thinking. An agent set to edit without asking is caught as its turn ends, by the edits
+  its run reports; the worktree is reset and the run says so, as a proposing reviewer's does
+  today. An analysis that edited stores nothing. An ask that edited shows its answer under
+  that notice.
+- **They count** toward the cap of 3 live runs and the 15 worktrees, and are evicted when
+  idle like any thread.
+- **The engineer's uncommitted edits are not seen**, as in a thread. Ask and Analyze say so
+  when the checkout has any. Anchors are then placed on the engineer's files by their snippet,
+  as notes are.
+
+## Milestone 7: reviewer aids
+
+### The author's report
+
+The agent that made the changes ends its turn with a report, in the same conversation. The
+owner chose the author over a fresh agent per run (a second turn and a wait on every run) and
+over the reviewer alone (nothing guides the first read).
+
+The prompt gains one paragraph that asks for a last code block fenced as `json`, given in
+words and not as an example, for the reason "Reviews" gives:
+
+```json
+{
+  "steps": [
+    {"path": "src/acp/connection.rs", "lines": [37, 52], "why": "recv() no longer panics", "risk": "eyes"}
+  ],
+  "checks": [
+    {"command": "cargo test acp", "result": "passed"}
+  ]
+}
+```
+
+- `steps` is the reading order: cause before effect, the core change before its call sites.
+  `lines` are on the new side of the diff. `risk` is `eyes` (needs the engineer's judgment),
+  `routine`, or `mechanical` (a rename, formatting, generated code).
+- Postil reads the block as the run ends and logs it as one `report` entry. The run log is
+  version 6 for it (version 5 keeps an execute call's command, for the evidence below).
+- An agent that writes no report, or one Postil cannot parse, leaves the run without one. The
+  changes view then works as it does today, and the run's dialog says the report is missing.
+
+```rust
+struct Report {
+    steps: Vec<Step>,
+    checks: Vec<Check>,
+}
+
+struct Step {
+    path: RepoPath,
+    lines: LineRange,   // New side of the diff.
+    why: String,        // One line.
+    risk: Risk,
+}
+
+enum Risk {
+    Eyes,
+    Routine,
+    Mechanical,
+}
+
+struct Check {
+    command: String,    // As the agent says it ran it.
+    result: Claimed,    // Passed or Failed: the agent's claim, never Postil's finding.
+}
+```
+
+### Guided walkthrough and risk
+
+The changes view gains an order: Walkthrough (the default when the run has a report) or Files
+(today's order).
+
+- **A step covers the hunks its lines overlap.** `n` and `p` move between steps; the step's
+  `why` shows above its hunks.
+- **Hunks no step names are never hidden.** They list after the last step under "Not in the
+  walkthrough", rated `eyes`: what the author left out is what most needs reading.
+- **Risk filters, it does not remove.** A header control shows all, or `eyes` first.
+  `mechanical` hunks start folded to one line each with their counts, and open on a click.
+- **The reviewer checks the ratings.** A proposing reviewer's prompt includes the report and
+  asks for a finding on any hunk rated too low. A hunk with such a finding shows as `eyes`,
+  with the finding beside it.
+- **One run at a time.** A walkthrough belongs to one run. The view of a whole thread (several
+  runs) keeps the Files order in version 1.
+
+### Evidence on the run
+
+"Did it run the tests" is answered from two sources that Postil compares: what the agent
+claims (`checks`) and what the run log holds (the tool calls of kind execute, each with its
+command and final status). The log keeps neither a command nor an exit status today: an
+execute call's `rawInput` is dropped when the message is parsed. Keeping the command is the
+first step of this milestone, and the states below read `completed` and `failed` as the
+agent reports them.
+
+| State | Meaning |
+|---|---|
+| Seen, passed | A logged command matches the claim, completed, and no edit finished after it. |
+| Seen, failed | A logged command matches the claim and failed. |
+| Stale | It passed, then an edit finished later in the same run. |
+| Claimed, not seen | The report names a command no logged tool call matches. |
+| None | The run ran no command. |
+
+- The run's card shows one icon for the worst state; the run's dialog lists each check with
+  its state and opens the step that ran it.
+- Postil does not guess which commands are tests. It lists what the author says it checked,
+  and under it every other command the run ran.
+- A claim matches a logged command when the texts are equal after trimming and collapsing
+  spaces. Anything looser would show a claim as seen that was not.
+
+### Ask without changing
+
+The engineer selects lines, a file, a folder or a diagram node and asks a question. Nothing is
+edited.
+
+- **An ask is a note with another intent.** `Note` gains `intent: Change | Ask`
+  (`review.json` version 5). It keeps its place in the tray, its anchor, its dialog, its
+  follow-ups and its status, for the reason `docs/design.md` gives for file notes: a note
+  keeps every view working on it.
+- **Keys:** `q` on a selection, or Ask in the right-click menu, opens the composer in ask
+  mode; `Cmd-Enter` sends at once to the default agent. An ask is never part of a send of
+  notes.
+- **The run** is read-only in a thread of its own, with a fresh agent kept for the ask's
+  follow-ups. The answer is the agent's reply, shown in the note's dialog, and the tray card
+  shows Answered.
+- **From an answer:** Make it a note (a `Change` note on the same lines, with the engineer's
+  text), or Remember (milestone 9).
+
+### Jump to definition
+
+`Cmd`-click on a name, or Go to Definition in the right-click menu, goes to where the name is
+defined. A key such as `g d` was dropped: the code view selects whole lines and has no caret
+to stand on a name.
+
+- **Source:** `tree-sitter-tags` 0.27.2 (the same release line as the highlighter) with the
+  `tags.scm` each grammar crate ships. Rust, JavaScript, TypeScript, Python and Go ship one;
+  JSON, TOML and Bash do not and have no definitions.
+- **The index** maps a name to its definitions: `HashMap<String, Vec<Definition>>`, a
+  definition being a path, a line and a kind. It is looked up by name on a click and rebuilt
+  per file. A worker thread builds it after the project opens and again for the files whose
+  stat data changed when the window regains focus or a run ends. It lives in memory only.
+- **One definition** jumps. **Several** open a list of one-line cards ranked: same file, same
+  folder, then the rest by path. **None** shows a toast.
+- **It matches names, not types.** Two functions named `new` both list. The list's header
+  says "by name".
+- `Cmd-[` and `Cmd-]` move back and forward through the places jumped from and to.
+
+## Milestone 8: the map
+
+### What the engineer sees
+
+The middle pane splits: the diagram on the left, the code on the right, a divider between
+them. The owner chose the split over a diagram that replaces the code and over a tray tab,
+because both directions of the link stay visible.
+
+```text
++-------+---------------------------------+--------+
+| files | Map > run        | code         | tray   |
+|       |   [site]         |   37 fn send |        |
+|       |     |            |   38   let   |        |
+|       |   [run]*         |   39   ...   |        |
+|       |     |            |              |        |
+|       |   [acp]          |              |        |
++-------+---------------------------------+--------+
+```
+
+- **Opening it:** the Map button beside the project name, View > Map, or `Cmd-Shift-M`. With
+  no analysis the pane shows what Analyze will do (the agent, read-only, from `HEAD`) and one
+  Analyze button.
+- **Sizes:** the diagram keeps at least 320 px and the code its 420 px. In a window too
+  narrow for both, the diagram takes the whole pane and `Cmd-Shift-M` switches between the
+  two. The width is kept in `layout.json`.
+- **The header** holds a breadcrumb (Architecture, then each component deepened into), three
+  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated.
+- **A node** is a small card: its label, one line of summary, and a mark when it is outdated
+  or unverified. Everything else is in its dialog, by the rule of "Cards and dialogs": the
+  detail, every anchor, the edges in and out, the notes on its lines, Ask, and Add note.
+- **Diagram to code:** a click selects the node, opens its first anchor in the code pane and
+  tints its lines. Enter opens the node's deeper diagram when it has one, else offers Analyze
+  deeper.
+- **Code to diagram:** the node that covers the code pane's selected line, or its first
+  visible line with no selection, is ringed in the diagram, which pans to it only when it is
+  off screen.
+- **Moving:** scroll pans, pinch zooms, `0` fits. Panning to a node takes 160 ms, ease-out,
+  and nothing moves under Reduce Motion. An idle diagram draws no frames.
+
+### The link shown in the code
+
+The owner asked for the link to be visible in the code, as notes are.
+
+```text
+      36
+  |   37  fn send(&self, notes: &[Note])        [run: send]
+  |   38      let prompt = build(notes);
+  |   39      self.agent.prompt(prompt)
+  |   40  }
+```
+
+- **A stripe** at the gutter's left edge spans the node's lines, and **a chip** at the end of
+  the first line names the node. A click on either opens the map at that node.
+- **A color of its own,** `--map`, a muted violet in both palettes. Amber stays reserved for
+  notes, steel for focus. This is a second rare accent, which "Look and feel" does not allow
+  yet; the owner approved the stripe and chip on 2026-11-25 and that section is amended.
+- **One stripe per line.** Lines covered by nested nodes show the innermost node of the
+  Architecture kind. When other diagrams cover the line too, the chip ends with a count that opens a menu
+  of them.
+- **A flow's steps** show in the gutter as their numbers only while that flow is open.
+- **Outdated nodes** draw a dashed stripe. Lost anchors draw nothing in the code, as lost
+  notes do.
+- View > Map Markers turns stripes and chips off. They are on once a repository has an
+  analysis.
+
+### The four kinds
+
+| Kind | Holds | Made by |
+|---|---|---|
+| Architecture | The system as it runs: its components and how they talk. | Analyze, Analyze deeper |
+| Data | The main types, what they hold, how they relate. | Analyze |
+| Flow | One behavior as ordered steps through the code. | Asked for by name |
+| Change map | The Architecture with what a run touched marked. | Computed, never stored |
+
+- **Architecture is the system, not the folder tree.** The owner set this on 2026-11-25. Its
+  top level shows what exists when the program runs: components (a process, a thread, a
+  service, a page), stores (a file, a database, a queue) and external systems (a subprocess,
+  a third-party API). A group is a boundary such as a process or a machine. An edge is a way
+  two of them talk, labeled with the mechanism ("JSON-RPC over stdio", "fetch on postil://",
+  "appends"). For Postil that is the diagram in `docs/design.md`, "Architecture": the page,
+  the Rust process with its worker and agent reader threads, the agent subprocess, and
+  `review.json`.
+- **Modules appear only below a component.** Analyze deeper on a component gives its
+  internals: the modules that make it, then their symbols. A module graph of the whole
+  repository is never the top level.
+- **Every node still cites code.** A component cites where it starts or is defined; a store
+  cites the code that reads and writes it; an external system cites the code that calls it.
+  An edge cites the call, the send or the write that makes it.
+- **Analyze** on the project asks for the Architecture's top level and the Data diagram of
+  the whole repository. The prompt asks for 7 to 25 nodes per diagram, a range chosen for
+  legibility at the pane's width; Postil draws what it gets.
+- **Analyze deeper** on a node, or on a folder or file in the file list's right-click menu,
+  asks for one more diagram under that node.
+- **A flow** is asked for in the Flows list ("Trace: how a note is sent"), or from a
+  selection or node with Trace from here. The order of its nodes is the order of its steps.
+- **The change map** opens from a run's dialog, beside Changes. A node is touched when a hunk
+  of the run's diff overlaps one of its anchors, placed in the run's snapshot before the run.
+  Touched nodes fill with the added color, nodes one edge from a touched node get an outline,
+  and changed files that no node covers list under "Not on the map". A click on a touched
+  node opens the changes view at its hunks.
+
+### Data structures
+
+Looked up: every anchor of the open file, on each file open. Iterated: one diagram's nodes
+and edges, on each draw. Changed: whole diagrams, by an analysis run. A repository holds tens
+of diagrams of tens of nodes, so every operation is a scan, as for notes.
+
+```rust
+/// `<git dir>/postil/analysis.json`, version 1.
+struct Analysis {
+    checked: CommitId,        // The commit the Architecture was last compared with.
+    diagrams: Vec<Diagram>,
+}
+
+struct Diagram {
+    id: DiagramId,            // "D1": stable, shown in the UI and sent to the agent.
+    kind: DiagramKind,        // Architecture, Data or Flow.
+    title: String,
+    parent: Option<NodeId>,   // The node this diagram deepens. None at the top level.
+    run: RunId,               // The analysis run that made it.
+    nodes: Vec<Node>,         // In a Flow, in step order.
+    edges: Vec<Edge>,
+}
+
+struct Node {
+    id: NodeId,               // "D1.3": the diagram's id, then a number.
+    kind: NodeKind,           // Decides the node's shape.
+    label: String,
+    summary: String,          // One line, on the card.
+    detail: String,           // Markdown subset, in the dialog.
+    group: Option<NodeId>,    // The boundary drawn around this one.
+    anchors: Vec<CodeRef>,
+}
+
+enum NodeKind {
+    Component,                // Something that runs, or a module or symbol below one.
+    Store,                    // Something that holds data.
+    External,                 // Something the repository talks to and does not contain.
+    Boundary,                 // A group: a process, a machine, a network.
+}
+
+struct Edge {
+    from: NodeId,
+    to: NodeId,
+    label: String,
+    anchor: Option<CodeRef>,  // The call, import or field that justifies the edge.
+}
+
+/// A place in the code, with whether Postil found it.
+struct CodeRef {
+    path: RepoPath,
+    target: Target,           // The notes' enum: lines with their snippet, or a path.
+    state: RefState,
+}
+
+enum RefState {
+    Found,
+    Outdated,                 // The snippet is gone from the file.
+    Unverified,               // The agent's citation never matched the file.
+}
+```
+
+- **Each diagram owns its nodes and edges.** A shared pool of nodes with diagrams as views
+  was weighed: it lets one node appear in two diagrams, but an Analyze deeper or a deleted
+  flow would then edit shared records. Self-contained diagrams are replaced and deleted whole.
+- **`CodeRef` reuses `Target`**, so placing an anchor is `locate`, the function that places
+  notes, with the same rule: stay, move to the only other copy, or lose the place.
+- **Positions are not stored.** The layout is computed from the graph when a diagram first
+  draws and kept for the session. The same graph gives the same layout.
+- **The file** is written atomically under a lock, refuses unknown fields, and is never
+  written over when it cannot be read, as `review.json` is. An agent or a script can read it.
+- **Private to the clone.** The owner chose the git directory over a tracked file (it would
+  change the working tree and conflict between teammates) and over hippius-mem (a memory
+  store is not made for graphs).
+
+### An analysis run
+
+- **The agent** is the settings' Analyzer, a new choice beside the default agent and the
+  reviewers, which starts as the default agent.
+- **The run** is read-only in a thread of its own. Its header is marked
+  `analysis: {kind, of}` (run log version 8). It counts toward the cap
+  of 3 live runs and is not listed in the Run tab, which lists runs of notes; the diagram
+  pane's header shows its status and Stop, and opens its dialog.
+- **The reply** ends with one `json` block: diagrams of nodes and edges, where a citation is
+  `{path, lines, first}` and `first` is the text of the first cited line.
+- **Checking a citation.** Postil reads the file in the run's worktree. The citation holds
+  when the line at `lines` equals `first`, both trimmed. Otherwise Postil looks for the only
+  line in the file equal to `first` and shifts the range to it. Otherwise the reference is
+  `Unverified`. Postil then stores the cited lines as the snippet itself, so the agent never
+  sends file contents back.
+- **What unverified means on screen.** A node with no verified anchor is dashed, says "not
+  found in code" and has no stripe. The pane's header counts them ("42 nodes, 3 unverified").
+  Nothing is dropped silently.
+- The analysis is not checked for truth beyond its citations. An edge that cites a real call
+  is drawn as the agent described it.
+
+### Outdated nodes and Update
+
+- **Outdated** is worked out on every read, as a note's anchor is: the snippet is no longer
+  in the file. A node with an outdated anchor is marked in the diagram and dashed in the code.
+- **Not on the map** is every file in the file list that no anchor covers and that was added
+  since the diagram's run.
+- **Update** sends the Analyzer only the outdated nodes, each with its old snippet, and the
+  files not on the map. The reply replaces those nodes by id, adds nodes and edges, and may
+  delete a node whose code is gone. The owner chose this over a full analysis as the only
+  fix.
+- An update can shift the layout, because positions follow the graph. Accepted.
+
+### Forced update when the architecture changes
+
+The owner set this on 2026-11-25: a merge that changes the system's architecture updates the
+diagram without being asked. It replaces "update on request" for the Architecture kind only.
+Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wait for Update.
+
+- **The trigger is `HEAD` moving forward,** not a pull request. `Analysis` holds `checked`,
+  the commit the Architecture was last compared with. When the window regains focus, and
+  when a run's status changes, the page asks Postil to compare `checked` with `HEAD`; there
+  is no focus hook in the Rust process, and the page already refreshes at both moments. The
+  update runs only when `checked` is an ancestor of `HEAD`: a commit, a merge or a pull.
+  That covers a pull request merged from
+  Postil, one merged on GitHub and pulled, a teammate's commits, and Apply once committed,
+  with one rule and no call to `gh`. Chosen over watching only the pull requests Postil
+  opened, which would miss every other way a change lands.
+- **A change counts when it touches the diagram.** No agent judges. After the move, any of
+  these is true: an anchor of an Architecture node or edge is `Outdated`; the diff from
+  `checked` to `HEAD` adds a file no node covers; it deletes a file a node cites. The downside
+  accepted: a refactor inside a component's cited lines starts an update that finds nothing
+  to change. An agent judging every merge was rejected (a turn per merge, and a wrong "no"
+  leaves the diagram stale with nothing on screen), and so was the author declaring it (it
+  covers only Postil's own runs).
+- **The update starts by itself:** the Update run above, for the Architecture's outdated
+  nodes and the files not on the map, with no click. The diagram pane's header says
+  "Updating after" and the commit's short id, with Stop. It spends tokens unasked; the owner
+  accepted that for this case.
+- **`checked` moves to `HEAD` as the run starts,** written before the agent is. A run that
+  fails or is stopped is therefore not started again for the same commit: its nodes stay
+  outdated and Update is there to press. A change that touches nothing moves `checked` with
+  no run.
+- **At the cap of 3 live runs** the update does not start and `checked` does not move, so the
+  next focus or thread end tries again.
+- **Another history starts no update.** A branch switch, a rebase or a reset makes `checked`
+  no ancestor of `HEAD`. Comparing the two would start a run on every switch between
+  branches, so the diagram instead says the checkout moved to another history and offers
+  Update, and `checked` moves when it is pressed. Decided 2026-11-25 while planning.
+- A repository with no analysis has nothing to update, and nothing runs.
+
+### Drawing and layout
+
+- **Postil draws the SVG**: cards as rounded rectangles in the palette's variables, edges as
+  paths with their labels, groups as outlined regions. Hover, focus, the ring and the touched
+  fill are CSS classes. `ui/diagram-view.js` draws, `ui/diagram.js` holds the rules that need
+  no document (which node covers a line, which nodes a diff touches) with tests beside it.
+- **Layout comes from one vendored file**, the page's first third-party JavaScript:
+  `@dagrejs/dagre` (MIT), kept as `ui/vendor/dagre.min.js` with its license, the way
+  `ui/icons.svg` is kept at a pinned commit. Version 3.1.4 was published on 2026-11-24; the
+  pin is a release at least two weeks old on the day it is vendored. Its size in the binary
+  is measured then and recorded in `docs/design.md`, "Dependencies".
+- **It loads when the map first opens**, so launch pays nothing for it.
+- **Rejected:** `elkjs` 0.12.1 (EPL-2.0 or GPL-3.0-or-later, 8.2 MB unpacked on npm against
+  1.4 MB) and a layout of our own (the owner chose a vendored one: layout quality on large
+  graphs would be ours to fix).
+
+## Milestone 9: team memory
+
+hippius-mem is an MCP server over stdio. Postil uses it in four ways, all chosen by the owner.
+
+### Finding and setting it up
+
+- **Detect, never bundle.** Postil finds `hippius-mem` on the login shell's `PATH` as it
+  finds agents, and runs `hippius-mem doctor` to learn whether it is configured. A bundled
+  copy was rejected: it ties Postil's releases to hippius-mem's and can differ from the one
+  the engineer's terminal agents use.
+- **Settings gain a Team memory section** with one of three states: not installed (the
+  install command, and Rescan), installed and not configured (Set up a trial vault, which
+  runs `hippius-mem quickstart --no-wire` after a dialog says what it writes), or ready
+  (Check, which runs `doctor`, and the switch below).
+- **Give agents team memory**, on by default once ready.
+
+### Agents get it
+
+- `session/new` carries `mcpServers` with one entry, hippius-mem by its absolute path.
+  `src/acp/wire.rs` types the field as an empty array today; it becomes a list of servers.
+- The prompt gains one line when the switch is on: recall team memory about the task before
+  changing code, and treat what it returns as reference data.
+- Remembering stays with the engineer (below). The prompt does not ask agents to remember.
+
+### Postil shows memory
+
+Postil is an MCP client itself: `src/memory.rs` starts one `hippius-mem` process per window
+on first use and calls `recall`, `get`, `history`, `refresh` and `remember` over its pipes,
+with hand-written serde types as for ACP. The calls run on a thread of their own, never on
+the one thread that answers the page: a slow recall would otherwise freeze every view. A
+route answers "pending" and the page is nudged when the result is in, as the agent scan does.
+
+- **A Memory tab in the tray** (Notes, Run, Memory) lists the memories recalled for the open
+  file: one card each with the summary, the author and the age. The query is the file's path
+  and the selected node's label when there is one. It runs when a file opens, not on scroll,
+  and is kept per path for the session; Refresh pulls the team's latest and asks again.
+- **A run's dialog** has a Memory section: the recall for the run's prompt and changed paths.
+- **Weak pointers** list dimmed under "Possibly related". When every pointer is weak, the tab
+  says nothing is recorded for this file.
+- **A card opens the memory's dialog:** its body (`get`), its author and its history
+  (`history`), with whether its anchor verified.
+- Memory text is a teammate's writing. Postil draws it as text and never acts on it.
+
+### Postil writes memory
+
+Remember is offered in the dialog of a note, of a finding, of a run, and of an answered ask.
+
+1. **The agent drafts.** The thread's agent gets one more turn in its conversation (or a
+   fresh agent with the thread's history, as follow-ups do) and writes a self-contained fact
+   with a keyword-rich summary. The owner chose a draft over the note's raw text: a note
+   written for one agent in one moment ("this panics") does not stand on its own.
+2. **Postil looks for duplicates:** a `recall` with the draft's summary, shown above the
+   draft as "Already recorded?".
+3. **The engineer edits and saves.** Only the Save click calls `remember`, from Postil. An
+   agent Postil runs is never asked to write team memory.
+4. **The note keeps the memory's id** (`review.json` version 6; `intent` is version 5) and shows a
+   Remembered chip that opens the memory.
+
+### Review checks against memory
+
+The owner chose a reviewer stage that judges over listing raw recall hits beside the changes
+(recall is fuzzy, and the engineer would judge every hit).
+
+- When the engineer presses Review, Postil recalls for the run's prompt and for each changed
+  path, drops weak pointers and duplicates, and keeps at most 12 (recall's default count).
+- The proposing reviewers' prompt carries those memories whole, in a block labeled as
+  reference data written by teammates, with the ask: report a change that contradicts a
+  recorded decision or repeats a recorded gotcha as a finding that names the memory.
+- A finding gains `memory: Option<MemoryId>` (run log version 10). Its card shows the
+  memory's summary and opens it, and the changes view flags the finding's line, since a
+  finding already carries its path and line.
+- With hippius-mem missing or failing, the review runs without the block and its dialog says
+  so.
+
+## Milestone 10: voice
+
+### Dictation
+
+Designed in another session; this section records its decisions. Apple's Speech and AVFAudio
+frameworks (`SFSpeechRecognizer`, `AVAudioEngine`), called from Rust through objc2, with
+on-device recognition required: no model in the binary, no daemon, no network call.
+
+- **`src/dictation.rs`** taps the input node, feeds a recognition request with partial
+  results, computes a mic level (20 to 30 Hz, only while recording, so an idle window still
+  draws no frames), and pushes state, level, transcript and error events through the event
+  loop to the page. It starts a fresh recognition task on a pause and near Apple's limit of
+  about 60 seconds per request.
+- **Typed bindings.** `objc2-speech` 0.3.2 and `objc2-avf-audio` 0.3.2, default features off
+  and only the classes used, plus `block2` 0.6.2, which is in the lockfile already. Chosen by
+  the owner on 2026-11-25 over raw `msg_send!`: two more crates buy calls the compiler checks.
+- **A second module with `unsafe`.** The audio tap and the completion blocks need it. The
+  owner allowed `src/dictation.rs` on 2026-11-25, as `src/clone.rs` was allowed on
+  2026-11-24; the crate still denies `unsafe` elsewhere, and `Cargo.toml`'s comment on the
+  lint names both modules when this is built.
+- **`ui/dictation.js`** is one widget attached to every text box (the composer, the note,
+  path-note and run dialogs, the question form, the memory draft, the flow box). It tracks
+  the range it is inserting, so partial results change in place and the text around the
+  caret is kept.
+- **Code-aware.** `contextualStrings` gets the open file's name, the names of the symbols in
+  view (from the jump index) and the labels of the open diagram's nodes.
+- **The bundle** gains `NSMicrophoneUsageDescription` and
+  `NSSpeechRecognitionUsageDescription` (`scripts/bundle.sh`) and the audio-input entitlement
+  (`assets/Postil.entitlements`). macOS ends a bare binary that asks for the microphone
+  without an `Info.plist`, so dictation is tested from `Postil.app`, not `cargo run`.
+
+### Voice commands
+
+The owner chose hold-to-talk over a listening mode: nothing is heard by accident and the
+microphone is off otherwise.
+
+- **One key, held.** In a text box it dictates into the box. Anywhere else what is said is a
+  command.
+- **A fixed grammar, matched in the page** (`ui/voice.js`, a plain function from a transcript
+  to a command or nothing, tested with `node --test`). No model interprets commands.
+
+| Said | Does |
+|---|---|
+| "next", "previous" | The next or previous walkthrough step, or hunk. |
+| "note", then words | Opens the composer on the selection or the current hunk, with the words. |
+| "ask", then words | The same, in ask mode. |
+| "open", then a file name | Opens the best fuzzy match in the file list. |
+| "go to", then a name | Jump to definition for that name. |
+| "show map", "show code", "show changes" | Switches the middle pane. |
+| "resolve" | Resolves the note whose dialog is open. |
+| "send" | Opens the send step. Said again there, it sends. |
+| "stop" | Stops the run the header shows. |
+
+- **What was heard is always shown** in a toast: the command it matched, or "not a command".
+  Unmatched speech does nothing.
+- **No voice for what cannot be undone:** Apply, Discard, deleting a note, saving a memory
+  and opening a pull request need a click or a key.
+- "note" and "ask" open the composer with the text; `Cmd-Enter` or a spoken "save" inside it
+  commits.
+
+## Decisions
+
+Settled by the owner on 2026-11-25:
+
+1. **Analyzer.** An ACP agent, read-only, whose every citation Postil checks. Rejected:
+   tree-sitter only, and a hybrid.
+2. **Rendering.** Postil's own SVG with a vendored layout file. Rejected: a layout of our
+   own, and Mermaid.
+3. **Diagram kinds.** Architecture, Flow, Data, and the change map of a run. The
+   Architecture is the running system (components, stores, external systems, how they talk);
+   modules show only below a component.
+4. **Placement.** The middle pane splits into diagram and code.
+5. **In the code.** A gutter stripe and a chip, in a color of their own.
+6. **Storage.** `<git dir>/postil/analysis.json`, private to the clone.
+7. **Staleness.** Mark outdated; update on request. The exception: new commits on the
+   checkout that touch the Architecture diagram start its update without a click.
+8. **Scope.** The whole repository first, then deeper on request, and flows by name.
+9. **Analyzer agent.** A setting of its own, starting as the default agent.
+10. **Memory.** Agents get hippius-mem; Postil shows memory; Postil writes memory from an
+    agent's draft the engineer approves; a reviewer stage checks a run against memory.
+11. **Memory setup.** Detect the installed binary and offer its setup steps. Not bundled.
+12. **Reviewer aids.** Walkthrough, risk ratings, evidence, ask, jump to definition. Viewed
+    marks were offered and not chosen.
+13. **Walkthrough author.** The agent that made the changes; a reviewer can dispute a rating.
+14. **Dictation.** Typed bindings, with `unsafe` allowed in `src/dictation.rs`.
+15. **Voice commands.** Hold a key to talk.
+16. **Order.** Reviewer aids, the map, memory, voice: milestones 7 to 10.
+
+## Open questions
+
+Assumed in this document and not confirmed. Each changes an interface, a data model or what
+Postil writes outside itself.
+
+1. **Read-only threads.** Read-only agents run in a thread of their own at `HEAD`, not in
+   the engineer's working tree, so they do not see uncommitted edits.
+2. **An ask is a note** with `intent: Ask`, not a record of its own.
+3. **Keys.** `q` to ask, `Cmd`-click to jump, `Cmd-Shift-M` for the map, `n` and `p` for
+   steps. The key held to talk is not chosen: Right Option is the proposal, since Fn
+   belongs to macOS dictation.
+4. **The map's color.** A muted violet; the mockups show it for approval.
+5. **Exit status.** Evidence reads a command's status as the agent reports it. Whether each
+   agent in the catalog reports a non-zero exit as a failed tool call is not checked yet.
+6. **hippius-mem's repository scope in a worktree.** Agents run in `~/.postil/worktrees/...`;
+   whether the server binds the right repository from there is not checked yet.
+7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
+   This document does not offer it from Postil.
+8. **The trial vault.** Set up runs `quickstart`, which makes a local vault. Moving to a
+   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret.
+9. **The language of dictation.** The system's language is assumed. When on-device
+   recognition is not available for it, dictation reports that and does not use the network.
+10. **Remember without the thread's agent.** A note that was never sent has no agent to draft
+    from; the dialog then opens with the note's text for the engineer to rewrite.
+
+## Testing
+
+End to end first, as `docs/design.md` sets out.
+
+- **The fake agent** gains scenarios: a report, a report that claims an unseen check, an
+  analysis with one citation that matches, one that moved and one that is wrong, an answer to
+  an ask, an agent that edits during a read-only run.
+- **Analysis** runs through `Site::respond` against real `git` in a temporary directory:
+  analyze, edit a cited file, read the outdated node, update. The forced update gets its
+  own cases: a commit that changes cited lines starts one, a commit that touches nothing
+  cited moves `checked` with no run, a failed update is not started twice for one commit,
+  and an update refused at the cap starts on the next check.
+- **Anchors** reuse the notes' property tests; citation checking gets its own (a shifted
+  range, a repeated first line, a line past the end of the file).
+- **Memory** runs against the real `hippius-mem` binary with a trial vault in a temporary
+  home directory when it is installed, and is skipped with a message when it is not. A test
+  that only replays a fake MCP server would test our reading of the protocol, not the server.
+- **The page's rules** (`ui/diagram.js`, `ui/voice.js`, the walkthrough's ordering, the
+  evidence states) get tests beside them under `node --test`.
+- **The diagram's clicks** (node to code, chip to node, a click during a streaming analysis)
+  run in Playwright's WebKit with the others.
+- **Dictation** cannot run in CI: it needs a microphone, a permission prompt and the bundle.
+  The rollover and insertion-range rules are separated from the framework calls and tested;
+  the rest is checked by hand from `Postil.app`, and the pull request says so.
+
+## Sources
+
+- hippius-mem: https://github.com/thenervelab/hippius-mem/blob/db9261b1/AGENTS.md
+- dagre: https://www.npmjs.com/package/@dagrejs/dagre/v/3.1.4
+- elkjs: https://www.npmjs.com/package/elkjs/v/0.12.1
+- tree-sitter-tags: https://crates.io/crates/tree-sitter-tags/0.27.2
+- objc2-speech: https://crates.io/crates/objc2-speech/0.3.2
+- objc2-avf-audio: https://crates.io/crates/objc2-avf-audio/0.3.2
