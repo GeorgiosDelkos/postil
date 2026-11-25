@@ -1121,18 +1121,19 @@ fn entry_of(
             content: ContentBlock::Text { text },
         } => Entry::Thought { text },
         SessionUpdate::ToolCall(call) => {
-            let execute = call.kind == ToolKind::Execute;
+            let (command, exit) = if call.kind == ToolKind::Execute {
+                (
+                    call.raw_input.as_ref().and_then(command_of),
+                    call.raw_output
+                        .as_ref()
+                        .and_then(|output| exit_of(call.status, output)),
+                )
+            } else {
+                (None, None)
+            };
             Entry::Tool {
-                command: call
-                    .raw_input
-                    .as_ref()
-                    .filter(|_| execute)
-                    .and_then(command_of),
-                exit: call
-                    .raw_output
-                    .as_ref()
-                    .filter(|_| execute)
-                    .and_then(|output| exit_of(call.status, output)),
+                command,
+                exit,
                 id: call.tool_call_id,
                 title: call.title,
                 tool: call.kind,
@@ -1145,19 +1146,21 @@ fn entry_of(
             let kind = update
                 .kind
                 .or_else(|| kinds.get(&update.tool_call_id).copied());
-            let execute = kind == Some(ToolKind::Execute);
+            let (command, exit) = if kind == Some(ToolKind::Execute) {
+                (
+                    update.raw_input.as_ref().and_then(command_of),
+                    update
+                        .raw_output
+                        .as_ref()
+                        .zip(update.status)
+                        .and_then(|(output, status)| exit_of(status, output)),
+                )
+            } else {
+                (None, None)
+            };
             Entry::ToolUpdate {
-                command: update
-                    .raw_input
-                    .as_ref()
-                    .filter(|_| execute)
-                    .and_then(command_of),
-                exit: update
-                    .raw_output
-                    .as_ref()
-                    .filter(|_| execute)
-                    .zip(update.status)
-                    .and_then(|(output, status)| exit_of(status, output)),
+                command,
+                exit,
                 id: update.tool_call_id,
                 title: update.title,
                 tool: update.kind,
@@ -1204,7 +1207,8 @@ fn command_of(raw_input: &Value) -> Option<String> {
     Some(format!("{kept}… ({} bytes in all)", command.len()))
 }
 
-/// The exit code a finished execute call reports in its `rawOutput`, seen 2026-11-25:
+/// The exit code in the `rawOutput` of a report that says the execute call finished (`status`
+/// is that report's own: both agents send the end and the output together, seen 2026-11-25):
 /// - Grok's object has `exit_code`. Grok ends a command that exits non-zero as `completed`, so
 ///   the code is the only sign it failed. Its updates while the command runs carry
 ///   `exit_code` 0 too, so a call still running has none.

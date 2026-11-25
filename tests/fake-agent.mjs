@@ -284,8 +284,11 @@ async function prompt(id, params) {
       update({ sessionUpdate: "tool_call_update", toolCallId: "c2", status: "completed", rawOutput: { exit_code: 101 } });
       // c3 as Claude's adapter when a command fails; a command too long to keep whole.
       update({ sessionUpdate: "tool_call", toolCallId: "c3", title: "Terminal", kind: "execute", status: "pending", rawInput: {} });
-      update({ sessionUpdate: "tool_call_update", toolCallId: "c3", rawInput: { command: `echo ${"x".repeat(5000)}` } });
+      // Two-byte characters, so byte 4096 falls inside one.
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c3", rawInput: { command: `echo ${"é".repeat(2600)}` } });
       update({ sessionUpdate: "tool_call_update", toolCallId: "c3", status: "failed", rawOutput: "Exit code 2\nno" });
+      // c4 reported whole in one call: kind, command and exit code together.
+      update({ sessionUpdate: "tool_call", toolCallId: "c4", title: "make", kind: "execute", status: "completed", rawInput: { command: "make" }, rawOutput: { exit_code: 1 } });
       // A read whose input has a command field, before and after: not an execute call.
       update({ sessionUpdate: "tool_call", toolCallId: "r1", title: "Read a.txt", kind: "read", status: "pending", rawInput: { command: "read", path: "a.txt" } });
       update({ sessionUpdate: "tool_call_update", toolCallId: "r1", status: "completed", rawInput: { command: "read" }, rawOutput: { exit_code: 1 } });

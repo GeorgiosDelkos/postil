@@ -1613,8 +1613,9 @@ fn a_log_without_an_end_reads_as_unfinished_and_torn_lines_spoil_only_themselves
     );
 }
 
-/// Each tool call of the run, in order, with its command and exit code as the page folds them:
-/// a later report replaces an earlier one.
+/// Each tool call of the run, in order, with its command and exit code as the page folds them
+/// (`foldRun`, ui/run.js): a `tool` entry replaces the call whole, and an update's fields
+/// replace the call's.
 fn executions(run: &serde_json::Value) -> Vec<(String, Option<String>, Option<i64>)> {
     let mut calls: Vec<(String, Option<String>, Option<i64>)> = Vec::new();
     for entry in entries(run) {
@@ -1629,6 +1630,9 @@ fn executions(run: &serde_json::Value) -> Vec<(String, Option<String>, Option<i6
                 calls.push((id.to_owned(), None, None));
                 calls.len() - 1
             });
+        if entry["kind"] == "tool" {
+            calls[index] = (id.to_owned(), None, None);
+        }
         if let Some(command) = entry["command"].as_str() {
             calls[index].1 = Some(command.to_owned());
         }
@@ -1651,8 +1655,9 @@ fn an_execute_call_keeps_its_command_and_exit_code_and_no_other_call_does() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let ended = wait_for(&site, &nudges, "ended");
 
-    let long = format!("echo {}", "x".repeat(5000));
-    let cut = format!("{}… (5005 bytes in all)", &long[..4096]);
+    // "echo " and 2600 two-byte characters: 5205 bytes, cut at the last whole character
+    // before byte 4096.
+    let cut = format!("echo {}… (5205 bytes in all)", "é".repeat(2045));
     let call = |id: &str, command: Option<&str>, exit: Option<i64>| {
         (id.to_owned(), command.map(str::to_owned), exit)
     };
@@ -1665,6 +1670,7 @@ fn an_execute_call_keeps_its_command_and_exit_code_and_no_other_call_does() {
             // Grok names the kind on an update, and ends a failure as completed.
             call("c2", Some("cargo build"), Some(101)),
             call("c3", Some(&cut), Some(2)),
+            call("c4", Some("make"), Some(1)),
             // A read's input and output, though it names a command and an exit code.
             call("r1", None, None),
             call("e1", None, None),
@@ -1688,7 +1694,10 @@ fn a_version_4_log_reads_without_commands() {
     let runs = repo.root.join(".git/postil/runs");
     fs::create_dir_all(&runs).unwrap();
     let header = header("R1").replace(r#""version":1"#, r#""version":4"#);
-    let tool = r#"{"kind":"tool","id":"c1","title":"cargo test","tool":"execute","status":"completed","places":[],"output":[]}"#;
+    let tool = concat!(
+        r#"{"kind":"tool","id":"c1","title":"cargo test","tool":"execute","#,
+        r#""status":"completed","places":[],"output":[]}"#,
+    );
     fs::write(
         runs.join("R1.jsonl"),
         format!("{header}\n{tool}\n{{\"kind\":\"ended\",\"reason\":\"end_turn\"}}\n"),
