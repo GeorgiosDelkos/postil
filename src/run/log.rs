@@ -103,6 +103,9 @@ struct RunUsage {
     total_tokens: Option<u64>,
     context_used: Option<u64>,
     context_size: Option<u64>,
+    /// Cumulative session cost before this turn began (for a kept agent reused on a follow-up).
+    cost_baseline: Option<(f64, String)>,
+    /// Latest cumulative session cost reported by the agent during this turn.
     cost_amount: Option<f64>,
     cost_currency: Option<String>,
 }
@@ -123,6 +126,29 @@ impl RunUsage {
             self.cost_amount = Some(cost.amount);
             self.cost_currency = Some(cost.currency);
         }
+    }
+
+    /// Cost attributable to this turn alone: the delta from `cost_baseline` when this run
+    /// continued an earlier turn on the same kept session with the same currency.
+    fn turn_cost(&self) -> (Option<f64>, Option<String>) {
+        let (Some(raw), Some(currency)) = (self.cost_amount, self.cost_currency.as_ref()) else {
+            return (None, None);
+        };
+        let amount = match &self.cost_baseline {
+            Some((base, base_currency)) if base_currency == currency && raw >= *base => {
+                (raw - *base).max(0.0)
+            }
+            _ => raw,
+        };
+        (Some(amount), Some(currency.clone()))
+    }
+
+    /// Latest known cumulative session cost for a follow-up that reuses this session.
+    fn session_cost(&self) -> Option<(f64, String)> {
+        if let (Some(amount), Some(currency)) = (self.cost_amount, self.cost_currency.as_ref()) {
+            return Some((amount, currency.clone()));
+        }
+        self.cost_baseline.clone()
     }
 
     fn record_prompt(&mut self, usage: PromptUsage) {
@@ -625,6 +651,17 @@ impl Run {
         }
     }
 
+    /// Records the cumulative session cost already accounted for by earlier turns on a kept
+    /// agent, so this run logs only its incremental cost.
+    pub(super) fn set_cost_baseline(&self, baseline: Option<(f64, String)>) {
+        self.state().usage.cost_baseline = baseline;
+    }
+
+    /// The latest cumulative session cost reported on this run (or its baseline if none).
+    pub(super) fn session_cost(&self) -> Option<(f64, String)> {
+        self.state().usage.session_cost()
+    }
+
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
     pub(super) fn record(&self, entry: Entry) {
         let finished = {
@@ -758,6 +795,7 @@ impl Run {
         } else {
             "notes"
         };
+        let (cost_amount, cost_currency) = state.usage.turn_cost();
         Some(LedgerRecord {
             version: RECORD_VERSION,
             run_id: state.header.id.clone(),
@@ -776,8 +814,8 @@ impl Run {
             total_tokens: state.usage.total_tokens,
             context_used: state.usage.context_used,
             context_size: state.usage.context_size,
-            cost_amount: state.usage.cost_amount,
-            cost_currency: state.usage.cost_currency.clone(),
+            cost_amount,
+            cost_currency,
             tool_calls: state.kinds.len() as u64,
         })
     }

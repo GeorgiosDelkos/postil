@@ -337,6 +337,10 @@ impl Slot {
                 .as_ref()
                 .is_some_and(|chain| state.header.review.as_ref() != Some(&chain.stage))
     }
+
+    fn session_cost(&self) -> Option<(f64, String)> {
+        self.run.as_deref().and_then(Run::session_cost)
+    }
 }
 
 /// A send that waits for its agent to start.
@@ -911,10 +915,12 @@ impl Runner {
         slot.chain = review;
         let new_thread = matches!(worktree, Worktree::Make);
         slot.making = !matches!(worktree, Worktree::Made);
+        let prev_session_cost = reuse.then(|| slot.session_cost()).flatten();
         slot.run = Some(Arc::clone(&run));
         slot.thread = thread.clone();
         slot.used = used;
         let replaced = if reuse && let Held::Ready(_, kept) = &slot.agent {
+            run.set_cost_baseline(prev_session_cost);
             begin(kept, &run, &marks, &prompt, &thread.path);
             Held::None
         } else {

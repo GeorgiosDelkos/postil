@@ -116,7 +116,12 @@ async function prompt(id, params) {
       // Agents send notifications and update kinds the app does not use.
       send({ method: "_x.ai/session/setup", params: { phase: "auth" } });
       update({ sessionUpdate: "current_mode_update", currentModeId: "default" });
-      update({ sessionUpdate: "usage_update", used: 10, size: 100, cost: { amount: 0.02, currency: "USD" } });
+      update({
+        sessionUpdate: "usage_update",
+        used: 10,
+        size: 100,
+        cost: { amount: Number((0.02 * prompts).toFixed(4)), currency: "USD" },
+      });
       const fs = await ask("fs/read_text_file", { sessionId: "S1", path: "/etc/hosts" });
       say(`fs answered ${fs.error?.code}`);
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hmm" } });

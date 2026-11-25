@@ -50,7 +50,8 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
   }
 
   function show(view) {
-    const unchanged = ui.error === null && JSON.stringify(view) === JSON.stringify(ui.view);
+    const unchanged =
+      !ui.refreshing && ui.error === null && JSON.stringify(view) === JSON.stringify(ui.view);
     ui.view = view;
     ui.scope = view.scope;
     ui.range = view.range;

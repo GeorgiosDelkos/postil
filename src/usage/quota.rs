@@ -29,6 +29,9 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// Hard limit on any single provider probe (subprocess or HTTP).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Maximum time an in-flight `Loading` entry stays fresh before a subsequent poll may retry it.
+const LOADING_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// State of a live quota probe for one agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -203,8 +206,12 @@ impl QuotaPoller {
                 }
                 let fresh = state.entries.get(name).is_some_and(|entry| {
                     entry.generation == generation
-                        && (entry.report.status == QuotaStatus::Loading
-                            || entry.updated.elapsed() < CACHE_TTL)
+                        && match entry.report.status {
+                            QuotaStatus::Loading => entry.updated.elapsed() < LOADING_TIMEOUT,
+                            QuotaStatus::Ok | QuotaStatus::Unavailable | QuotaStatus::Error => {
+                                entry.updated.elapsed() < CACHE_TTL
+                            }
+                        }
                 });
                 if fresh {
                     results.insert(name.to_owned(), state.entries[name].report.clone());
@@ -233,7 +240,14 @@ impl QuotaPoller {
             let spawned = std::thread::Builder::new()
                 .name(format!("quota-{name}"))
                 .spawn(move || {
+                    let mut guard = ProbeGuard {
+                        shared: Arc::clone(&shared),
+                        agent_name: agent_name.clone(),
+                        generation,
+                        armed: true,
+                    };
                     let report = probe(&agent_name, &path);
+                    guard.armed = false;
                     let mut state = lock(&shared);
                     if state.generation == generation {
                         state.entries.insert(
@@ -262,6 +276,33 @@ impl QuotaPoller {
         }
 
         results
+    }
+}
+
+/// Ensures a panicked probe thread never leaves an agent stuck in [`QuotaStatus::Loading`].
+struct ProbeGuard {
+    shared: Arc<Mutex<PollerState>>,
+    agent_name: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = lock(&self.shared);
+        if state.generation == self.generation {
+            state.entries.insert(
+                self.agent_name.clone(),
+                CachedQuota {
+                    report: QuotaReport::error("quota probe stopped unexpectedly"),
+                    updated: Instant::now(),
+                    generation: self.generation,
+                },
+            );
+        }
     }
 }
 
@@ -339,7 +380,14 @@ fn read_claude_credentials() -> Option<(String, Option<String>)> {
 }
 
 fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
-    let value: Value = serde_json::from_str(raw.trim()).ok()?;
+    let trimmed = raw.trim();
+    let decoded = if trimmed.starts_with('{') {
+        None
+    } else {
+        decode_hex_utf8(trimmed)
+    };
+    let text = decoded.as_deref().unwrap_or(trimmed);
+    let value: Value = serde_json::from_str(text).ok()?;
     let oauth = value.get("claudeAiOauth").unwrap_or(&value);
     let token = oauth
         .get("accessToken")
@@ -356,6 +404,33 @@ fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
         .filter(|s| !s.is_empty())
         .map(title_case);
     Some((token.to_owned(), plan))
+}
+
+/// Decodes a hex-encoded UTF-8 string, as macOS `security find-generic-password -w` prints
+/// when a Keychain item contains newlines or non-ASCII bytes.
+fn decode_hex_utf8(hex: &str) -> Option<String> {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    if hex.len() < 2 || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(pairs.len());
+    for &[hi, lo] in pairs {
+        bytes.push((hex_nibble(hi)? << 4) | hex_nibble(lo)?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
@@ -461,6 +536,8 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
         let requests = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"postil","version":"0.1.0"}}}"#,
             "\n",
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            "\n",
             r#"{"jsonrpc":"2.0","id":2,"method":"account/read","params":{}}"#,
             "\n",
             r#"{"jsonrpc":"2.0","id":3,"method":"account/rateLimits/read","params":{}}"#,
@@ -473,6 +550,7 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
         let reader = std::thread::Builder::new()
             .name("codex-quota-read".to_owned())
             .spawn(move || {
+                let mut init_error = None;
                 let mut account = None;
                 let mut limits = None;
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -480,6 +558,15 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
                         continue;
                     };
                     match msg.get("id").and_then(Value::as_u64) {
+                        Some(1) if msg.get("error").is_some() => {
+                            init_error = msg
+                                .get("error")
+                                .and_then(|err| err.get("message"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .or_else(|| Some("codex app-server refused initialize".to_owned()));
+                            break;
+                        }
                         Some(2) => account = Some(msg),
                         Some(3) => limits = Some(msg),
                         _ => {}
@@ -488,7 +575,7 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
                         break;
                     }
                 }
-                drop(sender.send((account, limits)));
+                drop(sender.send((init_error, account, limits)));
             });
         reader.ok()?;
         receiver.recv_timeout(PROBE_TIMEOUT).ok()
@@ -498,9 +585,12 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
     drop(child.kill());
     drop(child.wait());
 
-    let Some((account, limits)) = result else {
+    let Some((init_error, account, limits)) = result else {
         return QuotaReport::error("Codex quota probe timed out");
     };
+    if let Some(error) = init_error {
+        return QuotaReport::error(error);
+    }
     parse_codex_quota(account.as_ref(), limits.as_ref())
 }
 
@@ -647,12 +737,28 @@ fn parse_codex_credits(bucket: &Value) -> Option<CreditInfo> {
 
 // ---- Gemini -------------------------------------------------------------------------------
 
+enum GeminiCreds {
+    Token(String),
+    Expired,
+    Missing,
+}
+
 fn probe_gemini() -> QuotaReport {
-    let Some(token) = read_gemini_token() else {
-        if std::env::var_os("GEMINI_API_KEY").is_some_and(|val| !val.is_empty()) {
-            return QuotaReport::unavailable("API key mode — no subscription quota window");
+    let token = match read_gemini_creds(now_secs()) {
+        GeminiCreds::Token(token) => token,
+        GeminiCreds::Expired => {
+            return QuotaReport::unavailable(
+                "Session expired — run `gemini` in a terminal to refresh",
+            );
         }
-        return QuotaReport::unavailable("Not signed in — run `gemini` in a terminal to sign in");
+        GeminiCreds::Missing => {
+            if std::env::var_os("GEMINI_API_KEY").is_some_and(|val| !val.is_empty()) {
+                return QuotaReport::unavailable("API key mode — no subscription quota window");
+            }
+            return QuotaReport::unavailable(
+                "Not signed in — run `gemini` in a terminal to sign in",
+            );
+        }
     };
 
     let headers = [
@@ -700,17 +806,46 @@ fn probe_gemini() -> QuotaReport {
     }
 }
 
-fn read_gemini_token() -> Option<String> {
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+fn read_gemini_creds(now: u64) -> GeminiCreds {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return GeminiCreds::Missing;
+    };
     let path = PathBuf::from(home).join(".gemini/oauth_creds.json");
-    let raw = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    let token = value
+    let Ok(raw) = fs::read_to_string(path) else {
+        return GeminiCreds::Missing;
+    };
+    parse_gemini_creds(&raw, now)
+}
+
+fn parse_gemini_creds(raw: &str, now: u64) -> GeminiCreds {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return GeminiCreds::Missing;
+    };
+    let Some(token) = value
         .get("access_token")
         .or_else(|| value.get("accessToken"))
-        .and_then(Value::as_str)?
-        .trim();
-    (!token.is_empty()).then(|| token.to_owned())
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    else {
+        return GeminiCreds::Missing;
+    };
+    if let Some(expiry) = value
+        .get("expiry_date")
+        .or_else(|| value.get("expiryDate"))
+        .and_then(Value::as_u64)
+    {
+        // Google OAuth writes milliseconds since epoch; handle seconds too.
+        let expiry_secs = if expiry >= 10_000_000_000 {
+            expiry / 1000
+        } else {
+            expiry
+        };
+        if expiry_secs <= now {
+            return GeminiCreds::Expired;
+        }
+    }
+    GeminiCreds::Token(token.to_owned())
 }
 
 fn parse_gemini_load(body: &str) -> (Option<String>, Option<String>) {
@@ -1127,5 +1262,90 @@ mod tests {
             Some("new-Claude"),
             "older probe result was dropped"
         );
+    }
+
+    #[test]
+    fn poller_recovers_if_a_probe_thread_panics() {
+        let poller = QuotaPoller::new(|_, _| panic!("simulated probe panic"));
+        let initial = poller.snapshot(&[("Claude", true)], OsStr::new(""));
+        assert_eq!(initial["Claude"].status, QuotaStatus::Loading);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = poller.snapshot(&[("Claude", true)], OsStr::new(""));
+            if snap["Claude"].status != QuotaStatus::Loading {
+                assert_eq!(snap["Claude"].status, QuotaStatus::Error);
+                break;
+            }
+            assert!(Instant::now() < deadline, "panicked probe stayed Loading");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn parse_claude_credentials_decodes_hex_keychain_output() {
+        use std::fmt::Write as _;
+
+        let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-test","subscriptionType":"max"}}"#;
+        let mut hex = String::with_capacity(json.len() * 2);
+        for byte in json.bytes() {
+            write!(hex, "{byte:02x}").unwrap();
+        }
+        let parsed = parse_claude_credentials(&hex).expect("hex-encoded keychain JSON parses");
+        assert_eq!(parsed.0, "sk-ant-test");
+        assert_eq!(parsed.1.as_deref(), Some("Max"));
+    }
+
+    #[test]
+    fn parse_gemini_creds_detects_expired_token() {
+        let now = 1_795_000_000;
+        let expired = r#"{"access_token":"tok","expiry_date":1794000000000}"#;
+        assert!(matches!(
+            parse_gemini_creds(expired, now),
+            GeminiCreds::Expired
+        ));
+        let fresh = r#"{"access_token":"tok","expiry_date":1796000000000}"#;
+        assert!(matches!(parse_gemini_creds(fresh, now), GeminiCreds::Token(t) if t == "tok"));
+    }
+
+    #[test]
+    fn probe_codex_talks_json_rpc_over_stdio_to_app_server_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("codex-app-server");
+        let script = dir.path().join("codex");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "saw_initialized=0\n",
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"initialize\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"userAgent\":\"test\"}}\\n'\n",
+                "      ;;\n",
+                "    *'\"method\":\"initialized\"'*)\n",
+                "      saw_initialized=1\n",
+                "      ;;\n",
+                "    *'\"method\":\"account/read\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"authMode\":\"chatgpt\",\"planType\":\"plus\"}}\\n'\n",
+                "      ;;\n",
+                "    *'\"method\":\"account/rateLimits/read\"'*)\n",
+                "      if [ \"$saw_initialized\" = \"1\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":33.0,\"windowDurationMins\":300,\"resetsAt\":1800000000}}}}\\n'\n",
+                "      fi\n",
+                "      ;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = probe_codex(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.plan.as_deref(), Some("Plus"));
+        assert_eq!(report.windows.len(), 1);
+        assert!((report.windows[0].used_percent - 33.0).abs() < 1e-6);
     }
 }

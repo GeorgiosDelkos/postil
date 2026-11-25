@@ -145,6 +145,52 @@ fn a_finished_run_records_model_tokens_and_cost_that_survive_note_deletion() {
 }
 
 #[test]
+fn a_kept_agent_follow_up_records_only_its_session_cost_delta() {
+    let repo = TempRepo::new("usage-followup-delta");
+    repo.write("src/a.rs", "one\ntwo\nthree\n");
+    let (site, nudges) = run_site(&repo, "turn");
+    let site = site.with_quota_poller(QuotaPoller::new(|_, _| {
+        QuotaReport::unavailable("test stub")
+    }));
+
+    post_note(&site, "src/a.rs", 1, 1, "check this");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    let first = wait_for_run(&site, &nudges, "R1");
+    assert_eq!(first["status"], "ended");
+
+    // Follow up on the same kept agent: fake-agent reports cumulative cost 0.04 on prompt 2,
+    // so R2 should log only its 0.02 delta (total 0.04 across both runs, not 0.06).
+    let (status, body) = post(
+        &site,
+        &format!("{RUN}/follow"),
+        &serde_json::json!({ "of": "R1", "text": "one more tweak" }).to_string(),
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = wait_for_run(&site, &nudges, "R2");
+    assert_eq!(second["status"], "ended");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let usage = loop {
+        let reply = get_json(
+            &site,
+            "postil://localhost/api/usage?scope=project&range=today",
+        );
+        if reply["scanning"] == false {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "agent scan did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert_eq!(usage["summary"]["runs"], 2);
+    let cost = usage["summary"]["costAmount"].as_f64().unwrap();
+    assert!(
+        (cost - 0.04).abs() < 1e-9,
+        "expected 0.04 cumulative, got {cost}"
+    );
+}
+
+#[test]
 fn invalid_usage_query_params_are_refused() {
     let repo = TempRepo::new("usage-params");
     let site = repo.empty_site();
