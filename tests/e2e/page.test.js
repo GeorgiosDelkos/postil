@@ -49,9 +49,11 @@ before(async () => {
 after(() => browser?.close());
 
 // A new project on the bridge, `src/a.rs`, `b.rs` and `c.rs` in a fresh repository, open in a
-// new page. `api` calls its routes from the test, as the page does.
-async function openProject(t) {
-  const created = await fetch(new URL("new", bridge), { method: "POST" });
+// new page, its agent in the fake agent's `scenario`. `api` calls its routes from the test, as
+// the page does.
+async function openProject(t, scenario = "flood") {
+  const body = JSON.stringify({ scenario });
+  const created = await fetch(new URL("new", bridge), { method: "POST", body });
   const site = new URL((await created.json()).base, bridge);
   const page = await browser.newPage();
   t.after(() => page.close());
@@ -365,6 +367,25 @@ test("the run's dialog shows its branch, and Apply ends the thread once the run 
   await detail.locator(".run-thread-state").filter({ hasText: "Applied" }).waitFor();
   const thread = await api("api/thread?id=R1");
   assert.equal(thread.state, "applied");
+});
+
+test("a run's card marks its worst check, and a Checks row opens the step that ran it", async (t) => {
+  const { page, api } = await openProject(t, "evidence");
+  const note = await addNote(api, "Fix it.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  await page.locator("#tab-run").click();
+  // A check claimed and not in the log ranks below one that failed.
+  const card = page.locator("#run .run-entry");
+  await card.locator(".run-evidence.failed").waitFor();
+
+  await card.click();
+  const detail = page.locator("#run-detail");
+  const row = detail.locator(".run-check").filter({ hasText: "cargo clippy" });
+  await row.filter({ hasText: "failed · the author says passed" }).waitFor();
+  const unseen = detail.locator(".run-check").filter({ hasText: "cargo doc" });
+  assert.match(await unseen.textContent(), /not seen in the log/);
+  await row.click();
+  await detail.getByText("Step 2 of 2").waitFor();
 });
 
 test("two threads run side by side, and each stops from its own dialog", async (t) => {

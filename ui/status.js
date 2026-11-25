@@ -6,6 +6,7 @@
 import { covers } from "./note-place.js";
 import {
   diffStats,
+  evidence,
   foldRun,
   isLive,
   isOpen,
@@ -398,6 +399,7 @@ export function threadKey(thread) {
 function turnShown(turn) {
   const live = isLive(turn);
   const { plan, items } = foldRun(turn.entries);
+  const report = reportOf(turn);
   return [
     turn.id,
     turn.agent,
@@ -415,7 +417,15 @@ function turnShown(turn) {
     turn.entries.some((entry) => entry.kind === "snapshot"),
     // Arrives as the turn ends: the reply is drawn without its block, and a notice may show.
     // What the dialog draws of it, not the report whole, which can be tens of KB.
-    reportShown(reportOf(turn)),
+    reportShown(report),
+    // The Checks rows: a command that arrives after its call started changes which claim it
+    // matches, which the step cards above do not show. The call's id is the step a row opens.
+    evidence(report?.report ?? null, items).map((row) => [
+      row.command,
+      row.claim,
+      row.state,
+      row.item?.id ?? null,
+    ]),
   ];
 }
 
