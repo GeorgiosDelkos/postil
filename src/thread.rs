@@ -86,8 +86,7 @@ pub(crate) struct Thread {
     #[serde(default)]
     pub(crate) last_run: u64,
     pub(crate) state: State,
-    /// What the worktree was not given ([`make`]): ignored folders, or its submodules, each
-    /// with the reason.
+    /// What the worktree was not given ([`make`]), each with the reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped: Vec<String>,
     /// The pull request opened from the thread's branch, once one is.

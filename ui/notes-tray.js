@@ -344,7 +344,45 @@ export function notesTray({
     const links = el("div", "prompt-links");
     links.append(el("span", "prompt-links-label", "Linked files"));
     for (const path of files) links.append(el("span", "prompt-link", path));
-    previewEl.replaceChildren(text, ...(files.length ? [links] : []));
+    const warning = uncommittedWarning(reply);
+    previewEl.replaceChildren(
+      ...(warning ? [warning] : []),
+      text,
+      ...(files.length ? [links] : []),
+    );
+  }
+
+  // What the send step says when the working tree has changes since the last commit: the
+  // thread starts from that commit and does not see them, and a noted file among them may not
+  // have the note's lines in the agent's copy (docs/design.md, "Threads"). Null when clean.
+  function uncommittedWarning(reply) {
+    if (reply.uncommitted === 0) return null;
+    const warning = el("div", "send-warning");
+    // `git status` failed: the tree is not known to be clean, so the step does not say it is.
+    if (reply.uncommitted === null) {
+      const unknown = `Could not check your working tree for uncommitted changes (${reply.uncommittedError}). The thread starts from the last commit.`;
+      warning.append(el("div", "", unknown));
+      return warning;
+    }
+    const changes = reply.uncommitted === 1 ? "1 change" : `${reply.uncommitted} changes`;
+    warning.append(
+      el(
+        "div",
+        "",
+        `Your working tree has ${changes} since the last commit. The thread starts from that commit and does not see them.`,
+      ),
+    );
+    if (reply.uncommittedNoted.length) {
+      const noted = reply.uncommittedNoted.join(", ");
+      warning.append(
+        el(
+          "div",
+          "",
+          `Changed among the noted files: ${noted}. The agent's copy may not have their notes' lines, or the file at all.`,
+        ),
+      );
+    }
+    return warning;
   }
 
   async function sendNotes() {

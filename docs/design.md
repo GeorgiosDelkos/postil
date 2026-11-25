@@ -547,9 +547,8 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
 
 ### Worktrees
 
-Milestone 6, built but for two items marked below. Decided with the owner on 2026-11-24. Two
-agents in one working tree overwrite each other's edits, so each thread (a run of notes with
-its follow-ups and reviews)
+Milestone 6, built. Decided with the owner on 2026-11-24. Two agents in one working tree
+overwrite each other's edits, so each thread (a run of notes with its follow-ups and reviews)
 runs in a git worktree of its own, on a branch of its own. The engineer's working tree is
 never an agent's working directory; changes reach it only through Apply or a merged pull
 request.
@@ -558,8 +557,8 @@ Built (`src/thread.rs`, `src/clone.rs`, `src/run/room.rs`, `src/disk.rs`, `src/r
 `src/github.rs`): a worktree and a branch per thread, the record, commits as snapshots, the
 cloned build folders, Apply and Discard, a runner per thread with its locks, the cap of 3 live
 runs, `git worktree lock`, the startup sweep, the cap of 15 worktrees, the free-space floor and
-eviction, and pull requests. Not built yet, and marked so below: the warning about
-uncommitted changes, and sparse-checkout patterns.
+eviction, pull requests, the warning about uncommitted changes at send, and sparse-checkout
+patterns.
 
 #### Threads
 
@@ -613,9 +612,16 @@ uncommitted changes, and sparse-checkout patterns.
   Code do: those edits would otherwise land in the pull request. The fork commit is `HEAD` at
   send. When the checkout has uncommitted changes, the send step says the thread starts from
   the last commit and does not see them; when a noted file is among them, it adds that the
-  note's lines may not match (not built yet). A repository with no commit cannot send (422),
-  and the message says
-  it needs one commit first. A detached `HEAD` sends too, with no base branch: the thread can
+  note's lines may not match, or that the agent may not have the file. The preview reply
+  carries both: the count of entries `git status` lists (an untracked folder is one entry,
+  ignored files none), and the linked files among their paths, a rename's source included,
+  so the step names no file of the engineer's that it does not need to. The status runs on
+  the request thread at each tick, with `--no-optional-locks` so it never takes the
+  engineer's index lock; one that fails leaves the count unknown, and the step says it could
+  not check rather than showing a clean tree. A folder note is in the count only: the noted
+  files are the linked ones. A repository with no commit cannot send (422), and the message
+  says it needs one commit first. A detached `HEAD` sends too, with no base branch: the
+  thread can
   be applied but not opened as a pull request.
 - **The branch** is `postil/r<n>-<slug>`, the slug from the first note's text, lowercased to
   `[a-z0-9-]`, at most 40 characters, and `postil/r<n>` when nothing is left. Built from
@@ -634,8 +640,16 @@ uncommitted changes, and sparse-checkout patterns.
   it, and Postil strips the worktree's path from them.
 - **Making it:** `git worktree add -b <branch> <path> <fork commit>` on the agent's start
   thread, before the agent starts there, with no hooks (`post-checkout` may install or build),
-  then `git submodule update --init` when `.gitmodules` exists, and the checkout's
-  sparse-checkout patterns when it has any (not built yet). A worktree that cannot be made
+  then `git submodule update --init` when `.gitmodules` exists. When the engineer's checkout
+  is sparse, the worktree is too, with the same mode (cone or not) and patterns, and the
+  files they leave out are never written: in a large monorepo the checkout is the slow part,
+  and the disk. Git does this itself: `git worktree add`, run in the engineer's working tree
+  as Postil runs it, copies that tree's sparse-checkout settings to the new one (git 2.36
+  and later; tested with git 2.56, cone and not). Postil has no code for it, and a test
+  pins the behavior. An older git checks every file out. An agent may write outside the
+  patterns (a new test or doc): Postil's commits stage with `git add --all --sparse` (git
+  2.34), since without it git refuses such a file and every later commit of the thread
+  fails. A worktree that cannot be made
   fails the run and takes the thread out of the record: its branch name may belong to a
   thread of another working tree of the repository, which deleting this thread's note would
   otherwise delete.
@@ -1112,8 +1126,7 @@ retired; the measured numbers above are the baseline to not regress.
    `.github/workflows/release.yml` does the same in CI from a `v*` tag, with the secrets of
    the `release` environment that GeorgiosDelkos/vigil's release uses, and publishes a zip of
    the app (Apple Silicon only, the runner's architecture).
-6. **Threads side by side.** Built, but for the two items section "Worktrees" marks. A
-   worktree and a branch per thread (section
+6. **Threads side by side.** Built. A worktree and a branch per thread (section
    "Worktrees"), one pull request per step, so the main branch works after each. The owner
    chose this order on 2026-11-24, so agents never write to worktrees with no way to bring
    their changes back: the worktree with its branch, commits and clones, with Apply and

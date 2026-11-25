@@ -437,12 +437,21 @@ struct AnswerQuestion {
 
 /// The reply to `/api/run/preview`.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewView {
     /// The prompt's text, exactly as the agent will receive it.
     prompt: String,
     /// The files linked after the text, relative to the repository root. A folder note's
     /// folder is not among them (`notes::Prompt::files`).
     files: Vec<String>,
+    /// How many changes the engineer's working tree has since the last commit, as `git status`
+    /// lists them, which the thread, started from that commit, does not see (docs/design.md,
+    /// "Threads"); `None` when the status could not be read, which the page says.
+    uncommitted: Option<usize>,
+    /// The linked files among them: their notes' lines may not match the agent's copy.
+    uncommitted_noted: Vec<String>,
+    /// Why `git status` failed, when `uncommitted` is `None`.
+    uncommitted_error: Option<String>,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
@@ -949,9 +958,39 @@ impl Site {
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
         let prompt = self.runner()?.preview(&ids)?;
+        // One `git status` each time the send step reads the prompt, on the request thread:
+        // as long as `git status` in a terminal ([`Repo::uncommitted`]). One that fails costs
+        // the warning, not the prompt.
+        let (entries, uncommitted_error) = match self.repo()?.uncommitted() {
+            Ok(entries) => (Some(entries), None),
+            Err(error) => (None, Some(error_chain(&error))),
+        };
+        // A rename's source too: a noted file renamed away is in the agent's copy as it was.
+        let uncommitted_paths: Vec<&String> = entries
+            .iter()
+            .flatten()
+            .flat_map(|(path, source)| std::iter::once(path).chain(source))
+            .collect();
+        // A path ending in `/` is an untracked folder: every noted file in it is one the
+        // agent's copy lacks.
+        let is_uncommitted = |file: &String| {
+            uncommitted_paths
+                .iter()
+                .any(|path| *path == file || (path.ends_with('/') && file.starts_with(*path)))
+        };
+        let uncommitted_noted = prompt
+            .files
+            .iter()
+            .filter(|file| is_uncommitted(file))
+            .cloned()
+            .collect();
+        let uncommitted = entries.as_ref().map(Vec::len);
         Ok(to_json(&PreviewView {
             prompt: prompt.text,
             files: prompt.files,
+            uncommitted,
+            uncommitted_noted,
+            uncommitted_error,
         }))
     }
 

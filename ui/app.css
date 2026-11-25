@@ -1718,6 +1718,18 @@ button.repo-name:hover {
   color: var(--text-muted);
 }
 
+/* The send step's warning about changes since the last commit, above the prompt. */
+.send-warning {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--attention-border);
+  border-radius: 6px;
+  color: var(--attention);
+  font-size: 12px;
+}
+
 .prompt-links {
   display: flex;
   flex-wrap: wrap;

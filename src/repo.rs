@@ -713,6 +713,30 @@ impl Repo {
         git(&self.root, &args).map(drop)
     }
 
+    /// The engineer's changes since the last commit, for the warning at send: the entries
+    /// `git status` lists, each its path and a rename's source. An untracked folder is one
+    /// entry (`dir/`), as `git status` shows it, not one per file in it, so a large one counts
+    /// once and costs little. Takes no optional lock (`--no-optional-locks`): the engineer may
+    /// be committing in a terminal meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// The git error.
+    pub(crate) fn uncommitted(&self) -> Result<Vec<(String, Option<String>)>> {
+        let status = run_git(
+            &self.root,
+            None,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=normal",
+            ],
+        )?;
+        Ok(status_entries(&status))
+    }
+
     /// The paths with changes git would commit, as `git status` lists them: tracked files
     /// changed or deleted, and files that are neither tracked nor ignored. Empty when the
     /// working tree is clean. Ignored files are not listed.
@@ -726,18 +750,10 @@ impl Repo {
             None,
             &["status", "--porcelain", "-z", "--untracked-files=all"],
         )?;
-        let mut paths = Vec::new();
-        let mut entries = status.split_terminator('\0');
-        while let Some(entry) = entries.next() {
-            // `XY path`; a rename or copy (`R`, `C`) is followed by its source path, which is
-            // an entry of its own.
-            let (code, path) = entry.split_at(entry.len().min(3));
-            paths.push(path.to_owned());
-            if code.starts_with(['R', 'C']) {
-                entries.next();
-            }
-        }
-        Ok(paths)
+        Ok(status_entries(&status)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect())
     }
 
     /// Commits every change in the working tree with `message`, and returns the commit
@@ -758,10 +774,13 @@ impl Repo {
     ///
     /// The git errors, such as a missing `user.name`, or a working tree with no commit.
     pub(crate) fn commit_all(&self, message: &str) -> Result<String> {
-        // No hooks: writing the index runs `post-index-change`.
+        // No hooks: writing the index runs `post-index-change`. `--sparse` (git 2.34): in a
+        // worktree with a sparse checkout, which it takes from the engineer's, a file the agent
+        // writes outside the patterns is refused without it ("outside of your sparse-checkout
+        // definition"), and every later commit of the thread fails with it.
         git(
             &self.root,
-            &["-c", "core.hooksPath=/dev/null", "add", "--all"],
+            &["-c", "core.hooksPath=/dev/null", "add", "--all", "--sparse"],
         )?;
         // What was staged, not what `git status` lists: a submodule or a repository inside
         // the worktree with changes of its own is listed, but `git add` stages nothing for it,
@@ -1054,6 +1073,29 @@ fn run_git_with(
         command.env("GIT_INDEX_FILE", index);
     }
     output_of(command, args, input)
+}
+
+/// The entries of `git status --porcelain -z` output: each one's path and, for a rename or a
+/// copy, its source, which follows it as a field of its own. `XY path`: a rename shows in
+/// either column, `R ` once staged and ` R` when only the working tree has it (the moved file
+/// added with `git add -N`).
+fn status_entries(status: &str) -> Vec<(String, Option<String>)> {
+    let mut entries = Vec::new();
+    let mut fields = status.split_terminator('\0');
+    while let Some(field) = fields.next() {
+        let (code, path) = field.split_at(field.len().min(3));
+        let renamed = code
+            .bytes()
+            .take(2)
+            .any(|column| matches!(column, b'R' | b'C'));
+        let source = if renamed {
+            fields.next().map(str::to_owned)
+        } else {
+            None
+        };
+        entries.push((path.to_owned(), source));
+    }
+    entries
 }
 
 /// `git -C <dir>`, set to find the repository at `dir` as `search` says and never to prompt
