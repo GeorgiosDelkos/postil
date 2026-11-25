@@ -22,7 +22,7 @@
 //! killed while it ran, or another window is running it. Closing the project or quitting ends
 //! a run under way as failed (`Runner::close`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -75,9 +75,10 @@ pub(super) enum InThread<'a> {
 
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
-/// header); version 4 the `snapshot` entry. Older logs read as runs of notes, without
-/// snapshots.
-const LOG_VERSION: u32 = 4;
+/// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
+/// on the `tool` and `toolUpdate` entries. Older logs read as runs of notes, without
+/// snapshots, commands or exit codes.
+const LOG_VERSION: u32 = 5;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -109,6 +110,10 @@ pub(super) struct RunState {
     // Sets: a cancel can log a request's answer before the request itself.
     requested: BTreeSet<usize>,
     answered: BTreeSet<usize>,
+    /// Each tool call's kind as last reported, by call id. An update need not name its call's
+    /// kind (Claude's adapter names it only on the call, Grok only on an update), and only an
+    /// execute call's command is kept ([`entry_of`]).
+    kinds: HashMap<String, ToolKind>,
     /// Why the log is incomplete, the notes were not marked sent, or a review stopped here.
     pub(super) problem: Option<String>,
 }
@@ -184,6 +189,12 @@ pub(crate) enum Entry {
         status: ToolCallStatus,
         places: Vec<Place>,
         output: Vec<Output>,
+        /// An execute call's command line ([`command_of`]). Version 5 on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// A finished execute call's exit code ([`exit_of`]). Version 5 on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<i64>,
     },
     /// A tool call changed; only the fields that changed are set.
     ToolUpdate {
@@ -193,6 +204,12 @@ pub(crate) enum Entry {
         status: Option<ToolCallStatus>,
         places: Option<Vec<Place>>,
         output: Option<Vec<Output>>,
+        /// As in [`Entry::Tool`]: set when this change reports it, and it replaces the call's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// As in [`Entry::Tool`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<i64>,
     },
     /// The agent's plan, whole: each one replaces the last.
     Plan { steps: Vec<Step> },
@@ -572,8 +589,15 @@ impl Run {
         answer: Option<Entry>,
         root: &Path,
     ) -> Option<Vec<String>> {
+        // One hold of the state for the event, its answer and the notes: a reader sees both
+        // entries or neither, and a run that ended meanwhile neither takes the event nor marks
+        // its notes sent. Taken first, since an update is read by the kind of its call.
+        let mut state = self.state();
+        if !state.live() {
+            return None;
+        }
         let entry = match event {
-            Event::Update(update) => entry_of(update, root)?,
+            Event::Update(update) => entry_of(update, root, &state.kinds)?,
             Event::Permission(request) => Entry::Permission {
                 request: request.number,
                 tool_call: request.tool_call.tool_call_id,
@@ -614,13 +638,6 @@ impl Run {
                     reason: StopReason::Refusal
                 }
         );
-        // One hold of the state for the event, its answer and the notes: a reader sees both
-        // entries or neither, and a run that ended meanwhile neither takes the event nor marks
-        // its notes sent.
-        let mut state = self.state();
-        if !state.live() {
-            return None;
-        }
         for entry in std::iter::once(entry).chain(answer) {
             self.write(&mut state, entry);
         }
@@ -684,6 +701,7 @@ impl RunState {
             end: None,
             requested: BTreeSet::new(),
             answered: BTreeSet::new(),
+            kinds: HashMap::new(),
             problem: None,
         }
     }
@@ -784,10 +802,17 @@ impl RunState {
                 // Another window may start a run in the thread now, or end it.
                 self.lock = None;
             }
+            Entry::Tool { id, tool, .. }
+            | Entry::ToolUpdate {
+                id,
+                tool: Some(tool),
+                ..
+            } => {
+                self.kinds.insert(id.clone(), *tool);
+            }
             Entry::Message { .. }
             | Entry::Thought { .. }
-            | Entry::Tool { .. }
-            | Entry::ToolUpdate { .. }
+            | Entry::ToolUpdate { tool: None, .. }
             | Entry::Plan { .. }
             | Entry::Unreadable { .. }
             | Entry::Findings { .. }
@@ -1076,8 +1101,14 @@ fn record_last_run(active: &mut File, number: u64) -> io::Result<()> {
     active.set_len(text.len() as u64)
 }
 
-/// A session update as a log entry; `None` for what the run panel does not show.
-fn entry_of(update: SessionUpdate, root: &Path) -> Option<Entry> {
+/// A session update as a log entry; `None` for what the run panel does not show. `kinds`
+/// holds each call's kind as last reported, for an update that does not name it: an execute
+/// call's command and exit code are kept, and no other call's.
+fn entry_of(
+    update: SessionUpdate,
+    root: &Path,
+    kinds: &HashMap<String, ToolKind>,
+) -> Option<Entry> {
     let entry = match update {
         SessionUpdate::AgentMessageChunk {
             content: ContentBlock::Text { text },
@@ -1089,22 +1120,52 @@ fn entry_of(update: SessionUpdate, root: &Path) -> Option<Entry> {
         SessionUpdate::AgentThoughtChunk {
             content: ContentBlock::Text { text },
         } => Entry::Thought { text },
-        SessionUpdate::ToolCall(call) => Entry::Tool {
-            id: call.tool_call_id,
-            title: call.title,
-            tool: call.kind,
-            status: call.status,
-            places: places(call.locations, root),
-            output: outputs(call.content, root),
-        },
-        SessionUpdate::ToolCallUpdate(update) => Entry::ToolUpdate {
-            id: update.tool_call_id,
-            title: update.title,
-            tool: update.kind,
-            status: update.status,
-            places: update.locations.map(|locations| places(locations, root)),
-            output: update.content.map(|content| outputs(content, root)),
-        },
+        SessionUpdate::ToolCall(call) => {
+            let execute = call.kind == ToolKind::Execute;
+            Entry::Tool {
+                command: call
+                    .raw_input
+                    .as_ref()
+                    .filter(|_| execute)
+                    .and_then(command_of),
+                exit: call
+                    .raw_output
+                    .as_ref()
+                    .filter(|_| execute)
+                    .and_then(|output| exit_of(call.status, output)),
+                id: call.tool_call_id,
+                title: call.title,
+                tool: call.kind,
+                status: call.status,
+                places: places(call.locations, root),
+                output: outputs(call.content, root),
+            }
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let kind = update
+                .kind
+                .or_else(|| kinds.get(&update.tool_call_id).copied());
+            let execute = kind == Some(ToolKind::Execute);
+            Entry::ToolUpdate {
+                command: update
+                    .raw_input
+                    .as_ref()
+                    .filter(|_| execute)
+                    .and_then(command_of),
+                exit: update
+                    .raw_output
+                    .as_ref()
+                    .filter(|_| execute)
+                    .zip(update.status)
+                    .and_then(|(output, status)| exit_of(status, output)),
+                id: update.tool_call_id,
+                title: update.title,
+                tool: update.kind,
+                status: update.status,
+                places: update.locations.map(|locations| places(locations, root)),
+                output: update.content.map(|content| outputs(content, root)),
+            }
+        }
         SessionUpdate::Plan { entries } => Entry::Plan {
             steps: entries
                 .into_iter()
@@ -1120,6 +1181,51 @@ fn entry_of(update: SessionUpdate, root: &Path) -> Option<Entry> {
         | SessionUpdate::Other => return None,
     };
     Some(entry)
+}
+
+/// The most bytes of a command the log keeps. A heredoc can be megabytes, and a log is read
+/// whole. Arbitrary: far above a command line a person reads, and the evidence compares whole
+/// commands, so one cut never matches a claim.
+const MAX_COMMAND: usize = 4096;
+
+/// The command line in an execute call's `rawInput`: its `command` field when that is a
+/// string with more than blanks, cut to [`MAX_COMMAND`] bytes with a note of its length.
+/// Claude's adapter and Grok both send a string there (seen 2026-11-25, through Postil's own
+/// connection); neither was seen to send an array, so an array is not read.
+fn command_of(raw_input: &Value) -> Option<String> {
+    let command = raw_input.get("command")?.as_str()?;
+    if command.trim().is_empty() {
+        return None;
+    }
+    if command.len() <= MAX_COMMAND {
+        return Some(command.to_owned());
+    }
+    let kept = &command[..command.floor_char_boundary(MAX_COMMAND)];
+    Some(format!("{kept}… ({} bytes in all)", command.len()))
+}
+
+/// The exit code a finished execute call reports in its `rawOutput`, seen 2026-11-25:
+/// - Grok's object has `exit_code`. Grok ends a command that exits non-zero as `completed`, so
+///   the code is the only sign it failed. Its updates while the command runs carry
+///   `exit_code` 0 too, so a call still running has none.
+/// - Claude's adapter ends such a command as `failed`, with text whose first line is
+///   `Exit code N`; a command that succeeds gets its bare output. That text is read only from
+///   a failed call: a command that succeeds can print the same words.
+fn exit_of(status: ToolCallStatus, raw_output: &Value) -> Option<i64> {
+    match status {
+        ToolCallStatus::Completed | ToolCallStatus::Failed => {}
+        ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::Other => {
+            return None;
+        }
+    }
+    if let Some(code) = raw_output.get("exit_code") {
+        return code.as_i64();
+    }
+    if status != ToolCallStatus::Failed {
+        return None;
+    }
+    let text = raw_output.as_str()?.strip_prefix("Exit code ")?;
+    text.lines().next()?.parse().ok()
 }
 
 fn places(locations: Vec<Location>, root: &Path) -> Vec<Place> {
@@ -1256,6 +1362,8 @@ mod tests {
             status,
             places: Vec::new(),
             output,
+            command: None,
+            exit: None,
         };
         let message = |text: &str, id: &str| Entry::Message {
             text: text.to_owned(),
@@ -1271,6 +1379,8 @@ mod tests {
                 status: Some(ToolCallStatus::Completed),
                 places: None,
                 output: Some(vec![diff("first")]),
+                command: None,
+                exit: None,
             },
             message("one ", "m1"),
             message("part", "m1"),

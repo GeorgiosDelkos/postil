@@ -1613,6 +1613,93 @@ fn a_log_without_an_end_reads_as_unfinished_and_torn_lines_spoil_only_themselves
     );
 }
 
+/// Each tool call of the run, in order, with its command and exit code as the page folds them:
+/// a later report replaces an earlier one.
+fn executions(run: &serde_json::Value) -> Vec<(String, Option<String>, Option<i64>)> {
+    let mut calls: Vec<(String, Option<String>, Option<i64>)> = Vec::new();
+    for entry in entries(run) {
+        if entry["kind"] != "tool" && entry["kind"] != "toolUpdate" {
+            continue;
+        }
+        let id = entry["id"].as_str().unwrap();
+        let index = calls
+            .iter()
+            .position(|call| call.0 == id)
+            .unwrap_or_else(|| {
+                calls.push((id.to_owned(), None, None));
+                calls.len() - 1
+            });
+        if let Some(command) = entry["command"].as_str() {
+            calls[index].1 = Some(command.to_owned());
+        }
+        if let Some(exit) = entry["exit"].as_i64() {
+            calls[index].2 = Some(exit);
+        }
+    }
+    calls
+}
+
+/// Claude's adapter and Grok report a command in different shapes (tests/fake-agent.mjs,
+/// "checks"); both are kept, and no other call's input is.
+#[test]
+fn an_execute_call_keeps_its_command_and_exit_code_and_no_other_call_does() {
+    let repo = TempRepo::new("run-checks");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "checks");
+    post_note(&site, "a.txt", 1, 1, "check it");
+    let (status, body) = send(&site, &["N1"]);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ended = wait_for(&site, &nudges, "ended");
+
+    let long = format!("echo {}", "x".repeat(5000));
+    let cut = format!("{}… (5005 bytes in all)", &long[..4096]);
+    let call = |id: &str, command: Option<&str>, exit: Option<i64>| {
+        (id.to_owned(), command.map(str::to_owned), exit)
+    };
+    assert_eq!(
+        executions(&ended),
+        [
+            // The update's command replaces the one before it, spacing and all; output that
+            // starts like Claude's failure text is no exit code on a completed call.
+            call("c1", Some("cargo  test"), None),
+            // Grok names the kind on an update, and ends a failure as completed.
+            call("c2", Some("cargo build"), Some(101)),
+            call("c3", Some(&cut), Some(2)),
+            // A read's input and output, though it names a command and an exit code.
+            call("r1", None, None),
+            call("e1", None, None),
+        ]
+    );
+    let c2_exits: Vec<_> = entries(&ended)
+        .iter()
+        .filter(|entry| entry["id"] == "c2")
+        .filter_map(|entry| entry["exit"].as_i64())
+        .collect();
+    assert_eq!(c2_exits, [101], "no exit code while the command runs");
+
+    drop(site);
+    assert_read_back(&repo, &ended);
+}
+
+/// A log written before commands were kept reads, its execute call without one.
+#[test]
+fn a_version_4_log_reads_without_commands() {
+    let repo = TempRepo::new("run-version-4");
+    let runs = repo.root.join(".git/postil/runs");
+    fs::create_dir_all(&runs).unwrap();
+    let header = header("R1").replace(r#""version":1"#, r#""version":4"#);
+    let tool = r#"{"kind":"tool","id":"c1","title":"cargo test","tool":"execute","status":"completed","places":[],"output":[]}"#;
+    fs::write(
+        runs.join("R1.jsonl"),
+        format!("{header}\n{tool}\n{{\"kind\":\"ended\",\"reason\":\"end_turn\"}}\n"),
+    )
+    .unwrap();
+
+    let run = get_json(&repo.site(), RUN);
+    assert_eq!(run["problem"], serde_json::Value::Null, "{run}");
+    assert_eq!(executions(&run), [("c1".to_owned(), None, None)]);
+}
+
 #[test]
 fn an_unreadable_newest_log_is_skipped_and_named() {
     let repo = TempRepo::new("run-skip");
@@ -1633,8 +1720,8 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         ("\n", "its first line is not a run header"),
         ("not a header\n", "its first line is not a run header"),
         (
-            r#"{"version":5,"id":"R3","newField":1}"#,
-            "it is version 5, and this build of Postil reads versions 1 to 4",
+            r#"{"version":6,"id":"R3","newField":1}"#,
+            "it is version 6, and this build of Postil reads versions 1 to 5",
         ),
         (
             &*header("R3").replace(

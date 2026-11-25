@@ -232,8 +232,11 @@ enum NoteState {
 - **A run** is an append-only `Vec<Entry>` (message part, thought, tool call, tool call
   change, plan, permission request and answer, end), the same lines as its log on disk. A
   tool call's later changes are entries of their own, and the page folds them into the call:
-  the log stays append-only, and the page fetches only the entries it has not seen. Section
-  "Runs" has the rest.
+  the log stays append-only, and the page fetches only the entries it has not seen. An
+  execute call also keeps its command line and, once it finished, its exit code (run log
+  version 5), so a run can show what it checked: agents report a failure differently, and
+  Grok ends a command that exits non-zero as `completed`, with the code only in its
+  `rawOutput`. Section "Runs" has the rest.
 - **State on disk** is one file, `<git dir>/postil/review.json`, written atomically on every
   change. It sits inside the git directory, so it is never committed and needs no `.gitignore`
   entry. An agent or script can read and write notes by editing this file; the app reloads it on

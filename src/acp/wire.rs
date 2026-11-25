@@ -267,6 +267,12 @@ pub(crate) struct ToolCall {
     pub(crate) content: Vec<ToolCallContent>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub(crate) locations: Vec<Location>,
+    /// The tool's input, in the agent's own shape: the run log reads an execute call's
+    /// command from it (`run/log.rs`, `command_of`).
+    pub(crate) raw_input: Option<Value>,
+    /// The tool's output, in the agent's own shape: the run log reads an execute call's exit
+    /// code from it (`run/log.rs`, `exit_of`).
+    pub(crate) raw_output: Option<Value>,
 }
 
 /// A change to a tool call: only the fields that changed are present.
@@ -280,6 +286,8 @@ pub(crate) struct ToolCallUpdate {
     pub(crate) status: Option<ToolCallStatus>,
     pub(crate) content: Option<Vec<ToolCallContent>>,
     pub(crate) locations: Option<Vec<Location>>,
+    pub(crate) raw_input: Option<Value>,
+    pub(crate) raw_output: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
