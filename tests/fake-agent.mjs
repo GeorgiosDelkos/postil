@@ -269,12 +269,14 @@ async function prompt(id, params) {
       writeFileSync(`${process.cwd()}/bin.dat`, Buffer.from([0, 1, 2, 255, 0, 7]));
       return send({ id, result: { stopReason: "end_turn" } });
     case "checks": {
-      // Execute calls in the shapes real agents sent on 2026-11-25 (docs/review-assist.md,
-      // "Open questions"). c1 as Claude's adapter: the kind only on the call, whose input is
-      // empty; the command in updates; output that happens to start like a failure.
+      // Execute calls in the shapes Claude's adapter 0.94.0 and Grok 1.0.92 sent on
+      // 2026-11-25 through Postil's own connection. c1 as Claude's adapter: the kind only on
+      // the call, whose input is empty; the command in updates, then a blank one, which keeps
+      // it; output that happens to start like a failure.
       update({ sessionUpdate: "tool_call", toolCallId: "c1", title: "Terminal", kind: "execute", status: "pending", rawInput: {} });
       update({ sessionUpdate: "tool_call_update", toolCallId: "c1", title: "cargo test", rawInput: { command: "cargo test" } });
       update({ sessionUpdate: "tool_call_update", toolCallId: "c1", rawInput: { command: "cargo  test", description: "Run the tests" } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c1", rawInput: { command: "  " } });
       update({ sessionUpdate: "tool_call_update", toolCallId: "c1", status: "completed", rawOutput: "Exit code 3\nis what the test printed" });
       // c2 as Grok: no kind on the call, then the kind and input on an update; exit_code 0
       // while it runs; a failure that ends as completed.

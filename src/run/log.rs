@@ -1187,8 +1187,7 @@ fn entry_of(
 }
 
 /// The most bytes of a command the log keeps. A heredoc can be megabytes, and a log is read
-/// whole. Arbitrary: far above a command line a person reads, and the evidence compares whole
-/// commands, so one cut never matches a claim.
+/// whole. Arbitrary: far above a command line a person reads.
 const MAX_COMMAND: usize = 4096;
 
 /// The command line in an execute call's `rawInput`: its `command` field when that is a
