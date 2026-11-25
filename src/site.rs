@@ -444,9 +444,10 @@ struct PreviewView {
     /// The files linked after the text, relative to the repository root. A folder note's
     /// folder is not among them (`notes::Prompt::files`).
     files: Vec<String>,
-    /// How many paths the engineer's working tree has changed since the last commit, which
-    /// the thread, started from that commit, does not see (docs/design.md, "Threads").
-    uncommitted: usize,
+    /// How many changes the engineer's working tree has since the last commit, as `git status`
+    /// lists them, which the thread, started from that commit, does not see (docs/design.md,
+    /// "Threads"); `None` when the status could not be read, which the page says.
+    uncommitted: Option<usize>,
     /// The linked files among them: their notes' lines may not match the agent's copy.
     uncommitted_noted: Vec<String>,
 }
@@ -955,9 +956,13 @@ impl Site {
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
         let prompt = self.runner()?.preview(&ids)?;
-        // One `git status` each time the send step reads the prompt, as long as one in a
-        // terminal. A status that cannot be read leaves the warning out, not the prompt.
-        let changed = self.repo()?.changed().unwrap_or_default();
+        // One `git status` each time the send step reads the prompt, on the request thread:
+        // as long as `git status` in a terminal ([`Repo::uncommitted`]). One that fails costs
+        // the warning, not the prompt.
+        let (uncommitted, changed) = match self.repo()?.uncommitted() {
+            Ok((count, paths)) => (Some(count), paths),
+            Err(_) => (None, Vec::new()),
+        };
         let uncommitted_noted = prompt
             .files
             .iter()
@@ -967,7 +972,7 @@ impl Site {
         Ok(to_json(&PreviewView {
             prompt: prompt.text,
             files: prompt.files,
-            uncommitted: changed.len(),
+            uncommitted,
             uncommitted_noted,
         }))
     }

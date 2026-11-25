@@ -356,9 +356,16 @@ export function notesTray({
   // thread starts from that commit and does not see them, and a noted file among them may not
   // have the note's lines in the agent's copy (docs/design.md, "Threads"). Null when clean.
   function uncommittedWarning(reply) {
-    if (!reply.uncommitted) return null;
-    const changes = reply.uncommitted === 1 ? "1 change" : `${reply.uncommitted} changes`;
+    if (reply.uncommitted === 0) return null;
     const warning = el("div", "send-warning");
+    // `git status` failed: the tree is not known to be clean, so the step does not say it is.
+    if (reply.uncommitted === null) {
+      const unknown =
+        "Could not check your working tree for uncommitted changes. The thread starts from the last commit.";
+      warning.append(el("div", "", unknown));
+      return warning;
+    }
+    const changes = reply.uncommitted === 1 ? "1 change" : `${reply.uncommitted} changes`;
     warning.append(
       el(
         "div",
@@ -369,7 +376,11 @@ export function notesTray({
     if (reply.uncommittedNoted.length) {
       const noted = reply.uncommittedNoted.join(", ");
       warning.append(
-        el("div", "", `Changed among the noted files: ${noted}. Their notes' lines may not match.`),
+        el(
+          "div",
+          "",
+          `Changed among the noted files: ${noted}. The agent's copy may not have their notes' lines, or the file at all.`,
+        ),
       );
     }
     return warning;

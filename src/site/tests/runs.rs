@@ -252,10 +252,14 @@ fn the_prompt_preview_is_the_text_the_agent_receives() {
     assert_eq!(clean["uncommitted"], 0, "{clean}");
     repo.write("src/a.rs", "fn a() {\n    one();\n// moved\n");
     repo.write("b.txt", "not noted\n");
+    // An untracked folder counts once, as `git status` shows it, whatever it holds.
+    fs::create_dir_all(repo.root.join("vendor")).unwrap();
+    repo.write("vendor/one.rs", "1\n");
+    repo.write("vendor/two.rs", "2\n");
 
     let preview = get_json(&site, &format!("{RUN}/preview?notes=N2,N1"));
     // The thread starts from the last commit: the send step says what it will not see.
-    assert_eq!(preview["uncommitted"], 2, "{preview}");
+    assert_eq!(preview["uncommitted"], 3, "{preview}");
     assert_eq!(preview["uncommittedNoted"], serde_json::json!(["src/a.rs"]));
     assert_eq!(
         preview["prompt"],
@@ -272,6 +276,16 @@ fn the_prompt_preview_is_the_text_the_agent_receives() {
          > fn a() {\n\
          >     one();\n\
          explain this\n"
+    );
+
+    // A noted file renamed away is still named: the agent's copy has it at the old path.
+    repo.git(&["add", "--all"]);
+    repo.git(&["mv", "src/a.rs", "src/c.rs"]);
+    let renamed = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    assert_eq!(
+        renamed["uncommittedNoted"],
+        serde_json::json!(["src/a.rs"]),
+        "{renamed}"
     );
 }
 

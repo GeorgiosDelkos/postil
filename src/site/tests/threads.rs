@@ -1097,15 +1097,22 @@ fn a_worktree_checks_out_only_what_the_engineer_s_sparse_checkout_does() {
     repo.write("src/x.rs", "x\n");
     fs::create_dir_all(repo.root.join("docs")).unwrap();
     repo.write("docs/y.md", "y\n");
-    let (site, nudges) = run_site(&repo, "plain");
+    // An agent that writes a file outside the patterns, as one adding a test or a doc does.
+    let (site, nudges) = run_site(&repo, "writes-deep");
     repo.git(&["sparse-checkout", "set", "--cone", "src"]);
     assert!(!repo.root.join("docs").exists());
     post_note(&site, "a.txt", 1, 1, "one");
 
     send(&site, &["N1"]);
-    wait_for(&site, &nudges, "ended");
+    let run = wait_for(&site, &nudges, "ended");
 
+    // Its file is committed, so the run has its snapshot after, and Apply takes it.
+    assert!(run.to_string().contains("\"point\":\"after\""), "{run}");
     let worktree = PathBuf::from(thread(&site, "R1")["path"].as_str().unwrap());
+    assert_eq!(
+        git_out(&worktree, &["show", "HEAD:outside/new.md"]),
+        "prompt 1"
+    );
     assert!(worktree.join("a.txt").is_file() && worktree.join("src/x.rs").is_file());
     assert!(
         !worktree.join("docs").exists(),
@@ -1116,6 +1123,12 @@ fn a_worktree_checks_out_only_what_the_engineer_s_sparse_checkout_does() {
     assert_eq!(thread(&site, "R1")["skipped"], serde_json::Value::Null);
     // The engineer's own patterns are theirs still.
     assert_eq!(git_out(&repo.root, &["sparse-checkout", "list"]), "src");
+    let (status, body) = end(&site, "apply", "R1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("outside/new.md")).unwrap(),
+        "prompt 1\n"
+    );
 
     // The older mode, of gitignore-style patterns: only `src/`, no top-level file.
     repo.git(&["sparse-checkout", "set", "--no-cone", "/src/"]);

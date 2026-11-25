@@ -713,6 +713,43 @@ impl Repo {
         git(&self.root, &args).map(drop)
     }
 
+    /// The engineer's changes since the last commit, for the warning at send: how many entries
+    /// `git status` lists, and every path they name, a rename's source and target both. An
+    /// untracked folder is one entry, as `git status` shows it, not one per file in it, so a
+    /// large one counts once and costs little. Takes no optional lock
+    /// (`--no-optional-locks`): the engineer may be committing in a terminal meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// The git error.
+    pub(crate) fn uncommitted(&self) -> Result<(usize, Vec<String>)> {
+        let status = run_git(
+            &self.root,
+            None,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=normal",
+            ],
+        )?;
+        let (mut entries, mut paths) = (0, Vec::new());
+        let mut fields = status.split_terminator('\0');
+        while let Some(field) = fields.next() {
+            entries += 1;
+            let (code, path) = field.split_at(field.len().min(3));
+            paths.push(path.to_owned());
+            // A rename's source follows it: a noted file renamed away is named too.
+            if code.starts_with(['R', 'C'])
+                && let Some(source) = fields.next()
+            {
+                paths.push(source.to_owned());
+            }
+        }
+        Ok((entries, paths))
+    }
+
     /// The paths with changes git would commit, as `git status` lists them: tracked files
     /// changed or deleted, and files that are neither tracked nor ignored. Empty when the
     /// working tree is clean. Ignored files are not listed.
@@ -758,10 +795,13 @@ impl Repo {
     ///
     /// The git errors, such as a missing `user.name`, or a working tree with no commit.
     pub(crate) fn commit_all(&self, message: &str) -> Result<String> {
-        // No hooks: writing the index runs `post-index-change`.
+        // No hooks: writing the index runs `post-index-change`. `--sparse` (git 2.34): in a
+        // worktree with a sparse checkout, which it takes from the engineer's, a file the agent
+        // writes outside the patterns is refused without it ("outside of your sparse-checkout
+        // definition"), and every later commit of the thread fails with it.
         git(
             &self.root,
-            &["-c", "core.hooksPath=/dev/null", "add", "--all"],
+            &["-c", "core.hooksPath=/dev/null", "add", "--all", "--sparse"],
         )?;
         // What was staged, not what `git status` lists: a submodule or a repository inside
         // the worktree with changes of its own is listed, but `git add` stages nothing for it,

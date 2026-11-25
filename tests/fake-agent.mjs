@@ -8,7 +8,15 @@
 // what the app sent without reading the agent's input itself.
 
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, readSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  readSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { createInterface } from "node:readline";
 
 const [scenario, ...extra] = process.argv.slice(2);
@@ -232,6 +240,11 @@ async function prompt(id, params) {
       // Changes the working tree for real, as an agent's edits do: one file changed, one new.
       writeFileSync(`${process.cwd()}/a.txt`, `a\nprompt ${prompts}\n`);
       writeFileSync(`${process.cwd()}/new.txt`, "new\n");
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "writes-deep":
+      // A new file in a folder of its own: outside the patterns of a sparse checkout.
+      mkdirSync(`${process.cwd()}/outside`, { recursive: true });
+      writeFileSync(`${process.cwd()}/outside/new.md`, `prompt ${prompts}\n`);
       return send({ id, result: { stopReason: "end_turn" } });
     case "reviewer-silent":
       // A proposer whose reply has no findings block.

@@ -612,12 +612,16 @@ patterns.
   Code do: those edits would otherwise land in the pull request. The fork commit is `HEAD` at
   send. When the checkout has uncommitted changes, the send step says the thread starts from
   the last commit and does not see them; when a noted file is among them, it adds that the
-  note's lines may not match. The preview reply carries both: the count of changed paths
-  (`git status`, untracked files included, ignored ones not) and the linked files among them,
-  so the step names no file of the engineer's that it does not need to. A repository with no
-  commit cannot send (422),
-  and the message says
-  it needs one commit first. A detached `HEAD` sends too, with no base branch: the thread can
+  note's lines may not match, or that the agent may not have the file. The preview reply
+  carries both: the count of entries `git status` lists (an untracked folder is one entry,
+  ignored files none), and the linked files among their paths, a rename's source included,
+  so the step names no file of the engineer's that it does not need to. The status runs on
+  the request thread at each tick, with `--no-optional-locks` so it never takes the
+  engineer's index lock; one that fails leaves the count unknown, and the step says it could
+  not check rather than showing a clean tree. A folder note is in the count only: the noted
+  files are the linked ones. A repository with no commit cannot send (422), and the message
+  says it needs one commit first. A detached `HEAD` sends too, with no base branch: the
+  thread can
   be applied but not opened as a pull request.
 - **The branch** is `postil/r<n>-<slug>`, the slug from the first note's text, lowercased to
   `[a-z0-9-]`, at most 40 characters, and `postil/r<n>` when nothing is left. Built from
@@ -642,7 +646,10 @@ patterns.
   and the disk. Git does this itself: `git worktree add`, run in the engineer's working tree
   as Postil runs it, copies that tree's sparse-checkout settings to the new one (git 2.36
   and later; tested with git 2.56, cone and not). Postil has no code for it, and a test
-  pins the behavior. An older git checks every file out. A worktree that cannot be made
+  pins the behavior. An older git checks every file out. An agent may write outside the
+  patterns (a new test or doc): Postil's commits stage with `git add --all --sparse` (git
+  2.34), since without it git refuses such a file and every later commit of the thread
+  fails. A worktree that cannot be made
   fails the run and takes the thread out of the record: its branch name may belong to a
   thread of another working tree of the repository, which deleting this thread's note would
   otherwise delete.
