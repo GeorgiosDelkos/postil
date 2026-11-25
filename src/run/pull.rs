@@ -116,12 +116,21 @@ impl Runner {
     /// [`Error::PullRequestRefused`] with the reason (module docs); as [`thread::check`], for
     /// work Postil did not commit; and the git errors.
     pub(crate) fn open_pull_request(self: &Arc<Self>, id: &str) -> Result<()> {
-        let opening = self.check_opening(id)?;
-        if !self.start_pull_work(id, PullWork::Opening) {
+        // Before the thread's lock, which an opening of this window holds: taking it again
+        // would wait out its patience and blame another window.
+        if lock(&self.pull_work)
+            .get(id)
+            .is_some_and(|work| !matches!(work, PullWork::Failed { .. }))
+        {
             return Err(Error::BadRequest(format!(
                 "the pull request of {id} is being opened or read"
             )));
         }
+        let opening = self.check_opening(id)?;
+        let started = self.start_pull_work(id, PullWork::Opening);
+        // Requests run one at a time on the request thread, and a job only clears its work or
+        // marks it failed, so the work found absent above is still absent.
+        debug_assert!(started, "no work under way for {id}, checked above");
         let runner = Arc::clone(self);
         let thread_id = id.to_owned();
         self.spawn_pull_work(id, move |search_path| {
@@ -180,29 +189,29 @@ impl Runner {
                 pull.url
             )));
         }
-        let refused = |why: String| Error::PullRequestRefused(why);
         // The record is a file a hand edit can change: only Postil's branches are pushed.
         if !thread.branch.starts_with("postil/") {
-            return Err(refused(format!(
+            return Err(Error::PullRequestRefused(format!(
                 "its branch {} is not one of Postil's (postil/...)",
                 thread.branch
             )));
         }
         let local = thread.base.clone().ok_or_else(|| {
-            refused(
+            Error::PullRequestRefused(
                 "the thread started from a detached HEAD, so it has no branch to merge into"
                     .to_owned(),
             )
         })?;
-        let upstream = self
-            .repo
-            .upstream(&local)?
-            .ok_or_else(|| refused(format!("{local} tracks no remote, and there is no origin")))?;
+        let upstream = self.repo.upstream(&local)?.ok_or_else(|| {
+            Error::PullRequestRefused(format!("{local} tracks no remote, and there is no origin"))
+        })?;
         let (remote, base) = (upstream.remote, upstream.branch);
         let on_remote = self
             .repo
             .remote_branch_commit(&remote, &base)?
-            .ok_or_else(|| refused(format!("{base} is not on {remote}: push {local} first")))?;
+            .ok_or_else(|| {
+                Error::PullRequestRefused(format!("{base} is not on {remote}: push {local} first"))
+            })?;
         let unpushed = self
             .repo
             .commits_between(&on_remote, &thread.fork, LISTED_COMMITS + 1)?;
@@ -213,7 +222,7 @@ impl Runner {
                 ""
             };
             let listed = &unpushed[..unpushed.len().min(LISTED_COMMITS)];
-            return Err(refused(format!(
+            return Err(Error::PullRequestRefused(format!(
                 "the thread starts from commits of {local} that {remote} does not have, which \
                  the pull request would show ({}{more}): push {local} first",
                 listed.join("; ")

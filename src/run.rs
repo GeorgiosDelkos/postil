@@ -1556,7 +1556,9 @@ impl Runner {
     /// stage starts with no request from the page, or a pull request being opened. Closing the
     /// project does not stop an opening: it finishes and records its URL.
     pub(crate) fn busy(&self) -> bool {
-        self.slots().busy() || self.opening_pull_request()
+        // The slots are let go before `pull_work` is taken: the two are never held together.
+        let running = self.slots().busy();
+        running || self.opening_pull_request()
     }
 
     /// Stops every agent, running or starting, and ignores anything they would still report:

@@ -199,6 +199,40 @@ fn a_pull_request_needs_the_base_branch_on_the_remote_with_every_commit_the_thre
         "{body}"
     );
     assert!(thread(&site, "R2")["pullRequestWork"].is_null());
+
+    // Many such commits: the first ten are listed.
+    for n in 0..10 {
+        repo.git(&[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--message",
+            &format!("Also {n}"),
+        ]);
+    }
+    sent(&site, &nudges, "three");
+    let (status, body) = ask(&site, "pr", "R3");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("Also 9") && body.contains(", and more)"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("Only here"),
+        "the eleventh is left out: {body}"
+    );
+
+    // A record edited by hand to name a branch that is not Postil's: never pushed.
+    let file = repo.root.join(".git/postil/threads.json");
+    let text = fs::read_to_string(&file).unwrap();
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    fs::write(&file, text.replace(&format!("\"{branch}\""), "\"trunk\"")).unwrap();
+    let (status, body) = ask(&site, "pr", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("branch trunk is not one of Postil's"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -250,13 +284,15 @@ fn a_thread_cannot_be_ended_while_its_pull_request_is_being_opened() {
     let (_repo, site, nudges, gh, _bare) = published("pull-held");
     sent(&site, &nudges, "one");
     fs::write(gh.join("hold"), "").unwrap();
+    // The thread's lock is taken before the reply; `hold` keeps gh, and the job, from ending.
     assert_eq!(ask(&site, "pr", "R1").0, StatusCode::OK);
-    // The push may still be running; gh waits on `hold` once it starts.
-    let deadline = Instant::now() + WAIT;
-    while !gh.join("calls").exists() {
-        assert!(Instant::now() < deadline, "gh never ran");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+
+    let (status, body) = ask(&site, "pr", "R1");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("is being opened"),
+        "not another window's: {body}"
+    );
 
     let (status, body) = end(&site, "discard", "R1");
     assert_eq!(status, StatusCode::CONFLICT, "{body}");

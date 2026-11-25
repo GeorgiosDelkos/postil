@@ -56,10 +56,8 @@ pub(crate) fn create(
         }),
         // One the record lacks (a write that failed, a quit, another window): gh names it
         // ("a pull request for branch ... already exists:" and the URL), and it is the one.
-        Err(Error::GitHub { message, .. })
-            if message.contains("already exists") && pull_request_url(&message).is_some() =>
-        {
-            Ok(pull_request_url(&message).expect("checked by the guard"))
+        Err(Error::GitHub { command, message }) if message.contains("already exists") => {
+            pull_request_url(&message).ok_or(Error::GitHub { command, message })
         }
         Err(error) => Err(error),
     }
