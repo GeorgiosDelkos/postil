@@ -105,6 +105,22 @@ test("a tool call's changes apply to it in place, and only the fields they set",
   assert.deepEqual(items[0].output, [diff]);
 });
 
+test("an update's command and exit code replace the call's, and a later one wins", () => {
+  const run = (command, exit) => ({ kind: "toolUpdate", id: "c1", command, exit });
+  const { items } = foldRun([
+    tool("c1", { tool: "execute", command: "cargo test" }),
+    run("cargo test --all", undefined),
+    run(undefined, 0),
+    run("cargo  test", null),
+  ]);
+  assert.deepEqual([items[0].command, items[0].exit], ["cargo  test", 0], "an exit code of 0 kept");
+  assert.deepEqual(
+    [foldRun([tool("c2")]).items[0].command, foldRun([tool("c2")]).items[0].exit],
+    [null, null],
+    "a call with neither, as in a log before version 5",
+  );
+});
+
 test("a repeated tool call replaces the first; a change to an unknown call shows by id", () => {
   const { items } = foldRun([
     tool("t1"),
@@ -191,6 +207,8 @@ function randomEntries(seed) {
       status: maybe(pick(["in_progress", "completed"])),
       places: maybe([{ path: "a", line: 1 }]),
       output: maybe([{ type: "text", text: "out" }]),
+      command: maybe(pick(["cargo test", "make"])),
+      exit: maybe(pick([0, 1])),
     }),
     () => ({ kind: "plan", steps: [{ content: pick(["x", "y"]), status: "pending" }] }),
     () => ({

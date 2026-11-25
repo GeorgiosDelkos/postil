@@ -281,6 +281,36 @@ async function prompt(id, params) {
       renameSync(`${process.cwd()}/c.txt`, `${process.cwd()}/d.txt`);
       writeFileSync(`${process.cwd()}/bin.dat`, Buffer.from([0, 1, 2, 255, 0, 7]));
       return send({ id, result: { stopReason: "end_turn" } });
+    case "checks": {
+      // Execute calls in the shapes Claude's adapter 0.94.0 and Grok 1.0.92 sent on
+      // 2026-11-25 through Postil's own connection. c1 as Claude's adapter: the kind only on
+      // the call, whose input is empty; the command in updates, then a blank one, which keeps
+      // it; output that happens to start like a failure.
+      update({ sessionUpdate: "tool_call", toolCallId: "c1", title: "Terminal", kind: "execute", status: "pending", rawInput: {} });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c1", title: "cargo test", rawInput: { command: "cargo test" } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c1", rawInput: { command: "cargo  test", description: "Run the tests" } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c1", rawInput: { command: "  " } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c1", status: "completed", rawOutput: "Exit code 3\nis what the test printed" });
+      // c2 as Grok: no kind on the call, then the kind and input on an update; exit_code 0
+      // while it runs; a failure that ends as completed.
+      update({ sessionUpdate: "tool_call", toolCallId: "c2", title: "run_terminal_command", rawInput: { command: "cargo build" } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c2", kind: "execute", title: "Execute `cargo build`", rawInput: { variant: "Bash", command: "cargo build" } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c2", status: "in_progress", rawOutput: { exit_code: 0 } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c2", status: "completed", rawOutput: { exit_code: 101 } });
+      // c3 as Claude's adapter when a command fails; a command too long to keep whole.
+      update({ sessionUpdate: "tool_call", toolCallId: "c3", title: "Terminal", kind: "execute", status: "pending", rawInput: {} });
+      // Two-byte characters, so byte 4096 falls inside one.
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c3", rawInput: { command: `echo ${"é".repeat(2600)}` } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "c3", status: "failed", rawOutput: "Exit code 2\nno" });
+      // c4 reported whole in one call: kind, command and exit code together, a success.
+      update({ sessionUpdate: "tool_call", toolCallId: "c4", title: "make", kind: "execute", status: "completed", rawInput: { command: "make" }, rawOutput: { exit_code: 0 } });
+      // A read whose input has a command field, before and after: not an execute call.
+      update({ sessionUpdate: "tool_call", toolCallId: "r1", title: "Read a.txt", kind: "read", status: "pending", rawInput: { command: "read", path: "a.txt" } });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "r1", status: "completed", rawInput: { command: "read" }, rawOutput: { exit_code: 1 } });
+      // An edit after the first check.
+      update({ sessionUpdate: "tool_call", toolCallId: "e1", title: "Edit a.txt", kind: "edit", status: "completed", content: [{ type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "b" }] });
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "reject-only": {
       // No option allows, so Postil cannot answer it alone: the engineer does.
       const reply = await ask("session/request_permission", {

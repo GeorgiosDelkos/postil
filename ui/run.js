@@ -112,6 +112,10 @@ function foldMore(base, entries) {
           status: entry.status,
           places: entry.places,
           output: entry.output,
+          // An execute call's command line and exit code, when the agent reports them; logs
+          // before version 5 have neither (src/run/log.rs).
+          command: entry.command ?? null,
+          exit: entry.exit ?? null,
         };
         // An agent may report the same call twice; the second report replaces the first.
         const known = tools.get(entry.id);
@@ -133,10 +137,12 @@ function foldMore(base, entries) {
             status: "pending",
             places: [],
             output: [],
+            command: null,
+            exit: null,
           });
         }
         const tool = own(tools.get(entry.id));
-        for (const field of ["title", "tool", "status", "places", "output"]) {
+        for (const field of ["title", "tool", "status", "places", "output", "command", "exit"]) {
           if (entry[field] !== null && entry[field] !== undefined) tool[field] = entry[field];
         }
         break;

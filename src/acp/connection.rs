@@ -1159,6 +1159,8 @@ mod tests {
                     path: in_checkout("src/a.rs"),
                     line: Some(3),
                 }],
+                raw_input: None,
+                raw_output: None,
             }))
         );
         // A kind newer than the pinned schema reads as Other instead of losing the call.
