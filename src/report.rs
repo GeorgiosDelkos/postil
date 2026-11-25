@@ -14,12 +14,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::anchor::LineRange;
-use crate::review::last_json_block_in;
+use crate::review::last_json_block_and_span;
 
 /// What the prompt of notes asks of the agent's last words (`notes::prompt`). In words, never
 /// as an example block, which a reply quoting the prompt would hand back as a report. Tried
 /// on Claude and Grok, 10 runs each, on 2026-11-25: every reply held a report that reads
-/// (docs/review-assist.md, "Open questions", 11).
+/// (docs/review-assist.md, "Open questions", 11). Reviewers are shown a run's prompt without
+/// it (`review.rs`, `context`), found by this exact text: a run logged before a change to it
+/// keeps the old ask in what its reviewers read.
 pub(crate) const ASK: &str = "Then end your reply with a report for the engineer who reviews \
      your changes: one JSON object in a code block fenced as json, the last thing in your \
      reply. Its field steps is the order in which to read your changes, cause before effect \
@@ -55,11 +57,11 @@ pub(crate) struct Report {
     pub(crate) steps: Vec<Step>,
     /// The commands the agent says it ran to check its work.
     pub(crate) checks: Vec<Check>,
-    /// How many steps and checks the agent wrote that were left out or shortened: a step
-    /// whose path is missing or leaves the repository, or whose lines on a file that is
-    /// there are missing or no range; a check with no command or no claim; a `why` cut; a
-    /// limit passed. A missing `why` is kept empty and a missing `risk` read as `eyes`,
-    /// uncounted.
+    /// How many steps and checks the agent wrote that were left out: a step whose path is
+    /// missing or leaves the repository, or whose lines on a file that is there are missing or
+    /// no range; a check with no command or no claim; any past a limit. Not counted, since
+    /// what is kept shows it: a `why` cut to [`MAX_WHY`] (it ends in "…"), a missing `why`
+    /// (empty), a missing or unknown `risk` (`eyes`).
     pub(crate) cut: usize,
     /// The block as the reply holds it, from its fence to its closing fence: the page leaves
     /// exactly this out of the reply it draws, rather than finding the block again by a rule
@@ -82,7 +84,7 @@ pub(crate) struct Step {
 }
 
 /// How much a step needs the engineer, as the agent rates it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Risk {
     /// Needs the engineer's judgment. Also a rating Postil does not know: the safe reading.
@@ -101,7 +103,7 @@ pub(crate) struct Check {
     pub(crate) result: Claimed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Claimed {
     Passed,
@@ -119,7 +121,7 @@ pub(crate) enum Claimed {
 /// nor `checks`, or with either not a list.
 pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
     // A map and not a struct: serde reads a struct from an array too, by position.
-    let (object, span): (Map<String, Value>, _) = last_json_block_in(reply)?;
+    let (object, span): (Map<String, Value>, _) = last_json_block_and_span(reply)?;
     let list = |key: &str| match object.get(key) {
         None => Ok(None),
         Some(Value::Array(items)) => Ok(Some(items.as_slice())),
@@ -142,18 +144,15 @@ pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
             continue;
         }
         match step(value, root) {
-            Some((step, shortened)) => {
-                cut += usize::from(shortened);
-                kept_steps.push(step);
-            }
+            Some(step) => kept_steps.push(step),
             None => cut += 1,
         }
     }
     let mut kept_checks = Vec::new();
     for value in checks {
-        match check(value) {
-            Some(check) if kept_checks.len() < MAX_CHECKS => kept_checks.push(check),
-            Some(_) | None => cut += 1,
+        match check(value).filter(|_| kept_checks.len() < MAX_CHECKS) {
+            Some(check) => kept_checks.push(check),
+            None => cut += 1,
         }
     }
     Ok(Report {
@@ -164,8 +163,8 @@ pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
     })
 }
 
-/// One step, and whether its `why` was shortened; `None` when it cannot be used.
-fn step(value: &Value, root: &Path) -> Option<(Step, bool)> {
+/// One step; `None` when it cannot be used.
+fn step(value: &Value, root: &Path) -> Option<Step> {
     let path = repo_path(value.get("path")?.as_str()?, root)?;
     // A file the run deleted has no new side to name lines on.
     let lines = if root.join(&path).symlink_metadata().is_ok() {
@@ -174,8 +173,7 @@ fn step(value: &Value, root: &Path) -> Option<(Step, bool)> {
         None
     };
     let why = value.get("why").and_then(Value::as_str).unwrap_or_default();
-    let shortened = why.chars().count() > MAX_WHY;
-    let why = if shortened {
+    let why = if why.chars().count() > MAX_WHY {
         let kept: String = why.chars().take(MAX_WHY).collect();
         format!("{kept}…")
     } else {
@@ -185,13 +183,12 @@ fn step(value: &Value, root: &Path) -> Option<(Step, bool)> {
         .get("risk")
         .and_then(|risk| Risk::deserialize(risk).ok())
         .unwrap_or(Risk::Eyes);
-    let step = Step {
+    Some(Step {
         path,
         lines,
         why,
         risk,
-    };
-    Some((step, shortened))
+    })
 }
 
 fn check(value: &Value) -> Option<Check> {
@@ -350,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rating_postil_does_not_know_is_eyes_and_a_long_why_is_cut_and_counted() {
+    fn a_rating_postil_does_not_know_is_eyes_and_a_long_why_is_cut_at_the_limit() {
         let dir = root("report-fields");
         let risk = |risk: Value| {
             one_step(
@@ -370,13 +367,15 @@ mod tests {
         let block = json!({"steps": [{"path": "a.txt", "lines": [1, 1], "why": long}]});
         let report = read(&reply(&block), dir.path()).unwrap();
         assert_eq!(report.steps[0].why, format!("{}…", "x".repeat(MAX_WHY)));
-        assert_eq!(report.cut, 1, "kept, and counted as shortened");
-        let block =
-            json!({"steps": [{"path": "a.txt", "lines": [1, 1], "why": "x".repeat(MAX_WHY)}]});
         assert_eq!(
-            read(&reply(&block), dir.path()).unwrap().cut,
-            0,
-            "at the limit"
+            report.cut, 0,
+            "kept, and not counted: the ellipsis shows it"
+        );
+        let at_limit = "x".repeat(MAX_WHY);
+        let block = json!({"steps": [{"path": "a.txt", "lines": [1, 1], "why": at_limit}]});
+        assert_eq!(
+            read(&reply(&block), dir.path()).unwrap().steps[0].why,
+            at_limit
         );
     }
 
@@ -437,7 +436,8 @@ mod tests {
     }
 
     /// Lists of steps of random shapes, from a seeded generator so a failure repeats. Against
-    /// a model of what `read` promises: every step is kept or counted, never both or neither;
+    /// a model of what `read` promises: every step is kept or counted, never both or neither
+    /// (a shortened `why` is kept and not counted);
     /// a kept path is relative, inside the repository, and written as git writes it; kept
     /// lines are ordered from 1.
     #[test]

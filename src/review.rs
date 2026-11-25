@@ -231,7 +231,7 @@ pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, Str
 /// Why no block could be read: the reply has none, or none parses as a `T` (the last block's
 /// problem is given).
 pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, String> {
-    last_json_block_in(reply).map(|(value, _)| value)
+    last_json_block_and_span(reply).map(|(value, _)| value)
 }
 
 /// [`last_json_block`], and where in `reply` the block is: from its fence to the end of its
@@ -240,7 +240,7 @@ pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, Str
 /// # Errors
 ///
 /// As [`last_json_block`].
-pub(crate) fn last_json_block_in<T: DeserializeOwned>(
+pub(crate) fn last_json_block_and_span<T: DeserializeOwned>(
     reply: &str,
 ) -> Result<(T, Range<usize>), String> {
     const FENCE: &str = "```json";
@@ -358,7 +358,7 @@ mod tests {
     fn debug_output_shows_the_work_s_sizes_and_paths_never_its_text() {
         let shown = format!("{:?}", work());
         assert!(shown.contains("src/a.rs"), "{shown}");
-        for secret in ["rename one", "renamed one to two", "two();"] {
+        for secret in ["rename one", "renamed one to two", "two();", "secret why"] {
             assert!(!shown.contains(secret), "{shown}");
         }
     }

@@ -381,7 +381,8 @@ test("the run dialog keeps its key while the agent streams its reply and thought
 });
 
 const fenced = (json) => "```json\n" + json + "\n```";
-const reportEntry = (report, problem = null) => ({ kind: "report", report, problem });
+const reportEntry = (report, problem = null) =>
+  report ? { kind: "report", report } : { kind: "noReport", problem };
 
 // The block as src/report.rs keeps it, closed in whichever way the agent closed it.
 const report = fenced('{"steps": [], "checks": []}');
@@ -401,6 +402,12 @@ test("the report block the server read is left out of the reply, and only it", (
     `Use this:\n\n${config}`,
   );
   assert.equal(withoutReport(`${report}\nAgain:\n${report}`, report), `${report}\nAgain:`);
+  // The server reads only a fence that starts a line: the same text repeated inside a line is
+  // prose, and stays.
+  assert.equal(
+    withoutReport(`N1: done\n\n${report}\n\nRepeated inline: ${report} end.`, report),
+    `N1: done\n\nRepeated inline: ${report} end.`,
+  );
   const unclosed = '```json\n{"checks": []}';
   assert.equal(
     withoutReport(`Done.\n${unclosed}\nThen I ran ruff.`, unclosed),

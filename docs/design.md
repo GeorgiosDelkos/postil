@@ -373,8 +373,10 @@ the linked files as `GET /api/run/preview` returns them (`files`).
 The paragraph that asks for the author's report (`report::ASK`, shortened above) gives
 its shape in words, never as an example block, which a reply quoting the prompt would hand
 back. As a run of notes or a follow-up ends well, Postil reads the report from the reply and
-logs it as a `report` entry (run log version 6; `docs/review-assist.md`, "The author's
-report"). A follow-up's prompt, the engineer's words alone, ends with a one-line reminder.
+logs it with the end as a `report` entry, or a `noReport` entry saying why there is none
+(run log version 6; `docs/review-assist.md`, "The author's report"). A follow-up's prompt,
+the engineer's words alone, ends with a one-line reminder, or with the whole ask when its
+thread started before reports.
 
 ### Runs
 

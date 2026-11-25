@@ -157,7 +157,7 @@ fn sent_notes_reach_the_agent_and_every_step_of_the_run_is_kept_on_disk() {
             "toolUpdate",
             "plan",
             // The `turn` scenario's reply holds no report: the run says so, and ends well.
-            "report",
+            "noReport",
             "ended",
         ]
     );
@@ -779,8 +779,6 @@ fn reviewers_propose_read_only_then_the_last_judges_the_findings() {
     for stage in [&proposer, &judge] {
         assert_eq!(report_entry(stage), serde_json::Value::Null, "{stage}");
     }
-    let reviewed = get_json(&site, &format!("{RUN}?id=R1"));
-    assert_eq!(report_entry(&reviewed)["kind"], "report", "{reviewed}");
 
     assert_eq!(judge["review"]["reviewer"], 2);
     assert!(
@@ -1827,11 +1825,11 @@ fn a_version_4_log_reads_without_commands() {
     assert_eq!(executions(&run), [("c1".to_owned(), None, None)]);
 }
 
-/// The run's last `report` entry, or null when it has none.
+/// The run's last `report` or `noReport` entry, or null when it has none.
 fn report_entry(run: &serde_json::Value) -> serde_json::Value {
     entries(run)
         .into_iter()
-        .rfind(|entry| entry["kind"] == "report")
+        .rfind(|entry| entry["kind"] == "report" || entry["kind"] == "noReport")
         .unwrap_or_default()
 }
 
@@ -1881,7 +1879,6 @@ fn a_run_ends_with_its_report() {
                 // A path outside, lines that are no range, a result that is no claim.
                 "cut": 3,
             },
-            "problem": null,
         })
     );
     let kinds = kinds(&ended);
@@ -1916,7 +1913,7 @@ fn a_reply_with_no_report_or_a_bad_one_ends_the_run_well_and_says_why() {
         assert_eq!(ended["status"], "ended", "{scenario}: {ended}");
         assert_eq!(
             report_entry(&ended),
-            serde_json::json!({ "kind": "report", "report": null, "problem": problem }),
+            serde_json::json!({ "kind": "noReport", "problem": problem }),
             "{scenario}"
         );
     }

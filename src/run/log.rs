@@ -22,7 +22,7 @@
 //! killed while it ran, or another window is running it. Closing the project or quitting ends
 //! a run under way as failed (`Runner::close`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -156,7 +156,8 @@ pub(super) enum Origin {
 }
 
 /// A follow-up run's link to its thread: `of` is the run it follows, `text` what the engineer
-/// wrote. The prompt holds more when a fresh agent had to be told the thread first.
+/// wrote. The prompt holds more than `text`: a kept agent's ends with the reminder to report
+/// (`report::ASK_AGAIN`), and a fresh agent's starts with the thread so far.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct FollowUp {
@@ -258,11 +259,10 @@ pub(crate) enum Entry {
         problem: Option<String>,
     },
     /// The author's report, read from the reply of a run that is not a review stage when its
-    /// turn ended well (`report::read`); `problem` says why none could be read.
-    Report {
-        report: Option<Report>,
-        problem: Option<String>,
-    },
+    /// turn ended well (`report::read`), logged with the run's end.
+    Report { report: Report },
+    /// Where a [`Entry::Report`] would be: why no report could be read.
+    NoReport { problem: String },
     /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]), taken before the
     /// agent gets the prompt or as its turn ends.
     ///
@@ -590,16 +590,19 @@ impl Run {
     /// Records an agent's event, and returns the notes to mark sent now: the first sign that
     /// the agent took the turn (an update, a permission request, or a stop other than a
     /// refusal) releases them. A turn that fails or is refused at once leaves them open.
-    /// `answer`, the event's auto-answer, is recorded with it, at once.
+    /// `answer`, the event's auto-answer, is recorded with it, at once; `report`, the author's
+    /// report of a turn that ended well, just before it.
     pub(super) fn record_event(
         &self,
         event: Event,
+        report: Option<Entry>,
         answer: Option<Entry>,
         root: &Path,
     ) -> Option<Vec<String>> {
-        // One hold of the state for the event, its answer and the notes: a reader sees both
-        // entries or neither, and a run that ended meanwhile neither takes the event nor marks
-        // its notes sent. Taken first, since an update is read by the kind of its call.
+        // One hold of the state for the event, its report, its answer and the notes: a reader
+        // sees all the entries or none, and a run that ended meanwhile (a forced stop, a close)
+        // takes none of them, nor marks its notes sent. Taken first, since an update is read by
+        // the kind of its call.
         let mut state = self.state();
         if !state.live() {
             return None;
@@ -646,7 +649,7 @@ impl Run {
                     reason: StopReason::Refusal
                 }
         );
-        for entry in std::iter::once(entry).chain(answer) {
+        for entry in report.into_iter().chain([entry]).chain(answer) {
             self.write(&mut state, entry);
         }
         if took_turn {
@@ -715,31 +718,40 @@ impl RunState {
     }
 
     /// The agent's reply: its message parts joined, a blank line between messages.
+    ///
+    /// Folded as the page folds it (`ui/run.js`, `foldRun`; `ui/status.js`, `replyText`), so
+    /// the two read the same text: a part joins the message before it when it has the same
+    /// message id (or none) and no step was drawn between them, and each message is trimmed.
+    /// A step drawn is a thought, a request, an unreadable message, a failure, or a tool call
+    /// the run has not seen before; a repeated report of a known call changes its step in
+    /// place. Without this, an agent with no message ids would run a report's fence on from the
+    /// text before a tool call, and no block would start a line; and the block the report
+    /// keeps would not be found in the page's text.
     pub(super) fn reply(&self) -> String {
-        let mut reply = String::new();
-        // The message the next part joins: the last part's, until a step comes between.
-        let mut joins: Option<&Option<String>> = None;
+        let mut messages: Vec<String> = Vec::new();
+        // The id of the last thing drawn, when it is a message.
+        let mut last: Option<&Option<String>> = None;
+        let mut calls: HashSet<&str> = HashSet::new();
         for entry in &self.entries {
             match entry {
-                Entry::Message { text, message } => {
-                    if !reply.is_empty() && joins != Some(message) {
-                        reply.push_str("\n\n");
+                Entry::Message { text, message } => match messages.last_mut() {
+                    Some(open) if last == Some(message) => open.push_str(text),
+                    _ => {
+                        messages.push(text.clone());
+                        last = Some(message);
                     }
-                    reply.push_str(text);
-                    joins = Some(message);
+                },
+                Entry::Tool { id, .. } | Entry::ToolUpdate { id, .. } => {
+                    if calls.insert(id) {
+                        last = None;
+                    }
                 }
-                // A step drawn between two parts ends the message, as the page folds them
-                // (`ui/run.js`, `foldRun`): an agent with no message ids would otherwise run
-                // a report's fence on from the text before a tool call, and no block would
-                // start a line.
                 Entry::Thought { .. }
-                | Entry::Tool { .. }
                 | Entry::Permission { .. }
                 | Entry::Question { .. }
                 | Entry::Unreadable { .. }
-                | Entry::Failed { .. } => joins = None,
+                | Entry::Failed { .. } => last = None,
                 Entry::Started
-                | Entry::ToolUpdate { .. }
                 | Entry::Plan { .. }
                 | Entry::Answer { .. }
                 | Entry::Reply { .. }
@@ -747,10 +759,15 @@ impl RunState {
                 | Entry::Ended { .. }
                 | Entry::Findings { .. }
                 | Entry::Report { .. }
+                | Entry::NoReport { .. }
                 | Entry::Snapshot { .. } => {}
             }
         }
-        reply
+        messages
+            .iter()
+            .map(|message| message.trim())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// The run's work as a reviewer reads it: its prompt, its reply, the diffs of its
@@ -802,7 +819,7 @@ impl RunState {
             })
             .collect();
         let report = self.entries.iter().rev().find_map(|entry| match entry {
-            Entry::Report { report, .. } => report.clone(),
+            Entry::Report { report } => Some(report.clone()),
             _ => None,
         });
         Work {
@@ -854,6 +871,7 @@ impl RunState {
             | Entry::Unreadable { .. }
             | Entry::Findings { .. }
             | Entry::Report { .. }
+            | Entry::NoReport { .. }
             | Entry::Snapshot { .. } => {}
         }
     }
@@ -1435,7 +1453,10 @@ mod tests {
             unnamed("three "),
             unnamed("joined"),
             tool("t3", ToolCallStatus::Completed, Vec::new()),
-            unnamed("```json"),
+            unnamed("```json\n"),
+            // A known call reported again changes its step in place: the message goes on.
+            tool("t3", ToolCallStatus::Completed, Vec::new()),
+            unnamed("{}\n```  "),
         ] {
             run.record(entry);
         }
@@ -1443,7 +1464,10 @@ mod tests {
         let work = run.state().work();
         let afters: Vec<_> = work.diffs.iter().map(|diff| diff.after.as_str()).collect();
         assert_eq!(afters, ["first", "second"], "the update reached t1 only");
-        assert_eq!(work.reply, "one part\n\ntwo\n\nthree joined\n\n```json");
+        assert_eq!(
+            work.reply, "one part\n\ntwo\n\nthree joined\n\n```json\n{}\n```",
+            "each message trimmed, as the page shows it"
+        );
         drop(run);
         drop(fs::remove_dir_all(dir.parent().unwrap()));
     }

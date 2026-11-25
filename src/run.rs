@@ -2040,10 +2040,12 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         if ends_turn {
             runner.record_end_snapshot(&run, thread.as_ref());
         }
-        if ended_well {
-            record_report(&run, root);
-        }
-        if let Some(ids) = run.record_event(event, answer, root) {
+        let report = if ended_well {
+            report_entry(&run, root)
+        } else {
+            None
+        };
+        if let Some(ids) = run.record_event(event, report, answer, root) {
             runner.mark_sent(&run, &ids);
         }
     }
@@ -2244,31 +2246,41 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     write!(
         prompt,
         "\nThe engineer now asks:\n\n{text}\n\n{}",
-        report::ASK_AGAIN
+        report_ask(&thread[0].state().header.prompt)
     )
     .expect("writing to a String cannot fail");
     prompt
 }
 
-/// Logs the author's report of `run`, read from its reply in `root` (`report::read`), when
-/// its turn ended well: before the end is logged, which closes the log. A review stage logs
-/// findings instead. Asks the file system whether each step's path exists, so it is never
-/// called under the `Slots` lock.
-fn record_report(run: &Run, root: &Path) {
+/// What ends a fresh agent's follow-up prompt, given the prompt the thread started with: a
+/// reminder of the report that prompt asked for, or the whole ask when it asked for none (a
+/// thread from before reports, run log version 5 and older).
+fn report_ask(first_prompt: &str) -> &'static str {
+    if first_prompt.contains(report::ASK) {
+        report::ASK_AGAIN
+    } else {
+        report::ASK
+    }
+}
+
+/// The entry that logs the author's report of `run`, a turn that ended well, read from its
+/// reply in `root` (`report::read`); `None` for a review stage, which logs findings instead.
+/// The caller logs it with the run's end, under one hold of the run: a forced stop or a close
+/// that ends the run first takes neither. Asks the file system whether each step's path
+/// exists, so it is never called under the `Slots` lock.
+fn report_entry(run: &Run, root: &Path) -> Option<Entry> {
     let reply = {
         let state = run.state();
-        // `Run::record` refuses an ended run too; checked here as well so a run that a
-        // forced stop or a close ended reads no file for nothing.
+        // A run that a forced stop or a close ended takes no entry: no file is read for it.
         if state.header.review.is_some() || !state.live() {
-            return;
+            return None;
         }
         state.reply()
     };
-    let (report, problem) = match report::read(&reply, root) {
-        Ok(report) => (Some(report), None),
-        Err(problem) => (None, Some(problem)),
-    };
-    run.record(Entry::Report { report, problem });
+    Some(match report::read(&reply, root) {
+        Ok(report) => Entry::Report { report },
+        Err(problem) => Entry::NoReport { problem },
+    })
 }
 
 /// Says on `run` that no snapshot was taken, and why: the run goes on, without its changes
@@ -2381,6 +2393,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh agent sees the thread's first prompt as history: a reminder suffices when that
+    /// prompt asked for the report, and a thread from before reports needs the whole ask.
+    #[test]
+    fn a_fresh_follow_up_of_a_thread_from_before_reports_gets_the_whole_ask() {
+        let asked = format!("Address every note.\n{}\n[N1] a.txt", report::ASK);
+        assert_eq!(report_ask(&asked), report::ASK_AGAIN);
+        assert_eq!(report_ask("Address every note.\n\n[N1] a.txt"), report::ASK);
+    }
 
     #[test]
     fn a_chain_s_debug_output_counts_its_findings_and_never_shows_their_text() {
