@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 pub(crate) const MAX_READ: u64 = 20_000_000;
 
 /// The branch a new linked worktree checks out ([`Repo::add_worktree`]).
+// `Copy`: a small value of two borrows, passed by value (clippy's `needless_pass_by_value`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Checkout<'a> {
     /// A new branch, started at commit `fork`.
@@ -410,8 +411,12 @@ impl Repo {
         ];
         match checkout {
             Checkout::New { branch, fork } => {
-                args.extend([OsStr::new("-b"), OsStr::new(branch), path.as_os_str()]);
-                args.push(OsStr::new(fork));
+                args.extend([
+                    OsStr::new("-b"),
+                    OsStr::new(branch),
+                    path.as_os_str(),
+                    OsStr::new(fork),
+                ]);
             }
             Checkout::Existing { branch } => {
                 args.extend([path.as_os_str(), OsStr::new(branch)]);
@@ -482,6 +487,21 @@ impl Repo {
             return Err(not_ours());
         }
         Ok(Some(record))
+    }
+
+    /// The commit local branch `branch` names, or `None` when there is no such branch.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as a repository git cannot read.
+    pub(crate) fn branch_commit(&self, branch: &str) -> Result<Option<String>> {
+        let name = format!("refs/heads/{branch}^{{commit}}");
+        match git(&self.root, &["rev-parse", "--verify", "--quiet", &name]) {
+            Ok(id) => Ok(Some(id.trim_end().to_owned())),
+            // As in `head`: with `--quiet`, a name that resolves to nothing prints nothing.
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether `commit` is `descendant` or one of its ancestors.

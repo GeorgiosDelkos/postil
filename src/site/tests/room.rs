@@ -124,7 +124,9 @@ fn a_thread_with_work_not_committed_is_kept_and_a_send_past_the_cap_is_refused()
 
     let error = failure(&failed);
     assert!(
-        error.contains("has 1 worktrees") && error.contains("R1 keeps its own"),
+        error.contains("has 1 worktrees")
+            && error.contains("kept: R1 (")
+            && error.contains("mine.txt"),
         "{error}"
     );
     assert_eq!(
@@ -189,6 +191,67 @@ fn short_of_space_an_idle_thread_loses_its_build_folders_then_its_worktree() {
     assert!(!second.exists());
     assert_eq!(thread(&site, "R1")["state"], "evicted");
     assert_eq!(thread(&site, "R2")["state"], "evicted");
+}
+
+#[test]
+fn a_run_in_a_worktree_on_disk_evicts_nothing_under_the_floor() {
+    let (_repo, site, nudges, first) = written("room-made-floor");
+    send_ended(&site, &nudges, "two", "R2");
+    site.runner().unwrap().set_test_disk(TestDisk {
+        free_space: Some(Box::new(|| FLOOR - 1)),
+        ..TestDisk::default()
+    });
+
+    // R2's follow-up makes no worktree, so it takes none of R1's space.
+    assert_eq!(follow(&site, "R2").0, StatusCode::OK);
+    let run = wait_for_run(&site, &nudges, "R3");
+
+    assert_eq!(run["status"], "ended", "{run}");
+    assert_eq!(thread(&site, "R1")["state"], "open");
+    assert!(first.is_dir());
+}
+
+#[test]
+fn an_evicted_thread_whose_worktree_cannot_be_made_again_stays_evicted() {
+    let (repo, site, nudges, _first) = written("room-remake-fails");
+    site.runner().unwrap().set_test_disk(TestDisk {
+        max_worktrees: Some(1),
+        ..TestDisk::default()
+    });
+    send_ended(&site, &nudges, "two", "R2");
+    let branch = thread(&site, "R1")["branch"].as_str().unwrap().to_owned();
+    // Checked out in the engineer's tree: git makes no worktree on it.
+    repo.git(&["checkout", "--quiet", &branch]);
+
+    assert_eq!(follow(&site, "R1").0, StatusCode::OK);
+    let run = wait_for_run(&site, &nudges, "R3");
+
+    assert_eq!(run["status"], "failed", "{run}");
+    assert!(failure(&run).contains("already"), "{run}");
+    assert_eq!(thread(&site, "R1")["state"], "evicted");
+}
+
+#[test]
+fn apply_on_an_evicted_thread_takes_the_engineer_s_commit_on_its_branch() {
+    let (repo, site, nudges, first) = written("room-apply-commit");
+    // The engineer's own commit in the worktree, past Postil's last.
+    fs::write(first.join("mine.txt"), "mine\n").unwrap();
+    git_out(&first, &["add", "mine.txt"]);
+    git_out(&first, &["commit", "--quiet", "--message", "mine"]);
+    site.runner().unwrap().set_test_disk(TestDisk {
+        max_worktrees: Some(1),
+        ..TestDisk::default()
+    });
+    send_ended(&site, &nudges, "two", "R2");
+    assert_eq!(thread(&site, "R1")["state"], "evicted");
+
+    let (status, body) = end(&site, "apply", "R1");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        fs::read_to_string(repo.root.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
 }
 
 #[test]

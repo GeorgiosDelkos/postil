@@ -78,7 +78,7 @@ use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
     hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
-use crate::thread::{self, Delete, State, Thread};
+use crate::thread::{self, State, Thread};
 
 /// How long an agent may take to start, and then to open a session. Claude's adapter took
 /// 4.3 s to open a session with npx's cache warm (2026-11-23); a first `npx` run downloads
@@ -867,7 +867,11 @@ impl Runner {
         };
 
         let id = thread.id.clone();
-        let reuse = matches!(conversation, Conversation::Kept)
+        // Only in a worktree on disk: a follow-up chose the kept agent before it held the
+        // thread's lock, and another window may have evicted the thread since. Its worktree is
+        // then made again on the start thread, which a reused agent would skip.
+        let reuse = matches!(worktree, Worktree::Made)
+            && matches!(conversation, Conversation::Kept)
             && slots.by_thread.get(&id).is_some_and(|slot| {
                 matches!(
                     &slot.agent,
@@ -1363,7 +1367,12 @@ impl Runner {
                 Ending::Discard => State::Discarded,
             };
         })
-        .and_then(|()| thread::free(&self.repo, home, &thread, Delete::Later));
+        .and_then(|()| thread::free(&self.repo, home, &thread))
+        .map(|trashed| {
+            if let Some(trashed) = trashed {
+                trashed.delete_later();
+            }
+        });
         (self.notify)();
         ended
     }
@@ -1613,19 +1622,7 @@ impl Runner {
                     error: error_chain(error),
                 });
             };
-            let ready = match pending.worktree {
-                Worktree::Make | Worktree::Remake { .. } => runner.make_for(&pending),
-                Worktree::Made => match runner.free_disk(&id, &pending.worktree) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        if !runner.slots().let_go(&id, generation) {
-                            failed(&error);
-                        }
-                        false
-                    }
-                },
-            };
-            if !ready {
+            if !matches!(pending.worktree, Worktree::Made) && !runner.make_for(&pending) {
                 return (runner.notify)();
             }
             // Blocks until the login shell has said where programs are, a few seconds at most
@@ -1782,7 +1779,7 @@ impl Runner {
         let mark =
             |state: State| thread::update(&self.repo, &thread.id, |stored| stored.state = state);
         let made = self
-            .free_disk(&thread.id, &pending.worktree)
+            .free_disk(&thread.id)
             .and_then(|()| if remake { mark(State::Open) } else { Ok(()) })
             .and_then(|()| thread::make(&self.repo, thread));
         let skipped = match made {

@@ -32,7 +32,7 @@ pub(crate) fn available(path: &Path) -> io::Result<u64> {
     let values = url
         .resourceValuesForKeys_error(&NSArray::from_retained_slice(&keys))
         .map_err(|error| io::Error::other(error.localizedDescription().to_string()))?;
-    let mut free = 0;
+    let mut free = None;
     for key in &keys {
         let Some(value) = values.objectForKey(key) else {
             continue;
@@ -40,9 +40,15 @@ pub(crate) fn available(path: &Path) -> io::Result<u64> {
         let number = value
             .downcast::<NSNumber>()
             .map_err(|_| io::Error::other(format!("{key} is not a number")))?;
-        free = free.max(number.unsignedLongLongValue());
+        free = free.max(Some(number.unsignedLongLongValue()));
     }
-    Ok(free)
+    // Neither value is not 0 bytes free: it is a volume that cannot be measured.
+    free.ok_or_else(|| {
+        io::Error::other(format!(
+            "the volume of {} reports no free space",
+            path.display()
+        ))
+    })
 }
 
 /// Off macOS the space is not measured, and the floor is not kept.

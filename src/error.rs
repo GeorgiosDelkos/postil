@@ -236,8 +236,8 @@ pub enum Error {
     TooManyWorktrees {
         /// The most worktrees a repository may have.
         cap: usize,
-        /// The threads whose worktrees could not be freed: running, or holding work Postil
-        /// did not commit.
+        /// The threads whose worktrees could not be freed, each with why: `R1 (at work in
+        /// another window)`.
         kept: Vec<String>,
     },
     /// A run was to start while the worktrees' volume has less free space than the floor,
@@ -552,16 +552,13 @@ impl fmt::Display for Error {
     }
 }
 
-/// `"; R1 and R4 keep theirs, running or with work not committed"` for the threads `kept`
-/// whose worktrees could not be freed, or nothing when there are none.
+/// `"; kept: R1 (at work in another window); R4 (...)"` for the threads `kept`, each with why
+/// its worktree could not be freed, or nothing when there are none.
 fn held_by(kept: &[String]) -> String {
-    match kept {
-        [] => String::new(),
-        [one] => format!("; {one} keeps its own, running or with work not committed"),
-        [rest @ .., last] => format!(
-            "; {} and {last} keep theirs, running or with work not committed",
-            rest.join(", ")
-        ),
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("; kept: {}", kept.join("; "))
     }
 }
 

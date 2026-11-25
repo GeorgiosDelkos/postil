@@ -808,20 +808,30 @@ Built (`src/run/room.rs`).
   measured, or off macOS, counts as enough. Arbitrary: a few release builds of a Tauri app.
   Free space is the measure, not `du`, which counts a block shared by clones once per clone.
 - **When they are checked:** on the run's start thread, before a new or evicted thread's
-  worktree is made (the cap and the floor) and before the agent of a run in a worktree on disk
-  starts (the floor), so the seconds a delete takes keep no request waiting. A run refused
-  there fails, saying why; a new thread's then goes from the record, as one whose worktree
-  could not be made does.
+  worktree is made, so the seconds a delete takes keep no request waiting. A run in a
+  worktree already on disk adds no worktree and evicts nothing, even under the floor: a
+  follow-up that reuses its thread's agent starts on the request thread, where no delete may
+  wait, and evicting every idle thread for a run that frees nothing was the most harm for the
+  least gain (review of PR #49, 2026-11-25). A run refused there fails, naming each thread it
+  could not evict and why; a new thread's then goes from the record, as one whose worktree
+  could not be made does. Windows check apart, so two making worktrees at once can each see
+  room for one: the cap can be passed by the worktrees being made, at most 2.
 - **Eviction** takes idle threads only: its thread lock free (no run in any window), not busy
   in this window, and a worktree that passes the safety check. A thread with an open pull
   request qualifies, since its branch is pushed. They go in order of their last run, oldest
   first. Under the floor, a thread loses its build folders (the worktree's ignored top-level
   folders, deleted before the space is measured again), and its worktree goes only if still
-  short. Over the cap, whole worktrees go until the count fits. An evicted thread's kept
-  agent is stopped, its worktree freed with the delete finished before eviction goes on, and
-  it is marked `evicted`, keeping its branch and record. Apply and Discard work on it from
-  the branch. A follow-up or a review makes its worktree again at the same path from the
-  branch, locked, with fresh clones and a fresh agent told the thread so far; the thread is
+  short. Over the cap, whole worktrees go until the count fits; a thread another window
+  freed meanwhile counts as gone. Under the thread's lock the folders are only moved into the
+  trash and the record changed, milliseconds; the delete comes after the lock is let go,
+  because a held thread lock counts as a live run for the cap of 3. The agent this window
+  keeps for an evicted thread is stopped; another window's kept agent is not reachable, and
+  that window starts a fresh one for the thread's next run. The thread is marked `evicted`,
+  keeping its branch and record. Apply and Discard work on it from the branch, Apply taking
+  the branch's commit when it follows the tip, so a commit the engineer made in the worktree
+  before the eviction is applied too. A follow-up or a review makes its worktree again at the
+  same path from the branch, locked, with fresh clones and a fresh agent told the thread so
+  far; the thread is
   marked open before git makes it, and evicted again if it cannot be made. The same path,
   rather than a new one: the old folder is gone by then, and every run log already names that
   path. If eviction frees too little, the run is refused (`TooManyWorktrees`, `DiskFull`),
