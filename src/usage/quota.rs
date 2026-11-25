@@ -658,7 +658,7 @@ fn collect_codex_replies(stdout: ChildStdout) -> Result<(Option<Value>, Option<V
                     .and_then(Value::as_str)
                     .map_or_else(
                         || "codex app-server refused initialize".to_owned(),
-                        str::to_owned,
+                        bounded_provider_text,
                     ));
             }
             Some(2) => account = Some(msg),
@@ -702,7 +702,7 @@ fn parse_codex_quota(account: Option<&Value>, limits: Option<&Value>) -> QuotaRe
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("sign in with `codex` in a terminal");
-        return QuotaReport::unavailable(message);
+        return QuotaReport::unavailable(bounded_provider_text(message));
     }
     let Some(result) = limits_msg.get("result") else {
         return QuotaReport::unavailable("Codex did not return rate limit data");
@@ -1154,6 +1154,22 @@ fn run_timed(
     output.map_err(|error| format!("cannot read from {program}: {error}"))
 }
 
+/// Most characters of provider-written text a quota message keeps. Arbitrary: about two
+/// lines of the quota card, enough for an error sentence, and it bounds what the cache holds
+/// and the page shows when a provider sends a long reply.
+const MAX_PROVIDER_TEXT_CHARS: usize = 160;
+
+/// `text` cut to [`MAX_PROVIDER_TEXT_CHARS`] characters, ending in "…" when it was cut.
+fn bounded_provider_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let kept: String = chars.by_ref().take(MAX_PROVIDER_TEXT_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{kept}…")
+    } else {
+        kept
+    }
+}
+
 fn clamp_percent(value: f64) -> f64 {
     if !value.is_finite() {
         return 0.0;
@@ -1490,6 +1506,19 @@ mod tests {
         // Nothing listens on port 1, so curl exits with code 7 and an error on stderr.
         let error = curl_json("GET", "http://127.0.0.1:1/", &[], None).unwrap_err();
         assert_eq!(error, "cannot connect to the provider: check the network");
+    }
+
+    #[test]
+    fn codex_error_text_is_cut_to_the_bound() {
+        let at_bound = "é".repeat(MAX_PROVIDER_TEXT_CHARS);
+        let over = format!("{at_bound}x");
+        let limits = serde_json::json!({ "id": 3, "error": { "message": over } });
+        let report = parse_codex_quota(None, Some(&limits));
+        assert_eq!(report.message, Some(format!("{at_bound}…")));
+
+        let limits = serde_json::json!({ "id": 3, "error": { "message": at_bound } });
+        let report = parse_codex_quota(None, Some(&limits));
+        assert_eq!(report.message.as_deref(), Some(at_bound.as_str()));
     }
 
     #[test]
