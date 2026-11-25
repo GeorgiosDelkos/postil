@@ -233,14 +233,7 @@ impl QuotaPoller {
             let spawned = std::thread::Builder::new()
                 .name(format!("quota-{name}"))
                 .spawn(move || {
-                    let mut guard = ProbeGuard {
-                        shared: Arc::clone(&shared),
-                        agent_name: agent_name.clone(),
-                        generation,
-                        armed: true,
-                    };
                     let report = probe(&agent_name, &path);
-                    guard.armed = false;
                     let mut state = lock(&shared);
                     if state.generation == generation {
                         state.entries.insert(
@@ -269,33 +262,6 @@ impl QuotaPoller {
         }
 
         results
-    }
-}
-
-/// Ensures a panicked probe thread never leaves an agent stuck in [`QuotaStatus::Loading`].
-struct ProbeGuard {
-    shared: Arc<Mutex<PollerState>>,
-    agent_name: String,
-    generation: u64,
-    armed: bool,
-}
-
-impl Drop for ProbeGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut state = lock(&self.shared);
-        if state.generation == self.generation {
-            state.entries.insert(
-                self.agent_name.clone(),
-                CachedQuota {
-                    report: QuotaReport::error("quota probe stopped unexpectedly"),
-                    updated: Instant::now(),
-                    generation: self.generation,
-                },
-            );
-        }
     }
 }
 
@@ -1254,24 +1220,6 @@ mod tests {
             Some("new-Claude"),
             "older probe result was dropped"
         );
-    }
-
-    #[test]
-    fn poller_recovers_if_a_probe_thread_panics() {
-        let poller = QuotaPoller::new(|_, _| panic!("simulated probe panic"));
-        let initial = poller.snapshot(&["Claude"], OsStr::new(""));
-        assert_eq!(initial["Claude"].status, QuotaStatus::Loading);
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let snap = poller.snapshot(&["Claude"], OsStr::new(""));
-            if snap["Claude"].status != QuotaStatus::Loading {
-                assert_eq!(snap["Claude"].status, QuotaStatus::Error);
-                break;
-            }
-            assert!(Instant::now() < deadline, "panicked probe stayed Loading");
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     #[test]
