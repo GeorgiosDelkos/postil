@@ -691,6 +691,16 @@ Postil writes outside itself.
      run log version 5 (step 7.2, #54), and evidence reads a non-zero exit as failed whatever
      the status says.
 
+6. **hippius-mem's repository scope in a worktree.** Agents run in `~/.postil/worktrees/...`;
+   whether the server binds the right repository from there is not checked yet.
+7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
+   This document does not offer it from Postil.
+8. **The trial vault.** Set up runs `quickstart`, which makes a local vault. Moving to a
+   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret.
+9. **The language of dictation.** The system's language is assumed. When on-device
+   recognition is not available for it, dictation reports that and does not use the network.
+10. **Remember without the thread's agent.** A note that was never sent has no agent to draft
+    from; the dialog then opens with the note's text for the engineer to rewrite.
 11. **The report block: answered by spike S2, 2026-11-25.** Each agent got a prompt built as
     `notes::prompt` builds one (one note: fix `add` in a scratch repository and run its test),
     with this paragraph after "list each note id", the wording step 7.3 ships, 10 runs each:
@@ -714,16 +724,6 @@ Postil writes outside itself.
     - Both are above the plan's 8 of 10, so no second turn is needed.
     - Both agents ran with the owner's own configuration, as Postil runs them. In 2 of
       Claude's runs that configuration had the agent write a note to hippius-mem.
-6. **hippius-mem's repository scope in a worktree.** Agents run in `~/.postil/worktrees/...`;
-   whether the server binds the right repository from there is not checked yet.
-7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
-   This document does not offer it from Postil.
-8. **The trial vault.** Set up runs `quickstart`, which makes a local vault. Moving to a
-   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret.
-9. **The language of dictation.** The system's language is assumed. When on-device
-   recognition is not available for it, dictation reports that and does not use the network.
-10. **Remember without the thread's agent.** A note that was never sent has no agent to draft
-    from; the dialog then opens with the note's text for the engineer to rewrite.
 
 ## Testing
 

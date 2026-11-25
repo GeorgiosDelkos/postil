@@ -25,8 +25,8 @@ Found while reading the code. Each is applied to `docs/review-assist.md` with th
    (no build folders are cloned for a read-only thread).
 2. **Evidence needs data the log does not keep.** `ToolCall` in `src/acp/wire.rs` declares no
    `rawInput`, so an execute call's command line is dropped at parse, and no exit status is
-   kept: only `status` completed or failed. Step 7.2 keeps the command. Whether agents report
-   a non-zero exit as `failed` is spike S1.
+   kept: only `status` completed or failed. Step 7.2 keeps the command and the exit code:
+   spike S1 found that Grok reports a non-zero exit as `completed`.
 3. **A read-only run that edits is not marked failed.** Today a proposing reviewer that edits
    ends `Ended` with a problem text, and its worktree is reset. Read-only runs keep that
    behavior. What changes per kind: an analysis stores nothing, an ask shows its answer under
@@ -133,24 +133,31 @@ step named.
   name its call's kind (Claude names it only on the call, Grok only on an update), so
   `RunState` keeps each call's last known kind. `LOG_VERSION` 5. The exit code was added
   after S1, by the owner's choice on 2026-11-25.
-- `ui/run.js`: `foldMore` merges `command` into the tool item.
-- `tests/fake-agent.mjs`: scenario `checks` (an execute call with `rawInput`, completed; one
-  that fails; an edit after the first).
+- `ui/run.js`: `foldMore` merges `command` and `exit` into the tool item.
+- `tests/fake-agent.mjs`: scenario `checks`, each agent's shapes as S1 saw them: Claude's
+  (kind on the call, command in updates, a failure as `failed`), Grok's (kind on an update,
+  `exit_code` 0 while running, a failure as `completed`), a call reported whole, a read whose
+  input names a command, an edit after the first.
 
 **Edge cases**
 
-- `rawInput` missing, null, a string, or an object with no `command`: `command` is `None`.
-- A command over 4 KiB is cut with a marker: a heredoc can be megabytes, and the log is read
-  whole.
+- `rawInput` missing, null, a string, an object with no `command`, or a blank one: `command`
+  is `None`, and a blank one does not replace the call's.
+- A command over 4 KiB is cut at a character boundary, its length noted: a heredoc can be
+  megabytes, and the log is read whole.
 - An update that carries `rawInput` after the call did: the later one wins.
-- Version 4 logs read with no command.
+- Grok's `exit_code` 0 on an update while the command runs is not kept; Claude's
+  `Exit code N` text on a completed call is output, not an exit code.
+- Version 4 logs read with neither field.
 
-**Tests**
+**Tests** (as built in #54)
 
-- `an_execute_call_keeps_its_command` (site): catches the field dropped at parse or fold.
-- `a_command_is_kept_only_for_execute_calls`: catches a read's `rawInput` logged as a command.
+- `an_execute_call_keeps_its_command_and_exit_code_and_no_other_call_does` (site): catches
+  either field dropped at parse, an update read by its own kind only (Claude's command lost),
+  a running call's exit 0 kept, Claude's text read from a completed call, a read's input kept,
+  and a byte slice that panics inside a character.
 - `a_version_4_log_reads_without_commands`, and the refused-version test moved to 6.
-- `foldRun` test: an update's command replaces the call's.
+- `foldRun` test: an update's command and exit replace the call's, an exit of 0 included.
 
 ### 7.3 The author's report (run log 6)
 
@@ -192,6 +199,10 @@ step named.
   draws the reply without it, through a pure `withoutReport(text)`.
 - `agentSaid` (`ui/status.js:85`) reads `N3: ...` lines: a report after them must not change
   a note's Addressed status.
+- The run dialog tells a kept agent's follow-up from a fresh agent's by
+  `turn.prompt !== turn.followUp.text` (`ui/run-dialog.js:453`, and `threadKey`). A reminder
+  appended to a kept agent's prompt makes every follow-up read as a fresh agent's, so that
+  check must change with the reminder.
 
 **Tests**
 
@@ -217,6 +228,8 @@ step named.
   command kept, whose title equals it or equals it wrapped in backticks.
 - `ui/run-dialog.js`, `runDetail` (`:212`): a Checks section after Steps, each row opening
   its step (`openDetail({kind: "step", ...})`), then the run's other commands.
+- `ui/run.js`, `toolRow`: a step with a non-zero `exit` shows as failed. It reads `status`
+  only today, so Grok's failed command would show done in Steps and failed in Checks.
 - `ui/run-tab.js`: one icon on the card for the worst state, added to the card's signature
   (`:92`) or the card will not redraw.
 
@@ -332,7 +345,9 @@ the Checks row opens its step.
 - `resolving_an_ask_frees_its_worktree`, `a_read_thread_clones_no_build_folders`,
   `a_read_thread_cannot_be_applied`.
 - `a_version_4_review_reads_every_note_as_a_change`, the byte-for-byte tests of both files,
-  and `a_version_3_record_reads_every_thread_as_work`.
+  and `a_version_3_record_reads_every_thread_as_work`. `thread::read` lists the versions it
+  reads (`Ok(1 | 2 | THREADS_VERSION)`, `src/thread.rs:836`): version 3 joins that list, and
+  `threads.json` has no byte-for-byte test yet, so this step adds one.
 - `an_ask_at_the_cap_is_refused` (with `hang`).
 - Page: `runStatus` for an ask (ended, stopped, failed), `sendable`, `groupNotes`.
 - e2e: `q` on a selection opens the composer in ask mode and `Cmd-Enter` shows Answered.

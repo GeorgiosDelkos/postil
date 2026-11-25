@@ -10,7 +10,8 @@ owner until shared).
 What comes after milestone 6 is designed in `docs/review-assist.md` (2026-11-25): reviewer
 aids, the map of a repository, team memory and voice, as milestones 7 to 10. Where that
 document changes a rule of this one (a second accent color, a second module with `unsafe`,
-third-party JavaScript in the page, `mcpServers` no longer empty), it says so, and this
+third-party JavaScript in the page, `mcpServers` no longer empty, a middle pane split into
+diagram and code), it says so, and this
 document is amended when each is built.
 
 ## The problem in one sentence
