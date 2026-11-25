@@ -127,10 +127,13 @@ impl Runner {
             )));
         }
         let opening = self.check_opening(id)?;
-        let started = self.start_pull_work(id, PullWork::Opening);
         // Requests run one at a time on the request thread, and a job only clears its work or
-        // marks it failed, so the work found absent above is still absent.
-        debug_assert!(started, "no work under way for {id}, checked above");
+        // marks it failed, so the work found absent above is still absent. Checked in every
+        // build: breaking it would push and open a pull request twice.
+        assert!(
+            self.start_pull_work(id, PullWork::Opening),
+            "no work under way for {id}, checked above"
+        );
         let runner = Arc::clone(self);
         let thread_id = id.to_owned();
         self.spawn_pull_work(id, move |search_path| {

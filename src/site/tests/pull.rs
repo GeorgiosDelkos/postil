@@ -204,18 +204,22 @@ fn a_pull_request_needs_the_base_branch_on_the_remote_with_every_commit_the_thre
     );
     assert!(thread(&site, "R2")["pullRequestWork"].is_null());
 
-    // Many such commits: the first ten are listed.
-    for n in 0..10 {
-        repo.git(&[
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "--message",
-            &format!("Also {n}"),
-        ]);
-    }
+    // Ten such commits are all listed; with eleven, the first ten are.
+    let commit = |n: usize| {
+        let message = format!("Also {n}");
+        repo.git(&["commit", "--quiet", "--allow-empty", "--message", &message]);
+    };
+    (0..9).for_each(commit);
     sent(&site, &nudges, "three");
     let (status, body) = ask(&site, "pr", "R3");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("Only here") && !body.contains(", and more"),
+        "{body}"
+    );
+    commit(9);
+    sent(&site, &nudges, "four");
+    let (status, body) = ask(&site, "pr", "R4");
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
         body.contains("Also 9") && body.contains(", and more)"),
