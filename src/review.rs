@@ -169,7 +169,8 @@ fn context(text: &mut String, work: &Work) {
 ///
 /// As [`last_json_block`].
 pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, String> {
-    let entries: Vec<Value> = last_json_block(reply)?;
+    let entries: Vec<Value> =
+        last_json_block(reply).map_err(|problem| format!("no findings: {problem}"))?;
     Ok(numbered(&entries, first))
 }
 
@@ -360,7 +361,7 @@ mod tests {
         );
     }
 
-    /// The author's report (docs/review-assist.md) is an object, where findings are an array.
+    /// A report is an object, where findings are an array.
     #[test]
     fn the_last_json_block_reads_an_object_and_passes_over_a_later_array() {
         #[derive(Debug, PartialEq, Eq, Deserialize)]

@@ -5,11 +5,9 @@
 //! from the file list's right-click menu.
 //!
 //! A line note is anchored by its snippet: the text of its lines when it was written. Its
-//! line numbers are a hint. Whenever the notes are read, each one is placed by [`locate`]: it
-//! stays where its snippet still is, or moves to the only other copy of the snippet, or else
-//! its anchor becomes [`Anchor::Lost`]. A snippet found several times elsewhere is lost
-//! rather than guessed: a short line such as `}` repeats, and the nearest copy is often the
-//! wrong one. A file or folder note is found while its path is still a file or a folder of
+//! line numbers are a hint. Whenever the notes are read, each one is placed by [`locate`]
+//! (`anchor.rs` gives the rule), and a note it cannot place becomes [`Anchor::Lost`]. A file
+//! or folder note is found while its path is still a file or a folder of
 //! that kind, and lost otherwise: a rename is not followed, since nothing tells a renamed
 //! folder from a new one.
 //!
@@ -719,17 +717,14 @@ impl Review {
 /// is released when the returned file is dropped.
 fn lock(review_file: &Path) -> Result<File> {
     let path = review_file.with_extension("lock");
-    files::lock(&path).map_err(|source| {
+    files::lock(&path).map_err(move |source| {
         if source.kind() == io::ErrorKind::WouldBlock {
             Error::ReviewLocked {
-                path: path.clone(),
+                path,
                 seconds: files::LOCK_WAIT.as_secs(),
             }
         } else {
-            Error::WriteReview {
-                path: path.clone(),
-                source,
-            }
+            Error::WriteReview { path, source }
         }
     })
 }
