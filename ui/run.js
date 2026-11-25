@@ -95,7 +95,12 @@ function foldMore(base, entries) {
     else items.push({ type, text, message });
   };
 
-  for (const entry of entries.slice(base.entries.length)) {
+  // A tool call's final status ends it; `endedAt` is the index of the entry that said so. The
+  // items keep the order the calls started in, so this is the only record of the order they
+  // ended in: an edit started before a check and finished after it makes the check stale.
+  const ended = (status, at) => (status === "completed" || status === "failed" ? at : null);
+  for (let at = base.entries.length; at < entries.length; at += 1) {
+    const entry = entries[at];
     switch (entry.kind) {
       case "message":
         append("message", entry.text, entry.message);
@@ -116,6 +121,7 @@ function foldMore(base, entries) {
           // before version 5 have neither (src/run/log.rs).
           command: entry.command ?? null,
           exit: entry.exit ?? null,
+          endedAt: ended(entry.status, at),
         };
         // An agent may report the same call twice; the second report replaces the first.
         const known = tools.get(entry.id);
@@ -139,12 +145,14 @@ function foldMore(base, entries) {
             output: [],
             command: null,
             exit: null,
+            endedAt: null,
           });
         }
         const tool = own(tools.get(entry.id));
         for (const field of ["title", "tool", "status", "places", "output", "command", "exit"]) {
           if (entry[field] !== null && entry[field] !== undefined) tool[field] = entry[field];
         }
+        if (ended(entry.status, at) !== null) tool.endedAt = at;
         break;
       }
       case "plan":
@@ -276,13 +284,81 @@ export function toolRow(tool, live) {
   const place = tool.places[0];
   const target = onFile && place ? place.path : tool.title;
   let state;
-  if (tool.status === "failed") state = "failed";
+  // Grok ends a command that exits non-zero as completed, with the code alone saying it
+  // failed (src/run/log.rs, `exit_of`).
+  if (tool.status === "failed" || (tool.exit ?? 0) !== 0) state = "failed";
   else if (tool.status === "completed") {
     const stats = diffStats(tool.output);
     state = stats ? `+${stats.added} -${stats.removed}` : "done";
   } else state = live ? "" : "unfinished";
   const running = live && underWay(tool);
   return { verb, target, state, running };
+}
+
+// The tool kinds that change files: a check that passed before one of these ended is stale.
+// An execute call can change files too (a formatter); Postil cannot see into it, so the
+// stale state says "an edit after it" and claims no more.
+const EDITS = new Set(["edit", "delete", "move"]);
+
+// What a turn's checks show (docs/review-assist.md, "Evidence on the run"): each command the
+// author's report (src/report.rs) says it ran, against the execute calls the log holds, then
+// every other command the turn ran. Pure: `report` is the turn's report or null, `items` its
+// folded items (`foldRun`).
+//
+// A row is `{command, claim, state, item}`: `claim` is what the author says came of it,
+// "passed" or "failed", or null for a command it did not name; `item` is the execute call that
+// is the evidence, or null. `state` is the log's, never the author's:
+// - `failed`: the call failed, or exited non-zero whatever its status (Grok ends such a
+//   command as completed). A failure an edit followed is still failed (owner, 2026-11-25).
+// - `unfinished`: the call had not ended when the turn did.
+// - `stale`: it passed, and an edit, delete or move ended after it.
+// - `passed`: it passed, and no such edit ended after it.
+// - `not-seen`: no call ran the command the author names.
+// A claim is matched by the last execute call whose command equals it once trimmed and with
+// its spaces collapsed, and without a command kept (a log before version 5), by its title
+// alone or in backticks. Nothing looser: a claim shown as seen must have been run as said.
+export function evidence(report, items) {
+  const calls = items.filter((item) => item.type === "tool");
+  const runs = calls.filter((call) => call.tool === "execute");
+  const edits = calls.filter((call) => EDITS.has(call.tool) && call.status === "completed");
+  const stateOf = (run) => {
+    if (run.status === "failed" || (run.exit ?? 0) !== 0) return "failed";
+    if (run.status !== "completed" || run.endedAt === null) return "unfinished";
+    return edits.some((edit) => edit.endedAt > run.endedAt) ? "stale" : "passed";
+  };
+  const claimed = new Set();
+  const rows = (report?.checks ?? []).map((check) => {
+    const same = runs.filter((run) => ranAs(run, check.command));
+    for (const run of same) claimed.add(run);
+    const item = same.at(-1) ?? null;
+    const state = item ? stateOf(item) : "not-seen";
+    return { command: check.command, claim: check.result, state, item };
+  });
+  for (const run of runs) {
+    if (claimed.has(run)) continue;
+    rows.push({ command: run.command ?? run.title, claim: null, state: stateOf(run), item: run });
+  }
+  return rows;
+}
+
+const spaced = (text) => text.trim().replace(/\s+/g, " ");
+
+// Whether execute call `run` ran `command`, as `evidence` matches a claim.
+function ranAs(run, command) {
+  const wanted = spaced(command);
+  if (run.command !== null && run.command !== undefined) return spaced(run.command) === wanted;
+  const title = spaced(run.title);
+  return title === wanted || title === `\`${wanted}\``;
+}
+
+// The evidence states from worst to best, as the run's card ranks them (owner, 2026-11-25).
+const WORST_FIRST = ["failed", "not-seen", "stale", "unfinished", "passed"];
+
+// The worst state among the checks the author claimed, or null when it claimed none: the
+// card shows the evidence for what the report says, not for every command the agent tried.
+export function worstEvidence(rows) {
+  const claimed = rows.filter((row) => row.claim !== null).map((row) => row.state);
+  return WORST_FIRST.find((state) => claimed.includes(state)) ?? null;
 }
 
 // Lines added and removed by a tool call's diffs, or `null` when it has none.

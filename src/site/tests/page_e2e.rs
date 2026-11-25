@@ -1,14 +1,15 @@
 //! The page's end-to-end tests (`tests/e2e/`): the page in Playwright's WebKit, talking to
-//! real sites over HTTP on localhost, each with the fake agent (`tests/fake-agent.mjs`) in its
-//! `flood` scenario. They catch what the page's unit tests cannot: a click lost because the
-//! node under the pointer was replaced while a run streams.
+//! real sites over HTTP on localhost, each with the fake agent (`tests/fake-agent.mjs`) in the
+//! scenario its test asks for, `flood` unless it names another. They catch what the page's
+//! unit tests cannot: a click lost because the node under the pointer was replaced while a run
+//! streams.
 //!
 //! The app serves the page on the `postil://` scheme and tells it a run changed by calling
 //! `window.postil.runChanged()` (`shell.rs`). A browser driven by Playwright can do neither,
 //! so this bridge stands in for the window:
 //! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, `src/b.rs` and
 //!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
-//!   starts from nothing.
+//!   starts from nothing. A body `{"scenario": "..."}` names the fake agent's scenario.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -98,8 +99,10 @@ fn serve(requests: mpsc::Receiver<Asked>) {
 fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: TcpStream) {
     let path = request.uri().path();
     if path == "/new" {
+        let asked: serde_json::Value = serde_json::from_slice(request.body()).unwrap_or_default();
+        let scenario = asked["scenario"].as_str().unwrap_or("flood");
         let base = format!("/s{}/", sites.len());
-        sites.push(bridged(sites.len()));
+        sites.push(bridged(sites.len(), scenario));
         let body = serde_json::json!({ "base": base }).to_string();
         write_reply(
             &mut stream,
@@ -139,8 +142,9 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
     write_reply(&mut stream, &bridged.site.respond(&request));
 }
 
-/// A new site on a fresh repository, the `number`th the bridge opened.
-fn bridged(number: usize) -> Bridged {
+/// A new site on a fresh repository, the `number`th the bridge opened, its agent in
+/// `scenario`.
+fn bridged(number: usize, scenario: &str) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
     repo.write("src/a.rs", "one\ntwo\nthree\n");
     // For the file filter to list several matches.
@@ -157,7 +161,7 @@ fn bridged(number: usize) -> Bridged {
         })
     };
     Bridged {
-        site: agent_site(&repo, "flood", notify),
+        site: agent_site(&repo, scenario, notify),
         listeners,
         _repo: repo,
     }

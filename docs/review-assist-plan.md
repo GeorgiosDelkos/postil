@@ -190,8 +190,8 @@ step named.
 - `src/review.rs`, `context` (`:137`): the reviewers' prompt includes the report, and
   `propose_prompt` asks for a finding on a hunk rated too low.
 - `src/site/tests/page_e2e.rs`: `POST /new` takes `scenario` and `files`. Not in 7.3 as
-  built (#55's description): no 7.3 test runs the bridge, so the first step whose e2e test
-  needs it (7.5 or 7.7) makes the change.
+  built (#55's description): no 7.3 test runs the bridge. 7.4 added `scenario`, for its e2e
+  test; `files` comes with the first step whose e2e test needs files of its own (7.5 or 7.7).
 - `tests/fake-agent.mjs`: `report`, `report-bad`, `report-none`, `report-twice`.
 
 **Edge cases**
@@ -269,8 +269,10 @@ step named.
 - The claim says passed and the log says failed: the log's state shows, with "the author
   says passed" beside it.
 - A check that failed and was edited after shows failed. The card's worst state, in order:
-  failed, not seen, stale, unfinished, passed (owner, 2026-11-25). Checks on a follow-up's
-  turn: open ("What this plan leaves open", 16).
+  failed, not seen, stale, unfinished, passed (owner, 2026-11-25). The card ranks the checks
+  the latest turn's report claims: the other commands an agent tried do not mark it.
+- Each turn has its own Checks under its own Steps, the run's and each follow-up's (owner,
+  2026-11-25).
 - No report: the section lists the commands the run ran, with no claims.
 - A run with no command: "No command was run".
 
@@ -940,7 +942,7 @@ event source: "next" moves the walkthrough; "send" twice sends.
 7.1 -> 7.2 -> 7.3 -> 7.4
               7.3 -> 7.5
 7.1 -> 7.6 (read-only threads)  -> 8.2 -> 8.5, 8.7
-7.7 (independent; its e2e test needs `POST /new {files}`, below)
+7.7 (independent; its e2e test needs `POST /new` to take `files`, below)
 8.1 -> 8.2 -> 8.3 -> 8.4 -> 8.6
 9.1 -> 9.2 -> 9.4, 9.5        9.3 needs only 9.1
 10.1 -> 10.2 -> 10.3          10.3 uses 7.5 and 7.7 for two commands
@@ -949,8 +951,8 @@ event source: "next" moves the walkthrough; "send" twice sends.
 7.6 comes before the map because analysis runs are read-only threads. 9.1 and 10.1 have no
 dependency and can run beside the main line, each in a worktree of its own, and so can 7.7:
 its e2e test needs the bridge to write files with definitions
-(`src/site/tests/page_e2e.rs:143` writes three plain files today), and whichever of 7.5 and
-7.7 lands first makes that change.
+(`src/site/tests/page_e2e.rs:143` writes three plain files today; `POST /new` takes a
+scenario since 7.4), and whichever of 7.5 and 7.7 lands first adds `files`.
 
 ## What this plan leaves open
 
@@ -988,5 +990,5 @@ its options; the first is recommended.
     that failed and was edited after shows failed, and the card ranks failed, not seen,
     stale, unfinished, passed (7.4); any finding on a `routine` or `mechanical` hunk shows it
     as `eyes`, with no new field (7.5).
-16. **Checks on follow-ups** (7.4). (a) Each turn's Checks under its own Steps
-    (`followUpPart`); (b) only the latest turn's, for the card's icon.
+16. **Checks on follow-ups** (7.4). Settled by the owner on 2026-11-25 as (a): each turn's
+    Checks under its own Steps (`followUpPart`).

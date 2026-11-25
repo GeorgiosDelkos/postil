@@ -306,6 +306,16 @@ async function prompt(id, params) {
       say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "evidence": {
+      // Two commands and a report that claims three checks (ui/run.js, `evidence`): one
+      // passed as claimed, one that exited non-zero as Grok ends it (completed) though the
+      // report says passed, and one the log never shows.
+      update({ sessionUpdate: "tool_call", toolCallId: "c1", title: "cargo test", kind: "execute", status: "completed", rawInput: { command: "cargo test" }, rawOutput: { exit_code: 0 } });
+      update({ sessionUpdate: "tool_call", toolCallId: "c2", title: "cargo clippy", kind: "execute", status: "completed", rawInput: { command: "cargo clippy" }, rawOutput: { exit_code: 101 } });
+      const checks = ["cargo test", "cargo clippy", "cargo doc"].map((command) => ({ command, result: "passed" }));
+      say(`N1: done\n\n\`\`\`json\n${JSON.stringify({ steps: [], checks })}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "report-bad":
       // A json block that is an object, whose steps are not a list.
       say('N1: done\n\n```json\n{"steps": "first a.txt"}\n```');

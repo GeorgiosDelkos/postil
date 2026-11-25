@@ -447,6 +447,20 @@ test("a report arriving redraws the run dialog, and note lines before it still c
   assert.equal(agentSaid(streaming("R1", "ended", withBlock), "N1"), "renamed it");
 });
 
+test("a command that arrives after its call started redraws the run's Checks", () => {
+  // Claude's adapter names the command on an update, after the call (src/run/log.rs).
+  const report = reportEntry({
+    steps: [],
+    checks: [{ command: "cargo test", result: "passed" }],
+    cut: 0,
+    block: "",
+  });
+  const call = tool("c1", "execute", "Terminal");
+  const key = (entries) => threadKey([streaming("R1", "ended", [call, ...entries, report])]);
+  const named = { kind: "toolUpdate", id: "c1", command: "cargo test" };
+  assert.notEqual(key([named]), key([]), "the claim now matches the call");
+});
+
 test("a follow-up went to a fresh agent only when its prompt told the thread first", () => {
   const turn = (prompt) => ({ prompt, followUp: { of: "R1", text: "and more" } });
   assert.equal(freshAgent(turn("and more")), false, "a log from before the reminder");

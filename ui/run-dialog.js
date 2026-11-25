@@ -8,13 +8,23 @@ import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
-import { elapsed, foldRun, iconKind, isLive, statusLine, statusWord, toolRow } from "./run.js";
+import {
+  elapsed,
+  evidence,
+  foldRun,
+  iconKind,
+  isLive,
+  statusLine,
+  statusWord,
+  toolRow,
+} from "./run.js";
 import {
   freshAgent,
   noteStatus,
   planProgress,
   replyShown,
   reportNotice,
+  reportOf,
   reviewKey,
   reviewOf,
   threadKey,
@@ -22,6 +32,17 @@ import {
 } from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
+
+// What a Checks row says of each evidence state (`evidence` in run.js). "An edit after it"
+// rather than "stale": a formatter run as a command also changes files, unseen, so the row
+// claims only what the log shows.
+const CHECK_WORDS = {
+  passed: "passed",
+  failed: "failed",
+  stale: "passed, an edit after it",
+  unfinished: "unfinished",
+  "not-seen": "not seen in the log",
+};
 
 // `store` holds the runs (run-store.js); `detailEl` is the `<dialog>`. `noteOf(id)` gives a
 // note by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)`
@@ -264,6 +285,8 @@ export function runDialog({
     if (branch) body.append(branch);
 
     if (steps.length) body.append(stepsSection(view, steps));
+    const checks = checksSection(view);
+    if (checks) body.append(checks);
 
     const reply = replyPart(view);
     if (reply) body.append(reply);
@@ -457,12 +480,52 @@ export function runDialog({
     parts.push(asked);
     const steps = stepsOf(turn);
     if (steps.length) parts.push(stepsSection(turn, steps));
+    const checks = checksSection(turn);
+    if (checks) parts.push(checks);
     const reply = replyPart(turn);
     if (reply) parts.push(reply);
     const report = reportNotice(turn);
     if (report) parts.push(el("div", "run-notice", report));
     if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
     return parts;
+  }
+
+  // A turn's Checks (docs/review-assist.md, "Evidence on the run"): each check its report
+  // claims, with what the log shows, then every other command it ran, each row opening the
+  // step that ran it. Each turn has its own (owner, 2026-11-25). Null for a turn that logged
+  // neither a report nor a command, as every run did before reports.
+  function checksSection(turn) {
+    const report = reportOf(turn);
+    const rows = evidence(report?.report ?? null, foldRun(turn.entries).items);
+    if (!report && rows.length === 0) return null;
+    if (rows.length === 0) return section("Checks", el("div", "muted", "No command was run."));
+    const cards = el("div", "run-cards");
+    for (const row of rows) cards.append(checkCard(turn, row));
+    const claimed = rows.filter((row) => row.claim !== null).length;
+    return section(claimed ? `Checks · ${claimed}` : "Commands", cards);
+  }
+
+  // One row of a turn's Checks: the command, and its state as the log has it.
+  function checkCard(turn, { command, claim, state, item }) {
+    const said = claim !== null && claim !== state ? ` · the author says ${claim}` : "";
+    const label = `${CHECK_WORDS[state]}${said}`;
+    const parts = [
+      el("span", "tool-verb", claim === null ? "ran" : "check"),
+      el("code", "run-card-text tool-target", command),
+      el("span", `tool-state ${state}`, label),
+    ];
+    if (!item) {
+      const row = el("div", "run-card step run-check");
+      row.append(...parts);
+      return row;
+    }
+    const button = el("button", "run-card step run-check");
+    button.type = "button";
+    button.append(...parts, el("span", "run-chevron", "›"));
+    button.addEventListener("click", () =>
+      openDetail({ kind: "step", id: turn.id, key: itemKey(item) }),
+    );
+    return button;
   }
 
   // The cards of `steps`, some of `stepsOf(view)`, each opening its step.

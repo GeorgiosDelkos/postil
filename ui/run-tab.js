@@ -5,6 +5,7 @@
 import { el, statusIcon } from "./dom.js";
 import {
   elapsed,
+  evidence,
   foldRun,
   iconKind,
   isLive,
@@ -14,8 +15,26 @@ import {
   statusLine,
   statusWord,
   stopKey,
+  worstEvidence,
 } from "./run.js";
-import { latestOfThreads } from "./status.js";
+import { latestOfThreads, reportOf } from "./status.js";
+
+// The mark a run's card shows for the worst of its latest turn's checks, and its tooltip.
+const CHECK_MARKS = { failed: "×", "not-seen": "?", stale: "~", unfinished: "…", passed: "✓" };
+const CHECK_TITLES = {
+  failed: "A check the agent claims failed in the log",
+  "not-seen": "A check the agent claims is not in the log",
+  stale: "A check passed, then a file was edited after it",
+  unfinished: "A check the agent claims had not ended",
+  passed: "Every check the agent claims passed in the log",
+};
+
+// The worst state of the checks `turn`'s report claims (`worstEvidence`), or null when it
+// claims none. The latest turn's: a later turn's checks are what the work stands on now.
+function checksOf(turn) {
+  const report = reportOf(turn)?.report;
+  return report ? worstEvidence(evidence(report, foldRun(turn.entries).items)) : null;
+}
 
 // `store` holds the runs (run-store.js) and `dialog` is the run dialog (run-dialog.js).
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
@@ -90,7 +109,14 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       const view = store.byId(id);
       const latest = view ? (latests.get(id) ?? view) : null;
       const sig = view
-        ? JSON.stringify([latest.id, latest.status, view.agent, view.notes, statusWord(latest)])
+        ? JSON.stringify([
+            latest.id,
+            latest.status,
+            view.agent,
+            view.notes,
+            statusWord(latest),
+            checksOf(latest),
+          ])
         : (store.failure(id) ?? "loading");
       wanted.push([`run:${id}`, sig, () => runCard(id, view, latest)]);
     }
@@ -147,6 +173,14 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       statusIcon(iconKind(latest)),
       el("span", "run-id", view.id),
       el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`),
+    );
+    const checks = checksOf(latest);
+    if (checks) {
+      const mark = el("span", `run-evidence tool-state ${checks}`, CHECK_MARKS[checks]);
+      mark.title = CHECK_TITLES[checks];
+      button.append(mark);
+    }
+    button.append(
       el("span", `run-entry-status tone-${statusLine(latest).tone}`, statusWord(latest)),
       el("span", "run-chevron", "›"),
     );

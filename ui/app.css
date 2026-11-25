@@ -2029,6 +2029,18 @@ button.repo-name:hover {
   color: var(--text-muted);
 }
 
+/* A check's state that the engineer should look at: claimed and not in the log, or passed
+   before an edit (`evidence` in ui/run.js). */
+.tool-state.not-seen,
+.tool-state.stale {
+  color: var(--attention);
+}
+
+/* The mark on a run's card for the worst of its claimed checks. */
+.run-evidence {
+  font-weight: 600;
+}
+
 .tool-diff,
 .tool-output {
   max-height: 240px;

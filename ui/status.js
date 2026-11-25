@@ -6,6 +6,7 @@
 import { covers } from "./note-place.js";
 import {
   diffStats,
+  evidence,
   foldRun,
   isLive,
   isOpen,
@@ -416,6 +417,13 @@ function turnShown(turn) {
     // Arrives as the turn ends: the reply is drawn without its block, and a notice may show.
     // What the dialog draws of it, not the report whole, which can be tens of KB.
     reportShown(reportOf(turn)),
+    // The Checks rows: a command that arrives after its call started changes which claim it
+    // matches, which the step cards above do not show.
+    evidence(reportOf(turn)?.report ?? null, items).map((row) => [
+      row.command,
+      row.claim,
+      row.state,
+    ]),
   ];
 }
 
