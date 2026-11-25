@@ -287,8 +287,8 @@ async function prompt(id, params) {
       // Two-byte characters, so byte 4096 falls inside one.
       update({ sessionUpdate: "tool_call_update", toolCallId: "c3", rawInput: { command: `echo ${"é".repeat(2600)}` } });
       update({ sessionUpdate: "tool_call_update", toolCallId: "c3", status: "failed", rawOutput: "Exit code 2\nno" });
-      // c4 reported whole in one call: kind, command and exit code together.
-      update({ sessionUpdate: "tool_call", toolCallId: "c4", title: "make", kind: "execute", status: "completed", rawInput: { command: "make" }, rawOutput: { exit_code: 1 } });
+      // c4 reported whole in one call: kind, command and exit code together, a success.
+      update({ sessionUpdate: "tool_call", toolCallId: "c4", title: "make", kind: "execute", status: "completed", rawInput: { command: "make" }, rawOutput: { exit_code: 0 } });
       // A read whose input has a command field, before and after: not an execute call.
       update({ sessionUpdate: "tool_call", toolCallId: "r1", title: "Read a.txt", kind: "read", status: "pending", rawInput: { command: "read", path: "a.txt" } });
       update({ sessionUpdate: "tool_call_update", toolCallId: "r1", status: "completed", rawInput: { command: "read" }, rawOutput: { exit_code: 1 } });

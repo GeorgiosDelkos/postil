@@ -110,10 +110,10 @@ test("an update's command and exit code replace the call's, and a later one wins
   const { items } = foldRun([
     tool("c1", { tool: "execute", command: "cargo test" }),
     run("cargo test --all", undefined),
-    run(undefined, 1),
+    run(undefined, 0),
     run("cargo  test", null),
   ]);
-  assert.deepEqual([items[0].command, items[0].exit], ["cargo  test", 1]);
+  assert.deepEqual([items[0].command, items[0].exit], ["cargo  test", 0], "an exit code of 0 kept");
   assert.deepEqual(
     [foldRun([tool("c2")]).items[0].command, foldRun([tool("c2")]).items[0].exit],
     [null, null],

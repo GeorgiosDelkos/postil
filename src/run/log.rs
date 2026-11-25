@@ -76,8 +76,8 @@ pub(super) enum InThread<'a> {
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
-/// on the `tool` and `toolUpdate` entries. Older logs read as runs of notes, without
-/// snapshots, commands or exit codes.
+/// on the `tool` and `toolUpdate` entries. Every older version reads: a log before version 4
+/// has no snapshots, and one before version 5 no commands or exit codes.
 const LOG_VERSION: u32 = 5;
 
 /// One run and its log.

@@ -1670,7 +1670,8 @@ fn an_execute_call_keeps_its_command_and_exit_code_and_no_other_call_does() {
             // Grok names the kind on an update, and ends a failure as completed.
             call("c2", Some("cargo build"), Some(101)),
             call("c3", Some(&cut), Some(2)),
-            call("c4", Some("make"), Some(1)),
+            // A finished exit code of 0 is kept: a success Grok confirmed.
+            call("c4", Some("make"), Some(0)),
             // A read's input and output, though it names a command and an exit code.
             call("r1", None, None),
             call("e1", None, None),
