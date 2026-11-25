@@ -52,8 +52,8 @@ step named.
 
 | Spike | Question | Gates | If the answer is bad |
 |---|---|---|---|
-| S1 | For Claude and Grok: what does an execute tool call carry (`title`, `rawInput`, `rawOutput`), and is a non-zero exit `status: failed`? | 7.2, 7.4 | Evidence shows "ran" instead of "passed", from `status` alone. |
-| S2 | Do Claude and Grok end a turn with the report block when the prompt asks in words? 10 runs each. | 7.3 | Under 8 of 10: the report is asked for in a second short turn of the same session. |
+| S1 | For Claude and Grok: what does an execute tool call carry (`title`, `rawInput`, `rawOutput`), and is a non-zero exit `status: failed`? | 7.2, 7.4 | Evidence shows "ran" instead of "passed", from `status` alone. Done: Grok's is `completed`; the exit code is kept instead (design, "Open questions", 5). |
+| S2 | Do Claude and Grok end a turn with the report block when the prompt asks in words? 10 runs each. | 7.3 | Under 8 of 10: the report is asked for in a second short turn of the same session. Done: 10 of 10 each (design, "Open questions", 11). |
 | S3 | `hippius-mem`: the tool names and argument schemas (`tools/list`), `doctor`'s exit codes and output, whether `recall` touches the network, whether any call can prompt on a terminal, and which repository a server started in `~/.postil/worktrees/...` binds. | 9.1 to 9.5 | Wrong repository: Postil passes the repository explicitly where the tool takes one (`recall` has `repo`). |
 | S4 | `@dagrejs/dagre` at a release at least two weeks old: is there one browser file with a global, its size, and the layout time for 200 nodes in WKWebView? | 8.3 | Over 50 ms or no browser build: a layered layout of our own, limited to 60 nodes. |
 | S5 | `cargo deny check` with `tree-sitter-tags`, `objc2-speech`, `objc2-avf-audio` added. | 7.7, 10.1 | A license outside `deny.toml`'s list: ask the owner before adding an exception. |
@@ -124,11 +124,15 @@ step named.
 **Changes**
 
 - `src/acp/wire.rs`: `ToolCall` and `ToolCallUpdate` (`:259`, `:276`) gain
-  `raw_input: Option<serde_json::Value>`.
-- `src/run/log.rs`: `Entry::Tool` and `Entry::ToolUpdate` gain `command: Option<String>`,
-  filled in `entry_of` (`:1080`) only for `ToolKind::Execute`, by the rule S1 settles (the
-  expected one: `rawInput.command` when it is a string, or an array of strings joined by
-  spaces). `LOG_VERSION` 5.
+  `raw_input` and `raw_output: Option<serde_json::Value>`.
+- `src/run/log.rs`: `Entry::Tool` and `Entry::ToolUpdate` gain `command: Option<String>`
+  and `exit: Option<i64>`, filled in `entry_of` (`:1080`) only for execute calls, by the
+  rules S1 settled: `rawInput.command` when it is a string (no agent sent an array); the exit
+  code from Grok's `rawOutput.exit_code` or Claude's leading `Exit code N` line, only from a
+  report that the call finished, and Claude's text only from a failed one. An update need not
+  name its call's kind (Claude names it only on the call, Grok only on an update), so
+  `RunState` keeps each call's last known kind. `LOG_VERSION` 5. The exit code was added
+  after S1, by the owner's choice on 2026-11-25.
 - `ui/run.js`: `foldMore` merges `command` into the tool item.
 - `tests/fake-agent.mjs`: scenario `checks` (an execute call with `rawInput`, completed; one
   that fails; an edit after the first).
@@ -207,9 +211,10 @@ step named.
 **Changes**
 
 - `ui/run.js`: `evidence(report, items) -> [{command, claim, state, item}]`, pure.
-  States: `passed`, `failed`, `stale`, `unfinished`, `not-seen`. A claim matches the last
-  execute item whose command equals it after trimming and collapsing spaces; with no command
-  kept, whose title equals it or equals it wrapped in backticks.
+  States: `passed`, `failed`, `stale`, `unfinished`, `not-seen`. A non-zero `exit` is
+  `failed` whatever the item's status (Grok ends a failure as `completed`). A claim matches
+  the last execute item whose command equals it after trimming and collapsing spaces; with no
+  command kept, whose title equals it or equals it wrapped in backticks.
 - `ui/run-dialog.js`, `runDetail` (`:212`): a Checks section after Steps, each row opening
   its step (`openDetail({kind: "step", ...})`), then the run's other commands.
 - `ui/run-tab.js`: one icon on the card for the worst state, added to the card's signature

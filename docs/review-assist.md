@@ -150,10 +150,10 @@ The changes view gains an order: Walkthrough (the default when the run has a rep
 
 "Did it run the tests" is answered from two sources that Postil compares: what the agent
 claims (`checks`) and what the run log holds (the tool calls of kind execute, each with its
-command and final status). The log keeps neither a command nor an exit status today: an
-execute call's `rawInput` is dropped when the message is parsed. Keeping the command is the
-first step of this milestone, and the states below read `completed` and `failed` as the
-agent reports them.
+command and how it ended). Run log version 5 keeps an execute call's command and exit code
+(step 7.2). A non-zero exit code is a failure whatever the call's status says: Grok ends such
+a command as `completed` ("Open questions", 5). With no exit code, the states read
+`completed` and `failed` as the agent reports them.
 
 | State | Meaning |
 |---|---|
@@ -643,8 +643,77 @@ Postil writes outside itself.
    steps. The key held to talk is not chosen: Right Option is the proposal, since Fn
    belongs to macOS dictation.
 4. **The map's color.** A muted violet; the mockups show it for approval.
-5. **Exit status.** Evidence reads a command's status as the agent reports it. Whether each
-   agent in the catalog reports a non-zero exit as a failed tool call is not checked yet.
+5. **Exit status: answered by spike S1, 2026-11-25.** Claude (`claude-agent-acp` 0.94.0)
+   and Grok (1.0.92) ran `echo hello`, `sh -c 'echo failing >&2; exit 3'`,
+   `ls no-such-directory` and a Python test through Postil's own connection, in a scratch
+   repository. Neither asked permission for these commands. The tool call messages, verbatim
+   apart from `_meta` and long paths:
+
+   ```text
+   Claude, the call:
+   {"sessionUpdate":"tool_call","toolCallId":"toolu_01EvP1...","name":"Bash","rawInput":{},
+    "status":"pending","title":"Terminal","kind":"execute","content":[]}
+   then updates with no kind:
+   {"sessionUpdate":"tool_call_update","toolCallId":"toolu_01EvP1...",
+    "rawInput":{"command":"sh -c 'echo failing >&2; exit 3'"},
+    "title":"sh -c 'echo failing >&2; exit 3'"}
+   {"sessionUpdate":"tool_call_update","toolCallId":"toolu_01EvP1...","status":"failed",
+    "rawOutput":"Exit code 3\nfailing","content":[{"type":"content","content":{"type":"text",
+    "text":"```\nExit code 3\nfailing\n```"}}]}
+   a command that succeeds:
+   {"sessionUpdate":"tool_call_update","toolCallId":"toolu_01KZZC...","status":"completed",
+    "rawOutput":"hello","content":[...]}
+
+   Grok, the call, with no kind and no status:
+   {"sessionUpdate":"tool_call","toolCallId":"call-68c5...-1","title":"run_terminal_command",
+    "rawInput":{"command":"sh -c 'echo failing >&2; exit 3'",
+    "description":"Fail on purpose with exit 3"}}
+   then:
+   {"sessionUpdate":"tool_call_update","toolCallId":"call-68c5...-1","kind":"execute",
+    "title":"Execute `sh -c 'echo failing >&2; exit 3'`","content":[...],"locations":[],
+    "rawInput":{"variant":"Bash","command":"sh -c 'echo failing >&2; exit 3'",
+    "description":"Fail on purpose with exit 3","is_background":false}}
+   {"sessionUpdate":"tool_call_update","toolCallId":"call-68c5...-1","status":"in_progress",
+    "rawOutput":{"type":"Bash","output":[],"output_for_prompt":"","exit_code":0,...}}
+   {"sessionUpdate":"tool_call_update","toolCallId":"call-68c5...-1","status":"completed",
+    "rawOutput":{"type":"Bash","output":[102,97,...],"output_for_prompt":"exit: 3\nfailing\n",
+    "exit_code":3,"command":"sh -c 'echo failing >&2; exit 3'","truncated":false,
+    "signal":null,"timed_out":false,...}}
+   ```
+
+   - **Claude reports a non-zero exit as `failed`; Grok as `completed`,** with the code only
+     in `rawOutput.exit_code`, and `exit_code` 0 on updates while the command runs.
+   - **The kind is not on every message.** Claude names `execute` only on the call, whose
+     `rawInput` is empty; Grok names it only on its first update.
+   - `rawInput.command` was a string for both. No array was seen.
+   - The plan's fallback ("ran" instead of "passed", from `status` alone) would show Grok's
+     failures as passed. The owner chose instead to keep the exit code with the command in
+     run log version 5 (step 7.2, #54), and evidence reads a non-zero exit as failed whatever
+     the status says.
+
+11. **The report block: answered by spike S2, 2026-11-25.** Each agent got a prompt built as
+    `notes::prompt` builds one (one note: fix `add` in a scratch repository and run its test),
+    with this paragraph after "list each note id", the wording step 7.3 ships, 10 runs each:
+
+    > Then end your reply with a report for the engineer who reviews your changes: one JSON
+    > object in a code block fenced as json, the last thing in your reply. Its field steps is
+    > the order in which to read your changes, cause before effect and the core change before
+    > its callers. Each step is an object with path (the file, relative to the repository
+    > root), lines (the first and last line on the new side of the diff, as an array of two
+    > numbers), why (one line) and risk (eyes when the change needs the engineer's judgment,
+    > routine, or mechanical for a rename, formatting or generated code). Its field checks
+    > lists each command you ran to verify the work, each an object with command (exactly as
+    > you ran it) and result (passed or failed). Use an empty array when there is nothing to
+    > list.
+
+    - Claude: 10 of 10 replies ended with a block that parses with the shape above.
+    - Grok: 10 of 10 replies held one. In 3, the owner's Grok stop hook made Grok work on in
+      the same turn after the block (lint and type checks), so the block was not last and
+      missed those checks. They are in the run log, and the evidence lists them among the
+      run's other commands (step 7.4).
+    - Both are above the plan's 8 of 10, so no second turn is needed.
+    - Both agents ran with the owner's own configuration, as Postil runs them. In 2 of
+      Claude's runs that configuration had the agent write a note to hippius-mem.
 6. **hippius-mem's repository scope in a worktree.** Agents run in `~/.postil/worktrees/...`;
    whether the server binds the right repository from there is not checked yet.
 7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
