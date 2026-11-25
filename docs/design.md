@@ -974,8 +974,10 @@ When `~/.config/postil/settings.json` does not exist yet (first launch, outside 
 a modal startup wizard (`ui/wizard.js`, `ui/wizard-dialog.js`) opens over the window and walks
 through installed agents, the default agent and optional reviewers, appearance (with a live
 code preview) and startup behavior, and a readiness summary (`git`, `npx`, `gh`). Completing or
-skipping the wizard writes `settings.json` in one save; closing it mid-way reverts any preview
-without writing the file. The wizard can be run again any time from Postil > Setup Wizard… or
+skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
+installed built-in agents turned on); closing it mid-way reverts any preview without writing the
+file. The wizard's save names a revision like the dialog's, and when the file changes under it
+(another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
 from Settings.
 
 ## Dependencies

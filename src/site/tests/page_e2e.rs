@@ -9,6 +9,10 @@
 //! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, `src/b.rs` and
 //!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
 //!   starts from nothing.
+//! - `POST /new-fresh` makes a site the same way, but it opens no project, has no
+//!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
+//!   startup wizard open. `POST /new-fresh-gemini` does the same with a `gemini` program on
+//!   the search path, so the wizard finds that built-in agent installed.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -97,10 +101,15 @@ fn serve(requests: mpsc::Receiver<Asked>) {
 
 fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: TcpStream) {
     let path = request.uri().path();
-    if path == "/new" || path == "/new-fresh" {
+    let start = match path {
+        "/new" => Some(Start::FakeAgent),
+        "/new-fresh" => Some(Start::FirstRun),
+        "/new-fresh-gemini" => Some(Start::FirstRunWithGemini),
+        _ => None,
+    };
+    if let Some(start) = start {
         let base = format!("/s{}/", sites.len());
-        let fresh = path == "/new-fresh";
-        sites.push(bridged(sites.len(), fresh));
+        sites.push(bridged(sites.len(), start));
         let body = serde_json::json!({ "base": base }).to_string();
         write_reply(
             &mut stream,
@@ -140,9 +149,23 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
     write_reply(&mut stream, &bridged.site.respond(&request));
 }
 
-/// A new site on a fresh repository, the `number`th the bridge opened. When `fresh` is true,
-/// no `settings.json` is written beforehand so the startup wizard opens on first load.
-fn bridged(number: usize, fresh: bool) -> Bridged {
+/// What a new bridged site starts from.
+#[derive(Debug, Clone, Copy)]
+enum Start {
+    /// The repository open as the project, with the fake agent in its `flood` scenario.
+    FakeAgent,
+    /// No project, no `settings.json` and an empty search path, as on a first launch: the
+    /// page shows the welcome screen with the startup wizard over it.
+    FirstRun,
+    /// As [`Start::FirstRun`], with a `gemini` program on the search path, so the wizard
+    /// finds one built-in agent installed.
+    FirstRunWithGemini,
+}
+
+/// A new site, the `number`th the bridge opened, on a new repository holding `src/a.rs`,
+/// `src/b.rs` and `src/c.rs`. With [`Start::FirstRun`] the repository supplies only the
+/// configuration and home directories.
+fn bridged(number: usize, start: Start) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
     repo.write("src/a.rs", "one\ntwo\nthree\n");
     // For the file filter to list several matches.
@@ -158,18 +181,33 @@ fn bridged(number: usize, fresh: bool) -> Bridged {
             listeners.retain_mut(|stream| stream.write_all(b"data: run\n\n").is_ok());
         })
     };
-    let site = if fresh {
-        // Empty search path so ambient agents on the developer's or runner's PATH never alter
-        // the wizard's first-run defaults during the e2e test.
-        Site::new(
+    let site = match start {
+        Start::FakeAgent => agent_site(&repo, "flood", notify),
+        // An empty search path, so agents installed on the developer's or runner's PATH
+        // cannot change the wizard's first-run defaults.
+        Start::FirstRun => Site::new(
             Some(&repo.config()),
             Some(&repo.home()),
             None,
             no_agents(),
             notify,
-        )
-    } else {
-        agent_site(&repo, "flood", notify)
+        ),
+        Start::FirstRunWithGemini => {
+            // Found by name only: the wizard never starts it.
+            let bin = repo.root.join(".git/test-bin");
+            fs::create_dir_all(&bin).unwrap();
+            let gemini = bin.join("gemini");
+            fs::write(&gemini, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&gemini, fs::Permissions::from_mode(0o755)).unwrap();
+            let search_path = bin.into_os_string();
+            Site::new(
+                Some(&repo.config()),
+                Some(&repo.home()),
+                None,
+                Scanner::new(move || search_path.clone()),
+                notify,
+            )
+        }
     };
     Bridged {
         site,

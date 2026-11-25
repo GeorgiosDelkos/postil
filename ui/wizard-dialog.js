@@ -99,8 +99,13 @@ export function wizardDialog(
     session: 0,
   };
 
+  // A reply whose revision differs from the one on screen means the file changed since the
+  // draft was made (another window, the settings dialog, a refused save). The draft then starts
+  // over from the file: a save names the reply's revision, so keeping the draft would let
+  // Finish or Skip overwrite that change unseen, which the revision check exists to prevent.
   function ingestView(view, { resetDraft = false, session = ui.session } = {}) {
     if (session !== ui.session) return;
+    const fileChanged = ui.view !== null && view.revision !== ui.view.revision;
     const scanning = view.agents === null;
     const nextView = {
       ...view,
@@ -113,13 +118,16 @@ export function wizardDialog(
       JSON.stringify(nextView) === JSON.stringify(ui.view);
     ui.view = nextView;
     ui.scanning = scanning;
-    if (resetDraft || ui.draft === null) {
+    // Once the file exists, this is no longer a first run, so Skip goes away.
+    ui.firstRun = ui.firstRun && view.firstRun;
+    if (resetDraft || ui.draft === null || fileChanged) {
       ui.baseline = structuredClone(view.settings);
       ui.draft = structuredClone(view.settings);
     }
     if (ui.firstRun && !ui.touchedAgents && nextView.agents !== null) {
       ui.draft = applyDetectedDefaults(ui.draft, nextView.agents);
     }
+    if (fileChanged) apply(ui.draft);
     clearTimeout(ui.pollTimer);
     if (scanning && dialogEl.open) {
       ui.pollTimer = setTimeout(
@@ -178,20 +186,17 @@ export function wizardDialog(
       if (session !== ui.session) return;
       ui.saving = false;
       ui.error = String(error.message ?? error);
-      // Refresh settings & revision in case another window edited or created settings.json.
+      // A refusal for a changed file (409) is shown with the file as it now is, as its text
+      // says; `ingestView` starts the draft over when the revision moved.
       await fetchSettingsJson()
         .then((latest) => {
           if (session !== ui.session) return;
-          ui.view = {
-            ...ui.view,
-            revision: latest.revision,
-            problem: latest.problem,
-            firstRun: latest.firstRun,
-          };
-          ui.baseline = structuredClone(latest.settings);
-          ui.firstRun = latest.firstRun;
-          if (latest.problem) ui.error = null;
+          // The settings dialog's copy follows the file, then the window goes back to the
+          // draft's preview, which `onSaved` replaced with the file's settings.
           onSaved(latest);
+          ingestView(latest, { session });
+          if (latest.problem) ui.error = null;
+          apply(ui.draft);
         })
         .catch(() => {});
       if (session === ui.session && dialogEl.open) render();
@@ -567,7 +572,10 @@ export function wizardDialog(
     const node = el("footer", "wizard-footer");
     const left = el("div", "wizard-footer-left");
     if (ui.firstRun && !ui.view?.problem) {
-      const skip = controlButton("Skip", "wizard-skip", () => commit(ui.baseline));
+      // Skip drops the edits but keeps what step 1 showed as found: the installed agents on.
+      const skip = controlButton("Skip", "wizard-skip", () =>
+        commit(applyDetectedDefaults(ui.baseline, ui.view.agents)),
+      );
       skip.disabled = ui.saving || !ui.baseline;
       left.append(skip);
     }
