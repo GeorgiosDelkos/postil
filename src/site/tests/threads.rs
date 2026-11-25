@@ -1086,3 +1086,31 @@ fn a_worktree_whose_config_moves_its_working_tree_elsewhere_takes_no_run() {
         "?? theirs.txt"
     );
 }
+
+#[test]
+fn a_worktree_checks_out_only_what_the_engineer_s_sparse_checkout_does() {
+    let repo = TempRepo::new("thread-sparse");
+    repo.write("a.txt", "a\n");
+    repo.write("src/x.rs", "x\n");
+    fs::create_dir_all(repo.root.join("docs")).unwrap();
+    repo.write("docs/y.md", "y\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    repo.git(&["sparse-checkout", "set", "--cone", "src"]);
+    assert!(!repo.root.join("docs").exists());
+    post_note(&site, "a.txt", 1, 1, "one");
+
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+
+    let worktree = PathBuf::from(thread(&site, "R1")["path"].as_str().unwrap());
+    assert!(worktree.join("a.txt").is_file() && worktree.join("src/x.rs").is_file());
+    assert!(
+        !worktree.join("docs").exists(),
+        "left out, as in the engineer's tree"
+    );
+    assert_eq!(git_out(&worktree, &["sparse-checkout", "list"]), "src");
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+    assert_eq!(thread(&site, "R1")["skipped"], serde_json::Value::Null);
+    // The engineer's own patterns are theirs still.
+    assert_eq!(git_out(&repo.root, &["sparse-checkout", "list"]), "src");
+}

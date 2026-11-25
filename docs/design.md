@@ -547,9 +547,8 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
 
 ### Worktrees
 
-Milestone 6, built but for two items marked below. Decided with the owner on 2026-11-24. Two
-agents in one working tree overwrite each other's edits, so each thread (a run of notes with
-its follow-ups and reviews)
+Milestone 6, built. Decided with the owner on 2026-11-24. Two agents in one working tree
+overwrite each other's edits, so each thread (a run of notes with its follow-ups and reviews)
 runs in a git worktree of its own, on a branch of its own. The engineer's working tree is
 never an agent's working directory; changes reach it only through Apply or a merged pull
 request.
@@ -558,8 +557,8 @@ Built (`src/thread.rs`, `src/clone.rs`, `src/run/room.rs`, `src/disk.rs`, `src/r
 `src/github.rs`): a worktree and a branch per thread, the record, commits as snapshots, the
 cloned build folders, Apply and Discard, a runner per thread with its locks, the cap of 3 live
 runs, `git worktree lock`, the startup sweep, the cap of 15 worktrees, the free-space floor and
-eviction, and pull requests. Not built yet, and marked so below: the warning about
-uncommitted changes, and sparse-checkout patterns.
+eviction, pull requests, the warning about uncommitted changes at send, and sparse-checkout
+patterns.
 
 #### Threads
 
@@ -637,8 +636,15 @@ uncommitted changes, and sparse-checkout patterns.
   it, and Postil strips the worktree's path from them.
 - **Making it:** `git worktree add -b <branch> <path> <fork commit>` on the agent's start
   thread, before the agent starts there, with no hooks (`post-checkout` may install or build),
-  then `git submodule update --init` when `.gitmodules` exists, and the checkout's
-  sparse-checkout patterns when it has any (not built yet). A worktree that cannot be made
+  then `git submodule update --init` when `.gitmodules` exists. When the engineer's checkout
+  is sparse (`core.sparseCheckout`), the worktree is added with `--no-checkout`, given the
+  same mode (cone or not, `core.sparseCheckoutCone`) and patterns (`git sparse-checkout
+  list`, passed on standard input to `git sparse-checkout set`), and only then checked out,
+  so the files the patterns leave out are never written: in a large monorepo, the checkout
+  is the slow part and the disk. A sparse worktree whose patterns or files fail is removed
+  (`git worktree remove --force --force`, for its lock), so the make fails whole as a plain
+  `git worktree add` does; patterns that cannot be read leave every file checked out, and
+  the thread's `skipped` says so. A worktree that cannot be made
   fails the run and takes the thread out of the record: its branch name may belong to a
   thread of another working tree of the repository, which deleting this thread's note would
   otherwise delete.
@@ -1115,8 +1121,7 @@ retired; the measured numbers above are the baseline to not regress.
    `.github/workflows/release.yml` does the same in CI from a `v*` tag, with the secrets of
    the `release` environment that GeorgiosDelkos/vigil's release uses, and publishes a zip of
    the app (Apple Silicon only, the runner's architecture).
-6. **Threads side by side.** Built, but for the two items section "Worktrees" marks. A
-   worktree and a branch per thread (section
+6. **Threads side by side.** Built. A worktree and a branch per thread (section
    "Worktrees"), one pull request per step, so the main branch works after each. The owner
    chose this order on 2026-11-24, so agents never write to worktrees with no way to bring
    their changes back: the worktree with its branch, commits and clones, with Apply and
