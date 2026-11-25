@@ -3,21 +3,12 @@
 // its review's findings. ui/run.js has the rules. A run's follow-ups are part of its dialog,
 // which ends with the box that sends the next one.
 
-import { diffView, reviewSection } from "./dialog-parts.js";
+import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
-import {
-  elapsed,
-  foldRun,
-  iconKind,
-  isLive,
-  markdownBlocks,
-  statusLine,
-  statusWord,
-  toolRow,
-} from "./run.js";
+import { elapsed, foldRun, iconKind, isLive, statusLine, statusWord, toolRow } from "./run.js";
 import {
   noteStatus,
   planProgress,
@@ -819,27 +810,4 @@ function section(label, ...content) {
 function questionState(item) {
   if (item.answer === null) return "closed";
   return item.answer?.content ? "answered" : "skipped";
-}
-
-// Fills `view` with the agent's Markdown as elements, built node by node: its text is never
-// parsed as HTML.
-function fillMarkdown(view, text) {
-  view.replaceChildren();
-  for (const block of markdownBlocks(text.trim())) {
-    if (block.type === "code") view.append(el("pre", "run-code", block.text));
-    else if (block.type === "list") {
-      const list = el(block.ordered ? "ol" : "ul");
-      for (const item of block.items) list.append(inlineView("li", item));
-      view.append(list);
-    } else view.append(inlineView(block.type === "heading" ? "h4" : "p", block.inline));
-  }
-}
-
-function inlineView(tag, parts) {
-  const node = el(tag);
-  for (const part of parts) {
-    const wrap = { code: "code", strong: "strong", em: "em" }[part.type];
-    node.append(wrap ? el(wrap, "", part.text) : part.text);
-  }
-  return node;
 }

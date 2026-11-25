@@ -7,6 +7,7 @@
 
 mod acp;
 mod agents;
+mod anchor;
 mod clone;
 mod dialog;
 mod disk;

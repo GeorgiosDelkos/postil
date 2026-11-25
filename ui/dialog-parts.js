@@ -1,7 +1,7 @@
-// Parts that the note dialog (note-dialog.js) and the run dialog (run-dialog.js) both draw.
+// Parts that dialogs share: a diff, a Review section, and an agent's Markdown.
 
 import { el } from "./dom.js";
-import { partLines } from "./run.js";
+import { markdownBlocks, partLines } from "./run.js";
 
 // A diff as lines marked removed, added or unchanged (run.js, `partLines`).
 export function diffView(diff) {
@@ -41,4 +41,27 @@ export function reviewSection(title, { reviewed, names, busy, start, hintClass }
     part.append(el("div", hintClass, hint));
   }
   return part;
+}
+
+// Fills `view` with the agent's Markdown as elements, built node by node: its text is never
+// parsed as HTML.
+export function fillMarkdown(view, text) {
+  view.replaceChildren();
+  for (const block of markdownBlocks(text.trim())) {
+    if (block.type === "code") view.append(el("pre", "run-code", block.text));
+    else if (block.type === "list") {
+      const list = el(block.ordered ? "ol" : "ul");
+      for (const item of block.items) list.append(inlineView("li", item));
+      view.append(list);
+    } else view.append(inlineView(block.type === "heading" ? "h4" : "p", block.inline));
+  }
+}
+
+function inlineView(tag, parts) {
+  const node = el(tag);
+  for (const part of parts) {
+    const wrap = { code: "code", strong: "strong", em: "em" }[part.type];
+    node.append(wrap ? el(wrap, "", part.text) : part.text);
+  }
+  return node;
 }
