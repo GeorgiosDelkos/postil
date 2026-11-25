@@ -6,8 +6,8 @@
 //! apart before its new fields fail the parse. The recent projects, the layout and the open
 //! folders are the app's own conveniences and read through [`load_versioned`], which never
 //! fails; the settings and the notes are the engineer's and say why a file cannot be used.
-//! A file that two windows change holds [`lock`] on a lock file beside it while it reads,
-//! changes and writes.
+//! The review file is changed under [`lock`], on a lock file beside it, from its read to its
+//! write, so two windows cannot drop each other's changes.
 
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
@@ -227,19 +227,23 @@ const LOCK_RETRY: Duration = Duration::from_millis(20);
 /// The lock is released when the returned file is dropped. Blocks the calling thread while it
 /// waits.
 ///
+/// Run and thread locks do not use it (`run/log.rs`, `take_lock`): a forked agent child holds
+/// their descriptor until it execs, so they wait 200 ms at most, not seconds.
+///
 /// # Errors
 ///
-/// An error of kind [`io::ErrorKind::WouldBlock`] when the lock is still held after
-/// [`LOCK_WAIT`]; any other when the file cannot be created, opened or locked.
-pub(crate) fn lock(path: &Path) -> io::Result<File> {
+/// [`TryLockError::WouldBlock`] when the lock is still held after [`LOCK_WAIT`];
+/// [`TryLockError::Error`] when the file cannot be created, opened or locked.
+pub(crate) fn lock(path: &Path) -> std::result::Result<File, TryLockError> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        fs::create_dir_all(dir).map_err(TryLockError::Error)?;
     }
     let file = File::options()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(path)?;
+        .open(path)
+        .map_err(TryLockError::Error)?;
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match file.try_lock() {
@@ -247,8 +251,7 @@ pub(crate) fn lock(path: &Path) -> io::Result<File> {
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(LOCK_RETRY);
             }
-            Err(TryLockError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
-            Err(TryLockError::Error(source)) => return Err(source),
+            Err(error) => return Err(error),
         }
     }
 }

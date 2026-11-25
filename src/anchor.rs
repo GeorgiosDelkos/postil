@@ -28,8 +28,8 @@ struct RawLineRange {
 /// Where the lines of `snippet` are in `text`, given that they were last at `last`:
 /// `last` itself when they are still there, otherwise the only place they are, otherwise
 /// `None` (gone, or several places and no way to tell which). `snippet` is whole lines joined
-/// by `\n`, with no `\r` and no newline at its end, as a note stores its snippet; any other
-/// form matches nothing.
+/// by `\n`, with no `\r` and no newline at its end, as a note stores its snippet. It is not
+/// normalized: a trailing `\n` asks for an empty line after the snippet.
 pub(crate) fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
     // `str::lines` drops `\r\n` and `\n` alike, as the highlighter does, so the line numbers
     // here are the ones the page shows.

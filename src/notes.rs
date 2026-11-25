@@ -49,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::Path;
 
@@ -717,15 +717,12 @@ impl Review {
 /// is released when the returned file is dropped.
 fn lock(review_file: &Path) -> Result<File> {
     let path = review_file.with_extension("lock");
-    files::lock(&path).map_err(move |source| {
-        if source.kind() == io::ErrorKind::WouldBlock {
-            Error::ReviewLocked {
-                path,
-                seconds: files::LOCK_WAIT.as_secs(),
-            }
-        } else {
-            Error::WriteReview { path, source }
-        }
+    files::lock(&path).map_err(|error| match error {
+        TryLockError::WouldBlock => Error::ReviewLocked {
+            path,
+            seconds: files::LOCK_WAIT.as_secs(),
+        },
+        TryLockError::Error(source) => Error::WriteReview { path, source },
     })
 }
 
