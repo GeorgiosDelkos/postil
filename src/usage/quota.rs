@@ -1206,7 +1206,8 @@ fn parse_rfc3339_secs(input: &str) -> Option<u64> {
         return None;
     }
     if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || day < 1
+        || day > days_in_month(year, month)
         || hour > 23
         || minute > 59
         || second > 60
@@ -1246,6 +1247,16 @@ fn parse_rfc3339_secs(input: &str) -> Option<u64> {
     u64::try_from(secs).ok()
 }
 
+/// The number of days in `month` (1 to 12) of `year` in the Gregorian calendar.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
 /// Days since 1970-01-01 for a Gregorian civil date (Howard Hinnant's `days_from_civil`).
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = year - i64::from(month <= 2);
@@ -1273,6 +1284,86 @@ mod tests {
             Some(1_795_609_845)
         );
         assert_eq!(parse_rfc3339_secs("not-a-timestamp"), None);
+    }
+
+    /// Formats Unix seconds `secs`, shown at UTC offset `offset_mins`, as RFC 3339. Finds the
+    /// date by searching with `days_from_civil`, so it shares no calendar code with the
+    /// parser's `days_in_month`.
+    fn format_rfc3339(secs: i64, offset_mins: i64, fraction: bool) -> String {
+        let local = secs + offset_mins * 60;
+        let days = local.div_euclid(86_400);
+        let time = local.rem_euclid(86_400);
+        let mut year = 1969;
+        while days_from_civil(year + 1, 1, 1) <= days {
+            year += 1;
+        }
+        let mut month = 1;
+        while month < 12 && days_from_civil(year, month + 1, 1) <= days {
+            month += 1;
+        }
+        let day = days - days_from_civil(year, month, 1) + 1;
+        let (hour, minute, second) = (time / 3600, time / 60 % 60, time % 60);
+        let sign = if offset_mins < 0 { '-' } else { '+' };
+        let (off_h, off_m) = (offset_mins.abs() / 60, offset_mins.abs() % 60);
+        let frac = if fraction { ".250" } else { "" };
+        format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{frac}\
+             {sign}{off_h:02}:{off_m:02}"
+        )
+    }
+
+    #[test]
+    fn rfc3339_round_trips_a_spread_of_timestamps() {
+        // A fixed linear congruential generator (Knuth's MMIX constants), so the spread is
+        // the same on every run.
+        let mut state: u64 = 0x5eed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 33
+        };
+        // 2100-01-01T00:00:00Z: past any reset time a provider reports today.
+        let end = 4_102_444_800_u64;
+        for case in 0..2_000 {
+            let secs = i64::try_from(next() % end).unwrap();
+            let offset_mins = i64::try_from(next() % (2 * 14 * 60 + 1)).unwrap() - 14 * 60;
+            let offset_mins = if secs + offset_mins * 60 < 0 {
+                0
+            } else {
+                offset_mins
+            };
+            let text = format_rfc3339(secs, offset_mins, case % 2 == 0);
+            assert_eq!(
+                parse_rfc3339_secs(&text),
+                Some(u64::try_from(secs).unwrap()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc3339_rejects_a_day_past_the_end_of_its_month() {
+        assert_eq!(parse_rfc3339_secs("2026-02-31T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_secs("2026-02-29T00:00:00Z"), None);
+        assert!(parse_rfc3339_secs("2028-02-29T00:00:00Z").is_some());
+        assert_eq!(parse_rfc3339_secs("2100-02-29T00:00:00Z"), None);
+        assert!(parse_rfc3339_secs("2000-02-29T00:00:00Z").is_some());
+        for year in 1970..2101 {
+            for month in 1..=12 {
+                let (next_year, next_month) = if month == 12 {
+                    (year + 1, 1)
+                } else {
+                    (year, month + 1)
+                };
+                let length =
+                    days_from_civil(next_year, next_month, 1) - days_from_civil(year, month, 1);
+                let last = format!("{year:04}-{month:02}-{length:02}T00:00:00Z");
+                let past = format!("{year:04}-{month:02}-{:02}T00:00:00Z", length + 1);
+                assert!(parse_rfc3339_secs(&last).is_some(), "{last}");
+                assert_eq!(parse_rfc3339_secs(&past), None, "{past}");
+            }
+        }
     }
 
     #[test]
