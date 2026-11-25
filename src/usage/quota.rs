@@ -1012,8 +1012,11 @@ fn curl_json(
     let output = run_timed(
         Command::new("/usr/bin/curl")
             .args([
+                // curl honours `--disable` only as its first argument. It skips the user's
+                // `~/.curlrc`, which could log the Authorization header to a file
+                // (`--trace-ascii`) or change the reply's shape (`--include`).
+                "--disable",
                 "--silent",
-                "--show-error",
                 "--max-time",
                 "7",
                 "--write-out",
@@ -1025,21 +1028,34 @@ fn curl_json(
         Some(config.as_bytes()),
         PROBE_TIMEOUT,
     )?;
+    // curl's stderr is never shown: it can echo request details, and the page gets a fixed
+    // message per failure instead.
+    if !output.status.success() {
+        return Err(curl_failure(output.status.code()));
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Some((response_body, status_text)) = stdout.rsplit_once(STATUS_MARK) else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() {
-            "quota request failed".to_owned()
-        } else {
-            stderr
-        });
+        return Err("curl gave no HTTP status for the quota request".to_owned());
     };
     let status = status_text
         .trim()
         .parse::<u16>()
-        .map_err(|_| "could not read HTTP status from curl".to_owned())?;
+        .map_err(|_| "curl gave no HTTP status for the quota request".to_owned())?;
     Ok((status, response_body.to_owned()))
+}
+
+/// A fixed message for curl's exit `code` (`None` when a signal stopped it). The codes are
+/// the ones `man curl` lists under EXIT CODES.
+fn curl_failure(code: Option<i32>) -> String {
+    match code {
+        Some(6) => "cannot resolve the provider's host: check the network".to_owned(),
+        Some(7) => "cannot connect to the provider: check the network".to_owned(),
+        Some(28) => "the provider did not answer in time".to_owned(),
+        Some(35 | 60) => "secure connection to the provider failed".to_owned(),
+        Some(code) => format!("quota request failed (curl exit code {code})"),
+        None => "quota request was stopped by a signal".to_owned(),
+    }
 }
 
 fn curl_quote(value: &str) -> String {
@@ -1426,6 +1442,13 @@ mod tests {
         let report = probe_codex(dir.path().as_os_str());
         assert_eq!(report.status, QuotaStatus::Error);
         assert_eq!(report.message.as_deref(), Some("too old"));
+    }
+
+    #[test]
+    fn a_failed_curl_request_reports_a_fixed_message_not_curl_output() {
+        // Nothing listens on port 1, so curl exits with code 7 and an error on stderr.
+        let error = curl_json("GET", "http://127.0.0.1:1/", &[], None).unwrap_err();
+        assert_eq!(error, "cannot connect to the provider: check the network");
     }
 
     #[test]
