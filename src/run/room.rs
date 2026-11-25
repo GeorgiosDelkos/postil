@@ -1,7 +1,7 @@
 //! Keeping the disk in bounds (docs/design.md, "Keeping the disk in bounds"): at most
 //! [`MAX_WORKTREES`] worktrees per repository, and [`FLOOR`] bytes free on their volume. Both
 //! are checked on a run's start thread before a worktree is made, so the seconds a delete
-//! takes keep no request waiting. Windows check apart: two making
+//! takes keep no request waiting. Runs check apart, in one window or several: two making
 //! worktrees at once can each see room for one, so the cap can be passed by the worktrees
 //! being made at that moment, at most `MAX_LIVE - 1` (`log.rs`).
 //!
@@ -121,6 +121,8 @@ impl Runner {
                     Taken::Idle { thread, lock } => {
                         let trashed = thread::trash_build_folders(&self.repo, home, &thread);
                         drop(lock);
+                        // An error here is met again by the eviction below, whose check names
+                        // it as the reason the thread is kept.
                         trashed.into_iter().flatten().for_each(Trashed::delete_now);
                         if !short() {
                             return Ok(());
@@ -183,7 +185,8 @@ impl Runner {
         }
         let lock = match hold_thread_lock(&self.repo.runs_dir(), &other.id) {
             Ok(lock) => lock,
-            Err(Error::RunElsewhere) => return Taken::Kept("at work in another window".to_owned()),
+            // Another window's run, or another run of this window making room at once.
+            Err(Error::RunElsewhere) => return Taken::Kept("at work in another run".to_owned()),
             Err(error) => return Taken::Kept(error_chain(&error)),
         };
         if busy_here() {

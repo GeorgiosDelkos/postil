@@ -42,7 +42,7 @@ pub(crate) fn available(path: &Path) -> io::Result<u64> {
             .map_err(|_| io::Error::other(format!("{key} is not a number")))?;
         free = free.max(Some(number.unsignedLongLongValue()));
     }
-    // Neither value is not 0 bytes free: it is a volume that cannot be measured.
+    // No value is not the same as 0 bytes free: the volume cannot be measured.
     free.ok_or_else(|| {
         io::Error::other(format!(
             "the volume of {} reports no free space",

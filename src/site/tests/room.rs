@@ -101,6 +101,33 @@ fn over_the_cap_an_idle_thread_is_evicted_and_its_follow_up_makes_it_again() {
 }
 
 #[test]
+fn a_follow_up_in_a_thread_another_window_evicted_makes_its_worktree_again() {
+    // Window A ran R1 and keeps its agent.
+    let (repo, a, a_nudges, first) = written("room-two-windows");
+    // Window B, over a cap of 1, evicts R1, which A's agent cannot see.
+    let (b, b_nudges) = run_site(&repo, "writes");
+    b.runner().unwrap().set_test_disk(TestDisk {
+        max_worktrees: Some(1),
+        ..TestDisk::default()
+    });
+    send_ended(&b, &b_nudges, "two", "R2");
+    assert!(!first.exists());
+
+    assert_eq!(follow(&a, "R1").0, StatusCode::OK);
+    let run = wait_for_run(&a, &a_nudges, "R3");
+
+    // A fresh agent, in a worktree made again; A's kept one would work in the deleted folder.
+    assert_eq!(run["status"], "ended", "{run}");
+    assert!(first.is_dir(), "made again");
+    assert_eq!(thread(&a, "R1")["state"], "open");
+    let prompt = run["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("R1 was asked") && prompt.ends_with("now asks:\n\nmore\n"),
+        "the fresh agent is told the thread so far: {prompt}"
+    );
+}
+
+#[test]
 fn the_idle_thread_whose_latest_run_is_oldest_is_evicted_first() {
     let (_repo, site, nudges, first) = written("room-order");
     send_ended(&site, &nudges, "two", "R2");

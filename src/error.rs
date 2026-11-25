@@ -237,7 +237,7 @@ pub enum Error {
         /// The most worktrees a repository may have.
         cap: usize,
         /// The threads whose worktrees could not be freed, each with why: `R1 (at work in
-        /// another window)`.
+        /// another run)`.
         kept: Vec<String>,
     },
     /// A run was to start while the worktrees' volume has less free space than the floor,
@@ -552,7 +552,7 @@ impl fmt::Display for Error {
     }
 }
 
-/// `"; kept: R1 (at work in another window); R4 (...)"` for the threads `kept`, each with why
+/// `"; kept: R1 (at work in another run); R4 (...)"` for the threads `kept`, each with why
 /// its worktree could not be freed, or nothing when there are none.
 fn held_by(kept: &[String]) -> String {
     if kept.is_empty() {
