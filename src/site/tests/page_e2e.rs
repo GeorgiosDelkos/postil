@@ -9,7 +9,9 @@
 //! so this bridge stands in for the window:
 //! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, `src/b.rs` and
 //!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
-//!   starts from nothing. A body `{"scenario": "..."}` names the fake agent's scenario.
+//!   starts from nothing. Its body `{"scenario": "..."}` names the fake agent's scenario
+//!   (`openProject` in the tests sends `flood` unless told another); without one it is
+//!   refused.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -100,7 +102,17 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
     let path = request.uri().path();
     if path == "/new" {
         let asked: serde_json::Value = serde_json::from_slice(request.body()).unwrap_or_default();
-        let scenario = asked["scenario"].as_str().unwrap_or("flood");
+        // Refused, not defaulted: a misspelled field would otherwise run `flood` and fail
+        // the test far from here. A 400 and not a panic, which would end this thread and
+        // leave the suite to its timeout.
+        let Some(scenario) = asked["scenario"].as_str() else {
+            let body = &b"POST /new needs {\"scenario\": \"...\"}"[..];
+            write_reply(
+                &mut stream,
+                &reply(StatusCode::BAD_REQUEST, "text/plain", body),
+            );
+            return;
+        };
         let base = format!("/s{}/", sites.len());
         sites.push(bridged(sites.len(), scenario));
         let body = serde_json::json!({ "base": base }).to_string();
