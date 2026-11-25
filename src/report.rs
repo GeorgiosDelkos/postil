@@ -33,8 +33,9 @@ pub(crate) const ASK: &str = "Then end your reply with a report for the engineer
      with command (exactly as you ran it) and result (passed or failed). Use an empty array \
      when there is nothing to list.\n";
 
-/// The line a follow-up's prompt ends with (`run.rs`, `follow_up`): its prompt is otherwise
-/// the engineer's words alone, and a fresh agent's holds [`ASK`] only as history.
+/// The line a kept agent's follow-up prompt ends with (`run.rs`, `follow_up`), whose prompt
+/// is otherwise the engineer's words alone; and a fresh agent's, when the thread's first prompt
+/// holds [`ASK`] (`run.rs`, `report_ask`), which it then reads only as history.
 pub(crate) const ASK_AGAIN: &str = "When you finish, end your reply with the report the first \
      request asked for, one JSON object in a code block fenced as json with steps and checks, \
      for what you changed in this turn.\n";
@@ -150,7 +151,11 @@ pub(crate) fn read(reply: &str, root: &Path) -> Result<Report, String> {
     }
     let mut kept_checks = Vec::new();
     for value in checks {
-        match check(value).filter(|_| kept_checks.len() < MAX_CHECKS) {
+        if kept_checks.len() == MAX_CHECKS {
+            cut += 1;
+            continue;
+        }
+        match check(value) {
             Some(check) => kept_checks.push(check),
             None => cut += 1,
         }

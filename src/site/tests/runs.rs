@@ -1969,8 +1969,8 @@ fn a_stopped_run_reads_no_report() {
 }
 
 /// A log written before reports were kept reads: a run that ended well with no report entry,
-/// its command kept. Catches a version bump that lists the versions it reads and leaves the
-/// last one out (as `thread::read` lists them).
+/// its command kept. It shares its path with the version 4 test, and is kept because every
+/// version bump adds a test that the version before it reads (the owner's rule, 2026-11-25).
 #[test]
 fn a_version_5_log_reads_without_a_report() {
     let repo = TempRepo::new("run-version-5");

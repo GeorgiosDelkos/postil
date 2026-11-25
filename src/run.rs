@@ -2219,8 +2219,8 @@ fn first_option(options: &[PermissionOption], kinds: [PermissionKind; 2]) -> Opt
 }
 
 /// The prompt of a follow-up that goes to a fresh agent: the thread so far, each run's prompt
-/// and reply in order, then the engineer's `text`. The diffs stay out: the agent reads the
-/// files as they are now, linked after the text.
+/// and reply in order, then the engineer's `text`, then the ask for a report ([`report_ask`]).
+/// The diffs stay out: the agent reads the files as they are now, linked after the text.
 fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     let mut prompt = String::from(
         "You are continuing work another coding agent did in this repository; its \
@@ -2253,8 +2253,9 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
 }
 
 /// What ends a fresh agent's follow-up prompt, given the prompt the thread started with: a
-/// reminder of the report that prompt asked for, or the whole ask when it asked for none (a
-/// thread from before reports, run log version 5 and older).
+/// reminder of the report that prompt asked for, or the whole ask when it holds no
+/// `report::ASK` as worded now (a thread from before reports, run log version 5 and older, or
+/// from before a change to the wording).
 fn report_ask(first_prompt: &str) -> &'static str {
     if first_prompt.contains(report::ASK) {
         report::ASK_AGAIN
