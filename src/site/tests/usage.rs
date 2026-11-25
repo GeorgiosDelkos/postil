@@ -49,19 +49,15 @@ fn usage_lists_installed_built_in_agents_with_live_quotas_and_refresh() {
     site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
         .unwrap();
 
-    // Wait for both background probes to complete.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let body = loop {
-        let reply = get_json(&site, "postil://localhost/api/usage?scope=project&range=7d");
-        if reply["polling"] == false && reply["scanning"] == false {
-            break reply;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "quota probes did not finish: {reply}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let usage = "postil://localhost/api/usage?scope=project&range=7d";
+    let first = get_json(&site, usage);
+    assert_eq!(
+        first["polling"], true,
+        "the first GET starts the probes: {first}"
+    );
+    site.quotas.join_probes();
+    let body = get_json(&site, usage);
+    assert_eq!(body["polling"], false, "{body}");
 
     let agents = body["agents"].as_array().unwrap();
     let names: Vec<&str> = agents
@@ -83,11 +79,26 @@ fn usage_lists_installed_built_in_agents_with_live_quotas_and_refresh() {
         "",
     );
     assert_eq!(status, StatusCode::OK);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while calls.load(Ordering::SeqCst) < 4 {
-        assert!(Instant::now() < deadline, "refresh did not re-run probes");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    site.quotas.join_probes();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "refresh re-runs both probes"
+    );
+    // The two refresh probes run at once, so either may be call 3.
+    let refreshed = get_json(&site, usage);
+    let mut details: Vec<&str> = refreshed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| agent["quota"]["windows"][0]["detail"].as_str().unwrap())
+        .collect();
+    details.sort_unstable();
+    assert_eq!(
+        details,
+        ["call 3", "call 4"],
+        "the page shows the new results"
+    );
 }
 
 #[test]
