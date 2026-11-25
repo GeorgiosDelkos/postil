@@ -713,16 +713,16 @@ impl Repo {
         git(&self.root, &args).map(drop)
     }
 
-    /// The engineer's changes since the last commit, for the warning at send: how many entries
-    /// `git status` lists, and every path they name, a rename's source and target both. An
-    /// untracked folder is one entry, as `git status` shows it, not one per file in it, so a
-    /// large one counts once and costs little. Takes no optional lock
-    /// (`--no-optional-locks`): the engineer may be committing in a terminal meanwhile.
+    /// The engineer's changes since the last commit, for the warning at send: the entries
+    /// `git status` lists, each its path and a rename's source. An untracked folder is one
+    /// entry (`dir/`), as `git status` shows it, not one per file in it, so a large one counts
+    /// once and costs little. Takes no optional lock (`--no-optional-locks`): the engineer may
+    /// be committing in a terminal meanwhile.
     ///
     /// # Errors
     ///
     /// The git error.
-    pub(crate) fn uncommitted(&self) -> Result<(usize, Vec<String>)> {
+    pub(crate) fn uncommitted(&self) -> Result<Vec<(String, Option<String>)>> {
         let status = run_git(
             &self.root,
             None,
@@ -734,14 +734,7 @@ impl Repo {
                 "--untracked-files=normal",
             ],
         )?;
-        let entries = status_entries(&status);
-        let count = entries.len();
-        // A rename's source too: a noted file renamed away is named.
-        let paths = entries
-            .into_iter()
-            .flat_map(|(path, source)| std::iter::once(path).chain(source))
-            .collect();
-        Ok((count, paths))
+        Ok(status_entries(&status))
     }
 
     /// The paths with changes git would commit, as `git status` lists them: tracked files

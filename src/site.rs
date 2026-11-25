@@ -961,23 +961,30 @@ impl Site {
         // One `git status` each time the send step reads the prompt, on the request thread:
         // as long as `git status` in a terminal ([`Repo::uncommitted`]). One that fails costs
         // the warning, not the prompt.
-        let (uncommitted, changed, uncommitted_error) = match self.repo()?.uncommitted() {
-            Ok((count, paths)) => (Some(count), paths, None),
-            Err(error) => (None, Vec::new(), Some(error_chain(&error))),
+        let (entries, uncommitted_error) = match self.repo()?.uncommitted() {
+            Ok(entries) => (Some(entries), None),
+            Err(error) => (None, Some(error_chain(&error))),
         };
-        // A path of `git status` ending in `/` is an untracked folder: every noted file in it
-        // is one the agent's copy lacks.
-        let changes = |file: &String| {
-            changed
+        // A rename's source too: a noted file renamed away is in the agent's copy as it was.
+        let uncommitted_paths: Vec<&String> = entries
+            .iter()
+            .flatten()
+            .flat_map(|(path, source)| std::iter::once(path).chain(source))
+            .collect();
+        // A path ending in `/` is an untracked folder: every noted file in it is one the
+        // agent's copy lacks.
+        let is_uncommitted = |file: &String| {
+            uncommitted_paths
                 .iter()
-                .any(|path| path == file || (path.ends_with('/') && file.starts_with(path)))
+                .any(|path| *path == file || (path.ends_with('/') && file.starts_with(*path)))
         };
         let uncommitted_noted = prompt
             .files
             .iter()
-            .filter(|file| changes(file))
+            .filter(|file| is_uncommitted(file))
             .cloned()
             .collect();
+        let uncommitted = entries.as_ref().map(Vec::len);
         Ok(to_json(&PreviewView {
             prompt: prompt.text,
             files: prompt.files,
