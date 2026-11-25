@@ -167,10 +167,10 @@ fn context(text: &mut String, work: &Work) {
 ///
 /// # Errors
 ///
-/// As [`last_json_block`].
+/// As [`last_json_block`]. The page shows the problem after "A reviewer's findings could not be
+/// read", so it does not repeat that.
 pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, String> {
-    let entries: Vec<Value> =
-        last_json_block(reply).map_err(|problem| format!("no findings: {problem}"))?;
+    let entries: Vec<Value> = last_json_block(reply)?;
     Ok(numbered(&entries, first))
 }
 
@@ -204,10 +204,12 @@ pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, Str
         {
             Some(Ok(value)) => return Ok(value),
             Some(Err(error)) => {
-                problem.get_or_insert_with(|| format!("its ```json block does not parse: {error}"));
+                problem.get_or_insert_with(|| {
+                    format!("the reply's last ```json block does not parse: {error}")
+                });
             }
             None => {
-                problem.get_or_insert_with(|| "its ```json block is empty".to_owned());
+                problem.get_or_insert_with(|| "the reply's last ```json block is empty".to_owned());
             }
         }
     }

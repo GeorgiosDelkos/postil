@@ -44,7 +44,8 @@ export function reviewSection(title, { reviewed, names, busy, start, hintClass }
 }
 
 // Fills `view` with the agent's Markdown as elements, built node by node: its text is never
-// parsed as HTML.
+// parsed as HTML. The elements are styled by `.run-message` (app.css), so `view` carries that
+// class.
 export function fillMarkdown(view, text) {
   view.replaceChildren();
   for (const block of markdownBlocks(text.trim())) {
