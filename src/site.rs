@@ -1197,13 +1197,13 @@ impl Site {
             Some(value) => Scope::parse(&value).ok_or_else(|| {
                 Error::BadRequest(format!("scope={value:?}: expected project or all"))
             })?,
-            None if has_project => Scope::Project,
-            None => Scope::All,
+            None => Scope::Project,
         };
-        let scope = if requested_scope == Scope::Project && !has_project {
-            Scope::All
-        } else {
+        // With no project open, "this project" selects nothing: report every project.
+        let scope = if has_project {
             requested_scope
+        } else {
+            Scope::All
         };
         let range = match query_value(query, "range") {
             Some(value) => Range::parse(&value).ok_or_else(|| {

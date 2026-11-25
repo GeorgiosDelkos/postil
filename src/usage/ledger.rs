@@ -28,7 +28,7 @@ pub(crate) const RECORD_VERSION: u32 = 1;
 const DAY_SECS: u64 = 24 * 60 * 60;
 
 /// Which projects the report aggregates over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Scope {
     Project,
