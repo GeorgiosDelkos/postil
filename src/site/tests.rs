@@ -7,6 +7,7 @@ mod files;
 mod notes;
 mod page_e2e;
 mod projects;
+mod room;
 mod routes;
 mod runs;
 mod settings;

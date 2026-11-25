@@ -35,7 +35,11 @@
 //! thread's lock under the slots ([`Run::create`]), and only tries each for a moment; ending
 //! or forgetting a thread takes the thread's lock first and the slots after, and does so only
 //! while the thread is not busy in this window, when no launch there can come until that
-//! request is answered: only a request starts a run in an idle thread. No snapshot is taken
+//! request is answered: only a request starts a run in an idle thread. Eviction ([`room`]),
+//! on another run's start thread, takes an idle thread's lock first and the slots after too:
+//! a launch there meanwhile cannot take that lock, and is refused as during an ending, and a
+//! launch holding the slots only tries the lock for a moment, so neither waits on the other
+//! for long. No snapshot is taken
 //! under a run's state. The slots are held around the agent's calls that answer, cancel and
 //! prompt (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's
 //! worktree: the commit before a run (`add`, `diff --cached`, `commit`, `rev-parse`, tens of
@@ -47,6 +51,10 @@
 //! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
+mod room;
+
+#[cfg(test)]
+pub(crate) use room::{FLOOR, TestDisk};
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
@@ -70,7 +78,7 @@ use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
     hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
-use crate::thread::{self, State, Thread};
+use crate::thread::{self, Delete, State, Thread};
 
 /// How long an agent may take to start, and then to open a session. Claude's adapter took
 /// 4.3 s to open a session with npx's cache warm (2026-11-23); a first `npx` run downloads
@@ -107,6 +115,9 @@ pub(crate) struct Runner {
     /// or end a thread during it otherwise.
     #[cfg(test)]
     making_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// The disk bounds a test sets in place of the real ones ([`room::TestDisk`]).
+    #[cfg(test)]
+    test_disk: Mutex<room::TestDisk>,
 }
 
 /// What a runner holds now: a slot per thread this window ran in.
@@ -330,7 +341,14 @@ struct Pending {
 /// Whether a run's worktree is still to be made, on the start thread, before its agent.
 #[derive(Debug)]
 enum Worktree {
+    /// A new thread's, on a new branch: a worktree that cannot be made takes the thread out
+    /// of the record.
     Make,
+    /// An evicted thread's, again from its branch. The run records the commit it starts from
+    /// as its snapshot before when `snapshot` (it is not a proposer).
+    Remake {
+        snapshot: bool,
+    },
     Made,
 }
 
@@ -391,6 +409,14 @@ impl Runner {
             // Finishes deleting the worktrees of threads that ended while the app last ran:
             // a quit can cut a background delete short.
             thread::empty_trash(&thread::trash_for(repo.root(), home));
+            // Runs git in each folder no thread names, so off the request thread. An error
+            // reading the record shows at the first send.
+            let (repo, home) = (Arc::clone(&repo), home.clone());
+            let swept = std::thread::Builder::new()
+                .name("sweep-worktrees".to_owned())
+                .spawn(move || drop(thread::sweep(&repo, &home)));
+            // No thread: the folders stay until the next open, which is no harm.
+            drop(swept);
         }
         Arc::new(Self {
             repo,
@@ -402,6 +428,8 @@ impl Runner {
             next_stage_gate: Mutex::new(None),
             #[cfg(test)]
             making_gate: Mutex::new(None),
+            #[cfg(test)]
+            test_disk: Mutex::default(),
         })
     }
 
@@ -455,13 +483,13 @@ impl Runner {
         self.launch(slots, new)
     }
 
-    /// The open thread `id`, whose worktree is on disk.
+    /// The thread `id`, open with its worktree on disk, or evicted, whose run makes it again.
     ///
     /// # Errors
     ///
     /// [`Error::BadRequest`] when it has no thread (it ran before threads had worktrees), the
-    /// thread ended, or its worktree is gone; [`Error::NotAWorktree`] when the record puts it
-    /// where Postil puts no worktree; [`Error::NoHome`]; as [`thread::find`].
+    /// thread ended, or the worktree of an open one is gone; [`Error::NotAWorktree`] when the
+    /// record puts it where Postil puts no worktree; [`Error::NoHome`]; as [`thread::find`].
     fn open_thread(&self, id: &str) -> Result<Thread> {
         let thread = thread::find(&self.repo, id)?.ok_or_else(|| {
             Error::BadRequest(format!(
@@ -469,6 +497,12 @@ impl Runner {
             ))
         })?;
         let ended = match thread.state {
+            // Made again where Postil puts worktrees: checked before it is made.
+            State::Evicted => {
+                let home = self.home.as_deref().ok_or(Error::NoHome)?;
+                thread::check_place(&self.repo, home, &thread)?;
+                return Ok(thread);
+            }
             State::Open if thread.path.is_dir() => {
                 // The record is a file a hand edit can point anywhere: a commit, an agent and
                 // a proposer's undo go only into a worktree of Postil's ([`thread::open`]).
@@ -540,18 +574,20 @@ impl Runner {
         let first = thread[0].state().header.id.clone();
         // Refused here, before a run log is made, when the thread is not open; `launch` reads
         // it again under the thread's lock.
-        self.open_thread(&first)?;
+        let evicted = self.open_thread(&first)?.state == State::Evicted;
         let slots = self.slots();
-        // The thread's kept agent ran `followed`, the slot's run.
-        let same_conversation = slots.by_thread.get(&first).is_some_and(|slot| {
-            matches!(
-                &slot.agent,
-                Held::Ready(kept, live) if *kept == agent && live.is_alive()
-            ) && slot
-                .run
-                .as_ref()
-                .is_some_and(|run| Arc::ptr_eq(run, followed))
-        });
+        // The thread's kept agent ran `followed`, the slot's run. An evicted thread's agent,
+        // kept in another window, worked in a worktree that is gone.
+        let same_conversation = !evicted
+            && slots.by_thread.get(&first).is_some_and(|slot| {
+                matches!(
+                    &slot.agent,
+                    Held::Ready(kept, live) if *kept == agent && live.is_alive()
+                ) && slot
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| Arc::ptr_eq(run, followed))
+            });
         let prompt = if same_conversation {
             Prompt {
                 text: text.to_owned(),
@@ -852,9 +888,8 @@ impl Runner {
             .entry(id.clone())
             .or_insert_with(|| Slot::new(thread.clone()));
         slot.chain = review;
-        if let Worktree::Make = worktree {
-            slot.making = true;
-        }
+        let new_thread = matches!(worktree, Worktree::Make);
+        slot.making = !matches!(worktree, Worktree::Made);
         slot.run = Some(Arc::clone(&run));
         slot.thread = thread.clone();
         slot.used = used;
@@ -878,7 +913,8 @@ impl Runner {
                 // No thread will make the worktree: the thread goes, as one whose worktree
                 // could not be made does, before the failure ends the run and with it the
                 // thread's lock, so no window takes the thread meanwhile.
-                if std::mem::take(&mut slot.making) {
+                slot.making = false;
+                if new_thread {
                     self.drop_new_thread(&id);
                 }
                 run.record(Entry::Failed {
@@ -919,13 +955,26 @@ impl Runner {
                     return Err(error);
                 }
             },
-            Place::Open(id) => (self.open_thread(&id)?, Worktree::Made),
+            Place::Open(id) => {
+                let thread = self.open_thread(&id)?;
+                let worktree = match thread.state {
+                    State::Evicted => Worktree::Remake { snapshot },
+                    State::Open | State::Applied | State::Discarded => Worktree::Made,
+                };
+                // Eviction takes the thread whose latest run is oldest first. A record that
+                // cannot be written leaves it older than it is, which is no harm.
+                drop(thread::update(&self.repo, &id, |stored| {
+                    stored.last_run = thread::now();
+                }));
+                (thread, worktree)
+            }
         };
         match worktree {
-            // Its snapshot before is the fork commit, recorded on the start thread once the
-            // worktree is made: a run whose worktree could not be made has no changes view,
-            // which would compare the engineer's own files with the fork.
-            Worktree::Make => {}
+            // Its snapshot before is the fork commit, or the branch's commit for an evicted
+            // thread, recorded on the start thread once the worktree is made: a run whose
+            // worktree could not be made has no changes view, which would compare the
+            // engineer's own files with that commit.
+            Worktree::Make | Worktree::Remake { .. } => {}
             // Every run of an open thread starts from a commit of what was left there, a
             // proposer's too: undoing a proposer's edits goes back to that commit, which must
             // hold the engineer's own commits and edits.
@@ -1281,7 +1330,8 @@ impl Runner {
         }
         let _lock = hold_thread_lock(&self.repo.runs_dir(), id)?;
         let thread = match thread::find(&self.repo, id)? {
-            Some(thread) if thread.state == State::Open => thread,
+            // An evicted thread has its changes on its branch, and no worktree to check.
+            Some(thread) if matches!(thread.state, State::Open | State::Evicted) => thread,
             Some(_) => return Err(Error::BadRequest(format!("thread {id} already ended"))),
             None => return Err(Error::BadRequest(format!("there is no thread {id}"))),
         };
@@ -1313,7 +1363,7 @@ impl Runner {
                 Ending::Discard => State::Discarded,
             };
         })
-        .and_then(|()| thread::free(&self.repo, home, &thread));
+        .and_then(|()| thread::free(&self.repo, home, &thread, Delete::Later));
         (self.notify)();
         ended
     }
@@ -1563,9 +1613,19 @@ impl Runner {
                     error: error_chain(error),
                 });
             };
-            if let Worktree::Make = pending.worktree
-                && !runner.make_for(&pending)
-            {
+            let ready = match pending.worktree {
+                Worktree::Make | Worktree::Remake { .. } => runner.make_for(&pending),
+                Worktree::Made => match runner.free_disk(&id, &pending.worktree) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        if !runner.slots().let_go(&id, generation) {
+                            failed(&error);
+                        }
+                        false
+                    }
+                },
+            };
+            if !ready {
                 return (runner.notify)();
             }
             // Blocks until the login shell has said where programs are, a few seconds at most
@@ -1637,17 +1697,25 @@ impl Runner {
             .map(drop)
     }
 
-    /// Makes the worktree of `pending`'s new thread on its start thread, then marks the slot
-    /// done making. Returns whether the agent is to start: not when the worktree could not be
-    /// made, nor when the run was stopped or the project closed meanwhile; the run then ends
-    /// here, saying why, and with it the thread's lock.
+    /// Makes the worktree of `pending`'s new or evicted thread on its start thread, once the
+    /// disk has room for it ([`Runner::free_disk`]), then marks the slot done making. Returns
+    /// whether the agent is to start: not when the worktree could not be made, nor when the run
+    /// was stopped or the project closed meanwhile; the run then ends here, saying why, and
+    /// with it the thread's lock.
     fn make_for(&self, pending: &Pending) -> bool {
         let id = &pending.thread.id;
-        let made = self.make_worktree(&pending.thread);
+        let made = self.make_worktree(pending);
         let (gone, closed) = {
             let mut slots = self.slots();
             if let Some(slot) = slots.by_thread.get_mut(id) {
                 slot.making = false;
+                // A remade worktree is on its branch's commit, which a commit the engineer
+                // made there before the eviction moved past the recorded tip: a proposer's
+                // undo goes back to it.
+                if let Ok(Some(tip)) = &made {
+                    slot.thread.tip.clone_from(tip);
+                    slot.thread.state = State::Open;
+                }
             }
             (slots.let_go(id, pending.generation), slots.closed)
         };
@@ -1663,17 +1731,25 @@ impl Runner {
             });
             return false;
         }
-        if let Err(error) = made {
-            pending.run.record(Entry::Failed {
-                error: error_chain(&error),
-            });
-            return false;
+        let tip = match made {
+            Ok(tip) => tip,
+            Err(error) => {
+                pending.run.record(Entry::Failed {
+                    error: error_chain(&error),
+                });
+                return false;
+            }
+        };
+        let before = match (&pending.worktree, tip) {
+            // A new thread's run is a run of notes, which takes snapshots: the one before is
+            // the commit the worktree was made at.
+            (Worktree::Make, _) => Some(pending.thread.fork.clone()),
+            (Worktree::Remake { snapshot }, tip) => tip.filter(|_| *snapshot),
+            (Worktree::Made, _) => None,
+        };
+        if let Some(before) = before {
+            pending.run.record_snapshot(Point::Before, before);
         }
-        // A new thread's run is a run of notes, which takes snapshots: the one before is the
-        // commit the worktree was made at.
-        pending
-            .run
-            .record_snapshot(Point::Before, pending.thread.fork.clone());
         true
     }
 
@@ -1687,28 +1763,52 @@ impl Runner {
         remove_thread_lock(&self.repo.runs_dir(), id);
     }
 
-    /// Makes `thread`'s worktree ([`thread::make`]), and records in the thread what it was not
-    /// given. A record that cannot be written loses that list only.
+    /// Makes the worktree of `pending`'s new or evicted thread ([`thread::make`]) once the disk
+    /// has room for it ([`Runner::free_disk`]), and records in the thread what it was not
+    /// given; a record that cannot be written loses that list only. Returns, for an evicted
+    /// thread, the commit its branch is at, which becomes its tip.
     ///
-    /// A worktree that cannot be made takes the thread out of the record: it claims a branch
-    /// that `git worktree add` may not have made, which a thread of another working tree of
-    /// the repository may own, and deleting the thread's last note would delete it.
-    fn make_worktree(&self, thread: &Thread) -> Result<()> {
+    /// A new thread whose worktree cannot be made goes from the record: it claims a branch that
+    /// `git worktree add` may not have made, which a thread of another working tree of the
+    /// repository may own, and deleting the thread's last note would delete it. An evicted
+    /// thread is marked open before its worktree is made, as a new thread is written to the
+    /// record before, so a crash leaves a record naming whatever was made; marked evicted
+    /// again when it cannot be made.
+    fn make_worktree(&self, pending: &Pending) -> Result<Option<String>> {
         #[cfg(test)]
         self.pass_making_gate();
-        let skipped = match thread::make(&self.repo, thread) {
+        let thread = &pending.thread;
+        let remake = matches!(pending.worktree, Worktree::Remake { .. });
+        let mark =
+            |state: State| thread::update(&self.repo, &thread.id, |stored| stored.state = state);
+        let made = self
+            .free_disk(&thread.id, &pending.worktree)
+            .and_then(|()| if remake { mark(State::Open) } else { Ok(()) })
+            .and_then(|()| thread::make(&self.repo, thread));
+        let skipped = match made {
             Ok(skipped) => skipped,
             Err(error) => {
-                self.drop_new_thread(&thread.id);
+                if remake {
+                    drop(mark(State::Evicted));
+                } else {
+                    self.drop_new_thread(&thread.id);
+                }
                 return Err(error);
             }
         };
-        if !skipped.is_empty() {
+        // A remade worktree replaces the list its first one left.
+        if remake || !skipped.is_empty() {
             drop(thread::update(&self.repo, &thread.id, |stored| {
                 stored.skipped = skipped;
             }));
         }
-        Ok(())
+        if !remake {
+            return Ok(None);
+        }
+        // Commits nothing in a fresh checkout: reads the commit it is at, and records it as the
+        // tip, as every run of an open thread starts ([`Runner::place`]).
+        self.commit_worktree(&pending.run, thread, Point::Before)
+            .map(Some)
     }
 
     /// Commits everything in `thread`'s worktree for `run` at `point` ([`Repo::commit_all`])

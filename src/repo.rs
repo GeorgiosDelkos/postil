@@ -22,6 +22,15 @@ use crate::error::{Error, Result};
 /// their JSON) while the request thread works on it.
 pub(crate) const MAX_READ: u64 = 20_000_000;
 
+/// The branch a new linked worktree checks out ([`Repo::add_worktree`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Checkout<'a> {
+    /// A new branch, started at commit `fork`.
+    New { branch: &'a str, fork: &'a str },
+    /// A branch that exists, checked out nowhere else.
+    Existing { branch: &'a str },
+}
+
 /// A git working tree on disk.
 #[derive(Debug)]
 pub(crate) struct Repo {
@@ -372,21 +381,22 @@ impl Repo {
         }
     }
 
-    /// Makes a linked worktree at `path`, on a new branch `branch` that starts at commit
-    /// `fork`. Checks every file out, running the repository's smudge filters, so it takes as
-    /// long as a checkout. Leaves this working tree's files, index and branch alone.
+    /// Makes a linked worktree at `path`, on the branch `checkout` names, and locks it
+    /// (`git worktree lock`), so `git worktree remove` and `prune` leave it alone. Checks
+    /// every file out, running the repository's smudge filters, so it takes as long as a
+    /// checkout. Leaves this working tree's files, index and branch alone.
     ///
     /// # Errors
     ///
-    /// The git error, such as a branch of that name that exists already, or `path` that
-    /// exists and is not empty.
-    pub(crate) fn add_worktree(&self, path: &Path, branch: &str, fork: &str) -> Result<()> {
+    /// The git error, such as a new branch whose name exists already, an existing branch that
+    /// is gone or checked out elsewhere, or `path` that exists and is not empty.
+    pub(crate) fn add_worktree(&self, path: &Path, checkout: Checkout<'_>) -> Result<()> {
         // No hooks: the checkout runs `post-checkout`, which may install or build, and the
         // worktree is Postil's, not a checkout the engineer made.
         // Absolute pointers between the worktree and git's record of it, whatever the
         // engineer's config says (`worktree.useRelativePaths`, git 2.48): Postil finds the
         // record from the folder's path when the folder is gone.
-        let args = [
+        let mut args = vec![
             OsStr::new("-c"),
             OsStr::new("core.hooksPath=/dev/null"),
             OsStr::new("-c"),
@@ -394,11 +404,19 @@ impl Repo {
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--quiet"),
-            OsStr::new("-b"),
-            OsStr::new(branch),
-            path.as_os_str(),
-            OsStr::new(fork),
+            OsStr::new("--lock"),
+            OsStr::new("--reason"),
+            OsStr::new("Postil's worktree of a thread: end the thread in Postil to remove it"),
         ];
+        match checkout {
+            Checkout::New { branch, fork } => {
+                args.extend([OsStr::new("-b"), OsStr::new(branch), path.as_os_str()]);
+                args.push(OsStr::new(fork));
+            }
+            Checkout::Existing { branch } => {
+                args.extend([path.as_os_str(), OsStr::new(branch)]);
+            }
+        }
         run_git_with(&self.root, Search::Here, None, &args, None).map(drop)
     }
 
