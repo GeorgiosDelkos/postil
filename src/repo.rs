@@ -734,20 +734,14 @@ impl Repo {
                 "--untracked-files=normal",
             ],
         )?;
-        let (mut entries, mut paths) = (0, Vec::new());
-        let mut fields = status.split_terminator('\0');
-        while let Some(field) = fields.next() {
-            entries += 1;
-            let (code, path) = field.split_at(field.len().min(3));
-            paths.push(path.to_owned());
-            // A rename's source follows it: a noted file renamed away is named too.
-            if code.starts_with(['R', 'C'])
-                && let Some(source) = fields.next()
-            {
-                paths.push(source.to_owned());
-            }
-        }
-        Ok((entries, paths))
+        let entries = status_entries(&status);
+        let count = entries.len();
+        // A rename's source too: a noted file renamed away is named.
+        let paths = entries
+            .into_iter()
+            .flat_map(|(path, source)| std::iter::once(path).chain(source))
+            .collect();
+        Ok((count, paths))
     }
 
     /// The paths with changes git would commit, as `git status` lists them: tracked files
@@ -763,18 +757,10 @@ impl Repo {
             None,
             &["status", "--porcelain", "-z", "--untracked-files=all"],
         )?;
-        let mut paths = Vec::new();
-        let mut entries = status.split_terminator('\0');
-        while let Some(entry) = entries.next() {
-            // `XY path`; a rename or copy (`R`, `C`) is followed by its source path, which is
-            // an entry of its own.
-            let (code, path) = entry.split_at(entry.len().min(3));
-            paths.push(path.to_owned());
-            if code.starts_with(['R', 'C']) {
-                entries.next();
-            }
-        }
-        Ok(paths)
+        Ok(status_entries(&status)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect())
     }
 
     /// Commits every change in the working tree with `message`, and returns the commit
@@ -1094,6 +1080,29 @@ fn run_git_with(
         command.env("GIT_INDEX_FILE", index);
     }
     output_of(command, args, input)
+}
+
+/// The entries of `git status --porcelain -z` output: each one's path and, for a rename or a
+/// copy, its source, which follows it as a field of its own. `XY path`: a rename shows in
+/// either column, `R ` once staged and ` R` when only the working tree has it (the moved file
+/// added with `git add -N`).
+fn status_entries(status: &str) -> Vec<(String, Option<String>)> {
+    let mut entries = Vec::new();
+    let mut fields = status.split_terminator('\0');
+    while let Some(field) = fields.next() {
+        let (code, path) = field.split_at(field.len().min(3));
+        let renamed = code
+            .bytes()
+            .take(2)
+            .any(|column| matches!(column, b'R' | b'C'));
+        let source = if renamed {
+            fields.next().map(str::to_owned)
+        } else {
+            None
+        };
+        entries.push((path.to_owned(), source));
+    }
+    entries
 }
 
 /// `git -C <dir>`, set to find the repository at `dir` as `search` says and never to prompt

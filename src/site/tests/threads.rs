@@ -1113,6 +1113,8 @@ fn a_worktree_checks_out_only_what_the_engineer_s_sparse_checkout_does() {
         git_out(&worktree, &["show", "HEAD:outside/new.md"]),
         "prompt 1"
     );
+    // And the files the patterns keep off the disk are not staged as deleted.
+    assert_eq!(git_out(&worktree, &["show", "HEAD:docs/y.md"]), "y");
     assert!(worktree.join("a.txt").is_file() && worktree.join("src/x.rs").is_file());
     assert!(
         !worktree.join("docs").exists(),

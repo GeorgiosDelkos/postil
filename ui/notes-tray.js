@@ -360,8 +360,7 @@ export function notesTray({
     const warning = el("div", "send-warning");
     // `git status` failed: the tree is not known to be clean, so the step does not say it is.
     if (reply.uncommitted === null) {
-      const unknown =
-        "Could not check your working tree for uncommitted changes. The thread starts from the last commit.";
+      const unknown = `Could not check your working tree for uncommitted changes (${reply.uncommittedError}). The thread starts from the last commit.`;
       warning.append(el("div", "", unknown));
       return warning;
     }

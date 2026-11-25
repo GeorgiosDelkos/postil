@@ -450,6 +450,8 @@ struct PreviewView {
     uncommitted: Option<usize>,
     /// The linked files among them: their notes' lines may not match the agent's copy.
     uncommitted_noted: Vec<String>,
+    /// Why `git status` failed, when `uncommitted` is `None`.
+    uncommitted_error: Option<String>,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
@@ -959,14 +961,21 @@ impl Site {
         // One `git status` each time the send step reads the prompt, on the request thread:
         // as long as `git status` in a terminal ([`Repo::uncommitted`]). One that fails costs
         // the warning, not the prompt.
-        let (uncommitted, changed) = match self.repo()?.uncommitted() {
-            Ok((count, paths)) => (Some(count), paths),
-            Err(_) => (None, Vec::new()),
+        let (uncommitted, changed, uncommitted_error) = match self.repo()?.uncommitted() {
+            Ok((count, paths)) => (Some(count), paths, None),
+            Err(error) => (None, Vec::new(), Some(error_chain(&error))),
+        };
+        // A path of `git status` ending in `/` is an untracked folder: every noted file in it
+        // is one the agent's copy lacks.
+        let changes = |file: &String| {
+            changed
+                .iter()
+                .any(|path| path == file || (path.ends_with('/') && file.starts_with(path)))
         };
         let uncommitted_noted = prompt
             .files
             .iter()
-            .filter(|file| changed.contains(file))
+            .filter(|file| changes(file))
             .cloned()
             .collect();
         Ok(to_json(&PreviewView {
@@ -974,6 +983,7 @@ impl Site {
             files: prompt.files,
             uncommitted,
             uncommitted_noted,
+            uncommitted_error,
         }))
     }
 

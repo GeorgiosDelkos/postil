@@ -287,6 +287,45 @@ fn the_prompt_preview_is_the_text_the_agent_receives() {
         serde_json::json!(["src/a.rs"]),
         "{renamed}"
     );
+
+    // A rename only the working tree has (`git add -N`) is one change, in the second column.
+    repo.git(&["commit", "--quiet", "--message", "moved"]);
+    fs::rename(repo.root.join("src/c.rs"), repo.root.join("src/d.rs")).unwrap();
+    repo.git(&["add", "-N", "src/d.rs"]);
+    let moved = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    assert_eq!(moved["uncommitted"], 1, "{moved}");
+
+    // A git status that fails says why, and the prompt is still there.
+    fs::write(repo.root.join(".git/index"), "not an index").unwrap();
+    let unknown = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    assert!(unknown["uncommitted"].is_null(), "{unknown}");
+    assert!(
+        unknown["uncommittedError"]
+            .as_str()
+            .unwrap()
+            .contains("index"),
+        "{unknown}"
+    );
+    assert!(unknown["prompt"].as_str().unwrap().contains("[N1]"));
+}
+
+#[test]
+fn a_note_in_an_untracked_folder_is_named_as_changed() {
+    let repo = TempRepo::new("run-preview-untracked");
+    repo.write("a.txt", "a\n");
+    let (site, _nudges) = run_site(&repo, "plain");
+    fs::create_dir_all(repo.root.join("vendor")).unwrap();
+    repo.write("vendor/one.rs", "1\n");
+    post_note(&site, "vendor/one.rs", 1, 1, "new here");
+
+    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+
+    // `git status` names only `vendor/`: the agent's copy lacks the file it holds.
+    assert_eq!(preview["uncommitted"], 1, "{preview}");
+    assert_eq!(
+        preview["uncommittedNoted"],
+        serde_json::json!(["vendor/one.rs"])
+    );
 }
 
 #[test]
