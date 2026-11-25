@@ -5,13 +5,10 @@
 //! from the file list's right-click menu.
 //!
 //! A line note is anchored by its snippet: the text of its lines when it was written. Its
-//! line numbers are a hint. Whenever the notes are read, each one is placed by [`locate`]: it
-//! stays where its snippet still is, or moves to the only other copy of the snippet, or else
-//! its anchor becomes [`Anchor::Lost`]. A snippet found several times elsewhere is lost
-//! rather than guessed: a short line such as `}` repeats, and the nearest copy is often the
-//! wrong one. A file or folder note is found while its path is still a file or a folder of
-//! that kind, and lost otherwise: a rename is not followed, since nothing tells a renamed
-//! folder from a new one.
+//! line numbers are a hint. Whenever the notes are read, each one is placed by [`locate`]
+//! (`anchor.rs` gives the rule), and a note it cannot place becomes [`Anchor::Lost`]. A file
+//! or folder note is found while its path is still a file or a folder of that kind, and lost
+//! otherwise: a rename is not followed, since nothing tells a renamed folder from a new one.
 //!
 //! The anchor says only whether the note's target (its text, or its file or folder) is still
 //! there. It is kept apart from a note's lifecycle (open, sent, resolved, from milestone 3
@@ -54,15 +51,14 @@ use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::Path;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use serde::de::{self, Deserializer};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 
+use crate::anchor::{LineRange, locate, locate_lines};
 use crate::error::{Error, Result};
-use crate::files::{save_json, version_of};
+use crate::files::{self, save_json, version_of};
 use crate::repo::{PathKind, Repo};
 
 /// The format version this build writes. It reads this one and every older one; a file with
@@ -604,22 +600,6 @@ impl NoteId {
     }
 }
 
-/// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawLineRange")]
-struct LineRange {
-    start: usize,
-    end: usize,
-}
-
-/// A [`LineRange`] before its bounds are checked.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLineRange {
-    start: usize,
-    end: usize,
-}
-
 /// Whether a note's target is still there: its snippet in its file, or its file or folder.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -732,82 +712,17 @@ impl Review {
     }
 }
 
-/// Where the lines of `snippet` are in `text`, given that they were last at `last`:
-/// `last` itself when they are still there, otherwise the only place they are, otherwise
-/// `None` (gone, or several places and no way to tell which).
-fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
-    // `str::lines` drops `\r\n` and `\n` alike, as the highlighter does, so the line numbers
-    // here are the ones the page shows.
-    locate_lines(&text.lines().collect::<Vec<_>>(), snippet, last)
-}
-
-/// [`locate`] in a text already split into `lines`.
-fn locate_lines(lines: &[&str], snippet: &str, last: LineRange) -> Option<LineRange> {
-    let wanted: Vec<&str> = snippet.split('\n').collect();
-
-    let mut found = lines
-        .windows(wanted.len())
-        .enumerate()
-        .filter(|(_, window)| *window == wanted.as_slice())
-        .map(|(index, _)| LineRange {
-            start: index + 1,
-            end: index + wanted.len(),
-        });
-
-    let first = found.next()?;
-    let mut others = found.peekable();
-    if first == last || others.peek().is_none() {
-        return Some(first);
-    }
-    others.find(|&range| range == last)
-}
-
-/// How long a change waits for another process to release `review.lock`. A writer holds it
-/// while it reads, relocates and writes the file, milliseconds; arbitrary, far above that and
-/// short enough that a stuck process shows as an error rather than as page requests that
-/// never answer.
-const LOCK_WAIT: Duration = Duration::from_secs(2);
-
-/// How often a change waiting for `review.lock` tries again. Arbitrary: small against
-/// [`LOCK_WAIT`], and rare enough that waiting costs no noticeable CPU.
-const LOCK_RETRY: Duration = Duration::from_millis(20);
-
-/// Takes the exclusive lock on `review.lock` beside the review file, waiting up to
-/// [`LOCK_WAIT`] for another window's change to finish. The lock is released when the
-/// returned file is dropped. Blocks the calling thread while it waits.
+/// Takes the exclusive lock on `review.lock` beside the review file (`files::lock`). The lock
+/// is released when the returned file is dropped.
 fn lock(review_file: &Path) -> Result<File> {
     let path = review_file.with_extension("lock");
-    let error = |source| Error::WriteReview {
-        path: path.clone(),
-        source,
-    };
-    let dir = path
-        .parent()
-        .expect("the review file is <git dir>/postil/review.json, which has a parent");
-    fs::create_dir_all(dir).map_err(error)?;
-
-    let file = File::options()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(error)?;
-    let deadline = Instant::now() + LOCK_WAIT;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                thread::sleep(LOCK_RETRY);
-            }
-            Err(TryLockError::WouldBlock) => {
-                return Err(Error::ReviewLocked {
-                    path,
-                    seconds: LOCK_WAIT.as_secs(),
-                });
-            }
-            Err(TryLockError::Error(source)) => return Err(error(source)),
-        }
-    }
+    files::lock(&path).map_err(|error| match error {
+        TryLockError::WouldBlock => Error::ReviewLocked {
+            path,
+            seconds: files::LOCK_WAIT.as_secs(),
+        },
+        TryLockError::Error(source) => Error::WriteReview { path, source },
+    })
 }
 
 // Debug output shows ids, paths, and anchors, never note text: notes can quote code that is
@@ -964,94 +879,9 @@ impl<'de> Deserialize<'de> for NoteId {
     }
 }
 
-impl TryFrom<RawLineRange> for LineRange {
-    type Error = String;
-
-    fn try_from(raw: RawLineRange) -> std::result::Result<Self, Self::Error> {
-        let RawLineRange { start, end } = raw;
-        if start == 0 || start > end {
-            return Err(format!(
-                "lines {start}-{end}: lines are 1-based and start must not be after end"
-            ));
-        }
-        Ok(Self { start, end })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn range(start: usize, end: usize) -> LineRange {
-        LineRange { start, end }
-    }
-
-    #[test]
-    fn snippet_moves_with_every_insertion_and_deletion_around_it() {
-        // Ten distinct lines with a note on lines 4 to 6. Every way to insert one or three
-        // lines, and every way to delete one line, is checked against where the snippet
-        // must end up.
-        let original: Vec<String> = (1..=10).map(|n| format!("line {n}")).collect();
-        let snippet = original[3..6].join("\n");
-
-        for count in [1, 3] {
-            for at in 0..=original.len() {
-                let mut lines = original.clone();
-                for _ in 0..count {
-                    lines.insert(at, "new".to_owned());
-                }
-                let expected = if at <= 3 {
-                    Some(range(4 + count, 6 + count))
-                } else if at < 6 {
-                    None
-                } else {
-                    Some(range(4, 6))
-                };
-                let text = lines.join("\n");
-                let found = locate(&text, &snippet, range(4, 6));
-                assert_eq!(found, expected, "{count} at {at}");
-            }
-        }
-
-        for at in 0..original.len() {
-            let mut lines = original.clone();
-            lines.remove(at);
-            let expected = match at {
-                0..=2 => Some(range(3, 5)),
-                3..=5 => None,
-                _ => Some(range(4, 6)),
-            };
-            let found = locate(&lines.join("\n"), &snippet, range(4, 6));
-            assert_eq!(found, expected, "{at}");
-        }
-    }
-
-    #[test]
-    fn a_repeated_snippet_stays_put_or_is_lost_but_never_jumps_to_another_copy() {
-        // `}` is on lines 2, 4, and 8.
-        let text = "a\n}\nb\n}\nc\nd\ne\n}\n";
-        assert_eq!(locate(text, "}", range(4, 4)), Some(range(4, 4)));
-        assert_eq!(locate(text, "}", range(8, 8)), Some(range(8, 8)));
-        // The note was on the `}` that is now on line 4 or 8 after lines moved: no way to
-        // tell which, and the nearest copy (line 4) is the wrong one when two lines were
-        // inserted above line 6.
-        assert_eq!(locate(text, "}", range(6, 6)), None);
-        // One copy left: it is the note's, wherever it moved.
-        assert_eq!(locate("x\n}\n", "}", range(6, 6)), Some(range(2, 2)));
-    }
-
-    #[test]
-    fn snippet_matches_whole_lines_only_and_ignores_line_endings() {
-        assert_eq!(locate("ab\nb\n", "b", range(1, 1)), Some(range(2, 2)));
-        assert_eq!(locate("ab\n", "b", range(1, 1)), None);
-        let crlf = "a\r\nb\r\nc\r\n";
-        assert_eq!(locate(crlf, "b\nc", range(1, 2)), Some(range(2, 3)));
-        assert_eq!(
-            locate("a\n", "a\nb", range(1, 2)),
-            None,
-            "longer than the file"
-        );
-    }
 
     #[test]
     fn note_ids_read_only_n_and_a_positive_number() {
@@ -1069,7 +899,7 @@ mod tests {
     #[test]
     fn debug_output_names_notes_but_never_shows_their_text() {
         let lines = || Target::Lines {
-            lines: range(1, 1),
+            lines: LineRange { start: 1, end: 1 },
             snippet: "secret snippet".to_owned(),
         };
         let new = NewNote {
@@ -1109,7 +939,7 @@ mod tests {
         drop(fs::remove_dir_all(&dir));
         let file = dir.join("review.json");
         let lines = || Target::Lines {
-            lines: range(2, 3),
+            lines: LineRange { start: 2, end: 3 },
             snippet: "b\nc".to_owned(),
         };
         let note = |id, path: &str, target, state| Note {

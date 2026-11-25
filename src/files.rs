@@ -6,13 +6,17 @@
 //! apart before its new fields fail the parse. The recent projects, the layout and the open
 //! folders are the app's own conveniences and read through [`load_versioned`], which never
 //! fails; the settings and the notes are the engineer's and say why a file cannot be used.
+//! The review file is changed under [`lock`], on a lock file beside it, from its read to its
+//! write, so two windows cannot drop each other's changes.
 
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -206,6 +210,51 @@ fn follow_links(file: &Path) -> PathBuf {
         file = dir.join(target);
     }
     file
+}
+
+/// How long [`lock`] waits for another process to release a lock. A writer holds one while it
+/// reads, changes and writes its file, milliseconds; arbitrary, far above that and short
+/// enough that a stuck process shows as an error rather than as page requests that never
+/// answer.
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// How often [`lock`] tries again while it waits. Arbitrary: small against [`LOCK_WAIT`], and
+/// rare enough that waiting costs no noticeable CPU.
+const LOCK_RETRY: Duration = Duration::from_millis(20);
+
+/// Takes the exclusive lock on the file at `path`, creating it and its directory when they
+/// are missing, and waiting up to [`LOCK_WAIT`] for another window or process to release it.
+/// The lock is released when the returned file is dropped. Blocks the calling thread while it
+/// waits.
+///
+/// Run and thread locks do not use it (`run/log.rs`, `take_lock`): a window that runs an
+/// agent holds them for the whole run, so a send waits only out a forked child's copy (fork
+/// to exec), 200 ms at most, and then reports the other run.
+///
+/// # Errors
+///
+/// [`TryLockError::WouldBlock`] when the lock is still held after [`LOCK_WAIT`];
+/// [`TryLockError::Error`] when the file cannot be created, opened or locked.
+pub(crate) fn lock(path: &Path) -> std::result::Result<File, TryLockError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(TryLockError::Error)?;
+    }
+    let file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(TryLockError::Error)?;
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(LOCK_RETRY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The app's configuration directory: `$XDG_CONFIG_HOME/postil` when that variable holds an

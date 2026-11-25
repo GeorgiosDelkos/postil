@@ -11,6 +11,7 @@
 
 use std::fmt::{self, Write as _};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -160,20 +161,33 @@ fn context(text: &mut String, work: &Work) {
     }
 }
 
-/// The findings in a proposer's reply: the last ```` ```json ```` block that starts a line and
-/// holds an array, of objects, numbered from `F{first}` on. A field of the wrong type is left
-/// out; an entry without its text is skipped.
+/// The findings in a proposer's reply: the last ```` ```json ```` block that holds an array
+/// ([`last_json_block`]), of objects, numbered from `F{first}` on. A field of the wrong type is
+/// left out; an entry without its text is skipped.
 ///
 /// # Errors
 ///
-/// Why the findings cannot be read: no JSON block, or none that is an array (the last
-/// block's problem is given).
+/// As [`last_json_block`]. The page shows the problem after "A reviewer's findings could not be
+/// read", so it does not repeat that.
 pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, String> {
+    let entries: Vec<Value> = last_json_block(reply)?;
+    Ok(numbered(&entries, first))
+}
+
+/// The value of the last ```` ```json ```` block in `reply` that starts a line and parses as a
+/// `T`. The value ends where the JSON says, not at the next fence, so a string in it can quote
+/// code in a fence of its own.
+///
+/// # Errors
+///
+/// Why no block could be read: the reply has none, or none parses as a `T` (the last block's
+/// problem is given).
+pub(crate) fn last_json_block<T: DeserializeOwned>(reply: &str) -> Result<T, String> {
     const FENCE: &str = "```json";
     // A fence opens a block only at the start of a line, after blanks at most. JSON strings
-    // cannot hold a raw line break, so a fence that a finding's text quotes never starts a
-    // line, and is passed over here. From the last block backwards: a block
-    // after the findings that is not an array (an example, say) does not hide them.
+    // cannot hold a raw line break, so a fence that a string quotes never starts a line, and
+    // is passed over here. From the last block backwards: a block after the wanted one that is
+    // not a `T` (an example, say) does not hide it.
     let opens_block = |at: usize| {
         let before = reply[..at].trim_end_matches([' ', '\t']);
         before.is_empty() || before.ends_with('\n')
@@ -183,24 +197,23 @@ pub(crate) fn findings_in(reply: &str, first: usize) -> Result<Vec<Finding>, Str
         .rmatch_indices(FENCE)
         .filter(|(at, _)| opens_block(*at))
     {
-        match array_after(&reply[start + FENCE.len()..]) {
-            Ok(entries) => return Ok(numbered(&entries, first)),
-            Err(error) => {
-                problem.get_or_insert(error);
+        let body = &reply[start + FENCE.len()..];
+        match serde_json::Deserializer::from_str(body)
+            .into_iter::<T>()
+            .next()
+        {
+            Some(Ok(value)) => return Ok(value),
+            Some(Err(error)) => {
+                problem.get_or_insert_with(|| {
+                    format!("the reply's last ```json block does not parse: {error}")
+                });
+            }
+            None => {
+                problem.get_or_insert_with(|| "the reply's last ```json block is empty".to_owned());
             }
         }
     }
-    Err(problem.unwrap_or_else(|| "the reply has no ```json block of findings".to_owned()))
-}
-
-/// The JSON array at the start of `body`, after any whitespace. It ends where the JSON says,
-/// not at the next fence: a finding's text can quote code in a fence of its own.
-fn array_after(body: &str) -> Result<Vec<Value>, String> {
-    serde_json::Deserializer::from_str(body)
-        .into_iter::<Vec<Value>>()
-        .next()
-        .ok_or("the ```json block of findings is empty")?
-        .map_err(|error| format!("its findings are not a JSON array: {error}"))
+    Err(problem.unwrap_or_else(|| "the reply has no ```json block".to_owned()))
 }
 
 /// The findings `entries` hold, numbered from `F{first}` on.
@@ -346,7 +359,24 @@ mod tests {
         assert!(
             findings_in("```json\n{\"finding\": \"x\"}\n```", 1)
                 .unwrap_err()
-                .contains("not a JSON array")
+                .contains("does not parse: invalid type: map, expected a sequence")
+        );
+    }
+
+    /// A report is an object, where findings are an array.
+    #[test]
+    fn the_last_json_block_reads_an_object_and_passes_over_a_later_array() {
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        struct Probe {
+            steps: Vec<u32>,
+        }
+        let reply = "```json\n{\"steps\": [1]}\n```\nThen:\n```json\n{\"steps\": [2]}\n```\n\
+                     ```json\n[3]\n```\nDone.";
+        assert_eq!(last_json_block(reply), Ok(Probe { steps: vec![2] }));
+        assert!(
+            last_json_block::<Probe>("```json\n\"no\"\n```")
+                .unwrap_err()
+                .contains("expected struct Probe")
         );
     }
 
