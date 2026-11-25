@@ -1089,6 +1089,9 @@ fn a_worktree_whose_config_moves_its_working_tree_elsewhere_takes_no_run() {
 
 #[test]
 fn a_worktree_checks_out_only_what_the_engineer_s_sparse_checkout_does() {
+    // Git's own doing, which Postil relies on: `git worktree add`, run in the engineer's
+    // working tree, gives the new worktree that tree's sparse-checkout mode and patterns
+    // (git 2.36 and later), and writes only the files they take.
     let repo = TempRepo::new("thread-sparse");
     repo.write("a.txt", "a\n");
     repo.write("src/x.rs", "x\n");
@@ -1113,4 +1116,13 @@ fn a_worktree_checks_out_only_what_the_engineer_s_sparse_checkout_does() {
     assert_eq!(thread(&site, "R1")["skipped"], serde_json::Value::Null);
     // The engineer's own patterns are theirs still.
     assert_eq!(git_out(&repo.root, &["sparse-checkout", "list"]), "src");
+
+    // The older mode, of gitignore-style patterns: only `src/`, no top-level file.
+    repo.git(&["sparse-checkout", "set", "--no-cone", "/src/"]);
+    post_note(&site, "src/x.rs", 1, 1, "two");
+    send(&site, &["N2"]);
+    wait_for_run(&site, &nudges, "R2");
+    let worktree = PathBuf::from(thread(&site, "R2")["path"].as_str().unwrap());
+    assert!(worktree.join("src/x.rs").is_file() && !worktree.join("a.txt").exists());
+    assert_eq!(git_out(&worktree, &["sparse-checkout", "list"]), "/src/");
 }

@@ -86,8 +86,7 @@ pub(crate) struct Thread {
     #[serde(default)]
     pub(crate) last_run: u64,
     pub(crate) state: State,
-    /// What the worktree was not given ([`make`]): ignored folders, or its submodules, each
-    /// with the reason.
+    /// What the worktree was not given ([`make`]), each with the reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped: Vec<String>,
     /// The pull request opened from the thread's branch, once one is.
@@ -177,11 +176,10 @@ pub(crate) fn plan(
 }
 
 /// Makes `thread`'s worktree, locked in git, on its branch: a new branch at the fork commit for
-/// an open thread, its existing branch for an evicted one, with the engineer's sparse-checkout
-/// patterns when their working tree has any. Then checks out its submodules, and clones the
-/// engineer's ignored top-level folders (`target`, `node_modules`) into it. Returns what was
-/// not given to the worktree, each with the reason: sparse-checkout patterns that could not be
-/// read, a folder that could not be cloned or
+/// an open thread, its existing branch for an evicted one. Then checks out its submodules,
+/// and clones the engineer's ignored top-level folders (`target`, `node_modules`) into it.
+/// Returns what was
+/// not given to the worktree, each with the reason: a folder that could not be cloned or
 /// copied, a Python virtual environment (it names its own absolute path, so a clone would
 /// install into the engineer's), or submodules that could not be checked out. Takes as long
 /// as a checkout, plus seconds per large folder; checking out submodules may fetch over the
@@ -209,28 +207,18 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
             fork: &thread.fork,
         },
     };
-    let mut skipped = Vec::new();
-    // The engineer's sparse checkout, so the worktree holds what theirs does. Patterns that
-    // cannot be read leave every file checked out, which is slower but complete.
-    let sparse = repo.sparse_checkout().unwrap_or_else(|error| {
-        let why = error_chain(&error);
-        skipped.push(format!(
-            "sparse-checkout patterns (every file is checked out): {why}"
-        ));
-        None
-    });
-    repo.add_worktree(&thread.path, checkout, sparse.as_ref())?;
+    repo.add_worktree(&thread.path, checkout)?;
     // The worktree is made from here on: what fails now is something it was not given, not a
     // failed make, which would drop the thread and leave the worktree with no owner.
     let tree = match Repo::open(&thread.path) {
         Ok(tree) => tree,
         Err(error) => {
             let why = error_chain(&error);
-            skipped.push(format!("submodules and ignored folders: {why}"));
-            return Ok(skipped);
+            return Ok(vec![format!("submodules and ignored folders: {why}")]);
         }
     };
 
+    let mut skipped = Vec::new();
     if let Err(error) = tree.update_submodules() {
         skipped.push(format!("submodules: {}", error_chain(&error)));
     }

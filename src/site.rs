@@ -955,7 +955,9 @@ impl Site {
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
         let prompt = self.runner()?.preview(&ids)?;
-        let changed = self.repo()?.changed()?;
+        // One `git status` each time the send step reads the prompt, as long as one in a
+        // terminal. A status that cannot be read leaves the warning out, not the prompt.
+        let changed = self.repo()?.changed().unwrap_or_default();
         let uncommitted_noted = prompt
             .files
             .iter()

@@ -32,16 +32,6 @@ pub(crate) enum Checkout<'a> {
     Existing { branch: &'a str },
 }
 
-/// A working tree's sparse checkout ([`Repo::sparse_checkout`]): what a thread's worktree takes
-/// over, so it checks out what the engineer's does.
-#[derive(Debug)]
-pub(crate) struct Sparse {
-    /// Cone mode, whose patterns are folders; else gitignore-style patterns.
-    cone: bool,
-    /// One per line, as `git sparse-checkout list` prints them.
-    patterns: String,
-}
-
 /// A local branch's branch on a remote ([`Repo::upstream`]).
 #[derive(Debug)]
 pub(crate) struct Upstream {
@@ -403,21 +393,13 @@ impl Repo {
     /// Makes a linked worktree at `path`, on the branch `checkout` names, and locks it
     /// (`git worktree lock`), so `git worktree remove` and `prune` leave it alone. Checks
     /// every file out, running the repository's smudge filters, so it takes as long as a
-    /// checkout; with `sparse`, only the files its patterns take, as this working tree has
-    /// them (the rest of a large monorepo would take that much longer, and disk). Leaves this
-    /// working tree's files, index and branch alone.
+    /// checkout. Leaves this working tree's files, index and branch alone.
     ///
     /// # Errors
     ///
     /// The git error, such as a new branch whose name exists already, an existing branch that
-    /// is gone or checked out elsewhere, or `path` that exists and is not empty. Either way
-    /// nothing is left at `path`: a sparse worktree whose patterns or files fail is removed.
-    pub(crate) fn add_worktree(
-        &self,
-        path: &Path,
-        checkout: Checkout<'_>,
-        sparse: Option<&Sparse>,
-    ) -> Result<()> {
+    /// is gone or checked out elsewhere, or `path` that exists and is not empty.
+    pub(crate) fn add_worktree(&self, path: &Path, checkout: Checkout<'_>) -> Result<()> {
         // No hooks: the checkout runs `post-checkout`, which may install or build, and the
         // worktree is Postil's, not a checkout the engineer made.
         // Absolute pointers between the worktree and git's record of it, whatever the
@@ -435,11 +417,6 @@ impl Repo {
             OsStr::new("--reason"),
             OsStr::new("Postil's worktree of a thread: end the thread in Postil to remove it"),
         ];
-        // The patterns are set before any file is checked out, so the files they leave out
-        // are never written.
-        if sparse.is_some() {
-            args.push(OsStr::new("--no-checkout"));
-        }
         match checkout {
             Checkout::New { branch, fork } => {
                 args.extend([
@@ -453,45 +430,7 @@ impl Repo {
                 args.extend([path.as_os_str(), OsStr::new(branch)]);
             }
         }
-        run_git_with(&self.root, Search::Here, None, &args, None)?;
-        let Some(sparse) = sparse else {
-            return Ok(());
-        };
-        let checked_out = sparse_checkout_into(path, sparse);
-        if checked_out.is_err() {
-            // As a failed `git worktree add` leaves nothing: twice forced, for the lock.
-            let remove = ["worktree", "remove", "--force", "--force"].map(OsStr::new);
-            let args: Vec<&OsStr> = remove.into_iter().chain([path.as_os_str()]).collect();
-            drop(run_git_with(&self.root, Search::Here, None, &args, None));
-        }
-        checked_out
-    }
-
-    /// This working tree's sparse-checkout mode and patterns, or `None` when it checks out
-    /// every file.
-    ///
-    /// # Errors
-    ///
-    /// The git error when the config or the patterns cannot be read.
-    pub(crate) fn sparse_checkout(&self) -> Result<Option<Sparse>> {
-        if !self.config_bool("core.sparseCheckout")? {
-            return Ok(None);
-        }
-        Ok(Some(Sparse {
-            // Unset is the older mode of patterns, which the cone mode replaced in git 2.37.
-            cone: self.config_bool("core.sparseCheckoutCone")?,
-            patterns: git(&self.root, &["sparse-checkout", "list"])?,
-        }))
-    }
-
-    /// Whether boolean config `key` is true, as git reads `yes`, `on` or `1`; false when unset.
-    fn config_bool(&self, key: &str) -> Result<bool> {
-        match git(&self.root, &["config", "--type=bool", "--get", key]) {
-            Ok(value) => Ok(value.trim() == "true"),
-            // As in `config_value`: a key that is not set.
-            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(false),
-            Err(error) => Err(error),
-        }
+        run_git_with(&self.root, Search::Here, None, &args, None).map(drop)
     }
 
     /// The folder in which git keeps its record of the linked worktree at `path`
@@ -1115,27 +1054,6 @@ fn run_git_with(
         command.env("GIT_INDEX_FILE", index);
     }
     output_of(command, args, input)
-}
-
-/// Sets `sparse`'s mode and patterns in the worktree at `path`, made with no files
-/// (`--no-checkout`), then checks its files out. Neither runs a hook, as for the worktree's
-/// making ([`Repo::add_worktree`]). The patterns go on standard input: one may start with `-`
-/// or `!`.
-fn sparse_checkout_into(path: &Path, sparse: &Sparse) -> Result<()> {
-    let mode = if sparse.cone { "--cone" } else { "--no-cone" };
-    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
-    let set = [
-        no_hooks[0],
-        no_hooks[1],
-        "sparse-checkout",
-        "set",
-        mode,
-        "--stdin",
-    ];
-    let input = sparse.patterns.as_bytes();
-    run_git_with(path, Search::Here, None, &set.map(OsStr::new), Some(input))?;
-    let checkout = [no_hooks[0], no_hooks[1], "checkout", "--quiet"];
-    run_git_with(path, Search::Here, None, &checkout.map(OsStr::new), None).map(drop)
 }
 
 /// `git -C <dir>`, set to find the repository at `dir` as `search` says and never to prompt

@@ -637,14 +637,12 @@ patterns.
 - **Making it:** `git worktree add -b <branch> <path> <fork commit>` on the agent's start
   thread, before the agent starts there, with no hooks (`post-checkout` may install or build),
   then `git submodule update --init` when `.gitmodules` exists. When the engineer's checkout
-  is sparse (`core.sparseCheckout`), the worktree is added with `--no-checkout`, given the
-  same mode (cone or not, `core.sparseCheckoutCone`) and patterns (`git sparse-checkout
-  list`, passed on standard input to `git sparse-checkout set`), and only then checked out,
-  so the files the patterns leave out are never written: in a large monorepo, the checkout
-  is the slow part and the disk. A sparse worktree whose patterns or files fail is removed
-  (`git worktree remove --force --force`, for its lock), so the make fails whole as a plain
-  `git worktree add` does; patterns that cannot be read leave every file checked out, and
-  the thread's `skipped` says so. A worktree that cannot be made
+  is sparse, the worktree is too, with the same mode (cone or not) and patterns, and the
+  files they leave out are never written: in a large monorepo the checkout is the slow part,
+  and the disk. Git does this itself: `git worktree add`, run in the engineer's working tree
+  as Postil runs it, copies that tree's sparse-checkout settings to the new one (git 2.36
+  and later; tested with git 2.56, cone and not). Postil has no code for it, and a test
+  pins the behavior. An older git checks every file out. A worktree that cannot be made
   fails the run and takes the thread out of the record: its branch name may belong to a
   thread of another working tree of the repository, which deleting this thread's note would
   otherwise delete.
