@@ -189,7 +189,9 @@ step named.
   reads `findings` (`ui/status.js:270`).
 - `src/review.rs`, `context` (`:137`): the reviewers' prompt includes the report, and
   `propose_prompt` asks for a finding on a hunk rated too low.
-- `src/site/tests/page_e2e.rs`: `POST /new` takes `scenario` and `files`.
+- `src/site/tests/page_e2e.rs`: `POST /new` takes `scenario` and `files`. Not in 7.3 as
+  built (#55's description): no 7.3 test runs the bridge, so the first step whose e2e test
+  needs it (7.5 or 7.7) makes the change.
 - `tests/fake-agent.mjs`: `report`, `report-bad`, `report-none`, `report-twice`.
 
 **Edge cases**
@@ -938,16 +940,17 @@ event source: "next" moves the walkthrough; "send" twice sends.
 7.1 -> 7.2 -> 7.3 -> 7.4
               7.3 -> 7.5
 7.1 -> 7.6 (read-only threads)  -> 8.2 -> 8.5, 8.7
-7.3 -> 7.7 (only for the e2e bridge's files: `POST /new {files}`)
+7.7 (independent; its e2e test needs `POST /new {files}`, below)
 8.1 -> 8.2 -> 8.3 -> 8.4 -> 8.6
 9.1 -> 9.2 -> 9.4, 9.5        9.3 needs only 9.1
 10.1 -> 10.2 -> 10.3          10.3 uses 7.5 and 7.7 for two commands
 ```
 
 7.6 comes before the map because analysis runs are read-only threads. 9.1 and 10.1 have no
-dependency and can run beside the main line, each in a worktree of its own; so can 7.7 once
-7.3 lets the e2e bridge write files with definitions (`src/site/tests/page_e2e.rs:143`
-writes three plain files today), or 7.7 makes that bridge change itself if it lands first.
+dependency and can run beside the main line, each in a worktree of its own, and so can 7.7:
+its e2e test needs the bridge to write files with definitions
+(`src/site/tests/page_e2e.rs:143` writes three plain files today), and whichever of 7.5 and
+7.7 lands first makes that change.
 
 ## What this plan leaves open
 

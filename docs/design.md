@@ -349,6 +349,8 @@ accept both block types, so no capability check is needed.
 These are review notes an engineer wrote while reading this repository.
 Address every note. Change nothing the notes do not ask for.
 When you finish, list each note id with one line on what you did.
+Then end your reply with a report for the engineer who reviews your changes: one JSON object
+in a code block fenced as json, the last thing in your reply. [...]
 
 [N1] src/acp/connection.rs:37
 >     let reply = rx.recv().unwrap();
@@ -367,6 +369,14 @@ edits the file. A file or folder note quotes nothing: the agent reads the path i
 gets no `resource_link`, because agents read a link as a file; the path in the text names it.
 A file or folder that is gone says so under its heading, as lost lines do. The send step lists
 the linked files as `GET /api/run/preview` returns them (`files`).
+
+The paragraph that asks for the author's report (`report::ASK`, shortened above) gives
+its shape in words, never as an example block, which a reply quoting the prompt would hand
+back. As a run of notes or a follow-up ends well, Postil reads the report from the reply and
+logs it with the end as a `report` entry, or a `noReport` entry saying why there is none
+(run log version 6; `docs/review-assist.md`, "The author's report"). A follow-up's prompt,
+the engineer's words alone, ends with a one-line reminder, or with the whole ask when its
+thread started before reports.
 
 ### Runs
 

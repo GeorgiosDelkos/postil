@@ -10,9 +10,11 @@ import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
 import { elapsed, foldRun, iconKind, isLive, statusLine, statusWord, toolRow } from "./run.js";
 import {
+  freshAgent,
   noteStatus,
   planProgress,
-  replyText,
+  replyShown,
+  reportNotice,
   reviewKey,
   reviewOf,
   threadKey,
@@ -265,6 +267,8 @@ export function runDialog({
 
     const reply = replyPart(view);
     if (reply) body.append(reply);
+    const report = reportNotice(view);
+    if (report) body.append(el("div", "run-notice", report));
     if (view.problem) body.append(el("div", "run-notice", view.problem));
     for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
     if (!view.review) {
@@ -423,12 +427,12 @@ export function runDialog({
   // A run's reply, or null before it writes one: its text is written in place as it streams
   // (`streamed`), and only the reply's own nodes change.
   function replyPart(turn) {
-    let text = replyText(turn);
+    let text = replyShown(turn);
     if (!text) return null;
     const view = el("div", "run-message");
     fillMarkdown(view, text);
     streamed.push(() => {
-      const now = replyText(store.byId(turn.id) ?? turn);
+      const now = replyShown(store.byId(turn.id) ?? turn);
       if (now === text) return;
       text = now;
       fillMarkdown(view, text);
@@ -441,7 +445,7 @@ export function runDialog({
     const parts = [];
     const asked = section(`You · ${turn.id}`, el("div", "follow-up-text", turn.followUp.text));
     // The prompt holds more than the words when a fresh agent was told the thread first.
-    if (turn.prompt !== turn.followUp.text) {
+    if (freshAgent(turn)) {
       asked.append(
         el(
           "div",
@@ -455,6 +459,8 @@ export function runDialog({
     if (steps.length) parts.push(stepsSection(turn, steps));
     const reply = replyPart(turn);
     if (reply) parts.push(reply);
+    const report = reportNotice(turn);
+    if (report) parts.push(el("div", "run-notice", report));
     if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
     return parts;
   }
