@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
@@ -390,13 +390,54 @@ fn read_claude_credentials() -> Result<Option<(String, Option<String>)>, String>
     Ok(read_credentials_file(&path)?.and_then(|raw| parse_claude_credentials(&raw)))
 }
 
-/// Reads the credentials file at `path`, or `Ok(None)` when it does not exist.
+/// Largest credentials file read, in bytes. Arbitrary: the files hold a few tokens as JSON,
+/// under 2 KiB, and 64 KiB leaves room for growth while a stray huge file is refused rather
+/// than read into memory.
+const MAX_CREDENTIALS_BYTES: u64 = 64 * 1024;
+
+/// Reads the credentials file at `path`, or `Ok(None)` when it does not exist. Refuses
+/// anything but a regular file of at most [`MAX_CREDENTIALS_BYTES`], so a FIFO or a huge file
+/// can neither block the probe nor fill memory.
 fn read_credentials_file(path: &Path) -> Result<Option<String>, String> {
-    match fs::read_to_string(path) {
-        Ok(raw) => Ok(Some(raw)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    let shown = path.display();
+    let check = |metadata: &fs::Metadata| {
+        if !metadata.is_file() {
+            return Err(format!("{shown} is not a regular file"));
+        }
+        if metadata.len() > MAX_CREDENTIALS_BYTES {
+            return Err(format!(
+                "{shown} is larger than {MAX_CREDENTIALS_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    };
+
+    // `metadata` does not open the file, so a FIFO is refused before `open` could wait on it
+    // for a writer. A FIFO swapped in between the two calls would still block `open`; that
+    // takes someone rewriting the user's own home directory during the probe.
+    match fs::metadata(path) {
+        Ok(metadata) => check(&metadata)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {shown}: {error}")),
     }
+    let file = File::open(path).map_err(|error| format!("cannot read {shown}: {error}"))?;
+    // Check what was opened too, in case the path changed after `metadata`.
+    check(
+        &file
+            .metadata()
+            .map_err(|error| format!("cannot read {shown}: {error}"))?,
+    )?;
+
+    let mut raw = String::new();
+    file.take(MAX_CREDENTIALS_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|error| format!("cannot read {shown}: {error}"))?;
+    if raw.len() as u64 > MAX_CREDENTIALS_BYTES {
+        return Err(format!(
+            "{shown} is larger than {MAX_CREDENTIALS_BYTES} bytes"
+        ));
+    }
+    Ok(Some(raw))
 }
 
 fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
@@ -1475,12 +1516,47 @@ mod tests {
 
     #[test]
     fn a_missing_credentials_file_is_not_signed_in_but_an_unreadable_one_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = crate::testing::TempDir::new("quota-creds");
         assert_eq!(
             read_credentials_file(&dir.path().join("absent.json")),
             Ok(None)
         );
-        let error = read_credentials_file(dir.path()).unwrap_err();
+        let unreadable = dir.path().join("unreadable.json");
+        fs::write(&unreadable, "{}").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        let error = read_credentials_file(&unreadable).unwrap_err();
         assert!(error.starts_with("cannot read "), "{error}");
+    }
+
+    #[test]
+    fn credentials_files_are_read_only_when_regular_and_small() {
+        let dir = crate::testing::TempDir::new("quota-creds-kinds");
+        let small = dir.path().join("small.json");
+        fs::write(&small, r#"{"access_token":"tok"}"#).unwrap();
+        assert_eq!(
+            read_credentials_file(&small),
+            Ok(Some(r#"{"access_token":"tok"}"#.to_owned()))
+        );
+
+        let limit = usize::try_from(MAX_CREDENTIALS_BYTES).unwrap();
+        let at_limit = dir.path().join("at-limit.json");
+        fs::write(&at_limit, vec![b' '; limit]).unwrap();
+        assert!(read_credentials_file(&at_limit).is_ok_and(|raw| raw.unwrap().len() == limit));
+        let huge = dir.path().join("huge.json");
+        fs::write(&huge, vec![b' '; limit + 1]).unwrap();
+        let error = read_credentials_file(&huge).unwrap_err();
+        assert!(error.ends_with("is larger than 65536 bytes"), "{error}");
+
+        // Opening a FIFO with no writer would block forever, so this test hangs if the kind
+        // check is missing.
+        let fifo = dir.path().join("fifo.json");
+        let made = Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        let error = read_credentials_file(&fifo).unwrap_err();
+        assert!(error.ends_with("is not a regular file"), "{error}");
+        let error = read_credentials_file(dir.path()).unwrap_err();
+        assert!(error.ends_with("is not a regular file"), "{error}");
     }
 }
