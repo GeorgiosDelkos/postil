@@ -104,7 +104,7 @@ pub(crate) struct PullRequest {
 }
 
 /// Whether a pull request is open, or how it closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum PullState {
     Open,

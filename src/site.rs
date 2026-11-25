@@ -423,16 +423,6 @@ struct ThreadBody {
     /// The thread, by its first run: `R3`.
     thread: String,
 }
-
-/// What `POST /api/thread/pr` and `/api/thread/pr/state` ask of a thread's pull request.
-#[derive(Debug, Clone, Copy)]
-enum PullAction {
-    /// Push the branch and open a draft pull request.
-    Open,
-    /// Read its state again.
-    Check,
-}
-
 /// The body of `POST /api/run/question`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -819,11 +809,11 @@ impl Site {
                 _ => not_allowed("POST"),
             },
             "/api/thread/pr" => match *method {
-                Method::POST => json_or_error(self.pull_request(body, PullAction::Open)),
+                Method::POST => json_or_error(self.open_pull_request(body)),
                 _ => not_allowed("POST"),
             },
             "/api/thread/pr/state" => match *method {
-                Method::POST => json_or_error(self.pull_request(body, PullAction::Check)),
+                Method::POST => json_or_error(self.check_pull_request(body)),
                 _ => not_allowed("POST"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
@@ -1008,16 +998,19 @@ impl Site {
         Ok(b"{}".to_vec())
     }
 
-    /// The reply to `POST /api/thread/pr` and `POST /api/thread/pr/state`: starts opening the
-    /// thread's pull request, or reading its state, as `action` says, and answers `{}`. The
-    /// work goes on after the reply: `GET api/thread` shows it.
-    fn pull_request(&self, body: &[u8], action: PullAction) -> Result<Vec<u8>> {
+    /// The reply to `POST /api/thread/pr`: starts opening the thread's pull request, and
+    /// answers `{}`. The work goes on after the reply: `GET api/thread` shows it.
+    fn open_pull_request(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: ThreadBody = parse_body(body, Error::BadRequest)?;
-        let runner = self.runner()?;
-        match action {
-            PullAction::Open => runner.open_pull_request(&request.thread)?,
-            PullAction::Check => runner.check_pull_request(&request.thread)?,
-        }
+        self.runner()?.open_pull_request(&request.thread)?;
+        Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `POST /api/thread/pr/state`: starts reading the state of the thread's pull
+    /// request again, and answers `{}`, as [`Site::open_pull_request`] does.
+    fn check_pull_request(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: ThreadBody = parse_body(body, Error::BadRequest)?;
+        self.runner()?.check_pull_request(&request.thread)?;
         Ok(b"{}".to_vec())
     }
 

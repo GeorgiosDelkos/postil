@@ -342,7 +342,9 @@ export function runDialog({
       line.append(el("span", "run-thread-state", ended));
       return section("Branch", line);
     }
-    const busy = isLive(store.byId(latest.id) ?? latest);
+    // Opening its pull request holds the thread, as a run does: the server refuses an ending.
+    const busy =
+      isLive(store.byId(latest.id) ?? latest) || record.pullRequestWork?.kind === "opening";
     const apply = el("button", "button primary", "Apply");
     apply.type = "button";
     apply.title = "Write the thread's changes into your working tree, uncommitted";

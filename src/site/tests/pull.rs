@@ -1,17 +1,24 @@
 //! Pull requests from threads (`run/pull.rs`) through `/api/thread/pr`: the branch pushed to a
 //! real remote (a bare repository beside the test's), and a fake `gh` first on the search path,
 //! since GitHub cannot run here. The fake writes what it was asked to files beside it, prints
-//! a pull request's URL or the state in its `state` file, and fails while a `fail` file is
-//! there.
+//! a pull request's URL or the state in its `state` file, waits while a `hold` file is there,
+//! fails while a `fail` file is there, and says a pull request exists while `exists` is.
 
-use super::threads::thread;
+use super::threads::{end, thread};
 use super::*;
+use crate::agents::find_program;
 
 const FAKE_GH: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 echo "$*" >> "$dir/calls"
+while [ -f "$dir/hold" ]; do sleep 0.02; done
 if [ -f "$dir/fail" ]; then
   echo "gh: not logged in to github.com" >&2
+  exit 1
+fi
+if [ -f "$dir/exists" ]; then
+  echo "a pull request for branch \"x\" into branch \"trunk\" already exists:" >&2
+  echo "https://github.com/owner/repo/pull/3" >&2
   exit 1
 fi
 case "$1 $2" in
@@ -36,19 +43,19 @@ fn published(name: &str) -> (TempRepo, Site, mpsc::Receiver<()>, PathBuf, PathBu
         &repo.root,
         &["init", "--quiet", "--bare", bare.to_str().unwrap()],
     );
-    let (site, nudges) = site_with_gh(&repo, &gh);
+    let mut dirs = vec![gh.clone()];
+    dirs.extend(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH is set"),
+    ));
+    let (site, nudges) = site_on(&repo, &dirs);
     repo.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
     repo.git(&["push", "--quiet", "origin", "trunk"]);
     (repo, site, nudges, gh, bare)
 }
 
-/// As `run_site` with the "writes" agent, with `gh`'s folder first on the search path.
-fn site_with_gh(repo: &TempRepo, gh: &Path) -> (Site, mpsc::Receiver<()>) {
+/// As `run_site` with the "writes" agent, with `dirs` as the search path.
+fn site_on(repo: &TempRepo, dirs: &[PathBuf]) -> (Site, mpsc::Receiver<()>) {
     repo.commit();
-    let mut dirs = vec![gh.to_owned()];
-    dirs.extend(std::env::split_paths(
-        &std::env::var_os("PATH").expect("PATH is set"),
-    ));
     let path = std::env::join_paths(dirs).unwrap();
     let (sender, nudges) = mpsc::channel();
     let notify: Notify = Arc::new(move || sender.send(()).unwrap_or_default());
@@ -129,7 +136,13 @@ fn open_pull_request_pushes_the_branch_and_opens_a_draft_into_the_base_branch() 
         "{calls}"
     );
     let pr_body = fs::read_to_string(gh.join("body")).unwrap();
+    assert!(pr_body.starts_with("**N1**, `a.txt:1`"), "{pr_body}");
     assert!(pr_body.contains("It drops paths."), "{pr_body}");
+    // Not the agent's prompt: no instructions, and no quoted code, which can hold a secret.
+    assert!(
+        !pr_body.contains("Address every note") && !pr_body.contains("> a"),
+        "{pr_body}"
+    );
     assert!(
         pr_body.ends_with("Opened from Postil thread R1."),
         "{pr_body}"
@@ -169,7 +182,7 @@ fn a_pull_request_needs_the_base_branch_on_the_remote_with_every_commit_the_thre
     let (status, body) = ask(&site, "pr", "R1");
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
-        body.contains("trunk is not on origin: push it first"),
+        body.contains("trunk is not on origin: push trunk first"),
         "{body}"
     );
 
@@ -209,4 +222,112 @@ fn a_failed_gh_shows_on_the_thread_and_open_pull_request_can_be_asked_again() {
     let record = settled(&site, &nudges, "R1");
     assert_eq!(record["pullRequest"]["state"], "open", "{record}");
     assert!(record["pullRequestWork"].is_null(), "{record}");
+}
+
+#[test]
+fn a_pull_request_is_refused_from_a_detached_head_or_over_work_not_committed() {
+    let (repo, site, nudges, _gh, _bare) = published("pull-local");
+    sent(&site, &nudges, "one");
+    let worktree = PathBuf::from(thread(&site, "R1")["path"].as_str().unwrap());
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+
+    let (status, body) = ask(&site, "pr", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("mine.txt"),
+        "the push would leave it out: {body}"
+    );
+
+    repo.git(&["checkout", "--quiet", "--detach"]);
+    sent(&site, &nudges, "two");
+    let (status, body) = ask(&site, "pr", "R2");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("detached HEAD"), "{body}");
+}
+
+#[test]
+fn a_thread_cannot_be_ended_while_its_pull_request_is_being_opened() {
+    let (_repo, site, nudges, gh, _bare) = published("pull-held");
+    sent(&site, &nudges, "one");
+    fs::write(gh.join("hold"), "").unwrap();
+    assert_eq!(ask(&site, "pr", "R1").0, StatusCode::OK);
+    // The push may still be running; gh waits on `hold` once it starts.
+    let deadline = Instant::now() + WAIT;
+    while !gh.join("calls").exists() {
+        assert!(Instant::now() < deadline, "gh never ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let (status, body) = end(&site, "discard", "R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("opening its pull request"), "{body}");
+
+    fs::remove_file(gh.join("hold")).unwrap();
+    let record = settled(&site, &nudges, "R1");
+    assert_eq!(record["pullRequest"]["state"], "open", "{record}");
+    let (status, body) = end(&site, "discard", "R1");
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[test]
+fn a_pull_request_github_has_already_is_recorded_from_a_version_2_record() {
+    let (repo, site, nudges, gh, _bare) = published("pull-exists");
+    sent(&site, &nudges, "one");
+    let file = repo.root.join(".git/postil/threads.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    record["version"] = 2.into();
+    fs::write(&file, record.to_string()).unwrap();
+    fs::write(gh.join("exists"), "").unwrap();
+
+    assert_eq!(ask(&site, "pr", "R1").0, StatusCode::OK);
+    let record = settled(&site, &nudges, "R1");
+
+    assert_eq!(
+        record["pullRequest"]["url"], "https://github.com/owner/repo/pull/3",
+        "{record}"
+    );
+    assert!(record["pullRequestWork"].is_null(), "{record}");
+}
+
+#[test]
+fn a_base_branch_tracking_another_name_is_the_base_by_that_name() {
+    let (repo, site, nudges, gh, _bare) = published("pull-upstream");
+    repo.git(&["push", "--quiet", "origin", "trunk:develop"]);
+    repo.git(&[
+        "branch",
+        "--quiet",
+        "--set-upstream-to",
+        "origin/develop",
+        "trunk",
+    ]);
+    sent(&site, &nudges, "one");
+
+    assert_eq!(ask(&site, "pr", "R1").0, StatusCode::OK);
+    settled(&site, &nudges, "R1");
+
+    let calls = fs::read_to_string(gh.join("calls")).unwrap();
+    assert!(calls.contains("--base develop "), "{calls}");
+}
+
+#[test]
+fn without_gh_the_thread_says_how_to_install_it() {
+    let (repo, _site, _nudges, _gh, _bare) = published("pull-no-gh");
+    // A search path with node, for the agent, and git, and no gh.
+    let bin = repo.home().join("bin-without-gh");
+    fs::create_dir_all(&bin).unwrap();
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    for program in ["node", "git"] {
+        let found = find_program(program, &path).expect("node and git are installed");
+        std::os::unix::fs::symlink(found, bin.join(program)).unwrap();
+    }
+    let (site, nudges) = site_on(&repo, &[bin]);
+    // The site committed the files again: origin must have that commit too.
+    repo.git(&["push", "--quiet", "origin", "trunk"]);
+    sent(&site, &nudges, "one");
+
+    assert_eq!(ask(&site, "pr", "R1").0, StatusCode::OK);
+    let record = settled(&site, &nudges, "R1");
+
+    let error = record["pullRequestWork"]["error"].as_str().unwrap();
+    assert!(error.contains("brew install gh"), "{record}");
 }

@@ -254,11 +254,13 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     );
   }
 
-  // Asks GitHub again for the state of every open pull request of a thread this window has
-  // read: the window regained focus, after the engineer may have merged one. Never on a timer.
+  // Asks GitHub again for the state of every pull request not merged of a thread this window
+  // has read: the window regained focus, after the engineer may have merged one, or reopened
+  // one closed. A merged one stays merged. Never on a timer.
   function checkPullRequests() {
     for (const [id, record] of threads) {
-      if (record?.pullRequest?.state !== "open") continue;
+      const state = record?.pullRequest?.state;
+      if (!state || state === "merged") continue;
       post("api/thread/pr/state", { thread: id }).then(
         () => threads.delete(id),
         // A failure shows in the thread as `pullRequestWork`; nothing more to say here.

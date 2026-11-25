@@ -32,6 +32,14 @@ pub(crate) enum Checkout<'a> {
     Existing { branch: &'a str },
 }
 
+/// A local branch's branch on a remote ([`Repo::upstream`]).
+#[derive(Debug)]
+pub(crate) struct Upstream {
+    pub(crate) remote: String,
+    /// Its name there: `develop` for a local `dev` that tracks `origin/develop`.
+    pub(crate) branch: String,
+}
+
 /// A git working tree on disk.
 #[derive(Debug)]
 pub(crate) struct Repo {
@@ -512,38 +520,57 @@ impl Repo {
         self.ref_commit(&format!("refs/remotes/{remote}/{branch}"))
     }
 
-    /// The remote a pull request from branch `branch` goes to: the one `branch` tracks
-    /// (`branch.<name>.remote`), else `origin` when there is one. `None` when there is neither.
+    /// Where local branch `branch` lives on a remote: the remote and branch it tracks
+    /// (`branch.<name>.remote` and `.merge`), else the branch of the same name on `origin`
+    /// when there is one. `None` when there is neither.
     ///
     /// # Errors
     ///
-    /// The git error when the remotes cannot be listed.
-    pub(crate) fn remote_for(&self, branch: &str) -> Result<Option<String>> {
-        let key = format!("branch.{branch}.remote");
-        // `git config --get` exits 1, printing nothing, for a key that is not set.
-        if let Ok(remote) = git(&self.root, &["config", "--get", &key]) {
-            let remote = remote.trim();
-            // `.` is this repository itself: a branch tracking another local branch.
-            if !remote.is_empty() && remote != "." {
-                return Ok(Some(remote.to_owned()));
-            }
+    /// The git error when the config or the remotes cannot be read.
+    pub(crate) fn upstream(&self, branch: &str) -> Result<Option<Upstream>> {
+        let remote = self.config_value(&format!("branch.{branch}.remote"))?;
+        // `.` is this repository itself: a branch tracking another local branch.
+        if let Some(remote) = remote.filter(|remote| remote != ".") {
+            let merge = self.config_value(&format!("branch.{branch}.merge"))?;
+            let name = merge
+                .as_deref()
+                .and_then(|merge| merge.strip_prefix("refs/heads/"))
+                .unwrap_or(branch);
+            return Ok(Some(Upstream {
+                remote,
+                branch: name.to_owned(),
+            }));
         }
         let remotes = git(&self.root, &["remote"])?;
         Ok(remotes
             .lines()
             .any(|remote| remote == "origin")
-            .then(|| "origin".to_owned()))
+            .then(|| Upstream {
+                remote: "origin".to_owned(),
+                branch: branch.to_owned(),
+            }))
     }
 
-    /// The commits reachable from `to` and not from `from`, newest first, each as its short id
-    /// and subject: `"a1b2c3d Fix the parser"`.
+    /// The value of config `key`, or `None` when it is not set or empty.
+    fn config_value(&self, key: &str) -> Result<Option<String>> {
+        match git(&self.root, &["config", "--get", key]) {
+            Ok(value) => Ok(Some(value.trim().to_owned()).filter(|value| !value.is_empty())),
+            // `git config --get` exits 1, printing nothing, for a key that is not set.
+            Err(Error::Git { stderr, .. }) if stderr.trim().is_empty() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// At most `most` of the commits reachable from `to` and not from `from`, newest first,
+    /// each as its short id and subject: `"a1b2c3d Fix the parser"`.
     ///
     /// # Errors
     ///
     /// The git error, such as an id that names no commit.
-    pub(crate) fn commits_between(&self, from: &str, to: &str) -> Result<Vec<String>> {
+    pub(crate) fn commits_between(&self, from: &str, to: &str, most: usize) -> Result<Vec<String>> {
         let range = format!("{from}..{to}");
-        let log = git(&self.root, &["log", "--format=%h %s", &range])?;
+        let count = format!("--max-count={most}");
+        let log = git(&self.root, &["log", &count, "--format=%h %s", &range])?;
         Ok(log.lines().map(str::to_owned).collect())
     }
 

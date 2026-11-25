@@ -48,18 +48,31 @@ pub(crate) fn create(
         "--body-file",
         "-",
     ];
-    let printed = run(program, dir, search_path, &args, Some(new.body))?;
-    // `gh pr create` prints the URL on its last line.
-    printed
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| line.starts_with("https://"))
-        .map(str::to_owned)
-        .ok_or_else(|| Error::GitHub {
+    match run(program, dir, search_path, &args, Some(new.body)) {
+        // `gh pr create` prints the URL on its last line.
+        Ok(printed) => pull_request_url(&printed).ok_or_else(|| Error::GitHub {
             command: "gh pr create".to_owned(),
             message: format!("it printed no pull request URL: {printed}"),
-        })
+        }),
+        // One the record lacks (a write that failed, a quit, another window): gh names it
+        // ("a pull request for branch ... already exists:" and the URL), and it is the one.
+        Err(Error::GitHub { message, .. })
+            if message.contains("already exists") && pull_request_url(&message).is_some() =>
+        {
+            Ok(pull_request_url(&message).expect("checked by the guard"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The last line of `text` that is a pull request's URL: `https://` and `/pull/`. Only such a
+/// line is kept, since the page opens it in the browser.
+fn pull_request_url(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("https://") && line.contains("/pull/"))
+        .map(str::to_owned)
 }
 
 /// The state of the pull request at `url`, read with `gh` as [`create`] runs it.
@@ -118,16 +131,16 @@ fn run(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| failed(error.to_string()))?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        // No deadlock: gh reads the whole body before it prints anything. The pipe closes
-        // when `stdin` drops at the end of this block, which ends gh's read.
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|error| failed(error.to_string()))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| failed(error.to_string()))?;
+    let output = std::thread::scope(|scope| {
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // On a thread of its own, as `repo.rs` writes to git: gh may exit before it reads
+            // the body (not signed in), which fails the write, and its exit status and message
+            // then say why. The pipe closes when `stdin` drops, which ends gh's read.
+            scope.spawn(move || drop(stdin.write_all(input.as_bytes())));
+        }
+        child.wait_with_output()
+    })
+    .map_err(|error| failed(error.to_string()))?;
     if !output.status.success() {
         return Err(failed(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),

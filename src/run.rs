@@ -1552,10 +1552,11 @@ impl Runner {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Whether this window has a run under way, or a review between two stages, whose next
-    /// stage starts with no request from the page.
+    /// Whether this window has a run under way, a review between two stages, whose next
+    /// stage starts with no request from the page, or a pull request being opened. Closing the
+    /// project does not stop an opening: it finishes and records its URL.
     pub(crate) fn busy(&self) -> bool {
-        self.slots().busy()
+        self.slots().busy() || self.opening_pull_request()
     }
 
     /// Stops every agent, running or starting, and ignores anything they would still report:

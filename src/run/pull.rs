@@ -11,10 +11,18 @@
 //! window only ([`PullWork`]): it is not the thread's state, and a crash must not leave a
 //! thread marked as opening for good. The pull request's URL and state go in the record.
 //!
+//! Opening holds the thread's lock (`threads/<id>.lock`) from its checks until `gh` is done,
+//! as a run does: no run, ending, forgetting or eviction in any window changes the branch or
+//! the record under it, and each is refused as for a run under way. The lock is taken as an
+//! ending takes it: this window's slots are asked first, and nothing in this window takes the
+//! lock of a thread that is not busy until this request is answered (`run.rs`, "Threads and
+//! locks"). Reading the state takes no lock: it only writes the state it read.
+//!
 //! [`Runner::pull_work`] is a lock of its own, held for a map lookup or insert only and never
 //! with another of the runner's locks.
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -22,12 +30,22 @@ use serde::Serialize;
 use crate::agents::find_program;
 use crate::error::{Error, Result, error_chain};
 use crate::github::{self, NewPullRequest};
+use crate::notes;
+use crate::run::log::hold_thread_lock;
 use crate::run::{Runner, Slot, lock};
 use crate::thread::{self, PullRequest, PullState, State, Thread};
 
 /// The longest title a pull request takes from a note, in characters: GitHub shows about this
 /// much in a list. Arbitrary.
 const TITLE_LENGTH: usize = 72;
+
+/// The longest body, in characters. GitHub refuses a description over 65,536; this leaves
+/// room for the line after it.
+const BODY_LENGTH: usize = 60_000;
+
+/// How many of the base branch's commits the remote lacks a refusal lists. Arbitrary: enough
+/// to recognise them.
+const LISTED_COMMITS: usize = 10;
 
 /// What this window is doing about a thread's pull request, or why it last failed.
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +68,19 @@ pub(crate) struct ThreadView {
     pull_request_work: Option<PullWork>,
 }
 
+/// A pull request ready to be opened: what the checks found, for the job.
+#[derive(Debug)]
+struct Opening {
+    thread: Thread,
+    remote: String,
+    /// The base branch's name on the remote.
+    base: String,
+    title: String,
+    body: String,
+    /// The thread's lock, held until the job ends.
+    lock: File,
+}
+
 impl Runner {
     /// Thread `id`'s record, with what this window is doing about its pull request; `None` for
     /// a run from before threads had worktrees.
@@ -65,6 +96,13 @@ impl Runner {
         }))
     }
 
+    /// Whether this window is opening a pull request: the project is busy until it is done.
+    pub(crate) fn opening_pull_request(&self) -> bool {
+        lock(&self.pull_work)
+            .values()
+            .any(|work| matches!(work, PullWork::Opening))
+    }
+
     /// Opens a draft pull request from thread `id`'s branch into the branch `HEAD` was on at
     /// send (module docs): checks what it can here, then pushes the branch and runs
     /// `gh pr create` on a thread of its own, which records the URL in the thread, or the
@@ -72,59 +110,29 @@ impl Runner {
     ///
     /// # Errors
     ///
-    /// [`Error::NoHome`]; [`Error::TurnRunning`] while the thread is busy in this window;
-    /// [`Error::BadRequest`] for no open or evicted thread `id`, one with a pull request
-    /// already, or one being opened; [`Error::PullRequestRefused`] with the reason (module
-    /// docs); as [`thread::check`], for work Postil did not commit; and the git errors.
+    /// [`Error::NoHome`]; [`Error::TurnRunning`] while the thread is busy in this window, and
+    /// [`Error::RunElsewhere`] while another window holds its lock; [`Error::BadRequest`] for
+    /// no open or evicted thread `id`, one with a pull request already, or one being opened;
+    /// [`Error::PullRequestRefused`] with the reason (module docs); as [`thread::check`], for
+    /// work Postil did not commit; and the git errors.
     pub(crate) fn open_pull_request(self: &Arc<Self>, id: &str) -> Result<()> {
-        let home = self.home.as_deref().ok_or(Error::NoHome)?;
-        if self.slots().by_thread.get(id).is_some_and(Slot::busy) {
-            return Err(Error::TurnRunning);
-        }
-        let thread = match thread::find(&self.repo, id)? {
-            Some(thread) if matches!(thread.state, State::Open | State::Evicted) => thread,
-            _ => return Err(Error::BadRequest(format!("there is no open thread {id}"))),
-        };
-        if let Some(pull) = &thread.pull_request {
-            return Err(Error::BadRequest(format!(
-                "{id} has a pull request already: {}",
-                pull.url
-            )));
-        }
-        let refused = Error::PullRequestRefused;
-        let base = thread.base.clone().ok_or_else(|| {
-            refused(
-                "the thread started from a detached HEAD, so it has no branch to merge into"
-                    .to_owned(),
-            )
-        })?;
-        let remote = self
-            .repo
-            .remote_for(&base)?
-            .ok_or_else(|| refused(format!("{base} tracks no remote, and there is no origin")))?;
-        let on_remote = self
-            .repo
-            .remote_branch_commit(&remote, &base)?
-            .ok_or_else(|| refused(format!("{base} is not on {remote}: push it first")))?;
-        let unpushed = self.repo.commits_between(&on_remote, &thread.fork)?;
-        if !unpushed.is_empty() {
-            return Err(refused(format!(
-                "the thread starts from commits of {base} that {remote} does not have, which \
-                 the pull request would show ({}): push {base} first",
-                unpushed.join("; ")
-            )));
-        }
-        // Nothing left uncommitted, which the push would leave out.
-        thread::check(&self.repo, home, &thread)?;
-        let (title, body) = self.pull_request_text(id);
+        let opening = self.check_opening(id)?;
         if !self.start_pull_work(id, PullWork::Opening) {
             return Err(Error::BadRequest(format!(
                 "the pull request of {id} is being opened or read"
             )));
         }
         let runner = Arc::clone(self);
-        let id = id.to_owned();
-        self.spawn_pull_work(&id.clone(), move |search_path| {
+        let thread_id = id.to_owned();
+        self.spawn_pull_work(id, move |search_path| {
+            let Opening {
+                thread,
+                remote,
+                base,
+                title,
+                body,
+                lock: _held,
+            } = opening;
             let program = find_program("gh", search_path).ok_or(Error::NoGh)?;
             runner
                 .repo
@@ -136,14 +144,92 @@ impl Runner {
                 body: &body,
             };
             let url = github::create(&program, runner.repo.root(), search_path, &new)?;
-            thread::update(&runner.repo, &id, |stored| {
+            let recorded = thread::update(&runner.repo, &thread_id, |stored| {
                 stored.pull_request = Some(PullRequest {
-                    url,
+                    url: url.clone(),
                     state: PullState::Open,
                 });
+            });
+            // Opened, so the next Open would find it: the engineer needs its URL now.
+            recorded.map_err(|error| Error::GitHub {
+                command: "gh pr create".to_owned(),
+                message: format!(
+                    "opened {url}, but it could not be recorded: {}",
+                    error_chain(&error)
+                ),
             })
         });
         Ok(())
+    }
+
+    /// The checks of [`Runner::open_pull_request`] that need no network, under the thread's
+    /// lock, which the returned opening holds.
+    fn check_opening(&self, id: &str) -> Result<Opening> {
+        let home = self.home.as_deref().ok_or(Error::NoHome)?;
+        if self.slots().by_thread.get(id).is_some_and(Slot::busy) {
+            return Err(Error::TurnRunning);
+        }
+        let lock = hold_thread_lock(&self.repo.runs_dir(), id)?;
+        let thread = match thread::find(&self.repo, id)? {
+            Some(thread) if matches!(thread.state, State::Open | State::Evicted) => thread,
+            _ => return Err(Error::BadRequest(format!("there is no open thread {id}"))),
+        };
+        if let Some(pull) = &thread.pull_request {
+            return Err(Error::BadRequest(format!(
+                "{id} has a pull request already: {}",
+                pull.url
+            )));
+        }
+        let refused = |why: String| Error::PullRequestRefused(why);
+        // The record is a file a hand edit can change: only Postil's branches are pushed.
+        if !thread.branch.starts_with("postil/") {
+            return Err(refused(format!(
+                "its branch {} is not one of Postil's (postil/...)",
+                thread.branch
+            )));
+        }
+        let local = thread.base.clone().ok_or_else(|| {
+            refused(
+                "the thread started from a detached HEAD, so it has no branch to merge into"
+                    .to_owned(),
+            )
+        })?;
+        let upstream = self
+            .repo
+            .upstream(&local)?
+            .ok_or_else(|| refused(format!("{local} tracks no remote, and there is no origin")))?;
+        let (remote, base) = (upstream.remote, upstream.branch);
+        let on_remote = self
+            .repo
+            .remote_branch_commit(&remote, &base)?
+            .ok_or_else(|| refused(format!("{base} is not on {remote}: push {local} first")))?;
+        let unpushed = self
+            .repo
+            .commits_between(&on_remote, &thread.fork, LISTED_COMMITS + 1)?;
+        if !unpushed.is_empty() {
+            let more = if unpushed.len() > LISTED_COMMITS {
+                ", and more"
+            } else {
+                ""
+            };
+            let listed = &unpushed[..unpushed.len().min(LISTED_COMMITS)];
+            return Err(refused(format!(
+                "the thread starts from commits of {local} that {remote} does not have, which \
+                 the pull request would show ({}{more}): push {local} first",
+                listed.join("; ")
+            )));
+        }
+        // Nothing left uncommitted, which the push would leave out.
+        thread::check(&self.repo, home, &thread)?;
+        let (title, body) = self.pull_request_text(id);
+        Ok(Opening {
+            thread,
+            remote,
+            base,
+            title,
+            body,
+            lock,
+        })
     }
 
     /// Reads the state of thread `id`'s pull request again with `gh pr view`, on a thread of
@@ -162,11 +248,11 @@ impl Runner {
             return Ok(());
         }
         let runner = Arc::clone(self);
-        let id = id.to_owned();
-        self.spawn_pull_work(&id.clone(), move |search_path| {
+        let thread_id = id.to_owned();
+        self.spawn_pull_work(id, move |search_path| {
             let program = find_program("gh", search_path).ok_or(Error::NoGh)?;
             let state = github::state(&program, runner.repo.root(), search_path, &pull.url)?;
-            thread::update(&runner.repo, &id, |stored| {
+            thread::update(&runner.repo, &thread_id, |stored| {
                 if let Some(stored) = &mut stored.pull_request {
                     stored.state = state;
                 }
@@ -176,29 +262,28 @@ impl Runner {
     }
 
     /// The title and body of thread `id`'s pull request: the first line of its first note
-    /// still there, and the prompt its first run sent, which holds every note as the agent
-    /// read it. A thread whose first run cannot be read gets a title naming it, and a body
-    /// saying where it came from only.
+    /// still there, and its notes still there ([`notes::listed`]), never the prompt, which
+    /// quotes the code they are on. A thread whose first run or notes cannot be read gets a
+    /// title naming it, and a body saying where it came from only.
     fn pull_request_text(&self, id: &str) -> (String, String) {
-        let (notes, prompt) = self.run_by_id(id).map_or_else(
-            |_| (Vec::new(), String::new()),
-            |run| {
-                let state = run.state();
-                (state.header.notes.clone(), state.header.prompt.clone())
-            },
-        );
-        let title = notes
+        let ids = self
+            .run_by_id(id)
+            .map_or_else(|_| Vec::new(), |run| run.state().header.notes.clone());
+        let title = ids
             .iter()
-            .find_map(|note| crate::notes::body(&self.repo, note).ok())
+            .find_map(|note| notes::body(&self.repo, note).ok())
             .and_then(|body| body.lines().next().map(str::trim).map(str::to_owned))
             .filter(|line| !line.is_empty())
             .map_or_else(
                 || format!("Postil thread {id}"),
                 |line| line.chars().take(TITLE_LENGTH).collect(),
             );
-        let body = format!("{prompt}\n\nOpened from Postil thread {id}.")
-            .trim_start()
-            .to_owned();
+        let listed = notes::listed(&self.repo, &ids).unwrap_or_default();
+        let mut body: String = listed.chars().take(BODY_LENGTH).collect();
+        if body.len() < listed.len() {
+            body.push_str("\n\n(The notes go on; the rest is in Postil.)\n\n");
+        }
+        body.push_str(&format!("Opened from Postil thread {id}."));
         (title, body)
     }
 
@@ -239,8 +324,8 @@ impl Runner {
             });
         if let Err(error) = spawned {
             let error = Error::GitHub {
-                command: "a thread for gh".to_owned(),
-                message: format!("cannot start: {error}"),
+                command: "gh".to_owned(),
+                message: format!("cannot start a thread to run it: {error}"),
             };
             self.finish_pull_work(id, Err(error));
         }

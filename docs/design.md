@@ -547,8 +547,9 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
 
 ### Worktrees
 
-Milestone 6, built but for two items marked below. Decided with the owner on 2026-11-24. Two agents in one working tree
-overwrite each other's edits, so each thread (a run of notes with its follow-ups and reviews)
+Milestone 6, built but for two items marked below. Decided with the owner on 2026-11-24. Two
+agents in one working tree overwrite each other's edits, so each thread (a run of notes with
+its follow-ups and reviews)
 runs in a git worktree of its own, on a branch of its own. The engineer's working tree is
 never an agent's working directory; changes reach it only through Apply or a merged pull
 request.
@@ -604,8 +605,8 @@ uncommitted changes, and sparse-checkout patterns.
   (`open`, `merged` or `closed`) as last read. This is version 3. Version 1 had no `lastRun`
   and no evicted state, and neither 1 nor 2 a pull request; both are still read, version 1's
   threads as having run at time 0, and written back as version 3. A change reads the file,
-  changes one thread and writes it whole, under
-  `threads.lock`; a new thread is written before `git worktree add`, so a crash leaves a
+  changes one thread and writes it whole, under `threads.lock`; a new thread is written
+  before `git worktree add`, so a crash leaves a
   record pointing at whatever was made. Run logs stay append-only, so this file holds what
   changes. A file that cannot be read or parsed is reported and never written over.
 - **Based on `HEAD`, not on the engineer's uncommitted edits**, as Cursor, Codex and Claude
@@ -715,25 +716,36 @@ Three things end a thread, each one of the engineer's clicks:
 - **A merged or closed pull request** (built, `src/run/pull.rs`, `src/github.rs`). Open pull
   request, in the thread's dialog, does not end the thread. It is never automatic: it writes
   to GitHub. On the request thread it checks, with no network, what would make the pull
-  request wrong, and refuses (409) saying why: no base branch (the thread started from a
-  detached `HEAD`); a base branch with no remote (the one it tracks, else `origin`); a base
-  branch not on that remote, as this repository last fetched it; commits the thread starts
-  from that the remote's base branch lacks, listed, since the pull request would show them;
-  work Postil did not commit (the safety check). Then, on a thread of its own, it pushes the
-  branch to the branch of the same name on the remote, and runs `gh pr create --draft --base
-  <base> --head <branch>` with the first line of the first note as the title and the first
-  run's prompt, which holds the notes, as the body, and records the URL in the thread. The
-  push and `gh` run with the login shell's `PATH`, so the engineer's credential helpers are
-  found, and the push runs their `pre-push` hook, unlike Postil's own commits: it is their
-  push to their remote, which a hook may guard. Off the request thread because a hook can
-  take minutes, and the page's Stop and answers go through that thread. What this window is
+  request wrong, and refuses (409) saying why: a branch outside `postil/` (the record is a
+  file a hand edit can change); no base branch (the thread started from a detached `HEAD`);
+  a base branch with no remote (the remote and branch it tracks, else its name on
+  `origin`); a base branch not on that remote, as this repository last fetched it; commits
+  the thread starts from that the remote's base branch lacks, the first 10 listed, since the
+  pull request would show them; work Postil did not commit (the safety check). Then, on a
+  thread of its own, it pushes the branch to the branch of the same name on the remote, and
+  runs `gh pr create --draft --base <base> --head <branch>`, and records the URL in the
+  thread. The title is the first line of the first note. The body is the notes still there,
+  each with its place and text, cut at 60,000 characters (GitHub refuses over 65,536):
+  never the prompt, which quotes the code and could carry a secret a note asks to remove.
+  The push and `gh` run with the login shell's `PATH`, so the engineer's credential helpers
+  are found, and the push runs their `pre-push` hook, unlike Postil's own commits: it is
+  their push to their remote, which a hook may guard. Off the request thread because a hook
+  can take minutes, and the page's Stop and answers go through that thread. It holds the
+  thread's lock from its checks until `gh` is done, as a run does, so no run, ending,
+  forgetting or eviction in any window changes the branch or the record under it; the
+  dialog disables Apply and Discard meanwhile, and the project counts as busy. When GitHub
+  has a pull request for the branch already that the record lacks (a quit, a failed write,
+  another window), the URL in gh's "already exists" message is recorded. What this window is
   doing (opening, reading the state) or why it failed is kept in memory only, shown in the
   dialog, and lost with the window, so a crash leaves no thread marked as opening; the
   engineer asks again. Postil reads the state (`gh pr view <url> --json state`) when the
-  window regains focus, for the threads the page has read, never on a timer. Merged or
-  closed, the dialog says so and that Discard ends the thread: its changes reach the working
-  tree through the base branch, not through Apply. The pull request's link opens in the
-  default browser (`open`): the page itself never navigates away.
+  window regains focus, for every pull request not merged of the threads the page has read
+  (a closed one may be reopened), never on a timer. Merged or closed, the dialog says so and
+  that Discard ends the thread: its changes reach the working tree through the base branch,
+  not through Apply. Only a line of gh's output naming a pull request (`/pull/`) is kept as
+  the URL, and its link opens in the default browser (`open`): the page itself never
+  navigates away. Not supported: a fork (pushing to one remote and opening the pull request
+  on another); with several remotes and no default set, gh refuses rather than guessing.
 
 **The safety check:** the worktree has no uncommitted change outside ignored files, and its
 branch is at the commit Postil made last or past it. Past it is a commit the engineer made

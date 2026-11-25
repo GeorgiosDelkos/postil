@@ -482,7 +482,8 @@ impl fmt::Display for Error {
             Self::RunElsewhere => write!(
                 f,
                 "another Postil window is running an agent in this thread, or Postil is \
-                 starting, ending or freeing it (wait for it, or stop it there)"
+                 starting, ending or freeing it, or opening its pull request (wait for it, or \
+                 stop it there)"
             ),
             Self::TooManyWorktrees { cap, kept } => write!(
                 f,
