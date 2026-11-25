@@ -20,7 +20,7 @@ import { latestOfThreads } from "./status.js";
 // `store` holds the runs (run-store.js) and `dialog` is the run dialog (run-dialog.js).
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
 // sidebar's agent status.
-export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) {
+export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
   let clock = null;
   // The tray header's nodes, `{ key, title, stop }`, built by `renderHeader`.
   let header = null;
@@ -31,13 +31,15 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
   let views = new Map();
   let drawnRun = null;
 
-  // Stop asks the agent to stop. Once the Rust process would force it (forceAt), Stop ends it
-  // (src/run.rs, "Stopping"); sooner, the Rust process takes it as the same request.
+  // The header's Stop, and Escape: stops the latest run, the one the header shows, never one
+  // it does not (another thread's stops from its dialog). It asks the agent to stop. Once the
+  // Rust process would force it (forceAt), Stop ends it (src/run.rs, "Stopping"); sooner, the
+  // Rust process takes it as the same request.
   function stop() {
     const run = store.run();
     if (!isLive(run)) return Promise.resolve();
     if (run.status === "cancelling" && !forceable()) return Promise.resolve();
-    return store.post("api/run/cancel").catch((error) => onError(error.message));
+    return store.stop(run.id);
   }
 
   function forceable() {
@@ -62,18 +64,20 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
       return;
     }
     const wanted = [];
-    // What needs an answer now shows above the runs: a question, as a card that opens the
-    // run's dialog where it is answered, and a permission request Postil could not answer.
-    if (isLive(run)) {
-      const items = foldRun(run.entries).items;
+    // What needs an answer now shows above the runs, for each live run: a question, as a card
+    // that opens the run's dialog where it is answered, and a permission request Postil could
+    // not answer.
+    for (const live of store.liveRuns()) {
+      const items = foldRun(live.entries).items;
       const question = openQuestion(items);
       if (question) {
-        const key = `question:${run.id}:${question.request}`;
-        wanted.push([key, question.message, () => needsYouCard(run, question)]);
+        const key = `question:${live.id}:${question.request}`;
+        wanted.push([key, question.message, () => needsYouCard(live, question)]);
       }
       for (const item of items) {
         if (item.type !== "permission" || item.answer !== undefined) continue;
-        wanted.push([`permission:${item.request}`, item.title, () => permissionView(item)]);
+        const key = `permission:${live.id}:${item.request}`;
+        wanted.push([key, item.title, () => permissionView(live, item)]);
       }
     }
     // Reviewers' runs show inside the run they review, and follow-ups inside the run they
@@ -226,10 +230,11 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
     return { button, label };
   }
 
-  function permissionView(request) {
+  // Run `run`'s permission request `request`, with a button per option.
+  function permissionView(run, request) {
     const card = el("div", "permission open");
     card.append(
-      el("div", "permission-label", "Permission needed"),
+      el("div", "permission-label", `Permission needed · ${run.id}`),
       el("div", "permission-title", request.title),
     );
     const keys = permissionKeys(request.options);
@@ -241,7 +246,7 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl, onError }) 
       button.append(option.name);
       const key = keyFor(keys, option.id);
       if (key) button.append(el("kbd", "", key));
-      button.addEventListener("click", () => store.answer(request, option.id));
+      button.addEventListener("click", () => store.answer(run.id, request.request, option.id));
       buttons.append(button);
     }
     card.append(buttons);

@@ -149,6 +149,13 @@ fn post(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
     call(site, Method::POST, uri, body)
 }
 
+/// Stops the window's latest run, as its card's Stop does.
+fn stop(site: &Site) -> (StatusCode, String) {
+    let id = get_json(site, RUN)["id"].as_str().unwrap().to_owned();
+    let body = serde_json::json!({ "run": id }).to_string();
+    post(site, &format!("{RUN}/cancel"), &body)
+}
+
 fn put(site: &Site, uri: &str, body: &str) -> (StatusCode, String) {
     call(site, Method::PUT, uri, body)
 }

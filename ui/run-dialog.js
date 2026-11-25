@@ -7,6 +7,7 @@ import { diffView, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
+import { MAX_LIVE } from "./run-store.js";
 import {
   elapsed,
   foldRun,
@@ -81,6 +82,23 @@ export function runDialog({
     }
   }
 
+  // The run of the thread that starts at run `root` under way in this window, a stage of its
+  // review included; undefined when none is. One at a time per thread (src/run.rs), which
+  // `GET api/runs` names for each.
+  function liveOf(root) {
+    return store.liveRuns().find((run) => store.liveThread(run.id) === root);
+  }
+
+  // Why a follow-up or a review of the thread that starts at run `root` cannot start now, or
+  // "" when it can: one of its runs is under way, or as many runs as a repository may have.
+  function busyThread(root) {
+    if (liveOf(root)) return "Wait for the run under way, or stop it.";
+    if (store.liveRuns().length >= MAX_LIVE) {
+      return "Three agents are already working: wait for one to end, or stop one.";
+    }
+    return "";
+  }
+
   // A run deleted while its dialog is open closes the dialog.
   function closeIfGone(list) {
     if (detail && !list.includes(detail.id)) detailEl.close();
@@ -104,7 +122,15 @@ export function runDialog({
       // A reviewer's run belongs to the thread of the run it reviews, shown there.
       const record = root.review ? null : store.thread(root.id);
       const shown = [notes, reviewKey(review), reviewers(), record ?? null];
-      stamp = [`run:${root.id}`, threadKey(thread), JSON.stringify(shown), isLive(store.run())];
+      const live = root.review ? (isLive(root) ? root : undefined) : liveOf(root.id);
+      const liveKey = `${live?.id}:${live?.status}`;
+      stamp = [
+        `run:${root.id}`,
+        threadKey(thread),
+        JSON.stringify(shown),
+        liveKey,
+        busyThread(root.id),
+      ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, store.knownViews());
@@ -269,6 +295,17 @@ export function runDialog({
         ? `${view.id} · ${view.agent}`
         : `${view.id} to ${latest.id} · ${view.agent}`;
     const actions = [];
+    // Stops the thread's run under way. A second Stop from 3 s after the first ends an agent
+    // that did not stop (src/run.rs, "Stopping"); sooner, it is the same request.
+    const live = view.review ? (isLive(view) ? view : undefined) : liveOf(view.id);
+    if (live) {
+      const stopping = live.status === "cancelling";
+      const button = el("button", "button stop", stopping ? "Force stop" : "Stop");
+      button.type = "button";
+      button.title = `Stop ${live.id}`;
+      button.addEventListener("click", () => store.stop(live.id));
+      actions.push(button);
+    }
     // A run logged before snapshots has no changes view.
     if (view.entries.some((entry) => entry.kind === "snapshot")) {
       const button = el("button", "button run-detail-changes", "Changes");
@@ -413,12 +450,12 @@ export function runDialog({
       let held = "";
       const update = (next) => {
         target = next;
-        const busy = isLive(store.run());
+        const busy = busyThread(root.id);
         input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
         button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
-        button.disabled = busy || sending;
+        button.disabled = busy !== "" || sending;
         // The held message wins: it says why the page did not end, which the engineer asked for.
-        why.textContent = held || (busy ? "Wait for the run under way, or stop it." : "");
+        why.textContent = held || busy;
         why.classList.toggle("failed", held !== "");
       };
       const hasDraft = () => input.value.trim() !== "";
@@ -481,7 +518,7 @@ export function runDialog({
     const part = reviewSection(review ? `Review · ${review.findings.length} found` : "Review", {
       reviewed: Boolean(review),
       names: reviewers(),
-      busy: isLive(store.run()) || isLive(view),
+      busy: busyThread(view.id) !== "" || isLive(view),
       start: () => store.startReview(view.id),
       hintClass: "run-detail-text muted",
     });
@@ -697,7 +734,7 @@ export function runDialog({
     ];
   }
 
-  return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft };
+  return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft, busyThread };
 }
 
 // The run's steps in order, each with its index among the run's items and its key: every

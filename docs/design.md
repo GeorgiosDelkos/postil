@@ -368,22 +368,27 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 | `GET /api/run/preview?notes=N1,N2` | The prompt's text, exactly as the agent receives it. |
 | `POST /api/run` `{notes, agent?}` | Starts a run with the notes, in that order; the agent is the settings' one unless named. |
 | `GET /api/run?after=N` | The latest run, with its entries from number `N` on, and its notes and prompt only when `N` is 0: they never change; `null` when there is none. |
-| `GET /api/run?id=R2` | One run, whole: this window's when it is that one, else read from its log. |
-| `GET /api/runs` | The ids of the runs on disk, newest first. |
-| `POST /api/run/permission` `{request, option}` | Answers a permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
-| `POST /api/run/question` `{request, content}` | Answers a question with the form's values, or skips it (`content` `null`). |
-| `POST /api/run/cancel` | Cancels the run; open permission requests are answered `cancelled`. |
+| `GET /api/run?id=R2&after=N` | One run: this window's when it is one of its threads' latest, else read from its log; `after` as above, 0 when left out. |
+| `GET /api/runs` | `{runs, live}`: the ids of the runs on disk, newest first, and this window's runs under way, oldest first, each `{id, thread}`. |
+| `POST /api/run/permission` `{run, request, option}` | Answers run `run`'s permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
+| `POST /api/run/question` `{run, request, content}` | Answers run `run`'s question with the form's values, or skips it (`content` `null`). |
+| `POST /api/run/cancel` `{run}` | Cancels run `run`; open permission requests are answered `cancelled`. |
 
-- **The agent is kept between the runs of a thread**, with its session, so a follow-up
+- **Each thread keeps its agent between its runs**, with its session, so a follow-up
   reaches the same conversation: the owner chose this on 2026-11-23 over a fresh agent per
-  send. It is replaced when a run names another agent or command, and stopped when the project
-  closes, the agent exits, a turn fails (its session may be broken), or its thread ends. A
-  send starts a new thread in a new worktree (section "Worktrees"), so it always starts a
-  fresh agent, since 2026-11-24.
-- **One run at a time** per working tree: a send during a run is refused (409), and a live
-  run holds an exclusive lock on `runs/active.lock`, so another window on the same working
-  tree is refused too. Milestone 6 moves the rule to each thread, with a lock of its own, and
-  holds `runs/active.lock` only to take a run number (section "Worktrees").
+  send. It is replaced when a run names another agent or command, let go when the window
+  needs its place (section "Worktrees", "Threads"), and stopped when the project closes, the
+  agent exits, a turn fails (its session may be broken), or its thread ends. A send starts a
+  new thread in a new worktree, with a fresh agent.
+- **One run at a time per thread**, threads side by side: a follow-up or a review while the
+  thread's run goes on is refused (409), and a live run holds an exclusive lock on its
+  thread's `threads/<id>.lock`, so another window is refused there too. At most 3 runs are
+  live in a repository (section "Worktrees", "Keeping the disk in bounds"). A send of a note
+  that a run of this window under way carries is refused (400): notes are marked sent only
+  once the agent takes the turn, so the note still reads as open while its agent starts.
+  Another window does not know this window's runs, and can still send such a note in those
+  seconds: accepted, as two windows on one working tree are rare and the lock files carry no
+  notes.
 - **Stop** asks the agent to cancel (`session/cancel`), and answers its open permission
   requests `cancelled`, as well as any that arrive until the turn ends. An agent that is
   still starting is killed instead, and the run ends at once. A second Stop from 3 s after
@@ -551,10 +556,10 @@ request.
 
 Built (`src/thread.rs`, `src/clone.rs`): a worktree and a branch per thread, the record,
 commits as snapshots, the cloned build folders, Apply and Discard, and finishing deletes left
-in a repository's trash when it opens. Still one run at a time per repository, with one kept
-agent per window. Not built yet,
-and marked so below: a runner per thread with its locks, the warning about uncommitted
-changes, sparse-checkout patterns, the startup sweep and the disk bounds, and pull requests.
+in a repository's trash when it opens; a runner per thread with its locks, and the cap of 3
+live runs. Not built yet, and marked so below: `git worktree lock`, the warning about
+uncommitted changes, sparse-checkout patterns, the startup sweep and the other disk bounds,
+and pull requests.
 
 #### Threads
 
@@ -564,19 +569,28 @@ changes, sparse-checkout patterns, the startup sweep and the disk bounds, and pu
   as section "Runs" describes for one. The session's `cwd` (`session/new`), the prompt's
   `resource_link`s, and the paths in the run log are all in the thread's worktree, never in
   the engineer's working tree. A follow-up or a review stage uses only its thread's agent.
-  Built so far: the worktree as `cwd`, the links and the log's paths. The window still holds
-  one agent, kept for a follow-up of the run it ran; a send, which starts a new thread,
-  starts a fresh agent.
+  A window keeps at most 3 agents, running or idle: before a fresh one starts, the idle one
+  used least recently goes, and its thread's next follow-up tells a fresh agent the thread
+  (section "Follow-ups"). An idle agent is a process of a few hundred MB kept only for that
+  follow-up. A busy thread keeps its agent, so a review between two stages, busy with no
+  run, can leave a window one agent over until a later launch.
 - **Locks.** Run logs, notes, and the run-number counter stay in the project's git dir.
-  `runs/active.lock` is held only while a run number is taken. One run at a time per thread
-  is a lock of its own, `threads/r<n>.lock`, held for the run, plus `git worktree lock`, so
-  no cleanup removes a live worktree. `threads.lock` serializes, across windows, everything
-  that makes, ends, or evicts a worktree, and the count of live agents. Built so far:
-  `threads.lock` around every change to the record; `runs/active.lock` is still held for the
-  whole run, which keeps one run at a time per repository, and ending a thread or forgetting
-  it with its last note holds it too, so no window's agent works in a worktree being freed.
-  The window marks a worktree its start thread is still making, and counts it as a run under
-  way: no commit, run or ending touches a half-made checkout.
+  `runs/active.lock` is held only while a run is created: taking its number, counting the
+  live runs, and taking its thread's lock are one step across windows, so two windows never
+  both see a place under the cap. One run at a time per thread is a lock of its own,
+  `<git dir>/postil/threads/R<n>.lock`, held for the run; a lock held is a live run, which
+  the count reads by trying each one. Ending a thread, or forgetting it with its last note,
+  holds its lock, so no window's agent works in a worktree being freed; another window's run
+  there refuses the ending (409) and keeps a forgotten thread for the next delete. An ending
+  counts as a live run while it lasts (seconds for an Apply on a large repository), which a
+  count in another window can read: accepted, since telling the two apart would read the
+  record under `runs/active.lock`. A count at the cap is taken again for up to 200 ms
+  before it refuses, because a lock released a moment ago stays held in a process this one
+  forked until it runs its program. `threads.lock`
+  serializes, across windows, every change to the record. The window marks a
+  worktree its start thread is still making, and counts it as a run under way: no commit,
+  run or ending touches a half-made checkout. `git worktree lock`, so no cleanup removes a
+  live worktree, comes with the startup sweep that unlocks it (not built yet).
 - **The record** is `<git dir>/postil/threads.json` (version 1), one entry per thread: `id`,
   its first run; `path`, the worktree's absolute path; `branch`; `fork`, the commit it starts
   from; `base`, the branch `HEAD` was on at send; `tip`, the last commit Postil made or found,
@@ -756,19 +770,25 @@ worktree record of this repository; Postil writes those pointers absolute
 
 #### Keeping the disk in bounds
 
-Not built yet, except finishing the deletes left in a repository's trash when it opens.
+Not built yet, except finishing the deletes left in a repository's trash when it opens, and
+the cap on live runs.
 
 - **On start,** under `threads.lock`: a worktree whose thread lock is free is unlocked
   (`git worktree unlock`), since a crash leaves git's lock behind; worktrees under Postil's
   folders that no record names are removed if they pass the safety check, and kept and
   listed otherwise; `git worktree prune` drops entries whose folder is gone; and deletes left
   in `~/.postil/trash/` are finished.
-- **At most 3 live agents** per repository, counted across windows. A send beyond that is
-  refused (409) with the live threads named: a send that waited would hold the one request
+- **At most 3 live runs** per repository, counted across windows (built): the thread locks
+  held (section "Threads", "Locks"). A send, follow-up or review beyond that is refused (409)
+  with the live threads named, and the page offers no Send while its own window runs 3: a
+  send that waited would hold the one request
   thread (`shell.rs`), and with it the answer or the Stop that would free a place.
   Arbitrary: the engineer reads every result, and more at once is more than one person
-  follows. This bounds agent processes, a few hundred MB each; the builds they start can use
-  several GB of memory and disk each, which the cap does not bound.
+  follows. This bounds the agents at work, a few hundred MB each; idle agents are bounded per
+  window (section "Threads"), and the builds agents start can use several GB of memory and
+  disk each, which nothing bounds. A review's next stage counts when it starts: a send in
+  this window or another can take the place between two stages, and another window the
+  thread, and the review then stops, its last stage saying why.
 - **At most 15 worktrees** per repository, Codex's default; Cursor keeps 20. One Codex report
   found 61 worktrees holding about 100 GB.
 - **A free-space floor of 20 GB** on the worktrees' volume, read as
@@ -801,14 +821,20 @@ A card opens the run's dialog, which holds everything about it: the plan, one ca
 and output, with the arrow keys or ‹ › to move between steps and the run's id to go back),
 and the agent's whole reply. Nothing of a run but its card is in the tab: the owner asked on
 2026-11-23 for the steps and the reply to live in each run's dialog. What needs an answer
-now is the exception, above the runs: a card for the agent's open question, which opens the
-run's dialog with the question at its top (the note's dialog shows it too), and a permission
-request Postil could not answer. The tray header
-shows the latest run's status, its time and Stop while it runs.
+now is the exception, above the runs, for every run under way: a card for an agent's open
+question, which opens the run's dialog with the question at its top (the note's dialog shows
+it too), and a permission request Postil could not answer, named with its run. The tray
+header shows the latest run's status, its time and Stop while it runs; Escape stops that
+run, never one the header does not show. A thread's dialog has a Stop of its own while one
+of its runs goes on, so a run that is no longer the latest stops from there.
 
-Older runs are read once each by id and kept in the panel, which the notes' statuses read
-too (`byId`): a finished run does not change. The dialog is drawn again only when what it
-shows changes, so it keeps its scroll while the run streams.
+The panel follows the latest run and the window's other runs under way (`GET /api/runs`
+names them, each with its thread), each fetched from the entries it has not seen. A note's
+status comes from whichever of them carries it, and the send step leaves out the notes a run
+under way carries but has not marked sent yet. Older runs are read once each by
+id and kept, which the notes' statuses read too (`byId`): a finished run does not change.
+The dialog is drawn again only when what it shows changes, so it keeps its scroll while the
+run streams.
 
 ### Agents
 

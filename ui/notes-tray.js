@@ -9,7 +9,7 @@
 
 import { $, actOnSecondClick, el, showToast, statusIcon } from "./dom.js";
 import { fullPlace, shortPlace } from "./note-place.js";
-import { isLive, isOpen, isResolved, promptLines, sendable } from "./run.js";
+import { isOpen, isResolved, promptLines, sendable } from "./run.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
 // `state` is the page's state: the tray reads `notes`, `settings` and `projectOpen`, and keeps
@@ -66,26 +66,26 @@ export function notesTray({
       return;
     }
 
-    const live = runs.run();
+    const live = runs.liveRuns();
     const cards = new Map(state.notes.map((note) => [note.id, cardOf(note)]));
     const key = JSON.stringify([
       ...cards.values(),
-      live?.id,
-      live?.status,
-      live && planProgress(live),
+      ...live.map((run) => [run.id, run.status, planProgress(run)]),
     ]);
     if (key === drawnNotes) return;
     drawnNotes = key;
 
     const groups = groupNotes(state.notes, (note) => cards.get(note.id).status);
     const parts = [];
-    if (groups.inRun.length && isLive(live)) {
-      const progress = planProgress(live);
+    if (groups.inRun.length && live.length) {
+      // One run says how far it is; several, side by side, name themselves.
+      const progress = live.length === 1 ? planProgress(live[0]) : null;
+      const title =
+        live.length === 1
+          ? `In ${live[0].id} · ${live[0].agent}`
+          : `In ${live.map((run) => run.id).join(", ")}`;
       parts.push(
-        groupHeader(
-          `In ${live.id} · ${live.agent}`,
-          progress ? `${progress.done} of ${progress.total} steps` : "",
-        ),
+        groupHeader(title, progress ? `${progress.done} of ${progress.total} steps` : ""),
         ...groups.inRun.map((note) => noteItem(note, cards.get(note.id))),
       );
     }
@@ -112,7 +112,7 @@ export function notesTray({
 
   // The run a note's status comes from, or null (status.js, `runOf`).
   function runFor(note) {
-    return runOf(note, { get: (id) => runs.byId(id) }, runs.run());
+    return runOf(note, { get: (id) => runs.byId(id) }, runs.liveRuns());
   }
 
   // Everything a note's card shows, as plain data: two cards with equal data look the same. A
@@ -129,15 +129,16 @@ export function notesTray({
       body: note.body,
       outdated: note.anchor === "lost",
       status,
-      sendable: canSendAlone() && !isResolved(note),
+      sendable: canSendAlone() && !isResolved(note) && !inLiveRun(note),
     };
   }
 
-  // Whether the arrow on a card sends its note now: no run under way. A note whose lines moved
-  // can be sent too: the prompt quotes the lines as they were (src/notes.rs, `prompt`), and an
-  // agent's edit is the usual reason they moved.
+  // Whether the arrow on a card sends its note now: fewer runs under way than a repository may
+  // have (run-store.js, `MAX_LIVE`). A note whose lines moved can be sent too: the prompt
+  // quotes the lines as they were (src/notes.rs, `prompt`), and an agent's edit is the usual
+  // reason they moved.
   function canSendAlone() {
-    return !runs.live();
+    return !runs.full();
   }
 
   function groupHeader(left, right) {
@@ -246,7 +247,7 @@ export function notesTray({
     const shown =
       state.projectOpen &&
       state.tab === "notes" &&
-      !runs.live() &&
+      !runs.full() &&
       (state.send !== null || open > 0);
     sendBarEl.hidden = !shown;
     if (!shown) return;
@@ -274,12 +275,25 @@ export function notesTray({
     const pill = $("focus-pill");
     const open = state.notes.filter(isOpen).length;
     pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
-    if (open > 0 && !runs.live()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
-    pill.disabled = open === 0 || runs.live();
+    if (open > 0 && !runs.full()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
+    pill.disabled = open === 0 || runs.full();
   }
 
-  // Opens the send step with `ids` ticked: the open notes, or the one note of a Shift-click.
-  function openSend(ids = sendable(state.notes)) {
+  // Whether a run of this window under way carries `note`. A note is marked sent only once
+  // its agent takes the turn, so until then it reads as open; sending it again would put it in
+  // two threads at once, which the Rust process refuses.
+  function inLiveRun(note) {
+    return runs.liveRuns().some((run) => !run.review && run.notes.includes(note.id));
+  }
+
+  // The ids of the notes a send takes now (`sendable`), those in a run under way left out.
+  function sendableNow() {
+    return sendable(state.notes.filter((note) => !inLiveRun(note)));
+  }
+
+  // Opens the send step with `ids` ticked: the open notes not in a run under way, or the one
+  // note of a Shift-click.
+  function openSend(ids = sendableNow()) {
     if (!beforeSend()) return;
     state.send = { ticked: new Set(ids), agent: null, sending: false };
     showTab("notes");
@@ -436,6 +450,7 @@ export function notesTray({
     cardOf,
     noteCard,
     canSendAlone,
+    inLiveRun,
     openSend,
     closeSend,
     sendNotes,

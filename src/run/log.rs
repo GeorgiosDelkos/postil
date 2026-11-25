@@ -42,10 +42,36 @@ use crate::files::version_of;
 use crate::review::{Diff, Finding, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 
-/// How long a send waits for the run lock before it reports another window's run
-/// ([`take_run_lock`]). Arbitrary: far longer than a fork-to-exec window, short enough that a
-/// refused send answers at once.
+/// How long a send waits for the run lock or a thread's lock before it reports another
+/// window's run ([`take_lock`]). Arbitrary: far longer than a fork-to-exec window, short
+/// enough that a refused send answers at once.
 const LOCK_PATIENCE: Duration = Duration::from_millis(200);
+
+/// The most runs live at once in one repository, across windows (docs/design.md, "Keeping
+/// the disk in bounds"). Arbitrary: the engineer reads every result, and more at once is more
+/// than one person follows.
+pub(super) const MAX_LIVE: usize = 3;
+
+/// What a new run's header says before the run has an id, which [`Run::create`] gives it.
+#[derive(Debug)]
+pub(super) struct Opening<'a> {
+    /// The agent's name, as the settings give it.
+    pub(super) agent: &'a str,
+    /// The notes the run carries: it goes with the last of them.
+    pub(super) notes: &'a [String],
+    /// The prompt's text, as the agent receives it.
+    pub(super) prompt: &'a str,
+    pub(super) origin: Origin,
+}
+
+/// The thread a new run works in, whose lock it holds while live.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum InThread<'a> {
+    /// A new thread, whose id is the run's own.
+    New,
+    /// The open thread of this id.
+    Open(&'a str),
+}
 
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
@@ -64,10 +90,10 @@ pub(super) struct RunState {
     entries: Vec<Entry>,
     /// The log, open for appending while live; `None` after it ended or a write failed.
     log: Option<File>,
-    /// The exclusive lock on `runs/active.lock`, held from the run's creation until it ends:
-    /// whether it is held is whether the run is live (`RunState::live`). A log read from disk
-    /// has none. The file's text is the highest run number given (`last_run`).
-    active: Option<File>,
+    /// The exclusive lock on its thread's `threads/<id>.lock` ([`hold_thread_lock`]), held
+    /// from the run's creation until it ends: whether it is held is whether the run is live
+    /// (`RunState::live`). A log read from disk has none.
+    lock: Option<File>,
     // Kept as each entry is recorded, so a status needs no scan of the entries.
     pub(super) started: bool,
     cancel_requested: bool,
@@ -324,21 +350,50 @@ pub(crate) struct RunView {
 }
 
 impl Run {
-    /// Creates the log for a new run in `dir`, with the next free id, takes the working
-    /// tree's run lock, and writes the header.
-    pub(super) fn create(
-        dir: &Path,
-        agent: &str,
-        notes: &[String],
-        prompt: &str,
-        origin: Origin,
-    ) -> Result<Self> {
+    /// Creates the log for a new run in `dir`, with the next free id, takes the lock of the
+    /// run's thread, `thread`, and writes the header. `runs/active.lock` is held only for
+    /// this: it makes taking a number, counting the live runs and taking a thread's lock one
+    /// step across windows, so no two windows both see a place under [`MAX_LIVE`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RunElsewhere`] when another window's run works in the thread, or another
+    /// window holds a lock this takes past [`LOCK_PATIENCE`]; [`Error::TooManyRuns`] when
+    /// [`MAX_LIVE`] runs are live in the repository; [`Error::BadRequest`] for a thread id
+    /// that is not a run's; [`Error::ReadRun`] when the thread locks cannot be listed or
+    /// opened; and [`Error::WriteRun`] when a file cannot be written.
+    pub(super) fn create(dir: &Path, opening: Opening<'_>, thread: InThread<'_>) -> Result<Self> {
+        let Opening {
+            agent,
+            notes,
+            prompt,
+            origin,
+        } = opening;
         let error = |path: &Path| {
             let path = path.to_owned();
             move |source| Error::WriteRun { path, source }
         };
         let active_path = dir.join("active.lock");
         let mut active = hold_run_lock(dir)?;
+        let own = match thread {
+            InThread::Open(id) => Some(id),
+            InThread::New => None,
+        };
+        let lock = own.map(|id| hold_thread_lock(dir, id)).transpose()?;
+        // A lock released a moment ago can still look held ([`take_lock`]): a count at the cap
+        // is taken again until it is under it, for up to [`LOCK_PATIENCE`] in all, which only
+        // a send about to be refused waits.
+        let deadline = Instant::now() + LOCK_PATIENCE;
+        let live = loop {
+            let live = live_threads(dir, own)?;
+            if live.len() < MAX_LIVE || Instant::now() >= deadline {
+                break live;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        if live.len() >= MAX_LIVE {
+            return Err(Error::TooManyRuns { live });
+        }
 
         // A deleted run's number is not given again (`last_run`): a page that read the old R5
         // would show a new R5 as the old one.
@@ -382,9 +437,16 @@ impl Run {
                 source,
             });
         }
+        // A new thread's id is its first run's, unused until now, so its lock is free.
+        let lock = match lock {
+            Some(lock) => lock,
+            None => hold_thread_lock(dir, &header.id).inspect_err(|_| {
+                drop(fs::remove_file(&file));
+            })?,
+        };
         Ok(Self {
             file,
-            state: Mutex::new(RunState::new(header, Some(log), Some(active))),
+            state: Mutex::new(RunState::new(header, Some(log), Some(lock))),
         })
     }
 
@@ -608,12 +670,12 @@ impl fmt::Debug for Run {
 }
 
 impl RunState {
-    fn new(header: Header, log: Option<File>, active: Option<File>) -> Self {
+    fn new(header: Header, log: Option<File>, lock: Option<File>) -> Self {
         Self {
             header,
             entries: Vec::new(),
             log,
-            active,
+            lock,
             started: false,
             cancel_requested: false,
             cancel_asked: None,
@@ -698,7 +760,7 @@ impl RunState {
 
     /// Whether this process runs the run and it has not ended.
     pub(super) fn live(&self) -> bool {
-        self.active.is_some()
+        self.lock.is_some()
     }
 
     /// Keeps the fields that sum up the entries current with one more.
@@ -719,8 +781,8 @@ impl RunState {
                     Status::Failed
                 });
                 self.log = None;
-                // Another window may start a run now.
-                self.active = None;
+                // Another window may start a run in the thread now, or end it.
+                self.lock = None;
             }
             Entry::Message { .. }
             | Entry::Thought { .. }
@@ -762,16 +824,14 @@ impl RunState {
 }
 
 /// Opens `runs/active.lock` in the runs directory `dir`, making both when missing, and takes
-/// its exclusive lock, held until the returned file is dropped. A run holds it while live;
-/// ending or forgetting a thread holds it so that no run, in any window, works in the
-/// worktree meanwhile. This window's own live run holds it too, through another open file,
-/// so it refuses then as well.
+/// its exclusive lock, held until the returned file is dropped. [`Run::create`] holds it while
+/// it takes a run number and its thread's lock, milliseconds.
 ///
 /// # Errors
 ///
-/// [`Error::RunElsewhere`] while a run holds it, and [`Error::WriteRun`] when the file cannot
-/// be made or locked.
-pub(super) fn hold_run_lock(dir: &Path) -> Result<File> {
+/// [`Error::RunElsewhere`] while another window holds it past [`LOCK_PATIENCE`], and
+/// [`Error::WriteRun`] when the file cannot be made or locked.
+fn hold_run_lock(dir: &Path) -> Result<File> {
     let error = |path: &Path| {
         let path = path.to_owned();
         move |source| Error::WriteRun { path, source }
@@ -785,7 +845,7 @@ pub(super) fn hold_run_lock(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(&active_path)
         .map_err(error(&active_path))?;
-    take_run_lock(&active).map_err(|source| match source {
+    take_lock(&active).map_err(|source| match source {
         TryLockError::WouldBlock => Error::RunElsewhere,
         TryLockError::Error(source) => Error::WriteRun {
             path: active_path.clone(),
@@ -795,17 +855,130 @@ pub(super) fn hold_run_lock(dir: &Path) -> Result<File> {
     Ok(active)
 }
 
-/// Takes the exclusive lock on `runs/active.lock`, or reports that another window holds it.
+/// Opens the lock file of thread `id`, `threads/<id>.lock` beside the runs directory `dir`,
+/// making both when missing, and takes its exclusive lock, held until the returned file is
+/// dropped. A live run holds it ([`Run::create`]); ending or forgetting the thread holds it so
+/// that no run, in any window, works in the worktree meanwhile. This window's own live run in
+/// the thread holds it too, through another open file, so it refuses then as well.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] for an id that is not a run's (the record's ids can be edited by
+/// hand, and this one names a file); [`Error::RunElsewhere`] while a run holds it; and
+/// [`Error::WriteRun`] when the file cannot be made or locked.
+pub(super) fn hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
+    if run_number(id).is_none() {
+        return Err(Error::BadRequest(format!(
+            "thread id {id:?}: expected R and a number"
+        )));
+    }
+    let threads = threads_dir(dir);
+    fs::create_dir_all(&threads).map_err(|source| Error::WriteRun {
+        path: threads.clone(),
+        source,
+    })?;
+    let path = threads.join(format!("{id}.lock"));
+    let file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| Error::WriteRun {
+            path: path.clone(),
+            source,
+        })?;
+    take_lock(&file).map_err(|source| match source {
+        TryLockError::WouldBlock => Error::RunElsewhere,
+        TryLockError::Error(source) => Error::WriteRun { path, source },
+    })?;
+    Ok(file)
+}
+
+/// Deletes thread `id`'s lock file, once no run will work in the thread again: it was
+/// forgotten, or never made it into the record. The caller holds its lock, so no window can
+/// lock the file being removed. Another window's count that lists the file as it goes reads it
+/// as free ([`live_threads`]).
+pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
+    if run_number(id).is_some() {
+        // A file left behind is an empty file that locks nothing; nothing reads it.
+        drop(fs::remove_file(threads_dir(dir).join(format!("{id}.lock"))));
+    }
+}
+
+/// The ids of the threads whose lock a run holds now, in any window, `except` the one the
+/// caller holds; sorted. Each lock is only tried, never waited for, so a lock released a moment
+/// ago can read as held ([`Run::create`] counts again). Every count runs under
+/// [`hold_run_lock`], so no other count holds a lock for a moment meanwhile. Ending or
+/// forgetting a thread holds its lock too, and reads as a live run while it lasts: seconds for
+/// an Apply on a large repository.
+fn live_threads(dir: &Path, except: Option<&str>) -> Result<Vec<String>> {
+    let threads = threads_dir(dir);
+    let entries = match fs::read_dir(&threads) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(Error::ReadRun {
+                path: threads,
+                source,
+            });
+        }
+    };
+    let mut live = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::ReadRun {
+            path: threads.clone(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".lock")) else {
+            continue;
+        };
+        if run_number(id).is_none() || Some(id) == except {
+            continue;
+        }
+        let file = match File::open(entry.path()) {
+            Ok(file) => file,
+            // Removed since the listing ([`remove_thread_lock`]): no run holds it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::ReadRun {
+                    path: entry.path(),
+                    source,
+                });
+            }
+        };
+        match file.try_lock() {
+            // Dropping the file releases the lock it took.
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => live.push(id.to_owned()),
+            Err(TryLockError::Error(source)) => {
+                return Err(Error::ReadRun {
+                    path: entry.path(),
+                    source,
+                });
+            }
+        }
+    }
+    live.sort_by_key(|id| run_number(id));
+    Ok(live)
+}
+
+/// `<git dir>/postil/threads`, beside the runs directory `dir`: one lock file per thread.
+fn threads_dir(dir: &Path) -> PathBuf {
+    dir.with_file_name("threads")
+}
+
+/// Takes the exclusive lock on `file`, or reports that another holds it.
 ///
 /// A `flock` lock belongs to the open file, and a process this app forks (git, an agent)
 /// holds a copy of every open file from its fork until its exec closes them. A lock released
 /// a moment ago can so look held for microseconds, which a send right after a run ends hit in
 /// the tests. The lock is therefore tried for up to [`LOCK_PATIENCE`]; a window that really
 /// runs an agent holds it far longer.
-fn take_run_lock(active: &File) -> std::result::Result<(), TryLockError> {
+fn take_lock(file: &File) -> std::result::Result<(), TryLockError> {
     let deadline = Instant::now() + LOCK_PATIENCE;
     loop {
-        match active.try_lock() {
+        match file.try_lock() {
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -998,18 +1171,24 @@ fn json_line<T: Serialize>(value: &T) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A run of note N1 by agent "Fake", in a new thread, in the runs directory `dir`.
+    fn create(dir: &Path, prompt: &str) -> Run {
+        let opening = Opening {
+            agent: "Fake",
+            notes: &["N1".to_owned()],
+            prompt,
+            origin: Origin::Notes,
+        };
+        Run::create(dir, opening, InThread::New).unwrap()
+    }
+
     #[test]
     fn debug_output_names_the_run_but_never_shows_its_prompt() {
-        let dir = std::env::temp_dir().join(format!("postil-run-debug-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("postil-run-debug-{}", std::process::id()))
+            .join("runs");
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(
-            &dir,
-            "Fake",
-            &["N1".to_owned()],
-            "secret prompt",
-            Origin::Notes,
-        )
-        .unwrap();
+        let run = create(&dir, "secret prompt");
         run.record(Entry::Thought {
             text: "secret thought".to_owned(),
         });
@@ -1020,14 +1199,16 @@ mod tests {
         );
         assert!(!debug.contains("secret"), "{debug}");
         drop(run);
-        drop(fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(dir.parent().unwrap()));
     }
 
     #[test]
     fn after_a_failed_write_the_log_is_not_written_again_and_the_run_says_so() {
-        let dir = std::env::temp_dir().join(format!("postil-run-log-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("postil-run-log-{}", std::process::id()))
+            .join("runs");
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
+        let run = create(&dir, "p");
         let written = fs::read(&run.file).unwrap();
         // A log that refuses writes, as a full disk would.
         run.state().log = Some(File::open(&run.file).unwrap());
@@ -1053,14 +1234,16 @@ mod tests {
             "nothing was appended"
         );
         drop(state);
-        drop(fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(dir.parent().unwrap()));
     }
 
     #[test]
     fn the_work_holds_each_finished_call_s_last_diffs_and_the_reply_by_message() {
-        let dir = std::env::temp_dir().join(format!("postil-run-work-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("postil-run-work-{}", std::process::id()))
+            .join("runs");
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
+        let run = create(&dir, "p");
         let diff = |after: &str| Output::Diff {
             path: "a.rs".to_owned(),
             old_text: None,
@@ -1101,14 +1284,16 @@ mod tests {
         assert_eq!(afters, ["first", "second"], "the update reached t1 only");
         assert_eq!(work.reply, "one part\n\ntwo");
         drop(run);
-        drop(fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(dir.parent().unwrap()));
     }
 
     #[test]
     fn a_snapshot_point_is_recorded_once_and_only_while_the_run_is_live() {
-        let dir = std::env::temp_dir().join(format!("postil-run-snap-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("postil-run-snap-{}", std::process::id()))
+            .join("runs");
         fs::create_dir_all(&dir).unwrap();
-        let run = Run::create(&dir, "Fake", &["N1".to_owned()], "p", Origin::Notes).unwrap();
+        let run = create(&dir, "p");
         let points = |run: &Run| {
             run.state()
                 .entries
@@ -1127,6 +1312,6 @@ mod tests {
         run.record_snapshot(Point::Before, "b".to_owned());
         assert_eq!(points(&run), 1, "an ended run takes no snapshot");
         drop(run);
-        drop(fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(dir.parent().unwrap()));
     }
 }

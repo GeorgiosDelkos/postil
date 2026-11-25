@@ -23,11 +23,11 @@ import {
 // the note is gone; `canSend(note)` whether it can be sent now. The callbacks act on the note:
 // `showInCode(note)`, `send(note, { review })` (review: open the send step with it alone
 // ticked), `remove(note)`, `resolve(note)`, `reopen(note)`, `editNote(note, body)` (resolves
-// to whether the new text was saved), `showRun()`, and `answerQuestion(request, content)` for
-// the run's open question (`content` null to skip). `agent()` names the agent Send sends to, the
+// to whether the new text was saved), `showRun()`, and `answerQuestion(runId, request,
+// content)` for the run's open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
 // (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
-// `live()` says whether a run is under way.
+// `busy(runId)` says why a review of run `runId` cannot start now, or "" when it can.
 export function noteDialog(
   dialogEl,
   {
@@ -45,7 +45,7 @@ export function noteDialog(
     reviewOf,
     reviewers,
     startReview,
-    live,
+    busy,
   },
 ) {
   let shownId = null;
@@ -98,7 +98,12 @@ export function noteDialog(
     }
     const { note, run } = found;
     const review = run ? reviewOf(run.id) : null;
-    const key = noteDialogKey(note, run, review, [canSend(note), agent(), reviewers(), live()]);
+    const key = noteDialogKey(note, run, review, [
+      canSend(note),
+      agent(),
+      reviewers(),
+      run ? busy(run.id) : "",
+    ]);
     if (key === drawn) return;
     drawn = key;
     const same = shownId === scrolledId;
@@ -306,7 +311,7 @@ export function noteDialog(
     const part = reviewSection(title, {
       reviewed: Boolean(review),
       names,
-      busy: live(),
+      busy: busy(run.id) !== "",
       start: () => startReview(run.id),
       hintClass: "note-dialog-said muted",
     });
