@@ -659,6 +659,29 @@ test("a check is stale when an edit ended after it, by the order calls ended", (
   assert.equal(states(check, failedEdit)[0][2], "passed", "a failed edit changed nothing");
   const failedThenEdited = [ran("c1", "cargo test", { exit: 2 }), edited("e1")];
   assert.equal(states(check, failedThenEdited)[0][2], "failed", "failed wins over stale");
+  const deleted = [ran("c1", "cargo test"), { ...edited("e1"), tool: "delete" }];
+  assert.equal(states(check, deleted)[0][2], "stale", "a delete changes files too");
+  // The check ended before the edit; saying so again after it does not make it later.
+  const toldAgain = [
+    ran("c1", "cargo test"),
+    edited("e1"),
+    update("c1", { status: "completed" }),
+    ran("c1", "cargo test"),
+  ];
+  assert.equal(states(check, toldAgain)[0][2], "stale");
+  // Run again: under way, then ended after the edit.
+  const rerun = [
+    ...after,
+    update("c1", { status: "in_progress" }),
+    update("c1", { status: "completed" }),
+  ];
+  assert.equal(states(check, rerun)[0][2], "passed");
+  // The card ranks a stale check above one that had not ended.
+  const pending = [...after, ran("c2", "cargo build", { status: "pending" })];
+  const card = worstEvidence(
+    evidence(claims(["cargo build"], ["cargo test"]), foldRun(pending).items),
+  );
+  assert.equal(card, "stale");
 });
 
 test("with no report, the run's commands are listed with no claims", () => {

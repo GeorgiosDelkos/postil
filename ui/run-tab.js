@@ -108,6 +108,7 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
     for (const id of shown) {
       const view = store.byId(id);
       const latest = view ? (latests.get(id) ?? view) : null;
+      const checks = view ? checksOf(latest) : null;
       const sig = view
         ? JSON.stringify([
             latest.id,
@@ -115,10 +116,10 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
             view.agent,
             view.notes,
             statusWord(latest),
-            checksOf(latest),
+            checks,
           ])
         : (store.failure(id) ?? "loading");
-      wanted.push([`run:${id}`, sig, () => runCard(id, view, latest)]);
+      wanted.push([`run:${id}`, sig, () => runCard(id, view, latest, checks)]);
     }
 
     const next = new Map();
@@ -155,8 +156,9 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
   }
 
   // A run's card: its status, id, agent and notes, in one line. The status is its thread's
-  // latest run's, `latest`: the run itself, or its last follow-up.
-  function runCard(id, view, latest) {
+  // latest run's, `latest`: the run itself, or its last follow-up. `checks` is `latest`'s
+  // worst claimed check (`checksOf`), or null.
+  function runCard(id, view, latest, checks) {
     const button = el("button", "run-card run-entry");
     button.type = "button";
     if (!view) {
@@ -174,7 +176,6 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       el("span", "run-id", view.id),
       el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`),
     );
-    const checks = checksOf(latest);
     if (checks) {
       const mark = el("span", `run-evidence tool-state ${checks}`, CHECK_MARKS[checks]);
       mark.title = CHECK_TITLES[checks];

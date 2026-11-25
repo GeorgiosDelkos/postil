@@ -98,7 +98,10 @@ function foldMore(base, entries) {
   // A tool call's final status ends it; `endedAt` is the index of the entry that said so. The
   // items keep the order the calls started in, so this is the only record of the order they
   // ended in: an edit started before a check and finished after it makes the check stale.
-  const ended = (status, at) => (status === "completed" || status === "failed" ? at : null);
+  // A call that ended keeps the entry that first said so: one reported again, or completed a
+  // second time, after an edit must still read as stale. A status that is not final clears it.
+  const ended = (previous, status, at) =>
+    status === "completed" || status === "failed" ? (previous ?? at) : null;
   for (let at = base.entries.length; at < entries.length; at += 1) {
     const entry = entries[at];
     switch (entry.kind) {
@@ -109,6 +112,8 @@ function foldMore(base, entries) {
         append("thought", entry.text);
         break;
       case "tool": {
+        // An agent may report the same call twice; the second report replaces the first.
+        const known = tools.get(entry.id);
         const tool = {
           type: "tool",
           id: entry.id,
@@ -121,10 +126,8 @@ function foldMore(base, entries) {
           // before version 5 have neither (src/run/log.rs).
           command: entry.command ?? null,
           exit: entry.exit ?? null,
-          endedAt: ended(entry.status, at),
+          endedAt: ended(known === undefined ? null : items[known].endedAt, entry.status, at),
         };
-        // An agent may report the same call twice; the second report replaces the first.
-        const known = tools.get(entry.id);
         if (known === undefined) {
           tools.set(entry.id, items.length);
           items.push(tool);
@@ -152,7 +155,9 @@ function foldMore(base, entries) {
         for (const field of ["title", "tool", "status", "places", "output", "command", "exit"]) {
           if (entry[field] !== null && entry[field] !== undefined) tool[field] = entry[field];
         }
-        if (ended(entry.status, at) !== null) tool.endedAt = at;
+        if (entry.status !== null && entry.status !== undefined) {
+          tool.endedAt = ended(tool.endedAt, entry.status, at);
+        }
         break;
       }
       case "plan":
@@ -320,15 +325,28 @@ const EDITS = new Set(["edit", "delete", "move"]);
 export function evidence(report, items) {
   const calls = items.filter((item) => item.type === "tool");
   const runs = calls.filter((call) => call.tool === "execute");
-  const edits = calls.filter((call) => EDITS.has(call.tool) && call.status === "completed");
+  const lastEdit = Math.max(
+    -1,
+    ...calls
+      .filter((call) => EDITS.has(call.tool) && call.status === "completed")
+      .map((edit) => edit.endedAt ?? -1),
+  );
   const stateOf = (run) => {
     if (run.status === "failed" || (run.exit ?? 0) !== 0) return "failed";
     if (run.status !== "completed" || run.endedAt === null) return "unfinished";
-    return edits.some((edit) => edit.endedAt > run.endedAt) ? "stale" : "passed";
+    return lastEdit > run.endedAt ? "stale" : "passed";
   };
+  // The forms of each run's command a claim may match, made once: `evidence` runs on every
+  // redraw of the dialog and the card.
+  const forms = runs.map((run) =>
+    run.command === null || run.command === undefined
+      ? [spaced(run.title), spaced(run.title).replace(/^`(.*)`$/, "$1")]
+      : [spaced(run.command)],
+  );
   const claimed = new Set();
   const rows = (report?.checks ?? []).map((check) => {
-    const same = runs.filter((run) => ranAs(run, check.command));
+    const wanted = spaced(check.command);
+    const same = runs.filter((_, i) => forms[i].includes(wanted));
     for (const run of same) claimed.add(run);
     const item = same.at(-1) ?? null;
     const state = item ? stateOf(item) : "not-seen";
@@ -342,14 +360,6 @@ export function evidence(report, items) {
 }
 
 const spaced = (text) => text.trim().replace(/\s+/g, " ");
-
-// Whether execute call `run` ran `command`, as `evidence` matches a claim.
-function ranAs(run, command) {
-  const wanted = spaced(command);
-  if (run.command !== null && run.command !== undefined) return spaced(run.command) === wanted;
-  const title = spaced(run.title);
-  return title === wanted || title === `\`${wanted}\``;
-}
 
 // The evidence states from worst to best, as the run's card ranks them (owner, 2026-11-25).
 const WORST_FIRST = ["failed", "not-seen", "stale", "unfinished", "passed"];

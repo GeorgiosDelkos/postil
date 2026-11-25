@@ -162,6 +162,8 @@ export function runDialog({
       stamp = [
         `${view.id}:${detail.key}`,
         item.status,
+        // A non-zero exit fails a call its status calls completed (run.js, `toolRow`).
+        item.exit,
         item.output,
         item.text,
         answer,
@@ -507,12 +509,17 @@ export function runDialog({
 
   // One row of a turn's Checks: the command, and its state as the log has it.
   function checkCard(turn, { command, claim, state, item }) {
-    const said = claim !== null && claim !== state ? ` · the author says ${claim}` : "";
-    const label = `${CHECK_WORDS[state]}${said}`;
+    // Stale is a pass the author also calls passed: only a claim of another result disagrees.
+    const agrees = claim === null || claim === state || (claim === "passed" && state === "stale");
+    const said = agrees ? "" : ` · the author says ${claim}`;
+    const word = state === "unfinished" && isLive(turn) ? "running" : CHECK_WORDS[state];
+    const text = el("code", "run-card-text tool-target", command);
+    // The row cuts a long command short.
+    text.title = command;
     const parts = [
       el("span", "tool-verb", claim === null ? "ran" : "check"),
-      el("code", "run-card-text tool-target", command),
-      el("span", `tool-state ${state}`, label),
+      text,
+      el("span", `tool-state ${state}`, `${word}${said}`),
     ];
     if (!item) {
       const row = el("div", "run-card step run-check");
@@ -814,7 +821,7 @@ export function runDialog({
       return [detailHeader(null, "Question", `${view.id} · ${questionState(item)}`), body];
     }
     const row = toolRow(item, isLive(view));
-    const kind = item.status === "failed" ? "failed" : row.running ? "working" : "addressed";
+    const kind = row.state === "failed" ? "failed" : row.running ? "working" : "addressed";
     const actions = [];
     const path = item.places[0]?.path ?? item.output.find((part) => part.type === "diff")?.path;
     if (path) {

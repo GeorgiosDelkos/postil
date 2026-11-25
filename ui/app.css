@@ -1840,7 +1840,9 @@ button.repo-name:hover {
   text-align: left;
 }
 
-.run-card:hover,
+/* A button: a check the log never ran is a card that opens nothing. `:where` keeps the
+   specificity of `.run-card:hover`, so the tone rules after it still win. */
+:where(button).run-card:hover,
 .run-card:focus-visible {
   border-color: var(--border-strong);
   outline: none;
