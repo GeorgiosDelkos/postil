@@ -71,6 +71,16 @@ fn over_the_cap_an_idle_thread_is_evicted_and_its_follow_up_makes_it_again() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let run = wait_for_run(&site, &nudges, "R3");
     assert_eq!(run["status"], "ended", "{run}");
+    // Its changes view starts at the branch's commit the worktree was made at.
+    let tip = git_out(&first, &["rev-parse", "HEAD"]);
+    assert!(
+        run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["point"] == "before" && entry["tree"] == tip.as_str()),
+        "{run}"
+    );
     assert_eq!(thread(&site, "R1")["state"], "open");
     assert_eq!(thread(&site, "R2")["state"], "evicted");
     assert!(!second.exists());
@@ -169,6 +179,11 @@ fn short_of_space_an_idle_thread_loses_its_build_folders_then_its_worktree() {
     send_ended(&site, &nudges, "two", "R2");
 
     assert!(!built.exists());
+    let trash: Vec<_> = fs::read_dir(repo.home().join("trash"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(trash.is_empty(), "deleted, not only moved: {trash:?}");
     assert!(first.join("a.txt").is_file(), "the worktree stays");
     assert_eq!(thread(&site, "R1")["state"], "open");
 
