@@ -22,7 +22,7 @@ if [ -f "$dir/exists" ]; then
   exit 1
 fi
 case "$1 $2" in
-"pr create") cat > "$dir/body"; echo "https://github.com/owner/repo/pull/7" ;;
+"pr create") cat > "$dir/body"; echo "https://github.com/owner/repo/pull/7"; echo "https://docs.github.com/drafts" ;;
 "pr view") cat "$dir/state" 2>/dev/null || echo OPEN ;;
 esac
 "#;
@@ -142,6 +142,10 @@ fn open_pull_request_pushes_the_branch_and_opens_a_draft_into_the_base_branch() 
     assert!(
         !pr_body.contains("Address every note") && !pr_body.contains("> a"),
         "{pr_body}"
+    );
+    assert!(
+        !pr_body.contains("The notes go on"),
+        "nothing was cut: {pr_body}"
     );
     assert!(
         pr_body.ends_with("Opened from Postil thread R1."),
@@ -297,12 +301,25 @@ fn a_thread_cannot_be_ended_while_its_pull_request_is_being_opened() {
     let (status, body) = end(&site, "discard", "R1");
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("opening its pull request"), "{body}");
+    // The project is busy: opening another asks first.
+    let other = TempRepo::new("pull-held-other");
+    other.commit();
+    let (status, body) = post(
+        &site,
+        "postil://localhost/api/open",
+        &open_request(&other.root),
+    );
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     fs::remove_file(gh.join("hold")).unwrap();
     let record = settled(&site, &nudges, "R1");
     assert_eq!(record["pullRequest"]["state"], "open", "{record}");
     let (status, body) = end(&site, "discard", "R1");
     assert_eq!(status, StatusCode::OK, "{body}");
+    // Ended: no pull request is opened from it.
+    let (status, body) = ask(&site, "pr", "R1");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("no open thread R1"), "{body}");
 }
 
 #[test]
@@ -366,4 +383,17 @@ fn without_gh_the_thread_says_how_to_install_it() {
 
     let error = record["pullRequestWork"]["error"].as_str().unwrap();
     assert!(error.contains("brew install gh"), "{record}");
+}
+
+#[test]
+fn a_body_past_github_s_limit_is_cut_and_says_so() {
+    let (_repo, site, nudges, gh, _bare) = published("pull-long");
+    sent(&site, &nudges, &"x".repeat(61_000));
+
+    assert_eq!(ask(&site, "pr", "R1").0, StatusCode::OK);
+    settled(&site, &nudges, "R1");
+
+    let pr_body = fs::read_to_string(gh.join("body")).unwrap();
+    assert!(pr_body.chars().count() < 65_536, "{}", pr_body.len());
+    assert!(pr_body.contains("(The notes go on; the rest is in Postil.)"));
 }
