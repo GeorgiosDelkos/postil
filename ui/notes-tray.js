@@ -344,7 +344,35 @@ export function notesTray({
     const links = el("div", "prompt-links");
     links.append(el("span", "prompt-links-label", "Linked files"));
     for (const path of files) links.append(el("span", "prompt-link", path));
-    previewEl.replaceChildren(text, ...(files.length ? [links] : []));
+    const warning = uncommittedWarning(reply);
+    previewEl.replaceChildren(
+      ...(warning ? [warning] : []),
+      text,
+      ...(files.length ? [links] : []),
+    );
+  }
+
+  // What the send step says when the working tree has changes since the last commit: the
+  // thread starts from that commit and does not see them, and a noted file among them may not
+  // have the note's lines in the agent's copy (docs/design.md, "Threads"). Null when clean.
+  function uncommittedWarning(reply) {
+    if (!reply.uncommitted) return null;
+    const changes = reply.uncommitted === 1 ? "1 change" : `${reply.uncommitted} changes`;
+    const warning = el("div", "send-warning");
+    warning.append(
+      el(
+        "div",
+        "",
+        `Your working tree has ${changes} since the last commit. The thread starts from that commit and does not see them.`,
+      ),
+    );
+    if (reply.uncommittedNoted.length) {
+      const noted = reply.uncommittedNoted.join(", ");
+      warning.append(
+        el("div", "", `Changed among the noted files: ${noted}. Their notes' lines may not match.`),
+      );
+    }
+    return warning;
   }
 
   async function sendNotes() {

@@ -613,7 +613,10 @@ uncommitted changes, and sparse-checkout patterns.
   Code do: those edits would otherwise land in the pull request. The fork commit is `HEAD` at
   send. When the checkout has uncommitted changes, the send step says the thread starts from
   the last commit and does not see them; when a noted file is among them, it adds that the
-  note's lines may not match (not built yet). A repository with no commit cannot send (422),
+  note's lines may not match. The preview reply carries both: the count of changed paths
+  (`git status`, untracked files included, ignored ones not) and the linked files among them,
+  so the step names no file of the engineer's that it does not need to. A repository with no
+  commit cannot send (422),
   and the message says
   it needs one commit first. A detached `HEAD` sends too, with no base branch: the thread can
   be applied but not opened as a pull request.

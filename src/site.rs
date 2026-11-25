@@ -437,12 +437,18 @@ struct AnswerQuestion {
 
 /// The reply to `/api/run/preview`.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewView {
     /// The prompt's text, exactly as the agent will receive it.
     prompt: String,
     /// The files linked after the text, relative to the repository root. A folder note's
     /// folder is not among them (`notes::Prompt::files`).
     files: Vec<String>,
+    /// How many paths the engineer's working tree has changed since the last commit, which
+    /// the thread, started from that commit, does not see (docs/design.md, "Threads").
+    uncommitted: usize,
+    /// The linked files among them: their notes' lines may not match the agent's copy.
+    uncommitted_noted: Vec<String>,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
@@ -949,9 +955,18 @@ impl Site {
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
         let prompt = self.runner()?.preview(&ids)?;
+        let changed = self.repo()?.changed()?;
+        let uncommitted_noted = prompt
+            .files
+            .iter()
+            .filter(|file| changed.contains(file))
+            .cloned()
+            .collect();
         Ok(to_json(&PreviewView {
             prompt: prompt.text,
             files: prompt.files,
+            uncommitted: changed.len(),
+            uncommitted_noted,
         }))
     }
 

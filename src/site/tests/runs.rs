@@ -248,9 +248,15 @@ fn the_prompt_preview_is_the_text_the_agent_receives() {
     let (site, _nudges) = run_site(&repo, "plain");
     post_note(&site, "src/a.rs", 1, 2, "  explain this  \n");
     post_note(&site, "src/a.rs", 3, 3, "and this");
+    let clean = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    assert_eq!(clean["uncommitted"], 0, "{clean}");
     repo.write("src/a.rs", "fn a() {\n    one();\n// moved\n");
+    repo.write("b.txt", "not noted\n");
 
     let preview = get_json(&site, &format!("{RUN}/preview?notes=N2,N1"));
+    // The thread starts from the last commit: the send step says what it will not see.
+    assert_eq!(preview["uncommitted"], 2, "{preview}");
+    assert_eq!(preview["uncommittedNoted"], serde_json::json!(["src/a.rs"]));
     assert_eq!(
         preview["prompt"],
         "These are review notes an engineer wrote while reading this repository.\n\
