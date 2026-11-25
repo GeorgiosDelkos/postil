@@ -317,8 +317,10 @@ fn a_note_in_an_untracked_folder_is_named_as_changed() {
     fs::create_dir_all(repo.root.join("vendor")).unwrap();
     repo.write("vendor/one.rs", "1\n");
     post_note(&site, "vendor/one.rs", 1, 1, "new here");
+    // Committed and unchanged: not named.
+    post_note(&site, "a.txt", 1, 1, "as it was");
 
-    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1,N2"));
 
     // `git status` names only `vendor/`: the agent's copy lacks the file it holds.
     assert_eq!(preview["uncommitted"], 1, "{preview}");
