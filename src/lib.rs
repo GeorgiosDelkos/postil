@@ -13,6 +13,7 @@ mod disk;
 mod error;
 mod files;
 mod folders;
+mod github;
 mod highlight;
 mod layout;
 #[cfg(target_os = "macos")]

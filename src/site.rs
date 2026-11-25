@@ -416,12 +416,21 @@ struct FollowRun {
     text: String,
 }
 
-/// The body of `POST /api/thread/apply` and `POST /api/thread/discard`.
+/// The body of the `POST` routes under `/api/thread`: `apply`, `discard`, `pr`, `pr/state`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EndThread {
+struct ThreadBody {
     /// The thread, by its first run: `R3`.
     thread: String,
+}
+
+/// What `POST /api/thread/pr` and `/api/thread/pr/state` ask of a thread's pull request.
+#[derive(Debug, Clone, Copy)]
+enum PullAction {
+    /// Push the branch and open a draft pull request.
+    Open,
+    /// Read its state again.
+    Check,
 }
 
 /// The body of `POST /api/run/question`.
@@ -794,7 +803,7 @@ impl Site {
                 Method::GET => match query_value(query, "id") {
                     Some(id) => json_or_error(
                         self.runner()
-                            .and_then(|runner| runner.thread_record(&id))
+                            .and_then(|runner| runner.thread_view(&id))
                             .map(|thread| to_json(&thread)),
                     ),
                     None => bad_request("expected ?id=<the thread's first run>"),
@@ -807,6 +816,14 @@ impl Site {
             },
             "/api/thread/discard" => match *method {
                 Method::POST => json_or_error(self.end_thread(body, Ending::Discard)),
+                _ => not_allowed("POST"),
+            },
+            "/api/thread/pr" => match *method {
+                Method::POST => json_or_error(self.pull_request(body, PullAction::Open)),
+                _ => not_allowed("POST"),
+            },
+            "/api/thread/pr/state" => match *method {
+                Method::POST => json_or_error(self.pull_request(body, PullAction::Check)),
                 _ => not_allowed("POST"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
@@ -986,8 +1003,21 @@ impl Site {
     /// The reply to `POST /api/thread/apply` and `POST /api/thread/discard`: ends the thread
     /// in the body as `ending` says, and answers `{}`.
     fn end_thread(&self, body: &[u8], ending: Ending) -> Result<Vec<u8>> {
-        let request: EndThread = parse_body(body, Error::BadRequest)?;
+        let request: ThreadBody = parse_body(body, Error::BadRequest)?;
         self.runner()?.end_thread(&request.thread, ending)?;
+        Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `POST /api/thread/pr` and `POST /api/thread/pr/state`: starts opening the
+    /// thread's pull request, or reading its state, as `action` says, and answers `{}`. The
+    /// work goes on after the reply: `GET api/thread` shows it.
+    fn pull_request(&self, body: &[u8], action: PullAction) -> Result<Vec<u8>> {
+        let request: ThreadBody = parse_body(body, Error::BadRequest)?;
+        let runner = self.runner()?;
+        match action {
+            PullAction::Open => runner.open_pull_request(&request.thread)?,
+            PullAction::Check => runner.check_pull_request(&request.thread)?,
+        }
         Ok(b"{}".to_vec())
     }
 
@@ -1151,6 +1181,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::RunElsewhere
                 | Error::TooManyRuns { .. }
                 | Error::TooManyWorktrees { .. }
+                | Error::PullRequestRefused(_)
                 | Error::RunInOpenProject
                 | Error::ThreadChanged { .. }
                 | Error::NotAWorktree { .. }
@@ -1165,7 +1196,9 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AgentSilent { .. }
                 | Error::AgentExited { .. }
                 | Error::AgentRefused { .. }
-                | Error::AgentProtocol(_) => StatusCode::BAD_GATEWAY,
+                | Error::AgentProtocol(_)
+                | Error::NoGh
+                | Error::GitHub { .. } => StatusCode::BAD_GATEWAY,
                 // Well-formed requests for what cannot be done. The page tells a missing
                 // repository apart: it offers to make the folder one.
                 Error::NotARepository { .. }

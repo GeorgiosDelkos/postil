@@ -250,6 +250,18 @@ pub enum Error {
         /// As in [`Error::TooManyWorktrees`].
         kept: Vec<String>,
     },
+    /// A pull request was asked for that cannot be opened as the thread stands; the text says
+    /// why and what to do.
+    PullRequestRefused(String),
+    /// `gh` is not on the login shell's PATH.
+    NoGh,
+    /// A `gh` command failed.
+    GitHub {
+        /// `gh pr create`.
+        command: String,
+        /// What gh said.
+        message: String,
+    },
     /// Another project was asked to be opened while the open one has a run or a review under
     /// way, without asking to stop it.
     RunInOpenProject,
@@ -493,6 +505,12 @@ impl fmt::Display for Error {
                 live.len(),
                 live.join(", ")
             ),
+            Self::PullRequestRefused(why) => write!(f, "no pull request was opened: {why}"),
+            Self::NoGh => write!(
+                f,
+                "GitHub's gh command is not installed (brew install gh, then gh auth login)"
+            ),
+            Self::GitHub { command, message } => write!(f, "{command} failed: {message}"),
             Self::RunInOpenProject => write!(
                 f,
                 "a run is under way in the open project (wait for it, stop it, or ask again \
@@ -625,6 +643,9 @@ impl std::error::Error for Error {
             | Self::TooManyRuns { .. }
             | Self::TooManyWorktrees { .. }
             | Self::DiskFull { .. }
+            | Self::PullRequestRefused(_)
+            | Self::NoGh
+            | Self::GitHub { .. }
             | Self::RunInOpenProject
             | Self::NoSuchRequest
             | Self::NoSuchRun { .. }

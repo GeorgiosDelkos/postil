@@ -134,6 +134,11 @@ export function runStore({ render, onChange, onLoaded, onError }) {
         // A run that started or ended changed its thread: the worktree was made (`skipped`),
         // its tip moved, or a run elsewhere ended it.
         if (previous?.id !== run?.id || previous?.status !== run?.status) threads.clear();
+        // A pull request being opened or read is done when the server nudges: read again.
+        for (const [id, record] of threads) {
+          const work = record?.pullRequestWork;
+          if (work && work.kind !== "failed") threads.delete(id);
+        }
         render();
         onChange(run, previous);
       } while (again);
@@ -233,6 +238,35 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     );
   }
 
+  // Starts opening thread `id`'s pull request: the branch is pushed and a draft opened after
+  // the reply, which the thread's record then shows. Resolves to whether it started.
+  function openPullRequest(id) {
+    return post("api/thread/pr", { thread: id }).then(
+      () => {
+        threads.delete(id);
+        render();
+        return true;
+      },
+      (error) => {
+        onError(error.message);
+        return false;
+      },
+    );
+  }
+
+  // Asks GitHub again for the state of every open pull request of a thread this window has
+  // read: the window regained focus, after the engineer may have merged one. Never on a timer.
+  function checkPullRequests() {
+    for (const [id, record] of threads) {
+      if (record?.pullRequest?.state !== "open") continue;
+      post("api/thread/pr/state", { thread: id }).then(
+        () => threads.delete(id),
+        // A failure shows in the thread as `pullRequestWork`; nothing more to say here.
+        () => {},
+      );
+    }
+  }
+
   async function post(route, body) {
     const response = await fetch(route, { method: "POST", body: JSON.stringify(body ?? {}) });
     if (!response.ok) throw new Error(await response.text());
@@ -297,6 +331,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     startReview,
     thread,
     endThread,
+    openPullRequest,
+    checkPullRequests,
     knownViews,
     run: () => run,
     ids: () => ids,

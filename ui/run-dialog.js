@@ -383,7 +383,48 @@ export function runDialog({
       const skipped = `Not given to the worktree: ${record.skipped.join("; ")}`;
       part.append(el("div", "note-dialog-said muted", skipped));
     }
+    part.append(pullRequestPart(root, record, busy));
     return part;
+  }
+
+  // The thread's pull request (docs/design.md, "Ending a thread"): a link to it with its
+  // state, or Open pull request, which pushes the branch and opens a draft with `gh`. That
+  // goes on after the click (`pullRequestWork`); the store reads the thread again until it is
+  // done. Merged or closed on GitHub, the thread is ended here with Discard: the changes
+  // reach the working tree through the base branch, not through Apply.
+  function pullRequestPart(root, record, busy) {
+    const line = el("div", "run-thread-pull");
+    const work = record.pullRequestWork;
+    const pull = record.pullRequest;
+    if (pull) {
+      const link = el("a", "run-thread-link", "Pull request");
+      link.href = pull.url;
+      link.title = pull.url;
+      line.append(link, el("span", "run-thread-state", pull.state));
+      if (pull.state !== "open") {
+        const done = `${pull.state === "merged" ? "Merged" : "Closed"} on GitHub: Discard ends the thread and frees its worktree`;
+        line.append(el("div", "note-dialog-said muted", done));
+      }
+    } else {
+      const open = el("button", "button", "Open pull request");
+      open.type = "button";
+      open.title = record.base
+        ? `Push ${record.branch} and open a draft pull request into ${record.base}`
+        : "The thread started from a detached HEAD: it has no branch to merge into";
+      open.disabled = busy || !record.base || work?.kind === "opening";
+      open.addEventListener("click", () => {
+        open.disabled = true;
+        store.openPullRequest(root.id).then((started) => {
+          if (!started) open.disabled = false;
+        });
+      });
+      line.append(open);
+      if (work?.kind === "opening") {
+        line.append(el("span", "muted", "Pushing the branch and opening the pull request…"));
+      }
+    }
+    if (work?.kind === "failed") line.append(el("div", "note-dialog-said muted", work.error));
+    return line;
   }
 
   // A run's reply, or null before it writes one: its text is written in place as it streams

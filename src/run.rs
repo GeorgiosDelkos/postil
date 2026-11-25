@@ -51,6 +51,7 @@
 //! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
+mod pull;
 mod room;
 
 #[cfg(test)]
@@ -105,6 +106,9 @@ pub(crate) struct Runner {
     /// (`thread.rs`); `None` when the home folder is unknown, which refuses every send.
     home: Option<PathBuf>,
     slots: Mutex<Slots>,
+    /// What this window is doing about each thread's pull request, by thread id
+    /// ([`pull::PullWork`]); a lock never held with another.
+    pull_work: Mutex<HashMap<String, pull::PullWork>>,
     /// Holds a review's next stage, once, until a test lets it start
     /// ([`Runner::hold_next_stage`]): between a stage's end and the next stage's start is a
     /// window no request can otherwise be timed into.
@@ -424,6 +428,7 @@ impl Runner {
             notify,
             home,
             slots: Mutex::new(Slots::default()),
+            pull_work: Mutex::default(),
             #[cfg(test)]
             next_stage_gate: Mutex::new(None),
             #[cfg(test)]
@@ -1284,16 +1289,6 @@ impl Runner {
             None => id,
         };
         thread::find(&self.repo, &first)
-    }
-
-    /// The thread `id` as its record has it, or `None` when there is none (a run from before
-    /// threads had worktrees).
-    ///
-    /// # Errors
-    ///
-    /// As [`thread::find`].
-    pub(crate) fn thread_record(&self, id: &str) -> Result<Option<Thread>> {
-        thread::find(&self.repo, id)
     }
 
     /// Ends the open thread `id` as `ending` says (docs/design.md, "Ending a thread"), and

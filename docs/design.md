@@ -25,8 +25,7 @@ from a thread's branch and reads back only that pull request's state.
   opens a pull request from a thread's branch (section "Worktrees"); the owner moved that into
   scope on 2026-11-24.
 - Two agents in one working tree. Each thread gets a worktree of its own (section
-  "Worktrees", milestone 6), so threads run side by side; until that is built, one run at a
-  time per repository.
+  "Worktrees", milestone 6), so threads run side by side.
 
 ## The loop
 
@@ -548,18 +547,18 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
 
 ### Worktrees
 
-Milestone 6, under way. Decided with the owner on 2026-11-24. Two agents in one working tree
+Milestone 6, built but for two items marked below. Decided with the owner on 2026-11-24. Two agents in one working tree
 overwrite each other's edits, so each thread (a run of notes with its follow-ups and reviews)
 runs in a git worktree of its own, on a branch of its own. The engineer's working tree is
 never an agent's working directory; changes reach it only through Apply or a merged pull
 request.
 
-Built (`src/thread.rs`, `src/clone.rs`, `src/run/room.rs`, `src/disk.rs`): a worktree and a
-branch per thread, the record, commits as snapshots, the cloned build folders, Apply and
-Discard, a runner per thread with its locks, the cap of 3 live runs, `git worktree lock`, the
-startup sweep, the cap of 15 worktrees, the free-space floor and eviction. Not built yet, and
-marked so below: the warning about uncommitted changes, sparse-checkout patterns, and pull
-requests.
+Built (`src/thread.rs`, `src/clone.rs`, `src/run/room.rs`, `src/disk.rs`, `src/run/pull.rs`,
+`src/github.rs`): a worktree and a branch per thread, the record, commits as snapshots, the
+cloned build folders, Apply and Discard, a runner per thread with its locks, the cap of 3 live
+runs, `git worktree lock`, the startup sweep, the cap of 15 worktrees, the free-space floor and
+eviction, and pull requests. Not built yet, and marked so below: the warning about
+uncommitted changes, and sparse-checkout patterns.
 
 #### Threads
 
@@ -601,9 +600,11 @@ requests.
   from; `base`, the branch `HEAD` was on at send; `tip`, the last commit Postil made or found,
   before or after a run; `lastRun`, when its latest run started, in milliseconds since the
   Unix epoch; `skipped`, what the worktree was not given; and `state`: `open`, `evicted`,
-  `applied` or `discarded`. Version 1 had no `lastRun` and no evicted state; it is still read,
-  its threads as having run at time 0, and written back as version 2. The last step adds the
-  pull request's URL. A change reads the file, changes one thread and writes it whole, under
+  `applied` or `discarded`; and `pullRequest`, once one is opened, with its `url` and `state`
+  (`open`, `merged` or `closed`) as last read. This is version 3. Version 1 had no `lastRun`
+  and no evicted state, and neither 1 nor 2 a pull request; both are still read, version 1's
+  threads as having run at time 0, and written back as version 3. A change reads the file,
+  changes one thread and writes it whole, under
   `threads.lock`; a new thread is written before `git worktree add`, so a crash leaves a
   record pointing at whatever was made. Run logs stay append-only, so this file holds what
   changes. A file that cannot be read or parsed is reported and never written over.
@@ -711,15 +712,28 @@ Three things end a thread, each one of the engineer's clicks:
   rejected because it stages its result, and Postil leaves the engineer's index alone
   (section "The changes view").
 - **Discard** ends the thread with nothing applied.
-- **A merged or closed pull request** (not built yet). Open pull request does not end the
-  thread. It pushes
-  the branch (`GIT_TERMINAL_PROMPT=0`) and runs
-  `gh pr create --draft --head <branch> --base <base branch>`, the notes as the body, and
-  records the URL. It refuses with no base branch, or when the base branch is not on the
-  remote; when the local base branch is ahead of its remote, it lists those commits, since
-  they would show in the pull request. This writes to GitHub, so it is never automatic.
-  Postil reads the state (`gh pr view <url> --json state`) when the window regains focus,
-  never on a timer, and on merged or closed asks whether to end the thread.
+- **A merged or closed pull request** (built, `src/run/pull.rs`, `src/github.rs`). Open pull
+  request, in the thread's dialog, does not end the thread. It is never automatic: it writes
+  to GitHub. On the request thread it checks, with no network, what would make the pull
+  request wrong, and refuses (409) saying why: no base branch (the thread started from a
+  detached `HEAD`); a base branch with no remote (the one it tracks, else `origin`); a base
+  branch not on that remote, as this repository last fetched it; commits the thread starts
+  from that the remote's base branch lacks, listed, since the pull request would show them;
+  work Postil did not commit (the safety check). Then, on a thread of its own, it pushes the
+  branch to the branch of the same name on the remote, and runs `gh pr create --draft --base
+  <base> --head <branch>` with the first line of the first note as the title and the first
+  run's prompt, which holds the notes, as the body, and records the URL in the thread. The
+  push and `gh` run with the login shell's `PATH`, so the engineer's credential helpers are
+  found, and the push runs their `pre-push` hook, unlike Postil's own commits: it is their
+  push to their remote, which a hook may guard. Off the request thread because a hook can
+  take minutes, and the page's Stop and answers go through that thread. What this window is
+  doing (opening, reading the state) or why it failed is kept in memory only, shown in the
+  dialog, and lost with the window, so a crash leaves no thread marked as opening; the
+  engineer asks again. Postil reads the state (`gh pr view <url> --json state`) when the
+  window regains focus, for the threads the page has read, never on a timer. Merged or
+  closed, the dialog says so and that Discard ends the thread: its changes reach the working
+  tree through the base branch, not through Apply. The pull request's link opens in the
+  default browser (`open`): the page itself never navigates away.
 
 **The safety check:** the worktree has no uncommitted change outside ignored files, and its
 branch is at the commit Postil made last or past it. Past it is a commit the engineer made
@@ -1086,12 +1100,13 @@ retired; the measured numbers above are the baseline to not regress.
    `.github/workflows/release.yml` does the same in CI from a `v*` tag, with the secrets of
    the `release` environment that GeorgiosDelkos/vigil's release uses, and publishes a zip of
    the app (Apple Silicon only, the runner's architecture).
-6. **Threads side by side.** Under way. A worktree and a branch per thread (section
+6. **Threads side by side.** Built, but for the two items section "Worktrees" marks. A
+   worktree and a branch per thread (section
    "Worktrees"), one pull request per step, so the main branch works after each. The owner
    chose this order on 2026-11-24, so agents never write to worktrees with no way to bring
    their changes back: the worktree with its branch, commits and clones, with Apply and
    Discard (built); then a runner per thread, its locks and the agent cap (built); then the
-   startup sweep, eviction and the free-space floor (built); then Open pull request.
+   startup sweep, eviction and the free-space floor (built); then Open pull request (built).
 
 ## Testing
 

@@ -1911,6 +1911,24 @@ button.repo-name:hover {
   margin-left: auto;
 }
 
+/* The thread's pull request, under its branch: a link and its state, or Open pull request. */
+.run-thread-pull {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.run-thread-pull > .note-dialog-said {
+  flex-basis: 100%;
+}
+
+.run-thread-link {
+  color: var(--accent);
+}
+
 .run-thread .button {
   height: 26px;
   padding: 0 10px;

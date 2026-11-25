@@ -12,6 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -517,8 +518,20 @@ fn build_webview(
             }
         })
         // The page never navigates. Should it ever be sent elsewhere, the other origin must
-        // not reach the `postil://` handlers, which read and write the repository.
-        .with_navigation_handler(|url| url.starts_with("postil://"))
+        // not reach the `postil://` handlers, which read and write the repository. An https
+        // link (a thread's pull request) opens in the default browser instead; `open` returns
+        // once it has handed the URL over, and is waited for off the event loop.
+        .with_navigation_handler(|url| {
+            if url.starts_with("https://") {
+                let opened = thread::Builder::new()
+                    .name("open-link".to_owned())
+                    .spawn(move || drop(process::Command::new("/usr/bin/open").arg(url).status()));
+                // No thread: the link does nothing, as any other would.
+                drop(opened);
+                return false;
+            }
+            url.starts_with("postil://")
+        })
         // On macOS, wry fires `Started` from `didCommitNavigation`, before it runs the scripts
         // it queued and stops queueing (wry 0.57.3, `wkwebview/navigation.rs`,
         // `did_commit_navigation`); its docs say only "started loading", and other platforms'
