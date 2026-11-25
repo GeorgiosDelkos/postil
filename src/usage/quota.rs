@@ -1,10 +1,10 @@
 //! On-demand background probes for live provider account quotas and rate-limit windows.
 //!
 //! Each probe runs on a short-lived thread; every subprocess it starts has a hard timeout,
-//! and its process group is killed when done, matching `agents::Scanner`. Results are cached briefly in memory so reopening
-//! the Usage dialog does not spam provider endpoints, and nothing runs while the dialog is
-//! closed. Secrets (OAuth tokens) are piped to `/usr/bin/curl` over stdin (`--config -`),
-//! never passed in process arguments.
+//! and its process group is killed when done, matching `agents::Scanner`. Results are cached
+//! briefly in memory so reopening the Usage dialog does not spam provider endpoints, and
+//! nothing runs while the dialog is closed. Secrets (OAuth tokens) are piped to
+//! `/usr/bin/curl` over stdin (`--config -`), never passed in process arguments.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -621,7 +621,8 @@ fn read_codex_replies(child: &mut Child) -> Result<(Option<Value>, Option<Value>
         .take()
         .expect("probe_codex starts codex app-server with a piped stdout");
     let requests = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"postil","version":""#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"clientInfo":{"name":"postil","version":""#,
         env!("CARGO_PKG_VERSION"),
         r#""}}}"#,
         "\n",
@@ -854,7 +855,10 @@ fn probe_gemini() -> QuotaReport {
         "Content-Type: application/json".to_owned(),
         "Accept: application/json".to_owned(),
     ];
-    let load_body = r#"{"metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}"#;
+    let load_body = concat!(
+        r#"{"metadata":{"ideType":"IDE_UNSPECIFIED","#,
+        r#""platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}"#,
+    );
     let (project, plan) = match curl_json(
         "POST",
         "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
@@ -1409,8 +1413,12 @@ mod tests {
             "id": 3,
             "result": {
                 "rateLimits": {
-                    "primary": { "usedPercent": 21.0, "windowDurationMins": 300, "resetsAt": 1_795_620_000 },
-                    "secondary": { "usedPercent": 48.0, "windowDurationMins": 10080, "resetsAt": 1_796_000_000 },
+                    "primary": {
+                        "usedPercent": 21.0, "windowDurationMins": 300, "resetsAt": 1_795_620_000
+                    },
+                    "secondary": {
+                        "usedPercent": 48.0, "windowDurationMins": 10080, "resetsAt": 1_796_000_000
+                    },
                     "credits": { "hasCredits": true, "unlimited": false, "balance": "12.50" }
                 }
             }
@@ -1428,9 +1436,12 @@ mod tests {
     fn parses_gemini_retrieve_user_quota_buckets() {
         let body = r#"{
             "buckets": [
-                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.88, "resetTime": "2026-11-26T00:00:00Z" },
-                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.75, "resetTime": "2026-11-26T00:00:00Z" },
-                { "modelId": "gemini-2.5-flash", "remainingFraction": 0.96, "resetTime": "2026-11-26T00:00:00Z" }
+                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.88,
+                  "resetTime": "2026-11-26T00:00:00Z" },
+                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.75,
+                  "resetTime": "2026-11-26T00:00:00Z" },
+                { "modelId": "gemini-2.5-flash", "remainingFraction": 0.96,
+                  "resetTime": "2026-11-26T00:00:00Z" }
             ]
         }"#;
         let report = parse_gemini_quota(body, Some("Google AI Pro".to_owned()));
@@ -1556,17 +1567,21 @@ mod tests {
                 "while IFS= read -r line; do\n",
                 "  case \"$line\" in\n",
                 "    *'\"method\":\"initialize\"'*)\n",
-                "      printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"userAgent\":\"test\"}}\\n'\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":1,",
+                "\"result\":{\"userAgent\":\"test\"}}\\n'\n",
                 "      ;;\n",
                 "    *'\"method\":\"initialized\"'*)\n",
                 "      saw_initialized=1\n",
                 "      ;;\n",
                 "    *'\"method\":\"account/read\"'*)\n",
-                "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"authMode\":\"chatgpt\",\"planType\":\"plus\"}}\\n'\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,",
+                "\"result\":{\"authMode\":\"chatgpt\",\"planType\":\"plus\"}}\\n'\n",
                 "      ;;\n",
                 "    *'\"method\":\"account/rateLimits/read\"'*)\n",
                 "      if [ \"$saw_initialized\" = \"1\" ]; then\n",
-                "        printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":33.0,\"windowDurationMins\":300,\"resetsAt\":1800000000}}}}\\n'\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"rateLimits\":",
+                "{\"primary\":{\"usedPercent\":33.0,\"windowDurationMins\":300,",
+                "\"resetsAt\":1800000000}}}}\\n'\n",
                 "      fi\n",
                 "      ;;\n",
                 "  esac\n",
