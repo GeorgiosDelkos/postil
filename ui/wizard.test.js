@@ -29,6 +29,8 @@ function defaults() {
   };
 }
 
+const slot = (name, model = null) => ({ name, model });
+
 function scannedAgents() {
   return [
     {
@@ -38,7 +40,7 @@ function scannedAgents() {
       found: "/usr/local/bin/claude",
     },
     { name: "Codex", command: "npx -y @zed-industries/codex-acp", builtIn: true, found: null },
-    { name: "Gemini", command: "gemini --acp", builtIn: true, found: "/opt/homebrew/bin/gemini" },
+    { name: "Gemini", command: "agy acp", builtIn: true, found: "/Users/me/.local/bin/agy" },
     { name: "Grok", command: "grok agent stdio", builtIn: true, found: null },
     { name: "OpenCode", command: "opencode acp", builtIn: true, found: null },
   ];
@@ -53,10 +55,10 @@ test("step clamping stays inside the wizard's steps", () => {
 test("first-run defaults enable every found built-in agent and pick the first as default", () => {
   const next = applyDetectedDefaults(defaults(), scannedAgents());
   assert.deepEqual(next.enabledAgents, ["Claude", "Gemini"]);
-  assert.equal(next.agent, "Claude");
+  assert.deepEqual(next.agent, slot("Claude"));
 
   // Does not overwrite choices once an agent is already enabled or selected.
-  const custom = { ...defaults(), enabledAgents: ["Gemini"], agent: "Gemini" };
+  const custom = { ...defaults(), enabledAgents: ["Gemini"], agent: slot("Gemini") };
   assert.equal(applyDetectedDefaults(custom, scannedAgents()), custom);
 
   // Leaves the draft unchanged when no built-in agent is found.
@@ -69,17 +71,29 @@ test("toggling an agent in the wizard reconciles the default agent and reviewers
   let draft = defaults();
   draft = toggleWizardAgent(draft, "Claude", true);
   assert.deepEqual(draft.enabledAgents, ["Claude"]);
-  assert.equal(draft.agent, "Claude", "first enabled agent becomes default");
+  assert.deepEqual(draft.agent, slot("Claude"), "first enabled agent becomes default");
 
   draft = toggleWizardAgent(draft, "Gemini", true);
   assert.deepEqual(draft.enabledAgents, ["Claude", "Gemini"]);
-  assert.equal(draft.agent, "Claude", "existing default is preserved");
+  assert.deepEqual(draft.agent, slot("Claude"), "existing default is preserved");
 
-  draft = { ...draft, reviewers: ["Claude", "Gemini", "Claude"] };
+  draft = {
+    ...draft,
+    agent: slot("Claude", "opus"),
+    reviewers: [slot("Claude"), slot("Gemini", "gemini-4-neon"), slot("Claude", "haiku")],
+  };
   draft = toggleWizardAgent(draft, "Claude", false);
   assert.deepEqual(draft.enabledAgents, ["Gemini"]);
-  assert.equal(draft.agent, "Gemini", "default falls back to the next enabled agent");
-  assert.deepEqual(draft.reviewers, ["Gemini"], "disabled agent is removed from reviewers");
+  assert.deepEqual(
+    draft.agent,
+    slot("Gemini"),
+    "default falls back to the next enabled agent, on its own default model",
+  );
+  assert.deepEqual(
+    draft.reviewers,
+    [slot("Gemini", "gemini-4-neon")],
+    "disabled agent is removed from reviewers, the others keep their models",
+  );
 
   draft = toggleWizardAgent(draft, "Gemini", false);
   assert.deepEqual(draft.enabledAgents, []);
@@ -97,9 +111,9 @@ test("custom agents added in the wizard become the default when none is set and 
   assert.equal(added.error, undefined);
   assert.deepEqual(added.settings.customAgents, [{ name: "Local", command: "local-agent --acp" }]);
   assert.deepEqual(added.settings.enabledAgents, ["Local"]);
-  assert.equal(added.settings.agent, "Local");
+  assert.deepEqual(added.settings.agent, slot("Local"));
 
-  const withReviewer = { ...added.settings, reviewers: ["Local"] };
+  const withReviewer = { ...added.settings, reviewers: [slot("Local", "big")] };
   const renamed = saveWizardCustomAgent(
     withReviewer,
     { name: "Renamed", command: "renamed-agent --acp" },
@@ -107,8 +121,8 @@ test("custom agents added in the wizard become the default when none is set and 
     BUILT_IN,
   );
   assert.equal(renamed.error, undefined);
-  assert.equal(renamed.settings.agent, "Renamed");
-  assert.deepEqual(renamed.settings.reviewers, ["Renamed"]);
+  assert.deepEqual(renamed.settings.agent, slot("Renamed"));
+  assert.deepEqual(renamed.settings.reviewers, [slot("Renamed", "big")]);
 
   const removed = removeWizardCustomAgent(renamed.settings, "Renamed");
   assert.deepEqual(removed.customAgents, []);
@@ -129,7 +143,7 @@ test("wizardAgentRows merges unsaved custom agents and marks them pending PATH c
       { name: "Fresh", command: "fresh-agent --acp" },
     ],
     enabledAgents: ["Claude", "Saved", "Fresh"],
-    agent: "Claude",
+    agent: slot("Claude"),
   };
   const rows = wizardAgentRows(server, draft);
   const savedRow = rows.find((row) => row.name === "Saved");
@@ -143,9 +157,9 @@ test("wizardAgentRows merges unsaved custom agents and marks them pending PATH c
 
 test("npxWarning fires only when an enabled agent uses npx and npx is missing", () => {
   const agents = scannedAgents();
-  const withClaude = { ...defaults(), enabledAgents: ["Claude"], agent: "Claude" };
-  const withGemini = { ...defaults(), enabledAgents: ["Gemini"], agent: "Gemini" };
-  const withBoth = { ...defaults(), enabledAgents: ["Claude", "Codex"], agent: "Claude" };
+  const withClaude = { ...defaults(), enabledAgents: ["Claude"], agent: slot("Claude") };
+  const withGemini = { ...defaults(), enabledAgents: ["Gemini"], agent: slot("Gemini") };
+  const withBoth = { ...defaults(), enabledAgents: ["Claude", "Codex"], agent: slot("Claude") };
 
   assert.equal(
     npxWarning(withClaude, agents, { git: "/usr/bin/git", npx: "/usr/bin/npx", gh: null }),
@@ -164,24 +178,38 @@ test("npxWarning fires only when an enabled agent uses npx and npx is missing", 
 });
 
 test("wizardSummary and readinessItems describe the chosen settings and tools", () => {
-  const summary = wizardSummary({
+  const draft = {
     ...defaults(),
     theme: "dark",
     codeFontSize: 15,
     tabWidth: 2,
     reopenLastProject: true,
     enabledAgents: ["Claude", "Gemini"],
-    agent: "Claude",
-    reviewers: ["Gemini", "Claude"],
-  });
+    agent: slot("Claude", "opus"),
+    reviewers: [slot("Gemini", "gemini-4-neon"), slot("Claude")],
+  };
+  // Claude reported its models; Gemini's probe is still running, so its id stands.
+  const models = {
+    Claude: { status: "ready", current: "opus", options: [{ value: "opus", name: "Opus 5.5" }] },
+    Gemini: { status: "loading" },
+  };
   assert.deepEqual(
-    summary.map((item) => [item.label, item.value]),
+    wizardSummary(draft, models).map((item) => [item.label, item.value]),
     [
       ["Enabled agents", "Claude, Gemini"],
-      ["Send notes to", "Claude"],
-      ["Reviewers", "Gemini → Claude"],
+      ["Send notes to", "Claude · Opus 5.5"],
+      ["Reviewers", "Gemini · gemini-4-neon → Claude"],
       ["Appearance", "Dark · 15 px · 2-space tabs"],
       ["Startup", "Reopen the last project"],
+    ],
+  );
+  const unset = wizardSummary(defaults(), {});
+  assert.deepEqual(
+    unset.filter((item) => item.muted).map((item) => [item.label, item.value]),
+    [
+      ["Enabled agents", "None"],
+      ["Send notes to", "Not chosen yet"],
+      ["Reviewers", "None (review changes yourself)"],
     ],
   );
 

@@ -22,11 +22,12 @@ use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
+use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
 use crate::run::{Ending, Notify, Runner};
-use crate::settings::{self, RawSettings, Settings};
+use crate::settings::{self, CustomAgent, RawSettings, Settings};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
@@ -304,6 +305,8 @@ pub(crate) struct Site {
     agents: Scanner,
     /// On-demand background probes for live provider quotas (`usage/quota.rs`).
     quotas: QuotaPoller,
+    /// On-demand background probes for the models each agent offers (`models.rs`).
+    models: ModelProber,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
 }
@@ -377,6 +380,27 @@ struct SaveSettings {
     /// The revision of the settings file the change started from.
     revision: String,
     settings: RawSettings,
+}
+
+/// The body of `POST /api/agents/models`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelsRequest {
+    /// The agents whose models the page shows, by name.
+    agents: Vec<String>,
+    /// The page's custom agents, saved or not: the wizard saves only when it finishes. A
+    /// name found here is probed with this command, before the saved settings' one.
+    #[serde(default)]
+    custom_agents: Vec<CustomAgent>,
+}
+
+/// The reply to `POST /api/agents/models`.
+#[derive(Debug, Serialize)]
+struct ModelsView {
+    /// Whether any report is still loading, so the page asks again shortly.
+    loading: bool,
+    /// Each asked-for agent's report, by name.
+    models: BTreeMap<String, ModelReport>,
 }
 
 /// An agent as the settings dialog lists it.
@@ -580,6 +604,7 @@ impl Site {
             layout_file: config.map(|dir| dir.join("layout.json")),
             usage_file: config.map(|dir| dir.join("usage.jsonl")),
             home: home.map(Path::to_owned),
+            models: ModelProber::live(agents.clone()),
             agents,
             quotas: QuotaPoller::live(),
             notify,
@@ -718,13 +743,7 @@ impl Site {
                 Method::POST => json_or_error(self.reset_settings()),
                 _ => not_allowed("POST with no body"),
             },
-            "/api/agents/rescan" => match *method {
-                Method::POST => {
-                    self.agents.rescan();
-                    reply(StatusCode::OK, "application/json", self.settings())
-                }
-                _ => not_allowed("POST with no body"),
-            },
+            path if path.starts_with("/api/agents/") => self.respond_agents(path, method, body),
             "/api/usage" => match *method {
                 Method::GET => json_or_error(self.usage_view(query, QuotaFetch::Cached)),
                 _ => not_allowed("GET"),
@@ -885,6 +904,27 @@ impl Site {
             _ => not_allowed(
                 "GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1",
             ),
+        }
+    }
+
+    /// The replies to the routes under `/api/agents/`, as [`Site::respond`] gives them: a new
+    /// agent scan, and the models agents offer.
+    fn respond_agents(&self, path: &str, method: &Method, body: &[u8]) -> Reply {
+        match path {
+            "/api/agents/rescan" => match *method {
+                Method::POST => {
+                    self.agents.rescan();
+                    // An agent found again may be another version, with other models.
+                    self.models.rescan();
+                    reply(StatusCode::OK, "application/json", self.settings())
+                }
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/agents/models" => match *method {
+                Method::POST => json_or_error(self.agent_models(body)),
+                _ => not_allowed("POST {\"agents\": [...], \"customAgents\": [...]}"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
 
@@ -1102,17 +1142,14 @@ impl Site {
         let review: ReviewRun = parse_body(body, Error::BadRequest)?;
         // Loaded once, so every reviewer is checked against the same revision of the file.
         let settings = self.current_settings();
-        let reviewers = settings
-            .reviewers()
-            .iter()
-            .map(|name| settings.chosen_agent(name))
-            .collect::<Result<Vec<_>>>()?;
+        let reviewers = settings.reviewer_choices()?;
         self.runner()?.review(&review.of, reviewers)?;
         Ok(b"{}".to_vec())
     }
 
     /// The reply to `POST /api/run/follow`: sends the engineer's follow-up to the agent that
-    /// ran the run it follows, and answers `{}`.
+    /// ran the run it follows, and answers `{}`. The settings' choice for that agent is used
+    /// only when a fresh agent starts; a kept one goes on with its own (`Runner::follow_up`).
     fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
         let follow: FollowRun = parse_body(body, Error::BadRequest)?;
         let runner = self.runner()?;
@@ -1214,6 +1251,60 @@ impl Site {
     fn reset_settings(&self) -> Result<Vec<u8>> {
         settings::reset(self.settings_file.as_deref().ok_or(Error::NoHome)?)?;
         Ok(self.settings())
+    }
+
+    /// The reply to `POST /api/agents/models`: what each agent in the body reports it offers,
+    /// probing the ones not asked yet in the background (`models.rs`). Never waits for a
+    /// probe. A built-in agent is reported loading while the agent scan runs, and failed when
+    /// it is not installed, without starting it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when the body names an agent that is neither built in nor a
+    /// custom agent of the body or the settings, or a custom agent whose command breaks the
+    /// settings' rule.
+    fn agent_models(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: ModelsRequest = parse_body(body, Error::BadRequest)?;
+        let settings = self.current_settings();
+        let search_path = self.agents.path();
+        let mut models = BTreeMap::new();
+        let mut probed: Vec<(String, String)> = Vec::new();
+        for name in request.agents {
+            if let Some(agent) = BUILT_IN.iter().find(|agent| agent.name == name) {
+                let report = match search_path.as_deref() {
+                    None => ModelReport::Loading,
+                    Some(path) if agents::find_program(agent.program, path).is_none() => {
+                        ModelReport::Failed {
+                            error: format!("{name} is not installed"),
+                        }
+                    }
+                    Some(_) => {
+                        probed.push((name, agent.command.to_owned()));
+                        continue;
+                    }
+                };
+                models.insert(name, report);
+                continue;
+            }
+            let draft = request
+                .custom_agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .map(|agent| agent.command.as_str());
+            let command = draft
+                .or_else(|| settings.custom_command(&name))
+                .ok_or_else(|| Error::BadRequest(format!("there is no agent called {name:?}")))?
+                .to_owned();
+            settings::check_agent_command(&name, &command).map_err(Error::BadRequest)?;
+            probed.push((name, command));
+        }
+        let commands: Vec<&str> = probed.iter().map(|(_, command)| command.as_str()).collect();
+        let reports = self.models.query(&commands);
+        models.extend(probed.into_iter().map(|(name, _)| name).zip(reports));
+        let loading = models
+            .values()
+            .any(|report| matches!(report, ModelReport::Loading));
+        Ok(to_json(&ModelsView { loading, models }))
     }
 
     /// The reply to `GET /api/usage` and `POST /api/usage/refresh`.
@@ -1368,6 +1459,7 @@ impl std::fmt::Debug for Site {
             .field("usage_file", &self.usage_file)
             .field("agents", &self.agents)
             .field("quotas", &self.quotas)
+            .field("models", &self.models)
             .finish_non_exhaustive()
     }
 }
@@ -1382,6 +1474,8 @@ impl Drop for Site {
         if let Some(project) = self.project.borrow_mut().take() {
             project.runner.close();
         }
+        // A model probe's agent would otherwise run on until its timeout.
+        self.models.close();
     }
 }
 
@@ -1480,6 +1574,8 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AgentExited { .. }
                 | Error::AgentRefused { .. }
                 | Error::AgentProtocol(_)
+                | Error::ModelNotOffered { .. }
+                | Error::ModelNotChoosable { .. }
                 | Error::NoGh
                 | Error::GitHub { .. } => StatusCode::BAD_GATEWAY,
                 // Well-formed requests for what cannot be done. The page tells a missing

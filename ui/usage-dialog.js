@@ -222,7 +222,7 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
       el(
         "p",
         "settings-hint",
-        "Install Claude, Codex, Gemini, Grok, or OpenCode, or add a custom ACP agent in Settings.",
+        "Install Claude, Codex, Gemini (agy), Grok, or OpenCode, or add a custom ACP agent in Settings.",
       ),
     );
     const actions = el("div", "settings-actions");

@@ -94,45 +94,31 @@ export function selectBox(key, label, options, value, choose, { disabled = false
   return node;
 }
 
-// One row in the agent list. `idPrefix` keeps HTML ids unique when Settings and the Wizard
-// both live in the document.
+// One row in the agent list: the name, one dim line on where it stands (the full path of the
+// program is in its tooltip, not on the row), the command it starts with, and a switch.
 export function agentListRow(
   agent,
-  { disabled = false, formOpen = false, onToggle, onEdit, onRemove, idPrefix = "" },
+  { disabled = false, formOpen = false, onToggle, onEdit, onRemove },
 ) {
   const node = el("div", "agent-row");
-  // Keys of per-agent controls hold a `/`, which no fixed key does, so an agent named "add"
-  // cannot take the key of the Add agent button.
-  const key = `enable/${agent.name}`;
-  const id = `${idPrefix}${key}`;
-  const box = el("input");
-  box.type = "checkbox";
-  box.id = id;
-  box.dataset.key = key;
-  box.checked = agent.enabled;
-  // An agent that is not installed cannot be turned on; one already on stays shown so it
-  // can be turned off.
-  box.disabled = disabled || (!agent.found && !agent.enabled && !agent.pendingCheck);
-  box.addEventListener("change", () => onToggle(box.checked));
-
-  const text = el("label", "agent-text");
-  text.htmlFor = id;
+  const text = el("div", "agent-text");
   const name = el("span", "agent-name", agent.name);
   if (!agent.builtIn) name.append(el("span", "agent-badge", "custom"));
   // An agent that is on but missing is a problem; one that is off is only not installed.
   const status = agent.found
-    ? el("span", "agent-found", agent.found)
+    ? el("span", "agent-state", "Installed")
     : agent.pendingCheck
-      ? el("span", "agent-missing", "Checked on PATH when saved")
+      ? el("span", "agent-state", "Checked on PATH when saved")
       : agent.enabled
-        ? el("span", "agent-missing warning", "Not found on PATH")
-        : el("span", "agent-missing", "Not installed");
-  text.append(name, status, el("span", "agent-command", agent.command));
+        ? el("span", "agent-state warning", "Not found on PATH")
+        : el("span", "agent-state", "Not installed");
+  if (agent.found) status.title = agent.found;
   if (agent.usage) {
     const used = agent.usage[0].toUpperCase() + agent.usage.slice(1);
-    text.append(el("span", "agent-usage", used));
+    status.append(el("span", "agent-usage", ` · ${used}`));
   }
-  node.append(box, text);
+  text.append(name, status, el("span", "agent-command", agent.command));
+  node.append(text);
 
   if (!agent.builtIn) {
     const actions = el("div", "agent-actions");
@@ -142,7 +128,146 @@ export function agentListRow(
     actions.append(edit, remove);
     node.append(actions);
   }
+
+  // Keys of per-agent controls hold a `/`, which no fixed key does, so an agent named "add"
+  // cannot take the key of the Add agent button.
+  const toggle = toggleSwitch(
+    `enable/${agent.name}`,
+    agent.enabled,
+    () => onToggle(!agent.enabled),
+    {
+      label: agent.name,
+      // An agent that is not installed cannot be turned on; one already on stays shown so it
+      // can be turned off.
+      disabled: disabled || (!agent.found && !agent.enabled && !agent.pendingCheck),
+    },
+  );
+  node.append(toggle);
   return node;
+}
+
+// The choices of a model select, as `[value, label]` pairs: "Agent default" (value "") first,
+// then the models `report` (the agent's reply of api/agents/models) offers. The `saved` model
+// is always among them, so a redraw while the agent is asked, or after it failed to answer,
+// never drops it; one the agent answered without is marked as no longer offered.
+export function modelSelectOptions(report, saved) {
+  const options = [["", "Agent default"]];
+  if (report?.status !== "ready") {
+    if (saved !== null) options.push([saved, saved]);
+    return options;
+  }
+  options.push(...report.options.map((option) => [option.value, option.name]));
+  if (saved !== null && !report.options.some((option) => option.value === saved)) {
+    options.push([saved, `${saved} (not offered)`]);
+  }
+  return options;
+}
+
+// A select of `slot`'s model, among those `report` says its agent offers, with a dim line
+// under it while the agent is asked or when it could not say. `choose` gets the model id, or
+// null for the agent's default.
+export function modelSelect(key, slot, report, choose, { disabled = false } = {}) {
+  const node = el("div", "model-select");
+  const options = modelSelectOptions(report, slot.model);
+  const select = selectBox(
+    key,
+    `Model for ${slot.name}`,
+    options,
+    slot.model ?? "",
+    (value) => choose(value || null),
+    { disabled },
+  );
+  node.append(select);
+  if (report?.status === "loading") {
+    node.append(el("span", "settings-hint model-hint", `Asking ${slot.name} for its models…`));
+  } else if (report?.status === "failed") {
+    const hint = el("span", "settings-hint model-hint", report.error);
+    hint.title = report.error;
+    node.append(hint);
+  }
+  return node;
+}
+
+// The agent notes are sent to and its model, side by side. `key` names the agent select; the
+// model select is `${key}-model`. `onAgent` gets a name, or null for none.
+export function agentSlotControl(key, settings, models, { disabled = false, onAgent, onModel }) {
+  const enabled = settings.enabledAgents;
+  const none = enabled.length ? "None" : "Turn on an agent first";
+  const options = [["", none], ...enabled.map((name) => [name, name])];
+  const chosen = settings.agent;
+  const agent = selectBox(
+    key,
+    "Send notes to",
+    options,
+    chosen?.name ?? "",
+    (name) => onAgent(name || null),
+    { disabled: disabled || enabled.length === 0 },
+  );
+  const node = el("div", "slot-control");
+  node.append(agent);
+  if (chosen) {
+    node.append(modelSelect(`${key}-model`, chosen, models[chosen.name], onModel, { disabled }));
+  }
+  return node;
+}
+
+// How long a dialog waits before asking again for an agent whose probe failed (one not signed
+// in yet, say): the process probes a failed agent again only after 5 s (src/models.rs,
+// FAILED_TTL), so asking sooner would only get the same failure.
+const FAILED_POLL_MS = 5000;
+
+// The models of a dialog's enabled agents, from api/agents/models, for its model selects. It
+// asks again every SCAN_POLL_MS while an agent is being asked, after FAILED_POLL_MS while one
+// failed, and asks anew when the agents asked for change (`request`). `onChange(models)` gets
+// the reports by agent name whenever a reply changes them; `onError(error)` a request that
+// failed.
+export function modelReports({ onChange, onError }) {
+  let asked = null;
+  let timer = null;
+  let models = {};
+  // Counts requests, so the reply of one that a newer request replaced is dropped.
+  let generation = 0;
+
+  async function poll(body, id) {
+    try {
+      const reply = await fetchSettingsJson("api/agents/models", { method: "POST", body });
+      if (id !== generation) return;
+      const changed = JSON.stringify(reply.models) !== JSON.stringify(models);
+      models = reply.models;
+      const failed = Object.values(models).some((report) => report.status === "failed");
+      if (reply.loading) timer = setTimeout(() => poll(body, id), SCAN_POLL_MS);
+      else if (failed) timer = setTimeout(() => poll(body, id), FAILED_POLL_MS);
+      if (changed) onChange(models);
+    } catch (error) {
+      if (id !== generation) return;
+      asked = null;
+      onError(error);
+    }
+  }
+
+  return {
+    get models() {
+      return models;
+    },
+    // Asks for the models of `settings`' enabled agents, its custom agents as they are (saved
+    // or not), unless the last request asked for the same.
+    request(settings) {
+      const agents = settings.enabledAgents;
+      const body = JSON.stringify({ agents, customAgents: settings.customAgents });
+      if (body === asked) return;
+      asked = body;
+      generation += 1;
+      clearTimeout(timer);
+      if (agents.length > 0) poll(body, generation);
+    },
+    // Forgets what was asked and stops asking, so the next request asks again: after a
+    // rescan, or when the dialog closes.
+    reset() {
+      asked = null;
+      generation += 1;
+      clearTimeout(timer);
+    },
+  };
 }
 
 export function customAgentForm(form, { onSubmit, onCancel }) {
@@ -194,11 +319,26 @@ export function customAgentForm(form, { onSubmit, onCancel }) {
   return node;
 }
 
-export function reviewerControls(settings, { disabled = false, onMove, onRemove, onAdd }) {
+// The reviewers in order, each with its model select (`models` are the agents' reports, by
+// name), and a select that adds one.
+export function reviewerControls(
+  settings,
+  models,
+  { disabled = false, onMove, onRemove, onAdd, onModel },
+) {
   const list = el("ol", "reviewer-list");
-  settings.reviewers.forEach((name, index) => {
+  settings.reviewers.forEach((slot, index) => {
+    const { name } = slot;
     const item = el("li", "reviewer");
-    item.append(el("span", "reviewer-name", name));
+    // The name is cut to fit beside the model select; the tooltip shows it whole.
+    const label = el("span", "reviewer-name", name);
+    label.title = name;
+    item.append(
+      label,
+      modelSelect(`reviewer-model-${index}`, slot, models[name], (model) => onModel(index, model), {
+        disabled,
+      }),
+    );
     const up = controlButton("↑", `up-${index}`, () => onMove(index, -1), "icon-button");
     const down = controlButton("↓", `down-${index}`, () => onMove(index, 1), "icon-button");
     const remove = controlButton("×", `unreview-${index}`, () => onRemove(index), "icon-button");

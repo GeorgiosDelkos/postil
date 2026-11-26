@@ -281,8 +281,15 @@ fn a_branch_moved_off_postil_s_commits_is_refused_and_one_moved_past_them_is_tak
 fn work_left_in_the_worktree_is_committed_before_a_run_and_moves_the_tip_even_if_it_fails() {
     let (repo, site, nudges, worktree) = written("thread-before");
     fs::write(worktree.join("mine.txt"), "by hand\n").unwrap();
-    // The follow-up's agent never starts, so its run takes no snapshot after it.
+    // The follow-up's agent never starts, so its run takes no snapshot after it. A kept agent
+    // would take the follow-up whatever the settings say: opening another project and this
+    // one again lets it go, so the follow-up starts the agent the settings now name.
     set_agents(&site, &[("Fake", &fake_agent("exit-on-start"))], "Fake");
+    let other = TempRepo::new("thread-before-other");
+    site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
     let body = serde_json::json!({ "of": "R1", "text": "more" }).to_string();
     assert_eq!(
         post(&site, &format!("{RUN}/follow"), &body).0,
@@ -737,8 +744,8 @@ fn a_review_does_not_start_when_the_work_left_before_it_cannot_be_committed() {
     let settings = serde_json::json!({
         "customAgents": custom,
         "enabledAgents": ["Fake", "Reviewer"],
-        "agent": "Fake",
-        "reviewers": ["Reviewer"],
+        "agent": { "name": "Fake" },
+        "reviewers": [{ "name": "Reviewer" }],
     });
     assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
 

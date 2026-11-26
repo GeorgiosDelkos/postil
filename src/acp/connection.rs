@@ -18,10 +18,11 @@ use serde_json::Value;
 use crate::acp::wire::{
     self, CancelParams, CancelRequestParams, ClientCapabilities, ContentBlock,
     ElicitationCapabilities, ElicitationParams, ElicitationReply, Empty, FsCapabilities, Incoming,
-    InitializeParams, InitializeResult, NewSessionParams, NewSessionResult, Notification, Outcome,
-    PermissionOption, PermissionOutcome, PermissionParams, PermissionResult, PromptParams,
-    PromptResult, PromptUsage, Request, Response, RpcError, SessionUpdate, StopReason,
-    ToolCallUpdate, UpdateParams,
+    InitializeParams, InitializeResult, ModelConfig, ModelOption, NewSessionParams,
+    NewSessionResult, Notification, Outcome, PermissionOption, PermissionOutcome, PermissionParams,
+    PermissionResult, PromptParams, PromptResult, PromptUsage, Request, Response, RpcError,
+    SessionUpdate, SetConfigOptionParams, SetConfigOptionResult, StopReason, ToolCallUpdate,
+    UpdateParams,
 };
 use crate::agents;
 use crate::error::{Error, Result};
@@ -53,7 +54,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) cwd: &'a Path,
     /// Where the program, and the programs it starts (`npx` runs `node`), are looked for.
     pub(crate) search_path: &'a OsStr,
-    /// How long each start-up request (`initialize`, `session/new`) may take.
+    /// How long each start-up request (`initialize`, `session/new`, and
+    /// `session/set_config_option` when a model is set) may take.
     pub(crate) timeout: Duration,
 }
 
@@ -156,8 +158,12 @@ impl Stopper {
 pub(crate) struct Agent {
     process: Process,
     session: String,
-    /// The active model id reported in `session/new`, when the agent sent one.
+    /// The model in effect: the one [`Starting::open_session`] set, or the one the agent
+    /// reported in `session/new`, when it sent one.
     model: Option<String>,
+    /// The models the agent's model select offered in `session/new`, in its order; empty when
+    /// it has none.
+    offered: Vec<ModelOption>,
 }
 
 impl Agent {
@@ -190,7 +196,12 @@ impl Starting {
     }
 
     /// Introduces the app (`initialize`) and opens a session in the repository
-    /// (`session/new`). Blocks until both are answered, up to the launch's timeout each.
+    /// (`session/new`), then, when `model` is given, sets the session to it
+    /// (`session/set_config_option`), so no prompt can reach the agent before its model is
+    /// set. Blocks until each step is answered, up to the launch's timeout each.
+    ///
+    /// The model is checked against the ones the agent offers first: an agent may take an id
+    /// it does not know and fall back to another model without a word.
     ///
     /// # Errors
     ///
@@ -198,8 +209,9 @@ impl Starting {
     /// sign-in in a browser does this); [`Error::AgentExited`] when the process ends first,
     /// or is stopped; [`Error::AgentRefused`] when the agent answers with an error;
     /// [`Error::AgentProtocol`] when it speaks another version or replies in a shape the app
-    /// cannot read.
-    pub(crate) fn open_session(self) -> Result<Agent> {
+    /// cannot read; [`Error::ModelNotChoosable`] when `model` is given and the agent offers
+    /// no model choice, and [`Error::ModelNotOffered`] when it does not offer `model`.
+    pub(crate) fn open_session(self, model: Option<&str>) -> Result<Agent> {
         let initialize = InitializeParams {
             protocol_version: wire::PROTOCOL_VERSION,
             client_capabilities: ClientCapabilities {
@@ -234,19 +246,70 @@ impl Starting {
             mcp_servers: [],
         };
         let reply: NewSessionResult = process.call("session/new", &session, self.timeout)?;
-        let model = reply.current_model();
+        let model_config = reply.model_config();
+        let model = match model {
+            None => reply.current_model(),
+            Some(wanted) => Some(set_model(
+                &process,
+                &reply.session_id,
+                model_config.as_ref(),
+                wanted,
+                self.timeout,
+            )?),
+        };
         Ok(Agent {
             process,
             session: reply.session_id,
             model,
+            offered: model_config.map_or_else(Vec::new, |config| config.options),
         })
     }
+}
+
+/// Sets session `session` to the model `wanted`, which `config`, the agent's model select,
+/// must offer, and returns the model now in effect: the one the agent's reply reports, else
+/// `wanted`.
+fn set_model(
+    process: &Process,
+    session: &str,
+    config: Option<&ModelConfig>,
+    wanted: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let config = config.ok_or_else(|| Error::ModelNotChoosable {
+        model: wanted.to_owned(),
+    })?;
+    if !config.offers(wanted) {
+        return Err(Error::ModelNotOffered {
+            model: wanted.to_owned(),
+            offered: config
+                .options
+                .iter()
+                .map(|option| option.value.clone())
+                .collect(),
+        });
+    }
+    let params = SetConfigOptionParams {
+        session_id: session,
+        config_id: &config.id,
+        value: wanted,
+    };
+    let reply: SetConfigOptionResult =
+        process.call("session/set_config_option", &params, timeout)?;
+    let current = wire::model_config(&reply.config_options).and_then(|config| config.current);
+    Ok(current.unwrap_or_else(|| wanted.to_owned()))
 }
 
 impl Agent {
     /// The active model id reported when the session opened, when known.
     pub(crate) fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// The models the agent offered when the session opened, in its order; empty when it
+    /// offers no model choice.
+    pub(crate) fn offered_models(&self) -> &[ModelOption] {
+        &self.offered
     }
 
     /// Whether the agent is still there: false once the reader has seen its output end, or
@@ -1110,7 +1173,8 @@ mod tests {
             search_path: &search_path,
             timeout,
         };
-        let agent = Agent::spawn(&launch, move |event| drop(sender.send(event)))?.open_session()?;
+        let agent =
+            Agent::spawn(&launch, move |event| drop(sender.send(event)))?.open_session(None)?;
         Ok((agent, events))
     }
 
@@ -1536,7 +1600,7 @@ mod tests {
         };
         let starting = Agent::spawn(&launch, |_| {}).unwrap();
         let stopper = starting.stopper();
-        let opening = thread::spawn(move || starting.open_session());
+        let opening = thread::spawn(move || starting.open_session(None));
 
         // The agent writes its pid once it runs; then it never answers.
         let pid = read_fifo(&pid_file, WAIT);

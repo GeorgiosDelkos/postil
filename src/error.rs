@@ -7,6 +7,11 @@ use std::path::PathBuf;
 /// A specialized `Result` for this crate.
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
+/// How many offered models [`Error::ModelNotOffered`] names before it counts the rest.
+/// Arbitrary: enough to see the kind of id the agent now uses, short enough for one line of
+/// the run card (agy offered 11 on 2026-11-26).
+const MODELS_LISTED: usize = 8;
+
 /// Why opening the repository or the window failed, why a file could not be shown, or why
 /// the notes could not be read or saved.
 #[derive(Debug)]
@@ -190,6 +195,19 @@ pub enum Error {
     /// An agent speaks another protocol version or replied in a shape the app cannot read;
     /// the text says which.
     AgentProtocol(String),
+    /// The settings choose a model the agent does not offer (any more): an agent update can
+    /// drop a model id, and running another model instead would go unnoticed.
+    ModelNotOffered {
+        /// The model the settings choose.
+        model: String,
+        /// The models the agent offers, in its order.
+        offered: Vec<String>,
+    },
+    /// The settings choose a model for an agent that offers no model choice.
+    ModelNotChoosable {
+        /// The model the settings choose.
+        model: String,
+    },
     /// A run log could not be created or written.
     WriteRun {
         /// The log, or its directory.
@@ -464,6 +482,29 @@ impl fmt::Display for Error {
                 message,
             } => write!(f, "the agent refused {step}: {message} ({code})"),
             Self::AgentProtocol(problem) => write!(f, "the agent cannot be used: {problem}"),
+            Self::ModelNotOffered { model, offered } => {
+                write!(
+                    f,
+                    "the agent does not offer the model {model:?}; choose another for it in \
+                     Settings (offered: "
+                )?;
+                if offered.is_empty() {
+                    write!(f, "none")?;
+                }
+                for (index, value) in offered.iter().take(MODELS_LISTED).enumerate() {
+                    let comma = if index == 0 { "" } else { ", " };
+                    write!(f, "{comma}{value}")?;
+                }
+                if offered.len() > MODELS_LISTED {
+                    write!(f, ", and {} more", offered.len() - MODELS_LISTED)?;
+                }
+                write!(f, ")")
+            }
+            Self::ModelNotChoosable { model } => write!(
+                f,
+                "the agent does not let Postil choose its model; set it to Agent default in \
+                 Settings (configured: {model:?})"
+            ),
             Self::WriteRun { path, .. } => write!(
                 f,
                 "cannot write the run log {} (check that the directory is writable)",
@@ -650,6 +691,8 @@ impl std::error::Error for Error {
             | Self::AgentExited { .. }
             | Self::AgentRefused { .. }
             | Self::AgentProtocol(_)
+            | Self::ModelNotOffered { .. }
+            | Self::ModelNotChoosable { .. }
             | Self::TurnRunning
             | Self::RunElsewhere
             | Self::TooManyRuns { .. }
@@ -668,5 +711,30 @@ impl std::error::Error for Error {
             | Self::NotAWorktree { .. }
             | Self::ApplyConflict { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_not_offered_names_up_to_eight_offered_and_counts_the_rest() {
+        let offered = |count: usize| Error::ModelNotOffered {
+            model: "old".to_owned(),
+            offered: (1..=count).map(|n| format!("m{n}")).collect(),
+        };
+        let start = "the agent does not offer the model \"old\"; choose another for it in \
+                     Settings (offered: ";
+        assert_eq!(offered(0).to_string(), format!("{start}none)"));
+        assert_eq!(
+            offered(8).to_string(),
+            format!("{start}m1, m2, m3, m4, m5, m6, m7, m8)"),
+            "exactly the limit: all named, none counted"
+        );
+        assert_eq!(
+            offered(9).to_string(),
+            format!("{start}m1, m2, m3, m4, m5, m6, m7, m8, and 1 more)")
+        );
     }
 }

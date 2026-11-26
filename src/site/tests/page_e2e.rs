@@ -14,8 +14,8 @@
 //!   refused.
 //! - `POST /new-fresh` makes a site the same way, but it opens no project, has no
 //!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
-//!   startup wizard open. `POST /new-fresh-gemini` does the same with a `gemini` program on
-//!   the search path, so the wizard finds that built-in agent installed.
+//!   startup wizard open. `POST /new-fresh-gemini` does the same with an `agy` program on
+//!   the search path, so the wizard finds the built-in Gemini agent installed.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -175,7 +175,7 @@ enum Start {
     /// No project, no `settings.json` and an empty search path, as on a first launch: the
     /// page shows the welcome screen with the startup wizard over it.
     FirstRun,
-    /// As [`Start::FirstRun`], with a `gemini` program on the search path, so the wizard
+    /// As [`Start::FirstRun`], with an `agy` program (Gemini's) on the search path, so the wizard
     /// finds one built-in agent installed.
     FirstRunWithGemini,
 }
@@ -211,12 +211,13 @@ fn bridged(number: usize, start: Start) -> Bridged {
             notify,
         ),
         Start::FirstRunWithGemini => {
-            // Found by name only: the wizard never starts it.
+            // An empty script: the wizard asks it for its models, and it exits at once, so the
+            // model select offers only the agent's default.
             let bin = repo.root.join(".git/test-bin");
             fs::create_dir_all(&bin).unwrap();
-            let gemini = bin.join("gemini");
-            fs::write(&gemini, "#!/bin/sh\n").unwrap();
-            fs::set_permissions(&gemini, fs::Permissions::from_mode(0o755)).unwrap();
+            let agy = bin.join("agy");
+            fs::write(&agy, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
             let search_path = bin.into_os_string();
             Site::new(
                 Some(&repo.config()),

@@ -10,6 +10,7 @@
 import { $, actOnSecondClick, el, showToast, statusIcon } from "./dom.js";
 import { fullPlace, shortPlace } from "./note-place.js";
 import { isOpen, isResolved, promptLines, sendable } from "./run.js";
+import { formatSlot } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
 // `state` is the page's state: the tray reads `notes`, `settings` and `projectOpen`, and keeps
@@ -177,7 +178,7 @@ export function notesTray({
     const button = el("button", "note-send", "↗");
     button.type = "button";
     button.setAttribute("aria-label", `Send note ${note.id} alone`);
-    const agent = state.settings?.agent ?? "the agent";
+    const agent = state.settings?.agent ? formatSlot(state.settings.agent) : "the agent";
     button.title = `Send ${note.id} to ${agent} now · Shift-click to see the prompt first`;
     button.addEventListener("click", (event) => sendAlone(note, { review: event.shiftKey }));
     return button;
@@ -233,7 +234,7 @@ export function notesTray({
 
   // The agent of this send, or the settings' agent.
   function chosenAgent() {
-    return state.send?.agent ?? state.settings?.agent ?? null;
+    return state.send?.agent ?? state.settings?.agent?.name ?? null;
   }
 
   // The notes ticked for the send, in the tray's order, which is the prompt's order.
@@ -411,7 +412,7 @@ export function notesTray({
   // Sends `note` alone to the default agent, and stays on the notes: its card shows the run.
   // With `review`, or with no agent chosen yet, opens the send step with only it ticked.
   async function sendAlone(note, { review }) {
-    const agent = state.settings?.agent;
+    const agent = state.settings?.agent?.name;
     if (review || !agent) {
       openSend([note.id]);
       return;
@@ -444,7 +445,7 @@ export function notesTray({
     const agents = state.settings?.enabledAgents ?? [];
     const actions = agents.map((name) => ({
       label: name,
-      detail: name === state.settings.agent ? "default" : "",
+      detail: name === state.settings.agent?.name ? "default" : "",
       key: name === chosenAgent() ? "✓" : "",
       run: () => {
         if (!state.send) return;

@@ -5,18 +5,22 @@ import {
   addReviewer,
   agentRows,
   codeMetrics,
+  formatSlot,
   moveReviewer,
   removeCustomAgent,
   removeReviewer,
   saveCustomAgent,
   setAgent,
+  setAgentModel,
   setEnabled,
+  setReviewerModel,
 } from "./settings.js";
+import { modelSelectOptions } from "./settings-controls.js";
 
 const BUILT_IN = ["Claude", "Codex", "Gemini", "Grok", "OpenCode"];
 
 // Settings as api/settings returns them, with one custom agent in use as the agent and Grok
-// reviewing twice.
+// reviewing twice, once on a chosen model.
 function settings() {
   return {
     theme: "system",
@@ -25,10 +29,18 @@ function settings() {
     reopenLastProject: false,
     customAgents: [{ name: "Local", command: "local-agent --acp" }],
     enabledAgents: ["Grok", "Local", "Claude"],
-    agent: "Local",
-    reviewers: ["Grok", "Grok"],
+    agent: { name: "Local", model: null },
+    reviewers: [
+      { name: "Grok", model: "grok-4.7" },
+      { name: "Grok", model: null },
+    ],
   };
 }
+
+const slot = (name, model = null) => ({ name, model });
+
+// Their names, for the tests that check only which agents a list holds.
+const names = (slots) => slots.map((each) => each.name);
 
 test("the line height keeps the 22 px to 13 px proportion at every offered size", () => {
   assert.deepEqual(codeMetrics(13), { fontSize: 13, lineHeight: 22 });
@@ -97,8 +109,12 @@ test("a new custom agent is trimmed, enabled, and checked as the Rust process ch
 });
 
 test("renaming a custom agent renames it wherever it is chosen", () => {
-  // Local is the agent and also the second of three reviewers.
-  const before = { ...settings(), reviewers: ["Grok", "Local", "Claude"] };
+  // Local is the agent, on a model, and also the second of three reviewers, on another.
+  const before = {
+    ...settings(),
+    agent: slot("Local", "big"),
+    reviewers: [slot("Grok"), slot("Local", "small"), slot("Claude")],
+  };
   const renamed = saveCustomAgent(
     before,
     { name: "Mine", command: "mine --acp" },
@@ -107,8 +123,8 @@ test("renaming a custom agent renames it wherever it is chosen", () => {
   ).settings;
   assert.deepEqual(renamed.customAgents, [{ name: "Mine", command: "mine --acp" }]);
   assert.deepEqual(renamed.enabledAgents, ["Grok", "Mine", "Claude"]);
-  assert.equal(renamed.agent, "Mine");
-  assert.deepEqual(renamed.reviewers, ["Grok", "Mine", "Claude"]);
+  assert.deepEqual(renamed.agent, slot("Mine", "big"), "the model goes with the agent");
+  assert.deepEqual(renamed.reviewers, [slot("Grok"), slot("Mine", "small"), slot("Claude")]);
 
   const kept = saveCustomAgent(settings(), { name: "Local", command: "other" }, "Local", BUILT_IN);
   assert.equal(kept.error, undefined, "keeping its own name is not a clash");
@@ -124,19 +140,86 @@ test("a custom agent in use cannot be removed; a free one leaves every list", ()
 });
 
 test("the agent and reviewers are chosen among enabled agents only", () => {
-  assert.equal(setAgent(settings(), "Claude").settings.agent, "Claude");
+  assert.deepEqual(setAgent(settings(), "Claude").settings.agent, slot("Claude"));
   assert.equal(setAgent(settings(), null).settings.agent, null);
   assert.match(setAgent(settings(), "Gemini").error, /Turn Gemini on first/);
   const reviewers = addReviewer(settings(), "Claude").settings.reviewers;
-  assert.deepEqual(reviewers, ["Grok", "Grok", "Claude"]);
+  assert.deepEqual(reviewers.at(-1), slot("Claude"), "a new reviewer runs its default model");
+  assert.deepEqual(names(reviewers), ["Grok", "Grok", "Claude"]);
   assert.match(addReviewer(settings(), "Gemini").error, /Turn Gemini on first/);
+});
+
+test("switching the agent resets its model, and choosing the same one keeps it", () => {
+  const chosen = setAgentModel(settings(), "fast").settings;
+  assert.deepEqual(chosen.agent, slot("Local", "fast"));
+  assert.deepEqual(setAgent(chosen, "Local").settings.agent, slot("Local", "fast"));
+  assert.deepEqual(setAgent(chosen, "Claude").settings.agent, slot("Claude"));
+  assert.deepEqual(setAgentModel(chosen, null).settings.agent, slot("Local"));
+  assert.match(setAgentModel(setAgent(chosen, null).settings, "x").error, /Choose the agent/);
+});
+
+test("each reviewer entry has its own model, even for the same agent", () => {
+  const both = setReviewerModel(settings(), 1, "grok-4.6").settings;
+  assert.deepEqual(both.reviewers, [slot("Grok", "grok-4.7"), slot("Grok", "grok-4.6")]);
+  assert.deepEqual(setReviewerModel(both, 0, null).settings.reviewers[0], slot("Grok"));
+  assert.deepEqual(settings().reviewers[1], slot("Grok"), "the settings given are not changed");
+  // A move carries the model with its reviewer.
+  assert.deepEqual(moveReviewer(both, 1, -1).settings.reviewers[0], slot("Grok", "grok-4.6"));
+});
+
+test("a slot reads as its agent, then its model's name when the agent reported it", () => {
+  const ready = {
+    status: "ready",
+    current: "opus",
+    options: [{ value: "opus", name: "Opus 5.5" }],
+  };
+  assert.equal(formatSlot(slot("Claude", "opus"), ready), "Claude · Opus 5.5");
+  assert.equal(formatSlot(slot("Claude", "opus"), undefined), "Claude · opus");
+  assert.equal(formatSlot(slot("Claude", "sonnet"), ready), "Claude · sonnet");
+  assert.equal(formatSlot(slot("Claude"), ready), "Claude", "the agent's default names no model");
+});
+
+test("a model select never drops the saved model, and says when the agent stopped offering it", () => {
+  const ready = {
+    status: "ready",
+    current: "opus",
+    options: [
+      { value: "opus", name: "Opus 5.5" },
+      { value: "sonnet", name: "Sonnet 5.5" },
+    ],
+  };
+  assert.deepEqual(modelSelectOptions(ready, null), [
+    ["", "Agent default"],
+    ["opus", "Opus 5.5"],
+    ["sonnet", "Sonnet 5.5"],
+  ]);
+  assert.deepEqual(modelSelectOptions(ready, "sonnet"), modelSelectOptions(ready, null));
+  // A stored id the agent no longer offers stays chosen, marked, so the run's failure is no
+  // surprise and the engineer picks another (team note: such ids broke runs silently).
+  assert.deepEqual(modelSelectOptions(ready, "gemini-2.5-pro").at(-1), [
+    "gemini-2.5-pro",
+    "gemini-2.5-pro (not offered)",
+  ]);
+  for (const report of [{ status: "loading" }, { status: "failed", error: "x" }, undefined]) {
+    assert.deepEqual(modelSelectOptions(report, "opus"), [
+      ["", "Agent default"],
+      ["opus", "opus"],
+    ]);
+    assert.deepEqual(modelSelectOptions(report, null), [["", "Agent default"]]);
+  }
+  const none = { status: "ready", current: "m", options: [] };
+  assert.deepEqual(modelSelectOptions(none, "pro").at(-1), ["pro", "pro (not offered)"]);
 });
 
 test("reviewers are removed by position and moved within the list's ends", () => {
   const three = addReviewer(settings(), "Claude").settings;
-  assert.deepEqual(removeReviewer(three, 0).settings.reviewers, ["Grok", "Claude"]);
-  assert.deepEqual(moveReviewer(three, 2, -1).settings.reviewers, ["Grok", "Claude", "Grok"]);
-  assert.deepEqual(moveReviewer(three, 0, 1).settings.reviewers, ["Grok", "Grok", "Claude"]);
+  assert.deepEqual(names(removeReviewer(three, 0).settings.reviewers), ["Grok", "Claude"]);
+  assert.deepEqual(names(moveReviewer(three, 2, -1).settings.reviewers), [
+    "Grok",
+    "Claude",
+    "Grok",
+  ]);
+  assert.deepEqual(names(moveReviewer(three, 0, 1).settings.reviewers), ["Grok", "Grok", "Claude"]);
   assert.equal(moveReviewer(three, 0, -1).settings, three, "the first cannot move up");
   assert.equal(moveReviewer(three, 2, 1).settings, three, "the last cannot move down");
 });

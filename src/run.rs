@@ -595,17 +595,27 @@ impl Runner {
         let evicted = self.open_thread(&first)?.state == State::Evicted;
         let slots = self.slots();
         // The thread's kept agent ran `followed`, the slot's run. An evicted thread's agent,
-        // kept in another window, worked in a worktree that is gone.
-        let same_conversation = !evicted
-            && slots.by_thread.get(&first).is_some_and(|slot| {
-                matches!(
-                    &slot.agent,
-                    Held::Ready(kept, live) if *kept == agent && live.is_alive()
-                ) && slot
-                    .run
+        // kept in another window, worked in a worktree that is gone. The kept agent goes on
+        // with its own choice, model included, whatever the settings now say: a slot changed
+        // since must not drop the conversation or switch its model (decided 2026-11-26). Only
+        // a fresh agent takes `agent`, the settings' choice.
+        let kept = slots
+            .by_thread
+            .get(&first)
+            .filter(|_| !evicted)
+            .filter(|slot| {
+                slot.run
                     .as_ref()
                     .is_some_and(|run| Arc::ptr_eq(run, followed))
+            })
+            .and_then(|slot| match &slot.agent {
+                // The slot's run is `followed`, and `agent` is named from that run, so the kept
+                // agent is always the run's own agent: only whether it still runs is checked.
+                Held::Ready(kept, live) if live.is_alive() => Some(kept.clone()),
+                Held::Ready(..) | Held::Starting(_) | Held::None => None,
             });
+        let same_conversation = kept.is_some();
+        let agent = kept.unwrap_or(agent);
         let prompt = if same_conversation {
             // After the words, so the page tells this prompt from a fresh agent's by its start
             // (`ui/status.js`, `freshAgent`).
@@ -1685,7 +1695,7 @@ impl Runner {
                 let slot = slots.by_thread.get_mut(&id).expect("let_go found the slot");
                 slot.agent = Held::Starting(starting.stopper());
             }
-            let opened = starting.open_session();
+            let opened = starting.open_session(pending.agent.model.as_deref());
 
             let mut slots = runner.slots();
             if slots.let_go(&id, generation) {

@@ -734,8 +734,8 @@ fn reviewers_propose_read_only_then_the_last_judges_the_findings() {
             { "name": "Reviewer", "command": fake_agent("reviewer") },
         ],
         "enabledAgents": ["Fake", "Reviewer"],
-        "agent": "Fake",
-        "reviewers": ["Reviewer", "Reviewer"],
+        "agent": { "name": "Fake" },
+        "reviewers": [{ "name": "Reviewer" }, { "name": "Reviewer" }],
     });
     let (status, body) = save(&site, &settings.to_string());
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -828,11 +828,15 @@ fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
     ));
     let mut enabled = vec!["Fake"];
     enabled.extend(reviewers.iter().map(|(name, _)| *name));
+    let slots: Vec<_> = reviewers
+        .iter()
+        .map(|(name, _)| serde_json::json!({ "name": name }))
+        .collect();
     let settings = serde_json::json!({
         "customAgents": custom,
         "enabledAgents": enabled,
-        "agent": "Fake",
-        "reviewers": reviewers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        "agent": { "name": "Fake" },
+        "reviewers": slots,
     });
     let (status, body) = save(site, &settings.to_string());
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1033,8 +1037,8 @@ fn a_single_reviewer_only_proposes_and_a_send_after_a_review_starts_a_fresh_agen
     let settings = serde_json::json!({
         "customAgents": [{ "name": "Fake", "command": fake_agent("plain") }],
         "enabledAgents": ["Fake"],
-        "agent": "Fake",
-        "reviewers": ["Fake"],
+        "agent": { "name": "Fake" },
+        "reviewers": [{ "name": "Fake" }],
     });
     assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
     let body = serde_json::json!({ "of": "R1" }).to_string();
@@ -3014,8 +3018,8 @@ fn a_reviewer_that_is_the_thread_s_own_agent_still_starts_fresh() {
     let settings = serde_json::json!({
         "customAgents": [{ "name": "Fake", "command": fake_agent("reviewer") }],
         "enabledAgents": ["Fake"],
-        "agent": "Fake",
-        "reviewers": ["Fake"],
+        "agent": { "name": "Fake" },
+        "reviewers": [{ "name": "Fake" }],
     });
     let (status, body) = save(&site, &settings.to_string());
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3113,4 +3117,160 @@ fn the_latest_run_deleted_gives_way_to_the_window_s_run_under_way() {
     assert_eq!(latest["id"], "R1");
     assert_eq!(latest["status"], "running");
     assert_eq!(stop(&site).0, StatusCode::OK);
+}
+
+/// Saves Fake, the fake agent in `author`, as the agent notes go to, running `model`, and
+/// Reviewer, the fake agent in scenario "reviewer", as one reviewer per model in `reviewers`.
+fn set_models(site: &Site, author: &str, model: Option<&str>, reviewers: &[&str]) {
+    let settings = serde_json::json!({
+        "customAgents": [
+            { "name": "Fake", "command": fake_agent(author) },
+            { "name": "Reviewer", "command": fake_agent("reviewer") },
+        ],
+        "enabledAgents": ["Fake", "Reviewer"],
+        "agent": { "name": "Fake", "model": model },
+        "reviewers": reviewers
+            .iter()
+            .map(|model| serde_json::json!({ "name": "Reviewer", "model": model }))
+            .collect::<Vec<_>>(),
+    });
+    let (status, body) = save(site, &settings.to_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Waits until the usage ledger records `expected`, sorted, as the models `agent` ran, and
+/// fails when it does not within [`WAIT`]. A run's record is appended just after the run
+/// shows as ended (`run/log.rs`, `Run::record`), so one read could come too early.
+fn assert_ledger_models(site: &Site, agent: &str, expected: &[&str]) {
+    site.agents.wait();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let usage = get_json(site, "postil://localhost/api/usage?scope=all&range=all");
+        let agents = usage["agents"].as_array().unwrap();
+        let listed = agents.iter().find(|each| each["name"] == agent);
+        let mut models: Vec<&str> = listed
+            .and_then(|listed| listed["activity"]["models"].as_array())
+            .into_iter()
+            .flatten()
+            .map(|each| each["model"].as_str().unwrap())
+            .collect();
+        models.sort_unstable();
+        if models == expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{agent} ran {models:?}: {usage}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn the_slot_s_model_is_set_before_the_prompt_and_a_follow_up_keeps_its_agent_s_model() {
+    let repo = TempRepo::new("run-model");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    set_models(&site, "plain", Some("pro"), &[]);
+    post_note(&site, "a.txt", 1, 1, "one");
+    post_note(&site, "a.txt", 1, 1, "two");
+
+    send(&site, &["N1"]);
+    let first = wait_for(&site, &nudges, "ended");
+    assert_eq!(
+        kinds(&first)[1],
+        "message:model pro",
+        "the model is set before the prompt"
+    );
+
+    // The model unchanged, the follow-up goes to the agent kept from R1: its second prompt.
+    let follow = |of: &str| {
+        let body = serde_json::json!({ "of": of, "text": "more" }).to_string();
+        let (status, body) = post(&site, &format!("{RUN}/follow"), &body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    follow("R1");
+    let kept = wait_for_run(&site, &nudges, "R2");
+    assert!(
+        kinds(&kept).contains(&"message:prompt 2".to_owned()),
+        "{kept}"
+    );
+
+    // Another model for the slot: the conversation goes on with the kept agent, on the model
+    // it runs, and the slot's new model is for the next fresh agent.
+    set_models(&site, "plain", Some("m"), &[]);
+    follow("R2");
+    let continued = wait_for_run(&site, &nudges, "R3");
+    let said = kinds(&continued);
+    assert_eq!(said[1], "message:model pro", "{continued}");
+    assert!(said.contains(&"message:prompt 3".to_owned()), "{continued}");
+
+    send(&site, &["N2"]);
+    let fresh = wait_for_run(&site, &nudges, "R4");
+    let said = kinds(&fresh);
+    assert_eq!(said[1], "message:model m", "{fresh}");
+    assert!(said.contains(&"message:prompt 1".to_owned()), "{fresh}");
+    assert_ledger_models(&site, "Fake", &["m", "pro"]);
+}
+
+#[test]
+fn each_reviewer_runs_its_own_model() {
+    let repo = TempRepo::new("run-review-models");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    set_models(&site, "plain", None, &["fast", "pro"]);
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    let sent = wait_for(&site, &nudges, "ended");
+    assert!(
+        kinds(&sent)[1].starts_with("message:got "),
+        "no model is set without one in the slot: {sent}"
+    );
+
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+    // The judge's stage last: R2 may already have given way to it when the test first looks.
+    let judge = wait_for_run(&site, &nudges, "R3");
+    assert_eq!(kinds(&judge)[1], "message:model pro", "{judge}");
+    let proposer = get_json(&site, &format!("{RUN}?id=R2"));
+    assert_eq!(kinds(&proposer)[1], "message:model fast", "{proposer}");
+    assert_ledger_models(&site, "Reviewer", &["fast", "pro"]);
+}
+
+#[test]
+fn a_model_the_agent_does_not_offer_fails_the_run_before_any_prompt() {
+    let repo = TempRepo::new("run-model-gone");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    // A model id an older agent offered, as gemini-2.x ids were before agy.
+    set_models(&site, "plain", Some("gemini-2.5-pro"), &[]);
+    post_note(&site, "a.txt", 1, 1, "one");
+
+    send(&site, &["N1"]);
+    let failed = wait_for(&site, &nudges, "failed");
+    let error = entries(&failed)[0]["error"].as_str().unwrap().to_owned();
+    assert_eq!(
+        error,
+        "the agent does not offer the model \"gemini-2.5-pro\"; choose another for it in \
+         Settings (offered: m, pro, fast, deep)"
+    );
+    assert!(
+        !kinds(&failed)
+            .iter()
+            .any(|kind| kind.starts_with("message:")),
+        "the agent got no prompt: {failed}"
+    );
+    assert_eq!(states(&site), [serde_json::json!({ "kind": "open" })]);
+
+    // An agent with no model choice cannot run a model at all.
+    set_models(&site, "no-config", Some("pro"), &[]);
+    send(&site, &["N1"]);
+    let failed = wait_for_run(&site, &nudges, "R2");
+    let error = entries(&failed)[0]["error"].as_str().unwrap().to_owned();
+    assert_eq!(
+        error,
+        "the agent does not let Postil choose its model; set it to Agent default in Settings \
+         (configured: \"pro\")"
+    );
+    assert_eq!(states(&site), [serde_json::json!({ "kind": "open" })]);
 }
