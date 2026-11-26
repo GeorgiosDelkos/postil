@@ -414,3 +414,102 @@ test("two threads run side by side, and each stops from its own dialog", async (
   await api("api/run/cancel", { method: "POST", body: JSON.stringify({ run: "R2" }) });
   await page.locator("#run-header .stop").waitFor({ state: "detached" });
 });
+
+test("the startup wizard opens on first launch, saves settings, and stays closed on reload", async (t) => {
+  const created = await fetch(new URL("new-fresh", bridge), { method: "POST" });
+  const site = new URL((await created.json()).base, bridge);
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  page.setDefaultTimeout(WAIT);
+  await page.addInitScript(init);
+  await page.goto(site.href);
+
+  const wizard = page.locator("#wizard");
+  await wizard.waitFor();
+  await wizard.getByRole("heading", { name: "Connect your coding agents" }).waitFor();
+
+  // Add a custom agent on Step 1, walk through Steps 2–4, change appearance, and Finish.
+  await wizard.getByRole("button", { name: "Add agent…" }).click();
+  await wizard.locator('[data-key="form-name"]').fill("Local");
+  await wizard.locator('[data-key="form-command"]').fill("local-agent --acp");
+  await wizard.getByRole("button", { name: "Add", exact: true }).click();
+  await wizard.getByRole("button", { name: "Next" }).click();
+
+  await wizard.getByRole("heading", { name: "Default agent and reviewers" }).waitFor();
+  assert.equal(await wizard.locator('[data-key="wizard-agent"]').inputValue(), "Local");
+  await wizard.getByRole("button", { name: "Next" }).click();
+
+  await wizard.getByRole("heading", { name: "Appearance and startup" }).waitFor();
+  await wizard.getByRole("radio", { name: "Dark" }).click();
+  await wizard.getByRole("button", { name: "Next" }).click();
+
+  await wizard.getByRole("heading", { name: "Ready to review" }).waitFor();
+  await wizard.getByRole("button", { name: "Finish", exact: true }).click();
+  await wizard.waitFor({ state: "hidden" });
+
+  const reply = await fetch(new URL("api/settings", site));
+  const saved = await reply.json();
+  assert.equal(saved.firstRun, false);
+  assert.equal(saved.settings.theme, "dark");
+  assert.equal(saved.settings.agent, "Local");
+
+  // Reloading after setup shows the welcome screen without reopening the wizard.
+  await page.reload();
+  await page.locator("#welcome").waitFor();
+  assert.equal(await wizard.isVisible(), false);
+});
+
+test("Skip on the first run saves the defaults with the installed agents turned on", async (t) => {
+  const created = await fetch(new URL("new-fresh-gemini", bridge), { method: "POST" });
+  const site = new URL((await created.json()).base, bridge);
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  page.setDefaultTimeout(WAIT);
+  await page.addInitScript(init);
+  await page.goto(site.href);
+
+  const wizard = page.locator("#wizard");
+  await wizard.getByRole("checkbox", { name: /Gemini/ }).waitFor();
+  await wizard.getByRole("button", { name: "Skip" }).click();
+  await wizard.waitFor({ state: "hidden" });
+
+  const saved = await (await fetch(new URL("api/settings", site))).json();
+  assert.equal(saved.firstRun, false);
+  assert.deepEqual(saved.settings.enabledAgents, ["Gemini"]);
+  assert.equal(saved.settings.agent, "Gemini");
+  assert.equal(saved.settings.theme, "system");
+});
+
+test("a wizard whose save is refused starts over from the file another window wrote", async (t) => {
+  const created = await fetch(new URL("new-fresh", bridge), { method: "POST" });
+  const site = new URL((await created.json()).base, bridge);
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  page.setDefaultTimeout(WAIT);
+  await page.addInitScript(init);
+  await page.goto(site.href);
+
+  const wizard = page.locator("#wizard");
+  await wizard.getByRole("heading", { name: "Connect your coding agents" }).waitFor();
+  await wizard.getByRole("button", { name: "Next" }).click();
+  await wizard.getByRole("button", { name: "Next" }).click();
+  await wizard.getByRole("radio", { name: "Dark" }).click();
+  await wizard.getByRole("button", { name: "Next" }).click();
+  await wizard.getByRole("heading", { name: "Ready to review" }).waitFor();
+
+  // Another window creates settings.json while this wizard is open.
+  const before = await (await fetch(new URL("api/settings", site))).json();
+  const other = { ...before.settings, theme: "light", tabWidth: 8 };
+  const body = JSON.stringify({ revision: before.revision, settings: other });
+  const written = await fetch(new URL("api/settings", site), { method: "PUT", body });
+  assert.equal(written.status, 200, await written.text());
+
+  await wizard.getByRole("button", { name: "Finish", exact: true }).click();
+  await wizard.getByRole("alert").filter({ hasText: "the file changed" }).waitFor();
+  await wizard.getByRole("button", { name: "Finish", exact: true }).click();
+  await wizard.waitFor({ state: "hidden" });
+
+  const saved = await (await fetch(new URL("api/settings", site))).json();
+  assert.equal(saved.settings.theme, "light");
+  assert.equal(saved.settings.tabWidth, 8);
+});

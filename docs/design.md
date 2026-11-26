@@ -179,7 +179,8 @@ schedule three tasks.
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
 | `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
 | `ui/dom.js`, `ui/dialog-parts.js`, `ui/question-form.js` | Helpers the views share: `el()`, icons, the toast and two-click delete; the parts both dialogs draw; the question form. |
-| `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
+| `ui/settings.js`, `ui/settings-controls.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`), shared controls, and drawing. |
+| `ui/wizard.js`, `ui/wizard-dialog.js` | The first-run startup wizard: its rules (tested with `node --test`) and 4-step dialog. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 
@@ -978,6 +979,16 @@ Every reply carries the file's revision (a hash of its text), and a save names t
 it started from; a file changed since (another window, a hand edit) refuses the save, and the
 dialog shows the file as it now is. Without that, saving the whole settings would drop the
 other change.
+
+When `~/.config/postil/settings.json` does not exist yet (first launch, outside `--bench`),
+a modal startup wizard (`ui/wizard.js`, `ui/wizard-dialog.js`) opens over the window and walks
+through installed agents, the default agent and optional reviewers, appearance (with a live
+code preview) and startup behavior, and a readiness summary (`git`, `npx`, `gh`). Completing or
+skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
+installed built-in agents turned on); closing it mid-way reverts any preview without writing the
+file. The wizard's save names a revision like the dialog's, and when the file changes under it
+(another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
+from Settings.
 
 ## Dependencies
 

@@ -295,6 +295,8 @@ pub(crate) struct Loaded {
     /// A fingerprint of the file's text ([`revision_of`]), empty when there is no file or
     /// it cannot be read. A save names the revision it started from.
     pub(crate) revision: String,
+    /// Whether no settings file exists yet, so the startup wizard opens on first launch.
+    pub(crate) first_run: bool,
 }
 
 /// Reads the settings from `file`. Never fails: a file that cannot be used gives the defaults
@@ -302,10 +304,17 @@ pub(crate) struct Loaded {
 pub(crate) fn load(file: &Path) -> Loaded {
     let (read, revision) = read(file);
     match read {
-        Ok(settings) => Loaded {
-            settings: settings.unwrap_or_default(),
+        Ok(Some(settings)) => Loaded {
+            settings,
             problem: None,
             revision,
+            first_run: false,
+        },
+        Ok(None) => Loaded {
+            settings: Settings::default(),
+            problem: None,
+            revision,
+            first_run: true,
         },
         Err(problem) => Loaded {
             settings: Settings::default(),
@@ -314,6 +323,7 @@ pub(crate) fn load(file: &Path) -> Loaded {
                  or reset."
             )),
             revision,
+            first_run: false,
         },
     }
 }

@@ -264,6 +264,7 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
                 | Command::SwitchProject
                 | Command::GoToFile
                 | Command::Settings
+                | Command::SetupWizard
                 | Command::FocusMode => Unanswered::Ignore,
             };
             ask_page(&app.page, command.id(), unanswered);
