@@ -233,6 +233,47 @@ fn a_kept_agent_follow_up_records_only_its_session_cost_delta() {
 }
 
 #[test]
+fn grok_meta_usage_records_tokens_and_per_turn_cost_across_follow_ups() {
+    let repo = TempRepo::new("usage-grok-meta");
+    repo.write("src/a.rs", "one\ntwo\nthree\n");
+    let (site, nudges) = run_site(&repo, "grok-usage");
+    let site = site.with_quota_poller(QuotaPoller::new(|_, _| {
+        QuotaReport::unavailable("test stub")
+    }));
+
+    post_note(&site, "src/a.rs", 1, 1, "check this");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    assert_eq!(wait_for_run(&site, &nudges, "R1")["status"], "ended");
+
+    // Turn 2 reports a smaller per-turn cost ($0.01 vs $0.02), which sums to $0.03.
+    let (status, body) = post(
+        &site,
+        &format!("{RUN}/follow"),
+        &serde_json::json!({ "of": "R1", "text": "follow up" }).to_string(),
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(wait_for_run(&site, &nudges, "R2")["status"], "ended");
+
+    site.agents.wait();
+    let usage = get_json(
+        &site,
+        "postil://localhost/api/usage?scope=project&range=24h",
+    );
+    assert_eq!(usage["summary"]["runs"], 2);
+    assert_eq!(usage["summary"]["inputTokens"], 3000);
+    assert_eq!(usage["summary"]["outputTokens"], 100);
+    assert_eq!(usage["summary"]["cachedReadTokens"], 400);
+    assert_eq!(usage["summary"]["cachedWriteTokens"], 20);
+    assert_eq!(usage["summary"]["thoughtTokens"], 50);
+    assert_eq!(usage["summary"]["totalTokens"], 3100);
+    let cost = usage["summary"]["cost"]["amount"].as_f64().unwrap();
+    assert!(
+        (cost - 0.03).abs() < 1e-9,
+        "expected 0.03 across both turns, got {cost}"
+    );
+}
+
+#[test]
 fn an_unreadable_ledger_is_an_error_naming_the_file() {
     let repo = TempRepo::new("usage-unreadable");
     // A directory where the ledger should be: it exists, and reading it fails.

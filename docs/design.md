@@ -321,7 +321,7 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 |---|---|---|
 | app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false, and form questions (`elicitation.form`). |
 | app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
-| app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn; its `usage` token counts, when sent, go to the usage ledger. |
+| app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn; its token counts (`usage`, or Grok's `_meta.usage`) and per-turn cost (Grok's `_meta.usage.costUsdTicks`) go to the usage ledger. |
 | app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`, every open question `cancel`. |
 | agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, and `usage_update` (context fill and the session's cumulative cost, for the usage ledger, never shown in the run panel). Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
 | agent to app | `session/request_permission` | Answered at once with the allow option (once, else always). With none, it waits for the engineer. |
@@ -1040,13 +1040,15 @@ the token counts, the context fill and the cost the agent reported. It is separa
 run logs, so deleting notes keeps the history, and it spans projects. Each line carries
 `version` 1; a reader skips lines of another version and lines that do not parse, and an
 append after a torn last line starts on a new line, so a crash loses at most that line. The
-file is not synced and never compacted. ACP's `usage_update` cost is cumulative for the
-session, so a follow-up on a kept agent records its cost less what the session had cost
-before it; a meter that went down records no cost. Runs before this format, and runs whose
-log is reopened from disk, are not in the ledger.
+file is not synced and never compacted. When an agent reports a per-turn cost on its prompt
+reply (Grok's `_meta.usage.costUsdTicks`), that cost is recorded as-is; ACP's `usage_update`
+cost is cumulative for the session, so a follow-up on a kept agent records its cost less what
+the session had cost before it, and a meter that went down records no cost. Runs before this
+format, and runs whose log is reopened from disk, are not in the ledger.
 
 The account quotas (`src/usage/quota.rs`) are probed only while the dialog is open and cached
-for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`.
+for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`,
+and Grok through `grok agent stdio` (`_x.ai/billing`).
 Claude is asked over HTTPS with the agent's own sign-in: its token from the macOS Keychain item
 Claude Code writes, or `~/.claude/.credentials.json`. The token goes to `/usr/bin/curl` on
 stdin (`--config -`, with `--disable` so no `~/.curlrc` applies), never in its arguments; it is
@@ -1054,7 +1056,9 @@ never stored, logged, or sent to the page. The endpoint (Anthropic's `api/oauth/
 one Claude Code calls and is not documented, so Anthropic may change it; a probe that fails
 shows why and leaves the rest of the dialog working. Other agents show no quota. Gemini's was
 read with the `gemini` CLI's token (`~/.gemini/oauth_creds.json`) until 2026-11-26; `agy` keeps
-its sign-in to itself and writes no such file, so Gemini's quota is shown as unavailable.
+its sign-in in its own keyring ACL and Antigravity's terms disallow third-party extraction or
+polling of consumer quota endpoints, so Gemini's live quota is shown as unavailable (while
+`agy acp` still reports per-run token usage to the ledger).
 
 ## Dependencies
 

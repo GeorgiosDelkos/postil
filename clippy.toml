@@ -10,4 +10,4 @@ too-many-lines-threshold = 100
 
 # Product and protocol names that doc_markdown should not ask to backtick. ".." keeps
 # clippy's defaults (GitHub, WebAssembly, ...). Add the project's own names.
-doc-valid-idents = ["Postil", "WebKit", "WKWebView", "WebKitGTK", "AppKit", "OpenCode", ".."]
+doc-valid-idents = ["Postil", "WebKit", "WKWebView", "WebKitGTK", "AppKit", "OpenCode", "xAI", "SuperGrok", ".."]

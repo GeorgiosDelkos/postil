@@ -495,6 +495,26 @@ async function prompt(id, params) {
     case "exit-mid-turn":
       process.stderr.write("panicked at the model\n");
       return process.exit(1);
+    case "grok-usage":
+      // Grok places per-turn token counts and `costUsdTicks` under `_meta.usage` rather than
+      // top-level `usage` or `usage_update`; turn 2 costs less than turn 1 (`$0.01` vs `$0.02`).
+      return send({
+        id,
+        result: {
+          stopReason: "end_turn",
+          _meta: {
+            usage: {
+              inputTokens: 1000 * prompts,
+              outputTokens: 50,
+              cachedReadTokens: 200,
+              cacheCreationTokens: 10,
+              reasoningTokens: 25,
+              totalTokens: 1000 * prompts + 50,
+              costUsdTicks: prompts === 1 ? 200_000_000 : 100_000_000,
+            },
+          },
+        },
+      });
     default:
       return send({ id, result: { stopReason: "end_turn" } });
   }

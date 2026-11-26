@@ -30,7 +30,8 @@ use crate::usage::now_secs;
 /// current enough, and closing and reopening the dialog within it sends no request.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Hard limit on one subprocess a probe runs (`security`, `curl`, or `codex app-server`).
+/// Hard limit on one subprocess a probe runs (`security`, `curl`, `codex app-server`, or
+/// `grok agent stdio`).
 /// A probe runs up to two of them one after the other (Claude: the Keychain read, then the
 /// usage request), so a probe can take up to twice this. Arbitrary:
 /// long enough for a slow network round trip, short enough that the dialog does not show
@@ -335,12 +336,13 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
     match name {
         "Claude" => probe_claude(),
         "Codex" => probe_codex(search_path),
-        // agy keeps its sign-in to itself (no `~/.gemini/oauth_creds.json`, checked
-        // 2026-11-26, agy 1.5.18), so there is no token to ask Google's quota endpoint with.
+        // `agy` keeps its OAuth credentials in its own keyring ACL, and Google's Antigravity
+        // Terms disallow third-party extraction or polling of consumer quota endpoints;
+        // `agy acp` still reports per-run token usage to the Postil ledger below.
         "Gemini" => QuotaReport::unavailable(
-            "agy does not share its sign-in, so Postil cannot show Gemini's quota",
+            "Live quota is only shown inside agy (/usage) — see Postil activity below",
         ),
-        "Grok" => QuotaReport::unavailable("Live quota is not exposed by the Grok CLI yet"),
+        "Grok" => probe_grok(search_path),
         "OpenCode" => QuotaReport::unavailable(
             "OpenCode routes across multiple providers — see Postil activity below",
         ),
@@ -816,6 +818,223 @@ fn parse_codex_credits(bucket: &Value) -> Option<CreditInfo> {
         currency: None,
         unlimited,
     })
+}
+
+fn probe_grok(search_path: &OsStr) -> QuotaReport {
+    let Some(program) = agents::find_program("grok", search_path) else {
+        return QuotaReport::unavailable("Grok CLI not found on PATH");
+    };
+    let mut child = match Command::new(&program)
+        .args(["agent", "stdio"])
+        .current_dir(std::env::temp_dir())
+        .env("PATH", search_path)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return QuotaReport::error(format!("could not start grok agent stdio: {error}"));
+        }
+    };
+
+    let result = read_grok_reply(&mut child);
+    agents::kill_group(child.id());
+    drop(child.kill());
+    drop(child.wait());
+
+    match result {
+        Ok(billing) => parse_grok_quota(billing.as_ref()),
+        Err(message) => QuotaReport::error(message),
+    }
+}
+
+/// Sends ACP `initialize` and Grok's `_x.ai/billing` extension request to `grok agent stdio`,
+/// returning the `_x.ai/billing` reply (`None` when the process closed stdout first). Waits at
+/// most [`PROBE_TIMEOUT`]; does not stop the process.
+fn read_grok_reply(child: &mut Child) -> Result<Option<Value>, String> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("probe_grok starts grok agent stdio with a piped stdin");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("probe_grok starts grok agent stdio with a piped stdout");
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":1,"clientCapabilities":"#,
+        r#"{"fs":{"readTextFile":false,"writeTextFile":false},"#,
+        r#""terminal":false,"elicitation":{"form":{}}}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"_x.ai/billing","params":{}}"#,
+        "\n",
+    );
+    stdin
+        .write_all(requests.as_bytes())
+        .and_then(|()| stdin.flush())
+        .map_err(|error| format!("cannot write to grok agent stdio: {error}"))?;
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("grok-quota-read".to_owned())
+        .spawn(move || drop(sender.send(collect_grok_reply(stdout))))
+        .map_err(|error| format!("cannot start a thread to read grok agent stdio: {error}"))?;
+    receiver.recv_timeout(PROBE_TIMEOUT).map_err(|_| {
+        format!(
+            "grok agent stdio did not answer within {} s",
+            PROBE_TIMEOUT.as_secs()
+        )
+    })?
+}
+
+/// Reads `grok agent stdio` lines until the `_x.ai/billing` reply (`id: 2`) arrives, stdout
+/// ends, or `initialize` (`id: 1`) returned an error.
+fn collect_grok_reply(stdout: ChildStdout) -> Result<Option<Value>, String> {
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match msg.get("id").and_then(Value::as_u64) {
+            Some(1) if msg.get("error").is_some() => {
+                return Err(msg
+                    .get("error")
+                    .and_then(|err| err.get("message"))
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || "grok agent stdio refused initialize".to_owned(),
+                        bounded_provider_text,
+                    ));
+            }
+            Some(2) => return Ok(Some(msg)),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn parse_grok_quota(billing: Option<&Value>) -> QuotaReport {
+    let Some(billing_msg) = billing else {
+        return QuotaReport::unavailable("Grok did not return billing data");
+    };
+    if let Some(error) = billing_msg.get("error") {
+        if error.get("code").and_then(Value::as_i64) == Some(-32601) {
+            return QuotaReport::unavailable("Update Grok CLI (`grok update`) to check live quota");
+        }
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Not signed in — run `grok login` in a terminal");
+        return QuotaReport::unavailable(bounded_provider_text(message));
+    }
+    let Some(result) = billing_msg.get("result") else {
+        return QuotaReport::unavailable("Grok did not return billing data");
+    };
+
+    let plan = result
+        .get("subscription_tier")
+        .or_else(|| result.get("subscriptionTier"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(title_case);
+
+    let mut windows = Vec::new();
+    let mut credits = None;
+    if let Some(config) = result.get("config").filter(|v| v.is_object()) {
+        // Only emit a window when `creditUsagePercent` is explicitly present: omitting it is
+        // not 0% consumption.
+        if let Some(used) = config
+            .get("creditUsagePercent")
+            .or_else(|| config.get("credit_usage_percent"))
+            .and_then(Value::as_f64)
+        {
+            let period = config
+                .get("currentPeriod")
+                .or_else(|| config.get("current_period"));
+            let label =
+                grok_period_label(period.and_then(|p| p.get("type")).and_then(Value::as_str));
+            let resets_at = period
+                .and_then(|p| p.get("end"))
+                .or_else(|| config.get("billingPeriodEnd"))
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_secs);
+            windows.push(QuotaWindow {
+                label: label.to_owned(),
+                model: None,
+                used_percent: clamp_percent(used),
+                resets_at,
+                detail: None,
+            });
+        }
+        credits = parse_grok_credits(config);
+    }
+
+    if windows.is_empty() && credits.is_none() {
+        let message = if plan.is_none()
+            && std::env::var_os("XAI_API_KEY").is_some_and(|val| !val.is_empty())
+        {
+            "API key mode — no subscription quota window"
+        } else {
+            "Grok reported no active quota windows"
+        };
+        return QuotaReport {
+            plan,
+            ..QuotaReport::unavailable(message)
+        };
+    }
+    QuotaReport {
+        status: QuotaStatus::Ok,
+        plan,
+        windows,
+        credits,
+        message: None,
+        fetched_at: Some(now_secs()),
+    }
+}
+
+fn grok_period_label(period_type: Option<&str>) -> &'static str {
+    match period_type {
+        Some("USAGE_PERIOD_TYPE_DAILY") => "Daily window",
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => "Weekly window",
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => "Monthly window",
+        _ => "Usage window",
+    }
+}
+
+fn parse_grok_credits(config: &Value) -> Option<CreditInfo> {
+    if let Some(limit) = cents_usd(config.get("onDemandCap")).filter(|&cap| cap > 0.0) {
+        let used = cents_usd(config.get("onDemandUsed")).unwrap_or(0.0);
+        return Some(CreditInfo {
+            label: "On-demand".to_owned(),
+            used: Some(used),
+            limit: Some(limit),
+            remaining: Some((limit - used).max(0.0)),
+            currency: Some("USD".to_owned()),
+            unlimited: false,
+        });
+    }
+    let remaining = cents_usd(config.get("prepaidBalance")).filter(|&bal| bal > 0.0)?;
+    Some(CreditInfo {
+        label: "Prepaid credits".to_owned(),
+        used: None,
+        limit: None,
+        remaining: Some(remaining),
+        currency: Some("USD".to_owned()),
+        unlimited: false,
+    })
+}
+
+/// Reads a `{ "val": <cents> }` billing wrapper into US dollars.
+fn cents_usd(field: Option<&Value>) -> Option<f64> {
+    let val = field?.get("val")?;
+    let cents = val
+        .as_f64()
+        .or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()))?;
+    (cents.is_finite() && cents >= 0.0).then_some(cents / 100.0)
 }
 
 /// Reads a generic password secret from the macOS Keychain, bounded by [`PROBE_TIMEOUT`].
@@ -1629,5 +1848,112 @@ mod tests {
         assert!(error.ends_with("is not a regular file"), "{error}");
         let error = read_credentials_file(dir.path()).unwrap_err();
         assert!(error.ends_with("is not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn parses_grok_weekly_quota_credits_and_missing_percent() {
+        let weekly = serde_json::json!({
+            "id": 2,
+            "result": {
+                "config": {
+                    "creditUsagePercent": 12.0,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-11-24T08:37:24.596441+00:00",
+                        "end": "2026-12-01T08:37:24.596441+00:00"
+                    },
+                    "onDemandCap": { "val": 0 },
+                    "onDemandUsed": { "val": 0 },
+                    "prepaidBalance": { "val": 0 },
+                    "isUnifiedBillingUser": true
+                },
+                "subscription_tier": "SuperGrok Heavy"
+            }
+        });
+        let report = parse_grok_quota(Some(&weekly));
+        assert_eq!(report.status, QuotaStatus::Ok);
+        assert_eq!(report.plan.as_deref(), Some("SuperGrok Heavy"));
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].label, "Weekly window");
+        assert!((report.windows[0].used_percent - 12.0).abs() < 1e-6);
+        assert!(report.windows[0].resets_at.is_some());
+        assert!(report.credits.is_none());
+
+        // On-demand budget cap and used cents convert to USD; omitting creditUsagePercent does
+        // not fabricate a 0% window.
+        let on_demand = serde_json::json!({
+            "id": 2,
+            "result": {
+                "config": {
+                    "onDemandCap": { "val": 5000 },
+                    "onDemandUsed": { "val": 1250 },
+                    "prepaidBalance": { "val": 900 }
+                },
+                "subscription_tier": "SuperGrok"
+            }
+        });
+        let report = parse_grok_quota(Some(&on_demand));
+        assert_eq!(report.status, QuotaStatus::Ok);
+        assert_eq!(report.windows.len(), 0);
+        let credits = report.credits.unwrap();
+        assert_eq!(credits.label, "On-demand");
+        assert!((credits.used.unwrap() - 12.5).abs() < 1e-6);
+        assert!((credits.limit.unwrap() - 50.0).abs() < 1e-6);
+        assert!((credits.remaining.unwrap() - 37.5).abs() < 1e-6);
+
+        // Prepaid credits alone (including stringified cents).
+        let prepaid = serde_json::json!({
+            "id": 2,
+            "result": { "config": { "prepaidBalance": { "val": "2500" } } }
+        });
+        let report = parse_grok_quota(Some(&prepaid));
+        assert_eq!(report.status, QuotaStatus::Ok);
+        assert!((report.credits.unwrap().remaining.unwrap() - 25.0).abs() < 1e-6);
+
+        // An older Grok CLI without `_x.ai/billing` advises updating.
+        let unsupported = serde_json::json!({
+            "id": 2,
+            "error": { "code": -32601, "message": "Method not found" }
+        });
+        let report = parse_grok_quota(Some(&unsupported));
+        assert_eq!(report.status, QuotaStatus::Unavailable);
+        assert!(report.message.unwrap().contains("grok update"));
+    }
+
+    #[test]
+    fn probe_grok_talks_json_rpc_over_stdio_to_agent_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("grok-agent-stdio");
+        let script = dir.path().join("grok");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" != \"agent\" ] || [ \"$2\" != \"stdio\" ]; then exit 2; fi\n",
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"initialize\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1}}\\n'\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/mcp/servers_updated\",\"params\":{}}\\n'\n",
+                "      ;;\n",
+                "    *'\"method\":\"_x.ai/billing\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"config\":",
+                "{\"creditUsagePercent\":27.5,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_DAILY\",",
+                "\"end\":\"2026-12-01T00:00:00Z\"}},\"subscription_tier\":\"SuperGrok\"}}\\n'\n",
+                "      ;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = probe_grok(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.plan.as_deref(), Some("SuperGrok"));
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].label, "Daily window");
+        assert!((report.windows[0].used_percent - 27.5).abs() < 1e-6);
     }
 }

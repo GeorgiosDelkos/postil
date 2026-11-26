@@ -97,6 +97,8 @@ pub(crate) struct Run {
 struct RunUsage {
     /// The token counts of the prompt reply, which ends the turn.
     tokens: Option<PromptUsage>,
+    /// What this turn alone cost, when the prompt reply reported it (Grok's `_meta`).
+    direct_cost: Option<UsageCost>,
     context_used: Option<u64>,
     context_size: Option<u64>,
     /// The session's cumulative cost before this turn began (a kept agent on a follow-up).
@@ -113,20 +115,26 @@ impl RunUsage {
         if let Some(size) = size {
             self.context_size = Some(size);
         }
-        if let Some(cost) = cost
-            && cost.amount.is_finite()
-            && cost.amount >= 0.0
-            && !cost.currency.is_empty()
-        {
+        if let Some(cost) = cost.filter(valid_cost) {
             self.cost = Some(cost);
         }
     }
 
-    /// What this turn alone cost: the session's cost less `cost_baseline`. `None` when the
-    /// two cannot be compared (another currency, or a cumulative cost that went down, as a
-    /// rounded or reset meter does): recording the whole session's cost would count the
+    fn record_turn_cost(&mut self, cost: Option<UsageCost>) {
+        if let Some(cost) = cost.filter(valid_cost) {
+            self.direct_cost = Some(cost);
+        }
+    }
+
+    /// What this turn alone cost: the per-turn cost reported on the prompt reply when given,
+    /// else the session's cumulative cost less `cost_baseline`. `None` when the cumulative
+    /// figures cannot be compared (another currency, or a cumulative cost that went down, as
+    /// a rounded or reset meter does): recording the whole session's cost would count the
     /// earlier turns twice.
     fn turn_cost(&self) -> Option<UsageCost> {
+        if let Some(cost) = &self.direct_cost {
+            return Some(cost.clone());
+        }
         let cost = self.cost.as_ref()?;
         match &self.cost_baseline {
             None => Some(cost.clone()),
@@ -144,6 +152,10 @@ impl RunUsage {
     fn session_cost(&self) -> Option<UsageCost> {
         self.cost.clone().or_else(|| self.cost_baseline.clone())
     }
+}
+
+fn valid_cost(cost: &UsageCost) -> bool {
+    cost.amount.is_finite() && cost.amount >= 0.0 && !cost.currency.is_empty()
 }
 
 pub(super) struct RunState {
@@ -732,10 +744,15 @@ impl Run {
                     request: number,
                     option: None,
                 },
-                Event::TurnEnded(TurnEnd::Stopped { reason, usage }) => {
+                Event::TurnEnded(TurnEnd::Stopped {
+                    reason,
+                    usage,
+                    cost,
+                }) => {
                     if usage.is_some() {
                         state.usage.tokens = usage;
                     }
+                    state.usage.record_turn_cost(cost);
                     Entry::Ended { reason }
                 }
                 Event::TurnEnded(TurnEnd::Failed(error)) => Entry::Failed { error },
@@ -1654,6 +1671,16 @@ mod tests {
             currency: "EUR".to_owned(),
         };
         assert_eq!(turn(Some(usd(1.0)), euros), None);
+
+        // A per-turn cost reported on the prompt reply stands on its own, even on a kept
+        // session whose earlier turn cost more.
+        let mut usage = RunUsage {
+            cost_baseline: Some(usd(0.05)),
+            ..RunUsage::default()
+        };
+        usage.record_turn_cost(Some(usd(0.02)));
+        assert_eq!(usage.turn_cost().map(|c| c.amount), Some(0.02));
+        assert_eq!(usage.session_cost().map(|c| c.amount), Some(0.05));
     }
 
     #[test]

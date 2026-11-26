@@ -318,6 +318,73 @@ pub(crate) struct PromptResult {
     /// Token counts the agent reports when a prompt turn ends (optional in ACP).
     #[serde(default)]
     pub(crate) usage: Option<PromptUsage>,
+    /// Extra metadata an agent attaches to `session/prompt` (Grok places its per-turn token
+    /// counts and `costUsdTicks` under `_meta.usage`).
+    #[serde(default, rename = "_meta")]
+    meta: Option<Value>,
+}
+
+/// Number of `costUsdTicks` per US dollar in xAI's usage responses (`10^10`).
+const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
+
+impl PromptResult {
+    /// Token counts for the finished turn: ACP's top-level `usage` when present, else `_meta`
+    /// (`_meta.usage` or `_meta` itself, mapping Grok's `reasoningTokens` and
+    /// `cacheCreationTokens` to ACP's fields).
+    pub(crate) fn token_usage(&self) -> Option<PromptUsage> {
+        if self.usage.is_some() {
+            return self.usage;
+        }
+        let meta = self.meta.as_ref()?;
+        let source = meta.get("usage").filter(|v| v.is_object()).unwrap_or(meta);
+        let count = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| source.get(*key).and_then(Value::as_u64))
+        };
+        let usage = PromptUsage {
+            input_tokens: count(&["inputTokens", "input_tokens"]),
+            output_tokens: count(&["outputTokens", "output_tokens"]),
+            thought_tokens: count(&["thoughtTokens", "reasoningTokens", "reasoning_tokens"]),
+            cached_read_tokens: count(&["cachedReadTokens", "cache_read_input_tokens"]),
+            cached_write_tokens: count(&[
+                "cachedWriteTokens",
+                "cacheCreationTokens",
+                "cache_creation_input_tokens",
+            ]),
+            total_tokens: count(&["totalTokens", "total_tokens"]),
+        };
+        let any = [
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.thought_tokens,
+            usage.cached_read_tokens,
+            usage.cached_write_tokens,
+            usage.total_tokens,
+        ]
+        .into_iter()
+        .any(|field| field.is_some());
+        any.then_some(usage)
+    }
+
+    /// What this turn alone cost, when reported on the prompt reply (`_meta.usage.costUsdTicks`
+    /// in Grok's ACP server). Unlike `usage_update`, this figure is per turn, not cumulative.
+    pub(crate) fn turn_cost(&self) -> Option<UsageCost> {
+        let meta = self.meta.as_ref()?;
+        let source = meta.get("usage").filter(|v| v.is_object()).unwrap_or(meta);
+        let ticks = source
+            .get("costUsdTicks")
+            .or_else(|| source.get("cost_in_usd_ticks"))
+            .and_then(Value::as_u64)?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "u64 tick counts fit in f64 to sub-cent precision"
+        )]
+        let amount = (ticks as f64) / USD_TICKS_PER_DOLLAR;
+        Some(UsageCost {
+            amount,
+            currency: "USD".to_owned(),
+        })
+    }
 }
 
 /// Token counts reported on a `session/prompt` reply. Also the token part of a usage ledger
@@ -630,4 +697,77 @@ pub(crate) enum PermissionOutcome<'a> {
     Cancelled,
     #[serde(rename_all = "camelCase")]
     Selected { option_id: &'a str },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_result_prefers_standard_usage_and_falls_back_to_grok_meta_usage() {
+        let standard: PromptResult = serde_json::from_value(serde_json::json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "thoughtTokens": 5,
+                "totalTokens": 120
+            },
+            "_meta": {
+                "usage": { "inputTokens": 999, "costUsdTicks": 50_000_000 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            standard.token_usage(),
+            Some(PromptUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                thought_tokens: Some(5),
+                total_tokens: Some(120),
+                ..PromptUsage::default()
+            })
+        );
+        let cost = standard.turn_cost().unwrap();
+        assert!((cost.amount - 0.005).abs() < 1e-9);
+        assert_eq!(cost.currency, "USD");
+
+        let grok: PromptResult = serde_json::from_value(serde_json::json!({
+            "stopReason": "end_turn",
+            "_meta": {
+                "totalTokens": 22259,
+                "usage": {
+                    "inputTokens": 22137,
+                    "outputTokens": 114,
+                    "totalTokens": 22251,
+                    "cachedReadTokens": 1664,
+                    "cacheCreationTokens": 12,
+                    "reasoningTokens": 113,
+                    "costUsdTicks": 144_370_800
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            grok.token_usage(),
+            Some(PromptUsage {
+                input_tokens: Some(22137),
+                output_tokens: Some(114),
+                thought_tokens: Some(113),
+                cached_read_tokens: Some(1664),
+                cached_write_tokens: Some(12),
+                total_tokens: Some(22251),
+            })
+        );
+        let grok_cost = grok.turn_cost().unwrap();
+        assert!((grok_cost.amount - 0.014_437_08).abs() < 1e-12);
+
+        let empty: PromptResult = serde_json::from_value(serde_json::json!({
+            "stopReason": "end_turn",
+            "_meta": { "sessionId": "s1" }
+        }))
+        .unwrap();
+        assert_eq!(empty.token_usage(), None);
+        assert_eq!(empty.turn_cost(), None);
+    }
 }
