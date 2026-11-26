@@ -49,7 +49,7 @@ export function pathNoteDialog(dialogEl, { add, openSend }) {
     title.id = "path-note-title";
     const close = el("button", "button note-dialog-close", "esc");
     close.type = "button";
-    close.setAttribute("aria-label", "Discard");
+    close.setAttribute("aria-label", "Close");
     close.addEventListener("click", () => dialogEl.close());
     const actions = el("span", "note-dialog-actions");
     actions.append(close);
