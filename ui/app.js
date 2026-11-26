@@ -462,10 +462,19 @@ window.addEventListener("keydown", (event) => {
   }
 
   const typing = event.target.matches("input, textarea");
+  // Cmd-[ and Cmd-] go back and forward through the places jumped from and to (code-view.js).
+  // Claimed even when they do nothing, so WebKit never takes them for page history.
+  if (event.metaKey && (event.key === "[" || event.key === "]")) {
+    event.preventDefault();
+    if (!typing && !state.send && !changes.isOpen()) code.stepHistory(event.key === "[" ? -1 : 1);
+    return;
+  }
   // `a`, Shift-`a` and `r` answer a permission request while the run shows; focus mode hides it.
   const runKeys = !typing && !state.composer && state.tab === "run" && !inFocus();
   if (runKeys && runs.keydown(event)) return;
   if (event.key === "Escape") {
+    // A jump still waiting for the index is not wanted any more.
+    code.cancelJump();
     const action = escapeAction({
       focusMode: inFocus(),
       composer: Boolean(state.composer),
@@ -537,7 +546,11 @@ async function refresh() {
     await welcome.loadRecent();
     return;
   }
-  if (!state.projectOpen || state.composer) return;
+  if (!state.projectOpen) return;
+  // The definitions index looks at the files again on its own thread (src/definitions.rs);
+  // nothing here waits for it. Even with the composer open: the index moves no line.
+  void fetch("api/definitions/refresh", { method: "POST" });
+  if (state.composer) return;
   const path = state.wanted;
   // A later refresh may answer first, as a run's edits come one after another: only the
   // latest refresh draws, or an older file would be painted over a newer one.

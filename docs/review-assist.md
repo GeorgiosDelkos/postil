@@ -2,11 +2,12 @@
 
 Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
-walkthrough with its ratings and findings in the changes view (7.5), and read-only threads
-with Ask (7.6). This document adds to `docs/design.md`, which stays the reference for
-everything built so far. `docs/review-assist-plan.md` turns it into pull requests, with the
-edge cases and tests of each. Section "Decisions" lists what the owner settled on 2026-11-25;
-section "Open questions" lists what this document assumes and the owner has not confirmed.
+walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
+Ask (7.6), and jump to definition (7.7). This document adds to `docs/design.md`, which stays
+the reference for everything built so far. `docs/review-assist-plan.md` turns it into pull
+requests, with the edge cases and tests of each. Section "Decisions" lists what the owner
+settled on 2026-11-25; section "Open questions" lists what this document assumes and the owner
+has not confirmed.
 
 Mockups: https://claude.ai/code/artifact/61c79ac1-1498-4f37-9ec0-f2824cf3f92f (private to the owner until shared).
 
@@ -207,15 +208,31 @@ to stand on a name.
 - **Source:** `tree-sitter-tags` 0.27.2 (the same release line as the highlighter) with the
   `tags.scm` each grammar crate ships. Rust, JavaScript, TypeScript, Python and Go ship one;
   JSON, TOML and Bash do not and have no definitions.
-- **The index** maps a name to its definitions: `HashMap<String, Vec<Definition>>`, a
-  definition being a path, a line and a kind. It is looked up by name on a click and rebuilt
-  per file. A worker thread builds it after the project opens and again for the files whose
-  stat data changed when the window regains focus or a run ends. It lives in memory only.
+- **The index** maps a name to its definitions, a definition being a path, a line and a kind.
+  It is looked up by name on a click and rebuilt per file. A worker thread, `index-definitions`,
+  builds it after the project opens and again for the files whose size or modification time
+  changed when the page refreshes: on window focus and when a run's status changes, through
+  `POST /api/definitions/refresh`. A lookup during a refresh answers from the index as it
+  was; before the first build ends it says `{"state": "building"}`, and the page asks again
+  every 250 ms. It lives in memory only. Built (`src/definitions.rs`, step 7.7). Measured
+  2026-11-26 on a release build: this repository (145 files) builds in 0.19 to 0.33 s and
+  refreshes in 10 to 17 ms; a synthetic one of 50,000 small Rust and JavaScript files builds
+  in 1.4 to 6.3 s and refreshes in 150 to 250 ms, of which listing the files with git takes
+  40 to 60 ms. The ignored test `fifty_thousand_files_build_and_refresh` measures it again:
+  `cargo test --release --lib fifty_thousand -- --ignored --nocapture`.
 - **One definition** jumps. **Several** open a list of one-line cards ranked: same file, same
-  folder, then the rest by path. **None** shows a toast.
+  folder, then the rest by path, at most 50 with the count. **None** shows a toast, and so
+  does the clicked name being its own only definition.
 - **It matches names, not types.** Two functions named `new` both list. The list's header
   says "by name".
-- `Cmd-[` and `Cmd-]` move back and forward through the places jumped from and to.
+- **What a click finds**: the name under the pointer, Unicode identifier characters and `$`.
+  A click on whitespace, punctuation, a number, a string, a keyword or a comment does nothing.
+  A file whose language has no tags query says "No definitions for this file type." Files over
+  2 MB or not UTF-8 are not indexed.
+- `Cmd-[` and `Cmd-]` move back and forward through the places jumped from and to, at most
+  50; going back restores the scroll and the selection, and a place whose file is gone is
+  skipped. The history lives in the page, so opening another project, which reloads it, clears
+  it. The changes view and the prompt preview do not jump.
 
 ## Milestone 8: the map
 

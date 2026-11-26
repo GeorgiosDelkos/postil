@@ -1,8 +1,10 @@
 // The code pane: the open file as a virtual list, the selection of lines, copying, the
 // right-click menu's actions on the code, and the composer that writes a note.
 
+import { definitionsDialog } from "./definitions-dialog.js";
+import { NO_DEFINITION, jumpHistory, nameAt } from "./definitions.js";
 import { askWarning } from "./dialog-parts.js";
-import { $, el } from "./dom.js";
+import { $, el, showToast } from "./dom.js";
 import { onLines } from "./note-place.js";
 import { shouldReveal } from "./tree.js";
 
@@ -14,6 +16,9 @@ const OVERSCAN = 40;
 // The composer's height before it has been measured once. A guess: label, two text rows,
 // actions, and margins.
 const COMPOSER_HEIGHT_GUESS = 138;
+// How long to wait before asking again for definitions while the index is first built, in
+// ms: the owner's choice (2026-11-26), as the settings dialog asks again during its scan.
+const DEFINITIONS_POLL_MS = 250;
 
 // `state` is the page's state: the view keeps `file`, `wanted`, `selection` and `composer`,
 // and reads `noteByLine`. `menu` is the context menu (context-menu.js) and `files` the file
@@ -58,9 +63,16 @@ export function codeView({
   // Opens `path` in the code pane. Returns whether it was shown: not when a draft note would
   // be lost (the composer is focused instead), and not when a newer open overtook this one.
   async function openFile(path) {
+    return (await openFileFor(path, { onlyFound: false })) === "shown";
+  }
+
+  // As `openFile`, saying why a file was not shown: "held" (a draft note keeps the pane),
+  // "superseded" (a newer open overtook this one), or, with `onlyFound`, "missing" (the file
+  // cannot be read, and the open file stays, where `openFile` would show the reason instead).
+  async function openFileFor(path, { onlyFound }) {
     if (state.composer?.text.trim()) {
       state.composer.node.querySelector("textarea").focus();
-      return false;
+      return "held";
     }
     // The changes view and the send step's prompt cover the code pane: the file opened takes
     // their place.
@@ -68,9 +80,13 @@ export function codeView({
     state.composer = null;
     state.wanted = path;
     const reply = await fetchFile(path);
-    if (state.wanted !== path) return false;
+    if (state.wanted !== path) return "superseded";
+    if (onlyFound && !reply.ok) {
+      state.wanted = state.file?.path ?? null;
+      return "missing";
+    }
     showFile(path, reply, { keepView: false });
-    return true;
+    return "shown";
   }
 
   // Draws a reply of `fetchFile`. `keepView` is for the same file read again after it may have
@@ -228,6 +244,7 @@ export function codeView({
   // selection or the notes change, so those changes do not rebuild the rows.
   function decorateRow(row, index) {
     row.classList.toggle("selected", isSelected(index));
+    row.classList.toggle("jumped", jumped?.path === state.file?.path && jumped.index === index);
 
     const note = state.noteByLine.get(index);
     row.classList.toggle("noted", Boolean(note));
@@ -322,6 +339,13 @@ export function codeView({
     // A press on the + starts neither a text selection nor a drag: its click adds the note.
     if (event.target.closest(".add-note")) {
       event.preventDefault();
+      return;
+    }
+    // Cmd-click on a name jumps to its definition. It starts no drag, so the selection stays
+    // as it was: the mouseup below finds no `textDrag`.
+    if (event.button === 0 && event.metaKey && event.target.closest(".c")) {
+      event.preventDefault();
+      jumpFromPoint(event.clientX, event.clientY);
       return;
     }
     if (event.button !== 0 || event.target.classList.contains("n") || state.composer) return;
@@ -486,11 +510,13 @@ export function codeView({
       state.selection = { anchor: line, head: line };
       redecorateRows();
     }
-    menu.open(event.clientX, event.clientY, codeActions(line));
+    const name = state.file.definitions ? nameAtPoint(event.clientX, event.clientY) : null;
+    menu.open(event.clientX, event.clientY, codeActions(line, name));
   });
 
-  // The actions for the selected lines; `line` is the one right-clicked, for its note.
-  function codeActions(line) {
+  // The actions for the selected lines; `line` is the one right-clicked, for its note, and
+  // `name` the name right-clicked, `{ name, line }`, or null when the click was on none.
+  function codeActions(line, name) {
     const range = selectedRange();
     const first = range.start + 1;
     const last = range.end + 1;
@@ -521,6 +547,13 @@ export function codeView({
       },
       { label: "Copy Reference", detail: reference, run: () => copyText(reference) },
     ];
+    if (name) {
+      actions.push({
+        label: "Go to Definition",
+        detail: name.name,
+        run: () => goToDefinition(name.name, name.line),
+      });
+    }
     const note = state.noteByLine.get(line);
     if (note) {
       // A separator sets the one destructive item apart, as macOS menus do.
@@ -531,6 +564,154 @@ export function codeView({
       });
     }
     return actions;
+  }
+
+  // ---- Jump to definition -----------------------------------------------------------------
+  //
+  // Cmd-click on a name, or Go to Definition in the right-click menu, asks the Rust process
+  // where the name is defined (src/definitions.rs) and goes there; Cmd-[ and Cmd-] go back
+  // and forward (app.js). The changes view and the send step's prompt do not jump.
+
+  const picker = definitionsDialog($("definitions-dialog"));
+  const history = jumpHistory();
+  // Every ask is numbered; an answer to an older one, or to one cancelled, is dropped.
+  let jumpAsked = 0;
+  let jumpRetry = null;
+  // The line the last jump landed on, 0-based, marked until the next jump: { path, index }.
+  let jumped = null;
+  // Set while Cmd-[ or Cmd-] opens a place, so a held key does not start a second step.
+  let stepping = false;
+
+  // The name under the point (`x`, `y`) in the code, with its 0-based line: `{ name, line }`,
+  // or null on none, or on a string, keyword or comment.
+  function nameAtPoint(x, y) {
+    const caret = document.caretRangeFromPoint(x, y);
+    const node = caret?.startContainer;
+    if (node?.nodeType !== Node.TEXT_NODE) return null;
+    const token = node.parentElement;
+    const cell = token?.closest(".c");
+    if (!cell || !rowsEl.contains(cell)) return null;
+    if (token !== cell && NO_DEFINITION.has(token.className)) return null;
+    const found = nameAt(node.data, caret.startOffset);
+    if (!found) return null;
+    // Past a line's end, WebKit puts the caret after its last character: only a point on
+    // the name itself counts.
+    const range = document.createRange();
+    range.setStart(node, found.start);
+    range.setEnd(node, found.end);
+    const box = range.getBoundingClientRect();
+    if (x < box.left || x > box.right || y < box.top || y > box.bottom) return null;
+    return { name: found.name, line: Number(cell.closest(".ln").dataset.line) };
+  }
+
+  function jumpFromPoint(x, y) {
+    if (!state.file) return;
+    if (!state.file.definitions) {
+      showToast("No definitions for this file type.");
+      return;
+    }
+    const found = nameAtPoint(x, y);
+    if (found) goToDefinition(found.name, found.line);
+  }
+
+  // Drops a jump still asking: Escape, or a newer jump.
+  function cancelJump() {
+    jumpAsked += 1;
+    clearTimeout(jumpRetry);
+  }
+
+  // Goes to where `name`, clicked on 0-based `line` of the open file, is defined.
+  async function goToDefinition(name, line) {
+    cancelJump();
+    await askDefinitions(jumpAsked, name, state.file.path, line);
+  }
+
+  async function askDefinitions(asked, name, from, line) {
+    const query = `name=${encodeURIComponent(name)}&from=${encodeURIComponent(from)}`;
+    const response = await fetch(`api/definitions?${query}`);
+    // A newer jump, Escape, or another file opened meanwhile: the answer is not wanted.
+    if (asked !== jumpAsked || state.file?.path !== from) return;
+    if (!response.ok) {
+      showToast(await response.text());
+      return;
+    }
+    const reply = await response.json();
+    // An Escape during the parse: no further ask.
+    if (asked !== jumpAsked) return;
+    if (reply.state === "building") {
+      jumpRetry = setTimeout(() => askDefinitions(asked, name, from, line), DEFINITIONS_POLL_MS);
+      return;
+    }
+    const { definitions, total } = reply;
+    const here = (definition) => definition.path === from && definition.line === line + 1;
+    if (definitions.length === 0) {
+      showToast(`No definition found for ${name}.`);
+      return;
+    }
+    // Taken before the list opens: a refresh while it is open may change the open file.
+    const left = currentPlace();
+    const target =
+      definitions.length === 1 ? definitions[0] : await picker.open(name, definitions, total);
+    if (!target || asked !== jumpAsked) return;
+    if (here(target)) {
+      showToast("This is the definition.");
+      return;
+    }
+    const landed = { path: target.path, line: target.line, scrollTop: null, selection: null };
+    const shown = await showPlace(landed);
+    if (shown === "shown") history.jump(left, landed);
+    // The index has not seen the file go yet: it looks again on the next focus.
+    else if (shown === "missing") showToast(`${target.path} is no longer there.`);
+  }
+
+  function currentPlace() {
+    return {
+      path: state.file.path,
+      line: lineAt(codeEl.scrollTop) + 1,
+      scrollTop: codeEl.scrollTop,
+      selection: state.selection && { ...state.selection },
+    };
+  }
+
+  // Shows `place`, opening its file when another one is open. A place left before comes back
+  // with its scroll offset and selection; a new one has its line a third of the way down, and
+  // the selection of the file it was jumped from when that is the same file. Resolves to
+  // "shown", "missing" (its file is gone), or "superseded" (a draft note holds the pane, or
+  // another open overtook this one), as `jumpHistory().step` takes.
+  async function showPlace(place) {
+    if (state.file?.path !== place.path) {
+      const opened = await openFileFor(place.path, { onlyFound: true });
+      if (opened === "held") return "superseded";
+      if (opened !== "shown") return opened;
+    }
+    const returning = place.scrollTop !== null;
+    if (returning) {
+      const fits = place.selection && Math.max(place.selection.anchor, place.selection.head);
+      state.selection = fits !== null && fits < lineCount() ? { ...place.selection } : null;
+    }
+    // A place left before is wherever the pane was scrolled to: no line of it is marked.
+    jumped = returning ? null : { path: place.path, index: place.line - 1 };
+    redecorateRows();
+    const top = returning ? place.scrollTop : lineTop(place.line - 1) - codeEl.clientHeight / 3;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    codeEl.scrollTo({ top, behavior: returning || reduce ? "auto" : "smooth" });
+    return "shown";
+  }
+
+  async function stepHistory(direction) {
+    if (stepping || !state.file) return;
+    // A draft note keeps the pane, and its lines on screen: no step, not even in the file.
+    if (state.composer?.text.trim()) {
+      state.composer.node.querySelector("textarea").focus();
+      return;
+    }
+    cancelJump();
+    stepping = true;
+    try {
+      await history.step(direction, currentPlace(), showPlace);
+    } finally {
+      stepping = false;
+    }
   }
 
   // ---- Composer ---------------------------------------------------------------------------
@@ -721,5 +902,7 @@ export function codeView({
     openComposer,
     askOnSelection,
     closeComposer,
+    cancelJump,
+    stepHistory,
   };
 }

@@ -11,13 +11,15 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent};
+use tree_sitter_tags::TagsConfiguration;
 
 use crate::error::{Error, Result};
 
 /// The largest text [`Highlighter::lines`] colors, in bytes: 2 MB, the owner's choice
 /// (2026-11-23). A larger file comes back as plain lines: tree-sitter parses the whole text
-/// with no way to stop it, and the file is not worth seconds of a busy request thread.
-const MAX_HIGHLIGHTED: usize = 2_000_000;
+/// with no way to stop it, and the file is not worth seconds of a busy request thread. The
+/// definitions index (`definitions.rs`) skips larger files for the same reason.
+pub(crate) const MAX_HIGHLIGHTED: usize = 2_000_000;
 
 /// A run of text and the CSS class the page gives it. The class is empty for plain text.
 pub(crate) type Token<'a> = (&'static str, &'a str);
@@ -47,6 +49,9 @@ struct Grammar {
     /// Without the dot. Matched ignoring ASCII case.
     extensions: &'static [&'static str],
     build: fn() -> HighlightConfiguration,
+    /// Its definitions query, for jump to definition; `None` for a grammar crate that ships
+    /// no `tags.scm`.
+    tags: Option<fn() -> TagsConfiguration>,
 }
 
 /// The languages the app colors. Adding one is a grammar crate in `Cargo.toml` and a row
@@ -64,6 +69,13 @@ const GRAMMARS: &[Grammar] = &[
                 "",
             ))
         },
+        tags: Some(|| {
+            tags(TagsConfiguration::new(
+                tree_sitter_rust::LANGUAGE.into(),
+                tree_sitter_rust::TAGS_QUERY,
+                "",
+            ))
+        }),
     },
     Grammar {
         extensions: &["js", "mjs", "cjs", "jsx"],
@@ -81,6 +93,13 @@ const GRAMMARS: &[Grammar] = &[
                 tree_sitter_javascript::LOCALS_QUERY,
             ))
         },
+        tags: Some(|| {
+            tags(TagsConfiguration::new(
+                tree_sitter_javascript::LANGUAGE.into(),
+                tree_sitter_javascript::TAGS_QUERY,
+                "",
+            ))
+        }),
     },
     Grammar {
         extensions: &["ts", "mts", "cts"],
@@ -103,6 +122,13 @@ const GRAMMARS: &[Grammar] = &[
                 &locals,
             ))
         },
+        tags: Some(|| {
+            tags(TagsConfiguration::new(
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                &typescript_tags(),
+                "",
+            ))
+        }),
     },
     Grammar {
         extensions: &["tsx"],
@@ -126,6 +152,13 @@ const GRAMMARS: &[Grammar] = &[
                 &locals,
             ))
         },
+        tags: Some(|| {
+            tags(TagsConfiguration::new(
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                &typescript_tags(),
+                "",
+            ))
+        }),
     },
     Grammar {
         extensions: &["py"],
@@ -138,6 +171,13 @@ const GRAMMARS: &[Grammar] = &[
                 "",
             ))
         },
+        tags: Some(|| {
+            tags(TagsConfiguration::new(
+                tree_sitter_python::LANGUAGE.into(),
+                tree_sitter_python::TAGS_QUERY,
+                "",
+            ))
+        }),
     },
     Grammar {
         extensions: &["go"],
@@ -150,6 +190,13 @@ const GRAMMARS: &[Grammar] = &[
                 "",
             ))
         },
+        tags: Some(|| {
+            tags(TagsConfiguration::new(
+                tree_sitter_go::LANGUAGE.into(),
+                tree_sitter_go::TAGS_QUERY,
+                "",
+            ))
+        }),
     },
     Grammar {
         extensions: &["json"],
@@ -162,6 +209,7 @@ const GRAMMARS: &[Grammar] = &[
                 "",
             ))
         },
+        tags: None,
     },
     Grammar {
         extensions: &["toml"],
@@ -174,6 +222,7 @@ const GRAMMARS: &[Grammar] = &[
                 "",
             ))
         },
+        tags: None,
     },
     Grammar {
         extensions: &["sh", "bash", "zsh"],
@@ -186,8 +235,68 @@ const GRAMMARS: &[Grammar] = &[
                 "",
             ))
         },
+        tags: None,
     },
 ];
+
+/// Finishes a row's tags configuration, built from its grammar's `tags.scm` and no locals
+/// query.
+///
+/// JavaScript ships a locals query, and it is left out on purpose. `tree-sitter-tags` uses
+/// the locals only for a pattern with an `(#is-not? local)` predicate, to drop a reference to
+/// a local name; no `tags.scm` of these grammars has one, and the index keeps no references.
+/// The query would only add a pass over every file.
+fn tags(
+    configuration: std::result::Result<TagsConfiguration, tree_sitter_tags::Error>,
+) -> TagsConfiguration {
+    configuration.expect(
+        "every tags query of GRAMMARS compiles: the test \
+         `every_tags_query_compiles_and_names_known_kinds` builds each",
+    )
+}
+
+/// A grammar that has a tags query, by its row in [`GRAMMARS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TagsGrammar(usize);
+
+impl TagsGrammar {
+    /// Builds its tags configuration: compiles the query, which takes milliseconds, so the
+    /// caller keeps it.
+    pub(crate) fn configuration(self) -> TagsConfiguration {
+        let build = GRAMMARS[self.0]
+            .tags
+            .expect("a TagsGrammar is made only by tags_grammar, for a row with a tags query");
+        build()
+    }
+}
+
+/// The grammar whose tags query reads `path`, by its extension; `None` for a language
+/// without one.
+pub(crate) fn tags_grammar(path: &str) -> Option<TagsGrammar> {
+    let row = grammar_row(path)?;
+    GRAMMARS[row].tags.map(|_| TagsGrammar(row))
+}
+
+/// The row of [`GRAMMARS`] that claims `path`'s extension.
+fn grammar_row(path: &str) -> Option<usize> {
+    let extension = Path::new(path).extension()?.to_str()?;
+    GRAMMARS.iter().position(|grammar| {
+        grammar
+            .extensions
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(extension))
+    })
+}
+
+/// TypeScript's `tags.scm` lists only what TypeScript adds (interfaces, signatures, modules):
+/// it is written to follow JavaScript's, as its highlights query is.
+fn typescript_tags() -> String {
+    [
+        tree_sitter_javascript::TAGS_QUERY,
+        tree_sitter_typescript::TAGS_QUERY,
+    ]
+    .concat()
+}
 
 /// Finishes a grammar's configuration: its captures are mapped onto [`STYLES`].
 ///
@@ -223,13 +332,7 @@ impl Highlighter {
 
     /// The configuration for `path`'s extension, or `None` for a language without a grammar.
     fn configuration(&self, path: &str) -> Option<&HighlightConfiguration> {
-        let extension = Path::new(path).extension()?.to_str()?;
-        let index = GRAMMARS.iter().position(|grammar| {
-            grammar
-                .extensions
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(extension))
-        })?;
+        let index = grammar_row(path)?;
         Some(self.configurations[index].get_or_init(GRAMMARS[index].build))
     }
 
@@ -544,6 +647,25 @@ mod tests {
                 );
             }
             assert_eq!(rejoin(&lines), normalized(text), "{path}");
+        }
+    }
+
+    #[test]
+    fn every_tags_query_compiles_and_names_known_kinds() {
+        // A definition whose kind the index does not know would be dropped from it
+        // (`DefinitionKind::from_capture`): a grammar crate's update that adds one fails here.
+        for (row, grammar) in GRAMMARS.iter().enumerate() {
+            let Some(_) = grammar.tags else { continue };
+            let configuration = TagsGrammar(row).configuration();
+            for name in configuration.query.capture_names() {
+                if let Some(kind) = name.strip_prefix("definition.") {
+                    assert!(
+                        crate::definitions::DefinitionKind::from_capture(kind).is_some(),
+                        "{:?}: {name}",
+                        grammar.extensions
+                    );
+                }
+            }
         }
     }
 

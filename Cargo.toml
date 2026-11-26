@@ -21,6 +21,8 @@ serde = { version = "1.0.229", default-features = false, features = ["derive", "
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 # Syntax colors. One grammar crate per language.
 tree-sitter-highlight = "0.27.2"
+# Jump to definition: runs the grammars' tags queries (`src/definitions.rs`).
+tree-sitter-tags = "0.27.2"
 tree-sitter-rust = "0.24.2"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-typescript = "0.23.2"

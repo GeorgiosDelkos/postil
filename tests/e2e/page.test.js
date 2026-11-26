@@ -7,7 +7,7 @@
 // the node under the pointer while it drew the run again (docs/review-2026-11-23.md, D4).
 
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
@@ -997,4 +997,210 @@ test("a wizard whose save is refused starts over from the file another window wr
   const saved = await (await fetch(new URL("api/settings", site))).json();
   assert.equal(saved.settings.theme, "light");
   assert.equal(saved.settings.tabWidth, 8);
+});
+
+// Jump to definition (docs/review-assist-plan.md, 7.7): `src/a.rs` calls a function of
+// `src/b.rs`, one defined in two files, one of its own and one defined nowhere;
+// `src/long.rs` calls `helper` far enough down to scroll. No run starts, so the scenario
+// does not matter.
+const LONG_FILLER = 150;
+const DEFINITIONS = {
+  "src/a.rs": [
+    "fn main() {",
+    "    helper();",
+    "    ambiguous();",
+    "    local();",
+    "    // helper is in b",
+    '    missing("helper");',
+    "}",
+    "fn local() {}",
+    "",
+  ].join("\n"),
+  "src/b.rs": "pub fn helper() {}\n\npub fn ambiguous() {}\n",
+  "other/c.rs": "pub fn ambiguous() {}\n",
+  "src/long.rs": `${"// filler\n".repeat(LONG_FILLER)}fn far() {\n    helper();\n}\n`,
+  "config.json": '{"helper": 1}\n',
+};
+
+// A project of `DEFINITIONS`, with `asked`: every ask for definitions the page sends, to tell
+// a click that asked nothing.
+async function openDefinitions(t) {
+  const opened = await openProject(t, "flood", "new", { files: DEFINITIONS });
+  const asked = [];
+  opened.page.on("request", (request) => {
+    if (request.url().includes("api/definitions?")) asked.push(request.url());
+  });
+  return { ...opened, asked };
+}
+
+async function openFile(page, path) {
+  await page.locator("#filter").fill(path);
+  await page.locator("#filter").press("Enter");
+  await page.locator("#crumbs b").filter({ hasText: path.split("/").at(-1) }).waitFor();
+}
+
+// The token `text` on 0-based line `line` of the open file.
+const token = (page, line, text) =>
+  page.locator(`#code-rows .ln[data-line="${line}"] .c`).getByText(text, { exact: true });
+
+test("Cmd-click jumps to a definition and leaves the selection as it was; Cmd-[ goes back", async (t) => {
+  const { page } = await openDefinitions(t);
+  await openFile(page, "src/a.rs");
+  await page.locator('#code-rows .ln[data-line="0"] .n').click();
+  const selected = page.locator('#code-rows .ln.selected[data-line="0"]');
+  await selected.waitFor();
+
+  // In the same file: the selection stays, and the line jumped to is marked.
+  await token(page, 3, "local").click({ modifiers: ["Meta"] });
+  await page.locator('#code-rows .ln.jumped[data-line="7"]').waitFor();
+  assert.equal(await selected.count(), 1);
+
+  // To another file, and back with Cmd-[, the selection with it; forward again with Cmd-].
+  await token(page, 1, "helper").click({ modifiers: ["Meta"] });
+  await page.locator("#crumbs b").filter({ hasText: "b.rs" }).waitFor();
+  await page.locator('#code-rows .ln.jumped[data-line="0"]').waitFor();
+  await page.keyboard.press("Meta+BracketLeft");
+  await page.locator("#crumbs b").filter({ hasText: "a.rs" }).waitFor();
+  await selected.waitFor();
+  await page.keyboard.press("Meta+BracketRight");
+  await page.locator("#crumbs b").filter({ hasText: "b.rs" }).waitFor();
+});
+
+test("a name defined twice opens a ranked list, and a pick jumps there", async (t) => {
+  const { page } = await openDefinitions(t);
+  await openFile(page, "src/a.rs");
+  await token(page, 2, "ambiguous").click({ modifiers: ["Meta"] });
+
+  const dialog = page.locator("#definitions-dialog");
+  await dialog.filter({ hasText: "2 definitions · by name" }).waitFor();
+  const places = await dialog.locator(".definition-place").allTextContents();
+  assert.deepEqual(places, ["src/b.rs:3", "other/c.rs:1"], "the same folder first");
+  await dialog.locator(".definition-card").nth(1).click();
+  await page.locator("#crumbs b").filter({ hasText: "c.rs" }).waitFor();
+});
+
+test("Go to Definition in the right-click menu jumps, and clicks that cannot jump say why", async (t) => {
+  const { page, asked } = await openDefinitions(t);
+  await openFile(page, "src/a.rs");
+
+  // A Cmd-click on `helper` in a comment or a string asks nothing: the jump after them is
+  // the only ask.
+  const comment = token(page, 4, "// helper is in b");
+  await comment.click({ modifiers: ["Meta"], position: { x: 30, y: 5 } });
+  await token(page, 5, '"helper"').click({ modifiers: ["Meta"] });
+  await token(page, 0, "main").click({ modifiers: ["Meta"] });
+  await page.locator("#toast").filter({ hasText: "This is the definition." }).waitFor();
+  assert.equal(asked.length, 1, asked.join("\n"));
+
+  await token(page, 5, "missing").click({ modifiers: ["Meta"] });
+  await page.locator("#toast").filter({ hasText: "No definition found for missing." }).waitFor();
+
+  await token(page, 1, "helper").click({ button: "right" });
+  await page.locator("#context-menu").getByRole("menuitem", { name: /Go to Definition/ }).click();
+  await page.locator("#crumbs b").filter({ hasText: "b.rs" }).waitFor();
+
+  await openFile(page, "config.json");
+  await page.locator('#code-rows .ln[data-line="0"] .c').click({ modifiers: ["Meta"] });
+  await page.locator("#toast").filter({ hasText: "No definitions for this file type." }).waitFor();
+});
+
+// Waits until the project's index has finished its first build.
+const indexBuilt = (page) =>
+  page.waitForFunction(
+    async () => (await (await fetch("api/definitions?name=x")).json()).state === "ready",
+    null,
+    { polling: 100 },
+  );
+
+test("while the index is building, the page asks again and then jumps", async (t) => {
+  const { page, asked } = await openDefinitions(t);
+  await openFile(page, "src/a.rs");
+  let answers = 0;
+  await page.route(/api\/definitions\?/, (route) => {
+    answers += 1;
+    return answers === 1 ? route.fulfill({ json: { state: "building" } }) : route.continue();
+  });
+
+  await token(page, 1, "helper").click({ modifiers: ["Meta"] });
+
+  await page.locator("#crumbs b").filter({ hasText: "b.rs" }).waitFor();
+  assert.equal(asked.length, 2, asked.join("\n"));
+});
+
+test("Escape stops the page asking again while the index is building", async (t) => {
+  const { page, asked } = await openDefinitions(t);
+  await openFile(page, "src/a.rs");
+  await page.route(/api\/definitions\?/, (route) => route.fulfill({ json: { state: "building" } }));
+  // The page's timers run only when the test moves this clock on.
+  await page.clock.install();
+  await page.clock.pauseAt(Date.now() + 1000);
+
+  const answered = page.waitForResponse(/api\/definitions\?/);
+  await token(page, 1, "helper").click({ modifiers: ["Meta"] });
+  await answered;
+  await page.keyboard.press("Escape");
+  // Far past the 250 ms the page waits before asking again (ui/code-view.js).
+  await page.clock.runFor(5000);
+  // A round trip to the page, so a request it sent during the run above has been seen.
+  await page.evaluate(() => 0);
+
+  assert.equal(asked.length, 1, asked.join("\n"));
+  await page.locator("#crumbs b").filter({ hasText: "a.rs" }).waitFor();
+});
+
+test("a definition written on disk is found after the window regains focus", async (t) => {
+  const { page, api } = await openDefinitions(t);
+  // Built before the files are written, so only the focus refresh can see them.
+  await indexBuilt(page);
+  const { root } = await api("api/repo");
+  writeFileSync(join(root, "src/d.rs"), "fn caller() {\n    fresh();\n}\n");
+  writeFileSync(join(root, "src/e.rs"), "pub fn fresh() {}\n");
+
+  const refreshed = page.waitForResponse((response) =>
+    response.url().includes("api/definitions/refresh"),
+  );
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await refreshed;
+  // The refresh runs on the index's own thread: this waits until it has seen the new file.
+  await page.waitForFunction(
+    async () => (await (await fetch("api/definitions?name=fresh")).json()).total === 1,
+    null,
+    { polling: 100 },
+  );
+
+  await openFile(page, "src/d.rs");
+  await token(page, 1, "fresh").click({ modifiers: ["Meta"] });
+  await page.locator("#crumbs b").filter({ hasText: "e.rs" }).waitFor();
+});
+
+test("a jump to a file deleted since the index looked says so and stays put", async (t) => {
+  const { page, api } = await openDefinitions(t);
+  await indexBuilt(page);
+  const { root } = await api("api/repo");
+  unlinkSync(join(root, "src/b.rs"));
+
+  await openFile(page, "src/a.rs");
+  await token(page, 1, "helper").click({ modifiers: ["Meta"] });
+
+  await page.locator("#toast").filter({ hasText: "src/b.rs is no longer there." }).waitFor();
+  await page.locator("#crumbs b").filter({ hasText: "a.rs" }).waitFor();
+});
+
+test("Cmd-[ comes back to where the file was scrolled", async (t) => {
+  const { page } = await openDefinitions(t);
+  await openFile(page, "src/long.rs");
+  const code = page.locator("#code");
+  await code.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const call = token(page, LONG_FILLER + 1, "helper");
+  await call.waitFor();
+  const scrolled = await code.evaluate((element) => element.scrollTop);
+  assert.ok(scrolled > 0, "the file scrolls");
+
+  await call.click({ modifiers: ["Meta"] });
+  await page.locator("#crumbs b").filter({ hasText: "b.rs" }).waitFor();
+  await page.keyboard.press("Meta+BracketLeft");
+  await page.locator("#crumbs b").filter({ hasText: "long.rs" }).waitFor();
+  await page.waitForFunction((top) => document.getElementById("code").scrollTop === top, scrolled);
 });

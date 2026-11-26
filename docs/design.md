@@ -179,6 +179,7 @@ schedule three tasks.
 | `src/run/log.rs` | The run log: a run in memory and its file on disk. |
 | `src/usage/ledger.rs`, `src/usage/quota.rs` | The usage ledger (`usage.jsonl`) and its totals; the providers' account quotas, probed on demand. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
+| `src/definitions.rs` | Jump to definition: an index from a name to where it is defined, built from the grammars' tags queries on a thread per open project (`index-definitions`). |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
 | `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
 | `ui/dom.js`, `ui/dialog-parts.js`, `ui/question-form.js` | Helpers the views share: `el()`, icons, the toast and two-click delete; the parts both dialogs draw; the question form. |
@@ -187,6 +188,7 @@ schedule three tasks.
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 | `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
+| `ui/definitions.js`, `ui/definitions-dialog.js` | Jump to definition: the name under a click and the history of places (tested with `node --test`), and the list a name defined more than once opens. |
 
 ### Data structures
 
@@ -1128,6 +1130,14 @@ Languages built in: Rust, JavaScript, TypeScript and TSX, Python, Go, JSON, TOML
 files show as plain text. Markdown is not included yet: its grammar is two grammars joined by
 injections, which the highlighter does not run. Each grammar is compiled on first use, so launch
 pays for none of them. The eight grammars took the release binary from 3.6 MB to 9.1 MB.
+
+Jump to definition adds `tree-sitter-tags` 0.27.2, the highlighter's release line, which runs
+the `tags.scm` that the Rust, JavaScript, TypeScript, Python and Go grammar crates already
+ship. It adds one crate, 115 to 116 (its other dependencies, `tree-sitter`, `regex`, `memchr`,
+`streaming-iterator` and `thiserror`, are in the tree already), MIT-licensed, and `cargo deny
+check` passes with no new exception. The stripped release binary grew from 11,089,152 to
+11,207,920 bytes (0.12 MB). Measured 2026-11-26. Writing the definition patterns by hand over
+`tree-sitter` was the alternative: the same queries, maintained here instead of upstream.
 
 ### Expected total
 
