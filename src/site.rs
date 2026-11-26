@@ -81,6 +81,11 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/usage-dialog.js"),
     ),
     (
+        "/usage-popover.js",
+        "text/javascript",
+        include_bytes!("../ui/usage-popover.js"),
+    ),
+    (
         "/wizard.js",
         "text/javascript",
         include_bytes!("../ui/wizard.js"),

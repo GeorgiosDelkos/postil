@@ -141,8 +141,8 @@ flowchart LR
 
 The boundary is narrow on purpose. The page asks for data with `fetch` on a custom URL scheme
 (`postil://`), which the Rust process answers; no network socket is opened. The one exception
-is the Usage dialog's account quotas, which `/usr/bin/curl` fetches while the dialog is open
-(section "Usage"). Rust pushes
+is the account quotas, which `/usr/bin/curl` fetches while the Usage popover or dialog is
+open (section "Usage"). Rust pushes
 streaming events (agent updates) into the page. The page holds no state that matters: reloading
 it loses nothing.
 
@@ -186,7 +186,7 @@ schedule three tasks.
 | `ui/wizard.js`, `ui/wizard-dialog.js` | The first-run startup wizard: its rules (tested with `node --test`) and 4-step dialog. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
-| `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
+| `ui/usage.js`, `ui/usage-popover.js`, `ui/usage-dialog.js` | Usage: the formatting and ordering rules (tested with `node --test`), the popover, and the dialog. |
 
 ### Data structures
 
@@ -996,8 +996,14 @@ from Settings.
 
 ### Usage
 
-The Usage dialog (the Usage button above Settings, View > Usage, `Shift-Cmd-U`) shows, per
-agent, the provider account's quota and what Postil's own runs used. `GET /api/usage?scope=
+The Usage button above Settings (or View > Usage, `Shift-Cmd-U`) opens a popover above it, as
+Orca shows usage from its status bar: each installed or enabled built-in agent's account quota,
+tightest first, as a short bar and percentage per window with the soonest reset. Esc, a press
+outside, or leaving the window closes it. Its last row, "Usage details & history", opens the
+Usage dialog, which shows per agent the quota and what Postil's own runs used. The button
+shows the highest used percentage across agents, amber from 80% and red from 90% (Orca's
+thresholds); it changes only when the popover or dialog fetches, so it is the last reading
+seen, not a live one. `GET /api/usage?scope=
 project|all&range=24h|7d|30d|all` answers it, and `POST /api/usage/refresh` probes the quotas
 again. The ranges roll back from now: the process has no time zone, so a calendar day is not
 offered.
@@ -1013,8 +1019,8 @@ session, so a follow-up on a kept agent records its cost less what the session h
 before it; a meter that went down records no cost. Runs before this format, and runs whose
 log is reopened from disk, are not in the ledger.
 
-The account quotas (`src/usage/quota.rs`) are probed only while the dialog is open and cached
-for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`.
+The account quotas (`src/usage/quota.rs`) are probed only while the popover or dialog is open,
+and cached for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`.
 Claude and Gemini are asked over HTTPS with the agent's own sign-in: Claude's token from the
 macOS Keychain item Claude Code writes, or `~/.claude/.credentials.json`; Gemini's from
 `~/.gemini/oauth_creds.json`. The token goes to `/usr/bin/curl` on stdin (`--config -`, with
@@ -1264,7 +1270,7 @@ Assumed until someone objects:
    (it would hold the request thread). Pull requests need `gh`, installed and signed in.
 9. **Account quotas with the agents' own sign-in.** The Usage dialog reads the token Claude
    Code and the Gemini CLI already stored, read-only, and calls the providers' quota endpoints
-   with it, only while the dialog is open (section "Usage"). Decided by the owner 2026-11-25,
+   with it, only while the Usage popover or dialog is open (section "Usage"). Decided by the owner 2026-11-25,
    in the review of #57, over dropping live quotas (the ledger only) and probing Codex only.
    Accepted: the endpoints are undocumented and may change, and this is the one place Postil
    reaches the network or another tool's credentials.

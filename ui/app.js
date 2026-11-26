@@ -23,7 +23,9 @@ import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
+import { tightestQuota, quotaTone, formatPercent } from "./usage.js";
 import { usageDialog } from "./usage-dialog.js";
+import { usagePopover } from "./usage-popover.js";
 import { welcomeScreen } from "./welcome.js";
 import { wizardDialog } from "./wizard-dialog.js";
 
@@ -557,7 +559,7 @@ window.postil = {
     } else if (command === "setup-wizard") {
       settings.close();
       wizard.open();
-    } else if (command === "usage") usage.open();
+    } else if (command === "usage") usageMenu.toggle();
     else if (command === "focus-mode") toggleFocus();
     else if (command === "close-window" || command === "quit") quit();
   },
@@ -654,19 +656,32 @@ $("open-settings").addEventListener("click", () => {
   settings.open();
 });
 
+// The Usage button shows the tightest quota across agents, as Orca's status bar does. It
+// changes only when the popover or the dialog fetches: nothing polls the providers in the
+// background, so the reading is the last one seen.
+function showUsageLevel(view) {
+  const level = $("usage-level");
+  const used = tightestQuota(view.agents);
+  level.hidden = used === null;
+  if (used === null) return;
+  level.textContent = formatPercent(used);
+  level.className = `usage-level tone-${quotaTone(used)}`;
+}
+
 const usage = usageDialog($("usage"), {
   openSettings: () => {
     $("usage").close();
     settings.open();
   },
-  onTone: (tone) => {
-    const dot = $("usage-warn-dot");
-    dot.hidden = tone === null;
-    dot.classList.toggle("is-critical", tone === "critical");
-    dot.classList.toggle("is-warn", tone === "warn");
-  },
+  onView: showUsageLevel,
 });
-$("open-usage").addEventListener("click", () => usage.open());
+const usageMenu = usagePopover({
+  popoverEl: $("usage-popover"),
+  anchorEl: $("open-usage"),
+  openDetails: () => usage.open(),
+  onView: showUsageLevel,
+});
+$("open-usage").addEventListener("click", () => usageMenu.toggle());
 
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.

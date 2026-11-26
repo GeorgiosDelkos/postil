@@ -1,4 +1,4 @@
-// Pure formatting and view-model helpers for the Usage report dialog, without the DOM, so
+// Pure formatting and view-model helpers for the Usage popover and dialog, without the DOM, so
 // `ui/usage.test.js` can test them under `node --test`.
 
 // Compact human-readable token count: 0, 842, 12.5k, 1.42M.
@@ -45,10 +45,11 @@ export function formatPercent(value) {
   return `${clamped.toFixed(1)}%`;
 }
 
-// Visual tone for a quota utilization bar: normal (<80%), warn (80–94%), critical (>=95%).
+// Visual tone for a quota utilization bar: normal (<80%), warn (80–89%), critical (>=90%).
+// The thresholds are Orca's (20% and 10% left), which the popover follows.
 export function quotaTone(usedPercent) {
   if (!Number.isFinite(usedPercent)) return "normal";
-  if (usedPercent >= 95) return "critical";
+  if (usedPercent >= 90) return "critical";
   if (usedPercent >= 80) return "warn";
   return "normal";
 }
@@ -86,19 +87,52 @@ export function formatCredits(credits) {
   return "";
 }
 
-// Highest alert tone across cached quota windows for the sidebar indicator:
-// "critical" (>= 95%), "warn" (>= 90%), or null.
-export function highestQuotaTone(agents) {
-  if (!Array.isArray(agents)) return null;
-  let tone = null;
-  for (const agent of agents) {
-    if (agent.quota?.status !== "ok") continue;
-    for (const win of agent.quota.windows ?? []) {
-      if (win.usedPercent >= 95) return "critical";
-      if (win.usedPercent >= 90) tone = "warn";
+// The highest used percentage of one agent's quota windows, or null when it has no reading.
+export function agentTightest(agent) {
+  if (agent.quota?.status !== "ok") return null;
+  let tightest = null;
+  for (const win of agent.quota.windows ?? []) {
+    if (Number.isFinite(win.usedPercent) && (tightest === null || win.usedPercent > tightest)) {
+      tightest = win.usedPercent;
     }
   }
-  return tone;
+  return tightest;
+}
+
+// The highest used percentage across every agent's quota windows, for the sidebar button, or
+// null when no agent has a reading.
+export function tightestQuota(agents) {
+  if (!Array.isArray(agents)) return null;
+  let tightest = null;
+  for (const agent of agents) {
+    const used = agentTightest(agent);
+    if (used !== null && (tightest === null || used > tightest)) tightest = used;
+  }
+  return tightest;
+}
+
+// The agents the popover lists: built-in ones that are installed or turned on (a custom agent
+// has no account quota to show). The tightest come first, then those without a reading, by
+// name, so the agent closest to a limit is the first row.
+export function popoverAgents(agents) {
+  if (!Array.isArray(agents)) return [];
+  const listed = agents.filter((agent) => agent.builtIn && (agent.found || agent.enabled));
+  return listed.toSorted((a, b) => {
+    const left = agentTightest(a) ?? -1;
+    const right = agentTightest(b) ?? -1;
+    return right - left || a.name.localeCompare(b.name);
+  });
+}
+
+// The earliest reset among `windows` (Unix seconds), or null when none says when.
+export function soonestReset(windows) {
+  let soonest = null;
+  for (const win of windows ?? []) {
+    if (Number.isFinite(win.resetsAt) && (soonest === null || win.resetsAt < soonest)) {
+      soonest = win.resetsAt;
+    }
+  }
+  return soonest;
 }
 
 // Compact top-level summary items for the Usage dialog header strip.

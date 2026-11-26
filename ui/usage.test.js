@@ -8,9 +8,11 @@ import {
   formatPercent,
   formatReset,
   formatTokens,
-  highestQuotaTone,
+  popoverAgents,
   quotaTone,
+  soonestReset,
   summaryItems,
+  tightestQuota,
   tokenBreakdownTitle,
   usageUrl,
 } from "./usage.js";
@@ -43,7 +45,8 @@ test("formatPercent and quotaTone clamp values and pick thresholds", () => {
   assert.equal(formatPercent(120), "100%");
   assert.equal(quotaTone(79.9), "normal");
   assert.equal(quotaTone(80), "warn");
-  assert.equal(quotaTone(95), "critical");
+  assert.equal(quotaTone(89.9), "warn");
+  assert.equal(quotaTone(90), "critical");
 });
 
 test("formatReset renders countdowns in minutes, hours, and days", () => {
@@ -61,23 +64,46 @@ test("formatCredits handles unlimited, spent/limit, and remaining balances", () 
   assert.equal(formatCredits({ remaining: 12.5 }), "12.5 left");
 });
 
-test("highestQuotaTone flags >=90% as warn and >=95% as critical", () => {
-  assert.equal(highestQuotaTone([]), null);
+const ok = (...used) => ({
+  status: "ok",
+  windows: used.map((usedPercent) => ({ usedPercent })),
+});
+
+test("tightestQuota takes the highest window of any agent with a reading", () => {
+  assert.equal(tightestQuota(null), null);
+  assert.equal(tightestQuota([]), null);
+  assert.equal(tightestQuota([{ quota: { status: "error", windows: [] } }]), null);
+  assert.equal(tightestQuota([{ quota: ok() }]), null);
+  // 0% is a reading, not its absence.
+  assert.equal(tightestQuota([{ quota: ok(0) }]), 0);
+  assert.equal(tightestQuota([{ quota: ok(12, 61) }, { quota: ok(40) }, { quota: null }]), 61);
+  // A window still unread by a failed probe does not count.
   assert.equal(
-    highestQuotaTone([{ quota: { status: "ok", windows: [{ usedPercent: 70 }] } }]),
+    tightestQuota([{ quota: { status: "unavailable", windows: [{ usedPercent: 99 }] } }]),
     null,
   );
-  assert.equal(
-    highestQuotaTone([{ quota: { status: "ok", windows: [{ usedPercent: 91 }] } }]),
-    "warn",
+});
+
+test("popoverAgents lists installed or enabled built-ins, tightest first, then by name", () => {
+  const agents = [
+    { name: "Gemini", builtIn: true, found: true, quota: { status: "unavailable" } },
+    { name: "Claude", builtIn: true, found: true, quota: ok(20, 62) },
+    { name: "Local", builtIn: false, found: true, quota: ok(99) },
+    { name: "Grok", builtIn: true, found: false, enabled: false, quota: null },
+    { name: "Codex", builtIn: true, found: false, enabled: true, quota: ok(80) },
+    { name: "Amp", builtIn: true, found: true, quota: { status: "loading" } },
+  ];
+  assert.deepEqual(
+    popoverAgents(agents).map((agent) => agent.name),
+    ["Codex", "Claude", "Amp", "Gemini"],
   );
-  assert.equal(
-    highestQuotaTone([
-      { quota: { status: "ok", windows: [{ usedPercent: 91 }] } },
-      { quota: { status: "ok", windows: [{ usedPercent: 96 }] } },
-    ]),
-    "critical",
-  );
+  assert.deepEqual(popoverAgents(null), []);
+});
+
+test("soonestReset picks the earliest reset and skips windows without one", () => {
+  assert.equal(soonestReset(undefined), null);
+  assert.equal(soonestReset([{ resetsAt: null }]), null);
+  assert.equal(soonestReset([{ resetsAt: 300 }, { resetsAt: null }, { resetsAt: 120 }]), 120);
 });
 
 test("summaryItems, usageUrl, and tokenBreakdownTitle format view metadata", () => {

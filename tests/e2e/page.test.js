@@ -415,9 +415,35 @@ test("two threads run side by side, and each stops from its own dialog", async (
   await page.locator("#run-header .stop").waitFor({ state: "detached" });
 });
 
-test("Usage button opens the usage report, switches filters, and Refresh settles", async (t) => {
+test("Usage button opens a popover that refreshes, closes, and leads to the report", async (t) => {
   const { page } = await openProject(t);
-  await page.locator("#open-usage").click();
+  const button = page.locator("#open-usage");
+  const popover = page.locator("#usage-popover");
+  await button.click();
+  await popover.waitFor();
+  // The popover, not the modal report, is what the button opens.
+  assert.equal(await page.locator("#usage").isVisible(), false);
+  await popover
+    .locator(".usage-pop-row, .usage-pop-note:not(:has-text('Loading'))")
+    .first()
+    .waitFor();
+
+  await popover.getByRole("button", { name: "Refresh" }).click();
+  // Even when the reply matches the previous view, Refresh must settle back to enabled.
+  await popover.getByRole("button", { name: "Refresh", disabled: false }).waitFor();
+
+  // Escape closes it and gives the focus back to the button; a press outside closes it too.
+  await page.keyboard.press("Escape");
+  await popover.waitFor({ state: "hidden" });
+  assert.equal(await button.evaluate((node) => node === document.activeElement), true);
+  await button.click();
+  await popover.waitFor();
+  await page.locator("#files").click({ position: { x: 5, y: 5 } });
+  await popover.waitFor({ state: "hidden" });
+
+  await button.click();
+  await popover.getByRole("button", { name: /Usage details & history/ }).click();
+  await popover.waitFor({ state: "hidden" });
   const dialog = page.locator("#usage");
   await dialog.waitFor();
 

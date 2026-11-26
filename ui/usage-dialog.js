@@ -1,5 +1,6 @@
-// The Usage report dialog: shows live provider account quotas and filtered Postil activity
-// (per agent and per underlying model) from `api/usage`.
+// The Usage report dialog, opened from the Usage popover's "Usage details & history": shows
+// live provider account quotas and filtered Postil activity (per agent and per underlying
+// model) from `api/usage`.
 //
 // Polls while the agent scan or any live provider quota probe is in flight, and redraws only
 // when the reply changes so focus and scroll position stay put.
@@ -12,7 +13,6 @@ import {
   formatPercent,
   formatReset,
   formatTokens,
-  highestQuotaTone,
   quotaTone,
   rangeLabel,
   summaryItems,
@@ -30,7 +30,8 @@ function button(text, key, onClick, className = "button") {
   return node;
 }
 
-export function usageDialog(dialogEl, { openSettings, onTone }) {
+// `onView(view)` receives every reply, for the sidebar button's reading.
+export function usageDialog(dialogEl, { openSettings, onView }) {
   const ui = {
     scope: "project",
     range: "7d",
@@ -57,7 +58,7 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
     ui.range = view.range;
     ui.error = null;
     ui.refreshing = false;
-    onTone?.(highestQuotaTone(view.agents));
+    onView?.(view);
     clearTimeout(ui.pollTimer);
     if (dialogEl.open && (view.scanning || view.polling)) {
       ui.pollTimer = setTimeout(() => {
