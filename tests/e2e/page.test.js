@@ -290,7 +290,7 @@ test("a send that fails after its step was closed leaves the next send alone (JS
   await page.waitForFunction(() => !document.getElementById("send-button").disabled);
 });
 
-test("a right-click on a folder writes a note on all of it, and Send sends it at once", async (t) => {
+test("a right-click on a folder saves a note on it first, to send when chosen", async (t) => {
   const { page, api } = await openProject(t);
   await page.locator('#files .dir[data-path="src"]').click({ button: "right" });
   await page
@@ -300,21 +300,23 @@ test("a right-click on a folder writes a note on all of it, and Send sends it at
 
   const dialog = page.locator("#path-note-dialog");
   await dialog.locator(".note-dialog-where").filter({ hasText: "src/" }).waitFor();
+  assert.equal(
+    await dialog.getByRole("button", { name: /Send/ }).count(),
+    0,
+    "creating a path note offers Save and Discard, not Send",
+  );
   await dialog.locator("textarea").fill("Split this module.");
-  await dialog.getByRole("button", { name: /Send to Fake/ }).click();
+  await dialog.locator("textarea").press("Meta+Enter");
   await dialog.waitFor({ state: "hidden" });
 
-  // Stored first, then sent alone: the run's prompt names the folder, and its card stays.
+  // Cmd-Enter saves to the tray without starting a run, as in the line-note composer.
   await page.locator("#notes .note-place").filter({ hasText: "src/" }).waitFor();
   const { notes } = await api("api/notes");
   assert.deepEqual(
     notes.map(({ id, path, target, body }) => [id, path, target, body]),
     [["N1", "src", "folder", "Split this module."]],
   );
-  await page.waitForFunction(() => !document.getElementById("tab-run").hidden);
-  const run = await api("api/run");
-  assert.deepEqual(run.notes, ["N1"]);
-  assert.match(run.prompt, /\[N1\] src\/ \(folder\)\nSplit this module\.\n$/);
+  assert.equal(await api("api/run"), null, "saving a folder note sends nothing");
 
   // The folder's row counts the note on it, closed and open: no file below it carries it.
   const folder = page.locator('#files .dir[data-path="src"]');
@@ -322,9 +324,16 @@ test("a right-click on a folder writes a note on all of it, and Send sends it at
   await folder.click();
   await page.locator('#files .file[data-path="src/a.rs"]').waitFor();
   await folder.locator(".count").filter({ hasText: "1" }).waitFor();
+
+  // From the tray, the engineer then sends it when ready.
+  await page.locator("#notes .note-send").click();
+  await page.waitForFunction(() => !document.getElementById("tab-run").hidden);
+  const run = await api("api/run");
+  assert.deepEqual(run.notes, ["N1"]);
+  assert.match(run.prompt, /\[N1\] src\/ \(folder\)\nSplit this module\.\n$/);
 });
 
-test("c on a file's row writes a note on the file, and Save keeps it without a run", async (t) => {
+test("c on a file's row writes a note on the file, with Discard and Save note", async (t) => {
   const { page, api } = await openProject(t);
   await page.locator('#files .dir[data-path="src"]').click();
   await page.locator('#files .file[data-path="src/b.rs"]').focus();
@@ -333,10 +342,17 @@ test("c on a file's row writes a note on the file, and Save keeps it without a r
   const dialog = page.locator("#path-note-dialog");
   await dialog.locator(".note-dialog-where").filter({ hasText: "src/b.rs" }).waitFor();
   // An empty note is refused in the dialog, which stays open.
-  await dialog.getByRole("button", { name: "Save" }).click();
+  await dialog.getByRole("button", { name: /Save note/ }).click();
   await dialog.locator(".note-dialog-why").filter({ hasText: "Write the note first." }).waitFor();
+  await dialog.locator("textarea").fill("Draft to discard.");
+  await dialog.getByRole("button", { name: "Discard", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert.deepEqual((await api("api/notes")).notes, [], "Discard stores nothing");
+
+  await page.locator('#files .file[data-path="src/b.rs"]').focus();
+  await page.keyboard.press("c");
   await dialog.locator("textarea").fill("Fold into a.rs.");
-  await dialog.getByRole("button", { name: "Save" }).click();
+  await dialog.getByRole("button", { name: /Save note/ }).click();
   await dialog.waitFor({ state: "hidden" });
 
   await page.locator("#notes .note-place").filter({ hasText: "b.rs" }).waitFor();
@@ -345,7 +361,7 @@ test("c on a file's row writes a note on the file, and Save keeps it without a r
     notes.map(({ path, target }) => [path, target]),
     [["src/b.rs", "file"]],
   );
-  assert.equal(await api("api/run"), null, "Save sends nothing");
+  assert.equal(await api("api/run"), null, "Save note sends nothing");
   // The file's row counts its note.
   const count = page.locator('#files .file[data-path="src/b.rs"] .count');
   await count.filter({ hasText: "1" }).waitFor();

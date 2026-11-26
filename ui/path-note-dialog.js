@@ -1,23 +1,15 @@
 // The dialog that writes a note on a whole file or folder, opened from the file list's
 // right-click menu or with `c` on a row of the tree (docs/design.md, "The loop", step 3).
-// Save keeps the note in the tray; Send keeps it and sends it alone to the default agent at
-// once, as the arrow on a card does. Either way the note is stored first (src/notes.rs, `add`),
-// so a send that fails leaves it in the tray to send again.
+// Like the inline composer for line notes, it saves the note to the tray (or discards it),
+// leaving when and how to send it to the tray and the note's detail dialog.
 
 import { el, icon } from "./dom.js";
 import { fileIcon, folderIcon } from "./icons.js";
 
 // `dialogEl` is the `<dialog>`. The callbacks:
-// - `add(path, target, body)` stores the note and resolves to `{ note }`, or `{ error }` with
-//   the reason it was refused;
-// - `send(note, { review })` sends a stored note alone (review: open the send step with it
-//   alone ticked instead);
-// - `agent()` names the default agent, or null when none is set.
-//
-// Send is never turned off while a run is under way: the dialog would have to follow the run
-// to turn it back on. A send then is refused with the reason, after the note is saved, as the
-// arrow on a card is.
-export function pathNoteDialog(dialogEl, { add, send, agent }) {
+// - `add(path, target, body)` stores the note and resolves to null, or the reason it was refused;
+// - `openSend()` opens the tray's send step when `Cmd-Shift-Enter` is pressed with no draft.
+export function pathNoteDialog(dialogEl, { add, openSend }) {
   // The path and kind ("file" or "folder") of the note being written, while the dialog is open.
   let writing = null;
 
@@ -27,8 +19,15 @@ export function pathNoteDialog(dialogEl, { add, send, agent }) {
   dialogEl.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      // Cmd-Enter sends, as in the note dialog.
-      dialogEl.querySelector(".path-note-send")?.click();
+      if (event.shiftKey) {
+        if (!holdDraft("sending")) {
+          dialogEl.close();
+          openSend?.();
+        }
+      } else {
+        // Cmd-Enter saves the note, as in the line-note composer.
+        dialogEl.querySelector(".path-note-save")?.click();
+      }
     }
   });
 
@@ -77,27 +76,23 @@ export function pathNoteDialog(dialogEl, { add, send, agent }) {
   function footer(input) {
     const foot = el("footer", "note-dialog-footer");
     const why = el("span", "note-dialog-why");
-    const save = el("button", "button path-note-save", "Save");
+    const discard = el("button", "button path-note-discard", "Discard");
+    discard.type = "button";
+    discard.addEventListener("click", () => dialogEl.close());
+
+    const save = el("button", "button primary path-note-save");
     save.type = "button";
-    save.title = "Keeps the note in the tray, to send later.";
-    save.addEventListener("click", () => submit(input, why, null));
+    save.append("Save note", el("kbd", "", "⌘↵"));
+    save.title = "Keeps the note in the tray, to send when you choose.";
+    save.addEventListener("click", () => submit(input, why));
 
-    const to = agent();
-    const sendButton = el("button", "button primary path-note-send");
-    sendButton.type = "button";
-    sendButton.append(to ? `Send to ${to}` : "Send…", el("kbd", "", "⌘↵"));
-    sendButton.title =
-      "Keeps the note in the tray and sends it alone to the default agent. " +
-      "Shift-click shows the prompt first.";
-    sendButton.addEventListener("click", (event) => submit(input, why, { review: event.shiftKey }));
-
-    foot.append(el("span", "hint", "esc discard"), el("span", "spacer"), why, save, sendButton);
+    foot.append(el("span", "hint", "esc discard"), el("span", "spacer"), why, discard, save);
     return foot;
   }
 
-  // Stores the note, then sends it when `sending` is given. A refusal is shown in the dialog,
-  // which stays open with the text.
-  async function submit(input, why, sending) {
+  // Stores the note in the tray and closes the dialog. A refusal is shown in the dialog, which
+  // stays open with the text.
+  async function submit(input, why) {
     const current = writing;
     if (!current || current.saving) return;
     const text = input.value.trim();
@@ -107,16 +102,20 @@ export function pathNoteDialog(dialogEl, { add, send, agent }) {
       return;
     }
     current.saving = true;
-    const reply = await add(current.path, current.target, text).finally(() => {
+    let failure;
+    try {
+      failure = await add(current.path, current.target, text);
+    } catch (error) {
+      failure = `cannot save the note: ${error}`;
+    } finally {
       current.saving = false;
-    });
-    if (reply.error) {
+    }
+    if (failure) {
       // The dialog may have been closed while the request ran; the text is gone with it.
-      if (writing === current) fail(why, reply.error);
+      if (writing === current) fail(why, failure);
       return;
     }
     if (writing === current) dialogEl.close();
-    if (sending) send(reply.note, sending);
   }
 
   function fail(why, text) {
