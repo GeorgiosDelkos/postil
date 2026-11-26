@@ -51,7 +51,7 @@ pub(crate) use crate::acp::connection::{
     Agent, Event, Launch, PermissionRequest, Stopper, TurnEnd,
 };
 pub(crate) use crate::acp::wire::{
-    ContentBlock, ElicitationReply, Location, ModelOption, PermissionKind, PermissionOption,
-    PlanEntryStatus, PromptUsage, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
-    ToolKind, UsageCost,
+    ContentBlock, ElicitationReply, Location, METHOD_NOT_FOUND, ModelOption, PermissionKind,
+    PermissionOption, PlanEntryStatus, PromptUsage, SessionUpdate, StopReason, ToolCallContent,
+    ToolCallStatus, ToolKind, UsageCost,
 };

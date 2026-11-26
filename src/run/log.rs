@@ -148,9 +148,22 @@ impl RunUsage {
         }
     }
 
-    /// Latest known cumulative session cost for a follow-up that reuses this session.
+    /// Latest known cumulative session cost for a follow-up that reuses this session. When
+    /// only per-turn costs (`direct_cost`) were reported, advances `cost_baseline` by this
+    /// turn's cost so a later `usage_update` on the same session cannot count it again.
     fn session_cost(&self) -> Option<UsageCost> {
-        self.cost.clone().or_else(|| self.cost_baseline.clone())
+        if let Some(cost) = &self.cost {
+            return Some(cost.clone());
+        }
+        match (&self.cost_baseline, &self.direct_cost) {
+            (None, direct) => direct.clone(),
+            (Some(base), None) => Some(base.clone()),
+            (Some(base), Some(direct)) if base.currency == direct.currency => Some(UsageCost {
+                amount: base.amount + direct.amount,
+                currency: base.currency.clone(),
+            }),
+            (Some(_), Some(_)) => None,
+        }
     }
 }
 
@@ -1673,14 +1686,55 @@ mod tests {
         assert_eq!(turn(Some(usd(1.0)), euros), None);
 
         // A per-turn cost reported on the prompt reply stands on its own, even on a kept
-        // session whose earlier turn cost more.
+        // session whose earlier turn cost more, and advances the session baseline.
         let mut usage = RunUsage {
             cost_baseline: Some(usd(0.05)),
             ..RunUsage::default()
         };
         usage.record_turn_cost(Some(usd(0.02)));
         assert_eq!(usage.turn_cost().map(|c| c.amount), Some(0.02));
-        assert_eq!(usage.session_cost().map(|c| c.amount), Some(0.05));
+        assert!((usage.session_cost().unwrap().amount - 0.07).abs() < 1e-12);
+        assert_eq!(
+            RunUsage {
+                direct_cost: Some(usd(0.03)),
+                ..RunUsage::default()
+            }
+            .session_cost()
+            .map(|c| c.amount),
+            Some(0.03)
+        );
+        assert_eq!(
+            RunUsage {
+                cost_baseline: Some(usd(0.05)),
+                direct_cost: Some(UsageCost {
+                    amount: 0.02,
+                    currency: "EUR".to_owned(),
+                }),
+                ..RunUsage::default()
+            }
+            .session_cost(),
+            None
+        );
+
+        // Zero cost is valid; negative, non-finite, or currency-less costs are ignored.
+        let mut bounds = RunUsage::default();
+        bounds.record_update(None, None, Some(usd(0.0)));
+        assert_eq!(bounds.turn_cost().map(|c| c.amount), Some(0.0));
+        for bad in [
+            usd(-0.01),
+            usd(f64::NAN),
+            usd(f64::INFINITY),
+            usd(f64::NEG_INFINITY),
+            UsageCost {
+                amount: 1.0,
+                currency: String::new(),
+            },
+        ] {
+            let mut u = RunUsage::default();
+            u.record_update(None, None, Some(bad.clone()));
+            u.record_turn_cost(Some(bad));
+            assert_eq!(u.turn_cost(), None);
+        }
     }
 
     #[test]

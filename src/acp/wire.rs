@@ -317,7 +317,7 @@ pub(crate) struct PromptResult {
     pub(crate) stop_reason: StopReason,
     /// Token counts the agent reports when a prompt turn ends (optional in ACP).
     #[serde(default)]
-    pub(crate) usage: Option<PromptUsage>,
+    usage: Option<PromptUsage>,
     /// Extra metadata an agent attaches to `session/prompt` (Grok places its per-turn token
     /// counts and `costUsdTicks` under `_meta.usage`).
     #[serde(default, rename = "_meta")]
@@ -328,18 +328,20 @@ pub(crate) struct PromptResult {
 const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 
 impl PromptResult {
-    /// Token counts for the finished turn: ACP's top-level `usage` when present, else `_meta`
-    /// (`_meta.usage` or `_meta` itself, mapping Grok's `reasoningTokens` and
+    /// Token counts for the finished turn: ACP's top-level `usage` when non-empty, else
+    /// `_meta` (`_meta.usage` then `_meta`, mapping Grok's `reasoningTokens` and
     /// `cacheCreationTokens` to ACP's fields).
     pub(crate) fn token_usage(&self) -> Option<PromptUsage> {
-        if self.usage.is_some() {
-            return self.usage;
+        if let Some(usage) = self.usage.filter(|u| *u != PromptUsage::default()) {
+            return Some(usage);
         }
-        let meta = self.meta.as_ref()?;
-        let source = meta.get("usage").filter(|v| v.is_object()).unwrap_or(meta);
+        let meta = self.meta.as_ref().filter(|v| v.is_object())?;
+        let nested = meta.get("usage").filter(|v| v.is_object());
         let count = |keys: &[&str]| {
-            keys.iter()
-                .find_map(|key| source.get(*key).and_then(Value::as_u64))
+            [nested, Some(meta)].into_iter().flatten().find_map(|obj| {
+                keys.iter()
+                    .find_map(|key| obj.get(*key).and_then(u64_lenient))
+            })
         };
         let usage = PromptUsage {
             input_tokens: count(&["inputTokens", "input_tokens"]),
@@ -353,28 +355,19 @@ impl PromptResult {
             ]),
             total_tokens: count(&["totalTokens", "total_tokens"]),
         };
-        let any = [
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.thought_tokens,
-            usage.cached_read_tokens,
-            usage.cached_write_tokens,
-            usage.total_tokens,
-        ]
-        .into_iter()
-        .any(|field| field.is_some());
-        any.then_some(usage)
+        (usage != PromptUsage::default()).then_some(usage)
     }
 
     /// What this turn alone cost, when reported on the prompt reply (`_meta.usage.costUsdTicks`
     /// in Grok's ACP server). Unlike `usage_update`, this figure is per turn, not cumulative.
     pub(crate) fn turn_cost(&self) -> Option<UsageCost> {
-        let meta = self.meta.as_ref()?;
-        let source = meta.get("usage").filter(|v| v.is_object()).unwrap_or(meta);
-        let ticks = source
-            .get("costUsdTicks")
-            .or_else(|| source.get("cost_in_usd_ticks"))
-            .and_then(Value::as_u64)?;
+        let meta = self.meta.as_ref().filter(|v| v.is_object())?;
+        let nested = meta.get("usage").filter(|v| v.is_object());
+        let ticks = [nested, Some(meta)].into_iter().flatten().find_map(|obj| {
+            ["costUsdTicks", "cost_in_usd_ticks"]
+                .into_iter()
+                .find_map(|key| obj.get(key).and_then(u64_lenient))
+        })?;
         #[expect(
             clippy::cast_precision_loss,
             reason = "u64 tick counts fit in f64 to sub-cent precision"
@@ -387,14 +380,19 @@ impl PromptResult {
     }
 }
 
+/// Reads an unsigned integer from a JSON number or a stringified integer (proto3 `int64`).
+fn u64_lenient(val: &Value) -> Option<u64> {
+    val.as_u64()
+        .or_else(|| val.as_str()?.trim().parse::<u64>().ok())
+}
+
 /// Token counts reported on a `session/prompt` reply. Also the token part of a usage ledger
 /// record (`usage/ledger.rs`), which stores them as received.
 #[expect(
     clippy::struct_field_names,
     reason = "the fields are named as the protocol names them"
 )]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PromptUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,7 +409,7 @@ pub(crate) struct PromptUsage {
     pub(crate) total_tokens: Option<u64>,
 }
 
-/// Cost reported on an ACP `usage_update` session update.
+/// Cost reported by an agent: cumulative on `usage_update`, or per turn on `session/prompt`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 #[serde(rename_all = "camelCase")]
@@ -769,5 +767,39 @@ mod tests {
         .unwrap();
         assert_eq!(empty.token_usage(), None);
         assert_eq!(empty.turn_cost(), None);
+
+        // An empty top-level `usage: {}` does not shadow `_meta`, stringified proto3 `int64`
+        // ticks parse, and `null` primary keys fall back to snake_case / outer `_meta`.
+        let fallback: PromptResult = serde_json::from_value(serde_json::json!({
+            "stopReason": "end_turn",
+            "usage": {},
+            "_meta": {
+                "costUsdTicks": null,
+                "cost_in_usd_ticks": " 250000000 ",
+                "total_tokens": "15",
+                "usage": {
+                    "inputTokens": null,
+                    "input_tokens": "10",
+                    "output_tokens": 5,
+                    "reasoning_tokens": 2,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 1
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            fallback.token_usage(),
+            Some(PromptUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                thought_tokens: Some(2),
+                cached_read_tokens: Some(3),
+                cached_write_tokens: Some(1),
+                total_tokens: Some(15),
+            })
+        );
+        let fallback_cost = fallback.turn_cost().unwrap();
+        assert!((fallback_cost.amount - 0.025).abs() < 1e-12);
     }
 }
