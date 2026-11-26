@@ -11,7 +11,8 @@
 //!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
 //!   starts from nothing. Its body `{"scenario": "..."}` names the fake agent's scenario
 //!   (`openProject` in the tests sends `flood` unless told another); without one it is
-//!   refused.
+//!   refused. An optional `"files": {"path": "text"}` holds the repository's files instead of
+//!   the three.
 //! - `POST /new-fresh` makes a site the same way, but it opens no project, has no
 //!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
 //!   startup wizard open. `POST /new-fresh-gemini` does the same with an `agy` program on
@@ -30,6 +31,7 @@
 //! One thread owns the sites and answers every request, one at a time, as
 //! `spawn_site_worker` does in the app; a thread per connection reads its request.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::PoisonError;
@@ -124,7 +126,25 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
                 );
                 return;
             };
-            Some(Start::FakeAgent(scenario.to_owned()))
+            // Refused when not a map of path to text, for the reason above.
+            let files = match asked.get("files") {
+                None => None,
+                Some(files) => match serde_json::from_value(files.clone()) {
+                    Ok(files) => Some(files),
+                    Err(error) => {
+                        let body = format!("POST /new: files must map paths to text: {error}");
+                        write_reply(
+                            &mut stream,
+                            &reply(StatusCode::BAD_REQUEST, "text/plain", body.into_bytes()),
+                        );
+                        return;
+                    }
+                },
+            };
+            Some(Start::FakeAgent {
+                scenario: scenario.to_owned(),
+                files,
+            })
         }
         "/new-fresh" => Some(Start::FirstRun),
         "/new-fresh-gemini" => Some(Start::FirstRunWithGemini),
@@ -181,8 +201,12 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
 /// What a new bridged site starts from.
 #[derive(Debug)]
 enum Start {
-    /// The repository open as the project, with the fake agent in this scenario.
-    FakeAgent(String),
+    /// The repository open as the project, with the fake agent in `scenario`, holding `files`
+    /// in place of the three default files when given.
+    FakeAgent {
+        scenario: String,
+        files: Option<BTreeMap<String, String>>,
+    },
     /// No project, no `settings.json` and an empty search path, as on a first launch: the
     /// page shows the welcome screen with the startup wizard over it.
     FirstRun,
@@ -200,10 +224,19 @@ enum Start {
 /// configuration and home directories.
 fn bridged(number: usize, start: Start) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
-    repo.write("src/a.rs", "one\ntwo\nthree\n");
-    // For the file filter to list several matches.
-    repo.write("src/b.rs", "bee\n");
-    repo.write("src/c.rs", "sea\n");
+    if let Start::FakeAgent {
+        files: Some(files), ..
+    } = &start
+    {
+        for (path, text) in files {
+            repo.write(path, text);
+        }
+    } else {
+        repo.write("src/a.rs", "one\ntwo\nthree\n");
+        // For the file filter to list several matches.
+        repo.write("src/b.rs", "bee\n");
+        repo.write("src/c.rs", "sea\n");
+    }
     let listeners = Listeners::default();
     let notify: Notify = {
         let listeners = Arc::clone(&listeners);
@@ -215,7 +248,7 @@ fn bridged(number: usize, start: Start) -> Bridged {
         })
     };
     let site = match start {
-        Start::FakeAgent(scenario) => agent_site(&repo, &scenario, notify),
+        Start::FakeAgent { scenario, .. } => agent_site(&repo, &scenario, notify),
         // An empty search path, so agents installed on the developer's or runner's PATH
         // cannot change the wizard's first-run defaults.
         Start::FirstRun => Site::new(

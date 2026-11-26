@@ -76,12 +76,13 @@ step named.
   | Run log (`LOG_VERSION`, `src/run/log.rs:80`) | 4 | 7.2 (5), 7.3 (6), 7.6 (7), 8.2 (8), 9.4 (9), 9.5 (10) |
   | `review.json` (`VERSION`, `src/notes.rs:70`) | 4 | 7.6 (5), 9.4 (6) |
   | `threads.json` (`THREADS_VERSION`, `src/thread.rs:60`) | 3 | 7.6 (4) |
-  | `settings.json` (`VERSION`, `src/settings.rs:33`) | 1 | 8.2 (2), 9.1 (3) |
+  | `settings.json` (`VERSION`, `src/settings.rs:42`) | 2 | 8.2 (3), 9.1 (4) |
   | `layout.json` | 1 | 8.3 (2) |
   | `analysis.json` | none | 8.1 (1) |
 
-  `settings::parse` refuses every version but the current one, older ones included
-  (`src/settings.rs:349`). Step 8.2 changes it to read older versions first.
+  `settings.json` is at version 2 since #60 made the agent and reviewers `{name, model}` slots:
+  `settings::parse` (`src/settings.rs:461`) reads version 1 through `upgrade_v1` and refuses
+  every other older version. Step 8.2 adds version 2 to what it reads.
   `files::load_versioned` drops older versions too (`src/files.rs:44`), and `layout::load`
   then falls back to the default widths: step 8.3 reads a version 1 `layout.json` itself,
   with `map` defaulted, and tests `a_version_1_layout_keeps_its_widths`.
@@ -519,12 +520,12 @@ Rust only, no agent and no page.
   the anchor moved; delete the lines, read: `Outdated`); `an_unreadable_analysis_is_
   reported_and_kept`; the byte-for-byte test; `a_newer_analysis_is_refused`.
 
-### 8.2 Analysis runs (run log 8, settings 2)
+### 8.2 Analysis runs (run log 8, settings 3)
 
 **Changes**
 
 - `src/settings.rs`: `analyzer: Option<String>` with `check_choices` requiring it enabled and
-  an accessor that falls back to `agent`; `VERSION` 2, and `parse` (`:349`) reads version 1.
+  an accessor that falls back to `agent`; `VERSION` 3, and `parse` (`:461`) reads version 2.
   `ui/settings.js`: `usage` (`:21`) counts the analyzer, so it cannot be disabled while set.
 - `src/run/log.rs`: header `analysis: {kind, of}` and `Origin::Analysis` (version 8).
 - `src/analysis.rs`: the prompts (top level, deeper, flow, update), and
@@ -570,7 +571,7 @@ Rust only, no agent and no page.
   `an_empty_analysis_stores_nothing`.
 - `analyze_deeper_replaces_only_its_branch`, `deleting_a_diagram_takes_its_children`.
 - `update_replaces_only_outdated_nodes` (catches an update that rewrites healthy nodes).
-- `the_analyzer_falls_back_to_the_default_agent`, `a_version_1_settings_file_still_reads`
+- `the_analyzer_falls_back_to_the_default_agent`, `a_version_2_settings_file_still_reads`
   (catches the version refusal in `parse`), the settings byte-for-byte test.
 - Unit, `merge`: a property test that every stored edge joins two stored nodes.
 
@@ -744,12 +745,12 @@ opens the changes view at its hunk.
 
 ## Milestone 9: team memory
 
-### 9.1 Finding and setting up hippius-mem (settings 3)
+### 9.1 Finding and setting up hippius-mem (settings 4)
 
 **Changes.** `src/memory.rs`: `find` (`agents::find_program` on the `Scanner`'s path) and
 `state() -> Missing | Unconfigured | Ready`, from `doctor` as S3 describes it, run on a
 worker. `SettingsView` (`site.rs:308`) gains the state. Settings: `agent_memory: bool`
-(version 3). Routes: `POST /api/memory/setup`, `POST /api/memory/check`. The settings dialog's
+(version 4). Routes: `POST /api/memory/setup`, `POST /api/memory/check`. The settings dialog's
 Team memory section, with the rescan poll pattern (`ui/settings-dialog.js:320`).
 
 **Edge cases**
@@ -951,8 +952,7 @@ event source: "next" moves the walkthrough; "send" twice sends.
 7.6 comes before the map because analysis runs are read-only threads. 9.1 and 10.1 have no
 dependency and can run beside the main line, each in a worktree of its own, and so can 7.7:
 its e2e test needs the bridge to write files with definitions
-(`src/site/tests/page_e2e.rs:143` writes three plain files today; `POST /new` takes a
-scenario since 7.4), and whichever of 7.5 and 7.7 lands first adds `files`.
+(`POST /new` takes a scenario since 7.4, and `files` since 7.5).
 
 ## What this plan leaves open
 
@@ -967,24 +967,16 @@ The owner has not confirmed these; each is the design's assumption carried into 
    reading worktree the design proposed.
 6. The forced update only when history moved forward, correction 5 above.
 
-Found when the plan's review was checked against the code on 2026-11-25 (#51). Each names
-its options; the first is recommended.
+Found when the plan's review was checked against the code on 2026-11-25 (#51), each with its
+options, and settled since.
 
-7. **How the page learns a background result is in** (7.7, 9.2). No nudge exists but
-   `RunChanged`. (a) The page asks again on a timer while a result is pending, as the
-   settings dialog does every 250 ms. (b) A general nudge, `AppEvent::Changed(kind)` calling
-   `window.postil.changed(kind)`, which widens the shell-to-page interface and the e2e bridge.
-8. **Cmd-click in a comment** (7.7). (a) Does nothing, as in a string. (b) Jumps: a name in a
-   doc comment is often worth following.
-9. **Delete and Resolve of a live ask** (7.6). Delete: (a) succeeds as for any run today, the
-   thread ending when the run does; (b) 409 for an ask only, which changes the route and two
-   tests. Resolve: (a) refused with 409 while the ask runs; (b) resolves the note and ends the
-   thread when the run ends.
-10. **Logging the undo notice** (7.6, run log 7). (a) A new entry, `Entry::Undone { text }`;
-    (b) a `problem` field on the `ended` entry.
-11. **An ask refused at the cap** (7.6). (a) `POST /api/run/ask` takes the new note and saves
-    it only when the run starts, so a 409 leaves nothing; (b) the page deletes the note on
-    refusal (a crash between leaves it); (c) the ask stays open with an Ask button.
+7. to 11. Settled by the owner on 2026-11-26, each as (a): the page asks again on a 250 ms
+    timer while a background result is pending, as the settings dialog does, with no new
+    nudge (7.7, 9.2); Cmd-click in a comment does nothing, as in a string (7.7); deleting a
+    live ask succeeds and the thread ends when the run does, and resolving one is refused with
+    409 while it runs (7.6); the undo notice is a new run log entry, `Entry::Undone { text }`
+    (7.6, run log 7); `POST /api/run/ask` takes the new note and saves it only when the run
+    starts, so a 409 at the cap leaves nothing (7.6).
 12. to 15. Settled by the owner on 2026-11-25, each as (a): a deleted file's `lines` stay
     required and are ignored (7.3); lines past the end are not checked in Rust (7.3); a check
     that failed and was edited after shows failed, and the card ranks failed, not seen,

@@ -580,6 +580,10 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
   that file at that line with the composer: the next note goes on the change itself, and a
   follow-up sends it. A file draws its first 400 lines, and the rest on a click. Esc, the
   header's esc, or opening a file gives the pane back.
+- **Walkthrough order.** A single run whose author's report names steps opens in
+  Walkthrough order instead, with each hunk's rating and the review's findings beside their
+  lines; the 400-line limit is then per step (`docs/review-assist.md`, "Guided walkthrough and
+  risk"). A thread of several runs keeps the order above.
 
 ### Worktrees
 

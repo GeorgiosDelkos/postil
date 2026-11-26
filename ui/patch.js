@@ -4,9 +4,11 @@
 import { onLines } from "./note-place.js";
 
 // The files of `patch`, in its order. Each is `{ path, status, binary, added, removed, hunks }`:
-// `status` is "added", "deleted" or "modified"; a hunk is `{ header, lines }`, and a line is
-// `{ kind, old, new, text }` with `kind` "context", "add" or "del" and the line numbers it has
-// on each side (null on the side it is not on).
+// `status` is "added", "deleted" or "modified"; a hunk is `{ header, oldStart, oldCount,
+// newStart, newCount, lines }`, with its header's ranges, and a line is `{ kind, old, new,
+// text }` with `kind` "context", "add" or "del" and the line numbers it has on each side (null
+// on the side it is not on). A side with no lines (a new file's old side, a deleted or emptied
+// file's new side) has count 0.
 export function parsePatch(patch) {
   const files = [];
   let file = null;
@@ -38,11 +40,19 @@ export function parsePatch(patch) {
       else if (line.startsWith("--- ") && file.status === "deleted")
         file.path = sidePath(line.slice(4), "a/");
     }
-    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (header) {
       old = Number(header[1]);
-      next = Number(header[2]);
-      hunk = { header: line, lines: [] };
+      next = Number(header[3]);
+      // git leaves out a count of 1 (`@@ -0,0 +1 @@`).
+      hunk = {
+        header: line,
+        oldStart: old,
+        oldCount: Number(header[2] ?? 1),
+        newStart: next,
+        newCount: Number(header[4] ?? 1),
+        lines: [],
+      };
       file.hunks.push(hunk);
       continue;
     }
@@ -121,15 +131,90 @@ export function unquote(text) {
 // view shows only the changed lines and their context. A file or folder note has no line to
 // show beside, and is left out too.
 export function notesByLine(file, notes) {
-  const shown = new Set(
-    file.hunks
-      .flatMap((hunk) => hunk.lines.map((line) => line.new))
-      .filter((line) => line !== null),
-  );
+  const shown = shownLines(file);
   const placed = new Map();
   for (const note of notes) {
     if (!onLines(note) || note.path !== file.path || !shown.has(note.lines.end)) continue;
     placed.set(note.lines.end, [...(placed.get(note.lines.end) ?? []), note]);
   }
   return placed;
+}
+
+// The author's report's steps (src/report.rs) laid over `files`, for the walkthrough
+// (docs/review-assist.md, "Guided walkthrough and risk"): `{ groups, rest }`. Each group is
+// `{ step, number, entries, shownIn }`, one per step in the report's order, `number` from 1.
+// `entries` are the `{ file, hunk }` the step's lines overlap, in the patch's order; a file
+// with no hunks (a binary one) is one entry with `hunk` null. `rest` holds the entries no step
+// overlaps. Every entry is in exactly one place: an entry two steps overlap is the first's,
+// and the later step lists the first's number in `shownIn`. A step whose `entries` and
+// `shownIn` are both empty names no changed lines.
+export function walkthrough(files, steps) {
+  const groups = steps.map((step, index) => ({
+    step,
+    number: index + 1,
+    entries: [],
+    shownIn: [],
+  }));
+  const rest = [];
+  for (const file of files) {
+    for (const hunk of file.hunks.length > 0 ? file.hunks : [null]) {
+      const [first, ...later] = groups.filter((group) => covers(group.step, file, hunk));
+      if (!first) {
+        rest.push({ file, hunk });
+        continue;
+      }
+      first.entries.push({ file, hunk });
+      for (const group of later)
+        if (!group.shownIn.includes(first.number)) group.shownIn.push(first.number);
+    }
+  }
+  for (const group of groups) group.shownIn.sort((a, b) => a - b);
+  return { groups, rest };
+}
+
+// Whether `step` covers `hunk` of `file`. By path alone when either side has no lines to
+// compare: a step with no `lines` (its file is gone, src/report.rs), a hunk with no new side
+// (a deleted or emptied file), or a file with no hunks.
+function covers(step, file, hunk) {
+  if (step.path !== file.path) return false;
+  if (!step.lines || !hunk || hunk.newCount === 0) return true;
+  const last = hunk.newStart + hunk.newCount - 1;
+  return step.lines.start <= last && hunk.newStart <= step.lines.end;
+}
+
+// The rating `hunk` shows: `eyes` when a finding is on one of its new-side lines (`placed`,
+// from `findingsByLine`), whatever the report said, since a reviewer disputed it or found
+// something there; else `risk`, the step's. A finding carries no field for a dispute (owner,
+// 2026-11-25).
+export function hunkRisk(risk, hunk, placed) {
+  const found = hunk?.lines.some((line) => line.new !== null && placed.has(line.new));
+  return found ? "eyes" : risk;
+}
+
+// Where each of a review's `findings` on `file` shows: `placed`, a map from the new-side line
+// it names to the findings there, as `notesByLine` places notes; and `unplaced`, those with
+// no line or one outside the hunks, which show with the file. Findings on other files, or on
+// none, are left out.
+export function findingsByLine(file, findings) {
+  const shown = shownLines(file);
+  const placed = new Map();
+  const unplaced = [];
+  for (const finding of findings) {
+    if (finding.path !== file.path) continue;
+    if (finding.line === null || finding.line === undefined || !shown.has(finding.line)) {
+      unplaced.push(finding);
+      continue;
+    }
+    placed.set(finding.line, [...(placed.get(finding.line) ?? []), finding]);
+  }
+  return { placed, unplaced };
+}
+
+// The new-side line numbers `file`'s hunks show.
+function shownLines(file) {
+  return new Set(
+    file.hunks
+      .flatMap((hunk) => hunk.lines.map((line) => line.new))
+      .filter((line) => line !== null),
+  );
 }
