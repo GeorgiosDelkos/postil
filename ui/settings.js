@@ -195,3 +195,39 @@ export function moveReviewer(settings, index, step) {
   [reviewers[index], reviewers[target]] = [reviewers[target], reviewers[index]];
   return { settings: { ...settings, reviewers } };
 }
+
+// Team memory (hippius-mem) as the mark beside it shows it (`kind`, an `.agent-mark` class in
+// app.css) and says it (`label`), from `memory`, the `memory` of api/settings. Missing while the
+// switch is on is a problem; while it is off, only not installed.
+export function memoryState(memory, agentMemory) {
+  const state = memory.state;
+  if (state === null) return { kind: "unchecked", label: "Checking hippius-mem…" };
+  if (state.kind === "ready") return { kind: "installed", label: "Ready" };
+  if (state.kind === "unconfigured") {
+    if (canSetUp(state)) return { kind: "unchecked", label: "Installed, not set up" };
+    return { kind: "missing", label: "Installed, doctor did not pass" };
+  }
+  if (agentMemory) return { kind: "missing", label: "Not found on PATH" };
+  return { kind: "absent", label: "Not installed" };
+}
+
+// Whether Set up a trial vault is offered for `state`: only when doctor found no
+// configuration. hippius-mem exits 1 for every error, so its message tells this apart from a
+// configured vault whose check failed, where `quickstart` would only refuse ("a config already
+// exists"). The words are doctor's with no configuration (hippius-mem 0.7.1, spike S3), pinned
+// by the test of the real program in src/site/tests/memory.rs. Doctor printing nothing says
+// nothing against it.
+export function canSetUp(state) {
+  if (state?.kind !== "unconfigured") return false;
+  return state.problem === null || state.problem.includes("failed to load configuration");
+}
+
+// Turns team memory on or off. It turns on only once hippius-mem is ready (`state`, the state in
+// api/settings' `memory`); it turns off whatever the state, so a removed hippius-mem can be let
+// go. The Rust process checks the same rule against its own latest check (src/site.rs).
+export function setAgentMemory(settings, enabled, state) {
+  if (enabled && state?.kind !== "ready") {
+    return { error: "Set up hippius-mem before giving agents team memory." };
+  }
+  return { settings: { ...settings, agentMemory: enabled } };
+}

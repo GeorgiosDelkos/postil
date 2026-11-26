@@ -4,7 +4,8 @@ Status: 2026-11-26. Designed. Built so far: an execute call's command and exit c
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
 Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1), and
-analysis runs (8.2), with no page beyond the settings' Analyzer yet. This document adds to
+analysis runs (8.2), with no page beyond the settings' Analyzer yet, and finding and setting
+up hippius-mem (9.1), which no run uses yet. This document adds to
 `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -527,6 +528,11 @@ hippius-mem is an MCP server over stdio. Postil uses it in four ways, all chosen
 
 ### Finding and setting it up
 
+Built (step 9.1): `src/memory.rs`, the settings' Team memory section, and `agentMemory` in
+`settings.json` version 4. Set up is one click on a button that says what it writes, with no
+dialog before it (the plan's step 9.1 replaced the dialog), and shows `quickstart`'s own
+output. The switch turns on only while the latest check reads Ready.
+
 - **Detect, never bundle.** Postil finds `hippius-mem` on the login shell's `PATH` as it
   finds agents, and runs `hippius-mem doctor` to learn whether it is configured. A bundled
   copy was rejected: it ties Postil's releases to hippius-mem's and can differ from the one
@@ -746,11 +752,20 @@ Postil writes outside itself.
      the status says.
 
 6. **hippius-mem's repository scope in a worktree.** Agents run in `~/.postil/worktrees/...`;
-   whether the server binds the right repository from there is not checked yet.
+   whether the server binds the right repository from there is not checked yet. `doctor`
+   picks its profile by the git origin of its working directory, so step 9.1 runs it in the
+   open project's root (a worktree of it shares its origin), in the temporary directory with
+   no project open, and checks again when another project opens. With no project open, only
+   a catch-all or trial profile reads Ready. hippius-mem also reads a `./hippius-mem.toml`
+   before the global configuration, so a project's own `hippius-mem.toml` wins for `doctor`,
+   and will for step 9.3's server, which runs in a worktree of the project. A reviewed
+   repository could ship one that names its own endpoint: step 9.3 must decide whether that
+   is acceptable.
 7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
-   This document does not offer it from Postil.
+   This document does not offer it from Postil. Step 9.1 is built that way, not confirmed.
 8. **The trial vault.** Set up runs `quickstart`, which makes a local vault. Moving to a
-   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret.
+   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret. Step 9.1 is
+   built that way: Set up makes a trial vault only.
 9. **The language of dictation.** The system's language is assumed. When on-device
    recognition is not available for it, dictation reports that and does not use the network.
 10. **Remember without the thread's agent.** A note that was never sent has no agent to draft

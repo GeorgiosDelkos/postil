@@ -171,6 +171,7 @@ schedule three tasks.
 | `src/layout.rs`, `ui/panes.js` | The pane widths, `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
 | `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
+| `src/memory.rs` | Team memory: finding hippius-mem, `doctor` and the trial vault's set up, on threads of their own. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
 | `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
 | `src/menu.rs` | The macOS menu bar through `muda`; its commands run in the page. |
@@ -1026,16 +1027,18 @@ authentication, the run panel says which command to run in a terminal.
 button at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change saves at once. The
 settings are the theme (system, light, dark), the code font size (11 to 20 px; the line
 height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
-reopens the last project, and the agents above.
+reopens the last project, the agents above, and whether agents get team memory
+(`agentMemory`, docs/review-assist.md, "Milestone 9: team memory").
 
-The file is format version 3: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
+The file is format version 4: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
 `null` for the agent's default), `analyzer` a slot or `null` (analyses then go to `agent`, on
-its model), and `reviewers` a list of slots. Each names an enabled agent, so an agent in use
-cannot be turned off or removed. A version 2 file has no `analyzer`; a version 1 file, where the
-agent and reviewers are plain names, is read as slots with no model. The next save writes
-version 3; an older Postil then reads the file as one from a newer Postil and leaves it alone.
-A model id is 1 to 200 characters with no space at either end and no control character;
-whether the agent offers it is checked when a run starts (section "Runs").
+its model), `reviewers` a list of slots, and `agentMemory` a boolean, off by default. Each slot
+names an enabled agent, so an agent in use cannot be turned off or removed. A version 3 file has
+no `agentMemory` and reads with it off; a version 2 file has no `analyzer` either; a version 1
+file, where the agent and reviewers are plain names, is read as slots with no model. The next
+save writes version 4; an older Postil then reads the file as one from a newer Postil and
+leaves it alone. A model id is 1 to 200 characters with no space at either end and no control
+character; whether the agent offers it is checked when a run starts (section "Runs").
 
 The theme is set on the window, and WebKit answers the page's `prefers-color-scheme` from the
 window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:
@@ -1052,7 +1055,7 @@ through installed agents, the default agent and optional reviewers with their mo
 appearance (with a live code preview) and startup behavior, and a readiness summary (`git`,
 `npx`, `gh`). It is drawn as the main window's panes are (section "Look and feel"). Completing or
 skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
-installed built-in agents turned on); closing it mid-way reverts any preview without writing the
+installed built-in agents turned on, and team memory when hippius-mem is ready); closing it mid-way reverts any preview without writing the
 file. The wizard's save names a revision like the dialog's, and when the file changes under it
 (another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
 from Settings.

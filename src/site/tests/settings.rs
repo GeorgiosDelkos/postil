@@ -23,6 +23,7 @@ fn custom_settings() -> serde_json::Value {
             { "name": "Grok", "model": "grok-4.7" },
             { "name": "Grok", "model": null },
         ],
+        "agentMemory": false,
     })
 }
 
@@ -56,7 +57,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     assert_eq!(restarted["settings"], custom_settings());
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["settings"], custom_settings());
 }
 
@@ -196,8 +197,8 @@ fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
             "is not valid settings JSON",
         ),
         (
-            "{\"version\": 4, \"settings\": {}}",
-            "written by a newer Postil (format version 4)",
+            "{\"version\": 5, \"settings\": {}}",
+            "written by a newer Postil (format version 5)",
         ),
         (
             "{\"version\": 1, \"settings\": {\"agent\": 7}}",
@@ -394,7 +395,7 @@ fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
 }
 
 #[test]
-fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_3() {
+fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_4() {
     let repo = TempRepo::new("settings-v1");
     let file = repo.config().join("settings.json");
     fs::create_dir_all(repo.config()).unwrap();
@@ -435,7 +436,7 @@ fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_3() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 3);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["settings"]["analyzer"], serde_json::Value::Null);
     assert_eq!(stored["settings"]["agent"], view["settings"]["agent"]);
     assert_eq!(stored["settings"]["reviewers"][0]["model"], "grok-4.7");
@@ -467,6 +468,27 @@ fn a_version_2_settings_file_still_reads() {
         ("Grok", Some("grok-4.7")),
         "with no analyzer, analyses go to the agent notes are sent to, on its model"
     );
+}
+
+#[test]
+fn a_version_3_settings_file_still_reads_with_team_memory_off() {
+    let repo = TempRepo::new("settings-v3");
+    let file = repo.config().join("settings.json");
+    fs::create_dir_all(repo.config()).unwrap();
+    let v3 = serde_json::json!({
+        "version": 3,
+        "settings": {
+            "enabledAgents": ["Grok"],
+            "agent": { "name": "Grok", "model": null },
+            "analyzer": { "name": "Grok", "model": "grok-4.7-fast" },
+        },
+    });
+    fs::write(&file, v3.to_string()).unwrap();
+
+    let view = get_json(&repo.empty_site(), SETTINGS);
+    assert_eq!(view["problem"], serde_json::Value::Null, "{view}");
+    assert_eq!(view["settings"]["analyzer"]["model"], "grok-4.7-fast");
+    assert_eq!(view["settings"]["agentMemory"], false);
 }
 
 #[test]

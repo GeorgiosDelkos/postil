@@ -1,12 +1,13 @@
 //! Tests of the page's API ([`Site`]), through requests as the page sends them, one file per
 //! area. The helpers here are shared by the areas and by the window's tests in `shell.rs`.
-//! The `analysis`, `notes` and `settings` areas hide those crate modules from
+//! The `analysis`, `memory`, `notes` and `settings` areas hide those crate modules from
 //! `use super::*`: an area that needs those modules imports them by path.
 
 mod analysis;
 mod asks;
 mod definitions;
 mod files;
+mod memory;
 mod notes;
 mod page_e2e;
 mod projects;

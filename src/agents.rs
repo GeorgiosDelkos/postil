@@ -301,7 +301,8 @@ pub(crate) fn find_program(program: &str, search_path: &OsStr) -> Option<PathBuf
         .find(|path| is_executable(path))
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Whether `path` is an executable file.
+pub(crate) fn is_executable(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }

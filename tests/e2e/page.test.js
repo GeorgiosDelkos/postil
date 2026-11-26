@@ -735,6 +735,28 @@ test("Settings lists the models the agent reports and saves one per slot", async
   assert.equal(await model("reviewer-model-1").inputValue(), "deep");
 });
 
+test("Set up a trial vault shows what quickstart printed and turns team memory on", async (t) => {
+  const { page, api } = await openProject(t, "plain", "new-memory");
+  await page.locator("#open-settings").click();
+  const dialog = page.locator("#settings");
+
+  await dialog.getByText("Installed, not set up").waitFor();
+  await dialog.locator('[data-key="memory-setup"]').click();
+  // The set up takes half a second; the dialog asks again every 250 ms until it ends.
+  await dialog.locator(".memory-output").filter({ hasText: "Trial vault ready at" }).waitFor();
+  assert.equal(
+    await dialog.locator(".memory-output").textContent(),
+    "Trial vault ready at /tmp/postil-e2e-vault.",
+  );
+  await dialog.getByText("Ready", { exact: true }).waitFor();
+  const toggle = dialog.locator('[data-key="agent-memory"]');
+  await page.waitForFunction(
+    () => document.querySelector('[data-key="agent-memory"]')?.ariaChecked === "true",
+  );
+  assert.equal(await toggle.isDisabled(), false);
+  assert.equal((await api("api/settings")).settings.agentMemory, true);
+});
+
 // The longest name a custom agent may have (MAX_NAME in src/settings.rs).
 const LONG_NAME = "An agent whose name runs to forty chars!";
 
@@ -988,6 +1010,26 @@ test("Skip on the first run saves the defaults with the installed agents turned 
   assert.deepEqual(saved.settings.enabledAgents, ["Gemini"]);
   assert.deepEqual(saved.settings.agent, { name: "Gemini", model: null });
   assert.equal(saved.settings.theme, "system");
+});
+
+test("Skip on the first run turns team memory on only when hippius-mem is ready", async (t) => {
+  for (const memory of ["ready", "unconfigured"]) {
+    const body = JSON.stringify({ memory });
+    const created = await fetch(new URL("new-fresh-memory", bridge), { method: "POST", body });
+    const site = new URL((await created.json()).base, bridge);
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    page.setDefaultTimeout(WAIT);
+    await page.addInitScript(init);
+    await page.goto(site.href);
+
+    const wizard = page.locator("#wizard");
+    await wizard.getByRole("button", { name: "Skip" }).click();
+    await wizard.waitFor({ state: "hidden" });
+    const saved = await (await fetch(new URL("api/settings", site))).json();
+    assert.equal(saved.firstRun, false, memory);
+    assert.equal(saved.settings.agentMemory, memory === "ready", memory);
+  }
 });
 
 test("a wizard whose save is refused starts over from the file another window wrote", async (t) => {

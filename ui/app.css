@@ -1521,6 +1521,23 @@ button.repo-name:hover {
   opacity: var(--disabled-opacity);
 }
 
+/* What the last hippius-mem set up printed, as it printed it: its lines name the paths. */
+.memory-output {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: 11px var(--font-mono);
+  color: var(--text);
+}
+
+.memory-output.failed {
+  border-color: var(--note);
+}
+
 .agent-command {
   overflow: hidden;
   white-space: nowrap;

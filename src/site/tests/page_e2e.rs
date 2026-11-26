@@ -22,6 +22,12 @@
 //!   reviewer, and the custom Fake agent turned on beside it: the agents' logos show on
 //!   OpenCode's runs and are absent on Fake's. Its body may name the fake agent's scenario
 //!   as `POST /new` does; without one it is `reviewer-silent`, a reply with no findings.
+//! - `POST /new-memory` opens a project with the fake agent in `plain`, and a fake
+//!   `hippius-mem` that is installed and not set up until its `quickstart` runs, which takes
+//!   half a second, so the page asks again while it runs.
+//! - `POST /new-fresh-memory` makes a site as `POST /new-fresh` does, with a fake
+//!   `hippius-mem` whose doctor passes when the body is `{"memory": "ready"}` and fails
+//!   otherwise; the site has finished its first check when the reply comes.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -147,6 +153,14 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
             })
         }
         "/new-fresh" => Some(Start::FirstRun),
+        "/new-memory" => Some(Start::Memory),
+        "/new-fresh-memory" => {
+            let asked: serde_json::Value =
+                serde_json::from_slice(request.body()).unwrap_or_default();
+            Some(Start::FirstRunWithMemory {
+                ready: asked["memory"] == "ready",
+            })
+        }
         "/new-fresh-gemini" => Some(Start::FirstRunWithGemini),
         "/new-opencode" => {
             let asked: serde_json::Value =
@@ -217,6 +231,11 @@ enum Start {
     /// and reviewing, played by the fake agent in this scenario, and the custom Fake agent
     /// (`plain`) turned on.
     OpenCode(String),
+    /// The repository open as the project, with the fake agent in `plain`, and a fake
+    /// `hippius-mem` that its set up makes ready.
+    Memory,
+    /// As [`Start::FirstRun`], with a fake `hippius-mem` that is ready or not set up.
+    FirstRunWithMemory { ready: bool },
 }
 
 /// A new site, the `number`th the bridge opened, on a new repository holding `src/a.rs`,
@@ -276,6 +295,22 @@ fn bridged(number: usize, start: Start) -> Bridged {
             )
         }
         Start::OpenCode(scenario) => opencode_site(&repo, &scenario, notify),
+        Start::Memory => memory_site(&repo, notify),
+        Start::FirstRunWithMemory { ready } => {
+            let doctor = if ready { "exit 0" } else { "exit 1" };
+            let memory = fake_memory(&repo, &format!("#!/bin/sh\n{doctor}\n"));
+            let site = Site::new(
+                Some(&repo.config()),
+                Some(&repo.home()),
+                None,
+                no_agents(),
+                notify,
+            )
+            .with_memory(memory);
+            // The page's first read then shows the state, so Skip saves from it.
+            site.memory.wait();
+            site
+        }
     };
     Bridged {
         // A stub quota source: a live one would read the developer's real credentials and
@@ -323,6 +358,38 @@ fn opencode_site(repo: &TempRepo, scenario: &str, notify: Notify) -> Site {
     let (status, body) = save(&site, &settings.to_string());
     assert_eq!(status, StatusCode::OK, "{body}");
     site
+}
+
+/// The site of [`Start::Memory`] on `repo`: hippius-mem is a script in a folder of its own,
+/// configured once its `quickstart --no-wire` ran.
+fn memory_site(repo: &TempRepo, notify: Notify) -> Site {
+    let configured = repo.root.join(".git/memory-bin/configured");
+    let script = format!(
+        r#"#!/bin/sh
+case "$*" in
+doctor) [ -f {configured} ] && exit 0; exit 1 ;;
+"quickstart --no-wire")
+  /bin/sleep 0.5
+  /usr/bin/touch {configured}
+  echo "Trial vault ready at /tmp/postil-e2e-vault." ;;
+*) exit 9 ;;
+esac
+"#,
+        configured = configured.display()
+    );
+    agent_site(repo, "plain", notify).with_memory(fake_memory(repo, &script))
+}
+
+/// A memory whose `hippius-mem` is `script`, alone in a folder of its own in `repo`'s git
+/// directory.
+fn fake_memory(repo: &TempRepo, script: &str) -> crate::memory::Memory {
+    let bin = repo.root.join(".git/memory-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let program = bin.join(crate::memory::PROGRAM);
+    fs::write(&program, script).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path = bin.into_os_string();
+    crate::memory::Memory::new(Scanner::new(move || search_path.clone()))
 }
 
 /// Reads one HTTP/1.1 request: its line, its headers (only `content-length` is used) and

@@ -188,6 +188,13 @@ pub enum Error {
     SettingsLocked(String),
     /// The settings file changed after the page read it (another window, or a hand edit).
     SettingsChanged,
+    /// Team memory was turned on while hippius-mem is not ready (`memory.rs`); the text says
+    /// why.
+    MemoryNotReady(String),
+    /// A hippius-mem set up or check was asked for while a set up runs.
+    MemorySetupRunning,
+    /// The thread that checks or sets up hippius-mem could not start.
+    StartMemory(io::Error),
     /// The settings file could not be written.
     WriteSettings {
         /// The settings file's path.
@@ -508,6 +515,14 @@ impl fmt::Display for Error {
                 f,
                 "cannot save the settings: {problem} (fix the file, or reset the settings)"
             ),
+            Self::MemoryNotReady(problem) => {
+                write!(f, "cannot turn team memory on: {problem}")
+            }
+            Self::MemorySetupRunning => write!(
+                f,
+                "the hippius-mem set up is still running (wait for it to finish)"
+            ),
+            Self::StartMemory(_) => write!(f, "cannot start a thread to run hippius-mem"),
             Self::SettingsChanged => write!(
                 f,
                 "cannot save the settings: the file changed since this window read it (the \
@@ -724,6 +739,7 @@ impl std::error::Error for Error {
         match self {
             Self::SpawnGit(source)
             | Self::SpawnWorker(source)
+            | Self::StartMemory(source)
             | Self::Read { source, .. }
             | Self::ReadReview { source, .. }
             | Self::WriteReview { source, .. }
@@ -766,6 +782,8 @@ impl std::error::Error for Error {
             | Self::InvalidSettings(_)
             | Self::SettingsLocked(_)
             | Self::SettingsChanged
+            | Self::MemoryNotReady(_)
+            | Self::MemorySetupRunning
             | Self::AgentNotFound { .. }
             | Self::AgentSilent { .. }
             | Self::AgentExited { .. }

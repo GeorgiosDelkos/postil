@@ -24,6 +24,7 @@ use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{self, Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
+use crate::memory::{self, Memory};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
@@ -324,6 +325,8 @@ pub(crate) struct Site {
     quotas: QuotaPoller,
     /// On-demand background probes for the models each agent offers (`models.rs`).
     models: ModelProber,
+    /// Whether hippius-mem is installed and set up, checked in the background (`memory.rs`).
+    memory: Memory,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
 }
@@ -377,11 +380,57 @@ struct SettingsView<'a> {
     first_run: bool,
     /// Every agent, built-in ones first; `None` while the agent scan runs.
     agents: Option<Vec<AgentView<'a>>>,
+    /// Team memory: whether hippius-mem is installed and set up.
+    memory: MemoryView,
     /// External tools found on the search path; `None` while the agent scan runs.
     tools: Option<ToolsView>,
     /// The smallest and largest code font size.
     font_sizes: [u8; 2],
     tab_widths: [u8; 3],
+}
+
+/// Team memory as the settings dialog shows it.
+#[derive(Debug, Serialize)]
+struct MemoryView {
+    /// Whether a check or a set up runs, so the page asks again shortly.
+    pending: bool,
+    /// `None` while a check runs.
+    state: Option<MemoryStateView>,
+    /// The last set up; `None` before the first.
+    setup: Option<memory::Setup>,
+}
+
+/// [`memory::State`] with its path as text.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum MemoryStateView {
+    Missing,
+    Unconfigured {
+        path: String,
+        problem: Option<String>,
+    },
+    Ready {
+        path: String,
+    },
+}
+
+impl From<memory::Status> for MemoryView {
+    fn from(status: memory::Status) -> Self {
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        let state = status.state.map(|state| match state {
+            memory::State::Missing => MemoryStateView::Missing,
+            memory::State::Unconfigured { path, problem } => MemoryStateView::Unconfigured {
+                path: text(&path),
+                problem,
+            },
+            memory::State::Ready { path } => MemoryStateView::Ready { path: text(&path) },
+        });
+        Self {
+            pending: state.is_none() || status.setup == Some(memory::Setup::Running),
+            state,
+            setup: status.setup,
+        }
+    }
 }
 
 /// External tools found on the search path, for the startup wizard's readiness check.
@@ -633,6 +682,12 @@ impl Site {
         agents: Scanner,
         notify: Notify,
     ) -> Self {
+        // A test that sets no memory up must not run the machine's hippius-mem, whose `doctor`
+        // writes a probe into the engineer's vault: its memory finds no program.
+        #[cfg(not(test))]
+        let memory = Memory::new(agents.clone());
+        #[cfg(test)]
+        let memory = Memory::new(Scanner::new(OsString::new));
         Self {
             project: RefCell::new(None),
             highlighter: Highlighter::new(),
@@ -643,10 +698,17 @@ impl Site {
             usage_file: config.map(|dir| dir.join("usage.jsonl")),
             home: home.map(Path::to_owned),
             models: ModelProber::live(agents.clone()),
+            memory,
             agents,
             quotas: QuotaPoller::live(),
             notify,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_memory(mut self, memory: Memory) -> Self {
+        self.memory = memory;
+        self
     }
 
     #[cfg(test)]
@@ -698,6 +760,7 @@ impl Site {
             open.warning = warning;
             return Ok(());
         }
+        self.memory.open_project(repo.root());
         let repo = Arc::new(repo);
         let runner = Runner::new(
             Arc::clone(&repo),
@@ -795,6 +858,7 @@ impl Site {
                 _ => not_allowed("POST with no body"),
             },
             path if path.starts_with("/api/agents/") => self.respond_agents(path, method, body),
+            path if path.starts_with("/api/memory/") => self.respond_memory(path, method),
             "/api/usage" => match *method {
                 Method::GET => json_or_error(self.usage_view(query, QuotaFetch::Cached)),
                 _ => not_allowed("GET"),
@@ -810,15 +874,7 @@ impl Site {
             },
             path if path.starts_with("/api/analysis") => self.respond_analysis(request),
             "/api/runs" => match *method {
-                Method::GET => json_or_error(self.runner().and_then(|runner| {
-                    let ids = runner.ids()?;
-                    let live: Vec<_> = runner
-                        .live()
-                        .into_iter()
-                        .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
-                        .collect();
-                    Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
-                })),
+                Method::GET => json_or_error(self.runs()),
                 _ => not_allowed("GET"),
             },
             path if path == "/api/run" || path.starts_with("/api/run/") => {
@@ -1079,7 +1135,14 @@ impl Site {
                     self.agents.rescan();
                     // An agent found again may be another version, with other models.
                     self.models.rescan();
-                    reply(StatusCode::OK, "application/json", self.settings())
+                    // hippius-mem is looked for on the same path. A set up under way checks
+                    // it again when it ends.
+                    match self.memory.check() {
+                        Ok(()) | Err(Error::MemorySetupRunning) => {
+                            reply(StatusCode::OK, "application/json", self.settings())
+                        }
+                        Err(error) => json_or_error(Err(error)),
+                    }
                 }
                 _ => not_allowed("POST with no body"),
             },
@@ -1088,6 +1151,21 @@ impl Site {
                 _ => not_allowed("POST {\"agents\": [...], \"customAgents\": [...]}"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    /// The replies to the routes under `/api/memory/`, as [`Site::respond`] gives them: a new
+    /// check of hippius-mem, and a trial vault's set up. Both answer the settings at once and
+    /// run in the background (`memory.rs`).
+    fn respond_memory(&self, path: &str, method: &Method) -> Reply {
+        let start = match path {
+            "/api/memory/check" => Memory::check,
+            "/api/memory/setup" => Memory::setup,
+            _ => return reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        };
+        match *method {
+            Method::POST => json_or_error(start(&self.memory).map(|()| self.settings())),
+            _ => not_allowed("POST with no body"),
         }
     }
 
@@ -1216,6 +1294,18 @@ impl Site {
             .as_ref()
             .map(|project| Arc::clone(&project.runner))
             .ok_or(Error::NoProject)
+    }
+
+    /// The reply to `GET /api/runs`: every run's id, and the live ones with their threads.
+    fn runs(&self) -> Result<Vec<u8>> {
+        let runner = self.runner()?;
+        let ids = runner.ids()?;
+        let live: Vec<_> = runner
+            .live()
+            .into_iter()
+            .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
+            .collect();
+        Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
     }
 
     /// The reply to `GET /api/run`: with `?id=R2`, that run, else the latest run, or `null`
@@ -1427,6 +1517,7 @@ impl Site {
             file,
             first_run: loaded.first_run,
             agents,
+            memory: MemoryView::from(self.memory.status()),
             tools,
             font_sizes: [*settings::FONT_SIZES.start(), *settings::FONT_SIZES.end()],
             tab_widths: settings::TAB_WIDTHS,
@@ -1440,6 +1531,15 @@ impl Site {
         let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
         // Checked here, not by serde, for the same reason as `save_layout`.
         let settings = Settings::try_from(request.settings).map_err(Error::InvalidSettings)?;
+        // Only turning it on is refused, so a hippius-mem removed later does not block every
+        // other change. The state is the latest check's, never waited for: a check can take
+        // seconds, and the dialog offers the switch only once it is ready.
+        if settings.agent_memory() && !self.current_settings().agent_memory() {
+            let state = self.memory.status().state;
+            if let Some(problem) = memory::not_ready(state.as_ref()) {
+                return Err(Error::MemoryNotReady(problem));
+            }
+        }
         settings::save(file, &settings, &request.revision)?;
         Ok(self.settings())
     }
@@ -1657,6 +1757,7 @@ impl std::fmt::Debug for Site {
             .field("agents", &self.agents)
             .field("quotas", &self.quotas)
             .field("models", &self.models)
+            .field("memory", &self.memory)
             .finish_non_exhaustive()
     }
 }
@@ -1755,6 +1856,8 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AnalysisRefused(_)
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
+                | Error::MemoryNotReady(_)
+                | Error::MemorySetupRunning
                 | Error::TurnRunning
                 | Error::RunElsewhere
                 | Error::TooManyRuns { .. }
@@ -1793,6 +1896,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::Window(_)
                 | Error::Webview(_)
                 | Error::SpawnWorker(_)
+                | Error::StartMemory(_)
                 | Error::BenchInterrupted
                 | Error::ReadReview { .. }
                 | Error::ParseReview { .. }

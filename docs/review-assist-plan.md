@@ -759,10 +759,12 @@ Team memory section, with the rescan poll pattern (`ui/settings-dialog.js:320`).
 - `quickstart` refuses because a configuration exists: its message is shown as it is.
 - Set up is one click on a button that says what it writes, and the paths come from the
   command's own output, not from Postil's guess.
-- The binary is removed while Postil runs: the next call fails, the state turns to Missing,
-  and runs start without memory.
-- The setting is on and the state is not Ready: runs start without memory, and the run's
-  dialog says so once.
+- The binary is removed while Postil runs: the next call fails and the state turns to
+  Missing.
+- `doctor` exits 1 for every error: its message is shown, and Set up is offered only when it
+  says there is no configuration.
+- `doctor` picks its profile by the git origin of its working directory: it runs in the open
+  project's root, and again when another project opens.
 
 **Tests.** With a fake `hippius-mem` on a temporary `PATH` (a shell script: the real one
 cannot be made to hang or be missing): each state; the hang; the switch refused when not
@@ -810,7 +812,9 @@ one line. `tests/fake-agent.mjs`: `echo-session` replies with the `session/new` 
 **Edge cases.** The absolute path has spaces. The agent answers `session/new` with an error
 (S7): one retry with no servers, and the run's dialog says memory was not given. The setting
 is off: the list is empty and the prompt has no line. A reviewer and a read-only run get the
-server too: recall is a read.
+server too: recall is a read. The binary is removed while Postil runs: runs start without
+memory. The setting is on and the state is not Ready: runs start without memory, and the
+run's dialog says so once (moved here from 9.1, where no run uses memory yet).
 
 **Tests.** `a_run_gives_the_agent_team_memory` (site, `echo-session`),
 `the_setting_off_gives_none_and_no_prompt_line`, `a_refused_server_list_is_retried_without`.

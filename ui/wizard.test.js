@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   STEPS,
   applyDetectedDefaults,
+  applyMemoryDefault,
   clampStep,
   npxWarning,
   readinessItems,
@@ -27,6 +28,7 @@ function defaults() {
     agent: null,
     analyzer: null,
     reviewers: [],
+    agentMemory: false,
   };
 }
 
@@ -66,6 +68,18 @@ test("first-run defaults enable every found built-in agent and pick the first as
   const none = scannedAgents().map((agent) => ({ ...agent, found: null }));
   const empty = defaults();
   assert.equal(applyDetectedDefaults(empty, none), empty);
+});
+
+test("a first run's team memory follows whether hippius-mem is ready, both ways", () => {
+  const memory = (kind) => ({ pending: false, state: kind && { kind, path: "/p" }, setup: null });
+  const on = applyMemoryDefault(defaults(), memory("ready"));
+  assert.equal(on.agentMemory, true);
+  for (const unready of [memory("unconfigured"), memory("missing"), memory(null)]) {
+    const draft = defaults();
+    assert.equal(applyMemoryDefault(draft, unready), draft);
+    // A draft made while it was ready turns it off again once it is not.
+    assert.equal(applyMemoryDefault(on, unready).agentMemory, false);
+  }
 });
 
 test("toggling an agent in the wizard reconciles the default agent and reviewers", () => {

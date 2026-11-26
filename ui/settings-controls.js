@@ -100,6 +100,15 @@ export function selectBox(key, label, options, value, choose, { disabled = false
 // colour are CSS (`.agent-mark.<kind>`). Not installed is a hollow circle, with no glyph.
 const AGENT_MARKS = { installed: "✓", missing: "!", unchecked: "–", absent: "" };
 
+// The mark for `state`, `{ kind, label }` as `agentState` or `memoryState` gives it; the label
+// is what a screen reader says.
+export function stateMark(state) {
+  const mark = el("span", `agent-mark ${state.kind}`, AGENT_MARKS[state.kind]);
+  mark.setAttribute("role", "img");
+  mark.setAttribute("aria-label", state.label);
+  return mark;
+}
+
 // One row in the agent list: a mark for where the agent stands, its logo and name, what it is
 // used for, the command it starts with, and a switch. The state in words is the mark's label
 // and, with the full path of the program, the row's tooltip. A row whose agent is not
@@ -111,9 +120,7 @@ export function agentListRow(
   const state = agentState(agent);
   const node = el("div", `agent-row ${state.kind}`);
   node.title = agent.found ? `${state.label}: ${agent.found}` : state.label;
-  const mark = el("span", `agent-mark ${state.kind}`, AGENT_MARKS[state.kind]);
-  mark.setAttribute("role", "img");
-  mark.setAttribute("aria-label", state.label);
+  const mark = stateMark(state);
 
   const text = el("div", "agent-text");
   const name = el("span", "agent-name");
