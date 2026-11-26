@@ -94,7 +94,12 @@ const EXTENSIONS = new Map([
 
 // Built-in agents with a logo in agent-logos.svg, by name (BUILT_IN in src/agents.rs). The
 // comment at the top of that file says where each came from, and why the others have none.
-const AGENT_LOGOS = new Map([["OpenCode", "agent-opencode"]]);
+const AGENT_LOGOS = new Map([
+  ["Claude", "agent-claude"],
+  ["Codex", "agent-codex"],
+  ["Gemini", "agent-gemini"],
+  ["OpenCode", "agent-opencode"],
+]);
 
 // The symbol id of the agent's logo, or null. The name is matched exactly: a custom agent
 // cannot take a built-in name in any case (saveCustomAgent in settings.js), so it gets none.
