@@ -450,7 +450,9 @@ export function wizardDialog(
       },
       onModel: (model) => updateDraft(setAgentModel(ui.draft, model).settings),
     });
-    parts.push(settingRow("Send notes to", "The default agent, and the model it runs", slot));
+    const sendRow = settingRow("Send notes to", "The default agent, and the model it runs", slot);
+    sendRow.classList.add("stacked");
+    parts.push(sendRow);
 
     const reviewers = reviewerControls(ui.draft, models.models, {
       disabled: ui.saving,
@@ -470,7 +472,7 @@ export function wizardDialog(
       "Each one reviews the agent's work, in this order",
       reviewers,
     );
-    reviewerRow.classList.add("tall");
+    reviewerRow.classList.add("stacked");
     parts.push(reviewerRow);
 
     parts.push(

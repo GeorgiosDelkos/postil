@@ -526,6 +526,94 @@ test("Settings lists the models the agent reports and saves one per slot", async
   assert.equal(await model("reviewer-model-1").inputValue(), "deep");
 });
 
+// The longest name a custom agent may have (MAX_NAME in src/settings.rs).
+const LONG_NAME = "An agent whose name runs to forty chars!";
+
+// A project whose agent is OpenCode, reviewed by OpenCode and then by a custom agent named
+// LONG_NAME, both played by the fake agent.
+async function openLongNameProject(t) {
+  const opened = await openProject(t, null, "new-opencode");
+  const { revision, settings } = await opened.api("api/settings");
+  const fake = settings.customAgents.find((agent) => agent.name === "Fake");
+  const next = {
+    ...settings,
+    customAgents: [...settings.customAgents, { name: LONG_NAME, command: fake.command }],
+    enabledAgents: [...settings.enabledAgents, LONG_NAME],
+    reviewers: [
+      { name: "OpenCode", model: null },
+      { name: LONG_NAME, model: null },
+    ],
+  };
+  const body = JSON.stringify({ revision, settings: next });
+  await opened.api("api/settings", { method: "PUT", body });
+  // The page reads the settings as it loads; these were written after.
+  await opened.page.reload();
+  await opened.page.locator("#repo-name").filter({ hasText: /\S/ }).waitFor();
+  return opened;
+}
+
+// Checks that `dialog`'s slot rows share their columns: the model selects of the send-to slot
+// (`agentKey`-model) and of both reviewers have one x and one width, the reviewers' buttons one
+// x, every card fits in the dialog, and the long name is cut to its column with a tooltip.
+async function assertSlotsAligned(dialog, agentKey) {
+  // The dialog comes in with a short animation, which moves every box while it runs.
+  await dialog.evaluate((node) =>
+    Promise.all(node.getAnimations({ subtree: true }).map((animation) => animation.finished)),
+  );
+  const keys = [`${agentKey}-model`, "reviewer-model-0", "reviewer-model-1"];
+  const box = (key) => dialog.locator(`[data-key="${key}"]`).boundingBox();
+  const models = await Promise.all(keys.map(box));
+  for (const [index, model] of models.entries()) {
+    assert.equal(model.x, models[0].x, `${keys[index]} starts where ${keys[0]} does`);
+    assert.equal(model.width, models[0].width, `${keys[index]} is as wide as ${keys[0]}`);
+  }
+  const removes = await Promise.all(["unreview-0", "unreview-1"].map(box));
+  assert.equal(removes[1].x, removes[0].x, "the reviewers' buttons line up");
+
+  const outer = await dialog.boundingBox();
+  for (const card of await dialog.locator(".slot-card").all()) {
+    const { x, width } = await card.boundingBox();
+    assert.ok(x >= outer.x && x + width <= outer.x + outer.width, "a slot card fits its dialog");
+  }
+  const name = dialog.locator("li .slot-agent").filter({ hasText: LONG_NAME });
+  assert.equal(await name.getAttribute("title"), LONG_NAME);
+  const cut = await name
+    .locator(".slot-agent-name")
+    .evaluate((node) => node.scrollWidth > node.clientWidth);
+  assert.ok(cut, "the long name is cut to its column");
+
+  // A model name as long as real ones shows whole: WebKit cuts a select's text mid-glyph with
+  // no ellipsis, so the text and the native arrow must fit inside it. Under `appearance: auto`
+  // WebKit reports a padding of 0 whatever app.css sets, and the arrow is in no computed style:
+  // ARROW is its room, measured in WebKit on 2026-11-26 (about 30 px). The selects are one
+  // width, so one stands for all.
+  const ARROW = 30;
+  const select = dialog.locator('[data-key="reviewer-model-1"]');
+  await select.locator('option[value="long"]').waitFor({ state: "attached" });
+  await select.selectOption("long");
+  const room = await select.evaluate((node, arrow) => {
+    const context = document.createElement("canvas").getContext("2d");
+    context.font = getComputedStyle(node).font;
+    const text = context.measureText(node.selectedOptions[0].text).width;
+    return { needed: text + arrow, width: node.clientWidth };
+  }, ARROW);
+  assert.ok(room.needed <= room.width, `a long model name fits: ${JSON.stringify(room)}`);
+}
+
+test("the workflow slots line up whatever the agents' names, in Settings and the wizard", async (t) => {
+  const { page } = await openLongNameProject(t);
+  await page.locator("#open-settings").click();
+  const settings = page.locator("#settings");
+  await settings.locator('[data-key="reviewer-model-1"]').waitFor();
+  await assertSlotsAligned(settings, "agent");
+
+  await settings.locator('[data-key="run-wizard"]').click();
+  const wizard = page.locator("#wizard");
+  await wizard.locator('[data-key="step-workflow"]').click();
+  await wizard.locator('[data-key="reviewer-model-1"]').waitFor();
+  await assertSlotsAligned(wizard, "wizard-agent");
+});
+
 test("the startup wizard opens on first launch, saves settings, and stays closed on reload", async (t) => {
   const created = await fetch(new URL("new-fresh", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);

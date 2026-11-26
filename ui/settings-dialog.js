@@ -390,7 +390,13 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
       onAgent: (name) => save(setAgent(ui.view.settings, name)),
       onModel: (model) => save(setAgentModel(ui.view.settings, model)),
     });
-    return settingRow("Send notes to", "The agent that works on the notes, and its model", control);
+    const node = settingRow(
+      "Send notes to",
+      "The agent that works on the notes, and its model",
+      control,
+    );
+    node.classList.add("stacked");
+    return node;
   }
 
   function reviewers() {
@@ -410,7 +416,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
       "Each one reviews the agent's work, in this order",
       control,
     );
-    node.classList.add("tall");
+    node.classList.add("stacked");
     return node;
   }
 

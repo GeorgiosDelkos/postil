@@ -3252,7 +3252,7 @@ fn a_model_the_agent_does_not_offer_fails_the_run_before_any_prompt() {
     assert_eq!(
         error,
         "the agent does not offer the model \"gemini-2.5-pro\"; choose another for it in \
-         Settings (offered: m, pro, fast, deep)"
+         Settings (offered: m, pro, fast, deep, long)"
     );
     assert!(
         !kinds(&failed)

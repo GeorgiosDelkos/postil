@@ -196,8 +196,21 @@ export function modelSelect(key, slot, report, choose, { disabled = false } = {}
   return node;
 }
 
-// The agent notes are sent to and its model, side by side. `key` names the agent select; the
-// model select is `${key}-model`. `onAgent` gets a name, or null for none.
+// One row of a slot card: the reviewer's number, the agent, its model, and the row's buttons,
+// each in its column of the grid every slot row shares (`.slot-row`), so the model selects of
+// all rows line up whatever the agents' names. A number, model or actions given as null leave
+// their cell empty, to keep the columns.
+function slotRow(tag, number, agent, model, actions) {
+  const node = el(tag, "slot-row");
+  const numberCell = el("span", "slot-number", number ?? "");
+  const actionCell = el("div", "slot-actions");
+  if (actions) actionCell.append(...actions);
+  node.append(numberCell, agent, model ?? el("div"), actionCell);
+  return node;
+}
+
+// The agent notes are sent to and its model, as one row of a slot card. `key` names the agent
+// select; the model select is `${key}-model`. `onAgent` gets a name, or null for none.
 export function agentSlotControl(key, settings, models, { disabled = false, onAgent, onModel }) {
   const enabled = settings.enabledAgents;
   const none = enabled.length ? "None" : "Turn on an agent first";
@@ -211,11 +224,12 @@ export function agentSlotControl(key, settings, models, { disabled = false, onAg
     (name) => onAgent(name || null),
     { disabled: disabled || enabled.length === 0 },
   );
-  const node = el("div", "slot-control");
-  node.append(agent);
-  if (chosen) {
-    node.append(modelSelect(`${key}-model`, chosen, models[chosen.name], onModel, { disabled }));
-  }
+  agent.classList.add("slot-agent");
+  const model = chosen
+    ? modelSelect(`${key}-model`, chosen, models[chosen.name], onModel, { disabled })
+    : null;
+  const node = el("div", "slot-card");
+  node.append(slotRow("div", null, agent, model, null));
   return node;
 }
 
@@ -327,8 +341,8 @@ export function customAgentForm(form, { onSubmit, onCancel }) {
   return node;
 }
 
-// The reviewers in order, each with its model select (`models` are the agents' reports, by
-// name), and a select that adds one.
+// The reviewers in order as rows of a slot card, each with its model select (`models` are the
+// agents' reports, by name), and a last row with a select that adds one.
 export function reviewerControls(
   settings,
   models,
@@ -337,15 +351,18 @@ export function reviewerControls(
   const list = el("ol", "reviewer-list");
   settings.reviewers.forEach((slot, index) => {
     const { name } = slot;
-    const item = el("li", "reviewer");
-    // The name is cut to fit beside the model select; the tooltip shows it whole.
-    const label = el("span", "reviewer-name", name);
-    label.title = name;
-    item.append(
-      label,
-      modelSelect(`reviewer-model-${index}`, slot, models[name], (model) => onModel(index, model), {
-        disabled,
-      }),
+    // The name is cut to its column; the tooltip shows it whole.
+    const agent = el("span", "slot-agent");
+    agent.title = name;
+    const logo = agentLogoIcon(name);
+    if (logo) agent.append(logo);
+    agent.append(el("span", "slot-agent-name", name));
+    const model = modelSelect(
+      `reviewer-model-${index}`,
+      slot,
+      models[name],
+      (chosen) => onModel(index, chosen),
+      { disabled },
     );
     const up = controlButton("↑", `up-${index}`, () => onMove(index, -1), "icon-button");
     const down = controlButton("↓", `down-${index}`, () => onMove(index, 1), "icon-button");
@@ -356,8 +373,7 @@ export function reviewerControls(
     up.disabled = disabled || index === 0;
     down.disabled = disabled || index === settings.reviewers.length - 1;
     remove.disabled = disabled;
-    item.append(up, down, remove);
-    list.append(item);
+    list.append(slotRow("li", `${index + 1}.`, agent, model, [up, down, remove]));
   });
 
   const enabled = settings.enabledAgents.map((name) => [name, name]);
@@ -372,13 +388,18 @@ export function reviewerControls(
     },
     { disabled: disabled || settings.enabledAgents.length === 0 },
   );
+  add.classList.add("quiet");
+  const addRow = el("div", "slot-row slot-add");
+  addRow.append(el("span", "slot-number"), add);
 
+  const card = el("div", "slot-card");
+  card.append(list, addRow);
   const control = el("div", "reviewers");
   if (!settings.reviewers.length) {
     const none = "No review: the agent's work comes straight back to you.";
     control.append(el("p", "settings-hint", none));
   }
-  control.append(list, add);
+  control.append(card);
   return control;
 }
 

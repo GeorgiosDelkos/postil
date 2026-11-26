@@ -1152,8 +1152,11 @@ button.repo-name:hover {
   -webkit-backdrop-filter: blur(2px);
 }
 
+/* min-width 0: a flex item is otherwise as wide as its longest unbreakable line, and a
+   custom agent's command, kept on one line, then widened the panel past the dialog. */
 .settings-panel {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -1209,8 +1212,12 @@ button.repo-name:hover {
   padding: 6px 0;
 }
 
-.settings-row.tall {
-  align-items: flex-start;
+/* The label above its control, which takes the row's full width: the workflow's slot cards,
+   whose model selects need the room (see `.slot-card`). */
+.settings-row.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
 }
 
 .settings-label {
@@ -1423,8 +1430,10 @@ button.repo-name:hover {
 }
 
 /* The agents as one card with a hairline between rows: a status mark, the logo and name, what
-   the agent is used for, the command, and the switch on the right. */
-.agent-list {
+   the agent is used for, the command, and the switch on the right. The workflow's slot cards
+   (`.slot-card`) are drawn the same. */
+.agent-list,
+.slot-card {
   display: flex;
   flex-direction: column;
   margin-top: 8px;
@@ -1575,20 +1584,87 @@ button.repo-name:hover {
   font-size: 12px;
 }
 
-/* An agent and its model, side by side; a model's hint (asking, or why it could not) under
-   its select. */
-.slot-control {
-  flex: none;
+/* The workflow's slots: the agent notes go to, and the reviewers, each a row of a card drawn
+   as the agent list is. Every row has the same columns (the reviewer's number, the agent, its
+   model, the row's buttons), so the model selects start at one x with one width whatever the
+   agents' names. The cards sit under their labels (`.settings-row.stacked`) and fill the row,
+   because WebKit cuts a select's text mid-glyph with no ellipsis, and real model names need
+   145 to 225 px at the 12 px UI font. */
+.slot-card {
+  margin-top: 0;
+}
+.slot-row {
+  display: grid;
+  /* Number: "9." in tabular digits. Agent: a logo and about eighteen characters of name, and
+     "Turn on an agent first" whole in the send-to select. Model: the rest, 260 px in the
+     wizard at its full 560 px. Actions: three 26 px buttons. */
+  grid-template-columns: 14px 140px minmax(0, 1fr) 78px;
+  align-items: start;
+  column-gap: 6px;
+  padding: 6px 8px;
+}
+
+.slot-row + .slot-row,
+.reviewer-list:not(:empty) + .slot-row {
+  border-top: 1px solid var(--border);
+}
+
+.slot-number,
+.slot-agent {
+  height: 26px;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  min-width: 0;
+}
+
+.slot-number {
+  justify-content: flex-end;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.slot-agent {
   gap: 6px;
+  color: var(--text-strong);
 }
 
-.slot-control .select {
-  min-width: 130px;
-  max-width: 200px;
+.slot-agent-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
+.slot-row .select {
+  width: 100%;
+  min-width: 0;
+}
+
+.slot-actions {
+  display: flex;
+}
+
+.slot-actions .icon-button {
+  width: 26px;
+  min-width: 0;
+  padding: 0;
+}
+
+/* The add row is quiet: no border or fill until the pointer is on it, muted text, and the
+   accent only on focus (`.select:focus-visible`). It spans the agent and model columns. */
+.slot-add .select.quiet {
+  grid-column: 2 / 4;
+  background: none;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.slot-add .select.quiet:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+/* A model's hint (asking, or why it could not) under its select, cut to the column. */
 .model-select {
   min-width: 0;
   display: flex;
@@ -1597,7 +1673,6 @@ button.repo-name:hover {
 }
 
 .model-hint {
-  max-width: 200px;
   margin: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -1606,8 +1681,6 @@ button.repo-name:hover {
 }
 
 .reviewers {
-  width: 300px;
-  flex: none;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1617,55 +1690,10 @@ button.repo-name:hover {
   margin: 0;
 }
 
-.reviewers .select {
-  width: 100%;
-}
-
 .reviewer-list {
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: reviewer;
-}
-
-.reviewer-list:empty {
-  display: none;
-}
-
-.reviewer {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 32px;
-  padding: 3px 0 3px 4px;
-  counter-increment: reviewer;
-}
-
-.reviewer + .reviewer {
-  border-top: 1px solid var(--border);
-}
-
-.reviewer-name {
-  flex: none;
-  max-width: 96px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--text-strong);
-}
-
-.reviewer .model-select {
-  flex: 1;
-}
-
-.reviewers .reviewer .select {
-  min-width: 0;
-}
-
-.reviewer-name::before {
-  content: counter(reviewer) ". ";
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
 }
 
 .settings:focus,
@@ -1700,8 +1728,10 @@ button.repo-name:hover {
   -webkit-backdrop-filter: blur(2px);
 }
 
+/* min-width 0 as for `.settings-panel`. */
 .wizard-panel {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
