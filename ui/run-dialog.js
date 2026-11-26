@@ -282,7 +282,10 @@ export function runDialog({
       });
       noteCards.append(button);
     }
-    body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    // An analysis carries no notes: its diagrams name it (src/run.rs, `Runner::analyze`).
+    if (!view.analysis) {
+      body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    }
     const branch = threadPart(view, record, latest);
     if (branch) body.append(branch);
 
@@ -299,7 +302,8 @@ export function runDialog({
     if (!view.review) {
       // A thread that only reads changed nothing to review (src/run.rs, `Runner::review`).
       if (!readsOnly(view, record)) body.append(reviewPart(view, review));
-      body.append(followUpBox(view, latest));
+      // An analysis takes no follow-up (`POST api/run/follow` refuses one): analyze again.
+      if (!view.analysis) body.append(followUpBox(view, latest));
     }
 
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], {

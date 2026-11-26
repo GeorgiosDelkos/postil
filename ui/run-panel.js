@@ -86,5 +86,8 @@ export function runPanel({
     busyThread: dialog.busyThread,
     // Opens the dialog of run `id`'s thread.
     openRun: (id) => dialog.open({ kind: "run", id }),
+    // An analysis run, which the map starts and shows: followed, and stopped by its id.
+    track: store.track,
+    stopRun: store.stop,
   };
 }

@@ -415,6 +415,69 @@ fn a_newer_analysis_is_refused() {
     assert!(error.to_string().contains("version 3"), "{error}");
     assert_eq!(fs::read_to_string(&file).unwrap(), newer);
 }
+
+const START_OVER: &str = "postil://localhost/api/analysis/start-over";
+
+#[test]
+fn start_over_moves_an_unreadable_analysis_to_the_trash() {
+    let repo = TempRepo::new("analysis-start-over");
+    let site = repo.site();
+    let file = site.repo().unwrap().analysis_file();
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let newer = r#"{"version": 3, "checked": "abc1234", "diagrams": []}"#;
+    fs::write(&file, newer).unwrap();
+    assert_eq!(get(&site, ANALYSIS).0, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (status, reply) = post(&site, START_OVER, "");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let trashed = PathBuf::from(reply["trashed"].as_str().expect("where the file went"));
+    // The file is in the Trash, whole, and can be put back. Only a file that is both the one
+    // written here and in a Trash is deleted again: anything else is left for the engineer.
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let in_trash = trashed.starts_with(home.join(".Trash"))
+        || trashed
+            .components()
+            .any(|part| part.as_os_str() == ".Trashes");
+    assert!(in_trash, "{} is in no Trash", trashed.display());
+    assert_eq!(fs::read_to_string(&trashed).unwrap(), newer);
+    fs::remove_file(&trashed).unwrap();
+    assert!(!file.exists());
+    assert_eq!(get_json(&site, ANALYSIS), serde_json::Value::Null);
+
+    let (status, reply) = post(&site, START_OVER, "");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, r#"{"trashed":null}"#, "no file: nothing to move");
+}
+
+#[test]
+fn start_over_is_refused_while_an_analysis_runs() {
+    let repo = analyzed_repo("analysis-start-over-live");
+    let (site, nudges) = run_site(&repo, "hang");
+    let file = site.repo().unwrap().analysis_file();
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "{ not json").unwrap();
+    let id = analyze(&site, &serde_json::json!({ "kind": "analyze" }));
+    under_way(&site, &nudges, &id);
+
+    let (status, reply) = post(&site, START_OVER, "");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    assert!(
+        reply.contains("an analysis of this window is under way"),
+        "{reply}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "{ not json",
+        "the file stays"
+    );
+    // The hanging agent ignores the first Stop; the second, once its wait is over, forces it.
+    stop_run(&site, &id);
+    site.runner().unwrap().backdate_stop();
+    stop_run(&site, &id);
+    analyzed(&site, &nudges, &id);
+}
 // Analysis runs (docs/review-assist.md, "An analysis run"), against the fake agent's
 // `analysis` scenarios in `tests/fake-agent.mjs`.
 

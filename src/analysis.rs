@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
@@ -470,6 +470,25 @@ fn prune_orphans(diagrams: &mut Vec<Diagram>) {
             return;
         }
     }
+}
+
+/// Moves `repo`'s analysis file to the Trash, whatever it holds, and returns where it went, or
+/// `None` when there is none: the way out of a file [`load`] refuses, which [`save`] never
+/// writes over (docs/review-assist-plan.md, 8.1, "Edge cases"). Holds [`lock`] across the
+/// move, so a merge in another window either saves before it or after it, into a new file.
+///
+/// # Errors
+///
+/// As [`lock`]; [`Error::TrashAnalysis`] when the file is there and cannot be moved.
+pub(crate) fn start_over(repo: &Repo) -> Result<Option<PathBuf>> {
+    let file = repo.analysis_file();
+    let _lock = lock(&file)?;
+    if !file.exists() {
+        return Ok(None);
+    }
+    files::move_to_trash(&file)
+        .map(Some)
+        .map_err(|source| Error::TrashAnalysis { path: file, source })
 }
 
 /// Deletes diagram `id` from `repo`'s analysis, with the diagrams below its nodes, and returns

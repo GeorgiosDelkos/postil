@@ -211,6 +211,23 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/welcome.js"),
     ),
     (
+        "/diagram.js",
+        "text/javascript",
+        include_bytes!("../ui/diagram.js"),
+    ),
+    (
+        "/diagram-view.js",
+        "text/javascript",
+        include_bytes!("../ui/diagram-view.js"),
+    ),
+    // The map's layout library (ui/vendor/dagre.LICENSE), loaded by a script element when the
+    // map first opens, not imported.
+    (
+        "/vendor/dagre.min.js",
+        "text/javascript",
+        include_bytes!("../ui/vendor/dagre.min.js"),
+    ),
+    (
         "/icons.svg",
         "image/svg+xml",
         include_bytes!("../ui/icons.svg"),
@@ -477,6 +494,7 @@ struct LayoutView {
 struct LayoutLimits {
     sidebar: [u32; 2],
     tray: [u32; 2],
+    map: [u32; 2],
 }
 
 /// The body of `POST /api/run`.
@@ -961,6 +979,20 @@ impl Site {
         Ok(to_json(&serde_json::json!({ "run": run })))
     }
 
+    /// The reply to `POST /api/analysis/start-over`: moves the analysis file to the Trash, one
+    /// this build cannot read included, and answers `{"trashed": "<where it went>"}`, or
+    /// `{"trashed": null}` when there was no file. Refused while an analysis of this window is
+    /// under way: its merge would write a new file as this one goes.
+    fn start_analysis_over(&self) -> Result<Vec<u8>> {
+        if self.runner()?.analyzing() {
+            return Err(Error::AnalysisRefused(
+                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
+            ));
+        }
+        let trashed = analysis::start_over(&*self.repo()?)?;
+        Ok(to_json(&serde_json::json!({ "trashed": trashed })))
+    }
+
     /// The reply to `DELETE /api/analysis?diagram=D3`: deletes the diagram, with the diagrams
     /// below its nodes, and returns the analysis left, placed.
     fn delete_diagram(&self, query: &str) -> Result<Vec<u8>> {
@@ -1065,6 +1097,10 @@ impl Site {
             "/api/analysis/update" => match *method {
                 Method::POST => json_or_error(self.update_analysis(body)),
                 _ => not_allowed("POST {\"diagram\": ...}, or with no body for every diagram"),
+            },
+            "/api/analysis/start-over" => match *method {
+                Method::POST => json_or_error(self.start_analysis_over()),
+                _ => not_allowed("POST with no body"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
@@ -1192,6 +1228,7 @@ impl Site {
             limits: LayoutLimits {
                 sidebar: [*layout::SIDEBAR.start(), *layout::SIDEBAR.end()],
                 tray: [*layout::TRAY.start(), *layout::TRAY.end()],
+                map: [*layout::MAP.start(), *layout::MAP.end()],
             },
         })
     }
@@ -1802,6 +1839,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::ParseAnalysis { .. }
                 | Error::InvalidAnalysis { .. }
                 | Error::WriteAnalysis { .. }
+                | Error::TrashAnalysis { .. }
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }

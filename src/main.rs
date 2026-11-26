@@ -67,13 +67,19 @@ fn main() -> ExitCode {
             postil::bench(dir, file).map(|report| {
                 println!("launch_to_paint_ms {}", report.launch_to_paint.as_millis());
                 println!("page {}", report.page);
+                report.over_budget()
             })
         }
-        None => postil::run(args.dir.as_deref()),
+        None => postil::run(args.dir.as_deref()).map(|()| None),
     };
 
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(None) => ExitCode::SUCCESS,
+        // The report is printed above, so the run that missed is on record.
+        Ok(Some(missed)) => {
+            eprintln!("postil: bench: {missed}");
+            ExitCode::FAILURE
+        }
         Err(error) => {
             eprintln!("postil: {}", postil::error_chain(&error));
             ExitCode::FAILURE

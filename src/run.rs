@@ -631,6 +631,12 @@ impl Runner {
         Ok(saved.expect("launch succeeded, so Run::create called the content closure"))
     }
 
+    /// Whether an analysis run of this window is under way, or its worktree is being made.
+    /// Takes the slots' lock for the look only.
+    pub(crate) fn analyzing(&self) -> bool {
+        self.slots().analyzing()
+    }
+
     /// Starts an analysis run of `agent`, read-only in a new thread of its own that ends with
     /// the run (docs/review-assist.md, "An analysis run"), as `job` asks, and returns the run's
     /// id. Its reply is merged into the analysis as its turn ends well ([`finish_analysis`]).

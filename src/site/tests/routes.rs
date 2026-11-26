@@ -60,6 +60,11 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         "POST {\"diagram\": ...}, or with no body for every diagram",
     ),
     (
+        "/api/analysis/start-over",
+        &[Method::POST],
+        "POST with no body",
+    ),
+    (
         "/api/definitions",
         &[Method::GET],
         "GET ?name=<name>&from=<path>",

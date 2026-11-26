@@ -165,6 +165,13 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
+    /// The analysis file could not be moved to the Trash (Start over).
+    TrashAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// Foundation's reason, as an I/O error.
+        source: io::Error,
+    },
     /// Another writer held the analysis file's lock for as long as a change waits for it.
     AnalysisLocked {
         /// The lock file's path.
@@ -489,6 +496,11 @@ impl fmt::Display for Error {
                 "{}: {problem} (fix it, or move it aside to start over)",
                 path.display()
             ),
+            Self::TrashAnalysis { path, .. } => write!(
+                f,
+                "cannot move {} to the Trash (move it aside by hand to start over)",
+                path.display()
+            ),
             Self::WriteAnalysis { path, .. } => write!(
                 f,
                 "cannot write {} (check that its directory is writable; the analysis was not \
@@ -729,6 +741,7 @@ impl std::error::Error for Error {
             | Self::WriteReview { source, .. }
             | Self::ReadAnalysis { source, .. }
             | Self::WriteAnalysis { source, .. }
+            | Self::TrashAnalysis { source, .. }
             | Self::WriteRecent { source, .. }
             | Self::WriteSettings { source, .. }
             | Self::StartAgent { source, .. }

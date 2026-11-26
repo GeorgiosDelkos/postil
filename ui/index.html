@@ -11,7 +11,10 @@
 <nav class="sidebar" aria-label="Files">
   <div class="drag-strip" data-drag></div>
   <div class="repo" data-drag>
-    <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
+    <div class="repo-row">
+      <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
+      <button type="button" class="map-toggle" id="toggle-map" aria-pressed="false" aria-controls="map" title="Map (⇧⌘M)">Map</button>
+    </div>
     <div class="repo-branch" id="repo-branch"></div>
     <div class="repo-warning" id="repo-warning" hidden></div>
   </div>
@@ -43,18 +46,21 @@
   </div>
 </nav>
 
-<main class="pane code-pane">
-  <header class="pane-header" data-drag>
-    <div class="crumbs" id="crumbs"></div>
-    <div class="meta" id="file-meta"></div>
-  </header>
-  <div class="code" id="code" tabindex="0">
-    <div class="code-rows" id="code-rows"></div>
-    <div class="empty" id="code-empty">Pick a file on the left.</div>
+<main class="pane code-pane" id="code-pane">
+  <section class="map-pane" id="map" aria-label="Map" hidden></section>
+  <div class="code-column" id="code-column">
+    <header class="pane-header" data-drag>
+      <div class="crumbs" id="crumbs"></div>
+      <div class="meta" id="file-meta"></div>
+    </header>
+    <div class="code" id="code" tabindex="0">
+      <div class="code-rows" id="code-rows"></div>
+      <div class="empty" id="code-empty">Pick a file on the left.</div>
+    </div>
+    <div class="prompt-preview" id="prompt-preview" tabindex="0" hidden></div>
+    <div class="changes-view" id="changes-view" tabindex="0" hidden></div>
+    <button type="button" class="focus-pill" id="focus-pill"></button>
   </div>
-  <div class="prompt-preview" id="prompt-preview" tabindex="0" hidden></div>
-  <div class="changes-view" id="changes-view" tabindex="0" hidden></div>
-  <button type="button" class="focus-pill" id="focus-pill"></button>
 </main>
 
 <aside class="pane tray" id="tray" aria-label="Review">
@@ -77,6 +83,7 @@
 </aside>
 
 <div class="divider" id="divider-files" role="separator" aria-orientation="vertical" aria-label="File list width" aria-controls="files" tabindex="0" title="Drag to resize · double-click to reset"></div>
+<div class="divider" id="divider-map" role="separator" aria-orientation="vertical" aria-label="Map width" aria-controls="map" tabindex="0" title="Drag to resize · double-click to reset" hidden></div>
 <div class="divider" id="divider-tray" role="separator" aria-orientation="vertical" aria-label="Tray width" aria-controls="tray" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
 <section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>
@@ -102,6 +109,7 @@
 
 <dialog class="note-dialog" id="note-dialog" aria-labelledby="note-dialog-title"></dialog>
 <dialog class="note-dialog path-note" id="path-note-dialog" aria-labelledby="path-note-title"></dialog>
+<dialog class="note-dialog node-dialog" id="node-dialog" aria-labelledby="node-dialog-title"></dialog>
 <dialog class="note-dialog definitions-dialog" id="definitions-dialog" aria-labelledby="definitions-title"></dialog>
 <dialog class="note-dialog run-detail" id="run-detail" aria-labelledby="run-detail-title" tabindex="-1"></dialog>
 <dialog class="settings" id="settings" aria-labelledby="settings-title" tabindex="-1"></dialog>
