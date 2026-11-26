@@ -952,14 +952,13 @@ in the settings. Each catalog command is confirmed end to end with a real prompt
 `a_real_agent_answers_a_prompt` (`POSTIL_REAL_AGENT='<command>' cargo test real_agent --
 --ignored`):
 Claude and Grok passed on 2026-11-23; Codex and OpenCode are not installed on the development
-Mac. Gemini moved from the `gemini` CLI to the Antigravity CLI, `agy`, which has no `gemini`
-binary beside it.
+Mac. Antigravity runs through its CLI, `agy`, which replaced the older `gemini` CLI.
 
 | Name | Found by | Command | ACP support |
 |---|---|---|---|
 | Claude | `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Adapter around Claude Code. |
 | Codex | `codex` | `npx -y @zed-industries/codex-acp` | Adapter. |
-| Gemini | `agy` | `agy acp` | Native (`initialize` and `session/new` checked 2026-11-26, agy 1.5.18). |
+| Antigravity | `agy` | `agy acp` | Native (`initialize` and `session/new` checked 2026-11-26, agy 1.5.18). |
 | Grok | `grok` | `grok agent stdio` | Native (checked 2026-11-22). |
 | OpenCode | `opencode` | `opencode acp` | Native. |
 
@@ -1028,15 +1027,20 @@ from Settings.
 
 ### Usage
 
-The Usage dialog (the Usage button above Settings, View > Usage, `Shift-Cmd-U`) shows, per
-agent, the provider account's quota and what Postil's own runs used. `GET /api/usage?scope=
-project|all&range=24h|7d|30d|all` answers it, and `POST /api/usage/refresh` probes the quotas
-again. The ranges roll back from now: the process has no time zone, so a calendar day is not
-offered.
+The Usage view — the inline quota strip and popover at the foot of the sidebar (`ui/usage-bar.js`),
+the mini quota bars inside the agent picker, and the full Usage dialog (the Usage button above
+Settings, View > Usage, `Shift-Cmd-U`) — shows, per agent, the provider account's live quota and
+combined Postil + local CLI session activity. `GET /api/usage?scope=project|all&range=24h|7d|30d|all`
+answers it, and `POST /api/usage/refresh` probes quotas and rescans changed transcripts. The
+ranges roll back from now: the process has no time zone, so a calendar day is not offered.
 
 Postil's own usage lives in `~/.config/postil/usage.jsonl` (`src/usage/ledger.rs`): one JSON
 line per finished run, appended under `usage.lock`, with the agent, the model, the outcome,
-the token counts, the context fill and the cost the agent reported. It is separate from the
+the token counts, the context fill and the cost the agent reported. Alongside it,
+`src/usage/scanner.rs` scans local CLI session transcripts read-only (`~/.claude/projects`,
+`~/.codex/sessions`, `~/.grok/sessions`, `~/.gemini/antigravity-cli/brain`) on a background
+thread with an in-memory `(modified, len)` stamp cache, skipping sessions started inside
+`~/.postil` so Postil runs are never counted twice. It is separate from the
 run logs, so deleting notes keeps the history, and it spans projects. Each line carries
 `version` 1; a reader skips lines of another version and lines that do not parse, and an
 append after a torn last line starts on a new line, so a crash loses at most that line. The
@@ -1046,19 +1050,16 @@ cost is cumulative for the session, so a follow-up on a kept agent records its c
 the session had cost before it, and a meter that went down records no cost. Runs before this
 format, and runs whose log is reopened from disk, are not in the ledger.
 
-The account quotas (`src/usage/quota.rs`) are probed only while the dialog is open and cached
-for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`,
-and Grok through `grok agent stdio` (`_x.ai/billing`).
+The account quotas (`src/usage/quota.rs`) are cached for 60 s so window focus events and menu
+opens do not spam provider endpoints. Codex is asked through `codex app-server`, Antigravity
+through `agy -p /usage --output-format json --print-timeout 12s`, and Grok through
+`grok agent stdio` (`_x.ai/billing`).
 Claude is asked over HTTPS with the agent's own sign-in: its token from the macOS Keychain item
 Claude Code writes, or `~/.claude/.credentials.json`. The token goes to `/usr/bin/curl` on
 stdin (`--config -`, with `--disable` so no `~/.curlrc` applies), never in its arguments; it is
 never stored, logged, or sent to the page. The endpoint (Anthropic's `api/oauth/usage`) is the
 one Claude Code calls and is not documented, so Anthropic may change it; a probe that fails
-shows why and leaves the rest of the dialog working. Other agents show no quota. Gemini's was
-read with the `gemini` CLI's token (`~/.gemini/oauth_creds.json`) until 2026-11-26; `agy` keeps
-its sign-in in its own keyring ACL and Antigravity's terms disallow third-party extraction or
-polling of consumer quota endpoints, so Gemini's live quota is shown as unavailable (while
-`agy acp` still reports per-run token usage to the ledger).
+shows why and leaves the rest of the dialog working. Other agents show no quota.
 
 ## Dependencies
 

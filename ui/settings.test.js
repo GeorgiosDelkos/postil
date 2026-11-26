@@ -18,7 +18,7 @@ import {
 } from "./settings.js";
 import { modelSelectOptions } from "./settings-controls.js";
 
-const BUILT_IN = ["Claude", "Codex", "Gemini", "Grok", "OpenCode"];
+const BUILT_IN = ["Claude", "Codex", "Antigravity", "Grok", "OpenCode"];
 
 // Settings as api/settings returns them, with one custom agent in use as the agent and Grok
 // reviewing twice, once on a chosen model.
@@ -53,7 +53,7 @@ test("rows say which agents are enabled and what each one is used for", () => {
   const agents = [
     { name: "Claude", command: "c", builtIn: true, found: "/bin/claude" },
     { name: "Grok", command: "g", builtIn: true, found: null },
-    { name: "Gemini", command: "m", builtIn: true, found: null },
+    { name: "Antigravity", command: "m", builtIn: true, found: null },
     { name: "Local", command: "l", builtIn: false, found: null },
   ];
   const rows = agentRows(agents, settings());
@@ -62,7 +62,7 @@ test("rows say which agents are enabled and what each one is used for", () => {
     [
       ["Claude", true, null],
       ["Grok", true, "it reviews the agent's work"],
-      ["Gemini", false, null],
+      ["Antigravity", false, null],
       ["Local", true, "notes are sent to it"],
     ],
   );
@@ -87,11 +87,11 @@ test("an agent can be turned off only while nothing uses it", () => {
   ]);
   assert.match(setEnabled(settings(), "Local", false).error, /while notes are sent to it/);
   assert.match(setEnabled(settings(), "Grok", false).error, /while it reviews/);
-  assert.deepEqual(setEnabled(settings(), "Gemini", true).settings.enabledAgents, [
+  assert.deepEqual(setEnabled(settings(), "Antigravity", true).settings.enabledAgents, [
     "Grok",
     "Local",
     "Claude",
-    "Gemini",
+    "Antigravity",
   ]);
   const same = settings();
   assert.equal(setEnabled(same, "Grok", true).settings, same, "no change, same object");
@@ -154,11 +154,11 @@ test("a custom agent in use cannot be removed; a free one leaves every list", ()
 test("the agent and reviewers are chosen among enabled agents only", () => {
   assert.deepEqual(setAgent(settings(), "Claude").settings.agent, slot("Claude"));
   assert.equal(setAgent(settings(), null).settings.agent, null);
-  assert.match(setAgent(settings(), "Gemini").error, /Turn Gemini on first/);
+  assert.match(setAgent(settings(), "Antigravity").error, /Turn Antigravity on first/);
   const reviewers = addReviewer(settings(), "Claude").settings.reviewers;
   assert.deepEqual(reviewers.at(-1), slot("Claude"), "a new reviewer runs its default model");
   assert.deepEqual(names(reviewers), ["Grok", "Grok", "Claude"]);
-  assert.match(addReviewer(settings(), "Gemini").error, /Turn Gemini on first/);
+  assert.match(addReviewer(settings(), "Antigravity").error, /Turn Antigravity on first/);
 });
 
 test("switching the agent resets its model, and choosing the same one keeps it", () => {

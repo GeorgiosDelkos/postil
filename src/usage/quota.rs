@@ -31,13 +31,13 @@ use crate::usage::now_secs;
 /// current enough, and closing and reopening the dialog within it sends no request.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Hard limit on one subprocess a probe runs (`security`, `curl`, `codex app-server`, or
-/// `grok agent stdio`).
+/// Hard limit on one subprocess a probe runs (`security`, `curl`, `codex app-server`,
+/// `agy -p /usage`, or `grok agent stdio`).
 /// A probe runs up to two of them one after the other (Claude: the Keychain read, then the
 /// usage request), so a probe can take up to twice this. Arbitrary:
-/// long enough for a slow network round trip, short enough that the dialog does not show
-/// "Loading" for long.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// long enough for `agy` to start its local language server when cold, short enough that the
+/// dialog does not show "Loading" for long.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long an in-flight `Loading` entry stays fresh before a later poll replaces its probe.
 /// Two [`PROBE_TIMEOUT`]s (the longest a probe should take) plus 4 s of margin, so only a
@@ -60,6 +60,10 @@ pub(crate) enum QuotaStatus {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QuotaWindow {
     pub(crate) label: String,
+    /// Compact label (`"5h"`, `"wk"`, `"1d"`, `"mo"`) for primary account windows shown in the
+    /// inline sidebar strip and agent picker; `None` on secondary per-model buckets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) short_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
     /// Percentage of the window consumed, clamped to `0.0..=100.0`.
@@ -337,15 +341,10 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
     match name {
         "Claude" => probe_claude(),
         "Codex" => probe_codex(search_path),
-        // `agy` keeps its OAuth credentials in its own keyring ACL, and Google's Antigravity
-        // Terms disallow third-party extraction or polling of consumer quota endpoints;
-        // `agy acp` still reports per-run token usage to the Postil ledger below.
-        "Gemini" => QuotaReport::unavailable(
-            "Live quota is only shown inside agy (/usage) — see Postil activity below",
-        ),
+        "Antigravity" => probe_antigravity(search_path),
         "Grok" => probe_grok(search_path),
         "OpenCode" => QuotaReport::unavailable(
-            "OpenCode routes across multiple providers — see Postil activity below",
+            "OpenCode routes across multiple providers — see activity below",
         ),
         _ => QuotaReport::unavailable("No provider quota source"),
     }
@@ -506,14 +505,14 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
         return QuotaReport::error("unreadable reply from Claude usage endpoint");
     };
     let mut windows = Vec::new();
-    let specs: [(&str, &str, Option<&str>); 5] = [
-        ("five_hour", "5-hour session", None),
-        ("seven_day", "7-day all models", None),
-        ("seven_day_sonnet", "7-day Sonnet", Some("sonnet")),
-        ("seven_day_opus", "7-day Opus", Some("opus")),
-        ("seven_day_oauth_apps", "7-day OAuth apps", None),
+    let specs: [(&str, &str, Option<&str>, Option<&str>); 5] = [
+        ("five_hour", "5-hour session", Some("5h"), None),
+        ("seven_day", "7-day all models", Some("wk"), None),
+        ("seven_day_sonnet", "7-day Sonnet", None, Some("sonnet")),
+        ("seven_day_opus", "7-day Opus", None, Some("opus")),
+        ("seven_day_oauth_apps", "7-day OAuth apps", None, None),
     ];
-    for (key, label, model) in specs {
+    for (key, label, short_label, model) in specs {
         let Some(bucket) = json.get(key).filter(|val| val.is_object()) else {
             continue;
         };
@@ -526,6 +525,7 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
             .and_then(parse_rfc3339_secs);
         windows.push(QuotaWindow {
             label: label.to_owned(),
+            short_label: short_label.map(str::to_owned),
             model: model.map(str::to_owned),
             used_percent: clamp_percent(utilization),
             resets_at,
@@ -819,7 +819,11 @@ fn parse_codex_quota(account: Option<&Value>, limits: Option<&Value>) -> QuotaRe
 }
 
 fn collect_codex_bucket(bucket: &Value, model: Option<&str>, out: &mut Vec<QuotaWindow>) {
-    for (field, fallback_label) in [("primary", "5-hour window"), ("secondary", "7-day window")] {
+    let slots = [
+        ("primary", "5-hour window", "5h"),
+        ("secondary", "7-day window", "wk"),
+    ];
+    for (field, fallback_label, fallback_short) in slots {
         let Some(win) = bucket.get(field).filter(|v| v.is_object()) else {
             continue;
         };
@@ -838,11 +842,20 @@ fn collect_codex_bucket(bucket: &Value, model: Option<&str>, out: &mut Vec<Quota
             .get("windowDurationMins")
             .or_else(|| win.get("window_minutes"))
             .and_then(Value::as_u64);
-        let window_name = match mins {
-            Some(m) if m >= 60 * 24 => format!("{}-day window", m / (60 * 24)),
-            Some(m) if m >= 60 => format!("{}-hour window", m / 60),
-            Some(m) if m > 0 => format!("{m}-min window"),
-            _ => fallback_label.to_owned(),
+        let (window_name, short_code) = match mins {
+            Some(m) if (60 * 24 * 6..=60 * 24 * 8).contains(&m) => {
+                (format!("{}-day window", m / (60 * 24)), "wk".to_owned())
+            }
+            Some(m) if m >= 60 * 24 => {
+                let days = m / (60 * 24);
+                (format!("{days}-day window"), format!("{days}d"))
+            }
+            Some(m) if m >= 60 => {
+                let hours = m / 60;
+                (format!("{hours}-hour window"), format!("{hours}h"))
+            }
+            Some(m) if m > 0 => (format!("{m}-min window"), format!("{m}m")),
+            _ => (fallback_label.to_owned(), fallback_short.to_owned()),
         };
         let label = match model {
             Some(name) => format!("{name} ({window_name})"),
@@ -850,6 +863,7 @@ fn collect_codex_bucket(bucket: &Value, model: Option<&str>, out: &mut Vec<Quota
         };
         out.push(QuotaWindow {
             label,
+            short_label: model.is_none().then_some(short_code),
             model: model.map(str::to_owned),
             used_percent: clamp_percent(used),
             resets_at,
@@ -884,6 +898,233 @@ fn parse_codex_credits(bucket: &Value) -> Option<CreditInfo> {
         currency: None,
         unlimited,
     })
+}
+
+fn probe_antigravity(search_path: &OsStr) -> QuotaReport {
+    let Some(program) = agents::find_program("agy", search_path) else {
+        return QuotaReport::unavailable("Antigravity CLI (`agy`) not found on PATH");
+    };
+    let cwd = std::env::temp_dir().join("postil-quota");
+    if let Err(error) = fs::create_dir_all(&cwd) {
+        return QuotaReport::error(format!("cannot make the folder {}: {error}", cwd.display()));
+    }
+    let output = match run_timed(
+        Command::new(&program)
+            .args([
+                "-p",
+                "/usage",
+                "--output-format",
+                "json",
+                "--print-timeout",
+                "12s",
+            ])
+            .current_dir(&cwd)
+            .env("PATH", search_path)
+            .stdin(Stdio::null()),
+        None,
+        PROBE_TIMEOUT,
+    ) {
+        Ok(output) => output,
+        Err(message) => return QuotaReport::error(message),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_antigravity_quota(&stdout, output.status.success())
+}
+
+fn parse_antigravity_quota(stdout: &str, exit_ok: bool) -> QuotaReport {
+    let Some(json) = extract_antigravity_json(stdout) else {
+        return if exit_ok {
+            QuotaReport::error("unreadable reply from agy /usage")
+        } else {
+            QuotaReport::unavailable("Not signed in — run `agy login` in a terminal")
+        };
+    };
+
+    if let Some(report) = antigravity_error_report(&json) {
+        return report;
+    }
+
+    let groups = json
+        .get("command")
+        .and_then(|cmd| cmd.get("data"))
+        .or_else(|| json.get("data"))
+        .and_then(|data| data.get("groups"))
+        .and_then(Value::as_array);
+    let mut windows = Vec::new();
+    if let Some(groups) = groups {
+        let has_gemini = groups.iter().any(|group| {
+            group
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("Gemini Models"))
+        });
+        for (idx, group) in groups.iter().enumerate() {
+            let name = group.get("name").and_then(Value::as_str).unwrap_or("");
+            let is_primary =
+                name.eq_ignore_ascii_case("Gemini Models") || (!has_gemini && idx == 0);
+            collect_antigravity_group(group, is_primary, &mut windows);
+        }
+    }
+
+    if windows.is_empty() {
+        let message = if exit_ok {
+            "Antigravity reported no active quota windows"
+        } else {
+            "Not signed in — run `agy login` in a terminal"
+        };
+        return QuotaReport::unavailable(message);
+    }
+    QuotaReport {
+        status: QuotaStatus::Ok,
+        plan: None,
+        windows,
+        credits: None,
+        message: None,
+        fetched_at: Some(now_secs()),
+    }
+}
+
+fn extract_antigravity_json(stdout: &str) -> Option<Value> {
+    let trimmed = stdout.trim();
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+        && val.is_object()
+    {
+        return Some(val);
+    }
+    // Handle JSONL streams or trailing warning lines by scanning from the last object line.
+    if let Some(val) = trimmed
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|val| {
+            val.is_object()
+                && ["command", "status", "error", "data"]
+                    .iter()
+                    .any(|key| val.get(*key).is_some())
+        })
+    {
+        return Some(val);
+    }
+    // Fallback for multi-line pretty JSON preceded by startup banner lines.
+    trimmed
+        .rmatch_indices("\n{")
+        .find_map(|(idx, _)| serde_json::from_str::<Value>(&trimmed[idx + 1..]).ok())
+        .filter(Value::is_object)
+}
+
+fn antigravity_error_report(json: &Value) -> Option<QuotaReport> {
+    let status = json.get("status").and_then(Value::as_str);
+    let failed_status = status.is_some_and(|s| !s.eq_ignore_ascii_case("SUCCESS"));
+    let err_val = json
+        .get("error")
+        .or_else(|| json.get("command").and_then(|c| c.get("error")))
+        .filter(|v| !v.is_null());
+    if !failed_status && err_val.is_none() {
+        return None;
+    }
+    let message = err_val
+        .and_then(|err| {
+            err.as_str()
+                .or_else(|| err.get("message").and_then(Value::as_str))
+        })
+        .or_else(|| json.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(msg) = message else {
+        return Some(QuotaReport::unavailable(
+            "Not signed in — run `agy login` in a terminal",
+        ));
+    };
+    let lower = msg.to_ascii_lowercase();
+    let auth_issue = ["login", "sign in", "signed in", "auth", "credential"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let bounded = bounded_provider_text(msg);
+    Some(if auth_issue {
+        QuotaReport::unavailable(bounded)
+    } else {
+        QuotaReport::error(bounded)
+    })
+}
+
+fn collect_antigravity_group(group: &Value, is_primary: bool, out: &mut Vec<QuotaWindow>) {
+    let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
+        return;
+    };
+    let raw_group = group
+        .get("name")
+        .and_then(Value::as_str)
+        .map_or("", str::trim);
+    let (prefix, model) = if raw_group.is_empty() || raw_group.eq_ignore_ascii_case("Gemini Models")
+    {
+        ("Gemini models".to_owned(), None)
+    } else if raw_group.eq_ignore_ascii_case("Claude and GPT models") {
+        ("Claude & GPT".to_owned(), Some("claude-gpt".to_owned()))
+    } else {
+        let name = bounded_provider_text(raw_group);
+        (name.clone(), Some(name))
+    };
+
+    let mut group_windows: Vec<(u8, QuotaWindow)> = Vec::new();
+    for bucket in buckets {
+        let used = ["remaining_fraction", "remainingFraction"]
+            .into_iter()
+            .find_map(|key| bucket.get(key).and_then(Value::as_f64))
+            .filter(|val| val.is_finite())
+            .map(|rem| (1.0 - rem) * 100.0)
+            .or_else(|| {
+                ["used_percent", "usedPercent"]
+                    .into_iter()
+                    .find_map(|key| bucket.get(key).and_then(Value::as_f64))
+                    .filter(|val| val.is_finite())
+            });
+        let Some(used) = used else {
+            continue;
+        };
+        let (suffix, short, rank) = antigravity_window_labels(
+            bucket.get("window").and_then(Value::as_str),
+            bucket.get("name").and_then(Value::as_str),
+        );
+        // Unused buckets report `"1970-01-01T00:00:00Z"` (epoch 0), which means no timer has
+        // started yet rather than an imminent reset.
+        let resets_at = ["reset_time", "resetTime", "resets_at", "resetsAt"]
+            .into_iter()
+            .find_map(|key| bucket.get(key).and_then(Value::as_str))
+            .and_then(parse_rfc3339_secs)
+            .filter(|&ts| ts > 0);
+        group_windows.push((
+            rank,
+            QuotaWindow {
+                label: format!("{prefix} ({suffix})"),
+                short_label: is_primary.then_some(short).flatten().map(str::to_owned),
+                model: model.clone(),
+                used_percent: clamp_percent(used),
+                resets_at,
+                detail: None,
+            },
+        ));
+    }
+    group_windows.sort_by_key(|(rank, _)| *rank);
+    out.extend(group_windows.into_iter().map(|(_, win)| win));
+}
+
+fn antigravity_window_labels(
+    window: Option<&str>,
+    name: Option<&str>,
+) -> (String, Option<&'static str>, u8) {
+    match window.map(str::trim) {
+        Some("5h") => ("5h".to_owned(), Some("5h"), 0),
+        Some("daily" | "1d" | "24h") => ("24h".to_owned(), Some("1d"), 1),
+        Some("weekly") => ("weekly".to_owned(), Some("wk"), 2),
+        Some("monthly") => ("monthly".to_owned(), Some("mo"), 3),
+        other => {
+            let fallback = other
+                .filter(|s| !s.is_empty())
+                .or_else(|| name.map(str::trim).filter(|s| !s.is_empty()))
+                .unwrap_or("quota");
+            (bounded_provider_text(fallback), None, 4)
+        }
+    }
 }
 
 fn probe_grok(search_path: &OsStr) -> QuotaReport {
@@ -990,14 +1231,15 @@ fn parse_grok_quota(billing: Option<&Value>, has_api_key: bool) -> QuotaReport {
             let period = ["currentPeriod", "current_period"]
                 .into_iter()
                 .find_map(|key| config.get(key).filter(|v| v.is_object()));
-            let label =
-                grok_period_label(period.and_then(|p| p.get("type")).and_then(Value::as_str));
+            let (label, short_label) =
+                grok_period_labels(period.and_then(|p| p.get("type")).and_then(Value::as_str));
             let resets_at = period
                 .and_then(|p| p.get("end").and_then(Value::as_str))
                 .or_else(|| config.get("billingPeriodEnd").and_then(Value::as_str))
                 .and_then(parse_rfc3339_secs);
             windows.push(QuotaWindow {
                 label: label.to_owned(),
+                short_label: Some(short_label.to_owned()),
                 model: None,
                 used_percent: clamp_percent(used),
                 resets_at,
@@ -1028,12 +1270,12 @@ fn parse_grok_quota(billing: Option<&Value>, has_api_key: bool) -> QuotaReport {
     }
 }
 
-fn grok_period_label(period_type: Option<&str>) -> &'static str {
+fn grok_period_labels(period_type: Option<&str>) -> (&'static str, &'static str) {
     match period_type {
-        Some("USAGE_PERIOD_TYPE_DAILY") => "Daily window",
-        Some("USAGE_PERIOD_TYPE_WEEKLY") => "Weekly window",
-        Some("USAGE_PERIOD_TYPE_MONTHLY") => "Monthly window",
-        _ => "Usage window",
+        Some("USAGE_PERIOD_TYPE_DAILY") => ("Daily window", "1d"),
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => ("Weekly window", "wk"),
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => ("Monthly window", "mo"),
+        _ => ("Usage window", "lim"),
     }
 }
 
@@ -1260,7 +1502,7 @@ fn title_case(text: &str) -> String {
 
 /// Parses an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS(.frac)?(Z|[+-]HH:MM)`) into Unix
 /// seconds. Returns `None` on invalid input or dates before 1970-01-01.
-fn parse_rfc3339_secs(input: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_secs(input: &str) -> Option<u64> {
     let bytes = input.as_bytes();
     if bytes.len() < 20
         || bytes[4] != b'-'
@@ -2020,7 +2262,7 @@ mod tests {
             report.plan.unwrap().chars().count(),
             MAX_PROVIDER_TEXT_CHARS + 1
         );
-        assert_eq!(grok_period_label(Some("OTHER")), "Usage window");
+        assert_eq!(grok_period_labels(Some("OTHER")), ("Usage window", "lim"));
 
         // Empty windows/credits matrix over (plan, has_api_key).
         let empty_no_plan = serde_json::json!({ "result": { "config": {} } });
@@ -2062,11 +2304,9 @@ mod tests {
             probe_agent("Grok", empty).message.as_deref(),
             Some("Grok CLI not found on PATH")
         );
-        assert!(
-            probe_agent("Gemini", empty)
-                .message
-                .unwrap()
-                .contains("agy")
+        assert_eq!(
+            probe_agent("Antigravity", empty).message.as_deref(),
+            Some("Antigravity CLI (`agy`) not found on PATH")
         );
         assert!(
             probe_agent("OpenCode", empty)
@@ -2078,6 +2318,141 @@ mod tests {
             probe_agent("Other", empty).message.as_deref(),
             Some("No provider quota source")
         );
+    }
+
+    #[test]
+    fn parses_antigravity_usage_groups_orders_5h_before_weekly_and_skips_epoch_zero() {
+        let json = r#"{
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {
+                                    "id": "gemini-weekly",
+                                    "name": "Weekly Limit Remaining",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.8081,
+                                    "reset_time": "2026-12-03T07:10:47Z"
+                                },
+                                {
+                                    "id": "gemini-5h",
+                                    "name": "Five Hour Limit Remaining",
+                                    "window": "5h",
+                                    "remaining_fraction": 0.6469,
+                                    "reset_time": "2026-11-26T17:10:47Z"
+                                }
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {
+                                    "id": "3p-weekly",
+                                    "name": "Weekly Limit Remaining",
+                                    "window": "weekly",
+                                    "remaining_fraction": 1,
+                                    "reset_time": "1970-01-01T00:00:00Z"
+                                },
+                                {
+                                    "id": "3p-5h",
+                                    "name": "Five Hour Limit Remaining",
+                                    "window": "5h",
+                                    "remaining_fraction": 1,
+                                    "reset_time": "1970-01-01T00:00:00Z"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let report = parse_antigravity_quota(json, true);
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.windows.len(), 4);
+
+        assert_eq!(report.windows[0].label, "Gemini models (5h)");
+        assert_eq!(report.windows[0].short_label.as_deref(), Some("5h"));
+        assert!(report.windows[0].model.is_none());
+        assert!((report.windows[0].used_percent - 35.3).abs() < 1e-6);
+        assert!(report.windows[0].resets_at.is_some());
+
+        assert_eq!(report.windows[1].label, "Gemini models (weekly)");
+        assert_eq!(report.windows[1].short_label.as_deref(), Some("wk"));
+        assert!((report.windows[1].used_percent - 19.2).abs() < 1e-6);
+        assert!(report.windows[1].resets_at.is_some());
+
+        assert_eq!(report.windows[2].label, "Claude & GPT (5h)");
+        assert!(report.windows[2].short_label.is_none());
+        assert_eq!(report.windows[2].model.as_deref(), Some("claude-gpt"));
+        assert!((report.windows[2].used_percent).abs() < 1e-6);
+        assert!(
+            report.windows[2].resets_at.is_none(),
+            "epoch 0 means no reset timer started yet"
+        );
+
+        assert_eq!(report.windows[3].label, "Claude & GPT (weekly)");
+        assert!(report.windows[3].short_label.is_none());
+        assert!(report.windows[3].resets_at.is_none());
+    }
+
+    #[test]
+    fn probe_antigravity_runs_agy_usage_json_and_handles_auth_and_error_states() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("agy-usage");
+        let script = dir.path().join("agy");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" != \"-p\" ] || [ \"$2\" != \"/usage\" ] || ",
+                "[ \"$3\" != \"--output-format\" ] || [ \"$4\" != \"json\" ]; then exit 2; fi\n",
+                "printf 'banner line\\n{\"status\":\"SUCCESS\",\"command\":{\"data\":{\"groups\":",
+                "[{\"name\":\"Gemini Models\",\"buckets\":[{\"window\":\"5h\",",
+                "\"remaining_fraction\":0.75,\"reset_time\":\"2026-11-26T18:00:00Z\"}]}]}}}\\n'\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = probe_antigravity(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].short_label.as_deref(), Some("5h"));
+        assert!((report.windows[0].used_percent - 25.0).abs() < 1e-6);
+
+        let unauth = parse_antigravity_quota(
+            r#"{"status":"ERROR","error":{"message":"Not signed in: run agy login"}}"#,
+            false,
+        );
+        assert_eq!(unauth.status, QuotaStatus::Unavailable);
+        assert!(unauth.message.unwrap().contains("agy login"));
+
+        let server_err =
+            parse_antigravity_quota(r#"{"status":"ERROR","message":"backend down"}"#, false);
+        assert_eq!(server_err.status, QuotaStatus::Error);
+        assert_eq!(server_err.message.as_deref(), Some("backend down"));
+
+        let unreadable_fail = parse_antigravity_quota("", false);
+        assert_eq!(unreadable_fail.status, QuotaStatus::Unavailable);
+        let unreadable_ok = parse_antigravity_quota("not json", true);
+        assert_eq!(unreadable_ok.status, QuotaStatus::Error);
+
+        // JSONL stream with an init event before the usage reply and trailing warning text.
+        let jsonl = concat!(
+            r#"{"type":"init","session":"s1"}"#,
+            "\n",
+            r#"{"status":"SUCCESS","command":{"data":{"groups":[{"name":"Gemini Models","buckets":[{"window":"weekly","remaining_fraction":0.5}]}]}}}"#,
+            "\ntrailing cleanup note\n",
+        );
+        let from_jsonl = parse_antigravity_quota(jsonl, true);
+        assert_eq!(from_jsonl.status, QuotaStatus::Ok);
+        assert!((from_jsonl.windows[0].used_percent - 50.0).abs() < 1e-6);
     }
 
     #[test]

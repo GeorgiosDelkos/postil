@@ -14,8 +14,8 @@
 //!   refused.
 //! - `POST /new-fresh` makes a site the same way, but it opens no project, has no
 //!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
-//!   startup wizard open. `POST /new-fresh-gemini` does the same with an `agy` program on
-//!   the search path, so the wizard finds the built-in Gemini agent installed.
+//!   startup wizard open. `POST /new-fresh-antigravity` does the same with an `agy` program on
+//!   the search path, so the wizard finds the built-in Antigravity agent installed.
 //! - `POST /new-opencode` opens a project as `POST /new` does, with the built-in OpenCode
 //!   agent installed (an `opencode` program that runs the fake agent) as the agent and the
 //!   reviewer, and the custom Fake agent turned on beside it: the agents' logos show on
@@ -127,7 +127,7 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
             Some(Start::FakeAgent(scenario.to_owned()))
         }
         "/new-fresh" => Some(Start::FirstRun),
-        "/new-fresh-gemini" => Some(Start::FirstRunWithGemini),
+        "/new-fresh-antigravity" => Some(Start::FirstRunWithAntigravity),
         "/new-opencode" => {
             let asked: serde_json::Value =
                 serde_json::from_slice(request.body()).unwrap_or_default();
@@ -186,9 +186,9 @@ enum Start {
     /// No project, no `settings.json` and an empty search path, as on a first launch: the
     /// page shows the welcome screen with the startup wizard over it.
     FirstRun,
-    /// As [`Start::FirstRun`], with an `agy` program (Gemini's) on the search path, so the wizard
-    /// finds one built-in agent installed.
-    FirstRunWithGemini,
+    /// As [`Start::FirstRun`], with an `agy` program (Antigravity's) on the search path, so the
+    /// wizard finds one built-in agent installed.
+    FirstRunWithAntigravity,
     /// The repository open as the project, with the built-in OpenCode agent installed, chosen
     /// and reviewing, played by the fake agent in this scenario, and the custom Fake agent
     /// (`plain`) turned on.
@@ -225,7 +225,7 @@ fn bridged(number: usize, start: Start) -> Bridged {
             no_agents(),
             notify,
         ),
-        Start::FirstRunWithGemini => {
+        Start::FirstRunWithAntigravity => {
             // An empty script: the wizard asks it for its models, and it exits at once, so the
             // model select offers only the agent's default.
             let bin = repo.root.join(".git/test-bin");

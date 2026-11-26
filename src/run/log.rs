@@ -825,6 +825,7 @@ impl Run {
             context_size: state.usage.context_size,
             cost: state.usage.turn_cost(),
             tool_calls: state.kinds.len() as u64,
+            secondary_model: false,
         })
     }
 

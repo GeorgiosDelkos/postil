@@ -744,7 +744,7 @@ test("the startup wizard opens on first launch, saves settings, and stays closed
 });
 
 test("Skip on the first run saves the defaults with the installed agents turned on", async (t) => {
-  const created = await fetch(new URL("new-fresh-gemini", bridge), { method: "POST" });
+  const created = await fetch(new URL("new-fresh-antigravity", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);
   const page = await browser.newPage();
   t.after(() => page.close());
@@ -753,19 +753,19 @@ test("Skip on the first run saves the defaults with the installed agents turned 
   await page.goto(site.href);
 
   const wizard = page.locator("#wizard");
-  await wizard.getByRole("switch", { name: /Gemini/ }).waitFor();
+  await wizard.getByRole("switch", { name: /Antigravity/ }).waitFor();
 
   // Each row's mark says where the agent stands; a missing agent's row is dimmed.
   const row = (name) =>
     wizard.locator(".agent-row").filter({ has: page.getByRole("switch", { name }) });
   const mark = (name) => row(name).locator(".agent-mark");
-  assert.equal(await mark("Gemini").getAttribute("aria-label"), "Installed");
+  assert.equal(await mark("Antigravity").getAttribute("aria-label"), "Installed");
   assert.equal(await mark("OpenCode").getAttribute("aria-label"), "Not installed");
   const opacity = (name) =>
     row(name)
       .locator(".agent-text")
       .evaluate((node) => Number(getComputedStyle(node).opacity));
-  assert.equal(await opacity("Gemini"), 1);
+  assert.equal(await opacity("Antigravity"), 1);
   assert.ok((await opacity("OpenCode")) < 1, "a missing agent's row is dimmed");
   // OpenCode's logo refers to a symbol the page loaded from agent-logos.svg.
   const logo = row("OpenCode").locator("svg.agent-logo");
@@ -777,8 +777,8 @@ test("Skip on the first run saves the defaults with the installed agents turned 
 
   const saved = await (await fetch(new URL("api/settings", site))).json();
   assert.equal(saved.firstRun, false);
-  assert.deepEqual(saved.settings.enabledAgents, ["Gemini"]);
-  assert.deepEqual(saved.settings.agent, { name: "Gemini", model: null });
+  assert.deepEqual(saved.settings.enabledAgents, ["Antigravity"]);
+  assert.deepEqual(saved.settings.agent, { name: "Antigravity", model: null });
   assert.equal(saved.settings.theme, "system");
 });
 

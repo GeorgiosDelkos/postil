@@ -28,6 +28,7 @@ fn usage_lists_installed_built_in_agents_with_live_quotas_and_refresh() {
             plan: Some(if name == "Claude" { "Max" } else { "Plus" }.to_owned()),
             windows: vec![QuotaWindow {
                 label: "5-hour window".to_owned(),
+                short_label: Some("5h".to_owned()),
                 model: None,
                 used_percent: if name == "Claude" { 42.0 } else { 15.0 },
                 resets_at: Some(1_800_000_000),
@@ -374,4 +375,108 @@ fn usage_lists_an_agent_only_when_it_is_installed_or_has_history() {
     // The runs started in 1970: the last 24 hours, counted back from the clock, have none.
     let body = get_json(&site, "postil://localhost/api/usage?scope=all&range=24h");
     assert_eq!(body["summary"]["runs"], 0, "{body}");
+}
+
+#[test]
+fn usage_combines_postil_ledger_with_local_cli_transcripts_without_double_counting() {
+    use crate::usage::scanner::SessionScanner;
+
+    let repo = TempRepo::new("usage-cli-scan");
+    let fake_home = crate::testing::TempDir::new("usage-fake-home");
+    let now = crate::usage::now_secs();
+
+    // 1. A Postil ledger record on this repo.
+    let config = repo.config();
+    fs::create_dir_all(&config).unwrap();
+    let repo_root = repo.root.to_string_lossy().into_owned();
+    let ledger_line = serde_json::json!({
+        "version": 1,
+        "runId": "R1",
+        "repo": repo_root,
+        "agent": "Antigravity",
+        "model": "gemini-4-carbon",
+        "origin": "notes",
+        "outcome": "ended",
+        "startedAt": now - 60,
+        "endedAt": now - 40,
+        "inputTokens": 1000,
+        "outputTokens": 200,
+        "totalTokens": 1200,
+    });
+    fs::write(config.join("usage.jsonl"), format!("{ledger_line}\n")).unwrap();
+
+    // 2. An external Antigravity CLI transcript on a subdirectory of the same repo, plus one
+    //    inside `~/.postil` that must be ignored because Postil already recorded it.
+    let agy_ext = fake_home
+        .path()
+        .join(".gemini/antigravity-cli/brain/ext-1/.system_generated/logs");
+    fs::create_dir_all(&agy_ext).unwrap();
+    fs::write(
+        agy_ext.join("transcript.jsonl"),
+        format!(
+            concat!(
+                r#"{{"type":"USER_INPUT","content":"Command Working Directory: {}/src\n"}}"#,
+                "\n",
+                r#"{{"type":"PLANNER_RESPONSE","model":"gemini-4-carbon","input_tokens":500,"output_tokens":100,"tool_calls":[{{"id":"t1"}}]}}"#,
+                "\n",
+            ),
+            repo.root.display()
+        ),
+    )
+    .unwrap();
+
+    let agy_dup = fake_home
+        .path()
+        .join(".gemini/antigravity-cli/brain/dup-1/.system_generated/logs");
+    fs::create_dir_all(&agy_dup).unwrap();
+    fs::write(
+        agy_dup.join("transcript.jsonl"),
+        format!(
+            concat!(
+                r#"{{"type":"USER_INPUT","content":"Command Working Directory: {}\n"}}"#,
+                "\n",
+                r#"{{"type":"PLANNER_RESPONSE","model":"gemini-4-carbon","input_tokens":9000,"output_tokens":900}}"#,
+                "\n",
+            ),
+            fake_home.path().join(".postil/worktrees/R1").display()
+        ),
+    )
+    .unwrap();
+
+    let bin = repo.root.join(".git/fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    make_executable(&bin, "agy");
+    let search = OsString::from(&bin);
+    let scanner = Scanner::new(move || search.clone());
+    let _ = scanner.wait();
+
+    let site = Site::new(Some(&config), None, None, scanner, quiet())
+        .with_quota_poller(QuotaPoller::new(|_, _| QuotaReport::unavailable("stub")))
+        .with_session_scanner(SessionScanner::new(Some(fake_home.path().to_owned())));
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+
+    let first = get_json(
+        &site,
+        "postil://localhost/api/usage?scope=project&range=24h",
+    );
+    assert_eq!(first["polling"], true, "first call starts session scan");
+    site.sessions.join_scans();
+    site.quotas.join_probes();
+
+    let merged = get_json(
+        &site,
+        "postil://localhost/api/usage?scope=project&range=24h",
+    );
+    assert_eq!(merged["polling"], false);
+    assert_eq!(merged["summary"]["runs"], 2);
+    assert_eq!(merged["summary"]["totalTokens"], 1800);
+    let agy = merged["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "Antigravity")
+        .unwrap();
+    assert_eq!(agy["activity"]["runs"], 2);
+    assert_eq!(agy["activity"]["totalTokens"], 1800);
 }

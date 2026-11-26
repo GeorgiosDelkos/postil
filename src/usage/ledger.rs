@@ -109,7 +109,7 @@ pub(crate) enum RunOrigin {
 }
 
 /// One finished run recorded in `usage.jsonl`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LedgerRecord {
     pub(crate) version: u32,
@@ -134,6 +134,10 @@ pub(crate) struct LedgerRecord {
     pub(crate) cost: Option<UsageCost>,
     #[serde(default)]
     pub(crate) tool_calls: u64,
+    /// Additional per-model slice of a multi-model CLI session: contributes tokens, cost, and
+    /// its own model row without counting as a second session in overall or per-agent totals.
+    #[serde(skip)]
+    pub(crate) secondary_model: bool,
 }
 
 impl LedgerRecord {
@@ -182,12 +186,14 @@ pub(crate) struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, record: &LedgerRecord) {
-        self.runs += 1;
-        match record.outcome {
-            RunOutcome::Ended => self.ended += 1,
-            RunOutcome::Failed => self.failed += 1,
-            RunOutcome::Cancelled => {}
+    fn add(&mut self, record: &LedgerRecord, count_session: bool) {
+        if count_session {
+            self.runs += 1;
+            match record.outcome {
+                RunOutcome::Ended => self.ended += 1,
+                RunOutcome::Failed => self.failed += 1,
+                RunOutcome::Cancelled => {}
+            }
         }
         let add = |total: &mut u64, count: Option<u64>| {
             *total = total.saturating_add(count.unwrap_or(0));
@@ -204,11 +210,13 @@ impl Totals {
         );
         add(&mut self.thought_tokens, record.tokens.thought_tokens);
         add(&mut self.total_tokens, Some(record.total_tokens()));
-        add(
-            &mut self.duration_secs,
-            Some(record.ended_at.saturating_sub(record.started_at)),
-        );
-        add(&mut self.tool_calls, Some(record.tool_calls));
+        if count_session {
+            add(
+                &mut self.duration_secs,
+                Some(record.ended_at.saturating_sub(record.started_at)),
+            );
+            add(&mut self.tool_calls, Some(record.tool_calls));
+        }
         self.cost.add(record.cost.as_ref());
     }
 }
@@ -321,29 +329,69 @@ pub(crate) fn read(file: &Path) -> io::Result<Vec<LedgerRecord>> {
         .collect())
 }
 
+/// Maps legacy built-in agent names in `usage.jsonl` to their current catalog name when no
+/// custom agent claims the legacy name.
+pub(crate) fn canonical_agent_name(name: &str, remap_legacy_gemini: bool) -> &str {
+    if remap_legacy_gemini && name == "Gemini" {
+        "Antigravity"
+    } else {
+        name
+    }
+}
+
+/// Whether a record or CLI session at `session_repo` belongs inside `project_root`. Compares
+/// path components (treating macOS `/private/var` and `/private/tmp` aliases identically to
+/// `/var` and `/tmp`) so `/repo/sub` matches `/repo` while `/repo-other` does not.
+pub(crate) fn repo_matches_project(session_repo: &str, project_root: &str) -> bool {
+    if session_repo == project_root || Path::new(session_repo).starts_with(Path::new(project_root))
+    {
+        return true;
+    }
+    let norm_session = strip_macos_private(session_repo);
+    let norm_root = strip_macos_private(project_root);
+    Path::new(norm_session).starts_with(Path::new(norm_root))
+}
+
+pub(crate) fn strip_macos_private(path: &str) -> &str {
+    if path == "/private/var"
+        || path.starts_with("/private/var/")
+        || path == "/private/tmp"
+        || path.starts_with("/private/tmp/")
+    {
+        &path["/private".len()..]
+    } else {
+        path
+    }
+}
+
 /// Totals the `records` that started in `range` (relative to `now`), overall and per agent,
-/// then per model. `repo` keeps only that repository's records; `None` keeps every one.
-pub(crate) fn aggregate(
-    records: &[LedgerRecord],
+/// then per model. `repo` keeps only that repository's records (including subdirectories);
+/// `None` keeps every one.
+pub(crate) fn aggregate<'a>(
+    records: impl IntoIterator<Item = &'a LedgerRecord>,
     repo: Option<&str>,
     range: Range,
     now: u64,
+    remap_legacy_gemini: bool,
 ) -> (Totals, BTreeMap<String, AgentActivity>) {
     let cutoff = range.cutoff(now);
     let mut summary = Totals::default();
     let mut by_agent: BTreeMap<String, (Totals, BTreeMap<String, Totals>)> = BTreeMap::new();
 
-    let kept = records.iter().filter(|record| {
-        record.started_at >= cutoff && repo.is_none_or(|root| record.repo == root)
+    let kept = records.into_iter().filter(|record| {
+        record.started_at >= cutoff
+            && repo.is_none_or(|root| repo_matches_project(&record.repo, root))
     });
     for record in kept {
-        summary.add(record);
-        let (agent_totals, models) = by_agent.entry(record.agent.clone()).or_default();
-        agent_totals.add(record);
+        let count_session = !record.secondary_model;
+        summary.add(record, count_session);
+        let agent_name = canonical_agent_name(&record.agent, remap_legacy_gemini).to_owned();
+        let (agent_totals, models) = by_agent.entry(agent_name).or_default();
+        agent_totals.add(record, count_session);
         models
             .entry(record.model_label().to_owned())
             .or_default()
-            .add(record);
+            .add(record, true);
     }
 
     let activities = by_agent
@@ -397,6 +445,7 @@ mod tests {
             context_size: None,
             cost: None,
             tool_calls: 2,
+            secondary_model: false,
         }
     }
 
@@ -512,7 +561,7 @@ mod tests {
             .iter()
             .map(|&at| sample("R", "/a", "Claude", None, at))
             .collect();
-        let runs = |range| aggregate(&records, None, range, now).0.runs;
+        let runs = |range| aggregate(&records, None, range, now, true).0.runs;
         let parsed = |value| Range::parse(value).expect("a known range");
         assert_eq!(runs(parsed("24h")), 1);
         assert_eq!(runs(parsed("7d")), 3);
@@ -545,7 +594,7 @@ mod tests {
         })
         .collect();
 
-        let (summary, _) = aggregate(&records, None, Range::All, 2000);
+        let (summary, _) = aggregate(&records, None, Range::All, 2000, true);
         assert_eq!((summary.runs, summary.ended, summary.failed), (6, 2, 3));
         // Only the zero cost is valid: it still makes the total known, unlike no cost at all.
         let CostTotal::Same(total) = &summary.cost else {
@@ -611,7 +660,7 @@ mod tests {
             ),
         ];
 
-        let (summary, agents) = aggregate(&records, Some("/proj-a"), Range::SevenDays, now);
+        let (summary, agents) = aggregate(&records, Some("/proj-a"), Range::SevenDays, now, true);
         assert_eq!(summary.runs, 3);
         assert_eq!(summary.total_tokens, 990);
         assert_eq!(summary.cached_write_tokens, 5);
@@ -627,13 +676,36 @@ mod tests {
         assert_eq!(claude.models[1].model, "opus");
         assert_eq!(claude.models[1].totals.runs, 1);
 
-        let (all_day, day_agents) = aggregate(&records, None, Range::Day, now);
+        let (all_day, day_agents) = aggregate(&records, None, Range::Day, now, true);
         assert_eq!(all_day.runs, 3);
         assert!(day_agents.contains_key("Claude"));
         assert!(day_agents.contains_key("Codex"));
 
-        let (all_time, _) = aggregate(&records, None, Range::All, now);
+        let (all_time, _) = aggregate(&records, None, Range::All, now, true);
         assert_eq!(all_time.runs, 5);
+
+        // Subdirectory sessions match the project root, while sibling prefixes and legacy
+        // "Gemini" agent records normalize cleanly (unless a custom "Gemini" agent exists).
+        let sub_and_legacy = [
+            sample(
+                "R6",
+                "/proj-a/crates/core",
+                "Gemini",
+                Some("neon"),
+                now - 10,
+            ),
+            sample("R7", "/proj-ab", "Gemini", None, now - 10),
+        ];
+        let (sub_sum, sub_agents) =
+            aggregate(&sub_and_legacy, Some("/proj-a"), Range::Day, now, true);
+        assert_eq!(sub_sum.runs, 1);
+        assert!(sub_agents.contains_key("Antigravity"));
+        assert!(!sub_agents.contains_key("Gemini"));
+
+        let (_, custom_gemini) =
+            aggregate(&sub_and_legacy, Some("/proj-a"), Range::Day, now, false);
+        assert!(custom_gemini.contains_key("Gemini"));
+        assert!(!custom_gemini.contains_key("Antigravity"));
     }
 
     #[test]
@@ -644,7 +716,7 @@ mod tests {
             with_usage(sample("R1", "/a", "Claude", None, 1000), 1, 1, Some(0.5)),
             euros,
         ];
-        let (summary, _) = aggregate(&records, None, Range::All, 2000);
+        let (summary, _) = aggregate(&records, None, Range::All, 2000, true);
         assert!(matches!(summary.cost, CostTotal::Mixed));
         assert_eq!(
             serde_json::to_value(&summary).unwrap()["cost"],

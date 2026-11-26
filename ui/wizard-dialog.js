@@ -88,7 +88,7 @@ const PREVIEW_LINES = [
 
 export function wizardDialog(
   dialogEl,
-  { apply, onSaved, openFolder, canOpenFolder, openSettings },
+  { apply, onSaved, openFolder, canOpenFolder, openSettings, quotaBadge },
 ) {
   // The menu of agents that "+ Add reviewer" opens.
   const agentMenu = dialogMenu(dialogEl);
@@ -346,7 +346,7 @@ export function wizardDialog(
         el(
           "p",
           "wizard-callout",
-          "No built-in agents were found on your PATH. Install Claude, Codex, Gemini (agy), " +
+          "No built-in agents were found on your PATH. Install Claude, Codex, Antigravity (agy), " +
             "Grok, or OpenCode and click Rescan, add a custom ACP agent below, or continue and " +
             "set one up later in Settings (⌘,).",
         ),
@@ -463,6 +463,7 @@ export function wizardDialog(
     const reviewers = reviewerControls(ui.draft, models.models, {
       disabled: ui.saving,
       menu: agentMenu,
+      quotaBadge,
       onMove: (index, step) => {
         ui.focusNext = `${step < 0 ? "up" : "down"}-${index + step}`;
         updateDraft(moveReviewer(ui.draft, index, step).settings);

@@ -32,6 +32,7 @@ use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
     quota::{QuotaFetch, QuotaPoller, QuotaReport, QuotaStatus},
+    scanner::SessionScanner,
 };
 
 /// The page's files, served at these paths with these types: compiled into the binary as
@@ -75,6 +76,11 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/usage.js",
         "text/javascript",
         include_bytes!("../ui/usage.js"),
+    ),
+    (
+        "/usage-bar.js",
+        "text/javascript",
+        include_bytes!("../ui/usage-bar.js"),
     ),
     (
         "/usage-dialog.js",
@@ -241,11 +247,17 @@ pub(crate) fn start_site(
         Some(_) => Scanner::new(OsString::new),
         None => Scanner::new(agents::search_path),
     };
-    let home = std::env::var_os("HOME")
+    let user_home = std::env::var_os("HOME")
         // An empty HOME would put the worktrees in the current folder.
         .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".postil"));
-    let site = Site::new(config.as_deref(), home.as_deref(), bench, agents, notify);
+        .map(PathBuf::from);
+    let home = user_home.as_deref().map(|dir| dir.join(".postil"));
+    let sessions = match bench {
+        Some(_) => SessionScanner::disabled(),
+        None => SessionScanner::new(user_home),
+    };
+    let site = Site::new(config.as_deref(), home.as_deref(), bench, agents, notify)
+        .with_session_scanner(sessions);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
         site.open(repo, LiveRun::Stop)?;
     }
@@ -310,6 +322,8 @@ pub(crate) struct Site {
     agents: Scanner,
     /// On-demand background probes for live provider quotas (`usage/quota.rs`).
     quotas: QuotaPoller,
+    /// Read-only background scanner for local CLI session transcripts (`usage/scanner.rs`).
+    sessions: SessionScanner,
     /// On-demand background probes for the models each agent offers (`models.rs`).
     models: ModelProber,
     /// Tells the page a run changed (`run.rs`).
@@ -612,8 +626,14 @@ impl Site {
             models: ModelProber::live(agents.clone()),
             agents,
             quotas: QuotaPoller::live(),
+            sessions: SessionScanner::disabled(),
             notify,
         }
+    }
+
+    pub(crate) fn with_session_scanner(mut self, sessions: SessionScanner) -> Self {
+        self.sessions = sessions;
+        self
     }
 
     #[cfg(test)]
@@ -1347,11 +1367,23 @@ impl Site {
             })?,
             None => Vec::new(),
         };
+        let settings = self.current_settings();
+        let remap_legacy_gemini = !settings.custom_agents().iter().any(|agent| {
+            agent.name.eq_ignore_ascii_case("Gemini")
+                || agent.name.eq_ignore_ascii_case("Antigravity")
+        });
+        let (cli_records, scanning_sessions) = self.sessions.query(fetch);
         let only_repo = match scope {
             Scope::Project => project_root.as_deref(),
             Scope::All => None,
         };
-        let (summary, mut activities) = ledger::aggregate(&records, only_repo, range, now_secs());
+        let (summary, mut activities) = ledger::aggregate(
+            records.iter().chain(cli_records.iter()),
+            only_repo,
+            range,
+            now_secs(),
+            remap_legacy_gemini,
+        );
         let ledger_file = self
             .usage_file
             .as_ref()
@@ -1364,18 +1396,18 @@ impl Site {
                 project_name,
                 range,
                 scanning: true,
-                polling: false,
+                polling: scanning_sessions,
                 ledger_file,
                 summary,
                 agents: None,
             }));
         };
 
-        let settings = self.current_settings();
         let agents = self.usage_agents(&settings, &search_path, &mut activities, fetch);
-        let polling = agents
-            .iter()
-            .any(|agent| agent.quota.status == QuotaStatus::Loading);
+        let polling = scanning_sessions
+            || agents
+                .iter()
+                .any(|agent| agent.quota.status == QuotaStatus::Loading);
 
         Ok(to_json(&UsageView {
             scope,
@@ -1464,6 +1496,7 @@ impl std::fmt::Debug for Site {
             .field("usage_file", &self.usage_file)
             .field("agents", &self.agents)
             .field("quotas", &self.quotas)
+            .field("sessions", &self.sessions)
             .field("models", &self.models)
             .finish_non_exhaustive()
     }

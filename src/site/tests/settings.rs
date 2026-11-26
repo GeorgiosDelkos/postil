@@ -345,7 +345,14 @@ fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
         .collect();
     assert_eq!(
         names,
-        ["Claude", "Codex", "Gemini", "Grok", "OpenCode", "Local"]
+        [
+            "Claude",
+            "Codex",
+            "Antigravity",
+            "Grok",
+            "OpenCode",
+            "Local"
+        ]
     );
     let agent = |name: &str| {
         agents
@@ -469,12 +476,25 @@ fn a_model_id_with_a_stray_space_or_control_character_is_refused() {
 }
 
 #[test]
-fn gemini_is_found_as_agy_and_no_text_points_at_the_gemini_cli() {
+fn antigravity_is_found_as_agy_and_probed_via_agy_usage_and_acp() {
     let repo = TempRepo::new("settings-agy");
     let bin = repo.root.join(".git/test-bin");
     fs::create_dir_all(&bin).unwrap();
     let agy = bin.join("agy");
-    fs::write(&agy, "#!/bin/sh\n").unwrap();
+    fs::write(
+        &agy,
+        concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/usage\" ]; then\n",
+            "  printf '{\"status\":\"SUCCESS\",\"command\":{\"data\":{\"groups\":[",
+            "{\"name\":\"Gemini Models\",\"buckets\":[{\"window\":\"5h\",",
+            "\"remaining_fraction\":0.65,\"reset_time\":\"2026-11-26T18:00:00Z\"}]}]}}}\\n'\n",
+            "  exit 0\n",
+            "fi\n",
+            "exit 0\n",
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
     let search_path = bin.into_os_string();
     let site = Site::new(
@@ -486,15 +506,15 @@ fn gemini_is_found_as_agy_and_no_text_points_at_the_gemini_cli() {
     );
 
     let agents = scanned_settings(&site)["agents"].clone();
-    let gemini = agents
+    let antigravity = agents
         .as_array()
         .unwrap()
         .iter()
-        .find(|agent| agent["name"] == "Gemini")
+        .find(|agent| agent["name"] == "Antigravity")
         .unwrap()
         .clone();
-    assert_eq!(gemini["found"], agy.to_str().unwrap(), "{gemini}");
-    assert_eq!(gemini["command"], "agy acp");
+    assert_eq!(antigravity["found"], agy.to_str().unwrap(), "{antigravity}");
+    assert_eq!(antigravity["command"], "agy acp");
 
     let usage = |site: &Site| {
         let body = get_json(site, "postil://localhost/api/usage?scope=all");
@@ -502,24 +522,23 @@ fn gemini_is_found_as_agy_and_no_text_points_at_the_gemini_cli() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|agent| agent["name"] == "Gemini")
+            .find(|agent| agent["name"] == "Antigravity")
             .unwrap()["quota"]
             .clone()
     };
     assert_eq!(usage(&site)["status"], "loading");
     site.quotas.join_probes();
     let quota = usage(&site);
-    assert_eq!(quota["status"], "unavailable", "{quota}");
-    let message = quota["message"].as_str().unwrap();
-    assert!(message.contains("agy"), "{message}");
-    assert!(!message.contains("gemini"), "{message}");
+    assert_eq!(quota["status"], "ok", "{quota}");
+    assert_eq!(quota["windows"][0]["shortLabel"], "5h");
+    assert_eq!(quota["windows"][0]["usedPercent"], 35.0);
 
     // Installed, so it is started for its models: as `agy acp`, which here exits at once.
-    let body = models_body(&["Gemini"], &[]);
+    let body = models_body(&["Antigravity"], &[]);
     let (status, reply) = post(&site, MODELS, &body);
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert!(
-        reply.contains(r#""Gemini":{"status":"loading"}"#),
+        reply.contains(r#""Antigravity":{"status":"loading"}"#),
         "{reply}"
     );
     site.models.join_probes();

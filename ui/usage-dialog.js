@@ -30,7 +30,7 @@ function button(text, key, onClick, className = "button") {
   return node;
 }
 
-export function usageDialog(dialogEl, { openSettings, onTone }) {
+export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
   const ui = {
     scope: "project",
     range: "7d",
@@ -58,6 +58,7 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
     ui.error = null;
     ui.refreshing = false;
     onTone?.(highestQuotaTone(view.agents));
+    onView?.(view);
     clearTimeout(ui.pollTimer);
     if (dialogEl.open && (view.scanning || view.polling)) {
       ui.pollTimer = setTimeout(() => {
@@ -222,7 +223,7 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
       el(
         "p",
         "settings-hint",
-        "Install Claude, Codex, Gemini (agy), Grok, or OpenCode, or add a custom ACP agent in Settings.",
+        "Install Claude, Codex, Antigravity (agy), Grok, or OpenCode, or add a custom ACP agent in Settings.",
       ),
     );
     const actions = el("div", "settings-actions");
@@ -302,10 +303,10 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
     const scopeName =
       ui.view?.scope === "project" ? (ui.view.projectName ?? "This project") : "All projects";
     block.append(
-      el("div", "usage-sub-heading", `Postil activity · ${scopeName} · ${rangeLabel(ui.range)}`),
+      el("div", "usage-sub-heading", `Activity · ${scopeName} · ${rangeLabel(ui.range)}`),
     );
     if (!activity || activity.runs === 0) {
-      block.append(el("p", "usage-note", "No Postil runs in this period."));
+      block.append(el("p", "usage-note", "No runs recorded in this period."));
       return block;
     }
 
@@ -346,7 +347,7 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
     const hint = el(
       "span",
       "usage-footer-hint",
-      "Quotas are account-wide; activity reflects Postil runs.",
+      "Quotas are account-wide; activity combines Postil runs and local CLI sessions.",
     );
     if (ui.view?.ledgerFile) hint.title = ui.view.ledgerFile;
     const statusText = ui.error ?? updatedLabel(ui.view?.agents);

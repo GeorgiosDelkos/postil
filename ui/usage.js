@@ -140,3 +140,67 @@ export function tokenBreakdownTitle(row) {
   if (row.thoughtTokens > 0) parts.push(`Thought: ${row.thoughtTokens.toLocaleString()}`);
   return parts.join(" · ");
 }
+
+// Primary compact quota windows (`5h`, `wk`, `1d`, `mo`) for the sidebar strip and agent
+// picker menus. Falls back to the first two windows when none carries `shortLabel`.
+export function compactQuotaWindows(quota) {
+  if (quota?.status !== "ok" || !Array.isArray(quota.windows) || quota.windows.length === 0) {
+    return [];
+  }
+  const tagged = quota.windows.filter((win) => win.shortLabel);
+  const chosen = tagged.length > 0 ? tagged : quota.windows.slice(0, 2);
+  return chosen.map((win) => {
+    const usedPercent = Number.isFinite(win.usedPercent)
+      ? Math.max(0, Math.min(100, win.usedPercent))
+      : 0;
+    return {
+      label: win.shortLabel || inferShortLabel(win.label),
+      fullLabel: win.label,
+      usedPercent,
+      tone: quotaTone(usedPercent),
+      resetsAt: win.resetsAt ?? null,
+    };
+  });
+}
+
+function inferShortLabel(label) {
+  const lower = String(label ?? "").toLowerCase();
+  if (lower.includes("5h") || lower.includes("5-hour")) return "5h";
+  if (lower.includes("week") || lower.includes("7-day")) return "wk";
+  if (lower.includes("day") || lower.includes("daily") || lower.includes("24h")) return "1d";
+  if (lower.includes("month")) return "mo";
+  return "lim";
+}
+
+// Compact inline text for an agent's live quota: `5h 35% · wk 19%`, or credits when no window
+// is present.
+export function inlineQuotaText(quota) {
+  const compact = compactQuotaWindows(quota);
+  if (compact.length > 0) {
+    return compact.map((win) => `${win.label} ${formatPercent(win.usedPercent)}`).join(" · ");
+  }
+  if (quota?.status === "ok" && quota.credits) {
+    return formatCredits(quota.credits);
+  }
+  return "";
+}
+
+// The compact window with the highest utilization, used for single-meter menu badges.
+export function tightestQuotaWindow(quota) {
+  const compact = compactQuotaWindows(quota);
+  if (compact.length === 0) return null;
+  return compact.reduce((best, win) => (win.usedPercent > best.usedPercent ? win : best));
+}
+
+// Built-in agents to show in the sidebar quota strip and popover: enabled built-in agents when
+// any are enabled, else installed built-in agents.
+export function visibleQuotaAgents(agents, enabledNames) {
+  if (!Array.isArray(agents)) return [];
+  const enabledSet = new Set(Array.isArray(enabledNames) ? enabledNames : []);
+  const builtIns = agents.filter((agent) => agent.builtIn && agent.found);
+  if (enabledSet.size > 0) {
+    const enabledBuiltIns = builtIns.filter((agent) => enabledSet.has(agent.name));
+    if (enabledBuiltIns.length > 0) return enabledBuiltIns;
+  }
+  return builtIns;
+}
