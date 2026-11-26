@@ -2175,7 +2175,9 @@ button.repo-name:hover {
   text-align: left;
 }
 
-.run-card:hover,
+/* A button: a check the log never ran is a card that opens nothing. `:where` keeps the
+   specificity of `.run-card:hover`, so the tone rules after it still win. */
+:where(button).run-card:hover,
 .run-card:focus-visible {
   border-color: var(--border-strong);
   outline: none;
@@ -2362,6 +2364,18 @@ button.repo-name:hover {
 
 .tool-state.unfinished {
   color: var(--text-muted);
+}
+
+/* A check's state that the engineer should look at: claimed and not in the log, or passed
+   before an edit (`evidence` in ui/run.js). */
+.tool-state.not-seen,
+.tool-state.stale {
+  color: var(--attention);
+}
+
+/* The mark on a run's card for the worst of its claimed checks. */
+.run-evidence {
+  font-weight: 600;
 }
 
 .tool-diff,

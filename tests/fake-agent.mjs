@@ -281,6 +281,55 @@ async function prompt(id, params) {
       renameSync(`${process.cwd()}/c.txt`, `${process.cwd()}/d.txt`);
       writeFileSync(`${process.cwd()}/bin.dat`, Buffer.from([0, 1, 2, 255, 0, 7]));
       return send({ id, result: { stopReason: "end_turn" } });
+    case "report": {
+      // Edits a.txt and deletes b.txt for real, says what it did, and ends with the author's
+      // report (src/report.rs): steps on an edited file, on the deleted one (its lines name
+      // nothing left), on a path outside the repository, on the edited file by its absolute
+      // path with a rating Postil does not know, and on lines that are no range; a check, and
+      // one whose result is no claim.
+      writeFileSync(`${process.cwd()}/a.txt`, "a\nreported\n");
+      rmSync(`${process.cwd()}/b.txt`);
+      say("N1: done");
+      const report = {
+        steps: [
+          { path: "a.txt", lines: [1, 2], why: "the change", risk: "routine" },
+          { path: "b.txt", lines: [3, 4], why: "no longer used", risk: "mechanical" },
+          { path: "../x", lines: [1, 1], why: "outside", risk: "eyes" },
+          { path: `${process.cwd()}/a.txt`, lines: [2, 2], why: "absolute", risk: "weird" },
+          { path: "a.txt", lines: [0, 1], why: "no range", risk: "eyes" },
+        ],
+        checks: [
+          { command: "cargo test", result: "passed" },
+          { command: "cargo build", result: "maybe" },
+        ],
+      };
+      say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "evidence": {
+      // Two commands and a report that claims three checks (ui/run.js, `evidence`): one
+      // passed as claimed, one that exited non-zero as Grok ends it (completed) though the
+      // report says passed, and one the log never shows.
+      update({ sessionUpdate: "tool_call", toolCallId: "c1", title: "cargo test", kind: "execute", status: "completed", rawInput: { command: "cargo test" }, rawOutput: { exit_code: 0 } });
+      update({ sessionUpdate: "tool_call", toolCallId: "c2", title: "cargo clippy", kind: "execute", status: "completed", rawInput: { command: "cargo clippy" }, rawOutput: { exit_code: 101 } });
+      const checks = ["cargo test", "cargo clippy", "cargo doc"].map((command) => ({ command, result: "passed" }));
+      say(`N1: done\n\n\`\`\`json\n${JSON.stringify({ steps: [], checks })}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "report-bad":
+      // A json block that is an object, whose steps are not a list.
+      say('N1: done\n\n```json\n{"steps": "first a.txt"}\n```');
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "report-twice":
+      // A first report, text, a second report, and text after it: the second is the report.
+      say('```json\n{"checks": [{"command": "first", "result": "passed"}]}\n```\nThen I ran more.');
+      say('```json\n{"checks": [{"command": "second", "result": "failed"}]}\n```\nThat is all.');
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "report-cancel":
+      // A report written, then a turn that ends stopped: a stopped run reads no report.
+      say('```json\n{"checks": [{"command": "cargo test", "result": "passed"}]}\n```');
+      await onCancel;
+      return send({ id, result: { stopReason: "cancelled" } });
     case "checks": {
       // Execute calls in the shapes Claude's adapter 0.94.0 and Grok 1.0.92 sent on
       // 2026-11-25 through Postil's own connection. c1 as Claude's adapter: the kind only on

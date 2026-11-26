@@ -5,6 +5,10 @@ import {
   agentSaid,
   changedFiles,
   fileStats,
+  freshAgent,
+  replyShown,
+  reportNotice,
+  withoutReport,
   groupNotes,
   noteDialogKey,
   noteHistory,
@@ -374,4 +378,96 @@ test("the run dialog keeps its key while the agent streams its reply and thought
     "the reply shows",
   );
   assert.equal(replyText(streaming("R1", "ended", start)), "Done");
+});
+
+const fenced = (json) => "```json\n" + json + "\n```";
+const reportEntry = (report, problem = null) =>
+  report ? { kind: "report", report } : { kind: "noReport", problem };
+
+// The block as src/report.rs keeps it, closed in whichever way the agent closed it.
+const report = fenced('{"steps": [], "checks": []}');
+
+test("the report block the server read is left out of the reply, and only it", () => {
+  assert.equal(withoutReport(`N1: done\n\n${report}`, report), "N1: done", "block last");
+  // Spike S2 saw Grok go on working after its report in 3 of 10 runs.
+  assert.equal(
+    withoutReport(`N1: done\n\n${report}\nThen I ran the linter.`, report),
+    "N1: done\n\nThen I ran the linter.",
+    "text after the block stays",
+  );
+  // An example the agent showed before its report stays, whatever its shape.
+  const config = fenced('{"port": 80}');
+  assert.equal(
+    withoutReport(`Use this:\n\n${config}\n\n${report}`, report),
+    `Use this:\n\n${config}`,
+  );
+  assert.equal(withoutReport(`${report}\nAgain:\n${report}`, report), `${report}\nAgain:`);
+  // The server reads only a fence that starts a line: the same text repeated inside a line is
+  // prose, and stays.
+  assert.equal(
+    withoutReport(`N1: done\n\n${report}\n\nRepeated inline: ${report} end.`, report),
+    `N1: done\n\nRepeated inline: ${report} end.`,
+  );
+  const unclosed = '```json\n{"checks": []}';
+  assert.equal(
+    withoutReport(`Done.\n${unclosed}\nThen I ran ruff.`, unclosed),
+    "Done.\n\nThen I ran ruff.",
+    "a block never closed",
+  );
+  assert.equal(withoutReport("N1: done", report), "N1: done", "a reply that does not hold it");
+});
+
+test("the reply keeps its json block when the run has no report", () => {
+  const text = `Here is the config:\n\n${fenced('{"port": 80}')}`;
+  const ran = (entries) => streaming("R1", "ended", [said(text), ...entries]);
+  assert.equal(replyShown(ran([])), text, "a run from before reports");
+  assert.equal(replyShown(ran([reportEntry(null, "no steps and no checks")])), text);
+  const block = fenced('{"port": 80}');
+  const found = reportEntry({ steps: [], checks: [], cut: 0, block });
+  assert.equal(replyShown(ran([found])), "Here is the config:");
+});
+
+test("the run dialog says when the report is missing or partly left out", () => {
+  const ran = (entries) => streaming("R1", "ended", entries);
+  assert.equal(reportNotice(ran([])), null, "a run from before reports");
+  assert.equal(
+    reportNotice(ran([reportEntry(null, "the reply has no ```json block")])),
+    "No report from the agent: the reply has no ```json block",
+  );
+  assert.equal(reportNotice(ran([reportEntry({ steps: [], checks: [], cut: 0 })])), null);
+  assert.match(reportNotice(ran([reportEntry({ steps: [], checks: [], cut: 2 })])), /^2 parts/);
+});
+
+test("a report arriving redraws the run dialog, and note lines before it still count", () => {
+  const start = [said("N1: renamed it")];
+  const key = (entries) => threadKey([streaming("R1", "ended", entries)]);
+  const report = reportEntry({ steps: [], checks: [], cut: 0 });
+  assert.notEqual(key([...start, report]), key(start), "the report arrives");
+  const withBlock = [said(`N1: renamed it\n\n${fenced('{"steps": [{"why": "N1: not this"}]}')}`)];
+  assert.equal(agentSaid(streaming("R1", "ended", withBlock), "N1"), "renamed it");
+});
+
+test("a command that arrives after its call started redraws the run's Checks", () => {
+  // Claude's adapter names the command on an update, after the call (src/run/log.rs).
+  const report = reportEntry({
+    steps: [],
+    checks: [{ command: "cargo test", result: "passed" }],
+    cut: 0,
+    block: "",
+  });
+  const call = tool("c1", "execute", "Terminal");
+  const key = (entries) => threadKey([streaming("R1", "ended", [call, ...entries, report])]);
+  const named = { kind: "toolUpdate", id: "c1", command: "cargo test" };
+  assert.notEqual(key([named]), key([]), "the claim now matches the call");
+});
+
+test("a follow-up went to a fresh agent only when its prompt told the thread first", () => {
+  const turn = (prompt) => ({ prompt, followUp: { of: "R1", text: "and more" } });
+  assert.equal(freshAgent(turn("and more")), false, "a log from before the reminder");
+  assert.equal(freshAgent(turn("and more\n\nWhen you finish, end your reply…")), false);
+  assert.equal(
+    freshAgent(turn("You are continuing work another coding agent did…\n\nand more")),
+    true,
+  );
+  assert.equal(freshAgent(turn("and more, and then")), true, "words that only start alike");
 });
