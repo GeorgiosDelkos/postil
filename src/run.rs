@@ -81,6 +81,7 @@ use crate::run::log::{
     hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
 use crate::thread::{self, State, Thread};
+use crate::usage::ledger::LedgerSink;
 
 /// How long an agent may take to start, and then to open a session. Claude's adapter took
 /// 4.3 s to open a session with npx's cache warm (2026-11-23); a first `npx` run downloads
@@ -106,6 +107,8 @@ pub(crate) struct Runner {
     /// Postil's home folder, `~/.postil`, under which threads' worktrees live
     /// (`thread.rs`); `None` when the home folder is unknown, which refuses every send.
     home: Option<PathBuf>,
+    /// Durable global usage ledger (`<config dir>/usage.jsonl`), when configured.
+    usage_file: Option<PathBuf>,
     slots: Mutex<Slots>,
     /// What this window is doing about each thread's pull request, by thread id
     /// ([`pull::PullWork`]); a lock never held with another.
@@ -254,6 +257,13 @@ impl Slots {
     /// Whether any thread of this window is busy ([`Slot::busy`]).
     fn busy(&self) -> bool {
         self.by_thread.values().any(Slot::busy)
+    }
+
+    /// Whether `thread` holds a live ready agent matching `choice`.
+    fn has_live_agent(&self, thread: &str, choice: &AgentChoice) -> bool {
+        self.by_thread.get(thread).is_some_and(|slot| {
+            matches!(&slot.agent, Held::Ready(kept, live) if kept == choice && live.is_alive())
+        })
     }
 
     /// Before a fresh agent starts in `thread`, lets go of the agent of the idle slot used
@@ -409,6 +419,7 @@ impl Runner {
         agents: Scanner,
         notify: Notify,
         home: Option<PathBuf>,
+        usage_file: Option<PathBuf>,
     ) -> Arc<Self> {
         if let Some(home) = &home {
             // Finishes deleting the worktrees of threads that ended while the app last ran:
@@ -428,6 +439,7 @@ impl Runner {
             agents,
             notify,
             home,
+            usage_file,
             slots: Mutex::new(Slots::default()),
             pull_work: Mutex::default(),
             #[cfg(test)]
@@ -862,7 +874,12 @@ impl Runner {
             prompt: &prompt.text,
             origin,
         };
-        let run = Arc::new(Run::create(&self.repo.runs_dir(), opening, in_thread)?);
+        let run = Arc::new(Run::create(
+            &self.repo.runs_dir(),
+            opening,
+            in_thread,
+            self.usage_sink(),
+        )?);
         let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
@@ -880,12 +897,7 @@ impl Runner {
         // then made again on the start thread, which a reused agent would skip.
         let reuse = matches!(worktree, Worktree::Made)
             && matches!(conversation, Conversation::Kept)
-            && slots.by_thread.get(&id).is_some_and(|slot| {
-                matches!(
-                    &slot.agent,
-                    Held::Ready(choice, kept) if *choice == agent && kept.is_alive()
-                )
-            });
+            && slots.has_live_agent(&id, &agent);
         // A fresh agent may take the place of another thread's idle one.
         let evicted = if reuse {
             Held::None
@@ -902,10 +914,12 @@ impl Runner {
         slot.chain = review;
         let new_thread = matches!(worktree, Worktree::Make);
         slot.making = !matches!(worktree, Worktree::Made);
+        let prev_session_cost = reuse.then(|| slot.run.as_deref()?.session_cost()).flatten();
         slot.run = Some(Arc::clone(&run));
         slot.thread = thread.clone();
         slot.used = used;
         let replaced = if reuse && let Held::Ready(_, kept) = &slot.agent {
+            run.set_cost_baseline(prev_session_cost);
             begin(kept, &run, &marks, &prompt, &thread.path);
             Held::None
         } else {
@@ -1605,6 +1619,13 @@ impl Runner {
         lock(&self.slots)
     }
 
+    fn usage_sink(&self) -> Option<LedgerSink> {
+        self.usage_file.as_ref().map(|file| LedgerSink {
+            file: file.clone(),
+            repo: self.repo.root().to_string_lossy().into_owned(),
+        })
+    }
+
     /// Starts the agent on its own thread, then sends the prompt, unless the agent was let go
     /// meanwhile (the run cancelled, the project closed). A new thread's worktree is made
     /// there first ([`thread::make`]), which takes as long as a checkout.
@@ -1958,7 +1979,10 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
     };
     let ended_well = matches!(
         event,
-        Event::TurnEnded(TurnEnd::Stopped(StopReason::EndTurn))
+        Event::TurnEnded(TurnEnd::Stopped {
+            reason: StopReason::EndTurn,
+            ..
+        })
     );
     let ends_turn = matches!(event, Event::TurnEnded(_) | Event::Exited { .. });
     let (run, thread, released, answer, next) = {
@@ -2342,6 +2366,7 @@ fn edited_files(diffs: &[Diff]) -> Vec<String> {
 ///
 /// The prompt links files in `root`, the worktree the agent works in.
 fn begin(agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt, root: &Path) {
+    run.set_model(agent.model());
     if !ids.is_empty() {
         run.state().unmarked = Some(ids.to_vec());
     }

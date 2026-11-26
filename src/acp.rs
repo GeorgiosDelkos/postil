@@ -52,5 +52,5 @@ pub(crate) use crate::acp::connection::{
 };
 pub(crate) use crate::acp::wire::{
     ContentBlock, ElicitationReply, Location, PermissionKind, PermissionOption, PlanEntryStatus,
-    SessionUpdate, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
+    PromptUsage, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus, ToolKind, UsageCost,
 };

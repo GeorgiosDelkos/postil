@@ -228,7 +228,11 @@ fn bridged(number: usize, start: Start) -> Bridged {
         }
     };
     Bridged {
-        site,
+        // A stub quota source: a live one would read the developer's real credentials and
+        // call the providers with them from a test.
+        site: site.with_quota_poller(QuotaPoller::new(|_, _| {
+            QuotaReport::unavailable("e2e stub")
+        })),
         listeners,
         _repo: repo,
     }

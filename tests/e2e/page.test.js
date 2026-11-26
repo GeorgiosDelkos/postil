@@ -415,6 +415,24 @@ test("two threads run side by side, and each stops from its own dialog", async (
   await page.locator("#run-header .stop").waitFor({ state: "detached" });
 });
 
+test("Usage button opens the usage report, switches filters, and Refresh settles", async (t) => {
+  const { page } = await openProject(t);
+  await page.locator("#open-usage").click();
+  const dialog = page.locator("#usage");
+  await dialog.waitFor();
+
+  await dialog.locator(".usage-summary").waitFor();
+  await dialog.getByRole("radio", { name: "All projects" }).click();
+  await dialog.getByRole("radio", { name: "24h" }).click();
+  const refresh = dialog.getByRole("button", { name: "Refresh" });
+  await refresh.click();
+  // Even when the reply matches the previous view, Refresh must settle back to enabled.
+  await dialog.getByRole("button", { name: "Refresh", disabled: false }).waitFor();
+
+  await page.keyboard.press("Escape");
+  await dialog.waitFor({ state: "hidden" });
+});
+
 test("the startup wizard opens on first launch, saves settings, and stays closed on reload", async (t) => {
   const created = await fetch(new URL("new-fresh", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);

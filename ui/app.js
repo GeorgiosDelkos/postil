@@ -23,6 +23,7 @@ import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics } from "./settings.js";
 import { reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
+import { usageDialog } from "./usage-dialog.js";
 import { welcomeScreen } from "./welcome.js";
 import { wizardDialog } from "./wizard-dialog.js";
 
@@ -556,7 +557,8 @@ window.postil = {
     } else if (command === "setup-wizard") {
       settings.close();
       wizard.open();
-    } else if (command === "focus-mode") toggleFocus();
+    } else if (command === "usage") usage.open();
+    else if (command === "focus-mode") toggleFocus();
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
@@ -651,6 +653,20 @@ $("open-settings").addEventListener("click", () => {
   wizard.close();
   settings.open();
 });
+
+const usage = usageDialog($("usage"), {
+  openSettings: () => {
+    $("usage").close();
+    settings.open();
+  },
+  onTone: (tone) => {
+    const dot = $("usage-warn-dot");
+    dot.hidden = tone === null;
+    dot.classList.toggle("is-critical", tone === "critical");
+    dot.classList.toggle("is-warn", tone === "warn");
+  },
+});
+$("open-usage").addEventListener("click", () => usage.open());
 
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.

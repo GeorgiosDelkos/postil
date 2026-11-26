@@ -140,7 +140,9 @@ flowchart LR
 ```
 
 The boundary is narrow on purpose. The page asks for data with `fetch` on a custom URL scheme
-(`postil://`), which the Rust process answers; no network socket is opened. Rust pushes
+(`postil://`), which the Rust process answers; no network socket is opened. The one exception
+is the Usage dialog's account quotas, which `/usr/bin/curl` fetches while the dialog is open
+(section "Usage"). Rust pushes
 streaming events (agent updates) into the page. The page holds no state that matters: reloading
 it loses nothing.
 
@@ -175,6 +177,7 @@ schedule three tasks.
 | `src/acp/connection.rs` | Spawning an agent, the reader thread, requests, notifications. |
 | `src/run.rs` | Runs: the prompt, the agent kept between runs. |
 | `src/run/log.rs` | The run log: a run in memory and its file on disk. |
+| `src/usage/ledger.rs`, `src/usage/quota.rs` | The usage ledger (`usage.jsonl`) and its totals; the providers' account quotas, probed on demand. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
 | `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
@@ -183,6 +186,7 @@ schedule three tasks.
 | `ui/wizard.js`, `ui/wizard-dialog.js` | The first-run startup wizard: its rules (tested with `node --test`) and 4-step dialog. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
+| `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
 
 ### Data structures
 
@@ -316,10 +320,10 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 | Direction | Method | Used for |
 |---|---|---|
 | app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false, and form questions (`elicitation.form`). |
-| app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. |
-| app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn. |
+| app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
+| app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn; its `usage` token counts, when sent, go to the usage ledger. |
 | app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`, every open question `cancel`. |
-| agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`. Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
+| agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, and `usage_update` (context fill and the session's cumulative cost, for the usage ledger, never shown in the run panel). Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
 | agent to app | `session/request_permission` | Answered at once with the allow option (once, else always). With none, it waits for the engineer. |
 | agent to app | `elicitation/create`, `session/create_elicitation` | A question as a form; the reply is `accept` with the form's values, `decline` (skipped), or `cancel`. Unstable in ACP; the first name is the schema's at the pinned commit, the second Claude's adapter's. A URL question is refused. |
 | agent to app | `$/cancel_request` | The agent withdraws a request; an open question closes unanswered. |
@@ -990,6 +994,36 @@ file. The wizard's save names a revision like the dialog's, and when the file ch
 (another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
 from Settings.
 
+### Usage
+
+The Usage dialog (the Usage button above Settings, View > Usage, `Shift-Cmd-U`) shows, per
+agent, the provider account's quota and what Postil's own runs used. `GET /api/usage?scope=
+project|all&range=24h|7d|30d|all` answers it, and `POST /api/usage/refresh` probes the quotas
+again. The ranges roll back from now: the process has no time zone, so a calendar day is not
+offered.
+
+Postil's own usage lives in `~/.config/postil/usage.jsonl` (`src/usage/ledger.rs`): one JSON
+line per finished run, appended under `usage.lock`, with the agent, the model, the outcome,
+the token counts, the context fill and the cost the agent reported. It is separate from the
+run logs, so deleting notes keeps the history, and it spans projects. Each line carries
+`version` 1; a reader skips lines of another version and lines that do not parse, and an
+append after a torn last line starts on a new line, so a crash loses at most that line. The
+file is not synced and never compacted. ACP's `usage_update` cost is cumulative for the
+session, so a follow-up on a kept agent records its cost less what the session had cost
+before it; a meter that went down records no cost. Runs before this format, and runs whose
+log is reopened from disk, are not in the ledger.
+
+The account quotas (`src/usage/quota.rs`) are probed only while the dialog is open and cached
+for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`.
+Claude and Gemini are asked over HTTPS with the agent's own sign-in: Claude's token from the
+macOS Keychain item Claude Code writes, or `~/.claude/.credentials.json`; Gemini's from
+`~/.gemini/oauth_creds.json`. The token goes to `/usr/bin/curl` on stdin (`--config -`, with
+`--disable` so no `~/.curlrc` applies), never in its arguments; it is never stored, logged,
+or sent to the page. The endpoints (Anthropic's `api/oauth/usage`, Google's
+`v1internal:loadCodeAssist` and `v1internal:retrieveUserQuota`) are the ones the agents' own
+clients call and are not documented, so a provider may change them; a probe that fails shows
+why and leaves the rest of the dialog working. Other agents show no quota.
+
 ## Dependencies
 
 Measured on 2026-11-22 with `cargo tree --target aarch64-apple-darwin -e normal,build`, counting
@@ -1228,6 +1262,12 @@ Assumed until someone objects:
    repository (a `.gitignore` entry, and they would show in the file list), `git apply
    --3way` (it stages into the engineer's index), and queueing sends beyond the agent cap
    (it would hold the request thread). Pull requests need `gh`, installed and signed in.
+9. **Account quotas with the agents' own sign-in.** The Usage dialog reads the token Claude
+   Code and the Gemini CLI already stored, read-only, and calls the providers' quota endpoints
+   with it, only while the dialog is open (section "Usage"). Decided by the owner 2026-11-25,
+   in the review of #57, over dropping live quotas (the ledger only) and probing Codex only.
+   Accepted: the endpoints are undocumented and may change, and this is the one place Postil
+   reaches the network or another tool's credentials.
 
 ## Sources
 
