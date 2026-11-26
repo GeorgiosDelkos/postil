@@ -305,7 +305,7 @@ fn set_agents(site: &Site, agents: &[(&str, &str)], chosen: &str) {
     let settings = serde_json::json!({
         "customAgents": custom,
         "enabledAgents": names,
-        "agent": chosen,
+        "agent": { "name": chosen },
     });
     let (status, body) = save(site, &settings.to_string());
     assert_eq!(status, StatusCode::OK, "{body}");

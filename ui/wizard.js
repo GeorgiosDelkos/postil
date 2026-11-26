@@ -2,7 +2,7 @@
 // draft agent toggling (which cleans up dependent selections instead of refusing), environment
 // warnings, and the final summary. Tested with `node --test ui/`.
 
-import { removeCustomAgent, saveCustomAgent, setEnabled } from "./settings.js";
+import { formatSlot, removeCustomAgent, saveCustomAgent, setEnabled } from "./settings.js";
 
 export const STEPS = [
   { id: "agents", label: "Agents", title: "Connect your coding agents" },
@@ -25,7 +25,7 @@ export function applyDetectedDefaults(draft, agents) {
   return {
     ...draft,
     enabledAgents: installed,
-    agent: installed[0],
+    agent: { name: installed[0], model: null },
   };
 }
 
@@ -33,14 +33,16 @@ export function applyDetectedDefaults(draft, agents) {
 // turning off an agent that is chosen as the default or a reviewer), the wizard reconciles the
 // draft automatically: turning off the default moves it to the next enabled agent (or null) and
 // removes it from reviewers; turning on an agent while none is chosen picks it as the default.
+// An agent that becomes the default runs its own default model.
 export function toggleWizardAgent(draft, name, enabled) {
   if (enabled) {
     const next = setEnabled(draft, name, true).settings;
-    return next.agent === null ? { ...next, agent: name } : next;
+    return next.agent === null ? { ...next, agent: { name, model: null } } : next;
   }
   const enabledAgents = draft.enabledAgents.filter((each) => each !== name);
-  const reviewers = draft.reviewers.filter((each) => each !== name);
-  const agent = draft.agent === name ? (enabledAgents[0] ?? null) : draft.agent;
+  const reviewers = draft.reviewers.filter((slot) => slot.name !== name);
+  const fallback = enabledAgents.length ? { name: enabledAgents[0], model: null } : null;
+  const agent = draft.agent?.name === name ? fallback : draft.agent;
   return { ...draft, enabledAgents, agent, reviewers };
 }
 
@@ -51,8 +53,8 @@ export function saveWizardCustomAgent(draft, agent, previous, builtInNames) {
   if (result.error) return result;
   const settings = result.settings;
   if (previous === null && settings.agent === null) {
-    const added = settings.customAgents.at(-1)?.name ?? null;
-    return { settings: { ...settings, agent: added } };
+    const added = settings.customAgents.at(-1);
+    return { settings: { ...settings, agent: { name: added.name, model: null } } };
   }
   return result;
 }
@@ -110,9 +112,11 @@ export function npxWarning(draft, serverAgents, tools) {
   );
 }
 
-// Formats the chosen draft settings for the Ready summary step.
-export function wizardSummary(draft) {
+// Formats the chosen draft settings for the Ready summary step. `models` are the agents'
+// replies of api/agents/models, by name, for the models' display names.
+export function wizardSummary(draft, models) {
   const themeLabel = { system: "System", light: "Light", dark: "Dark" }[draft.theme] ?? draft.theme;
+  const slot = (each) => formatSlot(each, models[each.name]);
   return [
     {
       label: "Enabled agents",
@@ -121,13 +125,13 @@ export function wizardSummary(draft) {
     },
     {
       label: "Send notes to",
-      value: draft.agent ?? "Not chosen yet",
+      value: draft.agent ? slot(draft.agent) : "Not chosen yet",
       muted: draft.agent === null,
     },
     {
       label: "Reviewers",
       value: draft.reviewers.length
-        ? draft.reviewers.join(" → ")
+        ? draft.reviewers.map(slot).join(" → ")
         : "None (review changes yourself)",
       muted: draft.reviewers.length === 0,
     },

@@ -166,6 +166,11 @@ pub(crate) struct NewSessionResult {
     /// Extra metadata an agent attaches to `session/new` (Grok places its model info here).
     #[serde(default, rename = "_meta")]
     pub(crate) meta: Option<Value>,
+    /// The session's settings the client may change, of any shape: each entry is read on its
+    /// own by [`model_config`], so one of a shape the app does not know cannot fail the
+    /// session.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub(crate) config_options: Vec<Value>,
 }
 
 /// The active model an agent reports in `session/new`.
@@ -176,9 +181,104 @@ pub(crate) struct SessionModels {
     pub(crate) current_model_id: Option<String>,
 }
 
+/// The session setting that chooses the model: a select among `configOptions`. Every agent
+/// probed on 2026-11-26 (agy, Grok, OpenCode, Claude's adapter) reports one, with id and
+/// category `model`.
+#[derive(Debug)]
+pub(crate) struct ModelConfig {
+    /// The option's id, which `session/set_config_option` names.
+    pub(crate) id: String,
+    /// The model in effect, when the agent says.
+    pub(crate) current: Option<String>,
+    /// The models offered, in the agent's order, groups flattened.
+    pub(crate) options: Vec<ModelOption>,
+}
+
+impl ModelConfig {
+    /// Whether `model` is one of the values offered.
+    pub(crate) fn offers(&self, model: &str) -> bool {
+        self.options.iter().any(|option| option.value == model)
+    }
+}
+
+/// One model an agent offers: the id to send, and how to show it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) struct ModelOption {
+    pub(crate) value: String,
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+}
+
+/// The model select among `options`, an agent's `configOptions`: the first select whose
+/// category is `model`, else the first select whose id is `model`. `None` when there is none:
+/// the agent does not let the client choose. Options that cannot be read are skipped, and a
+/// group of options (`{"group", "name", "options": [...]}`, which the schema allows in place
+/// of a flat list) is read as its options, in order.
+pub(crate) fn model_config(options: &[Value]) -> Option<ModelConfig> {
+    let has = |option: &Value, field: &str, value: &str| {
+        option.get(field).and_then(Value::as_str) == Some(value)
+    };
+    let selects = || {
+        options
+            .iter()
+            .filter(|option| has(option, "type", "select"))
+    };
+    let select = selects()
+        .find(|option| has(option, "category", "model"))
+        .or_else(|| selects().find(|option| has(option, "id", "model")))?;
+    let id = select.get("id").and_then(Value::as_str)?.to_owned();
+    let current = select
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let entries = select.get("options").and_then(Value::as_array);
+    let read = |entry: &Value| serde_json::from_value::<ModelOption>(entry.clone()).ok();
+    let options = entries
+        .into_iter()
+        .flatten()
+        .flat_map(
+            |entry| match entry.get("options").and_then(Value::as_array) {
+                Some(group) => group.iter().filter_map(read).collect(),
+                None => read(entry).into_iter().collect::<Vec<_>>(),
+            },
+        )
+        .collect();
+    Some(ModelConfig {
+        id,
+        current,
+        options,
+    })
+}
+
+/// `session/set_config_option` params.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetConfigOptionParams<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) config_id: &'a str,
+    pub(crate) value: &'a str,
+}
+
+/// The `session/set_config_option` reply: the session's settings as they now are.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetConfigOptionResult {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub(crate) config_options: Vec<Value>,
+}
+
 impl NewSessionResult {
-    /// The active model id, when the agent reported one in `models.currentModelId` or `_meta`.
+    /// The model select the agent offers, if any ([`model_config`]).
+    pub(crate) fn model_config(&self) -> Option<ModelConfig> {
+        model_config(&self.config_options)
+    }
+
+    /// The active model id, when the agent reported one: the model select's current value,
+    /// else `models.currentModelId`, else `_meta`.
     pub(crate) fn current_model(&self) -> Option<String> {
+        let from_config = self.model_config().and_then(|config| config.current);
         let from_models = self
             .models
             .as_ref()
@@ -193,7 +293,9 @@ impl NewSessionResult {
                 })
                 .and_then(Value::as_str)
         };
-        from_models
+        from_config
+            .as_deref()
+            .or(from_models)
             .or_else(from_meta)
             .map(str::trim)
             .filter(|model| !model.is_empty())

@@ -433,6 +433,42 @@ test("Usage button opens the usage report, switches filters, and Refresh settles
   await dialog.waitFor({ state: "hidden" });
 });
 
+test("Settings lists the models the agent reports and saves one per slot", async (t) => {
+  const { page, api } = await openProject(t, "plain");
+  await page.locator("#open-settings").click();
+  const dialog = page.locator("#settings");
+
+  // The fake agent reports m, pro, fast and, in a group, deep (tests/fake-agent.mjs).
+  const model = (key) => dialog.locator(`[data-key="${key}"]`);
+  await model("agent-model").locator('option[value="deep"]').waitFor({ state: "attached" });
+  await model("agent-model").selectOption("pro");
+  // The same agent reviews twice, each time on a model of its own.
+  await dialog.locator('[data-key="reviewer-add"]').selectOption("Fake");
+  await model("reviewer-model-0").locator('option[value="fast"]').waitFor({ state: "attached" });
+  await dialog.locator('[data-key="reviewer-add"]').selectOption("Fake");
+  await model("reviewer-model-1").waitFor();
+  await model("reviewer-model-0").selectOption("fast");
+  await model("reviewer-model-1").selectOption("deep");
+
+  const wanted = {
+    agent: { name: "Fake", model: "pro" },
+    reviewers: [
+      { name: "Fake", model: "fast" },
+      { name: "Fake", model: "deep" },
+    ],
+  };
+  // Each change saves on its own, one after another: the last one's reply ends the wait.
+  const deadline = Date.now() + WAIT;
+  for (;;) {
+    const { settings } = await api("api/settings");
+    const saved = { agent: settings.agent, reviewers: settings.reviewers };
+    if (JSON.stringify(saved) === JSON.stringify(wanted)) break;
+    assert.ok(Date.now() < deadline, `saved ${JSON.stringify(saved)}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(await model("reviewer-model-1").inputValue(), "deep");
+});
+
 test("the startup wizard opens on first launch, saves settings, and stays closed on reload", async (t) => {
   const created = await fetch(new URL("new-fresh", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);
@@ -469,7 +505,7 @@ test("the startup wizard opens on first launch, saves settings, and stays closed
   const saved = await reply.json();
   assert.equal(saved.firstRun, false);
   assert.equal(saved.settings.theme, "dark");
-  assert.equal(saved.settings.agent, "Local");
+  assert.deepEqual(saved.settings.agent, { name: "Local", model: null });
 
   // Reloading after setup shows the welcome screen without reopening the wizard.
   await page.reload();
@@ -487,14 +523,14 @@ test("Skip on the first run saves the defaults with the installed agents turned 
   await page.goto(site.href);
 
   const wizard = page.locator("#wizard");
-  await wizard.getByRole("checkbox", { name: /Gemini/ }).waitFor();
+  await wizard.getByRole("switch", { name: /Gemini/ }).waitFor();
   await wizard.getByRole("button", { name: "Skip" }).click();
   await wizard.waitFor({ state: "hidden" });
 
   const saved = await (await fetch(new URL("api/settings", site))).json();
   assert.equal(saved.firstRun, false);
   assert.deepEqual(saved.settings.enabledAgents, ["Gemini"]);
-  assert.equal(saved.settings.agent, "Gemini");
+  assert.deepEqual(saved.settings.agent, { name: "Gemini", model: null });
   assert.equal(saved.settings.theme, "system");
 });
 

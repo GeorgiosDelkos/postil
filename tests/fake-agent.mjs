@@ -94,6 +94,26 @@ const initialize = (id) =>
 let cancelled;
 const onCancel = new Promise((resolve) => (cancelled = resolve));
 
+// The session's settings, as `session/new` reports them: a model select in the shape every
+// agent probed on 2026-11-26 sent (flat options, plus a group, which the schema allows), after
+// a boolean that also says "model", which is no select and must be passed over. Scenario
+// "no-config" reports none, as an agent that offers no model choice.
+const MODELS = [
+  { value: "m", name: "Model M" },
+  { value: "pro", name: "Pro", description: "The careful one" },
+  { value: "fast", name: "Fast" },
+  { group: "more", name: "More", options: [{ value: "deep", name: "Deep" }] },
+];
+const configOptions = (current) => [
+  { id: "model", name: "Use the model", category: "model", type: "boolean", currentValue: true },
+  { id: "model", name: "Model", category: "model", type: "select", currentValue: current, options: MODELS },
+];
+const offered = (value) =>
+  MODELS.some((option) => option.value === value || option.options?.some((each) => each.value === value));
+// The model the app set with `session/set_config_option`; the first message of each turn
+// names it, so a test sees that it was set before the prompt.
+let model = null;
+
 // Prompts this process received, so a test can tell a kept agent from a new one.
 let prompts = 0;
 // A file in the session's working directory, as agents report paths: absolute.
@@ -109,6 +129,7 @@ async function prompt(id, params) {
   // The model declines the work before doing any.
   if (scenario === "refusal") return send({ id, result: { stopReason: "refusal" } });
   const blocks = params.prompt.map((block) => (block.type === "text" ? block.text : block.uri));
+  if (model !== null) say(`model ${model}`);
   say(`got ${blocks.join(" | ")}`);
   say(`prompt ${prompts}`);
   switch (scenario) {
@@ -531,7 +552,20 @@ const handle = (line) => {
         writeFileSync(extra[0], String(child.pid));
       }
       send({ method: "_auth/status_update", params: { authStatus: { kind: "account" } } });
-      return send({ id: message.id, result: { sessionId: "S1", models: { currentModelId: "m" } } });
+      if (scenario === "no-config") {
+        return send({ id: message.id, result: { sessionId: "S1", models: { currentModelId: "m" } } });
+      }
+      // No `models`, as Claude's adapter sends none: the model in effect is read from the
+      // model select alone.
+      return send({ id: message.id, result: { sessionId: "S1", configOptions: configOptions("m") } });
+    case "session/set_config_option": {
+      const { configId, value } = message.params;
+      if (scenario === "no-config" || configId !== "model" || !offered(value)) {
+        return send({ id: message.id, error: { code: -32602, message: `no option ${configId}=${value}` } });
+      }
+      model = value;
+      return send({ id: message.id, result: { configOptions: configOptions(value) } });
+    }
     case "session/prompt":
       return prompt(message.id, message.params);
     case "session/cancel":

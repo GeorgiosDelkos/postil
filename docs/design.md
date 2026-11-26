@@ -424,9 +424,20 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   `POST /api/run/question` `{request, content}`, `content` the form's values or `null` to
   skip. Stop answers open questions `cancel`, and an agent's withdrawal closes one.
 - **Starting** happens on a thread of its own, because it can take minutes. Each start-up
-  step (`initialize`, `session/new`) may take 120 seconds, and Stop ends the wait. Gemini 0.40.1, not signed in,
-  never answers `initialize` (it waits for a browser sign-in), checked 2026-11-23; the run
-  then fails with the hint to run the agent in a terminal.
+  step (`initialize`, `session/new`, and `session/set_config_option` when a model is set) may
+  take 120 seconds, and Stop ends the wait. The `gemini` CLI 0.40.1 (Gemini's agent before
+  `agy`), not signed in, never answered `initialize` (it waits for a browser sign-in), checked
+  2026-11-23; the run then fails with the hint to run the agent in a terminal.
+- **The model** of the slot the run comes from (section "Settings") is set right after
+  `session/new` with `session/set_config_option`, before the prompt, and only when the agent's
+  model select offers it: an agent may take an id it does not know and run another model
+  without a word. A model it does not offer, or any model for an agent with no model select,
+  fails the start with a message that names the model and the ones offered, so the engineer
+  picks another in Settings. "Agent default" (no model) sets nothing. A follow-up goes on with
+  the agent kept from the run it follows, on the model that agent runs, even when the slot's
+  model changed since: changing the settings must not drop a live conversation or switch its
+  model (decided 2026-11-26). Only a fresh agent, for a new send or when no live agent is
+  kept, takes the settings' model.
 - **The log** is `<git dir>/postil/runs/R<n>.jsonl`: a header line (agent, notes, prompt,
   start time), then one line per entry, appended as it happens. The owner chose on 2026-11-23
   to keep runs on disk. Creating the file claims the id, so two windows never share one. After
@@ -941,13 +952,14 @@ in the settings. Each catalog command is confirmed end to end with a real prompt
 `a_real_agent_answers_a_prompt` (`POSTIL_REAL_AGENT='<command>' cargo test real_agent --
 --ignored`):
 Claude and Grok passed on 2026-11-23; Codex and OpenCode are not installed on the development
-Mac; Gemini needs a sign-in first.
+Mac. Gemini moved from the `gemini` CLI to the Antigravity CLI, `agy`, which has no `gemini`
+binary beside it.
 
 | Name | Found by | Command | ACP support |
 |---|---|---|---|
 | Claude | `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Adapter around Claude Code. |
 | Codex | `codex` | `npx -y @zed-industries/codex-acp` | Adapter. |
-| Gemini | `gemini` | `gemini --acp` | Native (`--acp` checked 2026-11-22). |
+| Gemini | `agy` | `agy acp` | Native (`initialize` and `session/new` checked 2026-11-26, agy 1.5.18). |
 | Grok | `grok` | `grok agent stdio` | Native (checked 2026-11-22). |
 | OpenCode | `opencode` | `opencode acp` | Native. |
 
@@ -964,6 +976,18 @@ custom agents, the agent notes are sent to, and the reviewers: an ordered list o
 same one allowed more than once, that review a run's work in turn when the engineer asks
 (section "Reviews"). An empty list means no review. Asked for by the owner on 2026-11-22.
 
+Each of those is a slot, an agent and the model it runs, so one agent may review twice on two
+models (chosen by the owner on 2026-11-26: a model per slot, the model only, no reasoning
+effort). The models are the agent's own: every agent probed on 2026-11-26 (agy, Grok, OpenCode,
+Claude's adapter) reports a model select in `session/new`'s `configOptions`, and the dialogs
+show that list. `POST /api/agents/models {agents, customAgents}` answers it (`src/models.rs`):
+it starts each agent once in `$TMPDIR/postil-models`, opens a session, reads the select, and
+stops it, on a thread of its own, so the page asks again while a probe runs. A list is kept until
+Rescan; a failed probe is tried again after 5 s. The custom agents travel in the body, so the
+wizard can ask about one it has not saved. No list is written down in Postil: it would be out
+of date with the next release of an agent. A free-text model id was rejected, since it cannot
+be checked before a run.
+
 Login is not handled in version 1 of the app: when an agent reports that it needs
 authentication, the run panel says which command to run in a terminal.
 
@@ -974,6 +998,13 @@ button at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change s
 settings are the theme (system, light, dark), the code font size (11 to 20 px; the line
 height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
 reopens the last project, and the agents above.
+
+The file is format version 2: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
+`null` for the agent's default), and `reviewers` a list of slots. A version 1 file, where both
+are plain names, is read as slots with no model, and the next save writes version 2; an older
+Postil then reads the file as one from a newer Postil and leaves it alone. A model id is 1 to
+200 characters with no space at either end and no control character; whether the agent offers
+it is checked when a run starts (section "Runs").
 
 The theme is set on the window, and WebKit answers the page's `prefers-color-scheme` from the
 window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:
@@ -986,8 +1017,9 @@ other change.
 
 When `~/.config/postil/settings.json` does not exist yet (first launch, outside `--bench`),
 a modal startup wizard (`ui/wizard.js`, `ui/wizard-dialog.js`) opens over the window and walks
-through installed agents, the default agent and optional reviewers, appearance (with a live
-code preview) and startup behavior, and a readiness summary (`git`, `npx`, `gh`). Completing or
+through installed agents, the default agent and optional reviewers with their models,
+appearance (with a live code preview) and startup behavior, and a readiness summary (`git`,
+`npx`, `gh`). It is drawn as the main window's panes are (section "Look and feel"). Completing or
 skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
 installed built-in agents turned on); closing it mid-way reverts any preview without writing the
 file. The wizard's save names a revision like the dialog's, and when the file changes under it
@@ -1015,14 +1047,14 @@ log is reopened from disk, are not in the ledger.
 
 The account quotas (`src/usage/quota.rs`) are probed only while the dialog is open and cached
 for 60 s, so an idle window does no work. Codex is asked through its own `codex app-server`.
-Claude and Gemini are asked over HTTPS with the agent's own sign-in: Claude's token from the
-macOS Keychain item Claude Code writes, or `~/.claude/.credentials.json`; Gemini's from
-`~/.gemini/oauth_creds.json`. The token goes to `/usr/bin/curl` on stdin (`--config -`, with
-`--disable` so no `~/.curlrc` applies), never in its arguments; it is never stored, logged,
-or sent to the page. The endpoints (Anthropic's `api/oauth/usage`, Google's
-`v1internal:loadCodeAssist` and `v1internal:retrieveUserQuota`) are the ones the agents' own
-clients call and are not documented, so a provider may change them; a probe that fails shows
-why and leaves the rest of the dialog working. Other agents show no quota.
+Claude is asked over HTTPS with the agent's own sign-in: its token from the macOS Keychain item
+Claude Code writes, or `~/.claude/.credentials.json`. The token goes to `/usr/bin/curl` on
+stdin (`--config -`, with `--disable` so no `~/.curlrc` applies), never in its arguments; it is
+never stored, logged, or sent to the page. The endpoint (Anthropic's `api/oauth/usage`) is the
+one Claude Code calls and is not documented, so Anthropic may change it; a probe that fails
+shows why and leaves the rest of the dialog working. Other agents show no quota. Gemini's was
+read with the `gemini` CLI's token (`~/.gemini/oauth_creds.json`) until 2026-11-26; `agy` keeps
+its sign-in to itself and writes no such file, so Gemini's quota is shown as unavailable.
 
 ## Dependencies
 
@@ -1263,8 +1295,9 @@ Assumed until someone objects:
    --3way` (it stages into the engineer's index), and queueing sends beyond the agent cap
    (it would hold the request thread). Pull requests need `gh`, installed and signed in.
 9. **Account quotas with the agents' own sign-in.** The Usage dialog reads the token Claude
-   Code and the Gemini CLI already stored, read-only, and calls the providers' quota endpoints
-   with it, only while the dialog is open (section "Usage"). Decided by the owner 2026-11-25,
+   Code already stored (and, until Gemini moved to `agy` on 2026-11-26, the Gemini CLI's),
+   read-only, and calls the provider's quota endpoint with it, only while the dialog is open
+   (section "Usage"). Decided by the owner 2026-11-25,
    in the review of #57, over dropping live quotas (the ledger only) and probing Codex only.
    Accepted: the endpoints are undocumented and may change, and this is the one place Postil
    reaches the network or another tool's credentials.

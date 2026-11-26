@@ -5,7 +5,7 @@
 //!   every completed run across projects with its agent, model, token counts, cost, and
 //!   duration so deleting notes never erases history;
 //! - [`quota`]: on-demand background probes for live provider account quotas and rate-limit
-//!   windows (Claude, Codex, Gemini, and graceful fallback for others), cached briefly in
+//!   windows (Claude and Codex, and graceful fallback for others), cached briefly in
 //!   memory so an idle window does zero work.
 
 pub(crate) mod ledger;

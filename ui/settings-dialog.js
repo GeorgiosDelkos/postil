@@ -11,14 +11,15 @@ import {
   SCAN_POLL_MS,
   THEMES,
   agentListRow,
+  agentSlotControl,
   controlButton,
   customAgentForm,
   fetchSettingsJson,
   fontStepper,
+  modelReports,
   restoreDialogFocus,
   reviewerControls,
   segmented,
-  selectBox,
   settingRow,
   settingSection,
   toggleSwitch,
@@ -31,7 +32,9 @@ import {
   removeReviewer,
   saveCustomAgent,
   setAgent,
+  setAgentModel,
   setEnabled,
+  setReviewerModel,
 } from "./settings.js";
 
 // `apply` is called with the settings in effect whenever they change (and once on opening),
@@ -61,6 +64,15 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
     pollTimer: null,
   };
 
+  // The enabled agents' models, for the model selects. Asked for only while the dialog is
+  // open: loading the settings at start-up must not start every agent.
+  const models = modelReports({
+    onChange: () => {
+      if (dialogEl.open) render();
+    },
+    onError: fail,
+  });
+
   // Takes a reply of api/settings. Its settings replace the ones on screen only when no save
   // is waiting: until then the screen holds changes the reply does not know of, and the next
   // change must start from them, or a quick second change would undo the first.
@@ -80,6 +92,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
     ui.view = next;
     ui.scanning = scanning;
     if (!ahead) apply(view.settings);
+    if (dialogEl.open && !view.problem) models.request(ui.view.settings);
     clearTimeout(ui.pollTimer);
     if (scanning && dialogEl.open) {
       ui.pollTimer = setTimeout(() => refresh().catch(fail), SCAN_POLL_MS);
@@ -110,6 +123,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
     ui.saved = false;
     ui.pending += 1;
     ui.view = { ...ui.view, settings: next.settings };
+    models.request(next.settings);
     render();
     ui.queue = ui.queue.then(async () => {
       try {
@@ -313,7 +327,10 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
       ui.scanning = true;
       render();
       try {
-        show(await fetchSettingsJson("api/agents/rescan", { method: "POST" }));
+        const view = await fetchSettingsJson("api/agents/rescan", { method: "POST" });
+        // The rescan forgot every agent's models too: they are asked for again.
+        models.reset();
+        show(view);
       } catch (error) {
         ui.scanning = false;
         fail(error);
@@ -368,23 +385,16 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
   }
 
   function chosenAgent() {
-    const enabled = ui.view.settings.enabledAgents;
-    const none = enabled.length ? "None" : "Turn on an agent first";
-    const options = [["", none], ...enabled.map((name) => [name, name])];
-    const chosen = ui.view.settings.agent ?? "";
-    const control = selectBox(
-      "agent",
-      "Send notes to",
-      options,
-      chosen,
-      (name) => save(setAgent(ui.view.settings, name || null)),
-      { disabled: locked() },
-    );
-    return settingRow("Send notes to", "The agent that works on the notes", control);
+    const control = agentSlotControl("agent", ui.view.settings, models.models, {
+      disabled: locked(),
+      onAgent: (name) => save(setAgent(ui.view.settings, name)),
+      onModel: (model) => save(setAgentModel(ui.view.settings, model)),
+    });
+    return settingRow("Send notes to", "The agent that works on the notes, and its model", control);
   }
 
   function reviewers() {
-    const control = reviewerControls(ui.view.settings, {
+    const control = reviewerControls(ui.view.settings, models.models, {
       disabled: locked(),
       onMove: (index, step) => {
         // The focus follows the reviewer it moved, so pressing again keeps moving it.
@@ -393,6 +403,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
       },
       onRemove: (index) => save(removeReviewer(ui.view.settings, index)),
       onAdd: (name) => save(addReviewer(ui.view.settings, name)),
+      onModel: (index, model) => save(setReviewerModel(ui.view.settings, index, model)),
     });
     const node = settingRow(
       "Reviewers",
@@ -419,6 +430,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
 
   dialogEl.addEventListener("close", () => {
     clearTimeout(ui.pollTimer);
+    models.reset();
     ui.form = null;
     ui.confirmReset = false;
   });

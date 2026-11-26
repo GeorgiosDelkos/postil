@@ -20,7 +20,7 @@ import { pathNoteDialog } from "./path-note-dialog.js";
 import { runPanel } from "./run-panel.js";
 import { escapeAction, foldRun, isOpen, isResolved } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
-import { codeMetrics } from "./settings.js";
+import { codeMetrics, formatSlot } from "./settings.js";
 import { reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
 import { usageDialog } from "./usage-dialog.js";
@@ -121,7 +121,7 @@ const runs = runPanel({
   noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
   openNote: (id) => noteDetail.open(id),
   openFile: (path) => code.openFile(path),
-  reviewers: () => state.settings?.reviewers ?? [],
+  reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
   showChanges: (from, to) => {
     tray.closeSend();
     changes.show(from, to);
@@ -167,7 +167,7 @@ const noteDetail = noteDialog($("note-dialog"), {
     return note ? { note, run: tray.runFor(note) } : null;
   },
   canSend: (note) => tray.canSendAlone() && !isResolved(note) && !tray.inLiveRun(note),
-  agent: () => state.settings?.agent ?? null,
+  agent: () => state.settings?.agent?.name ?? null,
   showInCode: (note) =>
     note.target === "folder" ? files.showFolder(note.path) : code.showNote(note),
   send: (note, options) => tray.sendAlone(note, options),
@@ -178,7 +178,7 @@ const noteDetail = noteDialog($("note-dialog"), {
   showRun: () => tray.showTab("run"),
   answerQuestion: (id, request, content) => runs.answerQuestion(id, request, content),
   reviewOf: (id) => reviewOf(id, runs.knownViews()),
-  reviewers: () => state.settings?.reviewers ?? [],
+  reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
   startReview: (id) => runs.startReview(id),
   busy: (id) => runs.busyThread(id),
 });
@@ -187,7 +187,7 @@ const noteDetail = noteDialog($("note-dialog"), {
 const pathNote = pathNoteDialog($("path-note-dialog"), {
   add: addPathNote,
   send: (note, options) => tray.sendAlone(note, options),
-  agent: () => state.settings?.agent ?? null,
+  agent: () => state.settings?.agent?.name ?? null,
 });
 
 const layout = dividers();

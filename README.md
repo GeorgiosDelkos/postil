@@ -139,12 +139,14 @@ them in Settings (`Cmd-,`):
 | -------- | ------------------------------------------------- |
 | Claude   | `npx -y @agentclientprotocol/claude-agent-acp`    |
 | Codex    | `npx -y @zed-industries/codex-acp`                |
-| Gemini   | `gemini --acp`                                    |
+| Gemini   | `agy acp` (the Antigravity CLI)                   |
 | Grok     | `grok agent stdio`                                |
 | OpenCode | `opencode acp`                                    |
 
 You can add any other agent by name and command in Settings. Settings also choose the agent
-notes go to by default and the reviewers, in order, for a review. Each agent signs in on its
+notes go to by default and the reviewers, in order, for a review, each with a model picked from
+the list the agent itself reports ("Agent default" keeps the agent's own). A model the agent no
+longer offers fails the run at start and says which ones it offers. Each agent signs in on its
 own: if a run fails at start, run the agent's command in a terminal once.
 
 ## Keyboard

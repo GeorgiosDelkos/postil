@@ -8,18 +8,26 @@ import {
   SCAN_POLL_MS,
   THEMES,
   agentListRow,
+  agentSlotControl,
   controlButton,
   customAgentForm,
   fetchSettingsJson,
   fontStepper,
+  modelReports,
   restoreDialogFocus,
   reviewerControls,
   segmented,
-  selectBox,
   settingRow,
   toggleSwitch,
 } from "./settings-controls.js";
-import { addReviewer, moveReviewer, removeReviewer, setAgent } from "./settings.js";
+import {
+  addReviewer,
+  moveReviewer,
+  removeReviewer,
+  setAgent,
+  setAgentModel,
+  setReviewerModel,
+} from "./settings.js";
 import {
   STEPS,
   applyDetectedDefaults,
@@ -99,6 +107,21 @@ export function wizardDialog(
     session: 0,
   };
 
+  // The enabled agents' models, asked for from the first step on, so the workflow step's
+  // selects are filled by the time it shows: Claude's adapter takes seconds to start. A reply
+  // after the dialog closed is dropped: closing resets it.
+  const models = modelReports({
+    onChange: () => {
+      if (dialogEl.open) render();
+    },
+    // Not `fail`, which also ends a save under way: a models request runs beside a save.
+    onError: (error) => {
+      if (!dialogEl.open) return;
+      ui.error = String(error.message ?? error);
+      render();
+    },
+  });
+
   // A reply whose revision differs from the one on screen means the file changed since the
   // draft was made (another window, the settings dialog, a refused save). The draft then starts
   // over from the file: a save names the reply's revision, so keeping the draft would let
@@ -128,6 +151,7 @@ export function wizardDialog(
       ui.draft = applyDetectedDefaults(ui.draft, nextView.agents);
     }
     if (fileChanged) apply(ui.draft);
+    if (dialogEl.open && !view.problem) models.request(ui.draft);
     clearTimeout(ui.pollTimer);
     if (scanning && dialogEl.open) {
       ui.pollTimer = setTimeout(
@@ -155,6 +179,7 @@ export function wizardDialog(
     ui.draft = next;
     ui.error = null;
     if (preview) apply(ui.draft);
+    models.request(ui.draft);
     render();
   }
 
@@ -218,15 +243,14 @@ export function wizardDialog(
 
   function panel() {
     const node = el("div", "wizard-panel");
+    // One compact bar, as the main window's header: the title, the steps, the close button.
     const header = el("header", "wizard-header");
-    const headTop = el("div", "wizard-header-top");
     const title = el("h2", "wizard-title", ui.firstRun ? "Welcome to Postil" : "Setup Wizard");
     title.id = "wizard-title";
     const close = controlButton("×", "wizard-close", () => dialogEl.close(), "icon-button");
     close.setAttribute("aria-label", "Close");
     close.disabled = ui.saving;
-    headTop.append(title, close);
-    header.append(headTop, stepBar());
+    header.append(title, stepBar(), close);
 
     const body = el("div", "wizard-body");
     if (!ui.view || !ui.draft) {
@@ -252,7 +276,12 @@ export function wizardDialog(
       const item = controlButton("", `step-${step.id}`, () => goTo(index), `wizard-step ${state}`);
       if (index === ui.step) item.setAttribute("aria-current", "step");
       item.disabled = ui.saving || !ui.draft || Boolean(ui.view?.problem);
-      item.append(el("span", "wizard-step-num", String(index + 1)), el("span", "", step.label));
+      if (state === "done") {
+        const mark = el("span", "wizard-step-mark", "✓");
+        mark.setAttribute("aria-hidden", "true");
+        item.append(mark);
+      }
+      item.append(step.label);
       nav.append(item);
     });
     return nav;
@@ -288,7 +317,6 @@ export function wizardDialog(
     for (const agent of rows) {
       list.append(
         agentListRow(agent, {
-          idPrefix: "wizard-",
           disabled: ui.saving,
           formOpen: ui.form !== null,
           onToggle: (checked) => {
@@ -312,9 +340,9 @@ export function wizardDialog(
         el(
           "p",
           "wizard-callout",
-          "No built-in agents were found on your PATH. Install Claude, Codex, Gemini, Grok, or " +
-            "OpenCode and click Rescan, add a custom ACP agent below, or continue and set one up " +
-            "later in Settings (⌘,).",
+          "No built-in agents were found on your PATH. Install Claude, Codex, Gemini (agy), " +
+            "Grok, or OpenCode and click Rescan, add a custom ACP agent below, or continue and " +
+            "set one up later in Settings (⌘,).",
         ),
       );
     }
@@ -349,7 +377,12 @@ export function wizardDialog(
       ui.scanning = true;
       render();
       try {
-        ingestView(await fetchSettingsJson("api/agents/rescan", { method: "POST" }), { session });
+        const view = await fetchSettingsJson("api/agents/rescan", { method: "POST" });
+        // A reply after the dialog closed or opened again belongs to no one on screen.
+        if (session !== ui.session) return;
+        // The rescan forgot every agent's models too: they are asked for again.
+        models.reset();
+        ingestView(view, { session });
       } catch (error) {
         if (session !== ui.session) return;
         ui.scanning = false;
@@ -409,24 +442,17 @@ export function wizardDialog(
       );
     }
 
-    const noneLabel = enabled.length ? "None" : "Turn on an agent first";
-    const options = [["", noneLabel], ...enabled.map((name) => [name, name])];
-    const agentSelect = selectBox(
-      "wizard-agent",
-      "Send notes to",
-      options,
-      ui.draft.agent ?? "",
-      (name) => {
-        const next = setAgent(ui.draft, name || null);
+    const slot = agentSlotControl("wizard-agent", ui.draft, models.models, {
+      disabled: ui.saving,
+      onAgent: (name) => {
+        const next = setAgent(ui.draft, name);
         if (next.settings) updateDraft(next.settings);
       },
-      { disabled: ui.saving || enabled.length === 0 },
-    );
-    parts.push(
-      settingRow("Send notes to", "The default agent that works on your notes", agentSelect),
-    );
+      onModel: (model) => updateDraft(setAgentModel(ui.draft, model).settings),
+    });
+    parts.push(settingRow("Send notes to", "The default agent, and the model it runs", slot));
 
-    const reviewers = reviewerControls(ui.draft, {
+    const reviewers = reviewerControls(ui.draft, models.models, {
       disabled: ui.saving,
       onMove: (index, step) => {
         ui.focusNext = `${step < 0 ? "up" : "down"}-${index + step}`;
@@ -437,6 +463,7 @@ export function wizardDialog(
         const next = addReviewer(ui.draft, name);
         if (next.settings) updateDraft(next.settings);
       },
+      onModel: (index, model) => updateDraft(setReviewerModel(ui.draft, index, model).settings),
     });
     const reviewerRow = settingRow(
       "Reviewers (optional)",
@@ -539,7 +566,7 @@ export function wizardDialog(
     ];
 
     const summary = el("dl", "wizard-summary");
-    for (const item of wizardSummary(ui.draft)) {
+    for (const item of wizardSummary(ui.draft, models.models)) {
       const row = el("div", "wizard-summary-row");
       row.append(
         el("dt", "wizard-summary-label", item.label),
@@ -637,6 +664,7 @@ export function wizardDialog(
   dialogEl.addEventListener("close", () => {
     ui.session += 1;
     clearTimeout(ui.pollTimer);
+    models.reset();
     if (!ui.committed && ui.baseline) apply(ui.baseline);
     ui.form = null;
     ui.error = null;

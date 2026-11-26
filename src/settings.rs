@@ -8,6 +8,11 @@
 //! so running an older build cannot drop the newer build's settings. A missing file is the
 //! defaults, and the first save creates it.
 //!
+//! Format version 2 names the agent notes are sent to, and each reviewer, as a slot: an
+//! agent's name and the model it runs (`{"name": "Claude", "model": "opus"}`, `null` for the
+//! agent's own default). A version 1 file, where they are plain names, is still read: each
+//! name becomes a slot with no model, and the next save writes version 2.
+//!
 //! The rules, checked when a [`RawSettings`] becomes a [`Settings`] (`TryFrom`), the only way
 //! to make one:
 //! - the code font size is 11 to 20 px and the tab width 2, 4 or 8;
@@ -16,7 +21,10 @@
 //!   whose program is a name on the search path or an absolute path;
 //! - the enabled agents are known agents, each once;
 //! - the agent notes are sent to, and every reviewer, is an enabled agent. A reviewer may be
-//!   listed more than once: each entry is one independent review.
+//!   listed more than once: each entry is one independent review;
+//! - a slot's model, when set, is 1 to 200 characters with no space at either end and no
+//!   control character. Whether the agent offers it is checked when a run starts, against
+//!   the list the agent reports then (`acp`, `Starting::open_session`).
 
 use std::fs;
 use std::io;
@@ -24,13 +32,17 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
 
-/// The format version this build reads and writes.
-const VERSION: u32 = 1;
+/// The format version this build writes. It also reads [`V1`].
+const VERSION: u32 = 2;
+
+/// The format before slots: the agent and the reviewers as plain names ([`upgrade_v1`]).
+const V1: u32 = 1;
 
 /// The code font sizes offered, in CSS px. 11 is the smallest Geist Mono size that stays
 /// legible on a non-Retina display; 20 fits about 100 columns in the code pane of a 1440 px
@@ -42,6 +54,10 @@ pub(crate) const TAB_WIDTHS: [u8; 3] = [2, 4, 8];
 
 /// The longest custom agent name, in characters. Arbitrary: it fits one row of the dialog.
 const MAX_NAME: usize = 40;
+
+/// The longest model id, in characters. Arbitrary: far above any id an agent reported on
+/// 2026-11-26 (the longest, `claude-fable-5-2[1m]`, has 20).
+const MAX_MODEL: usize = 200;
 
 /// The window's appearance.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -79,10 +95,24 @@ pub(crate) struct RawSettings {
     /// The names of the agents offered for sending and reviewing. A built-in agent that is
     /// enabled but no longer installed stays listed, marked missing.
     enabled_agents: Vec<String>,
-    /// The agent notes are sent to.
-    agent: Option<String>,
-    /// The agents that review the agent's work, in order.
-    reviewers: Vec<String>,
+    /// The agent notes are sent to, and its model.
+    agent: Option<AgentSlot>,
+    /// The agents that review the agent's work, in order, each with its model.
+    reviewers: Vec<AgentSlot>,
+}
+
+/// A place in the workflow: the agent notes are sent to, or one reviewer. One type for both,
+/// so the two cannot drift apart.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentSlot {
+    /// The agent's name, an enabled agent.
+    name: String,
+    /// The model id to set on the agent's session; `None` (`null`, or missing in a file
+    /// written by hand) keeps the agent's own default. Always written, so the file and the
+    /// page share one shape.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 impl Settings {
@@ -103,29 +133,63 @@ impl Settings {
         self.0.enabled_agents.iter().any(|enabled| enabled == name)
     }
 
-    /// The names of the agents that review the agent's work, in order.
-    pub(crate) fn reviewers(&self) -> &[String] {
-        &self.0.reviewers
-    }
-
-    /// The agent notes are sent to, with its command.
+    /// The agent notes are sent to, with its command and model.
     ///
     /// # Errors
     ///
     /// [`Error::BadRequest`] when none is chosen.
     pub(crate) fn default_agent(&self) -> Result<AgentChoice> {
-        let name = self.0.agent.as_deref().ok_or_else(|| {
+        let slot = self.0.agent.as_ref().ok_or_else(|| {
             Error::BadRequest("choose the agent notes are sent to in Settings".to_owned())
         })?;
-        self.chosen_agent(name)
+        self.choice(&slot.name, slot.model.clone())
     }
 
-    /// The agent called `name`, with its command.
+    /// The agent called `name`, with its command: a one-off choice in the send picker, or the
+    /// agent a follow-up starts when no live agent of the run is kept. It runs the default
+    /// slot's model when it is the default agent, and its own default model otherwise.
     ///
     /// # Errors
     ///
     /// [`Error::BadRequest`] when it is not enabled.
     pub(crate) fn chosen_agent(&self, name: &str) -> Result<AgentChoice> {
+        let model = self
+            .0
+            .agent
+            .as_ref()
+            .filter(|slot| slot.name == name)
+            .and_then(|slot| slot.model.clone());
+        self.choice(name, model)
+    }
+
+    /// The reviewers, in order, each with its command and model.
+    ///
+    /// # Errors
+    ///
+    /// None in practice: every reviewer is an enabled agent (`check_choices`). The `Result`
+    /// is [`Settings::choice`]'s.
+    pub(crate) fn reviewer_choices(&self) -> Result<Vec<AgentChoice>> {
+        self.0
+            .reviewers
+            .iter()
+            .map(|slot| self.choice(&slot.name, slot.model.clone()))
+            .collect()
+    }
+
+    /// The command of the agent called `name`, when it is a custom one.
+    pub(crate) fn custom_command(&self, name: &str) -> Option<&str> {
+        self.custom_agents()
+            .iter()
+            .find(|agent| agent.name == name)
+            .map(|agent| agent.command.as_str())
+    }
+
+    /// The agent called `name` running `model`, with its command.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when it is not enabled.
+    fn choice(&self, name: &str, model: Option<String>) -> Result<AgentChoice> {
         if !self.0.enabled_agents.iter().any(|enabled| enabled == name) {
             return Err(Error::BadRequest(format!(
                 "turn {name} on in Settings before sending to it"
@@ -135,18 +199,13 @@ impl Settings {
             .iter()
             .find(|agent| agent.name == name)
             .map(|agent| agent.command);
-        let custom = || {
-            self.custom_agents()
-                .iter()
-                .find(|agent| agent.name == name)
-                .map(|agent| agent.command.as_str())
-        };
         let command = built_in
-            .or_else(custom)
+            .or_else(|| self.custom_command(name))
             .expect("an enabled agent is a known one: the settings passed check_choices");
         Ok(AgentChoice {
             name: name.to_owned(),
             command: command.to_owned(),
+            model,
         })
     }
 }
@@ -207,23 +266,7 @@ impl RawSettings {
             {
                 return Err(format!("there is already an agent called {name:?}"));
             }
-            let Some(program) = agents::program_of(&agent.command) else {
-                return Err(format!("the agent {name:?} needs a command"));
-            };
-            // A relative path would be looked up from Postil's working directory (`/` when
-            // started from the Finder) but run from the project's, so it names two files.
-            if program.contains('/') && !program.starts_with('/') {
-                return Err(format!(
-                    "the program of {name:?} must be a name on the search path or an absolute \
-                     path, not {program}"
-                ));
-            }
-            if agent.command.contains(['"', '\'', '\\']) {
-                return Err(format!(
-                    "the command of {name:?} cannot hold quotes or backslashes: it is split on \
-                     spaces as it is"
-                ));
-            }
+            check_agent_command(name, &agent.command)?;
             names.push(name);
         }
         Ok(())
@@ -242,19 +285,73 @@ impl RawSettings {
                 return Err(format!("{name:?} is enabled twice"));
             }
         }
-        let enabled = |name: &String| self.enabled_agents.contains(name);
-        if let Some(agent) = self.agent.as_ref().filter(|agent| !enabled(agent)) {
-            return Err(format!(
-                "notes cannot go to {agent:?}: it is not an enabled agent"
-            ));
+        let enabled = |slot: &AgentSlot| self.enabled_agents.contains(&slot.name);
+        if let Some(agent) = &self.agent {
+            if !enabled(agent) {
+                return Err(format!(
+                    "notes cannot go to {:?}: it is not an enabled agent",
+                    agent.name
+                ));
+            }
+            check_model(agent)?;
         }
-        if let Some(reviewer) = self.reviewers.iter().find(|reviewer| !enabled(reviewer)) {
-            return Err(format!(
-                "{reviewer:?} cannot review: it is not an enabled agent"
-            ));
+        for reviewer in &self.reviewers {
+            if !enabled(reviewer) {
+                return Err(format!(
+                    "{:?} cannot review: it is not an enabled agent",
+                    reviewer.name
+                ));
+            }
+            check_model(reviewer)?;
         }
         Ok(())
     }
+}
+
+/// Checks the command of the agent called `name`: plain words (no quotes, split on
+/// whitespace as it is) whose program is a name on the search path or an absolute path. The
+/// rule for a custom agent's command, also applied to the wizard's unsaved custom agents
+/// before their models are asked for.
+pub(crate) fn check_agent_command(name: &str, command: &str) -> std::result::Result<(), String> {
+    let Some(program) = agents::program_of(command) else {
+        return Err(format!("the agent {name:?} needs a command"));
+    };
+    // A relative path would be looked up from Postil's working directory (`/` when
+    // started from the Finder) but run from the project's, so it names two files.
+    if program.contains('/') && !program.starts_with('/') {
+        return Err(format!(
+            "the program of {name:?} must be a name on the search path or an absolute path, \
+             not {program}"
+        ));
+    }
+    if command.contains(['"', '\'', '\\']) {
+        return Err(format!(
+            "the command of {name:?} cannot hold quotes or backslashes: it is split on spaces \
+             as it is"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a slot's model id, when it has one (module docs). The id travels to the agent as
+/// it is, so a stray space or newline from a hand edit would name a model no agent offers.
+fn check_model(slot: &AgentSlot) -> std::result::Result<(), String> {
+    let Some(model) = &slot.model else {
+        return Ok(());
+    };
+    let length = model.chars().count();
+    if length == 0
+        || length > MAX_MODEL
+        || model.trim() != model
+        || model.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "the model of {:?} must be 1 to {MAX_MODEL} characters, with no space at either \
+             end and no control character: {model:?}",
+            slot.name
+        ));
+    }
+    Ok(())
 }
 
 impl Default for RawSettings {
@@ -363,21 +460,51 @@ fn revision_of(json: &str) -> String {
 
 fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
     let shown = file.display();
-    match version_of(json.as_bytes()) {
-        Ok(version) if version > VERSION => {
+    // `None` when the field is missing or the text does not parse: the parse below says why.
+    let version = version_of(json.as_bytes()).ok();
+    match version {
+        Some(version) if version > VERSION => {
             return Err(format!(
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Ok(version) if version != VERSION => {
+        Some(version) if version != VERSION && version != V1 => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
     }
-    let stored: SettingsFile<RawSettings> = serde_json::from_str(json)
-        .map_err(|error| format!("{shown} is not valid settings JSON: {error}"))?;
+    let unreadable =
+        |error: serde_json::Error| format!("{shown} is not valid settings JSON: {error}");
+    let stored: SettingsFile<RawSettings> = if version == Some(V1) {
+        let mut value: Value = serde_json::from_str(json).map_err(unreadable)?;
+        upgrade_v1(&mut value);
+        serde_json::from_value(value).map_err(unreadable)?
+    } else {
+        // Read from the text, not through a `Value`, so serde's message names the line.
+        serde_json::from_str(json).map_err(unreadable)?
+    };
     Settings::try_from(stored.settings)
         .map_err(|problem| format!("{shown} breaks a rule: {problem}"))
+}
+
+/// Rewrites a version 1 file, as parsed, into version 2's shape: the agent and each reviewer,
+/// plain names there, become slots with no model. Anything else is left as it is, so a value
+/// of another type still fails the parse that follows, with serde's message.
+fn upgrade_v1(file: &mut Value) {
+    let slot = |value: &mut Value| {
+        if let Value::String(name) = value {
+            *value = serde_json::json!({ "name": name, "model": null });
+        }
+    };
+    let Some(settings) = file.get_mut("settings") else {
+        return;
+    };
+    if let Some(agent) = settings.get_mut("agent") {
+        slot(agent);
+    }
+    if let Some(Value::Array(reviewers)) = settings.get_mut("reviewers") {
+        reviewers.iter_mut().for_each(slot);
+    }
 }
 
 /// Writes `settings` to `file`, if the file is still at `revision`: the one the change
@@ -447,8 +574,11 @@ mod tests {
             "reopenLastProject": true,
             "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
             "enabledAgents": ["Claude", "Local"],
-            "agent": "Local",
-            "reviewers": ["Claude", "Claude"],
+            "agent": { "name": "Local" },
+            "reviewers": [
+                { "name": "Claude", "model": "opus" },
+                { "name": "Claude", "model": null },
+            ],
         }))
         .unwrap();
         let settings = Settings::try_from(raw).unwrap();
@@ -456,7 +586,7 @@ mod tests {
         save(&file, &settings, "").unwrap();
 
         let expected = r#"{
-  "version": 1,
+  "version": 2,
   "settings": {
     "theme": "dark",
     "codeFontSize": 14,
@@ -472,10 +602,19 @@ mod tests {
       "Claude",
       "Local"
     ],
-    "agent": "Local",
+    "agent": {
+      "name": "Local",
+      "model": null
+    },
     "reviewers": [
-      "Claude",
-      "Claude"
+      {
+        "name": "Claude",
+        "model": "opus"
+      },
+      {
+        "name": "Claude",
+        "model": null
+      }
     ]
   }
 }

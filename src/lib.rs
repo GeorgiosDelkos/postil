@@ -19,6 +19,7 @@ mod highlight;
 mod layout;
 #[cfg(target_os = "macos")]
 mod menu;
+mod models;
 mod notes;
 mod recent;
 mod repo;

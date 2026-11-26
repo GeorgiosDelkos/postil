@@ -32,7 +32,7 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Hard limit on one subprocess a probe runs (`security`, `curl`, or `codex app-server`).
 /// A probe runs up to two of them one after the other (Claude: the Keychain read, then the
-/// usage request; Gemini: two requests), so a probe can take up to twice this. Arbitrary:
+/// usage request), so a probe can take up to twice this. Arbitrary:
 /// long enough for a slow network round trip, short enough that the dialog does not show
 /// "Loading" for long.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -335,7 +335,11 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
     match name {
         "Claude" => probe_claude(),
         "Codex" => probe_codex(search_path),
-        "Gemini" => probe_gemini(),
+        // agy keeps its sign-in to itself (no `~/.gemini/oauth_creds.json`, checked
+        // 2026-11-26, agy 1.5.18), so there is no token to ask Google's quota endpoint with.
+        "Gemini" => QuotaReport::unavailable(
+            "agy does not share its sign-in, so Postil cannot show Gemini's quota",
+        ),
         "Grok" => QuotaReport::unavailable("Live quota is not exposed by the Grok CLI yet"),
         "OpenCode" => QuotaReport::unavailable(
             "OpenCode routes across multiple providers — see Postil activity below",
@@ -814,198 +818,6 @@ fn parse_codex_credits(bucket: &Value) -> Option<CreditInfo> {
     })
 }
 
-enum GeminiCreds {
-    Token(String),
-    Expired,
-    Missing,
-    /// The credentials file exists but cannot be read; the message says why.
-    Unreadable(String),
-}
-
-fn probe_gemini() -> QuotaReport {
-    let token = match read_gemini_creds(now_secs()) {
-        GeminiCreds::Token(token) => token,
-        GeminiCreds::Expired => {
-            return QuotaReport::unavailable(
-                "Session expired — run `gemini` in a terminal to refresh",
-            );
-        }
-        GeminiCreds::Missing => {
-            if std::env::var_os("GEMINI_API_KEY").is_some_and(|val| !val.is_empty()) {
-                return QuotaReport::unavailable("API key mode — no subscription quota window");
-            }
-            return QuotaReport::unavailable(
-                "Not signed in — run `gemini` in a terminal to sign in",
-            );
-        }
-        GeminiCreds::Unreadable(message) => return QuotaReport::error(message),
-    };
-
-    let headers = [
-        format!("Authorization: Bearer {token}"),
-        "Content-Type: application/json".to_owned(),
-        "Accept: application/json".to_owned(),
-    ];
-    let load_body = concat!(
-        r#"{"metadata":{"ideType":"IDE_UNSPECIFIED","#,
-        r#""platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}"#,
-    );
-    let (project, plan) = match curl_json(
-        "POST",
-        "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-        &headers,
-        Some(load_body),
-    ) {
-        Ok((200, body)) => parse_gemini_load(&body),
-        Ok((401 | 403, _)) => {
-            return QuotaReport::unavailable(
-                "Session expired or tier ineligible — run `gemini` in a terminal",
-            );
-        }
-        Ok((status, _)) => {
-            return QuotaReport::error(format!("Gemini loadCodeAssist returned HTTP {status}"));
-        }
-        Err(message) => return QuotaReport::error(message),
-    };
-
-    let quota_body = match project {
-        Some(project) => serde_json::json!({ "project": project }).to_string(),
-        None => "{}".to_owned(),
-    };
-    match curl_json(
-        "POST",
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-        &headers,
-        Some(&quota_body),
-    ) {
-        Ok((200, body)) => parse_gemini_quota(&body, plan),
-        Ok((401 | 403, _)) => {
-            QuotaReport::unavailable("Gemini quota unavailable for this account tier")
-        }
-        Ok((status, _)) => {
-            QuotaReport::error(format!("Gemini retrieveUserQuota returned HTTP {status}"))
-        }
-        Err(message) => QuotaReport::error(message),
-    }
-}
-
-fn read_gemini_creds(now: u64) -> GeminiCreds {
-    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
-        return GeminiCreds::Missing;
-    };
-    let path = PathBuf::from(home).join(".gemini/oauth_creds.json");
-    match read_credentials_file(&path) {
-        Ok(Some(raw)) => parse_gemini_creds(&raw, now),
-        Ok(None) => GeminiCreds::Missing,
-        Err(message) => GeminiCreds::Unreadable(message),
-    }
-}
-
-fn parse_gemini_creds(raw: &str, now: u64) -> GeminiCreds {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return GeminiCreds::Missing;
-    };
-    let Some(token) = value
-        .get("access_token")
-        .or_else(|| value.get("accessToken"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    else {
-        return GeminiCreds::Missing;
-    };
-    if let Some(expiry) = value
-        .get("expiry_date")
-        .or_else(|| value.get("expiryDate"))
-        .and_then(Value::as_u64)
-    {
-        // Google OAuth writes milliseconds since epoch; handle seconds too.
-        let expiry_secs = if expiry >= 10_000_000_000 {
-            expiry / 1000
-        } else {
-            expiry
-        };
-        if expiry_secs <= now {
-            return GeminiCreds::Expired;
-        }
-    }
-    GeminiCreds::Token(token.to_owned())
-}
-
-fn parse_gemini_load(body: &str) -> (Option<String>, Option<String>) {
-    let Ok(json) = serde_json::from_str::<Value>(body) else {
-        return (None, None);
-    };
-    let project = json
-        .get("cloudaicompanionProject")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let plan = json
-        .get("paidTier")
-        .or_else(|| json.get("currentTier"))
-        .and_then(|tier| tier.get("name"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    (project, plan)
-}
-
-fn parse_gemini_quota(body: &str, plan: Option<String>) -> QuotaReport {
-    let Ok(json) = serde_json::from_str::<Value>(body) else {
-        return QuotaReport::error("unreadable reply from Gemini quota endpoint");
-    };
-    let Some(buckets) = json.get("buckets").and_then(Value::as_array) else {
-        return QuotaReport::unavailable("Gemini reported no quota buckets");
-    };
-    // Deduplicate per modelId, keeping the tightest (lowest remainingFraction) bucket.
-    let mut by_model: HashMap<String, (f64, Option<u64>)> = HashMap::new();
-    for bucket in buckets {
-        let Some(model_id) = bucket.get("modelId").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(remaining) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
-            continue;
-        };
-        let resets_at = bucket
-            .get("resetTime")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs);
-        by_model
-            .entry(model_id.to_owned())
-            .and_modify(|entry| {
-                if remaining < entry.0 {
-                    *entry = (remaining, resets_at);
-                }
-            })
-            .or_insert((remaining, resets_at));
-    }
-
-    let mut windows: Vec<QuotaWindow> = by_model
-        .into_iter()
-        .map(|(model_id, (remaining, resets_at))| QuotaWindow {
-            label: model_id.clone(),
-            model: Some(model_id),
-            used_percent: clamp_percent((1.0 - remaining) * 100.0),
-            resets_at,
-            detail: None,
-        })
-        .collect();
-    windows.sort_by(|a, b| a.label.cmp(&b.label));
-
-    if windows.is_empty() {
-        return QuotaReport::unavailable("Gemini reported no model quota buckets");
-    }
-    QuotaReport {
-        status: QuotaStatus::Ok,
-        plan,
-        windows,
-        credits: None,
-        message: None,
-        fetched_at: Some(now_secs()),
-    }
-}
-
 /// Reads a generic password secret from the macOS Keychain, bounded by [`PROBE_TIMEOUT`].
 #[cfg(target_os = "macos")]
 fn read_keychain_secret(service: &str) -> Option<String> {
@@ -1422,28 +1234,6 @@ mod tests {
         assert!((report.credits.unwrap().remaining.unwrap() - 12.5).abs() < 1e-6);
     }
 
-    #[test]
-    fn parses_gemini_retrieve_user_quota_buckets() {
-        let body = r#"{
-            "buckets": [
-                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.88,
-                  "resetTime": "2026-11-26T00:00:00Z" },
-                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.75,
-                  "resetTime": "2026-11-26T00:00:00Z" },
-                { "modelId": "gemini-2.5-flash", "remainingFraction": 0.96,
-                  "resetTime": "2026-11-26T00:00:00Z" }
-            ]
-        }"#;
-        let report = parse_gemini_quota(body, Some("Google AI Pro".to_owned()));
-        assert_eq!(report.status, QuotaStatus::Ok);
-        assert_eq!(report.plan.as_deref(), Some("Google AI Pro"));
-        assert_eq!(report.windows.len(), 2);
-        assert_eq!(report.windows[0].label, "gemini-2.5-flash");
-        assert!((report.windows[0].used_percent - 4.0).abs() < 1e-6);
-        assert_eq!(report.windows[1].label, "gemini-2.5-pro");
-        assert!((report.windows[1].used_percent - 25.0).abs() < 1e-6);
-    }
-
     /// A probe whose first call waits until `release` is sent to it, and that reports which
     /// call each result came from.
     fn gated_poller() -> (QuotaPoller, mpsc::Receiver<()>, mpsc::Sender<()>) {
@@ -1669,43 +1459,6 @@ mod tests {
         assert!(credits(false, false).is_none());
         assert!(credits(true, false).is_some_and(|info| !info.unlimited));
         assert!(credits(false, true).is_some_and(|info| info.unlimited));
-    }
-
-    #[test]
-    fn gemini_load_reads_the_project_and_the_paid_or_current_tier() {
-        let load = |body: Value| parse_gemini_load(&body.to_string());
-        assert_eq!(
-            load(serde_json::json!({
-                "cloudaicompanionProject": "proj-1",
-                "paidTier": { "name": "Google AI Pro" },
-                "currentTier": { "name": "Free" },
-            })),
-            (Some("proj-1".to_owned()), Some("Google AI Pro".to_owned()))
-        );
-        assert_eq!(
-            load(serde_json::json!({ "currentTier": { "name": "Free" } })),
-            (None, Some("Free".to_owned()))
-        );
-        assert_eq!(
-            load(serde_json::json!({
-                "cloudaicompanionProject": "",
-                "currentTier": { "name": "" },
-            })),
-            (None, None)
-        );
-        assert_eq!(parse_gemini_load("not json"), (None, None));
-    }
-
-    #[test]
-    fn parse_gemini_creds_detects_expired_token() {
-        let now = 1_795_000_000;
-        let expired = r#"{"access_token":"tok","expiry_date":1794000000000}"#;
-        assert!(matches!(
-            parse_gemini_creds(expired, now),
-            GeminiCreds::Expired
-        ));
-        let fresh = r#"{"access_token":"tok","expiry_date":1796000000000}"#;
-        assert!(matches!(parse_gemini_creds(fresh, now), GeminiCreds::Token(t) if t == "tok"));
     }
 
     #[test]

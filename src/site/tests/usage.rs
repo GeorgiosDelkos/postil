@@ -312,7 +312,7 @@ fn usage_lists_an_agent_only_when_it_is_installed_or_has_history() {
             { "name": "Idle", "command": "missing-tool" },
         ],
         "enabledAgents": ["Installed"],
-        "agent": "Installed",
+        "agent": { "name": "Installed" },
     });
     assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
 

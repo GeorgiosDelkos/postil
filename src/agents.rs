@@ -32,10 +32,12 @@ pub(crate) struct BuiltIn {
 }
 
 /// The catalog. Each command was checked against the tool's own `--help` on 2026-11-22 where
-/// the tool was at hand (Gemini `--acp`, Grok `agent stdio`); Claude and Codex speak ACP
-/// through the adapters docs/design.md names, and OpenCode through its `acp` command. The
-/// ACP milestone confirms each one end to end. Cursor's CLI has no ACP mode, so it is not
-/// listed; a custom agent covers it if it gains one.
+/// the tool was at hand (Grok `agent stdio`); Claude and Codex speak ACP through the adapters
+/// docs/design.md names, and OpenCode through its `acp` command. Gemini runs through the
+/// Antigravity CLI, `agy`, whose `acp` subcommand answered `initialize` and `session/new` on
+/// 2026-11-26 (agy 1.5.18); the older `gemini` CLI is not used. The ACP milestone confirms
+/// each one end to end. Cursor's CLI has no ACP mode, so it is not listed; a custom agent
+/// covers it if it gains one.
 pub(crate) const BUILT_IN: [BuiltIn; 5] = [
     BuiltIn {
         name: "Claude",
@@ -49,8 +51,8 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
     },
     BuiltIn {
         name: "Gemini",
-        program: "gemini",
-        command: "gemini --acp",
+        program: "agy",
+        command: "agy acp",
     },
     BuiltIn {
         name: "Grok",
@@ -64,11 +66,16 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
     },
 ];
 
-/// The agent a run goes to: its name in the settings and the command that starts it.
+/// The agent a run goes to: its name in the settings, the command that starts it, and the
+/// model its session is set to. A follow-up that goes on with a kept agent takes that agent's
+/// own choice (`run.rs`, `Runner::follow_up`), so the model it runs stays the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentChoice {
     pub(crate) name: String,
     pub(crate) command: String,
+    /// The model id set on the session before its first prompt (`session/set_config_option`);
+    /// `None` keeps the agent's own default.
+    pub(crate) model: Option<String>,
 }
 
 /// How long the login shell may take to print its `PATH`. Arbitrary: a slow shell start-up
@@ -524,8 +531,8 @@ mod tests {
 
     #[test]
     fn the_built_in_names_are_unique_whatever_the_case() {
-        // Settings name agents by these names (`enabledAgents`, `agent`, `reviewers`), and
-        // custom names are refused when they match one regardless of case.
+        // Settings name agents by these names (`enabledAgents`, the `agent` and `reviewers`
+        // slots), and custom names are refused when they match one regardless of case.
         for (index, agent) in BUILT_IN.iter().enumerate() {
             for other in &BUILT_IN[index + 1..] {
                 assert!(

@@ -17,8 +17,11 @@ fn custom_settings() -> serde_json::Value {
         "reopenLastProject": true,
         "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
         "enabledAgents": ["Grok", "Local"],
-        "agent": "Local",
-        "reviewers": ["Grok", "Grok"],
+        "agent": { "name": "Local", "model": null },
+        "reviewers": [
+            { "name": "Grok", "model": "grok-4.7" },
+            { "name": "Grok", "model": null },
+        ],
     })
 }
 
@@ -52,7 +55,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     assert_eq!(restarted["settings"], custom_settings());
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 1);
+    assert_eq!(stored["version"], 2);
     assert_eq!(stored["settings"], custom_settings());
 }
 
@@ -133,11 +136,11 @@ fn settings_that_break_a_rule_are_refused_and_nothing_is_written() {
             "enabled twice",
         ),
         (
-            with("agent", "Claude".into()),
+            with("agent", serde_json::json!({ "name": "Claude" })),
             "notes cannot go to \"Claude\"",
         ),
         (
-            with("reviewers", serde_json::json!(["Claude"])),
+            with("reviewers", serde_json::json!([{ "name": "Claude" }])),
             "\"Claude\" cannot review",
         ),
         (with("colour", "red".into()), "unknown field `colour`"),
@@ -166,7 +169,7 @@ fn settings_that_break_a_rule_are_refused_and_nothing_is_written() {
     let mut at_limits = custom_settings();
     at_limits["customAgents"] = serde_json::json!([{ "name": longest, "command": "x" }]);
     at_limits["enabledAgents"] = serde_json::json!([longest]);
-    at_limits["agent"] = longest.into();
+    at_limits["agent"] = serde_json::json!({ "name": longest, "model": "m".repeat(200) });
     at_limits["reviewers"] = serde_json::json!([]);
     for size in [11, 20] {
         at_limits["codeFontSize"] = size.into();
@@ -192,8 +195,12 @@ fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
             "is not valid settings JSON",
         ),
         (
-            "{\"version\": 2, \"settings\": {}}",
-            "written by a newer Postil (format version 2)",
+            "{\"version\": 3, \"settings\": {}}",
+            "written by a newer Postil (format version 3)",
+        ),
+        (
+            "{\"version\": 1, \"settings\": {\"agent\": 7}}",
+            "is not valid settings JSON: invalid type: integer `7`, expected struct AgentSlot",
         ),
         (
             "{\"version\": 0, \"settings\": {}}",
@@ -383,6 +390,253 @@ fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
         custom_settings(),
         "nor reset"
     );
+}
+
+#[test]
+fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_2() {
+    let repo = TempRepo::new("settings-v1");
+    let file = repo.config().join("settings.json");
+    fs::create_dir_all(repo.config()).unwrap();
+    let v1 = serde_json::json!({
+        "version": 1,
+        "settings": {
+            "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
+            "enabledAgents": ["Grok", "Local"],
+            "agent": "Local",
+            "reviewers": ["Grok", "Local"],
+        },
+    });
+    fs::write(&file, v1.to_string()).unwrap();
+    let site = repo.empty_site();
+
+    let view = get_json(&site, SETTINGS);
+    assert_eq!(view["problem"], serde_json::Value::Null, "{view}");
+    assert_eq!(
+        view["settings"]["agent"],
+        serde_json::json!({ "name": "Local", "model": null })
+    );
+    assert_eq!(
+        view["settings"]["reviewers"],
+        serde_json::json!([
+            { "name": "Grok", "model": null },
+            { "name": "Local", "model": null },
+        ])
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        v1.to_string(),
+        "reading writes nothing"
+    );
+
+    let mut changed = view["settings"].clone();
+    changed["reviewers"][0]["model"] = "grok-4.7".into();
+    let (status, reply) = save(&site, &changed.to_string());
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(stored["version"], 2);
+    assert_eq!(stored["settings"]["agent"], view["settings"]["agent"]);
+    assert_eq!(stored["settings"]["reviewers"][0]["model"], "grok-4.7");
+}
+
+#[test]
+fn a_model_id_with_a_stray_space_or_control_character_is_refused() {
+    let repo = TempRepo::new("settings-bad-model");
+    let site = repo.empty_site();
+    let file = repo.config().join("settings.json");
+    for model in ["", " pro ", "pro\n", "pro\u{7}", &"m".repeat(201)] {
+        let slot = serde_json::json!({ "name": "Local", "model": model });
+        let mut as_agent = custom_settings();
+        as_agent["agent"] = slot.clone();
+        let mut as_reviewer = custom_settings();
+        as_reviewer["reviewers"][1] = slot;
+        for settings in [as_agent, as_reviewer] {
+            let (status, reply) = save(&site, &settings.to_string());
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{model:?}: {reply}");
+            assert!(
+                reply.contains("the model of \"Local\" must be 1 to 200 characters"),
+                "{reply}"
+            );
+        }
+    }
+    // Only a file is read in the old shape: the page always sends slots.
+    let mut plain_name = custom_settings();
+    plain_name["agent"] = "Local".into();
+    let (status, reply) = save(&site, &plain_name.to_string());
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(reply.contains("expected struct AgentSlot"), "{reply}");
+    assert!(!file.exists(), "nothing was written");
+}
+
+#[test]
+fn gemini_is_found_as_agy_and_no_text_points_at_the_gemini_cli() {
+    let repo = TempRepo::new("settings-agy");
+    let bin = repo.root.join(".git/test-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let agy = bin.join("agy");
+    fs::write(&agy, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&agy, fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path = bin.into_os_string();
+    let site = Site::new(
+        Some(&repo.config()),
+        None,
+        None,
+        Scanner::new(move || search_path.clone()),
+        quiet(),
+    );
+
+    let agents = scanned_settings(&site)["agents"].clone();
+    let gemini = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["name"] == "Gemini")
+        .unwrap()
+        .clone();
+    assert_eq!(gemini["found"], agy.to_str().unwrap(), "{gemini}");
+    assert_eq!(gemini["command"], "agy acp");
+
+    let usage = |site: &Site| {
+        let body = get_json(site, "postil://localhost/api/usage?scope=all");
+        body["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["name"] == "Gemini")
+            .unwrap()["quota"]
+            .clone()
+    };
+    assert_eq!(usage(&site)["status"], "loading");
+    site.quotas.join_probes();
+    let quota = usage(&site);
+    assert_eq!(quota["status"], "unavailable", "{quota}");
+    let message = quota["message"].as_str().unwrap();
+    assert!(message.contains("agy"), "{message}");
+    assert!(!message.contains("gemini"), "{message}");
+
+    // Installed, so it is started for its models: as `agy acp`, which here exits at once.
+    let body = models_body(&["Gemini"], &[]);
+    let (status, reply) = post(&site, MODELS, &body);
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(
+        reply.contains(r#""Gemini":{"status":"loading"}"#),
+        "{reply}"
+    );
+    site.models.join_probes();
+    let (_, reply) = post(&site, MODELS, &body);
+    assert!(reply.contains("the agent exited"), "{reply}");
+}
+
+/// The body of `POST /api/agents/models`, as the page sends it.
+fn models_body(agents: &[&str], drafts: &[(&str, &str)]) -> String {
+    let drafts: Vec<_> = drafts
+        .iter()
+        .map(|(name, command)| serde_json::json!({ "name": name, "command": command }))
+        .collect();
+    serde_json::json!({ "agents": agents, "customAgents": drafts }).to_string()
+}
+
+const MODELS: &str = "postil://localhost/api/agents/models";
+
+#[test]
+fn agents_report_their_models_for_saved_and_unsaved_custom_agents() {
+    let repo = TempRepo::new("settings-models");
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let site = Site::new(
+        Some(&repo.config()),
+        None,
+        None,
+        Scanner::new(move || path.clone()),
+        quiet(),
+    );
+    let settings = serde_json::json!({
+        "customAgents": [{ "name": "Saved", "command": fake_agent("plain") }],
+        "enabledAgents": ["Saved"],
+    });
+    assert_eq!(save(&site, &settings.to_string()).0, StatusCode::OK);
+    site.agents.wait();
+    let body = models_body(
+        &["Saved", "Draft", "Broken"],
+        &[
+            ("Draft", &fake_agent("no-config")),
+            ("Broken", "/nonexistent/agent --acp"),
+        ],
+    );
+
+    let (status, reply) = post(&site, MODELS, &body);
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let first: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(first["loading"], true);
+    assert_eq!(first["models"]["Saved"]["status"], "loading");
+
+    site.models.join_probes();
+    let (status, reply) = post(&site, MODELS, &body);
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let done: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(done["loading"], false, "{done}");
+    // The boolean that also says "model" is passed over, and the group is flattened.
+    assert_eq!(
+        done["models"]["Saved"],
+        serde_json::json!({
+            "status": "ready",
+            "current": "m",
+            "options": [
+                { "value": "m", "name": "Model M" },
+                { "value": "pro", "name": "Pro", "description": "The careful one" },
+                { "value": "fast", "name": "Fast" },
+                { "value": "deep", "name": "Deep" },
+            ],
+        })
+    );
+    assert_eq!(
+        done["models"]["Draft"],
+        serde_json::json!({ "status": "ready", "current": "m", "options": [] }),
+        "an agent without a model select offers no choice"
+    );
+    assert_eq!(done["models"]["Broken"]["status"], "failed");
+    let error = done["models"]["Broken"]["error"].as_str().unwrap();
+    assert!(
+        error.contains("cannot find the agent's program /nonexistent/agent"),
+        "{error}"
+    );
+
+    // A rescan forgets what agents reported: an update may have changed their models.
+    let (status, reply) = post(&site, "postil://localhost/api/agents/rescan", "");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (_, reply) = post(&site, MODELS, &body);
+    let rescanned: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(rescanned["models"]["Saved"]["status"], "loading", "{reply}");
+    site.models.join_probes();
+
+    let (status, reply) = post(&site, MODELS, &models_body(&["Nobody"], &[]));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply.contains("there is no agent called \"Nobody\""),
+        "{reply}"
+    );
+    let quoted = models_body(&["Odd"], &[("Odd", "run \"a b\"")]);
+    let (status, reply) = post(&site, MODELS, &quoted);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(reply.contains("cannot hold quotes"), "{reply}");
+}
+
+#[test]
+fn a_built_in_agent_that_is_not_installed_is_not_started_for_its_models() {
+    let repo = TempRepo::new("settings-models-missing");
+    let site = repo.empty_site();
+    site.agents.wait();
+    let (status, reply) = post(&site, MODELS, &models_body(&["Claude"], &[]));
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let view: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(
+        view,
+        serde_json::json!({
+            "loading": false,
+            "models": { "Claude": { "status": "failed", "error": "Claude is not installed" } },
+        })
+    );
+    let (status, _) = get(&site, MODELS);
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[test]

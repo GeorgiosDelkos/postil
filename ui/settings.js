@@ -17,11 +17,23 @@ export function codeMetrics(fontSize) {
   return { fontSize, lineHeight: Math.round((fontSize * 22) / 13) };
 }
 
+// The agent notes are sent to and each reviewer are slots, `{ name, model }`: an agent and the
+// model it runs, `model` null for the agent's own default (src/settings.rs, AgentSlot).
+
 // What an agent is used for, in words, or null when it is free to disable or remove.
 export function usage(settings, name) {
-  if (settings.agent === name) return "notes are sent to it";
-  if (settings.reviewers.includes(name)) return "it reviews the agent's work";
+  if (settings.agent?.name === name) return "notes are sent to it";
+  if (settings.reviewers.some((slot) => slot.name === name)) return "it reviews the agent's work";
   return null;
+}
+
+// A slot in words: "Claude · Opus 5.5". The model's name is the agent's own when `report`, the
+// agent's reply of api/agents/models, offers it; else the id. The agent's default names none.
+export function formatSlot(slot, report) {
+  if (slot.model === null) return slot.name;
+  const offered = report?.status === "ready" ? report.options : [];
+  const option = offered.find((each) => each.value === slot.model);
+  return `${slot.name} · ${option?.name ?? slot.model}`;
 }
 
 // The agents as the dialog lists them, in the scan's order: built-in ones, then custom ones.
@@ -84,13 +96,15 @@ export function saveCustomAgent(settings, agent, previous, builtInNames) {
     };
   }
   const rename = (each) => (each === previous ? name : each);
+  // The model stays: the agent is the same one under another name.
+  const renameSlot = (slot) => ({ ...slot, name: rename(slot.name) });
   return {
     settings: {
       ...settings,
       customAgents: settings.customAgents.map((each) => (each.name === previous ? saved : each)),
       enabledAgents: settings.enabledAgents.map(rename),
-      agent: settings.agent === null ? null : rename(settings.agent),
-      reviewers: settings.reviewers.map(rename),
+      agent: settings.agent === null ? null : renameSlot(settings.agent),
+      reviewers: settings.reviewers.map(renameSlot),
     },
   };
 }
@@ -108,19 +122,36 @@ export function removeCustomAgent(settings, name) {
   };
 }
 
-// The agent notes are sent to; null for none. Only an enabled agent can be chosen.
+// The agent notes are sent to; null for none. Only an enabled agent can be chosen. Another
+// agent starts on its default model, since models are the agent's own; the same agent keeps
+// the model it has.
 export function setAgent(settings, name) {
-  if (name !== null && !settings.enabledAgents.includes(name)) {
-    return { error: `Turn ${name} on first.` };
-  }
-  return { settings: { ...settings, agent: name } };
+  if (name === null) return { settings: { ...settings, agent: null } };
+  if (!settings.enabledAgents.includes(name)) return { error: `Turn ${name} on first.` };
+  const model = settings.agent?.name === name ? settings.agent.model : null;
+  return { settings: { ...settings, agent: { name, model } } };
 }
 
-// Adds a reviewer at the end. The same agent may review more than once: each entry is one
-// independent review.
+// The model of the agent notes are sent to; null for the agent's default.
+export function setAgentModel(settings, model) {
+  if (settings.agent === null) return { error: "Choose the agent notes are sent to first." };
+  return { settings: { ...settings, agent: { ...settings.agent, model } } };
+}
+
+// Adds a reviewer at the end, on its default model. The same agent may review more than once:
+// each entry is one independent review, with a model of its own.
 export function addReviewer(settings, name) {
   if (!settings.enabledAgents.includes(name)) return { error: `Turn ${name} on first.` };
-  return { settings: { ...settings, reviewers: [...settings.reviewers, name] } };
+  const reviewers = [...settings.reviewers, { name, model: null }];
+  return { settings: { ...settings, reviewers } };
+}
+
+// The model of the reviewer at `index`; null for the agent's default.
+export function setReviewerModel(settings, index, model) {
+  const reviewers = settings.reviewers.map((slot, at) =>
+    at === index ? { ...slot, model } : slot,
+  );
+  return { settings: { ...settings, reviewers } };
 }
 
 export function removeReviewer(settings, index) {
