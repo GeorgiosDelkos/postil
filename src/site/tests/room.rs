@@ -318,7 +318,7 @@ fn a_record_of_version_1_is_read_and_written_back_as_the_current_version() {
 
     assert_eq!(run["status"], "ended", "{run}");
     let record: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    assert_eq!(record["version"], 3);
+    assert_eq!(record["version"], 4);
     assert!(
         record["threads"][0]["lastRun"].as_u64().unwrap() > 0,
         "{record}"

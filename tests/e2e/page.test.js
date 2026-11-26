@@ -7,6 +7,8 @@
 // the node under the pointer while it drew the run again (docs/review-2026-11-23.md, D4).
 
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { after, before, test } from "node:test";
 
 import { webkit } from "playwright-core";
@@ -468,6 +470,68 @@ test("c on a file's row writes a note on the file, with Discard and Save note", 
   // The file's row counts its note.
   const count = page.locator('#files .file[data-path="src/b.rs"] .count');
   await count.filter({ hasText: "1" }).waitFor();
+});
+
+test("q on a line asks about it, read-only, and its answer becomes a note on request", async (t) => {
+  const { page, api } = await openProject(t, "plain");
+  // A change the thread does not see: the composer says the agent reads the last commit.
+  const { root } = await api("api/repo");
+  writeFileSync(join(root, "scratch.txt"), "not committed\n");
+  await page.locator("#filter").fill("a.rs");
+  await page.locator("#filter").press("Enter");
+  await page.locator("#code-rows .n").filter({ hasText: /^1$/ }).click();
+  await page.keyboard.press("q");
+
+  const composer = page.locator("#code-rows .composer");
+  await composer.locator("label").filter({ hasText: "Ask on line 1" }).waitFor();
+  const warning = composer.locator(".send-warning");
+  await warning.filter({ hasText: "1 change since the last commit" }).waitFor();
+  await composer.locator("textarea").fill("Why one?");
+  await composer.locator("textarea").press("Meta+Enter");
+  await composer.waitFor({ state: "detached" });
+
+  // The ask's card by its id: Make it a note below adds N2 with the same text.
+  const card = page
+    .locator("#notes .note")
+    .filter({ has: page.locator(".note-id", { hasText: /^N1$/ }) });
+  await card.filter({ hasText: "Answered in R1" }).waitFor();
+  const asked = (await api("api/notes")).notes;
+  assert.deepEqual(
+    asked.map(({ id, intent }) => [id, intent]),
+    [["N1", "ask"]],
+  );
+  assert.equal(await card.locator(".note-send").count(), 0, "an ask is never sent");
+
+  await card.click();
+  const dialog = page.locator("#note-dialog");
+  await dialog.locator(".run-message").filter({ hasText: "Why one?" }).waitFor();
+  await dialog.getByRole("button", { name: "Make it a note" }).click();
+  await dialog.locator(".note-dialog-why").filter({ hasText: "Made a note" }).waitFor();
+  const made = (await api("api/notes")).notes.find((note) => note.id === "N2");
+  assert.deepEqual(
+    [made.intent, made.target, made.lines, made.body],
+    ["change", "lines", { start: 1, end: 1 }, "Why one?"],
+  );
+
+  await dialog.getByRole("button", { name: "Open R1" }).click();
+  const detail = page.locator("#run-detail");
+  await detail.locator(".run-thread-state").filter({ hasText: "Read-only" }).waitFor();
+  for (const name of ["Apply", "Open pull request", "Review", "Changes"]) {
+    assert.equal(await detail.getByRole("button", { name, exact: true }).count(), 0, name);
+  }
+
+  // Resolving the ask ends its thread, and the run's dialog says so, with no Discard left.
+  await page.keyboard.press("Escape");
+  await detail.waitFor({ state: "hidden" });
+  await card.click();
+  await dialog.getByRole("button", { name: "Resolve" }).click();
+  // Resolve keeps the note dialog open, as for a change note: its button turns to Reopen.
+  await dialog.getByRole("button", { name: "Reopen" }).waitFor();
+  await card.filter({ hasText: "Resolved" }).waitFor();
+  assert.equal((await api("api/thread?id=R1")).state, "discarded");
+  await dialog.getByRole("button", { name: "Open R1" }).click();
+  await detail.locator(".run-thread-state").filter({ hasText: "Ended" }).waitFor();
+  assert.equal(await detail.getByRole("button", { name: "Discard" }).count(), 0);
 });
 
 test("the run's dialog shows its branch, and Apply ends the thread once the run stops", async (t) => {

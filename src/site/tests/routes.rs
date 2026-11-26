@@ -61,6 +61,12 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     ("/api/run/question", &[Method::POST], "POST"),
     ("/api/run/review", &[Method::POST], "POST"),
     ("/api/run/follow", &[Method::POST], "POST"),
+    ("/api/run/ask", &[Method::POST], "POST {\"note\": {...}}"),
+    (
+        "/api/run/uncommitted",
+        &[Method::GET],
+        "GET, with ?file=<path> for a file",
+    ),
 ];
 
 const METHODS: [Method; 5] = [

@@ -33,7 +33,7 @@ use crate::github::{self, NewPullRequest};
 use crate::notes;
 use crate::run::log::hold_thread_lock;
 use crate::run::{Runner, Slot, lock};
-use crate::thread::{self, PullRequest, PullState, State, Thread};
+use crate::thread::{self, Mode, PullRequest, PullState, State, Thread};
 
 /// The longest title a pull request takes from a note, in characters: GitHub shows about this
 /// much in a list. Arbitrary.
@@ -112,9 +112,9 @@ impl Runner {
     ///
     /// [`Error::NoHome`]; [`Error::TurnRunning`] while the thread is busy in this window, and
     /// [`Error::RunElsewhere`] while another window holds its lock; [`Error::BadRequest`] for
-    /// no open or evicted thread `id`, one with a pull request already, or one being opened;
-    /// [`Error::PullRequestRefused`] with the reason (module docs); as [`thread::check`], for
-    /// work Postil did not commit; and the git errors.
+    /// no open or evicted thread `id`, one that only reads, one with a pull request already, or
+    /// one being opened; [`Error::PullRequestRefused`] with the reason (module docs); as
+    /// [`thread::check`], for work Postil did not commit; and the git errors.
     pub(crate) fn open_pull_request(self: &Arc<Self>, id: &str) -> Result<()> {
         // Before the thread's lock, which an opening of this window holds: taking it again
         // would wait out its patience and blame another window.
@@ -186,6 +186,11 @@ impl Runner {
             Some(thread) if matches!(thread.state, State::Open | State::Evicted) => thread,
             _ => return Err(Error::BadRequest(format!("there is no open thread {id}"))),
         };
+        if thread.mode == Mode::Read {
+            return Err(Error::BadRequest(format!(
+                "thread {id} only reads: it has no changes for a pull request"
+            )));
+        }
         if let Some(pull) = &thread.pull_request {
             return Err(Error::BadRequest(format!(
                 "{id} has a pull request already: {}",

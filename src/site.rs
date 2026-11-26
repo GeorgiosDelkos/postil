@@ -550,14 +550,31 @@ struct PreviewView {
     /// The files linked after the text, relative to the repository root. A folder note's
     /// folder is not among them (`notes::Prompt::files`).
     files: Vec<String>,
+    #[serde(flatten)]
+    uncommitted: UncommittedView,
+}
+
+/// The reply to `/api/run/uncommitted`, and part of `/api/run/preview`'s.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UncommittedView {
     /// How many changes the engineer's working tree has since the last commit, as `git status`
     /// lists them, which the thread, started from that commit, does not see (docs/design.md,
     /// "Threads"); `None` when the status could not be read, which the page says.
     uncommitted: Option<usize>,
-    /// The linked files among them: their notes' lines may not match the agent's copy.
+    /// The files asked about among them (the linked files of a preview, the file of an ask):
+    /// their notes' lines may not match the agent's copy.
     uncommitted_noted: Vec<String>,
     /// Why `git status` failed, when `uncommitted` is `None`.
     uncommitted_error: Option<String>,
+}
+
+/// The body of `POST /api/run/ask`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AskRun {
+    /// The question, a new note as `POST /api/notes` takes one.
+    note: NewNote,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
@@ -724,11 +741,17 @@ impl Site {
             },
             "/api/notes" => self.respond_notes(method, query, body),
             "/api/notes/resolve" => match *method {
-                Method::POST => self.change_note(query, notes::resolve),
+                Method::POST => self.change_note(query, |site, repo, id| {
+                    // An ask's thread ends first, freeing its worktree; refused while it runs.
+                    if notes::is_ask(repo, id)? {
+                        site.runner()?.end_ask(id)?;
+                    }
+                    notes::resolve(repo, id)
+                }),
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/notes/reopen" => match *method {
-                Method::POST => self.change_note(query, notes::reopen),
+                Method::POST => self.change_note(query, |_, repo, id| notes::reopen(repo, id)),
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/folders" => match *method {
@@ -883,15 +906,15 @@ impl Site {
     }
 
     /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
-    /// changes the note's state with `change` (`notes::resolve` or `notes::reopen`), and
-    /// returns all notes.
-    fn change_note(&self, query: &str, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
+    /// changes the note's state with `change` (around `notes::resolve` or `notes::reopen`),
+    /// and returns all notes.
+    fn change_note(&self, query: &str, change: fn(&Self, &Repo, &str) -> Result<Review>) -> Reply {
         let Some(id) = query_value(query, "id") else {
             return bad_request("expected ?id=<note id>");
         };
         json_or_error(
             self.repo()
-                .and_then(|repo| change(&repo, &id))
+                .and_then(|repo| change(self, &repo, &id))
                 .map(|review| to_json(&review)),
         )
     }
@@ -1010,6 +1033,14 @@ impl Site {
                 Method::POST => json_or_error(self.follow_up(body)),
                 _ => not_allowed("POST"),
             },
+            "/api/run/ask" => match *method {
+                Method::POST => json_or_error(self.ask(body)),
+                _ => not_allowed("POST {\"note\": {...}}"),
+            },
+            "/api/run/uncommitted" => match *method {
+                Method::GET => json_or_error(self.uncommitted(query)),
+                _ => not_allowed("GET, with ?file=<path> for a file"),
+            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -1093,13 +1124,43 @@ impl Site {
         Ok(b"{}".to_vec())
     }
 
+    /// The reply to `POST /api/run/ask` `{"note": {...}}`: asks the question in the body, a new
+    /// note as `POST /api/notes` takes one, of the settings' agent, and returns every note, the
+    /// ask last (`Runner::ask`). The page fetches the run, as after a send.
+    fn ask(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: AskRun = parse_body(body, Error::InvalidNote)?;
+        let agent = self.current_settings().default_agent()?;
+        let review = self.runner()?.ask(agent, request.note)?;
+        Ok(to_json(&review))
+    }
+
+    /// The reply to `GET /api/run/uncommitted`, with `?file=<path>` for an ask on a file: the
+    /// engineer's changes since the last commit, which a new thread does not see, and whether
+    /// the file is among them, as the send step's preview says for its notes.
+    fn uncommitted(&self, query: &str) -> Result<Vec<u8>> {
+        let files: Vec<String> = query_value(query, "file").into_iter().collect();
+        // Answers no-project as the other run routes do, before reading the working tree.
+        self.runner()?;
+        Ok(to_json(&self.uncommitted_among(&files)?))
+    }
+
     /// The reply to `GET /api/run/preview?notes=N1,N2`.
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
         let prompt = self.runner()?.preview(&ids)?;
-        // One `git status` each time the send step reads the prompt, on the request thread:
-        // as long as `git status` in a terminal ([`Repo::uncommitted`]). One that fails costs
-        // the warning, not the prompt.
+        let uncommitted = self.uncommitted_among(&prompt.files)?;
+        Ok(to_json(&PreviewView {
+            prompt: prompt.text,
+            files: prompt.files,
+            uncommitted,
+        }))
+    }
+
+    /// The engineer's changes since the last commit, and which of `files` are among them.
+    fn uncommitted_among(&self, files: &[String]) -> Result<UncommittedView> {
+        // One `git status` each time the send step reads the prompt or an ask opens, on the
+        // request thread: as long as `git status` in a terminal ([`Repo::uncommitted`]). One
+        // that fails costs the warning, not the prompt or the question.
         let (entries, uncommitted_error) = match self.repo()?.uncommitted() {
             Ok(entries) => (Some(entries), None),
             Err(error) => (None, Some(error_chain(&error))),
@@ -1117,20 +1178,16 @@ impl Site {
                 .iter()
                 .any(|path| *path == file || (path.ends_with('/') && file.starts_with(*path)))
         };
-        let uncommitted_noted = prompt
-            .files
+        let uncommitted_noted = files
             .iter()
             .filter(|file| is_uncommitted(file))
             .cloned()
             .collect();
-        let uncommitted = entries.as_ref().map(Vec::len);
-        Ok(to_json(&PreviewView {
-            prompt: prompt.text,
-            files: prompt.files,
-            uncommitted,
+        Ok(UncommittedView {
+            uncommitted: entries.as_ref().map(Vec::len),
             uncommitted_noted,
             uncommitted_error,
-        }))
+        })
     }
 
     /// The reply to `POST /api/run/permission`.

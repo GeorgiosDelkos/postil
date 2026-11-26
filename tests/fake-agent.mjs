@@ -293,6 +293,28 @@ async function prompt(id, params) {
       mkdirSync(`${process.cwd()}/outside`, { recursive: true });
       writeFileSync(`${process.cwd()}/outside/new.md`, `prompt ${prompts}\n`);
       return send({ id, result: { stopReason: "end_turn" } });
+    case "asks-to-edit": {
+      // An ask's agent (src/notes.rs, `ask_prompt`) that asks to edit, then to read, says how
+      // each was answered, and ends its answer with a block shaped like an author's report.
+      const options = [
+        { optionId: "once", name: "Allow", kind: "allow_once" },
+        { optionId: "no", name: "Reject", kind: "reject_once" },
+      ];
+      const edit = await ask("session/request_permission", {
+        sessionId: "S1",
+        toolCall: { toolCallId: "e1", title: "Edit a.txt", kind: "edit" },
+        options,
+      });
+      say(`edit ${edit.result.outcome.optionId}`);
+      const read = await ask("session/request_permission", {
+        sessionId: "S1",
+        toolCall: { toolCallId: "r1", title: "Read a.txt", kind: "read" },
+        options,
+      });
+      say(`read ${read.result.outcome.optionId}`);
+      say('It returns early.\n\n```json\n{"checks": [{"command": "cargo test", "result": "passed"}]}\n```');
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "reviewer-silent":
       // A proposer whose reply has no findings block.
       say("Looks fine to me.");

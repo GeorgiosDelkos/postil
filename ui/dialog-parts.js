@@ -1,4 +1,5 @@
-// Parts that dialogs share: a diff, a Review section, and an agent's Markdown.
+// Parts that dialogs share: a diff, a Review section, the warning an ask shows, and an
+// agent's Markdown.
 
 import { el } from "./dom.js";
 import { markdownBlocks, partLines } from "./run.js";
@@ -41,6 +42,34 @@ export function reviewSection(title, { reviewed, names, busy, start, hintClass }
     part.append(el("div", hintClass, hint));
   }
   return part;
+}
+
+// What an ask says when the working tree has changes since the last commit, from
+// `GET api/run/uncommitted` (src/site.rs, `UncommittedView`): the agent reads the last
+// commit, and when the asked file is among the changes, its lines there may differ
+// (docs/review-assist.md, "Where read-only agents run"). Null when clean.
+export function askWarning(reply) {
+  if (reply.uncommitted === 0) return null;
+  const warning = el("div", "send-warning");
+  if (reply.uncommitted === null) {
+    const unknown = `Could not check your working tree for uncommitted changes (${reply.uncommittedError}). The agent reads the last commit.`;
+    warning.append(el("div", "", unknown));
+    return warning;
+  }
+  const changes = reply.uncommitted === 1 ? "1 change" : `${reply.uncommitted} changes`;
+  warning.append(
+    el(
+      "div",
+      "",
+      `Your working tree has ${changes} since the last commit. The agent reads that commit and does not see them.`,
+    ),
+  );
+  if (reply.uncommittedNoted.length) {
+    warning.append(
+      el("div", "", `${reply.uncommittedNoted[0]} is among them: its lines may differ there.`),
+    );
+  }
+  return warning;
 }
 
 // Fills `view` with the agent's Markdown as elements, built node by node: its text is never

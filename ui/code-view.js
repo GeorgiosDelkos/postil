@@ -1,6 +1,7 @@
 // The code pane: the open file as a virtual list, the selection of lines, copying, the
 // right-click menu's actions on the code, and the composer that writes a note.
 
+import { askWarning } from "./dialog-parts.js";
 import { $, el } from "./dom.js";
 import { onLines } from "./note-place.js";
 import { shouldReveal } from "./tree.js";
@@ -23,7 +24,8 @@ const COMPOSER_HEIGHT_GUESS = 138;
 // - `beforeOpen()` clears what covers the code pane before a file opens there;
 // - `headerHeld()` says whether another view holds the pane's header, so a file read again
 //   under it leaves the header alone;
-// - `onComposerClosed()` redraws what a saved note changes outside the code.
+// - `onComposerClosed()` redraws what a saved note changes outside the code;
+// - `onAsked()` follows the run a question asked from the composer started.
 export function codeView({
   state,
   codeEl,
@@ -36,6 +38,7 @@ export function codeView({
   beforeOpen,
   headerHeld,
   onComposerClosed,
+  onAsked,
 }) {
   // One code line's height in px: `--line-height` in app.css until the settings arrive, then
   // what they give (`setLineHeight`).
@@ -504,6 +507,13 @@ export function codeView({
         disabled: Boolean(state.composer),
       },
       {
+        label: "Ask",
+        key: "Q",
+        matches: (event) => event.key === "q" && !event.metaKey,
+        run: () => openComposer(range, { intent: "ask" }),
+        disabled: Boolean(state.composer),
+      },
+      {
         label: "Copy",
         key: "⌘C",
         matches: (event) => event.key === "c" && event.metaKey,
@@ -527,8 +537,10 @@ export function codeView({
 
   // Opens the composer on `range` (0-based lines), by default the selection. The context
   // menu passes the lines it was opened on, so its Add note acts on them whatever happened
-  // to the selection between the right-click and the click.
-  function openComposer(range = selectedRange()) {
+  // to the selection between the right-click and the click. With `intent` "ask" it asks a
+  // question about the lines instead (docs/review-assist.md, "Ask without changing"): saving
+  // sends it at once to the default agent, which only reads.
+  function openComposer(range = selectedRange(), { intent = "change" } = {}) {
     if (!range || state.composer) return;
     state.selection = { anchor: range.start, head: range.end };
 
@@ -539,11 +551,36 @@ export function codeView({
       codeEl.scrollTop = top - codeEl.clientHeight / 3;
     }
 
-    const composer = { ...range, text: "", saving: false, node: null };
+    const composer = { ...range, intent, text: "", saving: false, node: null };
     composer.node = buildComposer(composer);
     state.composer = composer;
     renderCode({ force: true });
     composer.node.querySelector("textarea").focus();
+    if (intent === "ask") showAskWarning(composer);
+  }
+
+  // Asks a question about the selected lines, as `q` does.
+  function askOnSelection() {
+    openComposer(selectedRange(), { intent: "ask" });
+  }
+
+  // The working tree's changes since the last commit, above the question once read: the agent
+  // reads that commit, and the asked file's lines may differ there. Nothing when they cannot be
+  // read: the question can go all the same.
+  async function showAskWarning(composer) {
+    const path = state.file.path;
+    let reply = null;
+    try {
+      const response = await fetch(`api/run/uncommitted?file=${encodeURIComponent(path)}`);
+      if (response.ok) reply = await response.json();
+    } catch {
+      // A request that never got an answer costs the warning only.
+    }
+    if (!reply || state.composer !== composer) return;
+    const warning = askWarning(reply);
+    if (!warning || state.composer !== composer) return;
+    composer.node.querySelector("textarea").before(warning);
+    measureComposer(composer.node);
   }
 
   // Closes the composer, saving its text as a note first when `save` is set. When saving
@@ -551,13 +588,14 @@ export function codeView({
   async function closeComposer({ save }) {
     const composer = state.composer;
     if (!composer || composer.saving) return;
-    if (save && composer.text.trim()) {
+    const saves = save && composer.text.trim() !== "";
+    if (saves) {
       composer.saving = true;
       let failure;
       try {
         failure = await saveNote(composer);
       } catch (error) {
-        failure = `cannot save the note: ${error}`;
+        failure = `cannot ${composer.intent === "ask" ? "ask" : "save the note"}: ${error}`;
       } finally {
         composer.saving = false;
       }
@@ -572,20 +610,25 @@ export function codeView({
     state.selection = null;
     renderCode({ force: true });
     onComposerClosed();
+    if (saves && composer.intent === "ask") onAsked();
     codeEl.focus();
   }
 
   // Sends the composer's note to the Rust process with the text the page showed on its lines,
-  // so a file changed on disk meanwhile cannot attach the note to other text. Returns the
-  // reason on failure, or null.
+  // so a file changed on disk meanwhile cannot attach the note to other text; a question goes
+  // to `api/run/ask`, which saves it only once its run starts (src/run.rs, `Runner::ask`).
+  // Returns the reason on failure, or null.
   async function saveNote(composer) {
-    const request = {
+    const note = {
       path: state.file.path,
       lines: { start: composer.start + 1, end: composer.end + 1 },
       snippet: linesText(composer),
       body: composer.text,
     };
-    const response = await fetch("api/notes", { method: "POST", body: JSON.stringify(request) });
+    const response =
+      composer.intent === "ask"
+        ? await fetch("api/run/ask", { method: "POST", body: JSON.stringify({ note }) })
+        : await fetch("api/notes", { method: "POST", body: JSON.stringify(note) });
     if (!response.ok) return await response.text();
     state.notes = (await response.json()).notes;
     indexNotes();
@@ -596,11 +639,16 @@ export function codeView({
   function buildComposer(composer) {
     const node = $("composer-template").content.firstElementChild.cloneNode(true);
 
+    const kind = composer.intent === "ask" ? "Ask" : "Note";
     const label =
       composer.start === composer.end
-        ? `Note on line ${composer.start + 1}`
-        : `Note on lines ${composer.start + 1} to ${composer.end + 1}`;
+        ? `${kind} on line ${composer.start + 1}`
+        : `${kind} on lines ${composer.start + 1} to ${composer.end + 1}`;
     node.querySelector("label").textContent = label;
+    if (composer.intent === "ask") {
+      node.querySelector("[data-action=save]").textContent = "Ask";
+      node.querySelector(".hint").textContent = "⌘↵ ask · esc discard";
+    }
 
     const textarea = node.querySelector("textarea");
     textarea.addEventListener("input", () => {
@@ -671,6 +719,7 @@ export function codeView({
     clearSelection,
     copyLines,
     openComposer,
+    askOnSelection,
     closeComposer,
   };
 }

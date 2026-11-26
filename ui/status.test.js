@@ -315,6 +315,47 @@ const streaming = (id, status, entries, extra = {}) => ({
   ...extra,
 });
 
+test("an ask is answered when its run ends well, with no line naming it", () => {
+  const ask = { ...sent("N1", "R1"), intent: "ask" };
+  const status = (r) => runStatus(ask, r);
+  const answer = [said("It returns early because the list is empty."), ended("end_turn")];
+  assert.deepEqual(status(run("R1", "ended", answer)), {
+    kind: "answered",
+    label: "Answered in R1",
+    tone: "done",
+  });
+  assert.equal(status(run("R1", "ended", [ended("cancelled")])).label, "Stopped in R1");
+  assert.equal(status(run("R1", "failed")).label, "Failed in R1");
+  assert.equal(status(run("R1", "running")).label, "Working");
+  assert.equal(
+    noteStatus({ ...ask, state: { kind: "resolved", run: "R1" } }, run("R1", "ended", answer))
+      .label,
+    "Resolved",
+  );
+  const groups = groupNotes([ask], () => status(run("R1", "ended", answer)));
+  assert.deepEqual(groups.done, [ask], "an answered ask is done");
+});
+
+test("an ask's dialog is drawn again as its answer streams, and on an undone edit", () => {
+  const ask = { ...sent("N1", "R1"), intent: "ask" };
+  const shown = [false, "Claude", [], true];
+  const key = (entries, problem = null) =>
+    noteDialogKey(ask, { ...streaming("R1", "running", entries), problem }, null, shown);
+  const start = [said("It returns")];
+  const drawn = key(start);
+  assert.notEqual(key([...start, said(" early.")]), drawn, "the answer it shows whole");
+  assert.notEqual(
+    key(start, "the agent changed files, though it may only read: its changes were undone"),
+    drawn,
+    "the notice above the answer",
+  );
+  // A change note's dialog shows only the agent's line about it, not the reply.
+  const change = sent("N1", "R1");
+  const changeKey = (entries) =>
+    noteDialogKey(change, streaming("R1", "running", entries), null, shown);
+  assert.equal(changeKey([...start, said(" early.")]), changeKey(start));
+});
+
 test("the note dialog keeps its key while its run streams what the dialog does not show", () => {
   const note = sent("N1", "R1");
   const shown = [true, "Claude", ["Codex"], true];
@@ -378,6 +419,18 @@ test("the run dialog keeps its key while the agent streams its reply and thought
     "the reply shows",
   );
   assert.equal(replyText(streaming("R1", "ended", start)), "Done");
+});
+
+test("an undone edit redraws the run dialog with its notice", () => {
+  // The server sets the run's problem from the `undone` entry (src/run/log.rs, `apply`), live
+  // and after a restart; the dialog shows it under the reply.
+  const start = [said("It returns early.")];
+  const text = "the agent changed files, though it may only read: its changes were undone";
+  const drawn = threadKey([streaming("R1", "running", start)]);
+  const undone = threadKey([
+    streaming("R1", "running", [...start, { kind: "undone", text }], { problem: text }),
+  ]);
+  assert.notEqual(undone, drawn);
 });
 
 const fenced = (json) => "```json\n" + json + "\n```";

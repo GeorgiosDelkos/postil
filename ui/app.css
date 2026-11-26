@@ -2322,6 +2322,12 @@ body.keyboard-input .slot-add:focus-visible {
   font-size: 12px;
 }
 
+/* In the ask composer and the ask dialog, the same warning sits above the question. */
+.composer .send-warning,
+.path-note .send-warning {
+  margin-bottom: 8px;
+}
+
 .prompt-links {
   display: flex;
   flex-wrap: wrap;
@@ -2963,6 +2969,7 @@ body.resizing * {
 }
 
 .status-icon.addressed,
+.status-icon.answered,
 .status-icon.resolved {
   border: 0;
   background: var(--added);

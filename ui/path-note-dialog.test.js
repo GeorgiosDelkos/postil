@@ -41,6 +41,10 @@ class FakeElement extends EventTarget {
     }
   }
 
+  prepend(item) {
+    this.children.unshift(item);
+  }
+
   replaceChildren(...items) {
     this.children = [];
     this.append(...items);
@@ -199,5 +203,68 @@ test("a save error keeps the dialog open with the draft and shows the reason", (
     assert.equal(
       dialogEl.querySelector(".note-dialog-why").textContent,
       "src/gone.rs is not a file in the repository",
+    );
+  }));
+
+// All the text under `node`, its children's in order.
+function textOf(node) {
+  return [node.textContent, ...node.children.map(textOf)].join("");
+}
+
+test("an ask on a file says what the agent cannot see, and asks instead of saving", () =>
+  withFakeDom(async () => {
+    const asked = [];
+    const checked = [];
+    const dialogEl = new FakeElement("dialog");
+    const dialog = pathNoteDialog(dialogEl, {
+      add: async () => assert.fail("an ask is not saved as a note"),
+      ask: async (...args) => {
+        asked.push(args);
+        return null;
+      },
+      uncommitted: async (...args) => {
+        checked.push(args);
+        return { uncommitted: 2, uncommittedNoted: ["src/a.rs"], uncommittedError: null };
+      },
+    });
+
+    dialog.open("src/a.rs", "file", { intent: "ask" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.deepEqual(checked, [["src/a.rs", "file"]]);
+    const warning = dialogEl.querySelector(".send-warning");
+    assert.match(textOf(warning), /2 changes since the last commit/);
+    assert.match(textOf(warning), /src\/a\.rs is among them/);
+    assert.match(textOf(dialogEl.querySelector(".path-note-save")), /^Ask/);
+    dialogEl.querySelector(".path-note-input").value = "Why two passes?";
+    assert.equal(metaEnter(dialogEl), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(asked, [["src/a.rs", "file", "Why two passes?"]]);
+    assert.equal(dialogEl.open, false);
+  }));
+
+test("an ask on a folder in a clean tree shows no warning, and a refusal keeps the question", () =>
+  withFakeDom(async () => {
+    const dialogEl = new FakeElement("dialog");
+    const dialog = pathNoteDialog(dialogEl, {
+      add: async () => null,
+      ask: async () => "3 agents already work in this repository",
+      uncommitted: async () => ({ uncommitted: 0, uncommittedNoted: [], uncommittedError: null }),
+    });
+
+    dialog.open("src", "folder", { intent: "ask" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(dialogEl.querySelector(".send-warning"), null);
+
+    const input = dialogEl.querySelector(".path-note-input");
+    input.value = "What is in here?";
+    dialogEl.querySelector(".path-note-save").click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(dialogEl.open, true);
+    assert.equal(input.value, "What is in here?");
+    assert.equal(
+      dialogEl.querySelector(".note-dialog-why").textContent,
+      "3 agents already work in this repository",
     );
   }));

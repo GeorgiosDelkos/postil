@@ -3,6 +3,7 @@
 //! The `notes` and `settings` areas hide `crate::notes` and `crate::settings` from
 //! `use super::*`: an area that needs those modules imports them by path.
 
+mod asks;
 mod files;
 mod notes;
 mod page_e2e;

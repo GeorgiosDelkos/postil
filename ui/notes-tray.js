@@ -9,7 +9,7 @@
 
 import { $, actOnSecondClick, agentLogoIcon, el, showToast, statusIcon } from "./dom.js";
 import { fullPlace, shortPlace } from "./note-place.js";
-import { isOpen, isResolved, promptLines, sendable } from "./run.js";
+import { isAsk, isResolved, promptLines, sendable, waitsToSend } from "./run.js";
 import { formatSlot } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
@@ -62,8 +62,9 @@ export function notesTray({
     }
     if (state.send) {
       drawnNotes = null;
-      // A resolved note is sent only once reopened (src/notes.rs, `resolve`).
-      notesEl.replaceChildren(...state.notes.filter((note) => !isResolved(note)).map(sendItem));
+      // A resolved note is sent only once reopened (src/notes.rs, `resolve`), and an ask never.
+      const offered = state.notes.filter((note) => !isResolved(note) && !isAsk(note));
+      notesEl.replaceChildren(...offered.map(sendItem));
       return;
     }
 
@@ -130,7 +131,7 @@ export function notesTray({
       body: note.body,
       outdated: note.anchor === "lost",
       status,
-      sendable: canSendAlone() && !isResolved(note) && !inLiveRun(note),
+      sendable: canSendAlone() && !isResolved(note) && !isAsk(note) && !inLiveRun(note),
     };
   }
 
@@ -244,7 +245,7 @@ export function notesTray({
 
   function renderSendBar() {
     renderFocusPill();
-    const open = state.notes.filter(isOpen).length;
+    const open = state.notes.filter(waitsToSend).length;
     const shown =
       state.projectOpen &&
       state.tab === "notes" &&
@@ -274,7 +275,7 @@ export function notesTray({
   // Focus mode's pill (app.js, `toggleFocus`): the open notes' count and Send.
   function renderFocusPill() {
     const pill = $("focus-pill");
-    const open = state.notes.filter(isOpen).length;
+    const open = state.notes.filter(waitsToSend).length;
     pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
     if (open > 0 && !runs.full()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
     pill.disabled = open === 0 || runs.full();
