@@ -49,9 +49,9 @@ from a thread's branch and reads back only that pull request's state.
    also copies the selection (code only, never the line numbers) and its `path:lines`
    reference. `v`/`j`/`k` is not built yet.
    A note can also be on a whole file or folder: right-click its row in the file list and
-   choose Add Note (or press `c` on a focused row). A dialog takes the text and offers Save,
-   which keeps the note in the tray, and Send to the default agent, which keeps it and sends it
-   alone at once. Both store the note first, so a send that fails leaves it to send again.
+   choose Add Note (or press `c` on a focused row). A dialog takes the text and saves the note to
+   the tray (`Save note` or `Cmd-Enter`, `Discard` or `Esc`), just like the inline composer, so
+   the engineer decides when and how to send it from the tray or its detail dialog.
    Asked for by the owner on 2026-11-24, as a modal over the window rather than the inline
    composer, which belongs to lines of code.
 4. **Collect.** Notes list in the tray on the right, grouped by file. Clicking one jumps to its
