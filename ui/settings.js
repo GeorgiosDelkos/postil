@@ -65,6 +65,10 @@ export function saveCustomAgent(settings, agent, previous, builtInNames) {
     return { error: `There is already an agent called ${name}.` };
   }
   if (!command) return { error: "Give the command that starts the agent." };
+  const program = command.split(/\s+/)[0];
+  if (program.includes("/") && !program.startsWith("/")) {
+    return { error: `The program must be on PATH or an absolute path, not ${program}.` };
+  }
   if (/["'\\]/.test(command)) {
     return { error: "The command is split on spaces as it is: it cannot hold quotes or \\." };
   }

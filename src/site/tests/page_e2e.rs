@@ -1,14 +1,21 @@
 //! The page's end-to-end tests (`tests/e2e/`): the page in Playwright's WebKit, talking to
-//! real sites over HTTP on localhost, each with the fake agent (`tests/fake-agent.mjs`) in its
-//! `flood` scenario. They catch what the page's unit tests cannot: a click lost because the
-//! node under the pointer was replaced while a run streams.
+//! real sites over HTTP on localhost, each with the fake agent (`tests/fake-agent.mjs`) in the
+//! scenario its test asks for, `flood` unless it names another. They catch what the page's
+//! unit tests cannot: a click lost because the node under the pointer was replaced while a run
+//! streams.
 //!
 //! The app serves the page on the `postil://` scheme and tells it a run changed by calling
 //! `window.postil.runChanged()` (`shell.rs`). A browser driven by Playwright can do neither,
 //! so this bridge stands in for the window:
 //! - `POST /new` opens a new project, a fresh repository holding `src/a.rs`, `src/b.rs` and
 //!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
-//!   starts from nothing.
+//!   starts from nothing. Its body `{"scenario": "..."}` names the fake agent's scenario
+//!   (`openProject` in the tests sends `flood` unless told another); without one it is
+//!   refused.
+//! - `POST /new-fresh` makes a site the same way, but it opens no project, has no
+//!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
+//!   startup wizard open. `POST /new-fresh-gemini` does the same with a `gemini` program on
+//!   the search path, so the wizard finds that built-in agent installed.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -97,9 +104,30 @@ fn serve(requests: mpsc::Receiver<Asked>) {
 
 fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: TcpStream) {
     let path = request.uri().path();
-    if path == "/new" {
+    let start = match path {
+        "/new" => {
+            let asked: serde_json::Value =
+                serde_json::from_slice(request.body()).unwrap_or_default();
+            // Refused, not defaulted: a misspelled field would otherwise run `flood` and fail
+            // the test far from here. A 400 and not a panic, which would end this thread and
+            // leave the suite to its timeout.
+            let Some(scenario) = asked["scenario"].as_str() else {
+                let body = &b"POST /new needs {\"scenario\": \"...\"}"[..];
+                write_reply(
+                    &mut stream,
+                    &reply(StatusCode::BAD_REQUEST, "text/plain", body),
+                );
+                return;
+            };
+            Some(Start::FakeAgent(scenario.to_owned()))
+        }
+        "/new-fresh" => Some(Start::FirstRun),
+        "/new-fresh-gemini" => Some(Start::FirstRunWithGemini),
+        _ => None,
+    };
+    if let Some(start) = start {
         let base = format!("/s{}/", sites.len());
-        sites.push(bridged(sites.len()));
+        sites.push(bridged(sites.len(), start));
         let body = serde_json::json!({ "base": base }).to_string();
         write_reply(
             &mut stream,
@@ -139,8 +167,23 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
     write_reply(&mut stream, &bridged.site.respond(&request));
 }
 
-/// A new site on a fresh repository, the `number`th the bridge opened.
-fn bridged(number: usize) -> Bridged {
+/// What a new bridged site starts from.
+#[derive(Debug)]
+enum Start {
+    /// The repository open as the project, with the fake agent in this scenario.
+    FakeAgent(String),
+    /// No project, no `settings.json` and an empty search path, as on a first launch: the
+    /// page shows the welcome screen with the startup wizard over it.
+    FirstRun,
+    /// As [`Start::FirstRun`], with a `gemini` program on the search path, so the wizard
+    /// finds one built-in agent installed.
+    FirstRunWithGemini,
+}
+
+/// A new site, the `number`th the bridge opened, on a new repository holding `src/a.rs`,
+/// `src/b.rs` and `src/c.rs`. With [`Start::FirstRun`] the repository supplies only the
+/// configuration and home directories.
+fn bridged(number: usize, start: Start) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
     repo.write("src/a.rs", "one\ntwo\nthree\n");
     // For the file filter to list several matches.
@@ -156,10 +199,38 @@ fn bridged(number: usize) -> Bridged {
             listeners.retain_mut(|stream| stream.write_all(b"data: run\n\n").is_ok());
         })
     };
+    let site = match start {
+        Start::FakeAgent(scenario) => agent_site(&repo, &scenario, notify),
+        // An empty search path, so agents installed on the developer's or runner's PATH
+        // cannot change the wizard's first-run defaults.
+        Start::FirstRun => Site::new(
+            Some(&repo.config()),
+            Some(&repo.home()),
+            None,
+            no_agents(),
+            notify,
+        ),
+        Start::FirstRunWithGemini => {
+            // Found by name only: the wizard never starts it.
+            let bin = repo.root.join(".git/test-bin");
+            fs::create_dir_all(&bin).unwrap();
+            let gemini = bin.join("gemini");
+            fs::write(&gemini, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&gemini, fs::Permissions::from_mode(0o755)).unwrap();
+            let search_path = bin.into_os_string();
+            Site::new(
+                Some(&repo.config()),
+                Some(&repo.home()),
+                None,
+                Scanner::new(move || search_path.clone()),
+                notify,
+            )
+        }
+    };
     Bridged {
         // A stub quota source: a live one would read the developer's real credentials and
         // call the providers with them from a test.
-        site: agent_site(&repo, "flood", notify).with_quota_poller(QuotaPoller::new(|_, _| {
+        site: site.with_quota_poller(QuotaPoller::new(|_, _| {
             QuotaReport::unavailable("e2e stub")
         })),
         listeners,

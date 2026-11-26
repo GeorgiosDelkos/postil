@@ -6,6 +6,7 @@
 import { covers } from "./note-place.js";
 import {
   diffStats,
+  evidence,
   foldRun,
   isLive,
   isOpen,
@@ -323,6 +324,70 @@ export function replyText(run) {
     .join("\n\n");
 }
 
+// What the run's author's report entries say (src/report.rs), logged with its end when its
+// turn ended well: `{report, problem}`, one of them null; null for a run with neither entry.
+export function reportOf(run) {
+  const entry = run.entries.findLast(
+    (entry) => entry.kind === "report" || entry.kind === "noReport",
+  );
+  if (!entry) return null;
+  return { report: entry.report ?? null, problem: entry.problem ?? null };
+}
+
+// What the run dialog says about a run's report, or null when there is nothing to say: that
+// the agent gave none, or that parts of it were left out.
+export function reportNotice(run) {
+  const entry = reportOf(run);
+  if (!entry) return null;
+  if (!entry.report) return `No report from the agent: ${entry.problem}`;
+  const { cut } = entry.report;
+  if (cut === 0) return null;
+  return `${cut} ${cut === 1 ? "part" : "parts"} of the agent's report could not be used`;
+}
+
+// `text` without the author's report block, which the run dialog does not show as prose:
+// `block` is the block's text as src/report.rs read it from the reply, so the page removes
+// exactly what was read and never finds another block by a rule of its own. Its last
+// occurrence that starts a line, after blanks at most, as the server's block does; the text
+// as it was when there is none.
+export function withoutReport(text, block) {
+  if (!block) return text;
+  for (let at = text.lastIndexOf(block); at !== -1; at = text.lastIndexOf(block, at - 1)) {
+    const lineStart = text.lastIndexOf("\n", at - 1) + 1;
+    if (/^[ \t]*$/.test(text.slice(lineStart, at))) {
+      const before = text.slice(0, at).trimEnd();
+      const after = text.slice(at + block.length).trim();
+      return [before, after].filter(Boolean).join("\n\n");
+    }
+    if (at === 0) break;
+  }
+  return text;
+}
+
+// The reply as the run dialog shows it: without the report block when the run has a report.
+export function replyShown(run) {
+  const text = replyText(run);
+  const report = reportOf(run)?.report;
+  return report ? withoutReport(text, report.block) : text;
+}
+
+// What the run dialog draws of a report entry: whether there is one, and what its notice says.
+function reportShown(entry) {
+  if (!entry) return null;
+  return [entry.report !== null, entry.report?.cut ?? 0, entry.problem];
+}
+
+// Whether follow-up `turn` went to a fresh agent, told the thread first, rather than to the
+// thread's kept agent. A kept agent's prompt is the engineer's words, then a blank line and a
+// reminder to end with a report (src/run.rs, `follow_up`); a log from before the reminder has
+// the words alone. A fresh agent's prompt starts with a fixed sentence about the thread
+// (`fresh_follow_up`), which words that are themselves that whole sentence would match: no
+// engineer writes that.
+export function freshAgent(turn) {
+  const words = turn.followUp.text;
+  return turn.prompt !== words && !turn.prompt.startsWith(`${words}\n\n`);
+}
+
 // What the run dialog shows of a thread (`threadOf`), as one string, but for the text the
 // agent streams: its replies and thoughts, which the dialog writes in place. The dialog is
 // built again only when this changes, so while the agent writes its step cards, Changes and
@@ -334,6 +399,7 @@ export function threadKey(thread) {
 function turnShown(turn) {
   const live = isLive(turn);
   const { plan, items } = foldRun(turn.entries);
+  const report = reportOf(turn);
   return [
     turn.id,
     turn.agent,
@@ -343,12 +409,23 @@ function turnShown(turn) {
     turn.problem ?? null,
     turn.review ?? null,
     turn.followUp ?? null,
-    turn.prompt === turn.followUp?.text,
+    turn.followUp ? freshAgent(turn) : null,
     plan,
     items.map((item) => itemShown(item, live)),
     // Whether the reply shows at all: its text is written in place.
     replyText(turn) !== "",
     turn.entries.some((entry) => entry.kind === "snapshot"),
+    // Arrives as the turn ends: the reply is drawn without its block, and a notice may show.
+    // What the dialog draws of it, not the report whole, which can be tens of KB.
+    reportShown(report),
+    // The Checks rows: a command that arrives after its call started changes which claim it
+    // matches, which the step cards above do not show. The call's id is the step a row opens.
+    evidence(report?.report ?? null, items).map((row) => [
+      row.command,
+      row.claim,
+      row.state,
+      row.item?.id ?? null,
+    ]),
   ];
 }
 

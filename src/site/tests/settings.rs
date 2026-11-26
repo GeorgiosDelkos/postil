@@ -31,6 +31,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     assert_eq!(view["settings"]["codeFontSize"], 13);
     assert_eq!(view["settings"]["tabWidth"], 4);
     assert_eq!(view["problem"], serde_json::Value::Null);
+    assert_eq!(view["firstRun"], true);
     assert_eq!(view["file"], file.to_str().unwrap());
     assert_eq!(view["fontSizes"], serde_json::json!([11, 20]));
     assert_eq!(view["tabWidths"], serde_json::json!([2, 4, 8]));
@@ -39,6 +40,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     let (status, body) = save(&repo.empty_site(), &custom_settings().to_string());
     assert_eq!(status, StatusCode::OK, "{body}");
     let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(saved["firstRun"], false);
     assert_eq!(
         saved["settings"],
         custom_settings(),
@@ -46,6 +48,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     );
 
     let restarted = get_json(&repo.empty_site(), SETTINGS);
+    assert_eq!(restarted["firstRun"], false);
     assert_eq!(restarted["settings"], custom_settings());
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
@@ -204,6 +207,7 @@ fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
     for (text, expected) in unusable {
         fs::write(&file, text).unwrap();
         let view = get_json(&site, SETTINGS);
+        assert_eq!(view["firstRun"], false);
         let problem = view["problem"].as_str().unwrap();
         assert!(problem.contains(expected), "{problem}");
         assert!(problem.contains("saving is off until"), "{problem}");
@@ -219,6 +223,7 @@ fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     let view: serde_json::Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(view["problem"], serde_json::Value::Null);
+    assert_eq!(view["firstRun"], false);
     assert_eq!(view["settings"]["tabWidth"], 4);
     let (status, reply) = save(&site, &custom_settings().to_string());
     assert_eq!(status, StatusCode::OK, "saving works again: {reply}");
@@ -286,6 +291,7 @@ fn without_a_configuration_directory_settings_are_the_defaults_and_cannot_be_sav
         "settings are off: cannot find the home directory (is HOME set?)"
     );
     assert_eq!(view["file"], serde_json::Value::Null);
+    assert_eq!(view["firstRun"], false);
     let (status, reply) = save(&site, &custom_settings().to_string());
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(reply, "cannot find the home directory (is HOME set?)");
@@ -377,6 +383,31 @@ fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
         custom_settings(),
         "nor reset"
     );
+}
+
+#[test]
+fn external_tools_are_detected_on_the_search_path_for_the_startup_wizard() {
+    let repo = TempRepo::new("settings-tools");
+    let bin = repo.root.join(".git/test-bin");
+    fs::create_dir_all(&bin).unwrap();
+    for program in ["git", "npx"] {
+        let path = bin.join(program);
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let search_path = bin.clone().into_os_string();
+    let site = Site::new(
+        Some(&repo.config()),
+        None,
+        None,
+        Scanner::new(move || search_path.clone()),
+        quiet(),
+    );
+
+    let view = scanned_settings(&site);
+    assert_eq!(view["tools"]["git"], bin.join("git").to_str().unwrap());
+    assert_eq!(view["tools"]["npx"], bin.join("npx").to_str().unwrap());
+    assert_eq!(view["tools"]["gh"], serde_json::Value::Null);
 }
 
 #[test]

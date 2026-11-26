@@ -60,6 +60,7 @@ use crate::anchor::{LineRange, locate, locate_lines};
 use crate::error::{Error, Result};
 use crate::files::{self, save_json, version_of};
 use crate::repo::{PathKind, Repo};
+use crate::report;
 
 /// The format version this build writes. It reads this one and every older one; a file with
 /// a newer version is refused, not rewritten.
@@ -284,6 +285,7 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
          Address every note. Change nothing the notes do not ask for.\n\
          When you finish, list each note id with one line on what you did.\n",
     );
+    text.push_str(report::ASK);
     let mut files: Vec<String> = Vec::new();
     for id in &wanted {
         let note = review

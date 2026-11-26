@@ -1,6 +1,8 @@
 # Postil: review assist
 
-Status: 2026-11-25. Designed, not built. This document adds to `docs/design.md`, which stays
+Status: 2026-11-25. Designed. Built so far: an execute call's command and exit code (step
+7.2), the author's report (7.3), read and logged, and the evidence on the run (7.4); the
+walkthrough is not. This document adds to `docs/design.md`, which stays
 the reference for everything built so far. `docs/review-assist-plan.md` turns it into pull
 requests, with the edge cases and tests of each. Section "Decisions" lists what the owner settled on
 2026-11-25; section "Open questions" lists what this document assumes and the owner has not

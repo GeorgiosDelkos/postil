@@ -7,6 +7,7 @@ import {
   diffStats,
   elapsed,
   escapeAction,
+  evidence,
   foldRun,
   isLive,
   inline,
@@ -21,6 +22,7 @@ import {
   statusLine,
   stopKey,
   toolRow,
+  worstEvidence,
 } from "./run.js";
 
 const note = (id, state, anchor = "found") => ({ id, state, anchor });
@@ -548,4 +550,152 @@ test("a permission key is read from the character, with only Shift making it upp
   // On AZERTY the key labelled A sends code KeyQ and key "a": it answers as its label says.
   assert.equal(press("a", { code: "KeyQ" }), "a");
   assert.equal(press("q", { code: "KeyA" }), null);
+});
+
+// Entries of a run, as the log holds them: execute calls with a command, and edits.
+const ran = (id, command, fields = {}) => ({
+  kind: "tool",
+  id,
+  title: "Terminal",
+  tool: "execute",
+  status: "completed",
+  places: [],
+  output: [],
+  command,
+  ...fields,
+});
+const edited = (id, status = "completed") => ({
+  kind: "tool",
+  id,
+  title: "Edit a.rs",
+  tool: "edit",
+  status,
+  places: [],
+  output: [],
+});
+const update = (id, fields) => ({ kind: "toolUpdate", id, ...fields });
+const claims = (...checks) => ({
+  steps: [],
+  checks: checks.map(([command, result = "passed"]) => ({ command, result })),
+  cut: 0,
+  block: "",
+});
+const states = (report, entries) =>
+  evidence(report, foldRun(entries).items).map(({ command, claim, state }) => [
+    command,
+    claim,
+    state,
+  ]);
+
+test("each check the author claims gets the log's state, the worst first on the card", () => {
+  const entries = [
+    ran("c1", "cargo test"),
+    ran("c2", "cargo clippy", { exit: 101 }),
+    ran("c3", "npm test", { status: "failed" }),
+    ran("c4", "cargo build", { status: "in_progress" }),
+  ];
+  const report = claims(
+    ["cargo test"],
+    ["cargo clippy"],
+    ["npm test"],
+    ["cargo build"],
+    ["cargo doc"],
+  );
+  assert.deepEqual(states(report, entries), [
+    ["cargo test", "passed", "passed"],
+    // Grok ends a failure as completed: the exit code says it failed.
+    ["cargo clippy", "passed", "failed"],
+    ["npm test", "passed", "failed"],
+    ["cargo build", "passed", "unfinished"],
+    ["cargo doc", "passed", "not-seen"],
+  ]);
+  const worst = (checks) => worstEvidence(evidence(claims(...checks), foldRun(entries).items));
+  assert.equal(worst([["cargo test"], ["cargo doc"], ["npm test"]]), "failed");
+  assert.equal(worst([["cargo test"], ["cargo doc"], ["cargo build"]]), "not-seen");
+  assert.equal(worst([["cargo test"], ["cargo build"]]), "unfinished");
+  assert.equal(worst([["cargo test"]]), "passed");
+  assert.equal(worst([]), null, "no claim, no icon");
+});
+
+test("a claim matches the last run of exactly that command, spaces aside", () => {
+  const entries = [
+    ran("c1", "cargo test", { exit: 1 }),
+    ran("c2", "cargo  test"),
+    ran("c3", "cargo test --no-run"),
+  ];
+  assert.deepEqual(states(claims(["cargo   test"]), entries), [
+    ["cargo   test", "passed", "passed"],
+    // Not claimed: listed under the run's other commands. The earlier runs of the claimed
+    // command are not, as the last run is the evidence.
+    ["cargo test --no-run", null, "passed"],
+  ]);
+  assert.deepEqual(
+    states(claims(["cargo test --no"]), entries).slice(0, 1),
+    [["cargo test --no", "passed", "not-seen"]],
+    "a prefix of a command is not the command",
+  );
+  // A log before version 5 kept no command: the title stands in, bare or in backticks.
+  const old = [ran("c1", null, { title: "`make lint`" }), ran("c2", null, { title: "make" })];
+  assert.deepEqual(states(claims(["make lint"], ["make"]), old), [
+    ["make lint", "passed", "passed"],
+    ["make", "passed", "passed"],
+  ]);
+});
+
+test("a check is stale when an edit ended after it, by the order calls ended", () => {
+  const check = claims(["cargo test"]);
+  const before = [edited("e1"), ran("c1", "cargo test")];
+  assert.equal(states(check, before)[0][2], "passed", "an edit before is no matter");
+  const after = [ran("c1", "cargo test"), edited("e1")];
+  assert.equal(states(check, after)[0][2], "stale");
+  // Started before the check, ended after it: only the order they ended in tells.
+  const overlapping = [
+    edited("e1", "in_progress"),
+    ran("c1", "cargo test"),
+    update("e1", { status: "completed" }),
+  ];
+  assert.equal(states(check, overlapping)[0][2], "stale");
+  const failedEdit = [ran("c1", "cargo test"), edited("e1", "failed")];
+  assert.equal(states(check, failedEdit)[0][2], "passed", "a failed edit changed nothing");
+  const failedThenEdited = [ran("c1", "cargo test", { exit: 2 }), edited("e1")];
+  assert.equal(states(check, failedThenEdited)[0][2], "failed", "failed wins over stale");
+  const deleted = [ran("c1", "cargo test"), { ...edited("e1"), tool: "delete" }];
+  assert.equal(states(check, deleted)[0][2], "stale", "a delete changes files too");
+  // The check ended before the edit; saying so again after it does not make it later.
+  const toldAgain = [
+    ran("c1", "cargo test"),
+    edited("e1"),
+    update("c1", { status: "completed" }),
+    ran("c1", "cargo test"),
+  ];
+  assert.equal(states(check, toldAgain)[0][2], "stale");
+  // Run again: under way, then ended after the edit.
+  const rerun = [
+    ...after,
+    update("c1", { status: "in_progress" }),
+    update("c1", { status: "completed" }),
+  ];
+  assert.equal(states(check, rerun)[0][2], "passed");
+  // The card ranks a stale check above one that had not ended.
+  const pending = [...after, ran("c2", "cargo build", { status: "pending" })];
+  const card = worstEvidence(
+    evidence(claims(["cargo build"], ["cargo test"]), foldRun(pending).items),
+  );
+  assert.equal(card, "stale");
+});
+
+test("with no report, the run's commands are listed with no claims", () => {
+  const entries = [ran("c1", "ls"), edited("e1"), ran("c2", "make", { status: "pending" })];
+  assert.deepEqual(states(null, entries), [
+    ["ls", null, "stale"],
+    ["make", null, "unfinished"],
+  ]);
+  assert.deepEqual(states(null, [edited("e1")]), [], "no command was run");
+});
+
+test("a step that exited non-zero shows failed, whatever its status", () => {
+  const item = foldRun([ran("c1", "cargo test", { exit: 3 })]).items[0];
+  assert.equal(toolRow(item, false).state, "failed");
+  const passed = foldRun([ran("c1", "cargo test", { exit: 0 })]).items[0];
+  assert.equal(toolRow(passed, false).state, "done");
 });

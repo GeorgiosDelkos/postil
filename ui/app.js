@@ -25,6 +25,7 @@ import { reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
 import { usageDialog } from "./usage-dialog.js";
 import { welcomeScreen } from "./welcome.js";
+import { wizardDialog } from "./wizard-dialog.js";
 
 const filesEl = $("files");
 const filterEl = $("filter");
@@ -550,8 +551,13 @@ window.postil = {
     if (command === "open-folder") welcome.chooseFolder();
     else if (command === "switch-project") welcome.show();
     else if (command === "go-to-file") goToFile();
-    else if (command === "settings") settings.open();
-    else if (command === "usage") usage.open();
+    else if (command === "settings") {
+      wizard.close();
+      settings.open();
+    } else if (command === "setup-wizard") {
+      settings.close();
+      wizard.open();
+    } else if (command === "usage") usage.open();
     else if (command === "focus-mode") toggleFocus();
     else if (command === "close-window" || command === "quit") quit();
   },
@@ -632,8 +638,21 @@ function applySettings(settings) {
   tray.renderSendBar();
 }
 
-const settings = settingsDialog($("settings"), { apply: applySettings });
-$("open-settings").addEventListener("click", () => settings.open());
+const settings = settingsDialog($("settings"), {
+  apply: applySettings,
+  openWizard: () => wizard.open(),
+});
+const wizard = wizardDialog($("wizard"), {
+  apply: applySettings,
+  onSaved: (view) => settings.sync(view),
+  openFolder: () => welcome.chooseFolder(),
+  canOpenFolder: () => !state.projectOpen,
+  openSettings: () => settings.open(),
+});
+$("open-settings").addEventListener("click", () => {
+  wizard.close();
+  settings.open();
+});
 
 const usage = usageDialog($("usage"), {
   openSettings: () => {
@@ -654,7 +673,10 @@ async function start() {
   loadIcons();
   // Before the first file is drawn, so it is drawn once at the right size. The defaults in
   // app.css stand when the settings cannot be read; the dialog says why when opened.
-  await Promise.all([settings.load().catch(() => {}), layout.load().catch(() => {})]);
+  const [settingsView] = await Promise.all([
+    settings.load().catch(() => null),
+    layout.load().catch(() => {}),
+  ]);
   const response = await fetch("api/repo");
   if (!response.ok) {
     $("code-empty").textContent = await response.text();
@@ -663,6 +685,7 @@ async function start() {
   const repo = await response.json();
   if (repo === null) {
     welcome.show();
+    if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });
     return;
   }
   state.projectOpen = true;
@@ -673,7 +696,11 @@ async function start() {
   // The latest run, this session's or one from before a restart.
   await runs.sync();
 
-  if (state.repo.bench) await runBench(state.repo.bench, { code, codeEl });
+  if (state.repo.bench) {
+    await runBench(state.repo.bench, { code, codeEl });
+    return;
+  }
+  if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });
 }
 
 // A promise nobody awaits, such as an event handler's async call, would otherwise fail

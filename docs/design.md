@@ -182,7 +182,8 @@ schedule three tasks.
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
 | `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
 | `ui/dom.js`, `ui/dialog-parts.js`, `ui/question-form.js` | Helpers the views share: `el()`, icons, the toast and two-click delete; the parts both dialogs draw; the question form. |
-| `ui/settings.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`) and its drawing. |
+| `ui/settings.js`, `ui/settings-controls.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`), shared controls, and drawing. |
+| `ui/wizard.js`, `ui/wizard-dialog.js` | The first-run startup wizard: its rules (tested with `node --test`) and 4-step dialog. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 | `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
@@ -353,6 +354,8 @@ accept both block types, so no capability check is needed.
 These are review notes an engineer wrote while reading this repository.
 Address every note. Change nothing the notes do not ask for.
 When you finish, list each note id with one line on what you did.
+Then end your reply with a report for the engineer who reviews your changes: one JSON object
+in a code block fenced as json, the last thing in your reply. [...]
 
 [N1] src/acp/connection.rs:37
 >     let reply = rx.recv().unwrap();
@@ -371,6 +374,14 @@ edits the file. A file or folder note quotes nothing: the agent reads the path i
 gets no `resource_link`, because agents read a link as a file; the path in the text names it.
 A file or folder that is gone says so under its heading, as lost lines do. The send step lists
 the linked files as `GET /api/run/preview` returns them (`files`).
+
+The paragraph that asks for the author's report (`report::ASK`, shortened above) gives
+its shape in words, never as an example block, which a reply quoting the prompt would hand
+back. As a run of notes or a follow-up ends well, Postil reads the report from the reply and
+logs it with the end as a `report` entry, or a `noReport` entry saying why there is none
+(run log version 6; `docs/review-assist.md`, "The author's report"). A follow-up's prompt,
+the engineer's words alone, ends with a one-line reminder, or with the whole ask when its
+thread started before reports.
 
 ### Runs
 
@@ -972,6 +983,16 @@ Every reply carries the file's revision (a hash of its text), and a save names t
 it started from; a file changed since (another window, a hand edit) refuses the save, and the
 dialog shows the file as it now is. Without that, saving the whole settings would drop the
 other change.
+
+When `~/.config/postil/settings.json` does not exist yet (first launch, outside `--bench`),
+a modal startup wizard (`ui/wizard.js`, `ui/wizard-dialog.js`) opens over the window and walks
+through installed agents, the default agent and optional reviewers, appearance (with a live
+code preview) and startup behavior, and a readiness summary (`git`, `npx`, `gh`). Completing or
+skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
+installed built-in agents turned on); closing it mid-way reverts any preview without writing the
+file. The wizard's save names a revision like the dialog's, and when the file changes under it
+(another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
+from Settings.
 
 ### Usage
 

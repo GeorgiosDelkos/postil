@@ -1590,8 +1590,343 @@ button.repo-name:hover {
   font-variant-numeric: tabular-nums;
 }
 
-.settings:focus {
+.settings:focus,
+.wizard:focus {
   outline: none;
+}
+
+/* Startup wizard: first-run guided setup, also re-openable from Settings or the menu bar. */
+
+.wizard {
+  width: min(620px, 100vw - 48px);
+  max-height: min(760px, 100vh - 64px);
+  padding: 0;
+  overflow: hidden;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  color: var(--text);
+}
+
+.wizard[open] {
+  display: flex;
+}
+
+.wizard::backdrop {
+  background: var(--scrim);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.wizard-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.wizard-header {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 16px 14px 22px;
+  border-bottom: 1px solid var(--border);
+}
+
+.wizard-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.wizard-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.wizard-steps {
+  display: flex;
+  gap: 6px;
+  padding-right: 6px;
+}
+
+.wizard-step {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 10px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  transition:
+    background-color 80ms linear,
+    border-color 80ms linear,
+    color 80ms linear;
+}
+
+.wizard-step:hover:not(:disabled) {
+  color: var(--text-strong);
+  border-color: var(--border-strong);
+}
+
+.wizard-step.current {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.wizard-step.done {
+  color: var(--text-soft);
+}
+
+.wizard-step:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.wizard-step:disabled {
+  opacity: var(--disabled-opacity);
+}
+
+.wizard-step-num {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--text-soft);
+  font: 600 11px var(--font-mono);
+}
+
+.wizard-step.current .wizard-step-num {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.wizard-step.done .wizard-step-num {
+  background: var(--border-strong);
+  color: var(--text-strong);
+}
+
+.wizard-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 22px 20px;
+}
+
+.wizard-step-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wizard-step-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.wizard-intro {
+  margin: 0 0 6px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.wizard-callout {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
+.wizard-callout.warning {
+  background: var(--note-wash);
+  border-color: var(--note);
+  color: var(--text-strong);
+}
+
+.wizard-tip {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.wizard-preview {
+  margin: 6px 0 4px;
+  padding: 10px 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font: var(--code-font-size) var(--font-mono);
+  tab-size: var(--tab-width);
+}
+
+.wizard-preview-line {
+  display: flex;
+  height: var(--line-height);
+  line-height: var(--line-height);
+}
+
+.wizard-preview-num {
+  flex: none;
+  width: 34px;
+  padding-right: 12px;
+  text-align: right;
+  color: var(--line-number);
+}
+
+.wizard-preview-code {
+  white-space: pre;
+  padding-right: 16px;
+}
+
+.wizard-summary {
+  margin: 4px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--card);
+}
+
+.wizard-summary-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 14px;
+}
+
+.wizard-summary-row + .wizard-summary-row {
+  border-top: 1px solid var(--border);
+}
+
+.wizard-summary-label {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.wizard-summary-value {
+  margin: 0;
+  text-align: right;
+  color: var(--text-strong);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.wizard-summary-value.muted {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.wizard-readiness {
+  margin-top: 10px;
+}
+
+.wizard-tool-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.wizard-tool {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.wizard-tool + .wizard-tool {
+  border-top: 1px solid var(--border);
+}
+
+.wizard-tool-name {
+  flex: none;
+  min-width: 44px;
+  font: 600 12px var(--font-mono);
+  color: var(--text-strong);
+}
+
+.wizard-tool.ok .wizard-tool-name {
+  color: var(--added);
+}
+
+.wizard-tool.warning .wizard-tool-name {
+  color: var(--note);
+}
+
+.wizard-tool-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 11.5px var(--font-mono);
+  color: var(--text-muted);
+}
+
+.wizard-tool.warning .wizard-tool-detail,
+.wizard-tool.muted .wizard-tool-detail {
+  font-family: inherit;
+  white-space: normal;
+}
+
+.wizard-tool.warning .wizard-tool-detail {
+  color: var(--note);
+}
+
+.wizard-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 22px;
+  border-top: 1px solid var(--border);
+}
+
+.wizard-footer-left,
+.wizard-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wizard-footer-left {
+  flex: 1;
+}
+
+.wizard-footer-left .settings-status {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: none;
+  overflow-wrap: anywhere;
 }
 
 /* The tray's tabs: the notes, and the run once there is one. */
@@ -1840,7 +2175,9 @@ button.repo-name:hover {
   text-align: left;
 }
 
-.run-card:hover,
+/* A button: a check the log never ran is a card that opens nothing. `:where` keeps the
+   specificity of `.run-card:hover`, so the tone rules after it still win. */
+:where(button).run-card:hover,
 .run-card:focus-visible {
   border-color: var(--border-strong);
   outline: none;
@@ -2027,6 +2364,18 @@ button.repo-name:hover {
 
 .tool-state.unfinished {
   color: var(--text-muted);
+}
+
+/* A check's state that the engineer should look at: claimed and not in the log, or passed
+   before an edit (`evidence` in ui/run.js). */
+.tool-state.not-seen,
+.tool-state.stale {
+  color: var(--attention);
+}
+
+/* The mark on a run's card for the worst of its claimed checks. */
+.run-evidence {
+  font-weight: 600;
 }
 
 .tool-diff,
@@ -3136,12 +3485,14 @@ body.focus-mode .code {
 /* Dialogs, the toast, and the views over the code come in short and end still (docs/design.md,
    "Motion"). */
 .note-dialog[open],
-.settings[open] {
+.settings[open],
+.wizard[open] {
   animation: dialog-in 120ms ease-out;
 }
 
 .note-dialog[open]::backdrop,
-.settings[open]::backdrop {
+.settings[open]::backdrop,
+.wizard[open]::backdrop {
   animation: fade-in 120ms ease-out;
 }
 
@@ -3177,8 +3528,10 @@ body.focus-mode .code {
 @media (prefers-reduced-motion: reduce) {
   .note-dialog[open],
   .settings[open],
+  .wizard[open],
   .note-dialog[open]::backdrop,
   .settings[open]::backdrop,
+  .wizard[open]::backdrop,
   .toast:not([hidden]),
   .changes-view:not([hidden]),
   .prompt-preview:not([hidden]) {

@@ -74,6 +74,7 @@ use crate::agents::{AgentChoice, Scanner};
 use crate::error::{Error, Result, error_chain};
 use crate::notes::{self, Prompt};
 use crate::repo::Repo;
+use crate::report;
 use crate::review::{self, Diff, Finding, Stage, Work};
 use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
@@ -606,8 +607,10 @@ impl Runner {
                     .is_some_and(|run| Arc::ptr_eq(run, followed))
             });
         let prompt = if same_conversation {
+            // After the words, so the page tells this prompt from a fresh agent's by its start
+            // (`ui/status.js`, `freshAgent`).
             Prompt {
-                text: text.to_owned(),
+                text: format!("{text}\n\n{}", report::ASK_AGAIN),
                 files: Vec::new(),
             }
         } else {
@@ -2052,15 +2055,21 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         (run, thread, released, answer, next)
     };
     if let Some(run) = run {
-        // Before the end is logged, so a reader that sees the end sees what the run changed.
-        if ends_turn {
-            runner.record_end_snapshot(&run, thread.as_ref());
-        }
         // The agent names files in the worktree it works in.
         let root = thread
             .as_ref()
             .map_or(runner.repo.root(), |thread| thread.path.as_path());
-        if let Some(ids) = run.record_event(event, answer, root) {
+        // Before the end is logged, so a reader that sees the end sees what the run changed,
+        // and its report.
+        if ends_turn {
+            runner.record_end_snapshot(&run, thread.as_ref());
+        }
+        let report = if ended_well {
+            report_entry(&run, root)
+        } else {
+            None
+        };
+        if let Some(ids) = run.record_event(event, report, answer, root) {
             runner.mark_sent(&run, &ids);
         }
     }
@@ -2234,8 +2243,8 @@ fn first_option(options: &[PermissionOption], kinds: [PermissionKind; 2]) -> Opt
 }
 
 /// The prompt of a follow-up that goes to a fresh agent: the thread so far, each run's prompt
-/// and reply in order, then the engineer's `text`. The diffs stay out: the agent reads the
-/// files as they are now, linked after the text.
+/// and reply in order, then the engineer's `text`, then the ask for a report ([`report_ask`]).
+/// The diffs stay out: the agent reads the files as they are now, linked after the text.
 fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
     let mut prompt = String::from(
         "You are continuing work another coding agent did in this repository; its \
@@ -2258,9 +2267,45 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
         )
         .expect("writing to a String cannot fail");
     }
-    write!(prompt, "\nThe engineer now asks:\n\n{text}\n")
-        .expect("writing to a String cannot fail");
+    write!(
+        prompt,
+        "\nThe engineer now asks:\n\n{text}\n\n{}",
+        report_ask(&thread[0].state().header.prompt)
+    )
+    .expect("writing to a String cannot fail");
     prompt
+}
+
+/// What ends a fresh agent's follow-up prompt, given the prompt the thread started with: a
+/// reminder of the report that prompt asked for, or the whole ask when it holds no
+/// `report::ASK` as worded now (a thread from before reports, run log version 5 and older, or
+/// from before a change to the wording).
+fn report_ask(first_prompt: &str) -> &'static str {
+    if first_prompt.contains(report::ASK) {
+        report::ASK_AGAIN
+    } else {
+        report::ASK
+    }
+}
+
+/// The entry that logs the author's report of `run`, a turn that ended well, read from its
+/// reply in `root` (`report::read`); `None` for a review stage, which logs findings instead.
+/// The caller logs it with the run's end, under one hold of the run: a forced stop or a close
+/// that ends the run first takes neither. Asks the file system whether each step's path
+/// exists, so it is never called under the `Slots` lock.
+fn report_entry(run: &Run, root: &Path) -> Option<Entry> {
+    let reply = {
+        let state = run.state();
+        // A run that a forced stop or a close ended takes no entry: no file is read for it.
+        if state.header.review.is_some() || !state.live() {
+            return None;
+        }
+        state.reply()
+    };
+    Some(match report::read(&reply, root) {
+        Ok(report) => Entry::Report { report },
+        Err(problem) => Entry::NoReport { problem },
+    })
 }
 
 /// Says on `run` that no snapshot was taken, and why: the run goes on, without its changes
@@ -2375,6 +2420,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    /// A fresh agent sees the thread's first prompt as history: a reminder suffices when that
+    /// prompt asked for the report, and a thread from before reports needs the whole ask.
+    #[test]
+    fn a_fresh_follow_up_of_a_thread_from_before_reports_gets_the_whole_ask() {
+        let asked = format!("Address every note.\n{}\n[N1] a.txt", report::ASK);
+        assert_eq!(report_ask(&asked), report::ASK_AGAIN);
+        assert_eq!(report_ask("Address every note.\n\n[N1] a.txt"), report::ASK);
+    }
+
     #[test]
     fn a_chain_s_debug_output_counts_its_findings_and_never_shows_their_text() {
         let chain = Chain {
@@ -2388,6 +2442,7 @@ mod tests {
                 prompt: "secret note".to_owned(),
                 reply: "secret reply".to_owned(),
                 diffs: Vec::new(),
+                report: None,
             },
             notes: vec!["N1".to_owned()],
             files: Vec::new(),
