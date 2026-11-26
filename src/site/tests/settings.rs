@@ -585,6 +585,7 @@ fn agents_report_their_models_for_saved_and_unsaved_custom_agents() {
                 { "value": "pro", "name": "Pro", "description": "The careful one" },
                 { "value": "fast", "name": "Fast" },
                 { "value": "deep", "name": "Deep" },
+                { "value": "long", "name": "OpenCode/Nemotron 3.5 Super VL Free" },
             ],
         })
     );

@@ -1152,8 +1152,11 @@ button.repo-name:hover {
   -webkit-backdrop-filter: blur(2px);
 }
 
+/* min-width 0: a flex item is otherwise as wide as its longest unbreakable line, and a
+   custom agent's command, kept on one line, then widened the panel past the dialog. */
 .settings-panel {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -1209,8 +1212,12 @@ button.repo-name:hover {
   padding: 6px 0;
 }
 
-.settings-row.tall {
-  align-items: flex-start;
+/* The label above its control, which takes the row's full width: the workflow's slot cards,
+   whose model selects need the room (see `.slot-card`). */
+.settings-row.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
 }
 
 .settings-label {
@@ -1423,8 +1430,10 @@ button.repo-name:hover {
 }
 
 /* The agents as one card with a hairline between rows: a status mark, the logo and name, what
-   the agent is used for, the command, and the switch on the right. */
-.agent-list {
+   the agent is used for, the command, and the switch on the right. The workflow's slot cards
+   (`.slot-card`) are drawn the same. */
+.agent-list,
+.slot-card {
   display: flex;
   flex-direction: column;
   margin-top: 8px;
@@ -1575,20 +1584,205 @@ button.repo-name:hover {
   font-size: 12px;
 }
 
-/* An agent and its model, side by side; a model's hint (asking, or why it could not) under
-   its select. */
-.slot-control {
-  flex: none;
+/* The workflow's slots: the agent notes go to, and the reviewers, each a row of a card drawn
+   as the agent list is. The rows read as text, not as form fields: the agent and the model are
+   pickers drawn as their value and a chevron (`.picker`). Both cards share the columns (a lead
+   glyph or the reviewer's number, the agent, its model, the reviewer's buttons), so agents and
+   models start at one x in every row. The cards sit under their labels
+   (`.settings-row.stacked`) and fill the row, so model names as long as real ones (145 to 225
+   px at the 12 px UI font) show whole at the dialogs' normal width. */
+.slot-card {
+  margin-top: 0;
+}
+
+.slot-row {
+  display: grid;
+  /* Lead: "→", "+" or "9." in tabular digits. Agent: a logo and about eighteen characters of
+     name; 148 px holds "Turn on an agent first" whole with the picker's chevron, which 140 px
+     cut by 4 px (WebKit, 2026-11-26). Model: the rest, 248 px in the wizard at its full
+     560 px, of which 236 px are left for text beside the chevron: enough for the 229 px model
+     name of the page's end-to-end test.
+     Actions: three 24 px buttons. The send-to row has no buttons, so its model runs to the
+     card's edge. */
+  grid-template-columns: 16px 148px minmax(0, 1fr) 72px;
+  align-items: start;
+  column-gap: 8px;
+  padding: 6px 8px;
+}
+
+.slot-row.send {
+  grid-template-columns: 16px 148px minmax(0, 1fr);
+}
+
+.slot-row + .slot-row,
+.reviewer-list:not(:empty) + .slot-row {
+  border-top: 1px solid var(--border);
+}
+
+.slot-lead,
+.slot-agent {
+  height: 24px;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  min-width: 0;
+}
+
+.slot-lead {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.slot-agent {
   gap: 6px;
+  color: var(--text-strong);
 }
 
-.slot-control .select {
-  min-width: 130px;
-  max-width: 200px;
+.slot-agent-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
+/* A select drawn as its value and a chevron: the select lies over the text, transparent, so
+   a click opens its native menu. Its padding lies outside the column (the negative margin),
+   so the text starts at the column's edge and the hover fill reaches past it. */
+.picker {
+  position: relative;
+  /* As wide as its text, not its cell, so the hover fill and the click end at the chevron. */
+  align-self: flex-start;
+  min-width: 0;
+  max-width: calc(100% + 12px);
+  height: 24px;
+  margin-left: -6px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  border-radius: 5px;
+  color: var(--text-strong);
+  transition: background-color 80ms linear;
+}
+
+.picker.muted {
+  color: var(--text-muted);
+}
+
+.picker:hover {
+  background: var(--hover);
+}
+
+/* The ring only after a key (ui/app.js sets `keyboard-input`): WebKit matches :focus-visible
+   on a select the pointer focused, which would ring the picker on every click. */
+body.keyboard-input .picker:has(.picker-select:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.picker-text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* A chevron pointing down, in the muted text colour through a mask. */
+.picker::after {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--text-muted);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpath d='M0.7 2.2 1.6 1.3 4 3.7 6.4 1.3 7.3 2.2 4 5.5z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpath d='M0.7 2.2 1.6 1.3 4 3.7 6.4 1.3 7.3 2.2 4 5.5z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+}
+
+.picker-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  appearance: none;
+  font: inherit;
+  cursor: pointer;
+}
+
+.picker-select:disabled {
+  cursor: default;
+}
+
+.picker:has(.picker-select:disabled):hover {
+  background: none;
+}
+
+/* A reviewer's buttons show while the pointer is on its row or the focus is in it: Tab
+   reaches them (they have tabIndex 0, ui/settings-controls.js), and the row shows them then.
+   A move the row cannot make is hidden and keeps its place. */
+.slot-actions {
+  display: flex;
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.slot-row:hover .slot-actions,
+.slot-row:focus-within .slot-actions {
+  opacity: 1;
+}
+
+.slot-actions .icon-button {
+  width: 24px;
+  height: 24px;
+  min-width: 0;
+  padding: 0;
+  font-size: 13px;
+}
+
+.slot-actions .impossible {
+  visibility: hidden;
+}
+
+/* "+ Add reviewer": quiet text over the lead and agent columns, the accent on hover and
+   focus. Its padding lies outside the columns, as a picker's does. */
+.slot-add {
+  grid-column: 1 / -1;
+  justify-self: start;
+  height: 24px;
+  margin-left: -6px;
+  padding: 0 6px;
+  display: grid;
+  grid-template-columns: 16px auto;
+  column-gap: 8px;
+  align-items: center;
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-muted);
+  font: inherit;
+  transition: color 80ms linear;
+}
+
+.slot-add .slot-lead {
+  height: auto;
+  color: inherit;
+}
+
+.slot-add:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+/* After a key only, as for `.picker`. */
+body.keyboard-input .slot-add:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  color: var(--accent);
+}
+
+/* A model's hint (asking, or why it could not) under its picker, cut to the column. */
 .model-select {
   min-width: 0;
   display: flex;
@@ -1597,7 +1791,6 @@ button.repo-name:hover {
 }
 
 .model-hint {
-  max-width: 200px;
   margin: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -1606,8 +1799,6 @@ button.repo-name:hover {
 }
 
 .reviewers {
-  width: 300px;
-  flex: none;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1617,55 +1808,10 @@ button.repo-name:hover {
   margin: 0;
 }
 
-.reviewers .select {
-  width: 100%;
-}
-
 .reviewer-list {
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: reviewer;
-}
-
-.reviewer-list:empty {
-  display: none;
-}
-
-.reviewer {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 32px;
-  padding: 3px 0 3px 4px;
-  counter-increment: reviewer;
-}
-
-.reviewer + .reviewer {
-  border-top: 1px solid var(--border);
-}
-
-.reviewer-name {
-  flex: none;
-  max-width: 96px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--text-strong);
-}
-
-.reviewer .model-select {
-  flex: 1;
-}
-
-.reviewers .reviewer .select {
-  min-width: 0;
-}
-
-.reviewer-name::before {
-  content: counter(reviewer) ". ";
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
 }
 
 .settings:focus,
@@ -1700,8 +1846,10 @@ button.repo-name:hover {
   -webkit-backdrop-filter: blur(2px);
 }
 
+/* min-width 0 as for `.settings-panel`. */
 .wizard-panel {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;

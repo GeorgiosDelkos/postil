@@ -97,12 +97,20 @@ const onCancel = new Promise((resolve) => (cancelled = resolve));
 // The session's settings, as `session/new` reports them: a model select in the shape every
 // agent probed on 2026-11-26 sent (flat options, plus a group, which the schema allows), after
 // a boolean that also says "model", which is no select and must be passed over. Scenario
-// "no-config" reports none, as an agent that offers no model choice.
+// "no-config" reports none, as an agent that offers no model choice. "long" has a name as long
+// as real ones (OpenCode's, 2026-11-26), for the page's test that a model select shows it whole.
 const MODELS = [
   { value: "m", name: "Model M" },
   { value: "pro", name: "Pro", description: "The careful one" },
   { value: "fast", name: "Fast" },
-  { group: "more", name: "More", options: [{ value: "deep", name: "Deep" }] },
+  {
+    group: "more",
+    name: "More",
+    options: [
+      { value: "deep", name: "Deep" },
+      { value: "long", name: "OpenCode/Nemotron 3.5 Super VL Free" },
+    ],
+  },
 ];
 const configOptions = (current) => [
   { id: "model", name: "Use the model", category: "model", type: "boolean", currentValue: true },
