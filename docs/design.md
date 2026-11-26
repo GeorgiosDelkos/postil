@@ -163,6 +163,8 @@ schedule three tasks.
 | `src/app.rs` | `App` state and `App::update(Event)`. No drawing, no I/O: testable headless. |
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
+| `src/anchor.rs` | `LineRange`, `Target` and `locate`: placing lines that move, for notes and the analysis. |
+| `src/analysis.rs` | The diagrams, checking an agent's citations, and reading and writing `analysis.json`. |
 | `src/thread.rs` | Threads: their worktrees, branches, `threads.json`, and freeing them. |
 | `src/clone.rs` | One `clonefile(2)` call that clones a build folder: the crate's one `unsafe`. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |

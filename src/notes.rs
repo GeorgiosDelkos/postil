@@ -66,7 +66,7 @@ use serde::de::{self, Deserializer};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 
-use crate::anchor::{LineRange, locate, locate_lines};
+use crate::anchor::{LineRange, Target, TargetKind, locate, locate_lines};
 use crate::error::{Error, Result};
 use crate::files::{self, save_json, version_of};
 use crate::repo::{PathKind, Repo};
@@ -645,52 +645,6 @@ enum NoteState {
     },
 }
 
-/// What a note is on.
-enum Target {
-    /// Lines of the file at the note's path.
-    Lines {
-        /// Where the snippet was found last.
-        lines: LineRange,
-        /// The text of the lines when the note was written, without line endings, joined
-        /// with `\n`.
-        snippet: String,
-    },
-    /// The whole file or folder at the note's path.
-    Path(PathKind),
-}
-
-impl Target {
-    /// The target that `kind`, `lines` and `snippet` describe, as read from JSON: a line note
-    /// has both fields and a file or folder note neither, so a typo in a hand edit is refused
-    /// instead of dropped.
-    fn read(
-        kind: TargetKind,
-        lines: Option<LineRange>,
-        snippet: Option<String>,
-    ) -> std::result::Result<Self, String> {
-        match (kind, lines, snippet) {
-            (TargetKind::Lines, Some(lines), Some(snippet)) => Ok(Self::Lines { lines, snippet }),
-            (TargetKind::Lines, _, _) => Err("a note on lines needs `lines` and `snippet`".into()),
-            (TargetKind::File, None, None) => Ok(Self::Path(PathKind::File)),
-            (TargetKind::Folder, None, None) => Ok(Self::Path(PathKind::Folder)),
-            (TargetKind::File | TargetKind::Folder, _, _) => {
-                Err("a note on a file or folder has no `lines` or `snippet`".into())
-            }
-        }
-    }
-}
-
-/// A note's `target` as the file and the page write it.
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TargetKind {
-    /// Absent before version 4, where every note is on lines; the page leaves it out too.
-    #[default]
-    Lines,
-    File,
-    Folder,
-}
-
 /// A [`Note`] as stored, before [`Target::read`] checks that its fields fit its target.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -911,19 +865,6 @@ impl fmt::Debug for CheckedNote {
     }
 }
 
-// The lines, never the snippet, for the reason given above `Review`'s.
-impl fmt::Debug for Target {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Lines { lines, .. } => f
-                .debug_struct("Lines")
-                .field("lines", lines)
-                .finish_non_exhaustive(),
-            Self::Path(kind) => f.debug_tuple("Path").field(kind).finish(),
-        }
-    }
-}
-
 impl fmt::Debug for Prompt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Prompt")
@@ -983,8 +924,8 @@ impl TryFrom<StoredNote> for Note {
             state,
             intent,
         } = stored;
-        let target =
-            Target::read(target, lines, snippet).map_err(|problem| format!("{id}: {problem}"))?;
+        let target = Target::read(target, lines, snippet, "note")
+            .map_err(|problem| format!("{id}: {problem}"))?;
         Ok(Self {
             id,
             path,
@@ -1010,7 +951,7 @@ impl TryFrom<RawNewNote> for NewNote {
         } = raw;
         Ok(Self {
             path,
-            target: Target::read(target, lines, snippet)?,
+            target: Target::read(target, lines, snippet, "note")?,
             body,
         })
     }

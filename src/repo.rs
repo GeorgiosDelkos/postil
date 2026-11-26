@@ -144,6 +144,12 @@ impl Repo {
         self.postil_dir().join("folders.json")
     }
 
+    /// Where this working tree's analysis is kept (`analysis.rs`): beside the review file, for
+    /// the same reason.
+    pub(crate) fn analysis_file(&self) -> PathBuf {
+        self.postil_dir().join("analysis.json")
+    }
+
     /// Where this working tree's run logs are stored (`run/log.rs`): beside the review file, for
     /// the same reason.
     pub(crate) fn runs_dir(&self) -> PathBuf {

@@ -3,11 +3,11 @@
 Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
-Ask (7.6), and jump to definition (7.7). This document adds to `docs/design.md`, which stays
-the reference for everything built so far. `docs/review-assist-plan.md` turns it into pull
-requests, with the edge cases and tests of each. Section "Decisions" lists what the owner
-settled on 2026-11-25; section "Open questions" lists what this document assumes and the owner
-has not confirmed.
+Ask (7.6), jump to definition (7.7), and the analysis file with its citation checking (8.1).
+This document adds to `docs/design.md`, which stays the reference for everything built so far.
+`docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
+Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
+what this document assumes and the owner has not confirmed.
 
 Mockups: https://claude.ai/code/artifact/61c79ac1-1498-4f37-9ec0-f2824cf3f92f (private to the owner until shared).
 
@@ -336,6 +336,12 @@ The owner asked for the link to be visible in the code, as notes are.
   node opens the changes view at its hunks.
 
 ### Data structures
+
+Built in step 8.1 (`src/analysis.rs`, `GET /api/analysis`): the types below, the file at
+version 1 without `checked`, which comes with the code that reads it in step 8.7 (version 2),
+checking a citation, and placing every verified reference on each read. As built, an unverified
+reference has no `target`, only its path and, when its file could not be read, a `reason`:
+its lines may be zero, reversed or past the end of a file that may not exist.
 
 Looked up: every anchor of the open file, on each file open. Iterated: one diagram's nodes
 and edges, on each draw. Changed: whole diagrams, by an analysis run. A repository holds tens

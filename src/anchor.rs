@@ -5,9 +5,64 @@
 //! numbers are a hint. [`locate`] keeps it where its snippet still is, or moves it to the only
 //! other copy of the snippet, or else finds nothing. A snippet found several times elsewhere
 //! is not guessed: a short line such as `}` repeats, and the nearest copy is often the wrong
-//! one. Notes are placed this way (`notes.rs`).
+//! one. Notes and the analysis's code references are placed this way (`notes.rs`,
+//! `analysis.rs`), and both are on a [`Target`].
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::repo::PathKind;
+
+/// What a note or a code reference is on.
+pub(crate) enum Target {
+    /// Lines of the file at the note's or reference's path.
+    Lines {
+        /// Where the snippet was found last.
+        lines: LineRange,
+        /// The text of the lines when the note or reference was made, without line endings,
+        /// joined with `\n`.
+        snippet: String,
+    },
+    /// The whole file or folder at the path.
+    Path(PathKind),
+}
+
+impl Target {
+    /// The target that `kind`, `lines` and `snippet` describe, as read from JSON: a target on
+    /// lines has both fields and one on a file or folder neither, so a typo in a hand edit is
+    /// refused instead of dropped. `noun` names what has the target in the message ("note").
+    pub(crate) fn read(
+        kind: TargetKind,
+        lines: Option<LineRange>,
+        snippet: Option<String>,
+        noun: &str,
+    ) -> Result<Self, String> {
+        match (kind, lines, snippet) {
+            (TargetKind::Lines, Some(lines), Some(snippet)) => Ok(Self::Lines { lines, snippet }),
+            (TargetKind::Lines, _, _) => {
+                Err(format!("a {noun} on lines needs `lines` and `snippet`"))
+            }
+            (TargetKind::File, None, None) => Ok(Self::Path(PathKind::File)),
+            (TargetKind::Folder, None, None) => Ok(Self::Path(PathKind::Folder)),
+            (TargetKind::File | TargetKind::Folder, _, _) => Err(format!(
+                "a {noun} on a file or folder has no `lines` or `snippet`"
+            )),
+        }
+    }
+}
+
+/// A [`Target`]'s `target` field as the files and the page write it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TargetKind {
+    /// The default for a note: absent before `review.json` version 4, where every note is on
+    /// lines; the page leaves it out too.
+    #[default]
+    Lines,
+    File,
+    Folder,
+}
 
 /// Lines `start` to `end` of a file, 1-based and inclusive, with `1 <= start <= end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +123,20 @@ impl TryFrom<RawLineRange> for LineRange {
             ));
         }
         Ok(Self { start, end })
+    }
+}
+
+// The lines, never the snippet: a snippet quotes code that is not meant to leave the machine,
+// and Debug output ends up in logs.
+impl fmt::Debug for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lines { lines, .. } => f
+                .debug_struct("Lines")
+                .field("lines", lines)
+                .finish_non_exhaustive(),
+            Self::Path(kind) => f.debug_tuple("Path").field(kind).finish(),
+        }
     }
 }
 
