@@ -66,13 +66,7 @@ const logos = readFileSync(new URL("./agent-logos.svg", import.meta.url), "utf8"
 test("each built-in agent's logo is a symbol of agent-logos.svg, other names get none", () => {
   const ids = new Set([...logos.matchAll(/<symbol id="([^"]+)"/g)].map((match) => match[1]));
   const named = ["Claude", "Codex", "Gemini", "Grok", "OpenCode"].map(agentLogo);
-  assert.deepEqual(named, [
-    "agent-claude",
-    "agent-codex",
-    "agent-gemini",
-    null,
-    "agent-opencode",
-  ]);
+  assert.deepEqual(named, ["agent-claude", "agent-codex", "agent-gemini", null, "agent-opencode"]);
   for (const id of named.filter(Boolean)) {
     assert.ok(ids.has(id), `${id} is missing from agent-logos.svg`);
   }
