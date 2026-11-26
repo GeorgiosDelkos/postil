@@ -204,6 +204,11 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/icons.svg"),
     ),
     (
+        "/agent-logos.svg",
+        "image/svg+xml",
+        include_bytes!("../ui/agent-logos.svg"),
+    ),
+    (
         "/fonts/Geist-Variable.woff2",
         "font/woff2",
         include_bytes!("../ui/fonts/Geist-Variable.woff2"),

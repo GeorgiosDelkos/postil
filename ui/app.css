@@ -83,6 +83,9 @@
 
   /* How far every disabled control fades. */
   --disabled-opacity: 0.45;
+  /* The faint part of an agent's logo: the opacity of the vendor's file for this theme
+     (OpenCode's dark logo, in ui/agent-logos.svg). */
+  --agent-logo-faint: 0.28;
 
   /* The code view's text size, line height, and tab width. ui/app.js sets all three from the
      settings (applySettings) and places rows by the line height; these are the defaults. */
@@ -142,6 +145,9 @@
     --syntax-comment: #6a6e78;
     --syntax-constant: #855600;
     --syntax-punctuation: #4a4d55;
+
+    /* OpenCode's light logo. */
+    --agent-logo-faint: 0.2;
   }
 }
 
@@ -740,6 +746,19 @@ kbd {
   margin-right: 6px;
 }
 
+/* An agent's logo beside its name (agent-logos.svg), at the size of the text line. Its
+   container's gap spaces it. A one-colour logo fills with the text colour; the faint part of
+   OpenCode's takes the palette's --agent-logo-faint. */
+.agent-logo {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+.agent-logo-faint {
+  fill-opacity: var(--agent-logo-faint);
+}
+
 /* The right-click menu on the code, drawn as a macOS menu: a translucent, blurred panel with
    tight rows, the item under the pointer filled with the accent, shortcuts at the right. */
 
@@ -787,6 +806,12 @@ kbd {
 
 .menu-item:disabled {
   color: var(--text-muted);
+}
+
+/* The room an item without an icon keeps in a menu where others have one: an agent logo's. */
+.menu-icon-slot {
+  flex: none;
+  width: 14px;
 }
 
 .menu-detail {
@@ -1397,8 +1422,8 @@ button.repo-name:hover {
   }
 }
 
-/* The agents as one card with a hairline between rows: name, a dim status line, the command,
-   and the switch on the right. */
+/* The agents as one card with a hairline between rows: a status mark, the logo and name, what
+   the agent is used for, the command, and the switch on the right. */
 .agent-list {
   display: flex;
   flex-direction: column;
@@ -1446,13 +1471,39 @@ button.repo-name:hover {
   color: var(--text-muted);
 }
 
-.agent-state {
-  font-size: 11.5px;
-  color: var(--text-muted);
+/* Where a row's agent stands (agentState in ui/settings.js), drawn as the run list draws a
+   run's status: installed in the green of Done, on but missing in the notes' amber, not yet
+   checked a muted dash, not installed a hollow circle with the row dimmed. */
+.agent-mark {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  display: inline-grid;
+  place-items: center;
+  box-sizing: border-box;
+  border-radius: 50%;
+  color: var(--canvas);
+  font: 700 10px/1 "Geist", system-ui, sans-serif;
 }
 
-.agent-state.warning {
-  color: var(--note);
+.agent-mark.installed {
+  background: var(--added);
+}
+
+.agent-mark.missing {
+  background: var(--note);
+}
+
+.agent-mark.unchecked {
+  background: var(--text-muted);
+}
+
+.agent-mark.absent {
+  border: 1.5px solid var(--text-muted);
+}
+
+.agent-row.absent .agent-text {
+  opacity: var(--disabled-opacity);
 }
 
 .agent-command {
@@ -1464,6 +1515,7 @@ button.repo-name:hover {
 }
 
 .agent-usage {
+  font-size: 11.5px;
   color: var(--text-muted);
 }
 

@@ -4,7 +4,7 @@
 // which ends with the box that sends the next one.
 
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
-import { actOnSecondClick, el, statusIcon } from "./dom.js";
+import { actOnSecondClick, agentLogoIcon, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
@@ -643,9 +643,10 @@ export function runDialog({
       const judges = review.reviewers > 1 && stage.review.reviewer === review.reviewers;
       const button = el("button", "run-card");
       button.type = "button";
+      button.append(statusIcon(iconKind(stage)), el("span", "run-id", stage.id));
+      const logo = agentLogoIcon(stage.agent);
+      if (logo) button.append(logo);
       button.append(
-        statusIcon(iconKind(stage)),
-        el("span", "run-id", stage.id),
         el("span", "run-card-text", `${stage.agent} · ${judges ? "judges and fixes" : "proposes"}`),
         el("span", `run-entry-status tone-${statusLine(stage).tone}`, statusWord(stage)),
         el("span", "run-chevron", "›"),

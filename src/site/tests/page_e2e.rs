@@ -16,6 +16,11 @@
 //!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
 //!   startup wizard open. `POST /new-fresh-gemini` does the same with an `agy` program on
 //!   the search path, so the wizard finds the built-in Gemini agent installed.
+//! - `POST /new-opencode` opens a project as `POST /new` does, with the built-in OpenCode
+//!   agent installed (an `opencode` program that runs the fake agent) as the agent and the
+//!   reviewer, and the custom Fake agent turned on beside it: the agents' logos show on
+//!   OpenCode's runs and are absent on Fake's. Its body may name the fake agent's scenario
+//!   as `POST /new` does; without one it is `reviewer-silent`, a reply with no findings.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -123,6 +128,12 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
         }
         "/new-fresh" => Some(Start::FirstRun),
         "/new-fresh-gemini" => Some(Start::FirstRunWithGemini),
+        "/new-opencode" => {
+            let asked: serde_json::Value =
+                serde_json::from_slice(request.body()).unwrap_or_default();
+            let scenario = asked["scenario"].as_str().unwrap_or("reviewer-silent");
+            Some(Start::OpenCode(scenario.to_owned()))
+        }
         _ => None,
     };
     if let Some(start) = start {
@@ -178,6 +189,10 @@ enum Start {
     /// As [`Start::FirstRun`], with an `agy` program (Gemini's) on the search path, so the wizard
     /// finds one built-in agent installed.
     FirstRunWithGemini,
+    /// The repository open as the project, with the built-in OpenCode agent installed, chosen
+    /// and reviewing, played by the fake agent in this scenario, and the custom Fake agent
+    /// (`plain`) turned on.
+    OpenCode(String),
 }
 
 /// A new site, the `number`th the bridge opened, on a new repository holding `src/a.rs`,
@@ -227,6 +242,7 @@ fn bridged(number: usize, start: Start) -> Bridged {
                 notify,
             )
         }
+        Start::OpenCode(scenario) => opencode_site(&repo, &scenario, notify),
     };
     Bridged {
         // A stub quota source: a live one would read the developer's real credentials and
@@ -237,6 +253,43 @@ fn bridged(number: usize, start: Start) -> Bridged {
         listeners,
         _repo: repo,
     }
+}
+
+/// The site of [`Start::OpenCode`] on `repo`, its project open, OpenCode played by the fake
+/// agent in `scenario`.
+fn opencode_site(repo: &TempRepo, scenario: &str, notify: Notify) -> Site {
+    repo.commit();
+    // OpenCode starts as `opencode acp`; the script drops the `acp` and runs the fake agent.
+    let bin = repo.root.join(".git/test-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let opencode = bin.join("opencode");
+    let fake = fake_agent(scenario);
+    fs::write(&opencode, format!("#!/bin/sh\nexec {fake}\n")).unwrap();
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).unwrap();
+    // This process's PATH after it, for the script to find `node`.
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let search_path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+            .expect("no directory on PATH holds a colon");
+
+    let site = Site::new(
+        Some(&repo.config()),
+        Some(&repo.home()),
+        None,
+        Scanner::new(move || search_path.clone()),
+        notify,
+    );
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+    let settings = serde_json::json!({
+        "customAgents": [{ "name": "Fake", "command": fake_agent("plain") }],
+        "enabledAgents": ["OpenCode", "Fake"],
+        "agent": { "name": "OpenCode" },
+        "reviewers": [{ "name": "OpenCode" }],
+    });
+    let (status, body) = save(&site, &settings.to_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+    site
 }
 
 /// Reads one HTTP/1.1 request: its line, its headers (only `content-length` is used) and

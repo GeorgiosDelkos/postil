@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg">
+<!-- The built-in agents' logos, one symbol each, drawn beside the agent's name (agentLogo in
+     ui/icons.js). Each is the vendor's own file, from the vendor's own site, with nothing
+     changed but what the page needs: the root's size, clip and mask wrappers are dropped and
+     a one-colour mark fills with currentColor, so it takes the text colour of Graphite and
+     Paper as the vendor's dark and light files do. ui/icons.test.js keeps this file to
+     symbols of plain paths.
+
+     agent-opencode: OpenCode's logo mark, "Default logo variant" on https://opencode.ai/brand,
+     files https://opencode.ai/brand/files/opencode-logo-transparent-light.svg (#1F1F1F, inner
+     square at 20% opacity) and opencode-logo-transparent-dark.svg (#EEEEEE, 28%), retrieved
+     2026-11-26. The inner square's opacity per theme is the palette variable agent-logo-faint in
+     ui/app.css.
+     Terms on that page: "OpenCode and the OpenCode logo are trademarks of Anomaly"; use the
+     light version on light backgrounds and the dark on dark; do not recolour it in new
+     colours; do not use it to suggest that Anomaly endorses or sponsors you.
+
+     Built-in agents without a logo here, as of 2026-11-26:
+     - Claude: Anthropic's Trademark Guidelines (effective 2024-08-01,
+       https://assets.claude.com/f7874b435aabdaee5f836e888b4439b9b56a934b.pdf) allow its marks
+       "only in materials we approve beforehand".
+     - Codex: https://openai.com/brand lists "Use the logo without permission" under Don't.
+     - Gemini: Google publishes no Gemini mark for download; its brand assets are behind an
+       approved account on the Partner Marketing Hub (partnermarketinghub.withgoogle.com).
+     - Grok: https://x.ai/legal/brand-guidelines and its logo kit on data.x.ai refuse any
+       client but a browser (HTTP 403), so neither the file nor its terms could be read.
+     A logo is added only once its vendor's terms allow this use. -->
+<symbol id="agent-opencode" viewBox="0 0 240 300"><path class="agent-logo-faint" fill="currentColor" d="M180 240H60V120H180V240Z"/><path fill="currentColor" d="M180 60H60V240H180V60ZM240 300H0V0H240V300Z"/></symbol>
+</svg>

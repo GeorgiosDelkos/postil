@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { fileIcon, folderIcon } from "./icons.js";
+import { agentLogo, fileIcon, folderIcon } from "./icons.js";
 
 const sprite = readFileSync(new URL("./icons.svg", import.meta.url), "utf8");
 const symbols = new Set([...sprite.matchAll(/<symbol id="([^"]+)"/g)].map((match) => match[1]));
@@ -59,4 +59,42 @@ test("every icon the mapping can return is in the sprite", () => {
     ids.add(fileIcon(`x.${key}`));
   }
   for (const id of ids) assert.ok(symbols.has(id), `${id} is missing from icons.svg`);
+});
+
+const logos = readFileSync(new URL("./agent-logos.svg", import.meta.url), "utf8");
+
+test("each built-in agent's logo is a symbol of agent-logos.svg, other names get none", () => {
+  const ids = new Set([...logos.matchAll(/<symbol id="([^"]+)"/g)].map((match) => match[1]));
+  const named = ["Claude", "Codex", "Gemini", "Grok", "OpenCode"].map(agentLogo);
+  assert.deepEqual(named, [null, null, null, null, "agent-opencode"]);
+  for (const id of named.filter(Boolean)) {
+    assert.ok(ids.has(id), `${id} is missing from agent-logos.svg`);
+  }
+  // A custom agent cannot take a built-in name in any case (saveCustomAgent in settings.js),
+  // so a name that differs only in case is not a built-in agent.
+  assert.equal(agentLogo("opencode"), null);
+  assert.equal(agentLogo("Local"), null);
+});
+
+test("agent-logos.svg holds only symbols of plain paths: no script, link, style or image", () => {
+  // The logos are third-party files: what else they carried was stripped, and stays out.
+  const body = logos.replaceAll(/<!--[\s\S]*?-->/g, "");
+  const tags = new Set([...body.matchAll(/<([a-zA-Z][\w:-]*)/g)].map((match) => match[1]));
+  assert.deepEqual([...tags].sort(), ["path", "svg", "symbol"]);
+  const names = new Set([...body.matchAll(/\s([a-zA-Z][\w:-]*)=/g)].map((match) => match[1]));
+  const allowed = new Set(["class", "d", "fill", "id", "viewBox", "xmlns"]);
+  assert.deepEqual(
+    [...names].filter((name) => !allowed.has(name)),
+    [],
+  );
+});
+
+test("the sprites' comments hold no double hyphen, which XML forbids in a comment", () => {
+  // The page parses each sprite as XML (loadIcons in dom.js): one "--" in a comment, such as
+  // a CSS variable's name, fails the whole file and every icon in it is an empty box.
+  for (const file of [sprite, logos]) {
+    for (const [, text] of file.matchAll(/<!--([\s\S]*?)-->/g)) {
+      assert.ok(!text.includes("--"), `a comment holds "--": ${text.slice(0, 80)}`);
+    }
+  }
 });

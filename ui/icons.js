@@ -1,5 +1,6 @@
 // Which icon a row of the file tree shows: the id of a symbol in icons.svg (Material Icon
 // Theme, see the comment at the top of that file). Plain functions of a name; file-list.js draws.
+// Also which logo an agent's name shows, from agent-logos.svg; dom.js `agentLogoIcon` draws.
 
 // Folders with an icon of their own, by name in lower case. Every other folder is plain.
 const FOLDERS = new Map([
@@ -90,6 +91,16 @@ const EXTENSIONS = new Map([
   ["nix", "nix"],
   ["mk", "makefile"],
 ]);
+
+// Built-in agents with a logo in agent-logos.svg, by name (BUILT_IN in src/agents.rs). The
+// comment at the top of that file says where each came from, and why the others have none.
+const AGENT_LOGOS = new Map([["OpenCode", "agent-opencode"]]);
+
+// The symbol id of the agent's logo, or null. The name is matched exactly: a custom agent
+// cannot take a built-in name in any case (saveCustomAgent in settings.js), so it gets none.
+export function agentLogo(name) {
+  return AGENT_LOGOS.get(name) ?? null;
+}
 
 export function folderIcon(name, open) {
   const kind = FOLDERS.get(name.toLowerCase()) ?? "base";
