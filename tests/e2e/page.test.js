@@ -1036,7 +1036,10 @@ async function openDefinitions(t) {
 async function openFile(page, path) {
   await page.locator("#filter").fill(path);
   await page.locator("#filter").press("Enter");
-  await page.locator("#crumbs b").filter({ hasText: path.split("/").at(-1) }).waitFor();
+  await page
+    .locator("#crumbs b")
+    .filter({ hasText: path.split("/").at(-1) })
+    .waitFor();
 }
 
 // The token `text` on 0-based line `line` of the open file.
@@ -1096,7 +1099,10 @@ test("Go to Definition in the right-click menu jumps, and clicks that cannot jum
   await page.locator("#toast").filter({ hasText: "No definition found for missing." }).waitFor();
 
   await token(page, 1, "helper").click({ button: "right" });
-  await page.locator("#context-menu").getByRole("menuitem", { name: /Go to Definition/ }).click();
+  await page
+    .locator("#context-menu")
+    .getByRole("menuitem", { name: /Go to Definition/ })
+    .click();
   await page.locator("#crumbs b").filter({ hasText: "b.rs" }).waitFor();
 
   await openFile(page, "config.json");
