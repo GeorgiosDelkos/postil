@@ -997,13 +997,15 @@ from Settings.
 ### Usage
 
 The Usage button above Settings (or View > Usage, `Shift-Cmd-U`) opens a popover above it, as
-Orca shows usage from its status bar: each installed or enabled built-in agent's account quota,
-tightest first, as a short bar and percentage per window with the soonest reset. Esc, a press
-outside, or leaving the window closes it. Its last row, "Usage details & history", opens the
-Usage dialog, which shows per agent the quota and what Postil's own runs used. The button
-shows the highest used percentage across agents, amber from 80% and red from 90% (Orca's
-thresholds); it changes only when the popover or dialog fetches, so it is the last reading
-seen, not a live one. `GET /api/usage?scope=
+Orca shows usage from its status bar: each installed built-in agent's account quota (the only
+ones probed), tightest first, as a bar and percentage per window with the soonest reset.
+While open it owns the keyboard, as the context menu does, so no key acts on the run under it.
+Esc, a press outside, leaving the window, or another menu command closes it. Its last row, "Usage
+details & history", opens the Usage dialog, which shows per agent the quota and what Postil's
+own runs used. The button shows the highest used percentage across agents, amber from 80% and
+red from 90% (Orca's thresholds). It changes only when a fetch from the popover or dialog
+settles (no probe still running), so it is the last reading seen, not a live one.
+`GET /api/usage?scope=
 project|all&range=24h|7d|30d|all` answers it, and `POST /api/usage/refresh` probes the quotas
 again. The ranges roll back from now: the process has no time zone, so a calendar day is not
 offered.

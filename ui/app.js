@@ -548,8 +548,15 @@ window.postil = {
   },
   menu: (command) => {
     // A click in the menu bar reaches the page as no event at all, so nothing else closes
-    // the right-click menu: it would stay drawn over the welcome screen or the filter.
+    // the right-click menu or the Usage popover: they would stay drawn over the welcome
+    // screen, the filter, or a dialog, and the popover would keep probing.
     menu.close();
+    if (command === "usage") {
+      // A dialog covers the sidebar the popover opens from, as for the page's own keys.
+      if (!document.querySelector("dialog[open]")) usageMenu.toggle();
+      return;
+    }
+    usageMenu.close();
     if (command === "open-folder") welcome.chooseFolder();
     else if (command === "switch-project") welcome.show();
     else if (command === "go-to-file") goToFile();
@@ -559,8 +566,7 @@ window.postil = {
     } else if (command === "setup-wizard") {
       settings.close();
       wizard.open();
-    } else if (command === "usage") usageMenu.toggle();
-    else if (command === "focus-mode") toggleFocus();
+    } else if (command === "focus-mode") toggleFocus();
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
@@ -658,8 +664,11 @@ $("open-settings").addEventListener("click", () => {
 
 // The Usage button shows the tightest quota across agents, as Orca's status bar does. It
 // changes only when the popover or the dialog fetches: nothing polls the providers in the
-// background, so the reading is the last one seen.
+// background, so the reading is the last one seen. A reply with probes still running is
+// skipped: a refresh reports every probed agent as loading until its probe ends, which would
+// blank the reading, or show a partial one, for the length of the probe.
 function showUsageLevel(view) {
+  if (view.scanning || view.polling) return;
   const level = $("usage-level");
   const used = tightestQuota(view.agents);
   level.hidden = used === null;

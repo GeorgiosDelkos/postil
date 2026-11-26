@@ -24,33 +24,53 @@ const POLL_MS = 250;
 export function usagePopover({ popoverEl, anchorEl, openDetails, onView }) {
   const ui = { view: null, error: null, refreshing: false, pollTimer: null, asked: 0 };
 
+  // Asks for the view; a reply or failure for a request since superseded (by a newer one, or
+  // by closing the panel) is dropped, so it can neither overwrite a newer reading nor restart
+  // polling. Never rejects.
   async function fetchView(refresh = false) {
     const token = ++ui.asked;
-    // The scope and range only filter Postil's own runs, which the popover does not show.
+    // The route always lists an installed built-in, whatever the range; the range only adds
+    // agents with past runs, which the popover does not list (`popoverAgents`).
     const url = usageUrl(refresh ? "api/usage/refresh" : "api/usage", "all", "24h");
-    const response = await fetch(url, refresh ? { method: "POST" } : undefined);
-    const text = await response.text();
-    if (!response.ok) throw new Error(text);
-    if (token !== ui.asked) return;
-    show(JSON.parse(text));
+    try {
+      const response = await fetch(url, refresh ? { method: "POST" } : undefined);
+      const text = await response.text();
+      if (token !== ui.asked) return;
+      if (!response.ok) throw new Error(text);
+      show(JSON.parse(text));
+    } catch (error) {
+      if (token !== ui.asked) return;
+      fail(error);
+    }
   }
 
   function show(view) {
+    // A poll that changed nothing is not drawn, so the list keeps its scroll and focus; a
+    // refresh always is, to take the busy state off its button.
+    const unchanged =
+      !ui.refreshing && ui.error === null && JSON.stringify(view) === JSON.stringify(ui.view);
     ui.view = view;
     ui.error = null;
     ui.refreshing = false;
     onView?.(view);
-    clearTimeout(ui.pollTimer);
-    if (!popoverEl.hidden && (view.scanning || view.polling)) {
-      ui.pollTimer = setTimeout(() => fetchView().catch(fail), POLL_MS);
-    }
-    render();
+    poll();
+    if (!unchanged) render();
   }
 
+  // Keeps the rows already drawn: one failed poll should not hide a good reading.
   function fail(error) {
     ui.error = String(error.message ?? error);
     ui.refreshing = false;
+    poll();
     render();
+  }
+
+  // Asks again shortly while the agent scan or a quota probe is still running.
+  function poll() {
+    clearTimeout(ui.pollTimer);
+    if (!popoverEl.hidden && (ui.view?.scanning || ui.view?.polling)) {
+      ui.pollTimer = setTimeout(fetchView, POLL_MS);
+    }
   }
 
   function busy() {
@@ -60,8 +80,9 @@ export function usagePopover({ popoverEl, anchorEl, openDetails, onView }) {
   function refresh() {
     if (busy()) return;
     ui.refreshing = true;
+    ui.error = null;
     render();
-    fetchView(true).catch(fail);
+    fetchView(true);
   }
 
   // ---- Drawing --------------------------------------------------------------------------
@@ -70,7 +91,9 @@ export function usagePopover({ popoverEl, anchorEl, openDetails, onView }) {
     const focused = popoverEl.contains(document.activeElement)
       ? document.activeElement.dataset.key
       : undefined;
+    const scrolled = popoverEl.querySelector(".usage-pop-body")?.scrollTop ?? 0;
     popoverEl.replaceChildren(header(), body(), footer());
+    popoverEl.querySelector(".usage-pop-body").scrollTop = scrolled;
     const target = focused && popoverEl.querySelector(`[data-key="${CSS.escape(focused)}"]`);
     if (target && !target.disabled) target.focus();
     else if (focused) popoverEl.focus();
@@ -95,8 +118,10 @@ export function usagePopover({ popoverEl, anchorEl, openDetails, onView }) {
   function body() {
     const node = el("div", "usage-pop-body");
     if (ui.error) {
-      node.append(el("p", "usage-pop-note is-error", ui.error));
-      return node;
+      const note = el("p", "usage-pop-note is-error", ui.error);
+      note.setAttribute("role", "alert");
+      node.append(note);
+      if (!ui.view) return node;
     }
     if (!ui.view || ui.view.scanning || ui.view.agents === null) {
       node.append(el("p", "usage-pop-note", "Loading usage…"));
@@ -185,13 +210,16 @@ export function usagePopover({ popoverEl, anchorEl, openDetails, onView }) {
 
   function open() {
     if (!popoverEl.hidden) return;
+    // A hidden button (the welcome screen hides the sidebar) has no box to open above: the
+    // panel would sit off screen, probing.
+    if (anchorEl.getClientRects().length === 0) return;
     ui.error = null;
     render();
     popoverEl.hidden = false;
     anchorEl.setAttribute("aria-expanded", "true");
     place();
     popoverEl.focus();
-    fetchView().catch(fail);
+    fetchView();
   }
 
   function close() {
@@ -206,12 +234,30 @@ export function usagePopover({ popoverEl, anchorEl, openDetails, onView }) {
     }
   }
 
+  // While open, the panel owns the keyboard, as the context menu does: no key reaches the
+  // window's handlers, so `a` cannot answer a permission and `c` cannot open a composer
+  // under it. A Command key is stopped but not prevented, so WebKit still hands it to the menu
+  // bar, whose command closes or toggles the panel (`window.postil.menu`).
   popoverEl.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
     event.stopPropagation();
-    close();
+    if (event.metaKey) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    } else if (event.key === "Tab") {
+      // The focus cycles inside the panel instead of leaving it open behind the focus.
+      event.preventDefault();
+      const buttons = [...popoverEl.querySelectorAll("button:not(:disabled)")];
+      const index = buttons.indexOf(document.activeElement);
+      const step = event.shiftKey ? -1 : 1;
+      const next = index === -1 ? (step === 1 ? 0 : buttons.length - 1) : index + step;
+      buttons.at(next % buttons.length)?.focus();
+    }
+    // Enter and Space are the focused button's own: they click it.
   });
+  // WebKit does not focus a button that is clicked: the press would move the focus out of the
+  // panel to the page, where the next Escape would stop a run instead of closing the panel.
+  popoverEl.addEventListener("mousedown", (event) => event.preventDefault());
   // A press outside the panel closes it; a press on the button is the button's (it toggles).
   window.addEventListener(
     "mousedown",

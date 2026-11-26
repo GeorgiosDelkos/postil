@@ -46,11 +46,13 @@ export function formatPercent(value) {
 }
 
 // Visual tone for a quota utilization bar: normal (<80%), warn (80–89%), critical (>=90%).
-// The thresholds are Orca's (20% and 10% left), which the popover follows.
+// The thresholds are Orca's (20% and 10% left), which the popover follows. Compared after
+// rounding as `formatPercent` rounds, so 79.6%, printed "80%", is already amber.
 export function quotaTone(usedPercent) {
   if (!Number.isFinite(usedPercent)) return "normal";
-  if (usedPercent >= 90) return "critical";
-  if (usedPercent >= 80) return "warn";
+  const shown = Math.round(usedPercent);
+  if (shown >= 90) return "critical";
+  if (shown >= 80) return "warn";
   return "normal";
 }
 
@@ -111,12 +113,13 @@ export function tightestQuota(agents) {
   return tightest;
 }
 
-// The agents the popover lists: built-in ones that are installed or turned on (a custom agent
-// has no account quota to show). The tightest come first, then those without a reading, by
-// name, so the agent closest to a limit is the first row.
+// The agents the popover lists: the installed built-ins (`found` is the program's path), the
+// only ones whose quota is probed; any other row could say only that it has no quota. The
+// tightest come first, then those without a reading, by name, so the agent closest to a
+// limit is the first row.
 export function popoverAgents(agents) {
   if (!Array.isArray(agents)) return [];
-  const listed = agents.filter((agent) => agent.builtIn && (agent.found || agent.enabled));
+  const listed = agents.filter((agent) => agent.builtIn && agent.found);
   return listed.toSorted((a, b) => {
     const left = agentTightest(a) ?? -1;
     const right = agentTightest(b) ?? -1;

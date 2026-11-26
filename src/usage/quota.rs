@@ -338,7 +338,7 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
         "Gemini" => probe_gemini(),
         "Grok" => QuotaReport::unavailable("Live quota is not exposed by the Grok CLI yet"),
         "OpenCode" => QuotaReport::unavailable(
-            "OpenCode routes across multiple providers — see Postil activity below",
+            "OpenCode routes across multiple providers, so it has no one account quota",
         ),
         _ => QuotaReport::unavailable("No provider quota source"),
     }

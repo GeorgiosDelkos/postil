@@ -43,10 +43,15 @@ test("formatPercent and quotaTone clamp values and pick thresholds", () => {
   assert.equal(formatPercent(62.4), "62%");
   assert.equal(formatPercent(4.5), "4.5%");
   assert.equal(formatPercent(120), "100%");
-  assert.equal(quotaTone(79.9), "normal");
+  assert.equal(quotaTone(79.4), "normal");
   assert.equal(quotaTone(80), "warn");
-  assert.equal(quotaTone(89.9), "warn");
+  assert.equal(quotaTone(89.4), "warn");
   assert.equal(quotaTone(90), "critical");
+  // The tone follows the printed percentage: "80%" is amber, "90%" red.
+  assert.equal(formatPercent(79.6), "80%");
+  assert.equal(quotaTone(79.6), "warn");
+  assert.equal(formatPercent(89.6), "90%");
+  assert.equal(quotaTone(89.6), "critical");
 });
 
 test("formatReset renders countdowns in minutes, hours, and days", () => {
@@ -84,14 +89,22 @@ test("tightestQuota takes the highest window of any agent with a reading", () =>
   );
 });
 
-test("popoverAgents lists installed or enabled built-ins, tightest first, then by name", () => {
+test("popoverAgents lists installed built-ins, tightest first, then by name", () => {
+  // `found` is the program's path, or null, as the route sends it.
   const agents = [
-    { name: "Gemini", builtIn: true, found: true, quota: { status: "unavailable" } },
-    { name: "Claude", builtIn: true, found: true, quota: ok(20, 62) },
-    { name: "Local", builtIn: false, found: true, quota: ok(99) },
-    { name: "Grok", builtIn: true, found: false, enabled: false, quota: null },
-    { name: "Codex", builtIn: true, found: false, enabled: true, quota: ok(80) },
-    { name: "Amp", builtIn: true, found: true, quota: { status: "loading" } },
+    { name: "Gemini", builtIn: true, found: "/bin/gemini", quota: { status: "unavailable" } },
+    { name: "Claude", builtIn: true, found: "/bin/claude", quota: ok(20, 62) },
+    { name: "Local", builtIn: false, found: "/bin/local", quota: ok(99) },
+    // Enabled with past runs but not installed: never probed, so not listed.
+    {
+      name: "Grok",
+      builtIn: true,
+      found: null,
+      enabled: true,
+      quota: { status: "unavailable" },
+    },
+    { name: "Codex", builtIn: true, found: "/bin/codex", quota: ok(80) },
+    { name: "Amp", builtIn: true, found: "/bin/amp", quota: { status: "loading" } },
   ];
   assert.deepEqual(
     popoverAgents(agents).map((agent) => agent.name),

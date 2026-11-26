@@ -3653,7 +3653,16 @@ body.focus-mode .code {
   }
 }
 
+/* The list scrolls and the header and the details row keep their height, so a list taller
+   than the window cannot push the details row out of the panel. */
+.usage-pop-header,
+.usage-pop-details {
+  flex: none;
+}
+
 .usage-pop-body {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }
 

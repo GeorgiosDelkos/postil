@@ -459,6 +459,54 @@ test("Usage button opens a popover that refreshes, closes, and leads to the repo
   await dialog.waitFor({ state: "hidden" });
 });
 
+test("the Usage popover owns the keyboard, and menu commands toggle or close it", async (t) => {
+  const { page, api } = await openProject(t);
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  const popover = page.locator("#usage-popover");
+  const menu = (command) => page.evaluate((name) => window.postil.menu(name), command);
+
+  // While the panel is open its keys stay its own: Shift-Cmd-Enter opens no send step, and
+  // Escape closes the panel instead of stopping the run under it.
+  await page.locator("#open-usage").click();
+  await popover.waitFor();
+  await popover.getByRole("button", { name: "Refresh", disabled: false }).click();
+  await popover.getByRole("button", { name: "Refresh", disabled: false }).waitFor();
+  await page.keyboard.press("Shift+Meta+Enter");
+  await page.keyboard.press("Escape");
+  await popover.waitFor({ state: "hidden" });
+  // A stop or the send step would show within a few draws.
+  await draws(page, 5);
+  assert.equal(await page.locator("#prompt-preview").isVisible(), false);
+  const run = await api("api/run");
+  assert.ok(isLive(run), `the run goes on: ${run.status}`);
+  assert.ok(!run.entries.some((entry) => entry.kind === "cancelRequested"), "no stop was asked");
+
+  // Shift-Cmd-U arrives as the menu command, which toggles the panel.
+  await menu("usage");
+  await popover.waitFor();
+  await menu("usage");
+  await popover.waitFor({ state: "hidden" });
+
+  // Another command closes it, and with a dialog open the usage command does nothing.
+  await menu("usage");
+  await popover.waitFor();
+  await menu("settings");
+  await popover.waitFor({ state: "hidden" });
+  await page.locator("#settings").waitFor();
+  await menu("usage");
+  await draws(page, 2);
+  assert.equal(await popover.isVisible(), false);
+  await page.keyboard.press("Escape");
+  await page.locator("#settings").waitFor({ state: "hidden" });
+
+  // On the welcome screen the button is hidden, so there is nothing to open above.
+  await menu("switch-project");
+  await page.locator("#welcome").waitFor();
+  await menu("usage");
+  await draws(page, 2);
+  assert.equal(await popover.isVisible(), false);
+});
+
 test("the startup wizard opens on first launch, saves settings, and stays closed on reload", async (t) => {
   const created = await fetch(new URL("new-fresh", bridge), { method: "POST" });
   const site = new URL((await created.json()).base, bridge);
