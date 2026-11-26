@@ -2,6 +2,7 @@
 // stepper, switch, agent rows, custom agent form, and reviewer list. Both views use the same
 // markup and rules (settings.js) so settings look and behave identically in both places.
 
+import { contextMenu } from "./context-menu.js";
 import { agentLogoIcon, el } from "./dom.js";
 import { agentState } from "./settings.js";
 
@@ -171,7 +172,26 @@ export function modelSelectOptions(report, saved) {
   return options;
 }
 
-// A select of `slot`'s model, among those `report` says its agent offers, with a dim line
+// `select` drawn as text with a chevron after it, as a row of a slot card shows its agent and
+// model. The select is laid, transparent, over the text: it keeps the keyboard, the native
+// menu, its label and its `data-key`. A value of "" (none, or the agent's default) is muted.
+function picker(select) {
+  select.className = "picker-select";
+  const text = el("span", "picker-text");
+  const node = el("span", "picker");
+  const show = () => {
+    text.textContent = select.selectedOptions[0]?.text ?? "";
+    node.classList.toggle("muted", select.value === "");
+    node.title = text.textContent;
+  };
+  // Shows the choice at once, before the save that follows it redraws the dialog.
+  select.addEventListener("change", show);
+  show();
+  node.append(text, select);
+  return node;
+}
+
+// A picker of `slot`'s model, among those `report` says its agent offers, with a dim line
 // under it while the agent is asked or when it could not say. `choose` gets the model id, or
 // null for the agent's default.
 export function modelSelect(key, slot, report, choose, { disabled = false } = {}) {
@@ -185,7 +205,7 @@ export function modelSelect(key, slot, report, choose, { disabled = false } = {}
     (value) => choose(value || null),
     { disabled },
   );
-  node.append(select);
+  node.append(picker(select));
   if (report?.status === "loading") {
     node.append(el("span", "settings-hint model-hint", `Asking ${slot.name} for its models…`));
   } else if (report?.status === "failed") {
@@ -196,21 +216,19 @@ export function modelSelect(key, slot, report, choose, { disabled = false } = {}
   return node;
 }
 
-// One row of a slot card: the reviewer's number, the agent, its model, and the row's buttons,
-// each in its column of the grid every slot row shares (`.slot-row`), so the model selects of
-// all rows line up whatever the agents' names. A number, model or actions given as null leave
-// their cell empty, to keep the columns.
-function slotRow(tag, number, agent, model, actions) {
-  const node = el(tag, "slot-row");
-  const numberCell = el("span", "slot-number", number ?? "");
-  const actionCell = el("div", "slot-actions");
-  if (actions) actionCell.append(...actions);
-  node.append(numberCell, agent, model ?? el("div"), actionCell);
+// The agent cell of a slot row: the agent's logo, then `name`, an element.
+function agentCell(agentName, name) {
+  const node = el("span", "slot-agent");
+  const logo = agentName ? agentLogoIcon(agentName) : null;
+  if (logo) node.append(logo);
+  node.append(name);
   return node;
 }
 
-// The agent notes are sent to and its model, as one row of a slot card. `key` names the agent
-// select; the model select is `${key}-model`. `onAgent` gets a name, or null for none.
+// The agent notes are sent to and its model, as the one row of a slot card: a muted arrow in
+// the lead column, the agent picker, and the model picker to the card's edge (this row has no
+// buttons). `key` names the agent select; the model select is `${key}-model`. `onAgent` gets
+// a name, or null for none.
 export function agentSlotControl(key, settings, models, { disabled = false, onAgent, onModel }) {
   const enabled = settings.enabledAgents;
   const none = enabled.length ? "None" : "Turn on an agent first";
@@ -224,12 +242,15 @@ export function agentSlotControl(key, settings, models, { disabled = false, onAg
     (name) => onAgent(name || null),
     { disabled: disabled || enabled.length === 0 },
   );
-  agent.classList.add("slot-agent");
-  const model = chosen
-    ? modelSelect(`${key}-model`, chosen, models[chosen.name], onModel, { disabled })
-    : null;
+  const lead = el("span", "slot-lead", "→");
+  lead.setAttribute("aria-hidden", "true");
+  const row = el("div", "slot-row send");
+  row.append(lead, agentCell(chosen?.name, picker(agent)));
+  if (chosen) {
+    row.append(modelSelect(`${key}-model`, chosen, models[chosen.name], onModel, { disabled }));
+  }
   const node = el("div", "slot-card");
-  node.append(slotRow("div", null, agent, model, null));
+  node.append(row);
   return node;
 }
 
@@ -341,22 +362,20 @@ export function customAgentForm(form, { onSubmit, onCancel }) {
   return node;
 }
 
-// The reviewers in order as rows of a slot card, each with its model select (`models` are the
-// agents' reports, by name), and a last row with a select that adds one.
+// The reviewers in order as rows of a slot card, each with its number, agent, model picker
+// (`models` are the agents' reports, by name) and buttons, and a last row whose button opens
+// `menu` (a `dialogMenu`) on the enabled agents to add one.
 export function reviewerControls(
   settings,
   models,
-  { disabled = false, onMove, onRemove, onAdd, onModel },
+  { disabled = false, menu, onMove, onRemove, onAdd, onModel },
 ) {
   const list = el("ol", "reviewer-list");
   settings.reviewers.forEach((slot, index) => {
     const { name } = slot;
     // The name is cut to its column; the tooltip shows it whole.
-    const agent = el("span", "slot-agent");
+    const agent = agentCell(name, el("span", "slot-agent-name", name));
     agent.title = name;
-    const logo = agentLogoIcon(name);
-    if (logo) agent.append(logo);
-    agent.append(el("span", "slot-agent-name", name));
     const model = modelSelect(
       `reviewer-model-${index}`,
       slot,
@@ -370,30 +389,27 @@ export function reviewerControls(
     up.setAttribute("aria-label", `Move ${name} up`);
     down.setAttribute("aria-label", `Move ${name} down`);
     remove.setAttribute("aria-label", `Remove ${name} as a reviewer`);
-    up.disabled = disabled || index === 0;
-    down.disabled = disabled || index === settings.reviewers.length - 1;
+    // A move the row cannot make is not shown; `impossible` hides it and keeps its place, so
+    // the buttons of every row stay in one column.
+    const first = index === 0;
+    const last = index === settings.reviewers.length - 1;
+    up.classList.toggle("impossible", first);
+    down.classList.toggle("impossible", last);
+    up.disabled = disabled || first;
+    down.disabled = disabled || last;
     remove.disabled = disabled;
-    list.append(slotRow("li", `${index + 1}.`, agent, model, [up, down, remove]));
+    // WebKit's Tab skips buttons under macOS's default keyboard navigation; tabIndex 0 puts
+    // them in the order.
+    up.tabIndex = down.tabIndex = remove.tabIndex = 0;
+    const actions = el("div", "slot-actions");
+    actions.append(up, down, remove);
+    const row = el("li", "slot-row");
+    row.append(el("span", "slot-lead", `${index + 1}.`), agent, model, actions);
+    list.append(row);
   });
 
-  const enabled = settings.enabledAgents.map((name) => [name, name]);
-  const options = [["", "Add a reviewer…"], ...enabled];
-  const add = selectBox(
-    "reviewer-add",
-    "Add a reviewer",
-    options,
-    "",
-    (name) => {
-      if (name) onAdd(name);
-    },
-    { disabled: disabled || settings.enabledAgents.length === 0 },
-  );
-  add.classList.add("quiet");
-  const addRow = el("div", "slot-row slot-add");
-  addRow.append(el("span", "slot-number"), add);
-
   const card = el("div", "slot-card");
-  card.append(list, addRow);
+  card.append(list, addReviewerRow(settings.enabledAgents, { disabled, menu, onAdd }));
   const control = el("div", "reviewers");
   if (!settings.reviewers.length) {
     const none = "No review: the agent's work comes straight back to you.";
@@ -401,6 +417,50 @@ export function reviewerControls(
   }
   control.append(card);
   return control;
+}
+
+// The last row of the reviewers' card: "+ Add reviewer", which opens `menu` under itself on
+// the `enabled` agents, each with its logo; `onAdd` gets the one chosen. With no agent turned
+// on it is disabled, and its tooltip says why.
+function addReviewerRow(enabled, { disabled, menu, onAdd }) {
+  const add = controlButton("", "reviewer-add", () => {
+    const { left, bottom } = add.getBoundingClientRect();
+    const actions = enabled.map((name) => ({
+      label: name,
+      icon: agentLogoIcon(name),
+      run: () => onAdd(name),
+    }));
+    menu.open(left, bottom + 4, actions);
+  });
+  add.className = "slot-add";
+  // In the Tab order, which WebKit leaves buttons out of (see the reviewers' buttons).
+  add.tabIndex = 0;
+  add.setAttribute("aria-haspopup", "menu");
+  add.setAttribute("aria-label", "Add reviewer");
+  add.append(el("span", "slot-lead", "+"), el("span", "", "Add reviewer"));
+  add.disabled = disabled || enabled.length === 0;
+  if (enabled.length === 0) add.title = "Turn on an agent first";
+  const row = el("div", "slot-row");
+  row.append(add);
+  return row;
+}
+
+// The page's menu (context-menu.js) for a modal dialog's controls. A modal dialog makes all
+// outside it inert, the window's own menu (#context-menu) and a popover over the dialog
+// included (WebKit, probed 2026-11-26), so the dialog holds a menu of its own: it keeps
+// `element` as its last child across redraws.
+export function dialogMenu(dialogEl) {
+  const element = el("div", "context-menu");
+  element.setAttribute("role", "menu");
+  element.setAttribute("aria-label", "Agents");
+  element.tabIndex = -1;
+  element.hidden = true;
+  // When the menu closes with the focus in it, the focus goes back to the button that opened
+  // it, found by its key, since a redraw may have replaced the button meanwhile.
+  const back = { focus: () => restoreDialogFocus(dialogEl, "reviewer-add") };
+  const menu = contextMenu({ menuEl: element, codeEl: back });
+  dialogEl.addEventListener("close", menu.close);
+  return { element, open: menu.open };
 }
 
 // Restores focus inside `dialogEl` after a full redraw, using each control's `data-key`.

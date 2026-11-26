@@ -1585,23 +1585,33 @@ button.repo-name:hover {
 }
 
 /* The workflow's slots: the agent notes go to, and the reviewers, each a row of a card drawn
-   as the agent list is. Every row has the same columns (the reviewer's number, the agent, its
-   model, the row's buttons), so the model selects start at one x with one width whatever the
-   agents' names. The cards sit under their labels (`.settings-row.stacked`) and fill the row,
-   because WebKit cuts a select's text mid-glyph with no ellipsis, and real model names need
-   145 to 225 px at the 12 px UI font. */
+   as the agent list is. The rows read as text, not as form fields: the agent and the model are
+   pickers drawn as their value and a chevron (`.picker`). Both cards share the columns (a lead
+   glyph or the reviewer's number, the agent, its model, the reviewer's buttons), so agents and
+   models start at one x in every row. The cards sit under their labels
+   (`.settings-row.stacked`) and fill the row, so model names as long as real ones (145 to 225
+   px at the 12 px UI font) show whole at the dialogs' normal width. */
 .slot-card {
   margin-top: 0;
 }
+
 .slot-row {
   display: grid;
-  /* Number: "9." in tabular digits. Agent: a logo and about eighteen characters of name, and
-     "Turn on an agent first" whole in the send-to select. Model: the rest, 260 px in the
-     wizard at its full 560 px. Actions: three 26 px buttons. */
-  grid-template-columns: 14px 140px minmax(0, 1fr) 78px;
+  /* Lead: "→", "+" or "9." in tabular digits. Agent: a logo and about eighteen characters of
+     name; 148 px holds "Turn on an agent first" whole with the picker's chevron, which 140 px
+     cut by 4 px (WebKit, 2026-11-26). Model: the rest, 248 px in the wizard at its full
+     560 px, of which 236 px are left for text beside the chevron: enough for the 229 px model
+     name of the page's end-to-end test.
+     Actions: three 24 px buttons. The send-to row has no buttons, so its model runs to the
+     card's edge. */
+  grid-template-columns: 16px 148px minmax(0, 1fr) 72px;
   align-items: start;
-  column-gap: 6px;
+  column-gap: 8px;
   padding: 6px 8px;
+}
+
+.slot-row.send {
+  grid-template-columns: 16px 148px minmax(0, 1fr);
 }
 
 .slot-row + .slot-row,
@@ -1609,16 +1619,15 @@ button.repo-name:hover {
   border-top: 1px solid var(--border);
 }
 
-.slot-number,
+.slot-lead,
 .slot-agent {
-  height: 26px;
+  height: 24px;
   display: flex;
   align-items: center;
   min-width: 0;
 }
 
-.slot-number {
-  justify-content: flex-end;
+.slot-lead {
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1635,36 +1644,145 @@ button.repo-name:hover {
   text-overflow: ellipsis;
 }
 
-.slot-row .select {
-  width: 100%;
+/* A select drawn as its value and a chevron: the select lies over the text, transparent, so
+   a click opens its native menu. Its padding lies outside the column (the negative margin),
+   so the text starts at the column's edge and the hover fill reaches past it. */
+.picker {
+  position: relative;
+  /* As wide as its text, not its cell, so the hover fill and the click end at the chevron. */
+  align-self: flex-start;
   min-width: 0;
+  max-width: calc(100% + 12px);
+  height: 24px;
+  margin-left: -6px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  border-radius: 5px;
+  color: var(--text-strong);
+  transition: background-color 80ms linear;
 }
 
-.slot-actions {
-  display: flex;
-}
-
-.slot-actions .icon-button {
-  width: 26px;
-  min-width: 0;
-  padding: 0;
-}
-
-/* The add row is quiet: no border or fill until the pointer is on it, muted text, and the
-   accent only on focus (`.select:focus-visible`). It spans the agent and model columns. */
-.slot-add .select.quiet {
-  grid-column: 2 / 4;
-  background: none;
-  border-color: transparent;
+.picker.muted {
   color: var(--text-muted);
 }
 
-.slot-add .select.quiet:hover:not(:disabled) {
+.picker:hover {
   background: var(--hover);
-  color: var(--text-strong);
 }
 
-/* A model's hint (asking, or why it could not) under its select, cut to the column. */
+/* The ring only after a key (ui/app.js sets `keyboard-input`): WebKit matches :focus-visible
+   on a select the pointer focused, which would ring the picker on every click. */
+body.keyboard-input .picker:has(.picker-select:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.picker-text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* A chevron pointing down, in the muted text colour through a mask. */
+.picker::after {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--text-muted);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpath d='M0.7 2.2 1.6 1.3 4 3.7 6.4 1.3 7.3 2.2 4 5.5z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpath d='M0.7 2.2 1.6 1.3 4 3.7 6.4 1.3 7.3 2.2 4 5.5z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+}
+
+.picker-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  appearance: none;
+  font: inherit;
+  cursor: pointer;
+}
+
+.picker-select:disabled {
+  cursor: default;
+}
+
+.picker:has(.picker-select:disabled):hover {
+  background: none;
+}
+
+/* A reviewer's buttons show while the pointer is on its row or the focus is in it: Tab
+   reaches them (they have tabIndex 0, ui/settings-controls.js), and the row shows them then.
+   A move the row cannot make is hidden and keeps its place. */
+.slot-actions {
+  display: flex;
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.slot-row:hover .slot-actions,
+.slot-row:focus-within .slot-actions {
+  opacity: 1;
+}
+
+.slot-actions .icon-button {
+  width: 24px;
+  height: 24px;
+  min-width: 0;
+  padding: 0;
+  font-size: 13px;
+}
+
+.slot-actions .impossible {
+  visibility: hidden;
+}
+
+/* "+ Add reviewer": quiet text over the lead and agent columns, the accent on hover and
+   focus. Its padding lies outside the columns, as a picker's does. */
+.slot-add {
+  grid-column: 1 / -1;
+  justify-self: start;
+  height: 24px;
+  margin-left: -6px;
+  padding: 0 6px;
+  display: grid;
+  grid-template-columns: 16px auto;
+  column-gap: 8px;
+  align-items: center;
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-muted);
+  font: inherit;
+  transition: color 80ms linear;
+}
+
+.slot-add .slot-lead {
+  height: auto;
+  color: inherit;
+}
+
+.slot-add:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+/* After a key only, as for `.picker`. */
+body.keyboard-input .slot-add:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  color: var(--accent);
+}
+
+/* A model's hint (asking, or why it could not) under its picker, cut to the column. */
 .model-select {
   min-width: 0;
   display: flex;

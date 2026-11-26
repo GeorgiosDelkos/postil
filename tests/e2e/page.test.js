@@ -490,6 +490,13 @@ test("a question from OpenCode shows its logo on the card that asks for an answe
   await page.locator("#run .run-card.needs").locator(logo).waitFor({ state: "attached" });
 });
 
+// Adds `name` as a reviewer in `dialog` as a user does: "+ Add reviewer", then the agent in the
+// menu it opens.
+async function addReviewer(dialog, name) {
+  await dialog.locator('[data-key="reviewer-add"]').click();
+  await dialog.locator(".context-menu").getByRole("menuitem", { name, exact: true }).click();
+}
+
 test("Settings lists the models the agent reports and saves one per slot", async (t) => {
   const { page, api } = await openProject(t, "plain");
   await page.locator("#open-settings").click();
@@ -500,9 +507,9 @@ test("Settings lists the models the agent reports and saves one per slot", async
   await model("agent-model").locator('option[value="deep"]').waitFor({ state: "attached" });
   await model("agent-model").selectOption("pro");
   // The same agent reviews twice, each time on a model of its own.
-  await dialog.locator('[data-key="reviewer-add"]').selectOption("Fake");
+  await addReviewer(dialog, "Fake");
   await model("reviewer-model-0").locator('option[value="fast"]').waitFor({ state: "attached" });
-  await dialog.locator('[data-key="reviewer-add"]').selectOption("Fake");
+  await addReviewer(dialog, "Fake");
   await model("reviewer-model-1").waitFor();
   await model("reviewer-model-0").selectOption("fast");
   await model("reviewer-model-1").selectOption("deep");
@@ -552,9 +559,28 @@ async function openLongNameProject(t) {
   return opened;
 }
 
-// Checks that `dialog`'s slot rows share their columns: the model selects of the send-to slot
-// (`agentKey`-model) and of both reviewers have one x and one width, the reviewers' buttons one
-// x, every card fits in the dialog, and the long name is cut to its column with a tooltip.
+// Waits until the computed opacity of `locator`'s element is `value`, past its transition.
+// The element is looked up anew each frame: a save in Settings redraws the dialog, and a node
+// it replaced has no computed style.
+async function settlesAt(dialog, selector, value) {
+  await dialog.evaluate(
+    (node, [query, wanted]) =>
+      new Promise((resolve) => {
+        const check = () => {
+          const target = node.querySelector(query);
+          if (target && getComputedStyle(target).opacity === wanted) resolve();
+          else requestAnimationFrame(check);
+        };
+        check();
+      }),
+    [selector, value],
+  );
+}
+
+// Checks that `dialog`'s slot rows share their columns: the agents and the model pickers of
+// the send-to slot (`agentKey`) and of both reviewers start at one x, the reviewers' model
+// cells have one width and their buttons one x, every card fits in the dialog, the long name
+// is cut to its column with a tooltip, and a long model name shows whole.
 async function assertSlotsAligned(dialog, agentKey) {
   // The dialog comes in with a short animation, which moves every box while it runs.
   await dialog.evaluate((node) =>
@@ -565,8 +591,16 @@ async function assertSlotsAligned(dialog, agentKey) {
   const models = await Promise.all(keys.map(box));
   for (const [index, model] of models.entries()) {
     assert.equal(model.x, models[0].x, `${keys[index]} starts where ${keys[0]} does`);
-    assert.equal(model.width, models[0].width, `${keys[index]} is as wide as ${keys[0]}`);
   }
+  const agents = await Promise.all(
+    (await dialog.locator(".slot-agent").all()).map((agent) => agent.boundingBox()),
+  );
+  assert.equal(agents.length, 3);
+  for (const agent of agents) assert.equal(agent.x, agents[0].x, "the agents start at one x");
+  const cells = await Promise.all(
+    (await dialog.locator("li .model-select").all()).map((cell) => cell.boundingBox()),
+  );
+  assert.equal(cells[1].width, cells[0].width, "the reviewers' model cells are one width");
   const removes = await Promise.all(["unreview-0", "unreview-1"].map(box));
   assert.equal(removes[1].x, removes[0].x, "the reviewers' buttons line up");
 
@@ -582,22 +616,34 @@ async function assertSlotsAligned(dialog, agentKey) {
     .evaluate((node) => node.scrollWidth > node.clientWidth);
   assert.ok(cut, "the long name is cut to its column");
 
-  // A model name as long as real ones shows whole: WebKit cuts a select's text mid-glyph with
-  // no ellipsis, so the text and the native arrow must fit inside it. Under `appearance: auto`
-  // WebKit reports a padding of 0 whatever app.css sets, and the arrow is in no computed style:
-  // ARROW is its room, measured in WebKit on 2026-11-26 (about 30 px). The selects are one
-  // width, so one stands for all.
-  const ARROW = 30;
+  // A model name as long as real ones shows whole, not cut with an ellipsis. The reviewers'
+  // model cells are one width, so one stands for both; the send-to row's is wider.
   const select = dialog.locator('[data-key="reviewer-model-1"]');
   await select.locator('option[value="long"]').waitFor({ state: "attached" });
   await select.selectOption("long");
-  const room = await select.evaluate((node, arrow) => {
-    const context = document.createElement("canvas").getContext("2d");
-    context.font = getComputedStyle(node).font;
-    const text = context.measureText(node.selectedOptions[0].text).width;
-    return { needed: text + arrow, width: node.clientWidth };
-  }, ARROW);
-  assert.ok(room.needed <= room.width, `a long model name fits: ${JSON.stringify(room)}`);
+  const text = select.locator("xpath=..").locator(".picker-text");
+  await text.filter({ hasText: "OpenCode/Nemotron 3.5 Super VL Free" }).waitFor();
+  const room = await text.evaluate((node) => ({ text: node.scrollWidth, room: node.clientWidth }));
+  assert.ok(room.text <= room.room, `a long model name shows whole: ${JSON.stringify(room)}`);
+
+  // A move a row cannot make is hidden, not drawn disabled; the others are shown.
+  // Looked up and read in one evaluation, for the reason `settlesAt` gives.
+  const visibility = (key) =>
+    dialog.evaluate(
+      (node, query) => getComputedStyle(node.querySelector(query)).visibility,
+      `[data-key="${key}"]`,
+    );
+  assert.equal(await visibility("up-0"), "hidden");
+  assert.equal(await visibility("down-1"), "hidden");
+  assert.equal(await visibility("down-0"), "visible");
+  assert.equal(await visibility("up-1"), "visible");
+
+  // A row's buttons show with the focus in the row, and not in another, with the pointer away.
+  await dialog.page().mouse.move(1, 1);
+  await dialog.locator('[data-key="reviewer-model-0"]').focus();
+  const actions = (index) => `li:nth-child(${index + 1}) .slot-actions`;
+  await settlesAt(dialog, actions(0), "1");
+  await settlesAt(dialog, actions(1), "0");
 }
 
 test("the workflow slots line up whatever the agents' names, in Settings and the wizard", async (t) => {
@@ -612,6 +658,45 @@ test("the workflow slots line up whatever the agents' names, in Settings and the
   await wizard.locator('[data-key="step-workflow"]').click();
   await wizard.locator('[data-key="reviewer-model-1"]').waitFor();
   await assertSlotsAligned(wizard, "wizard-agent");
+});
+
+test("the workflow slots ring a picker only after a key, and Tab reaches every button", async (t) => {
+  const { page } = await openLongNameProject(t);
+  await page.locator("#open-settings").click();
+  const wizard = page.locator("#wizard");
+  await page.locator('#settings [data-key="run-wizard"]').click();
+  await wizard.locator('[data-key="step-workflow"]').click();
+  const model = (key) => wizard.locator(`[data-key="${key}"]`);
+  await model("reviewer-model-1").waitFor();
+  const outline = (key) =>
+    wizard.evaluate(
+      (node, query) => getComputedStyle(node.querySelector(query).parentElement).outlineStyle,
+      `[data-key="${key}"]`,
+    );
+  const focused = () => page.evaluate(() => document.activeElement?.dataset.key);
+
+  // A click focuses the picker without its ring; Shift-Tab and Tab ring the one they reach.
+  const box = await model("reviewer-model-0").boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  assert.equal(await focused(), "reviewer-model-0");
+  assert.equal(await outline("reviewer-model-0"), "none");
+  await page.keyboard.press("Shift+Tab");
+  assert.equal(await focused(), "wizard-agent-model");
+  assert.equal(await outline("wizard-agent-model"), "solid");
+  await page.keyboard.press("Tab");
+  assert.equal(await outline("reviewer-model-0"), "solid");
+
+  // Tab goes on through the row's buttons, which it shows, past the move the first row cannot
+  // make, then through the last row to "+ Add reviewer".
+  await page.keyboard.press("Tab");
+  assert.equal(await focused(), "down-0");
+  await settlesAt(wizard, "li:nth-child(1) .slot-actions", "1");
+  const keys = [];
+  for (let step = 0; step < 5; step += 1) {
+    await page.keyboard.press("Tab");
+    keys.push(await focused());
+  }
+  assert.deepEqual(keys, ["unreview-0", "reviewer-model-1", "up-1", "unreview-1", "reviewer-add"]);
 });
 
 test("the startup wizard opens on first launch, saves settings, and stays closed on reload", async (t) => {

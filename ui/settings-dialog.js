@@ -14,6 +14,7 @@ import {
   agentSlotControl,
   controlButton,
   customAgentForm,
+  dialogMenu,
   fetchSettingsJson,
   fontStepper,
   modelReports,
@@ -41,6 +42,8 @@ import {
 // so the page can follow them. `openWizard` opens the startup wizard. Closing gives the focus
 // back to where it was when the dialog opened, as `<dialog>` does: a note being written keeps it.
 export function settingsDialog(dialogEl, { apply, openWizard }) {
+  // The menu of agents that "+ Add reviewer" opens.
+  const agentMenu = dialogMenu(dialogEl);
   const ui = {
     // The reply of api/settings, or null before the first one.
     view: null,
@@ -160,7 +163,10 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
     const focused = ui.focusNext ?? (dialogEl.contains(active) ? active.dataset.key : undefined);
     ui.focusNext = null;
     const scrolled = dialogEl.querySelector(".settings-body")?.scrollTop ?? 0;
-    dialogEl.replaceChildren(panel());
+    // The panel is replaced and the menu after it kept, so an open menu keeps the focus.
+    const next = panel();
+    if (dialogEl.contains(agentMenu.element)) dialogEl.firstElementChild.replaceWith(next);
+    else dialogEl.replaceChildren(next, agentMenu.element);
     dialogEl.querySelector(".settings-body").scrollTop = scrolled;
     restoreDialogFocus(dialogEl, focused);
   }
@@ -402,6 +408,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
   function reviewers() {
     const control = reviewerControls(ui.view.settings, models.models, {
       disabled: locked(),
+      menu: agentMenu,
       onMove: (index, step) => {
         // The focus follows the reviewer it moved, so pressing again keeps moving it.
         ui.focusNext = `${step < 0 ? "up" : "down"}-${index + step}`;

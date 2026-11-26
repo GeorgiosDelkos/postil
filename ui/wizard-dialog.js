@@ -11,6 +11,7 @@ import {
   agentSlotControl,
   controlButton,
   customAgentForm,
+  dialogMenu,
   fetchSettingsJson,
   fontStepper,
   modelReports,
@@ -89,6 +90,8 @@ export function wizardDialog(
   dialogEl,
   { apply, onSaved, openFolder, canOpenFolder, openSettings },
 ) {
+  // The menu of agents that "+ Add reviewer" opens.
+  const agentMenu = dialogMenu(dialogEl);
   const ui = {
     view: null,
     baseline: null,
@@ -235,7 +238,10 @@ export function wizardDialog(
     const focused = ui.focusNext ?? (dialogEl.contains(active) ? active.dataset.key : undefined);
     ui.focusNext = null;
     const scrolled = dialogEl.querySelector(".wizard-body")?.scrollTop ?? 0;
-    dialogEl.replaceChildren(panel());
+    // The panel is replaced and the menu after it kept, so an open menu keeps the focus.
+    const next = panel();
+    if (dialogEl.contains(agentMenu.element)) dialogEl.firstElementChild.replaceWith(next);
+    else dialogEl.replaceChildren(next, agentMenu.element);
     const body = dialogEl.querySelector(".wizard-body");
     if (body) body.scrollTop = scrolled;
     restoreDialogFocus(dialogEl, focused);
@@ -456,6 +462,7 @@ export function wizardDialog(
 
     const reviewers = reviewerControls(ui.draft, models.models, {
       disabled: ui.saving,
+      menu: agentMenu,
       onMove: (index, step) => {
         ui.focusNext = `${step < 0 ? "up" : "down"}-${index + step}`;
         updateDraft(moveReviewer(ui.draft, index, step).settings);
