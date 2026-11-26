@@ -2,7 +2,7 @@
 // lists the runs, one small card each, newest first; a card opens the run's dialog
 // (run-dialog.js). What needs an answer now shows above the runs.
 
-import { el, statusIcon } from "./dom.js";
+import { agentLogoIcon, el, statusIcon } from "./dom.js";
 import {
   elapsed,
   evidence,
@@ -145,8 +145,10 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
   function needsYouCard(view, question) {
     const button = el("button", "run-card needs");
     button.type = "button";
+    button.append(statusIcon("needs"));
+    const logo = agentLogoIcon(view.agent);
+    if (logo) button.append(logo);
     button.append(
-      statusIcon("needs"),
       el("span", "run-card-text", `${view.agent} has a question: ${question.message}`),
       el("span", "run-id", view.id),
       el("span", "run-chevron", "›"),
@@ -171,11 +173,10 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       return button;
     }
     const more = latest.id === view.id ? "" : ` · +${latest.id}`;
-    button.append(
-      statusIcon(iconKind(latest)),
-      el("span", "run-id", view.id),
-      el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`),
-    );
+    button.append(statusIcon(iconKind(latest)), el("span", "run-id", view.id));
+    const logo = agentLogoIcon(view.agent);
+    if (logo) button.append(logo);
+    button.append(el("span", "run-card-text", `${view.agent} · ${view.notes.join(" ")}${more}`));
     if (checks) {
       const mark = el("span", `run-evidence tool-state ${checks}`, CHECK_MARKS[checks]);
       mark.title = CHECK_TITLES[checks];

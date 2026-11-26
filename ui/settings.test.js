@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   addReviewer,
   agentRows,
+  agentState,
   codeMetrics,
   formatSlot,
   moveReviewer,
@@ -66,6 +67,17 @@ test("rows say which agents are enabled and what each one is used for", () => {
     ],
   );
   assert.equal(rows[0].found, "/bin/claude", "the scan's fields are kept");
+});
+
+test("a row's state: found first, then a pending check, then on but missing", () => {
+  const state = (row) => agentState(row).kind;
+  // Found wins over a pending check and over being on.
+  assert.equal(state({ found: "/bin/x", pendingCheck: true, enabled: true }), "installed");
+  assert.equal(state({ found: null, pendingCheck: true, enabled: true }), "unchecked");
+  assert.equal(state({ found: null, enabled: true }), "missing");
+  assert.equal(state({ found: null, enabled: false }), "absent");
+  assert.equal(agentState({ found: null, enabled: true }).label, "Not found on PATH");
+  assert.equal(agentState({ found: null, enabled: false }).label, "Not installed");
 });
 
 test("an agent can be turned off only while nothing uses it", () => {

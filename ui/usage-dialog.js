@@ -4,7 +4,7 @@
 // Polls while the agent scan or any live provider quota probe is in flight, and redraws only
 // when the reply changes so focus and scroll position stay put.
 
-import { el } from "./dom.js";
+import { agentLogoIcon, el } from "./dom.js";
 import {
   formatCost,
   formatCredits,
@@ -236,6 +236,8 @@ export function usageDialog(dialogEl, { openSettings, onTone }) {
 
     const head = el("header", "usage-card-header");
     const left = el("div", "usage-card-title");
+    const logo = agentLogoIcon(agent.name);
+    if (logo) left.append(logo);
     left.append(el("span", "usage-agent-name", agent.name));
     if (!agent.builtIn) left.append(el("span", "agent-badge", "custom"));
 

@@ -45,6 +45,16 @@ export function agentRows(agents, settings) {
   }));
 }
 
+// Where a row's agent stands, as the mark beside its name shows it (`kind`, a class in
+// app.css) and says it (`label`). An agent that is on but missing is a problem; one that is
+// off is only not installed.
+export function agentState(agent) {
+  if (agent.found) return { kind: "installed", label: "Installed" };
+  if (agent.pendingCheck) return { kind: "unchecked", label: "Checked on PATH when saved" };
+  if (agent.enabled) return { kind: "missing", label: "Not found on PATH" };
+  return { kind: "absent", label: "Not installed" };
+}
+
 // Ticks or unticks an agent. An agent in use cannot be unticked: the settings would name an
 // agent that is not offered, which the Rust process refuses.
 export function setEnabled(settings, name, enabled) {

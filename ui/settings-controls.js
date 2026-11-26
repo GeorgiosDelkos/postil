@@ -2,7 +2,8 @@
 // stepper, switch, agent rows, custom agent form, and reviewer list. Both views use the same
 // markup and rules (settings.js) so settings look and behave identically in both places.
 
-import { el } from "./dom.js";
+import { agentLogoIcon, el } from "./dom.js";
+import { agentState } from "./settings.js";
 
 // How long a dialog waits before asking again while the agent scan runs. Arbitrary: short
 // enough that the list appears as soon as the scan ends, long enough not to busy the process.
@@ -94,31 +95,38 @@ export function selectBox(key, label, options, value, choose, { disabled = false
   return node;
 }
 
-// One row in the agent list: the name, one dim line on where it stands (the full path of the
-// program is in its tooltip, not on the row), the command it starts with, and a switch.
+// The mark before an agent's name in the list, one glyph per `agentState` kind; its shape and
+// colour are CSS (`.agent-mark.<kind>`). Not installed is a hollow circle, with no glyph.
+const AGENT_MARKS = { installed: "✓", missing: "!", unchecked: "–", absent: "" };
+
+// One row in the agent list: a mark for where the agent stands, its logo and name, what it is
+// used for, the command it starts with, and a switch. The state in words is the mark's label
+// and, with the full path of the program, the row's tooltip. A row whose agent is not
+// installed has its logo, name, use and command dimmed (`.agent-text`).
 export function agentListRow(
   agent,
   { disabled = false, formOpen = false, onToggle, onEdit, onRemove },
 ) {
-  const node = el("div", "agent-row");
+  const state = agentState(agent);
+  const node = el("div", `agent-row ${state.kind}`);
+  node.title = agent.found ? `${state.label}: ${agent.found}` : state.label;
+  const mark = el("span", `agent-mark ${state.kind}`, AGENT_MARKS[state.kind]);
+  mark.setAttribute("role", "img");
+  mark.setAttribute("aria-label", state.label);
+
   const text = el("div", "agent-text");
-  const name = el("span", "agent-name", agent.name);
+  const name = el("span", "agent-name");
+  const logo = agentLogoIcon(agent.name);
+  if (logo) name.append(logo);
+  name.append(agent.name);
   if (!agent.builtIn) name.append(el("span", "agent-badge", "custom"));
-  // An agent that is on but missing is a problem; one that is off is only not installed.
-  const status = agent.found
-    ? el("span", "agent-state", "Installed")
-    : agent.pendingCheck
-      ? el("span", "agent-state", "Checked on PATH when saved")
-      : agent.enabled
-        ? el("span", "agent-state warning", "Not found on PATH")
-        : el("span", "agent-state", "Not installed");
-  if (agent.found) status.title = agent.found;
+  text.append(name);
   if (agent.usage) {
     const used = agent.usage[0].toUpperCase() + agent.usage.slice(1);
-    status.append(el("span", "agent-usage", ` · ${used}`));
+    text.append(el("span", "agent-usage", used));
   }
-  text.append(name, status, el("span", "agent-command", agent.command));
-  node.append(text);
+  text.append(el("span", "agent-command", agent.command));
+  node.append(mark, text);
 
   if (!agent.builtIn) {
     const actions = el("div", "agent-actions");

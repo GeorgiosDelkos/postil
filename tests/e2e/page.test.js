@@ -50,10 +50,10 @@ after(() => browser?.close());
 
 // A new project on the bridge, `src/a.rs`, `b.rs` and `c.rs` in a fresh repository, open in a
 // new page, its agent in the fake agent's `scenario`. `api` calls its routes from the test, as
-// the page does.
-async function openProject(t, scenario = "flood") {
+// the page does. `route` is the bridge's route that makes the site (src/site/tests/page_e2e.rs).
+async function openProject(t, scenario = "flood", route = "new") {
   const body = JSON.stringify({ scenario });
-  const created = await fetch(new URL("new", bridge), { method: "POST", body });
+  const created = await fetch(new URL(route, bridge), { method: "POST", body });
   const site = new URL((await created.json()).base, bridge);
   const page = await browser.newPage();
   t.after(() => page.close());
@@ -433,6 +433,63 @@ test("Usage button opens the usage report, switches filters, and Refresh settles
   await dialog.waitFor({ state: "hidden" });
 });
 
+test("OpenCode's logo shows wherever the page names it, and a custom agent has none", async (t) => {
+  const { page, api } = await openProject(t, null, "new-opencode");
+  const logo = 'svg.agent-logo use[href="#agent-opencode"]';
+  const note = await addNote(api, "Rename two.");
+  // The page reads the notes as it loads; this one was written after.
+  await page.reload();
+  await page.locator(".note-item").first().waitFor();
+
+  // The send step's agent picker: OpenCode with its logo, Fake with an empty slot instead.
+  await page.locator("#send-button").click();
+  await page.locator("#agent-picker").click();
+  const menu = page.locator("#context-menu");
+  const item = (name) => menu.locator(".menu-item").filter({ hasText: name });
+  await item("OpenCode").locator(logo).waitFor({ state: "attached" });
+  assert.equal(await item("Fake").locator("svg.agent-logo").count(), 0);
+  assert.equal(await item("Fake").locator(".menu-icon-slot").count(), 1);
+  await page.keyboard.press("Escape");
+
+  // The run's card, and once it ended, its reviewer's card in the run's dialog.
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  await page.locator("#tab-run").click();
+  const card = page.locator("#run .run-entry");
+  await card.locator(logo).waitFor({ state: "attached" });
+  const deadline = Date.now() + WAIT;
+  for (;;) {
+    const { status } = await api("api/run?id=R1");
+    if (status === "ended") break;
+    assert.ok(Date.now() < deadline, `R1 is ${status}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
+  await card.click();
+  const stage = page.locator("#run-detail .run-card").filter({ hasText: "R2" });
+  await stage
+    .filter({ hasText: "OpenCode · proposes" })
+    .locator(logo)
+    .waitFor({ state: "attached" });
+  await page.keyboard.press("Escape");
+
+  // The Usage dialog's cards.
+  await page.locator("#open-usage").click();
+  const usage = page.locator("#usage .usage-card");
+  await usage.filter({ hasText: "OpenCode" }).locator(logo).waitFor({ state: "attached" });
+  const fake = usage.filter({ hasText: "Fake" });
+  await fake.waitFor();
+  assert.equal(await fake.locator("svg.agent-logo").count(), 0);
+});
+
+test("a question from OpenCode shows its logo on the card that asks for an answer", async (t) => {
+  const { page, api } = await openProject(t, "ask", "new-opencode");
+  const note = await addNote(api, "Rename two.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  await page.locator("#tab-run").click();
+  const logo = 'svg.agent-logo use[href="#agent-opencode"]';
+  await page.locator("#run .run-card.needs").locator(logo).waitFor({ state: "attached" });
+});
+
 test("Settings lists the models the agent reports and saves one per slot", async (t) => {
   const { page, api } = await openProject(t, "plain");
   await page.locator("#open-settings").click();
@@ -524,6 +581,24 @@ test("Skip on the first run saves the defaults with the installed agents turned 
 
   const wizard = page.locator("#wizard");
   await wizard.getByRole("switch", { name: /Gemini/ }).waitFor();
+
+  // Each row's mark says where the agent stands; a missing agent's row is dimmed.
+  const row = (name) =>
+    wizard.locator(".agent-row").filter({ has: page.getByRole("switch", { name }) });
+  const mark = (name) => row(name).locator(".agent-mark");
+  assert.equal(await mark("Gemini").getAttribute("aria-label"), "Installed");
+  assert.equal(await mark("OpenCode").getAttribute("aria-label"), "Not installed");
+  const opacity = (name) =>
+    row(name)
+      .locator(".agent-text")
+      .evaluate((node) => Number(getComputedStyle(node).opacity));
+  assert.equal(await opacity("Gemini"), 1);
+  assert.ok((await opacity("OpenCode")) < 1, "a missing agent's row is dimmed");
+  // OpenCode's logo refers to a symbol the page loaded from agent-logos.svg.
+  const logo = row("OpenCode").locator("svg.agent-logo");
+  const symbol = await logo.locator("use").getAttribute("href");
+  await page.locator(`${symbol} path`).first().waitFor({ state: "attached" });
+
   await wizard.getByRole("button", { name: "Skip" }).click();
   await wizard.waitFor({ state: "hidden" });
 

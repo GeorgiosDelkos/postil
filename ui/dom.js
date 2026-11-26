@@ -1,5 +1,7 @@
 // Small DOM helpers shared by the page's modules.
 
+import { agentLogo } from "./icons.js";
+
 export const $ = (id) => document.getElementById(id);
 
 export function el(tag, className, text) {
@@ -52,10 +54,25 @@ export function statusIcon(kind) {
   return icon;
 }
 
-// Puts icons.svg into the page once, so every icon refers to a symbol in this document.
-// Until it arrives, or if it fails, the icons are empty boxes and nothing else changes.
+// The logo of the agent called `name` (agentLogo in icons.js), or null for an agent without
+// one, which shows its name alone.
+export function agentLogoIcon(name) {
+  const id = agentLogo(name);
+  if (!id) return null;
+  const svg = icon(id);
+  svg.setAttribute("class", "agent-logo");
+  return svg;
+}
+
+// Puts icons.svg (the file tree's icons) and agent-logos.svg into the page once, so every
+// icon refers to a symbol in this document. Until a sprite arrives, or if it fails, its icons
+// are empty boxes and nothing else changes.
 export async function loadIcons() {
-  const response = await fetch("icons.svg");
+  await Promise.all(["icons.svg", "agent-logos.svg"].map(loadSprite));
+}
+
+async function loadSprite(file) {
+  const response = await fetch(file);
   if (!response.ok) return;
   const sprite = new DOMParser().parseFromString(await response.text(), "image/svg+xml");
   const root = document.importNode(sprite.documentElement, true);

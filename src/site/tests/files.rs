@@ -85,6 +85,7 @@ fn page_assets_are_served_with_their_types() {
         ("/", "text/html"),
         ("/app.css", "text/css"),
         ("/icons.svg", "image/svg+xml"),
+        ("/agent-logos.svg", "image/svg+xml"),
         ("/fonts/Geist-Variable.woff2", "font/woff2"),
         ("/fonts/GeistMono-Variable.woff2", "font/woff2"),
     ];
@@ -124,10 +125,12 @@ fn page_only_links_to_assets_that_are_served() {
             );
         }
     }
-    assert!(
-        DOM_JS.contains("\"icons.svg\""),
-        "dom.js loads the icon sprite"
-    );
+    for sprite in ["icons.svg", "agent-logos.svg"] {
+        assert!(
+            DOM_JS.contains(&format!("\"{sprite}\"")),
+            "dom.js loads {sprite}"
+        );
+    }
     for font in [
         "fonts/Geist-Variable.woff2",
         "fonts/GeistMono-Variable.woff2",
