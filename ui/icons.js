@@ -93,11 +93,12 @@ const EXTENSIONS = new Map([
 ]);
 
 // Built-in agents with a logo in agent-logos.svg, by name (BUILT_IN in src/agents.rs). The
-// comment at the top of that file says where each came from, and why the others have none.
+// comment at the top of that file says where each came from and on what terms.
 const AGENT_LOGOS = new Map([
   ["Claude", "agent-claude"],
   ["Codex", "agent-codex"],
   ["Gemini", "agent-gemini"],
+  ["Grok", "agent-grok"],
   ["OpenCode", "agent-opencode"],
 ]);
 
