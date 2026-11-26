@@ -13,6 +13,8 @@ import {
   saveCustomAgent,
   setAgent,
   setAgentModel,
+  setAnalyzer,
+  setAnalyzerModel,
   setEnabled,
   setReviewerModel,
 } from "./settings.js";
@@ -31,6 +33,7 @@ function settings() {
     customAgents: [{ name: "Local", command: "local-agent --acp" }],
     enabledAgents: ["Grok", "Local", "Claude"],
     agent: { name: "Local", model: null },
+    analyzer: null,
     reviewers: [
       { name: "Grok", model: "grok-4.7" },
       { name: "Grok", model: null },
@@ -95,6 +98,29 @@ test("an agent can be turned off only while nothing uses it", () => {
   ]);
   const same = settings();
   assert.equal(setEnabled(same, "Grok", true).settings, same, "no change, same object");
+});
+
+test("the analyzer is chosen among enabled agents and cannot be turned off or removed", () => {
+  const chosen = setAnalyzer(settings(), "Claude").settings;
+  assert.deepEqual(chosen.analyzer, slot("Claude"));
+  assert.match(setEnabled(chosen, "Claude", false).error, /while it analyzes the repository/);
+  assert.match(setAnalyzer(settings(), "Gemini").error, /Turn Gemini on first/);
+  const fast = setAnalyzerModel(chosen, "fast").settings;
+  assert.deepEqual(fast.analyzer, slot("Claude", "fast"));
+  assert.deepEqual(setAnalyzer(fast, "Claude").settings.analyzer, slot("Claude", "fast"));
+  assert.deepEqual(setAnalyzer(fast, "Grok").settings.analyzer, slot("Grok"));
+  assert.equal(setAnalyzer(fast, null).settings.analyzer, null);
+  assert.match(setAnalyzerModel(settings(), "x").error, /Choose the analyzer/);
+
+  const custom = setAnalyzer(setAgent(settings(), "Claude").settings, "Local").settings;
+  assert.match(removeCustomAgent(custom, "Local").error, /cannot be removed while it analyzes/);
+  const renamed = saveCustomAgent(
+    setAnalyzerModel(custom, "big").settings,
+    { name: "Mine", command: "mine --acp" },
+    "Local",
+    BUILT_IN,
+  ).settings;
+  assert.deepEqual(renamed.analyzer, slot("Mine", "big"), "renamed, its model kept");
 });
 
 test("a new custom agent is trimmed, enabled, and checked as the Rust process checks it", () => {

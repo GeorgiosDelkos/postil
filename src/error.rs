@@ -172,6 +172,14 @@ pub enum Error {
         /// How long the change waited, in seconds.
         seconds: u64,
     },
+    /// An analysis run was refused before a thread was made: the analyzer is not installed,
+    /// or an analysis of this window is under way. The text says which.
+    AnalysisRefused(String),
+    /// A diagram was asked for by an id the analysis does not hold.
+    NoSuchDiagram {
+        /// The id asked for, `D3`.
+        id: String,
+    },
     /// The page sent settings that break a rule (`settings.rs`); the text says which.
     InvalidSettings(String),
     /// The settings file on disk cannot be used, so saving over it is refused until it is
@@ -493,6 +501,8 @@ impl fmt::Display for Error {
                  again; `lsof` on that file names the process)",
                 path.display()
             ),
+            Self::AnalysisRefused(problem) => write!(f, "cannot analyze: {problem}"),
+            Self::NoSuchDiagram { id } => write!(f, "the analysis has no diagram {id}"),
             Self::InvalidSettings(problem) => write!(f, "cannot save the settings: {problem}"),
             Self::SettingsLocked(problem) => write!(
                 f,
@@ -751,6 +761,8 @@ impl std::error::Error for Error {
             | Self::ReviewLocked { .. }
             | Self::InvalidAnalysis { .. }
             | Self::AnalysisLocked { .. }
+            | Self::AnalysisRefused(_)
+            | Self::NoSuchDiagram { .. }
             | Self::InvalidSettings(_)
             | Self::SettingsLocked(_)
             | Self::SettingsChanged

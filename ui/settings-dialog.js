@@ -34,6 +34,8 @@ import {
   saveCustomAgent,
   setAgent,
   setAgentModel,
+  setAnalyzer,
+  setAnalyzerModel,
   setEnabled,
   setReviewerModel,
 } from "./settings.js";
@@ -357,7 +359,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
         }),
       );
     }
-    node.append(actions, chosenAgent(), reviewers());
+    node.append(actions, chosenAgent(), analyzer(), reviewers());
     return node;
   }
 
@@ -399,6 +401,24 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
     const node = settingRow(
       "Send notes to",
       "The agent that works on the notes, and its model",
+      control,
+    );
+    node.classList.add("stacked");
+    return node;
+  }
+
+  function analyzer() {
+    const control = agentSlotControl("analyzer", ui.view.settings, models.models, {
+      slot: ui.view.settings.analyzer,
+      label: "Analyzer",
+      emptyLabel: "Same as Send notes to",
+      disabled: locked(),
+      onAgent: (name) => save(setAnalyzer(ui.view.settings, name)),
+      onModel: (model) => save(setAnalyzerModel(ui.view.settings, model)),
+    });
+    const node = settingRow(
+      "Analyzer",
+      "The agent that draws the map of the repository, read-only, and its model",
       control,
     );
     node.classList.add("stacked");

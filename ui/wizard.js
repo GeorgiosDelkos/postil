@@ -32,7 +32,8 @@ export function applyDetectedDefaults(draft, agents) {
 // Turns an agent on or off inside the wizard's draft. Unlike the Settings dialog (which refuses
 // turning off an agent that is chosen as the default or a reviewer), the wizard reconciles the
 // draft automatically: turning off the default moves it to the next enabled agent (or null) and
-// removes it from reviewers; turning on an agent while none is chosen picks it as the default.
+// removes it from reviewers and from the analyzer; turning on an agent while none is chosen
+// picks it as the default.
 // An agent that becomes the default runs its own default model.
 export function toggleWizardAgent(draft, name, enabled) {
   if (enabled) {
@@ -43,7 +44,9 @@ export function toggleWizardAgent(draft, name, enabled) {
   const reviewers = draft.reviewers.filter((slot) => slot.name !== name);
   const fallback = enabledAgents.length ? { name: enabledAgents[0], model: null } : null;
   const agent = draft.agent?.name === name ? fallback : draft.agent;
-  return { ...draft, enabledAgents, agent, reviewers };
+  // Analyses then go to the default agent.
+  const analyzer = draft.analyzer?.name === name ? null : (draft.analyzer ?? null);
+  return { ...draft, enabledAgents, agent, analyzer, reviewers };
 }
 
 // Adds or edits a custom agent in the wizard's draft. Returns `{ settings }` or `{ error }`.

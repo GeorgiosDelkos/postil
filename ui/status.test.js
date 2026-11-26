@@ -433,6 +433,21 @@ test("an undone edit redraws the run dialog with its notice", () => {
   assert.notEqual(undone, drawn);
 });
 
+test("an analysis run's dialog redraws for what it was asked and for why nothing was stored", () => {
+  // The server sets the problem from the `noAnalysis` entry (src/run/log.rs, `apply`).
+  const asked = { analysis: { kind: "analyze" } };
+  const ended = threadKey([streaming("R1", "ended", [], asked)]);
+  assert.notEqual(ended, threadKey([streaming("R1", "ended", [])]), "the run's kind");
+  const empty = "the analysis was empty";
+  const nothing = threadKey([
+    streaming("R1", "ended", [{ kind: "noAnalysis", problem: empty }], {
+      ...asked,
+      problem: empty,
+    }),
+  ]);
+  assert.notEqual(nothing, ended);
+});
+
 const fenced = (json) => "```json\n" + json + "\n```";
 const reportEntry = (report, problem = null) =>
   report ? { kind: "report", report } : { kind: "noReport", problem };

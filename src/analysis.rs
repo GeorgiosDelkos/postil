@@ -19,9 +19,10 @@
 //!
 //! # The file
 //!
-//! The analysis lives in `<git dir>/postil/analysis.json`, version 1. Reading it never writes
-//! it: [`current`] places every verified reference where its code is now (`place`) on each
-//! read, whatever state the file stores for it, as notes are placed: a reference whose code is
+//! The analysis lives in `<git dir>/postil/analysis.json`, version 2: version 1 without each
+//! diagram's `dropped`, which reads as nothing dropped. Reading it never writes it:
+//! [`current`] places every verified reference where its code is now (`place`) on each read,
+//! whatever state the file stores for it, as notes are placed: a reference whose code is
 //! gone reads as outdated, and found again once the code is back. An unverified reference is
 //! left as it is.
 //!
@@ -39,6 +40,18 @@
 //! - Each node's id starts with its diagram's id (`D2.3` is in `D2`), and is unique.
 //! - An edge joins two different nodes of its own diagram.
 //! - A node's `group` names another node of its diagram, and following groups never loops.
+//! - A diagram's `parent` names a node of another diagram, and following parents (from a
+//!   diagram to its parent node's diagram) never loops. A diagram whose parent node goes (its
+//!   diagram replaced or deleted, or the node deleted by Update) goes with it, and so do the
+//!   diagrams below it ([`prune_orphans`]). A node Update replaces in place keeps its id, so
+//!   the diagrams below it stay.
+//!
+//! # Analysis runs
+//!
+//! An analysis run (`run.rs`, `Runner::analyze`) asks the Analyzer, read-only in a thread of
+//! its own, for diagrams in one json block at the end of its reply ([`prompt`]); [`merge`]
+//! reads that block as the run's turn ends well, checks every citation against the run's
+//! worktree, applies the limits, and only then takes [`lock`], loads, merges and saves.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -54,10 +67,18 @@ use crate::error::{Error, Result};
 use crate::files::{self, save_json, version_of};
 use crate::repo::{MAX_READ, PathKind, Repo};
 
-/// The format version this build writes and reads. A file with another version is refused,
-/// not rewritten. `checked` (the commit the Architecture was last compared with) is not in
-/// version 1: it comes with the code that reads it.
-const VERSION: u32 = 1;
+mod merge;
+mod prompt;
+
+pub(crate) use merge::merge;
+pub(crate) use prompt::{
+    AnalysisJob, AnalysisKind, AnalysisRun, AnalyzeRequest, Planned, UpdateRequest, plan,
+};
+
+/// The format version this build writes. It reads every version from 1 on; a newer one is
+/// refused, not rewritten. Version 2 added each diagram's `dropped`. `checked` (the commit the
+/// Architecture was last compared with) is not in it yet: it comes with the code that reads it.
+const VERSION: u32 = 2;
 
 /// Reads the analysis and places every found code reference where its code is now, or
 /// returns `None` when there is no analysis file. Does not write.
@@ -104,9 +125,9 @@ pub(crate) fn load(file: &Path) -> Result<Option<Analysis>> {
     // The version is read on its own first: a newer format would otherwise fail on its first
     // new field, with a message that hides the real reason.
     let version = version_of(json.as_bytes()).map_err(parse_error)?;
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(invalid(format!(
-            "version {version}, but this build of Postil reads version {VERSION}"
+            "version {version}, but this build of Postil reads versions 1 to {VERSION}"
         )));
     }
     let stored: AnalysisFile = serde_json::from_str(&json).map_err(parse_error)?;
@@ -114,6 +135,20 @@ pub(crate) fn load(file: &Path) -> Result<Option<Analysis>> {
     Ok(Some(Analysis {
         diagrams: stored.diagrams,
     }))
+}
+
+/// The ids of the runs that made the stored diagrams (`R5`), as `analysis.json` stores them:
+/// an analysis run's log stays while one names it. None with no analysis file. Takes no lock.
+///
+/// # Errors
+///
+/// As [`load`].
+pub(crate) fn runs_named(repo: &Repo) -> Result<HashSet<String>> {
+    Ok(load(&repo.analysis_file())?
+        .iter()
+        .flat_map(|analysis| &analysis.diagrams)
+        .map(|diagram| diagram.run.to_string())
+        .collect())
 }
 
 /// Takes the exclusive lock on `analysis.lock` beside the analysis file `file`
@@ -125,10 +160,6 @@ pub(crate) fn load(file: &Path) -> Result<Option<Analysis>> {
 ///
 /// [`Error::AnalysisLocked`] when another writer keeps the lock; [`Error::WriteAnalysis`] when
 /// the lock file cannot be created or locked.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the analysis run's merge, step 8.2")
-)]
 pub(crate) fn lock(file: &Path) -> Result<File> {
     let path = file.with_extension("lock");
     files::lock(&path).map_err(|error| match error {
@@ -148,10 +179,6 @@ pub(crate) fn lock(file: &Path) -> Result<File> {
 /// [`Error::InvalidAnalysis`] when `analysis` breaks the module's invariants, which a later
 /// [`load`] would refuse; as [`load`] when the file there now cannot be read or is refused.
 /// Either way nothing is written. [`Error::WriteAnalysis`] when the file cannot be written.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the analysis run's merge, step 8.2")
-)]
 pub(crate) fn save(file: &Path, analysis: &Analysis) -> Result<()> {
     check_graph(&analysis.diagrams).map_err(|problem| Error::InvalidAnalysis {
         path: file.to_owned(),
@@ -174,12 +201,9 @@ pub(crate) fn save(file: &Path, analysis: &Analysis) -> Result<()> {
 /// references"). A folder, or a file cited with no `lines`, is a path target, found while the
 /// path is a folder or a file. A path that is not written as git writes paths, that names
 /// nothing, or a folder cited with lines, is unverified with no reason; a file that cannot be
-/// read is unverified with the reason, which names no path on disk.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the analysis run's merge, step 8.2")
-)]
-pub(crate) fn check_in(cited: Cited, repo: &Repo) -> CodeRef {
+/// read is unverified with the reason, which names no path on disk. Reads a cited file once
+/// per `read`, however many citations name it.
+fn check_in(cited: Cited, repo: &Repo, read: &mut ReadFiles) -> CodeRef {
     let path = cited.path.clone();
     // `kind` fails only for a path that is not written as git writes it.
     let Ok(Some(kind)) = repo.kind(&path) else {
@@ -189,10 +213,31 @@ pub(crate) fn check_in(cited: Cited, repo: &Repo) -> CodeRef {
         (PathKind::Folder, None) => CodeRef::found(path, Target::Path(PathKind::Folder)),
         (PathKind::File, None) => CodeRef::found(path, Target::Path(PathKind::File)),
         (PathKind::Folder, Some(_)) => CodeRef::unverified(path, None),
-        (PathKind::File, Some(_)) => match repo.read(&path) {
-            Ok(text) => check(cited, &text),
-            Err(error) => CodeRef::unverified(path, Some(unreadable(&error))),
-        },
+        (PathKind::File, Some(_)) => {
+            let text = read
+                .0
+                .entry(path.clone())
+                .or_insert_with(|| repo.read(&path).map_err(|error| unreadable(&error)));
+            match text {
+                Ok(text) => check(cited, text),
+                Err(reason) => CodeRef::unverified(path, Some(reason.clone())),
+            }
+        }
+    }
+}
+
+/// The text of each file [`check_in`] read, by path, or why it could not be read: kept for
+/// one reply's citations, since 600 citations of one 4 MB file read separately took 713 ms on
+/// the agent's reader thread (the judge's measurement, 2026-11-26).
+/// Its `Debug` counts the files: their text is code.
+#[derive(Default)]
+struct ReadFiles(HashMap<String, std::result::Result<String, String>>);
+
+impl fmt::Debug for ReadFiles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadFiles")
+            .field("files", &self.0.len())
+            .finish()
     }
 }
 
@@ -331,33 +376,129 @@ fn check_graph(diagrams: &[Diagram]) -> std::result::Result<(), String> {
         if !diagram_ids.insert(diagram.id) {
             return Err(format!("diagram id {} is used twice", diagram.id));
         }
-        // Each node's group, by its id.
-        let mut groups = HashMap::new();
-        for node in &diagram.nodes {
-            if node.id.diagram != diagram.id {
-                return Err(format!("node {} is in diagram {}", node.id, diagram.id));
-            }
-            if groups.insert(node.id, node.group).is_some() {
-                return Err(format!("node id {} is used twice", node.id));
-            }
+        check_diagram(diagram)?;
+    }
+    check_parents(diagrams)
+}
+
+/// The module's invariants within one diagram: its node ids, its edges and its groups.
+fn check_diagram(diagram: &Diagram) -> std::result::Result<(), String> {
+    // Each node's group, by its id.
+    let mut groups = HashMap::new();
+    for node in &diagram.nodes {
+        if node.id.diagram != diagram.id {
+            return Err(format!("node {} is in diagram {}", node.id, diagram.id));
         }
-        for edge in &diagram.edges {
-            let name = format!("edge {} -> {}", edge.from, edge.to);
-            if let Some(end) = [edge.from, edge.to]
-                .into_iter()
-                .find(|end| !groups.contains_key(end))
-            {
-                return Err(format!("{name}: {end} is no node of {}", diagram.id));
-            }
-            if edge.from == edge.to {
-                return Err(format!("{name} joins a node to itself"));
-            }
+        if groups.insert(node.id, node.group).is_some() {
+            return Err(format!("node id {} is used twice", node.id));
         }
-        for node in &diagram.nodes {
-            check_group(node.id, &groups, diagram.id)?;
+    }
+    for edge in &diagram.edges {
+        let name = format!("edge {} -> {}", edge.from, edge.to);
+        if let Some(end) = [edge.from, edge.to]
+            .into_iter()
+            .find(|end| !groups.contains_key(end))
+        {
+            return Err(format!("{name}: {end} is no node of {}", diagram.id));
+        }
+        if edge.from == edge.to {
+            return Err(format!("{name} joins a node to itself"));
+        }
+    }
+    for node in &diagram.nodes {
+        check_group(node.id, &groups, diagram.id)?;
+    }
+    Ok(())
+}
+
+/// Checks that each diagram's parent is a node of another diagram, and that following
+/// parents from any diagram ends at the top level within as many steps as there are
+/// diagrams, or it loops. Diagram ids are unique by now.
+fn check_parents(diagrams: &[Diagram]) -> std::result::Result<(), String> {
+    let nodes: HashSet<NodeId> = diagrams
+        .iter()
+        .flat_map(|diagram| diagram.nodes.iter().map(|node| node.id))
+        .collect();
+    let parents: HashMap<DiagramId, Option<NodeId>> = diagrams
+        .iter()
+        .map(|diagram| (diagram.id, diagram.parent))
+        .collect();
+    for diagram in diagrams {
+        let Some(parent) = diagram.parent else {
+            continue;
+        };
+        if parent.diagram == diagram.id {
+            return Err(format!(
+                "diagram {}: its parent {parent} is one of its own nodes",
+                diagram.id
+            ));
+        }
+        if !nodes.contains(&parent) {
+            return Err(format!(
+                "diagram {}: its parent {parent} is no node of the analysis",
+                diagram.id
+            ));
+        }
+        // A parent naming no node ends the walk here; its own diagram's turn reports it.
+        let mut at = diagram.id;
+        let ends = (0..parents.len()).any(|_| match parents.get(&at).copied().flatten() {
+            None => true,
+            Some(parent) => {
+                at = parent.diagram;
+                false
+            }
+        });
+        if !ends {
+            return Err(format!("diagram {}: its parents loop", diagram.id));
         }
     }
     Ok(())
+}
+
+/// Removes every diagram whose parent node is gone, and then those below them, until each
+/// diagram left is at the top level or under a node that is there: what a replaced or
+/// deleted diagram, or a node Update deleted, takes with it.
+fn prune_orphans(diagrams: &mut Vec<Diagram>) {
+    loop {
+        let nodes: HashSet<NodeId> = diagrams
+            .iter()
+            .flat_map(|diagram| diagram.nodes.iter().map(|node| node.id))
+            .collect();
+        let count = diagrams.len();
+        diagrams.retain(|diagram| diagram.parent.is_none_or(|parent| nodes.contains(&parent)));
+        if diagrams.len() == count {
+            return;
+        }
+    }
+}
+
+/// Deletes diagram `id` from `repo`'s analysis, with the diagrams below its nodes, and returns
+/// the analysis left, placed as [`current`] places it. Holds [`lock`] from the read to the
+/// save, and places once it is released.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] for an id that is not `D` and a number; [`Error::NoSuchDiagram`]
+/// when the analysis has no such diagram, or there is no analysis; as [`lock`], [`load`] and
+/// [`save`].
+pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Analysis> {
+    let wanted = DiagramId::parse(id)
+        .ok_or_else(|| Error::BadRequest(format!("diagram id {id:?}: expected D and a number")))?;
+    let missing = || Error::NoSuchDiagram { id: id.to_owned() };
+    let file = repo.analysis_file();
+    let held = lock(&file)?;
+    let mut analysis = load(&file)?.ok_or_else(missing)?;
+    let count = analysis.diagrams.len();
+    analysis.diagrams.retain(|diagram| diagram.id != wanted);
+    if analysis.diagrams.len() == count {
+        return Err(missing());
+    }
+    prune_orphans(&mut analysis.diagrams);
+    save(&file, &analysis)?;
+    // Placing reads the working tree, which needs no lock: another writer may go on.
+    drop(held);
+    place(&mut analysis, repo);
+    Ok(analysis)
 }
 
 /// Follows the groups from `node` up: each must be a node of `diagram`, and the walk must end
@@ -441,10 +582,47 @@ struct Diagram {
     /// In a flow, in step order.
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    /// What the runs that made the diagram left out of it. Absent when nothing was, and in
+    /// every file of version 1.
+    #[serde(default, skip_serializing_if = "Dropped::is_empty")]
+    dropped: Dropped,
+}
+
+/// What the runs that wrote a diagram left out of what their agents sent, counted, so the
+/// pane's header says so: nothing is dropped silently (docs/review-assist-plan.md, 8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+struct Dropped {
+    /// Nodes: a key used twice, one past the 200 a diagram holds, or, in an update, one whose
+    /// id is not of an outdated node.
+    nodes: usize,
+    /// Edges to or from no node, or from a node to itself.
+    edges: usize,
+    /// Groups that named no node, or whose chain looped: the node is kept, with no group.
+    groups: usize,
+    /// Labels, summaries, details and titles cut to their limits.
+    shortened: usize,
+    /// Whether the reply was over 2 MiB, and only its end was read.
+    reply_cut: bool,
+}
+
+impl Dropped {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Adds `other`'s counts to these: an update adds to what the diagram's first run left out.
+    fn add(&mut self, other: Self) {
+        self.nodes += other.nodes;
+        self.edges += other.edges;
+        self.groups += other.groups;
+        self.shortened += other.shortened;
+        self.reply_cut |= other.reply_cut;
+    }
 }
 
 /// What a diagram shows.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum DiagramKind {
     Architecture,
@@ -580,10 +758,6 @@ struct StoredCodeRef {
 /// A citation as an agent writes it: `lines` and `first`, the text of the first cited line,
 /// or neither for a whole file or folder. The bounds are not checked: zero or reversed lines
 /// make the citation unverified, not the reply unreadable.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "built from the analysis run's reply, step 8.2")
-)]
 pub(crate) struct Cited {
     path: String,
     lines: Option<CitedLines>,
@@ -592,10 +766,6 @@ pub(crate) struct Cited {
 
 /// Lines `start` to `end` as an agent cited them, 1-based and inclusive, not yet checked.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "built from the analysis run's reply, step 8.2")
-)]
 pub(crate) struct CitedLines {
     start: usize,
     end: usize,
@@ -604,12 +774,12 @@ pub(crate) struct CitedLines {
 /// A diagram's id, written `D1`: stable, shown in the page and sent to the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-struct DiagramId(u32);
+pub(crate) struct DiagramId(u32);
 
 /// A node's id, written `D1.3`: its diagram's id, then its number in the diagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-struct NodeId {
+pub(crate) struct NodeId {
     diagram: DiagramId,
     node: u32,
 }
@@ -815,6 +985,7 @@ impl fmt::Debug for Diagram {
             .field("run", &self.run)
             .field("nodes", &self.nodes)
             .field("edges", &self.edges)
+            .field("dropped", &self.dropped)
             .finish_non_exhaustive()
     }
 }

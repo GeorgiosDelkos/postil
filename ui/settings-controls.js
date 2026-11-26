@@ -225,18 +225,31 @@ function agentCell(agentName, name) {
   return node;
 }
 
-// The agent notes are sent to and its model, as the one row of a slot card: a muted arrow in
-// the lead column, the agent picker, and the model picker to the card's edge (this row has no
-// buttons). `key` names the agent select; the model select is `${key}-model`. `onAgent` gets
-// a name, or null for none.
-export function agentSlotControl(key, settings, models, { disabled = false, onAgent, onModel }) {
+// One slot, the agent notes are sent to by default, and its model, as the one row of a slot
+// card: a muted arrow in the lead column, the agent picker, and the model picker to the card's
+// edge (this row has no buttons). `key` names the agent select; the model select is
+// `${key}-model`. `slot` is the chosen slot or null, `label` the picker's name and
+// `emptyLabel` what no choice says. `onAgent` gets a name, or null for none.
+export function agentSlotControl(
+  key,
+  settings,
+  models,
+  {
+    slot = settings.agent,
+    label = "Send notes to",
+    emptyLabel = "None",
+    disabled = false,
+    onAgent,
+    onModel,
+  },
+) {
   const enabled = settings.enabledAgents;
-  const none = enabled.length ? "None" : "Turn on an agent first";
+  const none = enabled.length ? emptyLabel : "Turn on an agent first";
   const options = [["", none], ...enabled.map((name) => [name, name])];
-  const chosen = settings.agent;
+  const chosen = slot ?? null;
   const agent = selectBox(
     key,
-    "Send notes to",
+    label,
     options,
     chosen?.name ?? "",
     (name) => onAgent(name || null),

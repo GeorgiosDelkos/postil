@@ -17,12 +17,14 @@ export function codeMetrics(fontSize) {
   return { fontSize, lineHeight: Math.round((fontSize * 22) / 13) };
 }
 
-// The agent notes are sent to and each reviewer are slots, `{ name, model }`: an agent and the
-// model it runs, `model` null for the agent's own default (src/settings.rs, AgentSlot).
+// The agent notes are sent to, the analyzer and each reviewer are slots, `{ name, model }`: an
+// agent and the model it runs, `model` null for the agent's own default (src/settings.rs,
+// AgentSlot). The analyzer is null when analyses go to the agent notes are sent to.
 
 // What an agent is used for, in words, or null when it is free to disable or remove.
 export function usage(settings, name) {
   if (settings.agent?.name === name) return "notes are sent to it";
+  if (settings.analyzer?.name === name) return "it analyzes the repository";
   if (settings.reviewers.some((slot) => slot.name === name)) return "it reviews the agent's work";
   return null;
 }
@@ -114,6 +116,7 @@ export function saveCustomAgent(settings, agent, previous, builtInNames) {
       customAgents: settings.customAgents.map((each) => (each.name === previous ? saved : each)),
       enabledAgents: settings.enabledAgents.map(rename),
       agent: settings.agent === null ? null : renameSlot(settings.agent),
+      analyzer: settings.analyzer ? renameSlot(settings.analyzer) : null,
       reviewers: settings.reviewers.map(renameSlot),
     },
   };
@@ -146,6 +149,22 @@ export function setAgent(settings, name) {
 export function setAgentModel(settings, model) {
   if (settings.agent === null) return { error: "Choose the agent notes are sent to first." };
   return { settings: { ...settings, agent: { ...settings.agent, model } } };
+}
+
+// The agent that analyzes the repository for the map; null for the agent notes are sent to. As
+// for that agent, only an enabled one can be chosen, and another agent starts on its default
+// model.
+export function setAnalyzer(settings, name) {
+  if (name === null) return { settings: { ...settings, analyzer: null } };
+  if (!settings.enabledAgents.includes(name)) return { error: `Turn ${name} on first.` };
+  const model = settings.analyzer?.name === name ? settings.analyzer.model : null;
+  return { settings: { ...settings, analyzer: { name, model } } };
+}
+
+// The analyzer's model; null for the agent's default.
+export function setAnalyzerModel(settings, model) {
+  if (!settings.analyzer) return { error: "Choose the analyzer first." };
+  return { settings: { ...settings, analyzer: { ...settings.analyzer, model } } };
 }
 
 // Adds a reviewer at the end, on its default model. The same agent may review more than once:

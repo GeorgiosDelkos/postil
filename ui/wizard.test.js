@@ -25,6 +25,7 @@ function defaults() {
     customAgents: [],
     enabledAgents: [],
     agent: null,
+    analyzer: null,
     reviewers: [],
   };
 }
@@ -80,9 +81,13 @@ test("toggling an agent in the wizard reconciles the default agent and reviewers
   draft = {
     ...draft,
     agent: slot("Claude", "opus"),
+    analyzer: slot("Gemini", "gemini-4-carbon"),
     reviewers: [slot("Claude"), slot("Gemini", "gemini-4-neon"), slot("Claude", "haiku")],
   };
+  const analyzerOff = toggleWizardAgent(draft, "Gemini", false);
+  assert.equal(analyzerOff.analyzer, null, "analyses go to the default agent then");
   draft = toggleWizardAgent(draft, "Claude", false);
+  assert.deepEqual(draft.analyzer, slot("Gemini", "gemini-4-carbon"), "another's stays");
   assert.deepEqual(draft.enabledAgents, ["Gemini"]);
   assert.deepEqual(
     draft.agent,
