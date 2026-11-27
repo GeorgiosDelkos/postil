@@ -112,8 +112,9 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       }
     };
     for (const live of store.liveRuns()) includeRoot(store.liveThread(live.id));
-    for (const id of [...candidates]) {
-      let cur = store.byId(id);
+    const initialCount = candidates.length;
+    for (let i = 0; i < initialCount; i += 1) {
+      let cur = store.byId(candidates[i]);
       while (cur?.followUp?.of) {
         includeRoot(cur.followUp.of);
         cur = store.byId(cur.followUp.of);
