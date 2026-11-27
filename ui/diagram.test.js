@@ -13,9 +13,12 @@ import {
   breadcrumb,
   clampTransform,
   diagramCounts,
+  fileMarks,
   fitTransform,
+  innermost,
   layoutDiagram,
   nearestNode,
+  nodeAtLine,
   nodeState,
   notesOn,
   runProblem,
@@ -327,4 +330,183 @@ test("a failed analysis run says why, and one that stored its diagrams says noth
   assert.equal(runProblem(run("failed", [])), "The analysis run failed.");
   assert.equal(runProblem(run("ended", [{ kind: "ended" }])), null);
   assert.equal(runProblem(run("running", [])), null);
+});
+
+// A reference to lines `start` to `end` of `path`, found unless `state` says otherwise.
+const cite = (start, end, state = "found", path = "src/a.rs") => ({
+  path,
+  target: "lines",
+  lines: { start, end },
+  state,
+});
+
+test("innermost picks the smallest range on the line, then the deepest, then the first", () => {
+  const at = (depth, start, end, name) => ({ ...cite(start, end), depth, name });
+  const name = (anchors, line) => innermost(anchors, line)?.name ?? null;
+  const wide = at(2, 1, 10, "wide and deep");
+  const narrow = at(0, 3, 4, "narrow at the top");
+  assert.equal(name([wide, narrow], 3), "narrow at the top", "depth never beats a smaller range");
+  assert.equal(name([wide, narrow], 5), "wide and deep");
+  assert.equal(name([wide, narrow], 11), null, "past every range");
+
+  const equal = [at(0, 3, 4, "top"), at(2, 3, 4, "deepest"), at(1, 3, 4, "deeper")];
+  assert.equal(name(equal, 3), "deepest", "equal ranges: the diagram deepest under the top");
+  assert.equal(name([at(1, 3, 4, "first"), at(1, 3, 4, "second")], 4), "first");
+
+  const disjoint = [at(0, 1, 2, "one"), at(0, 4, 5, "two")];
+  assert.equal(name(disjoint, 2), "one");
+  assert.equal(name(disjoint, 4), "two");
+  assert.equal(name(disjoint, 3), null, "between two ranges");
+
+  const unverified = { ...at(0, 3, 3, "unverified"), state: "unverified" };
+  const file = { path: "src/a.rs", target: "file", state: "found", depth: 3, name: "file" };
+  assert.equal(name([wide, unverified, file], 3), "wide and deep", "only placed line references");
+  const outdated = { ...at(0, 3, 3, "outdated"), state: "outdated" };
+  assert.equal(name([wide, outdated], 3), "outdated", "an outdated range is at its last lines");
+});
+
+// An analysis of src/a.rs: an Architecture diagram with a boundary around a component, a Data
+// diagram whose one node cites line 2 twice, and a flow of two steps.
+function markedAnalysis() {
+  const arch = diagram([
+    node("D1.1", { label: "Server", anchors: [cite(1, 8)] }),
+    node("D1.2", { label: "Parser", group: "D1.1", anchors: [cite(2, 4)] }),
+    node("D1.3", { label: "Gone", anchors: [cite(6, 6, "unverified")] }),
+    node("D1.4", { label: "Old", anchors: [cite(9, 12, "outdated")] }),
+    node("D1.5", { label: "Elsewhere", anchors: [cite(1, 20, "found", "src/b.rs")] }),
+  ]);
+  const data = {
+    ...diagram([node("D2.1", { label: "Token", anchors: [cite(2, 3), cite(2, 2)] })]),
+    id: "D2",
+    kind: "data",
+    title: "Types",
+  };
+  const flow = {
+    ...diagram([
+      node("D3.1", { label: "Read", anchors: [cite(5, 5)] }),
+      node("D3.2", { label: "Parse", anchors: [cite(2, 2), cite(7, 7)] }),
+    ]),
+    id: "D3",
+    kind: "flow",
+    title: "Load",
+  };
+  return { diagrams: [arch, data, flow] };
+}
+
+test("a file's marks: the innermost Architecture node per line, its chip on its first line", () => {
+  const marks = fileMarks(markedAnalysis(), "src/a.rs", 10);
+  const shown = (index) => {
+    const mark = marks.get(index);
+    const chip = mark.chip && [mark.chip.label, ...mark.chip.others.map((other) => other.label)];
+    return [mark.nodeId, mark.outdated, chip];
+  };
+  assert.deepEqual(shown(0), ["D1.1", false, ["Server"]]);
+  // The Data node is smaller on lines 2 and 3, but the Architecture node wins them. The chip
+  // names each other diagram once, the Data one though it cites line 2 twice.
+  assert.deepEqual(shown(1), ["D1.2", false, ["Parser", "Token", "Parse"]]);
+  assert.deepEqual(shown(2), ["D1.2", false, null], "no chip after the first line");
+  assert.deepEqual(shown(4), ["D1.1", false, null], "back in the boundary: no second chip");
+  assert.deepEqual(shown(5), ["D1.1", false, null], "an unverified reference draws nothing");
+  assert.deepEqual(shown(8), ["D1.4", true, ["Old"]], "outdated, at its last lines");
+  assert.equal(marks.has(10), false, "nothing past the end of a shortened file");
+  assert.equal(marks.size, 10);
+  assert.equal(marks.get(1).step, null, "no step numbers while no flow is open");
+
+  assert.deepEqual([...fileMarks(markedAnalysis(), "src/a.rs", 1).keys()], [0]);
+  assert.equal(fileMarks(markedAnalysis(), "src/a.rs", 0).size, 0, "an empty file");
+  assert.equal(fileMarks(null, "src/a.rs", 10).size, 0, "no analysis");
+  assert.equal(fileMarks(markedAnalysis(), "src/c.rs", 10).size, 0, "a file no node cites");
+});
+
+test("an outer node whose first line an inner one wins has its chip where it first shows", () => {
+  const analysis = {
+    diagrams: [
+      diagram([
+        node("D1.1", { label: "Server", anchors: [cite(2, 10)] }),
+        node("D1.2", { label: "Header", anchors: [cite(2, 3)] }),
+      ]),
+    ],
+  };
+  const marks = fileMarks(analysis, "src/a.rs", 12);
+  assert.equal(marks.get(1).chip.label, "Header");
+  assert.equal(marks.get(3).nodeId, "D1.1");
+  assert.equal(marks.get(3).chip?.label, "Server", "on line 4, the first it shows");
+  assert.equal(marks.get(4).chip, null);
+});
+
+test("of equal ranges, the node of the diagram deeper under the top shows", () => {
+  const analysis = markedAnalysis();
+  // A diagram under Server, whose one node cites exactly Server's lines.
+  const child = {
+    ...diagram([node("D4.1", { label: "Inside", anchors: [cite(1, 8)] })]),
+    id: "D4",
+    title: "Server, deeper",
+    parent: "D1.1",
+  };
+  analysis.diagrams.push(child);
+  const marks = fileMarks(analysis, "src/a.rs", 10);
+  assert.equal(marks.get(0).nodeId, "D4.1");
+  assert.deepEqual(
+    marks.get(0).chip.others.map((other) => other.nodeId),
+    ["D1.1"],
+    "the top diagram's node is behind +1",
+  );
+  assert.equal(marks.get(1).nodeId, "D1.2", "the smaller range still wins");
+});
+
+test("a line only another kind covers shows that node, and an open flow numbers its steps", () => {
+  const analysis = markedAnalysis();
+  analysis.diagrams[0].nodes = [];
+  const marks = fileMarks(analysis, "src/a.rs", 10);
+  // Line 2: the Data node's and the flow's one-line references tie, and the first in the file
+  // wins; the flow is the other diagram.
+  assert.equal(marks.get(1).nodeId, "D2.1");
+  assert.deepEqual(
+    marks.get(1).chip.others.map((other) => other.diagramId),
+    ["D3"],
+  );
+  assert.equal(marks.get(4).nodeId, "D3.1", "line 5: only the flow covers it");
+  assert.equal(marks.get(4).chip.label, "Read");
+
+  const open = fileMarks(analysis, "src/a.rs", 10, { openDiagramId: "D3" });
+  const steps = [...open].filter(([, mark]) => mark.step !== null);
+  assert.deepEqual(
+    steps.map(([index, mark]) => [index, mark.step]),
+    [
+      [1, 2],
+      [4, 1],
+    ],
+    "each step on its first reference's first line; Parse's second reference has none",
+  );
+  assert.notEqual(open.get(1).key, marks.get(1).key, "a step changes the row's key");
+  const other = fileMarks(analysis, "src/a.rs", 10, { openDiagramId: "D2" });
+  assert.equal(other.get(1).step, null, "no step numbers while another diagram is open");
+});
+
+test("a step whose first reference is past the end of a shortened file is numbered at its next", () => {
+  const flow = {
+    ...diagram([node("D3.1", { label: "Read", anchors: [cite(30, 31), cite(4, 4)] })]),
+    id: "D3",
+    kind: "flow",
+  };
+  const marks = fileMarks({ diagrams: [flow] }, "src/a.rs", 10, { openDiagramId: "D3" });
+  assert.equal(marks.get(3).step, 1);
+});
+
+test("the node at a code line is in the diagram given, by its lines, else by its whole file", () => {
+  const [arch, data] = markedAnalysis().diagrams;
+  assert.equal(nodeAtLine(arch, "src/a.rs", 3), "D1.2");
+  assert.equal(nodeAtLine(arch, "src/a.rs", 6), "D1.1");
+  assert.equal(nodeAtLine(data, "src/a.rs", 6), null, "never a node of another diagram");
+  assert.equal(nodeAtLine(arch, "src/a.rs", 30), null);
+
+  const folder = { path: "src", target: "folder", state: "found" };
+  const whole = diagram([
+    node("D1.1", { kind: "boundary", anchors: [folder] }),
+    node("D1.2", { group: "D1.1", anchors: [{ ...folder, path: "src/a.rs", target: "file" }] }),
+    node("D1.3", { anchors: [cite(2, 2)] }),
+  ]);
+  assert.equal(nodeAtLine(whole, "src/a.rs", 2), "D1.3");
+  assert.equal(nodeAtLine(whole, "src/a.rs", 5), "D1.2", "the node of the whole file");
+  assert.equal(nodeAtLine(whole, "src/b.rs", 1), null, "a folder rings nothing");
 });

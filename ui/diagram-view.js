@@ -19,6 +19,7 @@ import {
   firstFound,
   fitTransform,
   layoutDiagram,
+  nodeAtLine,
   nodeState,
   notesOn,
   runProblem,
@@ -57,6 +58,8 @@ const KINDS = [
 // - `writeNote(anchor, intent)` writes a note ("change") or asks a question ("ask") on it;
 // - `alone()` says whether the map takes the whole code pane (a narrow window): a click then
 //   opens the node's dialog, whose Show in code gives the pane to the code;
+// - `onChange()` follows a new analysis, another diagram opened, and the map shown or hidden,
+//   which the stripes and chips in the code show (code-view.js, `decorateRow`);
 // - `onError(text)` shows a failure.
 export function diagramView({
   mapEl,
@@ -68,6 +71,7 @@ export function diagramView({
   showAnchor,
   writeNote,
   alone,
+  onChange,
   onError,
 }) {
   const view = {
@@ -91,7 +95,18 @@ export function diagramView({
     retry: null,
     // Uncommitted changes, for the empty state (`GET api/run/uncommitted`).
     uncommitted: null,
+    // The code pane's line the map follows, `{ path, line }` with `line` 1-based, or null, and
+    // the node of the drawn diagram that stands for it, ringed (`followCode`).
+    code: null,
+    codeNode: null,
   };
+  // A node to centre once its diagram is drawn: `revealNode` asked for it while the layout
+  // library or the analysis was still loading.
+  let pendingCentre = null;
+  // Every read of the analysis is numbered as it is asked for, and one older than a reply
+  // already applied is dropped, as the notes are (app.js, `fetchNotes`).
+  let analysisAsked = 0;
+  let analysisShown = 0;
   // Layouts by diagram id and run, for the session (diagram.js, `layoutDiagram`).
   const layouts = new Map();
   // The drawn diagram: its layout, the SVG's viewport group, and the node elements by id.
@@ -137,13 +152,29 @@ export function diagramView({
 
   // Reads the analysis again and draws it. The selection stays while its node is still there.
   async function load() {
+    await applyAnalysis(await fetchAnalysis());
+  }
+
+  // The reply to `api/analysis`, numbered: `{ number, analysis }`, `analysis` as `view.analysis`
+  // holds it.
+  async function fetchAnalysis() {
+    const number = ++analysisAsked;
     const response = await fetch("api/analysis");
     if (!response.ok) {
-      view.analysis = { status: "error", data: null, error: await response.text() };
-    } else {
-      const data = await response.json();
-      view.analysis = { status: data ? "ready" : "none", data, error: null };
+      return { number, analysis: { status: "error", data: null, error: await response.text() } };
     }
+    const data = await response.json();
+    return { number, analysis: { status: data ? "ready" : "none", data, error: null } };
+  }
+
+  // Takes a reply of `fetchAnalysis`, for the code's stripes and chips even while the map is
+  // hidden, and draws it when the map shows.
+  async function applyAnalysis(reply) {
+    if (reply.number < analysisShown) return;
+    analysisShown = reply.number;
+    view.analysis = reply.analysis;
+    onChange();
+    if (!view.shown) return;
     if (view.analysis.status !== "ready") await loadUncommitted();
     render();
   }
@@ -179,7 +210,10 @@ export function diagramView({
   function openDiagram(id) {
     view.diagramId = id;
     view.selected = null;
+    // A node `revealNode` asked for is not in the diagram chosen instead.
+    pendingCentre = null;
     render();
+    onChange();
   }
 
   // ---- Drawing -----------------------------------------------------------------------------
@@ -256,7 +290,7 @@ export function diagramView({
     search.value = view.search;
     search.addEventListener("input", () => {
       view.search = search.value;
-      ringMatches();
+      syncRings();
     });
     search.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -268,7 +302,7 @@ export function diagramView({
         event.stopPropagation();
         search.value = "";
         view.search = "";
-        ringMatches();
+        syncRings();
       }
     });
     parts.push(search);
@@ -300,6 +334,8 @@ export function diagramView({
   }
 
   function showCard(card) {
+    // A glide under way pans the drawn diagram, which this card replaces.
+    stopGlide();
     drawn = null;
     body.replaceChildren(card);
   }
@@ -416,16 +452,16 @@ export function diagramView({
   }
 
   // Called after every change of the runs: the strip follows the run, and a run that ended
-  // well wrote the analysis, which is read again.
+  // well wrote the analysis, which is read again: also with the map closed since, for the code's
+  // stripes and chips.
   function runChanged() {
-    if (!view.shown) return;
     const tracked = view.runId && runs.byId(view.runId);
     if (tracked && !isLive(tracked) && view.settled !== tracked.id) {
       view.settled = tracked.id;
       load().catch((error) => onError(String(error)));
       return;
     }
-    renderStrip();
+    if (view.shown) renderStrip();
   }
 
   // ---- The diagram -------------------------------------------------------------------------
@@ -435,6 +471,8 @@ export function diagramView({
   }
 
   function drawDiagram(diagram) {
+    // A glide under way is towards a node of the diagram drawn before: it would pan this one.
+    stopGlide();
     let positioned;
     try {
       positioned = layoutDiagram(diagram, window.dagre, layouts);
@@ -467,13 +505,29 @@ export function diagramView({
       pane.append(card);
     }
     svg.append(pane);
+    // A card that had the focus goes with the old SVG, and the focus with it to the page's
+    // body: the selected card takes it back, as an analysis read again redraws under the
+    // keyboard.
+    const focused = body.contains(document.activeElement);
     body.replaceChildren(svg);
     drawn = { diagram, positioned, pane, cards };
+    if (focused) (cards.get(view.selected) ?? body).focus({ preventScroll: true });
     if (!view.transforms.has(diagram.id) && viewport().width > 0) {
       view.transforms.set(diagram.id, fitTransform(positioned, viewport()));
     }
     applyTransform();
-    ringMatches();
+    view.codeNode = view.code && nodeAtLine(diagram, view.code.path, view.code.line);
+    syncRings();
+    centrePending();
+  }
+
+  // Centres the node `revealNode` asked for, once its diagram is drawn in a pane with a size.
+  function centrePending() {
+    const box = pendingCentre && drawn?.positioned.byId.get(pendingCentre);
+    if (!box || viewport().width === 0) return;
+    pendingCentre = null;
+    setTransform(centreOn(box, viewport(), transform()));
+    drawn.cards.get(box.id)?.focus({ preventScroll: true });
   }
 
   function svgEl(tag, className, attributes = {}) {
@@ -514,6 +568,7 @@ export function diagramView({
       "aria-label": `${box.node.label}, boundary`,
     });
     head.append(svgText("map-group-label", box.x + 12, box.y + 18, box.node.label));
+    head.classList.toggle("selected", box.id === view.selected);
     group.append(
       svgEl("rect", "map-group-box", {
         x: box.x,
@@ -581,10 +636,13 @@ export function diagramView({
     return text.length > length ? `${text.slice(0, length - 1)}…` : text;
   }
 
-  function ringMatches() {
+  // Rings the nodes the search matches and the node of the code pane's line.
+  function syncRings() {
     if (!drawn) return;
     const matches = new Set(view.search ? searchNodes(drawn.diagram, view.search) : []);
-    for (const [id, card] of drawn.cards) card.classList.toggle("ringed", matches.has(id));
+    for (const [id, card] of drawn.cards) {
+      card.classList.toggle("ringed", matches.has(id) || id === view.codeNode);
+    }
   }
 
   // ---- Pan and zoom ------------------------------------------------------------------------
@@ -694,13 +752,15 @@ export function diagramView({
   });
 
   // A pane resized (a divider, the window) keeps the pan, brought back if it lost every node;
-  // a diagram drawn while the pane had no size is fitted once it has one.
+  // a diagram drawn while the pane had no size is fitted once it has one, or centred on the
+  // node `revealNode` asked for.
   new ResizeObserver(() => {
     if (!drawn || viewport().width === 0) return;
     if (!view.transforms.has(drawn.diagram.id)) {
       view.transforms.set(drawn.diagram.id, fitTransform(drawn.positioned, viewport()));
     }
     setTransform(transform());
+    centrePending();
   }).observe(body);
 
   // ---- Selection and the keyboard ----------------------------------------------------------
@@ -725,6 +785,42 @@ export function diagramView({
     const card = event.target.closest("[data-node-id]");
     if (card) select(card.dataset.nodeId, { show: true });
   });
+
+  // Selects node `nodeId` of diagram `diagramId`, a click on its stripe or chip in the code: at
+  // once when that diagram is drawn, else once it is, opened if need be.
+  function revealNode(diagramId, nodeId) {
+    if (drawn?.diagram.id === diagramId && drawn.cards.has(nodeId)) {
+      select(nodeId, { show: false });
+      return;
+    }
+    const switched = view.diagramId !== diagramId;
+    view.diagramId = diagramId;
+    view.selected = nodeId;
+    pendingCentre = nodeId;
+    render();
+    if (switched) onChange();
+  }
+
+  // Follows the code pane's line `line` (1-based) of the file at `path`, or nothing with null:
+  // rings the drawn diagram's node for it, and pans to that node when it is wholly off screen.
+  // It never opens another diagram, and never pans while the pane is dragged.
+  function followCode(path, line) {
+    view.code = path && line ? { path, line } : null;
+    if (!view.shown || !drawn) return;
+    const next = view.code && nodeAtLine(drawn.diagram, path, line);
+    if (next === view.codeNode) return;
+    view.codeNode = next;
+    syncRings();
+    if (next === null || panning || viewport().width === 0) return;
+    const box = drawn.positioned.byId.get(next);
+    const { x, y, scale } = transform();
+    const { width, height } = viewport();
+    const left = x + box.x * scale;
+    const top = y + box.y * scale;
+    const off =
+      left + box.width * scale < 0 || left > width || top + box.height * scale < 0 || top > height;
+    if (off) glideTo(centreOn(box, viewport(), transform()));
+  }
   body.addEventListener("dblclick", (event) => {
     const card = event.target.closest("[data-node-id]");
     if (card) openNode(drawn.positioned.byId.get(card.dataset.nodeId).node);
@@ -916,18 +1012,31 @@ export function diagramView({
   });
 
   return {
-    // Shows or hides the map. The first show loads the layout library and the analysis.
+    // Shows or hides the map. The first show loads the layout library; every show reads the
+    // analysis again.
     setShown(shown) {
       if (view.shown === shown) return;
       view.shown = shown;
+      onChange();
       if (!shown) return;
       render();
       ensureDagre();
       load().catch((error) => onError(String(error)));
     },
     runChanged,
-    // Reads the analysis again, as on the window's focus: another window may have analyzed.
-    refresh: () => (view.shown ? load() : Promise.resolve()),
+    // Reads the analysis again, as at start and on the window's focus: another window may have
+    // analyzed, or the code under a node moved. `fetchAnalysis` and `applyAnalysis` are its two
+    // halves, for a caller that draws the reply with others.
+    load,
+    fetchAnalysis,
+    applyAnalysis,
+    // The analysis read last, or null when there is none or it cannot be used.
+    analysis: () => view.analysis.data,
+    isShown: () => view.shown,
+    // The id of the diagram the map shows, or null while it is hidden.
+    openDiagramId: () => (view.shown ? (current()?.id ?? null) : null),
+    revealNode,
+    followCode,
     focus: () => (drawn?.cards.get(view.selected) ?? body).focus({ preventScroll: true }),
   };
 }

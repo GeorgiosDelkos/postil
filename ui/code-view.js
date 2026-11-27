@@ -21,10 +21,13 @@ const COMPOSER_HEIGHT_GUESS = 138;
 const DEFINITIONS_POLL_MS = 250;
 
 // `state` is the page's state: the view keeps `file`, `wanted`, `selection` and `composer`,
-// and reads `noteByLine`. `menu` is the context menu (context-menu.js) and `files` the file
-// list (file-list.js), which `reveal`s the open file. The callbacks:
+// and reads `noteByLine`, `markByLine` and `mapMarkers`. `menu` is the context menu
+// (context-menu.js) and `files` the file list (file-list.js), which `reveal`s the open file.
+// The callbacks:
 // - `indexNotes()` derives `noteByLine` and `noteCountByPath` again after the file or the
-//   notes changed;
+//   notes changed, and `indexMarks()` derives `markByLine` after the file changed;
+// - `openMapNode(diagramId, nodeId)` opens the map at a node, a click on its stripe or chip;
+// - `onActiveLine()` follows a change of the line the map follows (`activeLine`);
 // - `deleteNote(note)` deletes a note, from the right-click menu;
 // - `beforeOpen()` clears what covers the code pane before a file opens there;
 // - `headerHeld()` says whether another view holds the pane's header, so a file read again
@@ -39,6 +42,9 @@ export function codeView({
   menu,
   files,
   indexNotes,
+  indexMarks,
+  openMapNode,
+  onActiveLine,
   deleteNote,
   beforeOpen,
   headerHeld,
@@ -113,12 +119,17 @@ export function codeView({
     }
 
     indexNotes();
+    indexMarks();
     // The changes view and the send step's prompt hold the header while they are open over the
     // file; a refresh of the file under them (on focus, or as a run moves on) leaves it alone.
     if (!headerHeld()) renderHeader(path);
     if (shouldReveal(previous, path, { keepView })) files.reveal(previous, path);
-    if (!keepView) codeEl.scrollTop = 0;
+    if (!keepView) {
+      codeEl.scrollTop = 0;
+      held = null;
+    }
     renderCode({ force: true });
+    onActiveLine();
   }
 
   function renderHeader(path) {
@@ -147,6 +158,21 @@ export function codeView({
   // The lines of the map's node last shown in the code, tinted while that file is open:
   // `{ path, start, end }`, 0-based and inclusive, or null.
   let mapped = null;
+  // The 0-based line of the open file the map follows in place of the first visible one, set
+  // when the map showed its node's lines here, or null. Until the engineer scrolls, clicks or
+  // types in the code: the scroll to those lines passes other nodes' lines on its way, and
+  // ends with them a third of the way down, and the map must stay on the node clicked.
+  let held = null;
+  // The map follows the first visible line again, at once: a click or a key may move nothing
+  // that would tell it.
+  function release() {
+    if (held === null) return;
+    held = null;
+    onActiveLine();
+  }
+  for (const type of ["wheel", "pointerdown", "keydown"]) {
+    codeEl.addEventListener(type, release, { passive: true });
+  }
 
   // Opens the file of the map's code reference `anchor` (diagram.js), with its lines a third
   // of the way down and tinted, or at the top for a whole file. A folder has no file: the
@@ -155,6 +181,7 @@ export function codeView({
     const lines = anchor.target === "lines" ? anchor.lines : null;
     mapped = lines && { path: anchor.path, start: lines.start - 1, end: lines.end - 1 };
     if (state.file?.path !== anchor.path && !(await openFile(anchor.path))) return;
+    held = lines && lines.start - 1;
     redecorateRows();
     const top = lines ? lineTop(lines.start - 1) - codeEl.clientHeight / 3 : 0;
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -165,6 +192,10 @@ export function codeView({
   // file: the file list shows it (file-list.js, `showFolder`).
   async function showNote(note) {
     if (state.file?.path !== note.path && !(await openFile(note.path))) return;
+    // The note's lines, not the map's node, are what the pane shows now; a pane already there
+    // does not scroll, so the map is told here.
+    held = null;
+    onActiveLine();
     // A third of the way down reads better than the very top edge.
     const top = onLines(note) ? lineTop(note.lines.start - 1) - codeEl.clientHeight / 3 : 0;
     codeEl.scrollTo({ top, behavior: "smooth" });
@@ -234,6 +265,9 @@ export function codeView({
     const below = composer && composer.end >= last ? composerHeight : 0;
     rowsEl.style.paddingTop = `${ROWS_PADDING + first * lineHeight + above}px`;
     rowsEl.style.paddingBottom = `${ROWS_PADDING + (lineCount() - last) * lineHeight + below}px`;
+    // How far a node's stripe reaches past the composer's line, to the line after it (app.css,
+    // `.map-stripe.continues`).
+    rowsEl.style.setProperty("--composer-height", `${composerHeight}px`);
   }
 
   function lineRow(index) {
@@ -257,13 +291,20 @@ export function codeView({
     return row;
   }
 
-  // Applies selection and note styling to a row. Called for new rows and again when the
-  // selection or the notes change, so those changes do not rebuild the rows.
+  // Applies selection, map and note styling to a row. Called for new rows and again when the
+  // selection, the notes or the analysis change, so those changes do not rebuild the rows.
   function decorateRow(row, index) {
     row.classList.toggle("selected", isSelected(index));
     row.classList.toggle("jumped", jumped?.path === state.file?.path && jumped.index === index);
     const onMap = mapped?.path === state.file?.path && mapped.start <= index && index <= mapped.end;
     row.classList.toggle("mapped", onMap);
+
+    // The stripe and chip are replaced only when their key changes, as the remark below is.
+    const mark = state.mapMarkers ? (state.markByLine.get(index) ?? null) : null;
+    const next = mark && state.composer?.end === index && state.markByLine.get(index + 1);
+    const continues = Boolean(next) && next.nodeId === mark.nodeId;
+    const markKey = mark && `${mark.key}:${continues}`;
+    if ((row.dataset.markKey ?? null) !== markKey) drawMark(row, mark, continues, markKey);
 
     const note = state.noteByLine.get(index);
     row.classList.toggle("noted", Boolean(note));
@@ -276,10 +317,64 @@ export function codeView({
     if (remark !== null) row.append(el("span", "remark", remark));
   }
 
+  // Draws `mark` (app.js, `markByLine`) on `row`, or nothing for null: the stripe at the
+  // gutter's left edge, beside the line number rather than in it, whose press would start a
+  // line selection; a flow's step number; and on the node's first line its chip, before the
+  // note's remark, and the count of other diagrams on the line. `continues` reaches the stripe
+  // past the composer under the line to the node's next line.
+  function drawMark(row, mark, continues, markKey) {
+    for (const old of row.querySelectorAll(".map-stripe, .map-step, .map-chip, .map-chip-more")) {
+      old.remove();
+    }
+    if (mark === null) {
+      delete row.dataset.markKey;
+      return;
+    }
+    row.dataset.markKey = markKey;
+    const number = row.querySelector(".n");
+    const stripe = el("button", "map-stripe");
+    stripe.type = "button";
+    stripe.tabIndex = -1;
+    stripe.classList.toggle("outdated", mark.outdated);
+    stripe.classList.toggle("continues", continues);
+    stripe.title = mark.outdated ? `${mark.label} (outdated)` : mark.label;
+    stripe.setAttribute("aria-label", `Map: ${mark.label}`);
+    number.before(stripe);
+    if (mark.step !== null) number.before(el("span", "map-step", String(mark.step)));
+    if (!mark.chip) return;
+
+    const remark = row.querySelector(".remark");
+    const chip = el("button", "map-chip", mark.chip.label);
+    chip.type = "button";
+    chip.tabIndex = -1;
+    chip.title = mark.chip.label;
+    row.insertBefore(chip, remark);
+    const { others } = mark.chip;
+    if (others.length === 0) return;
+    const more = el("button", "map-chip-more", `+${others.length}`);
+    more.type = "button";
+    more.tabIndex = -1;
+    const diagrams = others.length === 1 ? "diagram" : "diagrams";
+    more.setAttribute("aria-label", `${others.length} more ${diagrams} on this line`);
+    row.insertBefore(more, remark);
+  }
+
   function redecorateRows() {
     for (const row of rowsEl.querySelectorAll(".ln")) {
       decorateRow(row, Number(row.dataset.line));
     }
+    onActiveLine();
+  }
+
+  // The line the map follows (docs/review-assist.md, "Code to diagram"), `{ path, line }` with
+  // `line` 1-based: the composer's first line, else the selection's moving end, else the line
+  // the map showed (`held`), else the first visible line. Null with no file or an empty one.
+  function activeLine() {
+    const count = lineCount();
+    if (count === 0) return null;
+    const index =
+      state.composer?.start ?? state.selection?.head ?? held ?? lineAt(codeEl.scrollTop);
+    return { path: state.file.path, line: Math.min(Math.max(index, 0), count - 1) + 1 };
   }
 
   // A new code font size: the line at the top stays at the top. The scroll offset is in
@@ -355,8 +450,9 @@ export function codeView({
   let textDrag = null;
 
   rowsEl.addEventListener("mousedown", (event) => {
-    // A press on the + starts neither a text selection nor a drag: its click adds the note.
-    if (event.target.closest(".add-note")) {
+    // A press on the + or on a map stripe or chip starts neither a text selection nor a drag,
+    // whose release would clear the selection: its click adds the note or opens the map.
+    if (event.target.closest(".add-note, .map-stripe, .map-chip, .map-chip-more")) {
       event.preventDefault();
       return;
     }
@@ -372,12 +468,24 @@ export function codeView({
   });
 
   // The + on a line: a note on that line, or on the whole selection when the line is in it.
+  // A stripe or a chip opens the map at its node, and the count a menu of the other diagrams'.
   rowsEl.addEventListener("click", (event) => {
-    if (!event.target.closest(".add-note")) return;
     const line = lineOfEvent(event);
-    const range = selectedRange();
-    const inSelection = range && range.start <= line && line <= range.end;
-    openComposer(inSelection ? range : { start: line, end: line });
+    const mark = state.markByLine.get(line);
+    if (event.target.closest(".map-stripe")) openMapNode(mark.diagramId, mark.nodeId);
+    else if (event.target.closest(".map-chip")) openMapNode(mark.chip.diagramId, mark.chip.nodeId);
+    else if (event.target.closest(".map-chip-more")) {
+      const others = mark.chip.others.map((other) => ({
+        label: other.label,
+        detail: other.diagramTitle,
+        run: () => openMapNode(other.diagramId, other.nodeId),
+      }));
+      menu.open(event.clientX, event.clientY, others);
+    } else if (event.target.closest(".add-note")) {
+      const range = selectedRange();
+      const inSelection = range && range.start <= line && line <= range.end;
+      openComposer(inSelection ? range : { start: line, end: line });
+    }
   });
 
   document.addEventListener("selectionchange", () => {
@@ -446,8 +554,8 @@ export function codeView({
     return lines.map((tokens) => tokens.map(([, text]) => text).join("")).join("\n");
   }
 
-  // The code the text selection covers, without the line numbers and note remarks that sit
-  // in the same rows: WebKit's own selection text includes them even though they cannot be
+  // The code the text selection covers, without the line numbers, map chips and note remarks
+  // that sit in the same rows: WebKit's own selection text includes them even though they cannot be
   // selected (seen 2026-11-22: a two-line selection copied the gutter's "3"). Null when the
   // selection is not in the code, or covers other lines than the selected ones (a leftover
   // from before the gutter or a right-click chose new lines).
@@ -710,6 +818,7 @@ export function codeView({
     }
     // A place left before is wherever the pane was scrolled to: no line of it is marked.
     jumped = returning ? null : { path: place.path, index: place.line - 1 };
+    held = null;
     redecorateRows();
     const top = returning ? place.scrollTop : lineTop(place.line - 1) - codeEl.clientHeight / 3;
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -755,6 +864,7 @@ export function codeView({
     composer.node = buildComposer(composer);
     state.composer = composer;
     renderCode({ force: true });
+    onActiveLine();
     composer.node.querySelector("textarea").focus();
     if (intent === "ask") showAskWarning(composer);
   }
@@ -809,6 +919,7 @@ export function codeView({
     state.composer = null;
     state.selection = null;
     renderCode({ force: true });
+    onActiveLine();
     onComposerClosed();
     if (saves && composer.intent === "ask") onAsked();
     codeEl.focus();
@@ -899,6 +1010,9 @@ export function codeView({
       requestAnimationFrame(() => {
         renderQueued = false;
         renderCode();
+        // Inside the rendered window `renderCode` draws nothing, but the first visible line
+        // moved all the same.
+        onActiveLine();
       });
     },
     { passive: true },
@@ -914,6 +1028,7 @@ export function codeView({
     showNote,
     showAnchor,
     lineCount,
+    activeLine,
     render: renderCode,
     redecorate: redecorateRows,
     setLineHeight,

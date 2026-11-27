@@ -192,14 +192,14 @@ schedule three tasks.
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
 | `src/definitions.rs` | Jump to definition: an index from a name to where it is defined, built from the grammars' tags queries on a thread per open project (`index-definitions`). |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
-| `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
+| `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection, composer, and the map's stripes and chips, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
 | `ui/dom.js`, `ui/dialog-parts.js`, `ui/question-form.js` | Helpers the views share: `el()`, icons, the toast and two-click delete; the parts both dialogs draw; the question form. |
 | `ui/settings.js`, `ui/settings-controls.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`), shared controls, and drawing. |
 | `ui/wizard.js`, `ui/wizard-dialog.js` | The first-run startup wizard: its rules (tested with `node --test`) and 4-step dialog. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 | `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
-| `ui/diagram.js`, `ui/diagram-view.js` | The map: its rules (layout through dagre, a node's state, search, pan and zoom arithmetic, tested with `node --test`), and the SVG, the keyboard and the node's dialog. |
+| `ui/diagram.js`, `ui/diagram-view.js` | The map: its rules (layout through dagre, a node's state, search, pan and zoom arithmetic, the stripes and chips a file shows (`fileMarks`, `innermost`) and the node of a code line, tested with `node --test`), and the SVG, the keyboard, the node's dialog and following the code pane's line. |
 | `ui/vendor/dagre.min.js` | `@dagrejs/dagre`, the map's layout, vendored with `dagre.LICENSE` and loaded by a script element when the map first opens. |
 | `ui/definitions.js`, `ui/definitions-dialog.js` | Jump to definition: the name under a click and the history of places (tested with `node --test`), and the list a name defined more than once opens. |
 

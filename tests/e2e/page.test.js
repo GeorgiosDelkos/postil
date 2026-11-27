@@ -1284,11 +1284,11 @@ const ANALYSIS = {
   ],
 };
 
-// Writes `ANALYSIS` into the open project's analysis file, as an analysis run would.
-async function writeAnalysis(api) {
+// Writes `analysis` into the open project's analysis file, as an analysis run would.
+async function writeAnalysis(api, analysis = ANALYSIS) {
   const { root } = await api("api/repo");
   mkdirSync(join(root, ".git/postil"), { recursive: true });
-  writeFileSync(join(root, ".git/postil/analysis.json"), JSON.stringify(ANALYSIS));
+  writeFileSync(join(root, ".git/postil/analysis.json"), JSON.stringify(analysis));
 }
 
 // Opens a project with `ANALYSIS` written, and counts the page's requests for the layout
@@ -1303,7 +1303,14 @@ async function openMapped(t, scenario = "flood", options = {}) {
   return { ...opened, dagre };
 }
 
-const node = (page, label) => page.locator(".map-node").filter({ hasText: label });
+// The card whose label is `label`, whole: `hasText` alone matches any card whose text holds it
+// anywhere, case-insensitively ("Far" in "runs on far past").
+const node = (page, label) => {
+  const exact = new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+  return page
+    .locator(".map-node")
+    .filter({ has: page.locator(".map-node-label", { hasText: exact }) });
+};
 
 test("the map loads its layout only when opened, and a node's click opens its lines", async (t) => {
   const { page, dagre } = await openMapped(t);
@@ -1536,4 +1543,397 @@ test("an analysis file this build cannot read offers Start over, which clears th
   assert.equal(readFileSync(trashed, "utf8"), "{ not json");
   unlinkSync(trashed);
   await page.locator(".map-empty").waitFor();
+});
+
+// ---- The link shown in the code (docs/review-assist-plan.md, 8.4) --------------------------
+
+// `src/m.rs`, 200 lines `l1` to `l200`, tall enough to scroll a node's lines out of view.
+const MARKED_LINES = Array.from({ length: 200 }, (_, index) => `l${index + 1}`);
+const MARKED_FILES = { "src/m.rs": `${MARKED_LINES.join("\n")}\n` };
+const markedCite = (start, end) => ({
+  path: "src/m.rs",
+  target: "lines",
+  lines: { start, end },
+  snippet: MARKED_LINES.slice(start - 1, end).join("\n"),
+});
+const markedNode = (id, label, anchors) => ({
+  id,
+  kind: "component",
+  label,
+  summary: "",
+  detail: "",
+  anchors,
+});
+const LONG_LABEL = "A parser whose name runs on far past the room a chip in the code may take";
+
+// An Architecture diagram of src/m.rs: Server on lines 2 to 6, the long-named parser inside it
+// on 3 and 4, Old on lines 10 and 11, whose snippet is no longer there (outdated), and Far on
+// 150 to 152; and a Data diagram whose Token is on line 3 too.
+const MARKED = {
+  version: 2,
+  diagrams: [
+    {
+      id: "D1",
+      kind: "architecture",
+      title: "System",
+      run: "R1",
+      nodes: [
+        markedNode("D1.1", "Server", [markedCite(2, 6)]),
+        markedNode("D1.2", LONG_LABEL, [markedCite(3, 4)]),
+        markedNode("D1.3", "Old", [{ ...markedCite(10, 11), snippet: "gone\nnow" }]),
+        markedNode("D1.4", "Far", [markedCite(150, 152)]),
+      ],
+      edges: [],
+    },
+    {
+      id: "D2",
+      kind: "data",
+      title: "Types",
+      run: "R1",
+      nodes: [{ ...markedNode("D2.1", "Token", [markedCite(3, 3)]), kind: "store" }],
+      edges: [],
+    },
+  ],
+};
+
+// `MARKED` with a flow of two steps: Read on lines 20 and 21, then Write on line 25.
+const MARKED_FLOW = {
+  ...MARKED,
+  diagrams: [
+    ...MARKED.diagrams,
+    {
+      id: "D3",
+      kind: "flow",
+      title: "Load",
+      run: "R1",
+      nodes: [
+        markedNode("D3.1", "Read", [markedCite(20, 21)]),
+        markedNode("D3.2", "Write", [markedCite(25, 25)]),
+      ],
+      edges: [],
+    },
+  ],
+};
+
+// Opens a project of `MARKED_FILES` with `analysis` written, src/m.rs open, its stripes drawn,
+// and counts the page's requests for the layout library.
+async function openMarked(t, analysis = MARKED) {
+  const opened = await openProject(t, "flood", "new", { files: MARKED_FILES });
+  await writeAnalysis(opened.api, analysis);
+  const dagre = [];
+  opened.page.on("request", (request) => {
+    if (request.url().endsWith("vendor/dagre.min.js")) dagre.push(request.url());
+  });
+  // The page read no analysis as it opened: the window's focus reads it again.
+  await opened.page.evaluate(() => dispatchEvent(new Event("focus")));
+  await openFile(opened.page, "src/m.rs");
+  await opened.page.locator('#code-rows .ln[data-line="1"] .map-stripe').waitFor();
+  return { ...opened, dagre };
+}
+
+const row = (page, index) => page.locator(`#code-rows .ln[data-line="${index}"]`);
+
+// The map's card of node `id`, by its id: one label may hold another ("far" in the parser's).
+const card = (page, id) => page.locator(`#map .map-node[data-node-id="${id}"]`);
+
+// Waits until node `id` is the only card with class `state` ("selected" or "ringed").
+const onlyNode = (page, state, id) =>
+  page.waitForFunction(
+    ([name, wanted]) => {
+      const cards = [...document.querySelectorAll(`.map-node.${name}`)];
+      return cards.length === 1 && cards[0].dataset.nodeId === wanted;
+    },
+    [state, id],
+  );
+
+test("stripes and chips show before the map opens, and a chip opens the map at its node", async (t) => {
+  const { page, dagre } = await openMarked(t);
+  assert.deepEqual(dagre, [], "the stripes need no layout");
+  // Server's five lines and Old's two, solid and dashed.
+  assert.equal(await page.locator("#code-rows .map-stripe").count(), 7);
+  assert.equal(await page.locator("#code-rows .map-stripe.outdated").count(), 2);
+  assert.equal(await row(page, 9).locator(".map-stripe.outdated").count(), 1);
+  assert.equal(await row(page, 0).locator(".map-stripe").count(), 0);
+
+  // A chip on each node's first line, the long one cut with its whole name in its title, and
+  // the Data diagram's Token behind +1.
+  assert.equal(await row(page, 1).locator(".map-chip").textContent(), "Server");
+  const long = row(page, 2).locator(".map-chip");
+  assert.equal(await long.getAttribute("title"), LONG_LABEL);
+  assert.ok((await long.boundingBox()).width <= 180, "cut at 180 px");
+  assert.equal(await row(page, 2).locator(".map-chip-more").textContent(), "+1");
+  assert.equal(await row(page, 3).locator(".map-chip").count(), 0, "one chip per node");
+
+  // View > Map Markers turns them off, and on again.
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.equal(await page.locator("#code-rows .map-stripe, #code-rows .map-chip").count(), 0);
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.equal(await page.locator("#code-rows .map-stripe").count(), 7);
+
+  // The chip opens the map, whose layout loads first, at its node.
+  await row(page, 1).locator(".map-chip").click();
+  await onlyNode(page, "selected", "D1.1");
+  assert.equal(dagre.length, 1);
+  // The code column beside the map at 1280 px is under 520 px: chips go, stripes stay.
+  assert.ok(!(await row(page, 1).locator(".map-chip").isVisible()), "no chip in a narrow column");
+  assert.ok(await row(page, 1).locator(".map-stripe").isVisible());
+
+  // With room, +1 lists the other diagram, and its item opens that diagram at Token.
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await row(page, 2).locator(".map-chip-more").click();
+  await page.locator("#context-menu .menu-item").filter({ hasText: "Token" }).click();
+  await onlyNode(page, "selected", "D2.1");
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+});
+
+test("a click on a stripe keeps the line selection, and the map follows the code's line", async (t) => {
+  const { page } = await openMarked(t);
+  await row(page, 2).locator(".n").click();
+  await row(page, 3)
+    .locator(".n")
+    .click({ modifiers: ["Shift"] });
+  await row(page, 4).locator(".map-stripe").click();
+  await onlyNode(page, "selected", "D1.1");
+  assert.deepEqual(
+    await page
+      .locator("#code-rows .ln.selected")
+      .evaluateAll((rows) => rows.map((each) => each.dataset.line)),
+    ["2", "3"],
+    "the selection stays",
+  );
+  // The selection's moving end is on line 4, the parser's.
+  await onlyNode(page, "ringed", "D1.2");
+
+  // No selection: the first visible line, followed in the scroll's frame even where the scroll
+  // draws no new rows (line 10, inside the rendered window).
+  await page.locator("#code").focus();
+  await page.keyboard.press("Escape");
+  await page.locator(".map-node.ringed").waitFor({ state: "detached" });
+  const scrollTo = (line) =>
+    page.locator("#code").evaluate((code, at) => {
+      const height = parseFloat(getComputedStyle(code).getPropertyValue("--line-height"));
+      code.scrollTop = 12 + (at - 0.5) * height;
+    }, line);
+  await scrollTo(10);
+  await onlyNode(page, "ringed", "D1.3");
+
+  // Far moved off the map's screen: scrolled to in the code, it is ringed and panned to, in the
+  // same diagram.
+  const body = await page.locator("#map .map-body").boundingBox();
+  const far = await card(page, "D1.4").boundingBox();
+  await page.mouse.move(body.x + body.width / 2, body.y + body.height / 2);
+  await page.mouse.wheel(0, -(body.y + body.height - far.y + 20));
+  await page.waitForFunction(
+    (bottom) =>
+      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().top >
+      bottom,
+    body.y + body.height,
+  );
+  await scrollTo(150);
+  await onlyNode(page, "ringed", "D1.4");
+  await page.waitForFunction(
+    ({ top, bottom }) => {
+      const box = document
+        .querySelector('#map .map-node[data-node-id="D1.4"]')
+        .getBoundingClientRect();
+      return box.top >= top && box.bottom <= bottom;
+    },
+    { top: body.y, bottom: body.y + body.height },
+  );
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "System");
+
+  // The code never switches the diagram: with Types open, line 150, which only System's Far
+  // covers, rings nothing, and line 3 rings Types' Token.
+  await page.locator(".map-kind").filter({ hasText: "Data" }).click();
+  await page.locator(".map-crumbs b").filter({ hasText: "Types" }).waitFor();
+  await scrollTo(150);
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  assert.equal(await page.locator(".map-node.ringed").count(), 0);
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+  await scrollTo(3);
+  await onlyNode(page, "ringed", "D2.1");
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+});
+
+test("a flow's step numbers show in the gutter only while the map shows that flow", async (t) => {
+  const { page } = await openMarked(t, MARKED_FLOW);
+  const steps = () =>
+    page
+      .locator("#code-rows .map-step")
+      .evaluateAll((all) =>
+        all.map((step) => [step.closest(".ln").dataset.line, step.textContent]),
+      );
+  assert.deepEqual(await steps(), [], "none with the map closed");
+
+  await page.locator("#toggle-map").click();
+  await node(page, "Server").waitFor();
+  assert.deepEqual(await steps(), [], "none while the Architecture shows");
+
+  const kind = (name) => page.locator(".map-kind").filter({ hasText: name }).click();
+  await kind("Flows");
+  await node(page, "Read").waitFor();
+  // Each step on the first line of its reference: lines 20 and 25.
+  assert.deepEqual(await steps(), [
+    ["19", "1"],
+    ["24", "2"],
+  ]);
+  await kind("Architecture");
+  await node(page, "Server").waitFor();
+  assert.deepEqual(await steps(), []);
+  await kind("Flows");
+  await node(page, "Read").waitFor();
+  assert.equal((await steps()).length, 2, "back with the flow");
+
+  await page.locator("#toggle-map").click();
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.deepEqual(await steps(), [], "gone with the map closed");
+});
+
+test("a pan towards the code's node stops when another diagram opens", async (t) => {
+  const { page } = await openMarked(t);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.locator("#toggle-map").click();
+  await card(page, "D1.4").waitFor();
+  // Far off the map's screen, as in the test above.
+  const body = await page.locator("#map .map-body").boundingBox();
+  const far = await card(page, "D1.4").boundingBox();
+  await page.mouse.move(body.x + body.width / 2, body.y + body.height / 2);
+  await page.mouse.wheel(0, -(body.y + body.height - far.y + 20));
+  await page.waitForFunction(
+    (bottom) =>
+      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().top >
+      bottom,
+    body.y + body.height,
+  );
+  // Line 150 starts a 160 ms glide to Far; Data opens two frames in, and Types must stay
+  // where it is drawn.
+  const moved = await page.evaluate(async () => {
+    const code = document.getElementById("code");
+    const height = parseFloat(getComputedStyle(code).getPropertyValue("--line-height"));
+    code.scrollTop = 12 + 149.5 * height;
+    const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    await frame();
+    await frame();
+    const ringed = document.querySelector(".map-node.ringed")?.dataset.nodeId;
+    [...document.querySelectorAll(".map-kind")].find((each) => each.textContent === "Data").click();
+    const pane = () => document.querySelector("#map .map-viewport").getAttribute("transform");
+    const drawn = pane();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const crumb = document.querySelector(".map-crumbs b").textContent;
+    return { ringed, crumb, drawn, later: pane() };
+  });
+  assert.equal(moved.ringed, "D1.4", "the glide had started");
+  assert.equal(moved.crumb, "Types");
+  assert.equal(moved.later, moved.drawn, "Types stays where it was drawn");
+});
+
+test("a note shown in the code moves the ring off the node the map showed", async (t) => {
+  const { page, api } = await openMarked(t);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  const request = { path: "src/m.rs", lines: { start: 3, end: 3 }, snippet: "l3", body: "Three." };
+  await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator(".note-item").first().waitFor();
+  await page.locator("#toggle-map").click();
+  // Far's code shown, a third of the way down: the map follows Far, not the first line.
+  await card(page, "D1.4").click();
+  await onlyNode(page, "ringed", "D1.4");
+  await page.waitForFunction(() => document.getElementById("code").scrollTop > 1000);
+
+  await page.locator(".note-item .note-card, .note-item button").first().click();
+  await page.locator("#note-dialog button").filter({ hasText: "Show in code" }).click();
+  await page.waitForFunction(() => document.getElementById("code").scrollTop < 200);
+  await page.waitForFunction(
+    () => !document.querySelector('.map-node.ringed[data-node-id="D1.4"]'),
+  );
+});
+
+test("a stripe's node keeps the focus when the map, opened by the stripe, reads the analysis", async (t) => {
+  const { page } = await openMarked(t);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.locator("#toggle-map").click();
+  await card(page, "D1.1").waitFor();
+  await page.locator("#toggle-map").click();
+  await page.locator("#map").waitFor({ state: "hidden" });
+
+  // The map opens drawn from the analysis it holds, at once, and draws again once it has read
+  // it anew. The card focused by the click is taken in the click's own task, before that.
+  await page.evaluate(() => {
+    document.querySelector('#code-rows .ln[data-line="9"] .map-stripe').click();
+    window.focusedCard = document.activeElement;
+  });
+  assert.equal(await page.evaluate(() => window.focusedCard.dataset.nodeId), "D1.3");
+  await page.waitForFunction(() => !window.focusedCard.isConnected);
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset?.nodeId), "D1.3");
+});
+
+test("the stripe continues past the composer, and a note on a striped line shows both", async (t) => {
+  const { page } = await openMarked(t);
+  await row(page, 2).locator(".n").click();
+  await page.keyboard.press("c");
+  await page.locator("#note-body").waitFor();
+  // Down to the parser's next line, once the composer is measured (code-view.js).
+  await page.waitForFunction(() => {
+    const stripe = document.querySelector('.ln[data-line="2"] .map-stripe.continues');
+    const next = document.querySelector('.ln[data-line="3"]');
+    if (!stripe || !next) return false;
+    return Math.abs(stripe.getBoundingClientRect().bottom - next.getBoundingClientRect().top) <= 1;
+  });
+  assert.equal(await row(page, 3).locator(".map-stripe:not(.continues)").count(), 1);
+
+  await page.locator("#note-body").fill("On three.");
+  await page.keyboard.press("Meta+Enter");
+  await row(page, 2).locator(".remark").waitFor();
+  // The chip comes before the remark, drawn in either order.
+  const order = () =>
+    row(page, 2).evaluate((line) =>
+      [...line.children]
+        .map((child) => child.className)
+        .filter((name) => ["map-chip", "map-chip-more", "remark"].includes(name)),
+    );
+  assert.match(await row(page, 2).getAttribute("class"), /\bnoted\b/);
+  assert.equal(await row(page, 2).locator(".map-stripe:not(.continues)").count(), 1);
+  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "remark"]);
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.deepEqual(await order(), ["remark"]);
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "remark"]);
+});
+
+test("Cmd-C over striped and chipped lines copies their code alone", async (t) => {
+  const { page } = await openMarked(t);
+  // What the page puts on the clipboard: the whole lines of a gutter selection through the
+  // Clipboard API, a text selection through the copy event (code-view.js, `copyLines`).
+  await page.evaluate(() => {
+    window.written = [];
+    window.copyEvents = [];
+    navigator.clipboard.writeText = async (text) => window.written.push(text);
+    addEventListener("copy", (event) => {
+      window.copyEvents.push(event.clipboardData.getData("text/plain"));
+    });
+  });
+  const taken = (name) => page.evaluate((key) => window[key].splice(0), name);
+
+  await row(page, 1).locator(".n").click();
+  await row(page, 2)
+    .locator(".n")
+    .click({ modifiers: ["Shift"] });
+  await page.keyboard.press("Meta+c");
+  await page.waitForFunction(() => window.written.length > 0);
+  assert.deepEqual(await taken("written"), ["l2\nl3"]);
+
+  // A drag across the code of the same two lines, the chips and +1 between them.
+  const from = await row(page, 1).locator(".c").boundingBox();
+  const to = await row(page, 2).locator(".c").boundingBox();
+  await page.mouse.move(from.x + 1, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(to.x + to.width - 1, to.y + to.height / 2, { steps: 4 });
+  await page.mouse.up();
+  await taken("copyEvents");
+  await page.keyboard.press("Meta+c");
+  await page.waitForFunction(() => window.copyEvents.length > 0);
+  assert.deepEqual(await taken("copyEvents"), ["l2\nl3"]);
+  assert.deepEqual(await taken("written"), [], "the browser copied the text selection");
 });

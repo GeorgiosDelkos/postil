@@ -1,10 +1,11 @@
 # Postil: review assist
 
-Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
+Status: 2026-11-27. Designed. Built so far: an execute call's command and exit code (step
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
-Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1), and
-analysis runs (8.2), and the split pane with the diagram view (8.3). This document adds to
+Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1),
+analysis runs (8.2), the split pane with the diagram view (8.3), and the link shown in the
+code with code to diagram (8.4). This document adds to
 `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists

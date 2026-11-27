@@ -11,6 +11,7 @@ import { changesView } from "./changes-view.js";
 import { codeView } from "./code-view.js";
 import { contextMenu } from "./context-menu.js";
 import { diagramView } from "./diagram-view.js";
+import { fileMarks } from "./diagram.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
@@ -58,6 +59,12 @@ const state = {
   // file, and the number of notes on each file or folder path.
   noteByLine: new Map(),
   noteCountByPath: new Map(),
+  // Derived from the map's analysis (diagram-view.js, read from `api/analysis` at start, so
+  // they show before the map is first opened) by `indexMarks`: the stripe and chip on each
+  // 0-based line of the open file (diagram.js, `fileMarks`).
+  markByLine: new Map(),
+  // Whether the stripes and chips show (View > Map Markers), for this window's session.
+  mapMarkers: true,
   // The repository's files as a tree (tree.js), rebuilt when the file list changes, and the
   // paths of the folders open in it.
   tree: buildTree([]),
@@ -100,6 +107,9 @@ const code = codeView({
   menu,
   files,
   indexNotes,
+  indexMarks,
+  openMapNode: openNodeInMap,
+  onActiveLine: syncCodeToMap,
   deleteNote,
   beforeOpen: () => {
     changes.close();
@@ -229,6 +239,11 @@ const map = diagramView({
   },
   writeNote: writeOnAnchor,
   alone: () => mapMode.open && layout.isNarrow(),
+  // A new analysis, or a flow opened or closed, changes the stripes, chips and step numbers.
+  onChange: () => {
+    indexMarks();
+    code.redecorate();
+  },
   onError: showToast,
 });
 
@@ -292,6 +307,14 @@ function indexNotes() {
       state.noteByLine.set(line, note);
     }
   }
+}
+
+// Rebuilds `markByLine` for the open file from the map's analysis, with the step numbers of
+// the flow the map shows.
+function indexMarks() {
+  const lineCount = code.lineCount();
+  const openDiagramId = map.openDiagramId();
+  state.markByLine = fileMarks(map.analysis(), state.file?.path, lineCount, { openDiagramId });
 }
 
 // Stores a note on the whole file or folder at `path` (`target` "file" or "folder") and draws
@@ -571,21 +594,30 @@ async function refresh() {
     return;
   }
   if (!state.projectOpen) return;
-  // Another window may have analyzed the repository, or the code under a node moved.
-  map.refresh().catch((error) => showToast(String(error)));
   // The definitions index looks at the files again on its own thread (src/definitions.rs);
   // nothing here waits for it. Even with the composer open: the index moves no line.
   void fetch("api/definitions/refresh", { method: "POST" });
-  if (state.composer) return;
+  // Another window may have analyzed the repository, or the code under a node moved. With the
+  // composer open the file is not read again, but the map is.
+  if (state.composer) {
+    map.load().catch((error) => showToast(String(error)));
+    return;
+  }
   const path = state.wanted;
   // A later refresh may answer first, as a run's edits come one after another: only the
   // latest refresh draws, or an older file would be painted over a newer one.
   const generation = ++refreshes;
-  const [repo, notes, file] = await Promise.all([
+  const [repo, notes, analysis, file] = await Promise.all([
     fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
     fetchNotes(),
+    map.fetchAnalysis(),
     path ? code.fetchFile(path) : null,
   ]);
+  // Before the check below, and before the file, which indexes the stripes and chips with the
+  // notes, so both are drawn on the new text. Even when the engineer moved on: a file opened
+  // meanwhile is indexed against the analysis the map holds, and dropping this reply would
+  // leave it without its stripes until the next focus. Its number keeps a newer reply's.
+  void map.applyAnalysis(analysis).catch((error) => showToast(String(error)));
   // The engineer moved on while the replies were in flight: their action wins.
   if (state.composer || state.wanted !== path || generation !== refreshes) return;
 
@@ -663,6 +695,7 @@ window.postil = {
     } else if (command === "usage") usage.open();
     else if (command === "focus-mode") toggleFocus();
     else if (command === "map") toggleMap();
+    else if (command === "map-markers") toggleMapMarkers();
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
@@ -756,6 +789,32 @@ function drawMapMode(narrow = layout.isNarrow()) {
   $("code-pane").classList.toggle("map-full", open && narrow && mapMode.shows === "map");
   $("toggle-map").setAttribute("aria-pressed", String(mapMode.open));
   map.setShown(shown);
+  syncCodeToMap();
+}
+
+// Opens the map at node `nodeId` of diagram `diagramId`, a click on its stripe or chip in the
+// code: out of focus mode, and in a narrow window in place of the code.
+function openNodeInMap(diagramId, nodeId) {
+  leaveFocus();
+  if (!mapMode.open) setMapOpen(true);
+  else if (layout.isNarrow() && mapMode.shows !== "map") {
+    mapMode.shows = "map";
+    drawMapMode();
+  }
+  map.revealNode(diagramId, nodeId);
+}
+
+// The map follows the code pane's line while it shows.
+function syncCodeToMap() {
+  if (!map.isShown()) return;
+  const active = code.activeLine();
+  map.followCode(active?.path ?? null, active?.line ?? null);
+}
+
+// View > Map Markers: the stripes and chips go, or come back.
+function toggleMapMarkers() {
+  state.mapMarkers = !state.mapMarkers;
+  code.redecorate();
 }
 
 // A narrow window showing the map alone gives the pane to the code, where a node's code shows.
@@ -865,7 +924,9 @@ async function start() {
   showRepo(repo);
   await files.loadFolders().catch(() => {});
   files.render();
-  await loadNotes();
+  // The analysis too, for the stripes and chips in the code: a repository without one reads
+  // `null`, and the layout library waits for the map to open.
+  await Promise.all([loadNotes(), map.load().catch((error) => showToast(String(error)))]);
   // The latest run, this session's or one from before a restart.
   await runs.sync();
 

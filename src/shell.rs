@@ -288,7 +288,8 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
                 | Command::Usage
                 | Command::SetupWizard
                 | Command::FocusMode
-                | Command::Map => Unanswered::Ignore,
+                | Command::Map
+                | Command::MapMarkers => Unanswered::Ignore,
             };
             ask_page(&app.page, command.id(), unanswered);
         }

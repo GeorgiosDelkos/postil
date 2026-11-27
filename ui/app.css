@@ -531,6 +531,86 @@ kbd {
   color: var(--note);
 }
 
+/* The map's node on a line (docs/review-assist.md, "The link shown in the code"): a stripe at
+   the gutter's left edge, left of the +, dashed when the node's code is outdated. Under a line
+   whose composer is open it reaches past the composer to the node's next line. A height, not
+   `bottom: 0`: an empty button is sized by its content, which `top` and `bottom` may not
+   override in WebKit. */
+.ln .map-stripe {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 6px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 3px solid var(--map);
+  background: none;
+  cursor: pointer;
+}
+
+.ln .map-stripe.outdated {
+  border-left-style: dashed;
+}
+
+.ln .map-stripe.continues {
+  height: calc(100% + var(--composer-height, 138px));
+}
+
+/* A flow's step number, while the map shows that flow. The + takes its place on hover. */
+.ln .map-step {
+  position: absolute;
+  left: 6px;
+  width: 16px;
+  text-align: center;
+  font: 600 10.5px "Geist", sans-serif;
+  line-height: var(--line-height);
+  color: var(--map);
+  pointer-events: none;
+}
+
+.ln:hover .map-step {
+  opacity: 0;
+}
+
+/* The node's name at the end of its first line, cut at 180 px with the whole name in its
+   title, and the count of other diagrams on the line. */
+.ln .map-chip,
+.ln .map-chip-more {
+  flex: none;
+  align-self: center;
+  height: 17px;
+  padding: 0 7px;
+  margin-right: 6px;
+  background: var(--map-wash);
+  border: 1px solid var(--map);
+  border-radius: 5px;
+  color: var(--map);
+  font: 500 11.5px/15px "Geist", sans-serif;
+  white-space: nowrap;
+  user-select: none;
+  cursor: pointer;
+}
+
+.ln .map-chip {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ln .map-chip-more {
+  padding: 0 5px;
+}
+
+/* A code column under 520 px has no room for chips; the stripes stay. `.code` is the
+   container. */
+@container (width < 520px) {
+  .ln .map-chip,
+  .ln .map-chip-more {
+    display: none;
+  }
+}
+
 .k { color: var(--syntax-keyword); }
 .f { color: var(--syntax-function); }
 .s { color: var(--syntax-string); }
@@ -4578,6 +4658,11 @@ body.focus-mode .code {
   fill: var(--text-strong);
 }
 
+/* A search match, or the boundary of the code pane's line; before the selection, as for cards. */
+.map-group-head.ringed .map-group-label {
+  fill: var(--accent);
+}
+
 .map-group-head.selected .map-group-label,
 .map-group-head:focus-visible .map-group-label {
   fill: var(--map);
@@ -4653,6 +4738,7 @@ body.focus-mode .code {
   fill: var(--note);
 }
 
+/* A search match, or the node of the code pane's line. */
 .map-node.ringed .map-node-box {
   stroke: var(--accent);
   stroke-width: 2;
