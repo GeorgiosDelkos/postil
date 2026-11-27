@@ -137,6 +137,41 @@ pub enum Error {
         /// How long the change waited, in seconds.
         seconds: u64,
     },
+    /// The analysis file exists but could not be read.
+    ReadAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// The analysis file is not JSON of the expected shape.
+    ParseAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// What the JSON parser reported, with the line and column.
+        source: serde_json::Error,
+    },
+    /// The analysis file parses but breaks a rule of the format.
+    InvalidAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// Which rule, and where.
+        problem: String,
+    },
+    /// The analysis file could not be written.
+    WriteAnalysis {
+        /// The analysis file's path, or its lock file's.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// Another writer held the analysis file's lock for as long as a change waits for it.
+    AnalysisLocked {
+        /// The lock file's path.
+        path: PathBuf,
+        /// How long the change waited, in seconds.
+        seconds: u64,
+    },
     /// The page sent settings that break a rule (`settings.rs`); the text says which.
     InvalidSettings(String),
     /// The settings file on disk cannot be used, so saving over it is refused until it is
@@ -429,6 +464,35 @@ impl fmt::Display for Error {
                  again; `lsof` on that file names the process)",
                 path.display()
             ),
+            // As for the review file: a file that cannot be read is never written over, so the
+            // diagrams in it are safe until the engineer fixes or moves it.
+            Self::ReadAnalysis { path, .. } => write!(
+                f,
+                "cannot read {} (fix its permissions or encoding, or move it aside to start over)",
+                path.display()
+            ),
+            Self::ParseAnalysis { path, .. } => write!(
+                f,
+                "cannot parse {} (fix it, or move it aside to start over)",
+                path.display()
+            ),
+            Self::InvalidAnalysis { path, problem } => write!(
+                f,
+                "{}: {problem} (fix it, or move it aside to start over)",
+                path.display()
+            ),
+            Self::WriteAnalysis { path, .. } => write!(
+                f,
+                "cannot write {} (check that its directory is writable; the analysis was not \
+                 saved)",
+                path.display()
+            ),
+            Self::AnalysisLocked { path, seconds } => write!(
+                f,
+                "another writer held {} for {seconds} s, so the analysis was not saved (try \
+                 again; `lsof` on that file names the process)",
+                path.display()
+            ),
             Self::InvalidSettings(problem) => write!(f, "cannot save the settings: {problem}"),
             Self::SettingsLocked(problem) => write!(
                 f,
@@ -653,6 +717,8 @@ impl std::error::Error for Error {
             | Self::Read { source, .. }
             | Self::ReadReview { source, .. }
             | Self::WriteReview { source, .. }
+            | Self::ReadAnalysis { source, .. }
+            | Self::WriteAnalysis { source, .. }
             | Self::WriteRecent { source, .. }
             | Self::WriteSettings { source, .. }
             | Self::StartAgent { source, .. }
@@ -664,7 +730,7 @@ impl std::error::Error for Error {
             | Self::ReadRun { source, .. }
             | Self::WriteWorktree { source, .. }
             | Self::WriteThreads { source, .. } => Some(source),
-            Self::ParseReview { source, .. } => Some(source),
+            Self::ParseReview { source, .. } | Self::ParseAnalysis { source, .. } => Some(source),
             Self::Highlight { source, .. } => Some(source),
             Self::Window(source) => Some(source),
             Self::Webview(source) => Some(source),
@@ -683,6 +749,8 @@ impl std::error::Error for Error {
             | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. }
             | Self::ReviewLocked { .. }
+            | Self::InvalidAnalysis { .. }
+            | Self::AnalysisLocked { .. }
             | Self::InvalidSettings(_)
             | Self::SettingsLocked(_)
             | Self::SettingsChanged

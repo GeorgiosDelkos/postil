@@ -1,0 +1,868 @@
+//! The analysis: diagrams of the repository that an agent drew, each node and edge tied to the
+//! code it stands for, and the file that stores them (docs/review-assist.md, "Data
+//! structures").
+//!
+//! # Code references
+//!
+//! An agent cites code as `{path, lines, first}`, where `first` is the text of the first cited
+//! line. [`check_in`] holds a citation against the file: it is found when the line at `lines`
+//! equals `first`, both trimmed, or else when exactly one line of the file equals `first`, and
+//! the range moves there. Otherwise it is [`RefState::Unverified`]. A blank `first` holds only
+//! at the stated line: a blank line is never unique. A found citation keeps the cited lines as
+//! its snippet, so the agent never sends file contents back, and from then on it is placed as
+//! a note is, by [`locate`](crate::anchor::locate).
+//!
+//! A reference that was verified is [`RefState::Found`] or [`RefState::Outdated`] and has a
+//! [`Target`]; an unverified one has no target, since its lines may be zero, reversed or past
+//! the end of a file that may not exist, and may have a `reason` (the file was too large, or
+//! not text).
+//!
+//! # The file
+//!
+//! The analysis lives in `<git dir>/postil/analysis.json`, version 1. Reading it never writes
+//! it: [`current`] places every verified reference where its code is now (`place`) on each
+//! read, whatever state the file stores for it, as notes are placed: a reference whose code is
+//! gone reads as outdated, and found again once the code is back. An unverified reference is
+//! left as it is.
+//!
+//! The file refuses unknown fields, a newer version, and ids or edges that break the rules
+//! below, naming the file, and [`save`] never writes over a file that [`load`] refuses, so a
+//! hand edit gone wrong is reported rather than lost. A writer takes [`lock`] (`analysis.lock`
+//! beside the file) before it reads what it changes, and holds it until [`save`] has renamed
+//! the new file into place, so two windows cannot drop each other's changes.
+//!
+//! # Invariants
+//!
+//! What [`load`] and [`save`] check:
+//!
+//! - Diagram ids are unique.
+//! - Each node's id starts with its diagram's id (`D2.3` is in `D2`), and is unique.
+//! - An edge joins two different nodes of its own diagram.
+//! - A node's `group` names another node of its diagram, and following groups never loops.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fs::{self, File, TryLockError};
+use std::io;
+use std::path::Path;
+
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
+
+use crate::anchor::{LineRange, Target, TargetKind, locate_lines};
+use crate::error::{Error, Result};
+use crate::files::{self, save_json, version_of};
+use crate::repo::{MAX_READ, PathKind, Repo};
+
+/// The format version this build writes and reads. A file with another version is refused,
+/// not rewritten. `checked` (the commit the Architecture was last compared with) is not in
+/// version 1: it comes with the code that reads it.
+const VERSION: u32 = 1;
+
+/// Reads the analysis and places every found code reference where its code is now, or
+/// returns `None` when there is no analysis file. Does not write.
+///
+/// # Errors
+///
+/// As [`load`]. A reference whose file cannot be read is not an error: it is outdated.
+pub(crate) fn current(repo: &Repo) -> Result<Option<Analysis>> {
+    let Some(mut analysis) = load(&repo.analysis_file())? else {
+        return Ok(None);
+    };
+    place(&mut analysis, repo);
+    Ok(Some(analysis))
+}
+
+/// Reads the analysis file as it is, with no reference placed, or `None` when there is none.
+///
+/// # Errors
+///
+/// [`Error::ReadAnalysis`] when the file exists but cannot be read; [`Error::ParseAnalysis`]
+/// when it is not JSON of the format's shape (an unknown field included);
+/// [`Error::InvalidAnalysis`] for another version, or ids and edges that break the module's
+/// invariants.
+pub(crate) fn load(file: &Path) -> Result<Option<Analysis>> {
+    let json = match fs::read_to_string(file) {
+        Ok(json) => json,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::ReadAnalysis {
+                path: file.to_owned(),
+                source,
+            });
+        }
+    };
+    let parse_error = |source| Error::ParseAnalysis {
+        path: file.to_owned(),
+        source,
+    };
+    let invalid = |problem| Error::InvalidAnalysis {
+        path: file.to_owned(),
+        problem,
+    };
+
+    // The version is read on its own first: a newer format would otherwise fail on its first
+    // new field, with a message that hides the real reason.
+    let version = version_of(json.as_bytes()).map_err(parse_error)?;
+    if version != VERSION {
+        return Err(invalid(format!(
+            "version {version}, but this build of Postil reads version {VERSION}"
+        )));
+    }
+    let stored: AnalysisFile = serde_json::from_str(&json).map_err(parse_error)?;
+    check_graph(&stored.diagrams).map_err(invalid)?;
+    Ok(Some(Analysis {
+        diagrams: stored.diagrams,
+    }))
+}
+
+/// Takes the exclusive lock on `analysis.lock` beside the analysis file `file`
+/// (`files::lock`), waiting up to `files::LOCK_WAIT` for another writer. The lock is released
+/// when the returned file is dropped. A writer takes it before it reads the analysis it
+/// changes, and holds it across [`save`].
+///
+/// # Errors
+///
+/// [`Error::AnalysisLocked`] when another writer keeps the lock; [`Error::WriteAnalysis`] when
+/// the lock file cannot be created or locked.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the analysis run's merge, step 8.2")
+)]
+pub(crate) fn lock(file: &Path) -> Result<File> {
+    let path = file.with_extension("lock");
+    files::lock(&path).map_err(|error| match error {
+        TryLockError::WouldBlock => Error::AnalysisLocked {
+            path,
+            seconds: files::LOCK_WAIT.as_secs(),
+        },
+        TryLockError::Error(source) => Error::WriteAnalysis { path, source },
+    })
+}
+
+/// Replaces the analysis file `file` with `analysis`, as pretty JSON, atomically. The caller
+/// holds [`lock`]; this does not take it.
+///
+/// # Errors
+///
+/// [`Error::InvalidAnalysis`] when `analysis` breaks the module's invariants, which a later
+/// [`load`] would refuse; as [`load`] when the file there now cannot be read or is refused.
+/// Either way nothing is written. [`Error::WriteAnalysis`] when the file cannot be written.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the analysis run's merge, step 8.2")
+)]
+pub(crate) fn save(file: &Path, analysis: &Analysis) -> Result<()> {
+    check_graph(&analysis.diagrams).map_err(|problem| Error::InvalidAnalysis {
+        path: file.to_owned(),
+        problem,
+    })?;
+    // Read for its errors only: a file this build cannot read holds diagrams the engineer
+    // may want back, so it is never written over.
+    load(file)?;
+    let stored = StoredAnalysis {
+        version: VERSION,
+        diagrams: &analysis.diagrams,
+    };
+    save_json(file, &stored).map_err(|source| Error::WriteAnalysis {
+        path: file.to_owned(),
+        source,
+    })
+}
+
+/// Checks the citation `cited` against the working tree of `repo` (module docs, "Code
+/// references"). A folder, or a file cited with no `lines`, is a path target, found while the
+/// path is a folder or a file. A path that is not written as git writes paths, that names
+/// nothing, or a folder cited with lines, is unverified with no reason; a file that cannot be
+/// read is unverified with the reason, which names no path on disk.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the analysis run's merge, step 8.2")
+)]
+pub(crate) fn check_in(cited: Cited, repo: &Repo) -> CodeRef {
+    let path = cited.path.clone();
+    // `kind` fails only for a path that is not written as git writes it.
+    let Ok(Some(kind)) = repo.kind(&path) else {
+        return CodeRef::unverified(path, None);
+    };
+    match (kind, &cited.lines) {
+        (PathKind::Folder, None) => CodeRef::found(path, Target::Path(PathKind::Folder)),
+        (PathKind::File, None) => CodeRef::found(path, Target::Path(PathKind::File)),
+        (PathKind::Folder, Some(_)) => CodeRef::unverified(path, None),
+        (PathKind::File, Some(_)) => match repo.read(&path) {
+            Ok(text) => check(cited, &text),
+            Err(error) => CodeRef::unverified(path, Some(unreadable(&error))),
+        },
+    }
+}
+
+/// [`check_in`] for a citation of lines in a file whose text is `text`: found at the stated
+/// lines or the shifted ones, or unverified. With no `lines`, a whole-file target.
+fn check(cited: Cited, text: &str) -> CodeRef {
+    let Cited { path, lines, first } = cited;
+    let Some(lines) = lines else {
+        return CodeRef::found(path, Target::Path(PathKind::File));
+    };
+    // Split as `locate` splits, so the snippet is placed later by the same lines.
+    let file: Vec<&str> = text.lines().collect();
+    let Some(range) = first.and_then(|first| cited_range(&file, lines, &first)) else {
+        return CodeRef::unverified(path, None);
+    };
+    let snippet = file[range.start - 1..range.end].join("\n");
+    CodeRef::found(
+        path,
+        Target::Lines {
+            lines: range,
+            snippet,
+        },
+    )
+}
+
+/// Where the cited lines are in `file`: the stated range when its first line equals `first`,
+/// both trimmed, or else the range of the same length at the only line equal to `first`, when
+/// `first` is not blank and the range fits in the file. A stated range that is zero, reversed
+/// or past the end of the file is never found.
+fn cited_range(file: &[&str], cited: CitedLines, first: &str) -> Option<LineRange> {
+    let CitedLines { start, end } = cited;
+    if start == 0 || start > end || end > file.len() {
+        return None;
+    }
+    let count = end - start + 1;
+    let first = first.trim();
+    if file[start - 1].trim() == first {
+        return Some(LineRange { start, end });
+    }
+    if first.is_empty() {
+        return None;
+    }
+
+    let mut equal = file
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == first)
+        .map(|(index, _)| index);
+    let index = equal.next()?;
+    if equal.next().is_some() {
+        return None;
+    }
+    (index <= file.len() - count).then_some(LineRange {
+        start: index + 1,
+        end: index + count,
+    })
+}
+
+/// Why a file could not be read, for an unverified reference's dialog. It names no path: in
+/// an analysis run the file is in a worktree that is deleted as the run ends.
+fn unreadable(error: &Error) -> String {
+    match error {
+        Error::FileTooLarge { bytes, .. } => format!(
+            "{} MB, over the {} MB limit",
+            bytes.div_ceil(1_000_000),
+            MAX_READ / 1_000_000
+        ),
+        Error::Read { source, .. } if source.kind() == io::ErrorKind::InvalidData => {
+            "the file is not UTF-8 text".to_owned()
+        }
+        Error::Read { source, .. } => format!("cannot read the file: {source}"),
+        // `Repo::read` fails only as above, or for a path `Repo::kind` already refused.
+        other => other.to_string(),
+    }
+}
+
+/// Places every verified reference of `analysis` in the working tree as it is now, found or
+/// outdated as stored: lines by [`locate_lines`], a file or folder by whether its path is still
+/// of that kind. One that is placed is found; one that cannot be is outdated, its last lines
+/// and snippet kept. Unverified references are left as they are.
+///
+/// Reads each cited file and splits it into lines once, however many references it has. 200
+/// references over 60 files of 1,000 lines took 2.5 to 5.5 ms in a release build and 5 to 17
+/// ms in a debug one, on an Apple silicon laptop on 2026-11-26. To measure it again, time this
+/// call in the test `place_finds_outdated_anchors_again_keeps_unverified_ones_and_scales_to_200`.
+/// That is under the 10 ms above which results would be kept per path and stat, so nothing
+/// is cached.
+fn place(analysis: &mut Analysis, repo: &Repo) {
+    let mut read: HashMap<String, Option<String>> = HashMap::new();
+    for anchor in analysis.anchors_mut() {
+        let RefDetail::Verified {
+            target: Target::Lines { .. },
+            ..
+        } = anchor.detail
+        else {
+            continue;
+        };
+        if !read.contains_key(&anchor.path) {
+            read.insert(anchor.path.clone(), repo.read(&anchor.path).ok());
+        }
+    }
+    let split: HashMap<&str, Vec<&str>> = read
+        .iter()
+        .filter_map(|(path, text)| Some((path.as_str(), text.as_deref()?.lines().collect())))
+        .collect();
+
+    for anchor in analysis.anchors_mut() {
+        let RefDetail::Verified { target, placed } = &mut anchor.detail else {
+            continue;
+        };
+        let found = match target {
+            Target::Lines { lines, snippet } => {
+                let file = split.get(anchor.path.as_str());
+                match file.and_then(|file| locate_lines(file, snippet, *lines)) {
+                    Some(now) => {
+                        *lines = now;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Target::Path(kind) => repo.kind(&anchor.path).ok().flatten() == Some(*kind),
+        };
+        *placed = if found {
+            VerifiedState::Found
+        } else {
+            VerifiedState::Outdated
+        };
+    }
+}
+
+/// Checks the module's invariants on `diagrams`, and says which one the first broken one is.
+fn check_graph(diagrams: &[Diagram]) -> std::result::Result<(), String> {
+    let mut diagram_ids = HashSet::new();
+    for diagram in diagrams {
+        if !diagram_ids.insert(diagram.id) {
+            return Err(format!("diagram id {} is used twice", diagram.id));
+        }
+        // Each node's group, by its id.
+        let mut groups = HashMap::new();
+        for node in &diagram.nodes {
+            if node.id.diagram != diagram.id {
+                return Err(format!("node {} is in diagram {}", node.id, diagram.id));
+            }
+            if groups.insert(node.id, node.group).is_some() {
+                return Err(format!("node id {} is used twice", node.id));
+            }
+        }
+        for edge in &diagram.edges {
+            let name = format!("edge {} -> {}", edge.from, edge.to);
+            if let Some(end) = [edge.from, edge.to]
+                .into_iter()
+                .find(|end| !groups.contains_key(end))
+            {
+                return Err(format!("{name}: {end} is no node of {}", diagram.id));
+            }
+            if edge.from == edge.to {
+                return Err(format!("{name} joins a node to itself"));
+            }
+        }
+        for node in &diagram.nodes {
+            check_group(node.id, &groups, diagram.id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Follows the groups from `node` up: each must be a node of `diagram`, and the walk must end
+/// within as many steps as there are nodes, or it loops.
+fn check_group(
+    node: NodeId,
+    groups: &HashMap<NodeId, Option<NodeId>>,
+    diagram: DiagramId,
+) -> std::result::Result<(), String> {
+    let mut at = node;
+    for _ in 0..groups.len() {
+        let Some(group) = groups[&at] else {
+            return Ok(());
+        };
+        if !groups.contains_key(&group) {
+            return Err(format!(
+                "node {at}: its group {group} is no node of {diagram}"
+            ));
+        }
+        at = group;
+    }
+    Err(format!("node {node}: its groups loop"))
+}
+
+/// The diagrams of one working tree, as `GET /api/analysis` returns them. The file adds its
+/// version (`AnalysisFile`).
+#[derive(Serialize)]
+pub(crate) struct Analysis {
+    diagrams: Vec<Diagram>,
+}
+
+impl Analysis {
+    /// Every code reference, of the nodes and of the edges.
+    fn anchors_mut(&mut self) -> impl Iterator<Item = &mut CodeRef> {
+        self.diagrams.iter_mut().flat_map(|diagram| {
+            let nodes = diagram
+                .nodes
+                .iter_mut()
+                .flat_map(|node| node.anchors.iter_mut());
+            let edges = diagram
+                .edges
+                .iter_mut()
+                .filter_map(|edge| edge.anchor.as_mut());
+            nodes.chain(edges)
+        })
+    }
+}
+
+/// `analysis.json` as read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalysisFile {
+    #[expect(
+        dead_code,
+        reason = "declared so `deny_unknown_fields` accepts it; `version_of` reads it first"
+    )]
+    version: u32,
+    diagrams: Vec<Diagram>,
+}
+
+/// `analysis.json` as written.
+#[derive(Serialize)]
+struct StoredAnalysis<'a> {
+    version: u32,
+    diagrams: &'a [Diagram],
+}
+
+/// One diagram: its nodes and the edges between them. Each diagram owns its nodes, so it is
+/// replaced and deleted whole.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Diagram {
+    id: DiagramId,
+    kind: DiagramKind,
+    title: String,
+    /// The node this diagram deepens; `None` at the top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<NodeId>,
+    /// The analysis run that made it.
+    run: RunId,
+    /// In a flow, in step order.
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
+
+/// What a diagram shows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DiagramKind {
+    Architecture,
+    Data,
+    Flow,
+}
+
+/// A box in a diagram.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Node {
+    id: NodeId,
+    kind: NodeKind,
+    label: String,
+    /// One line, on the card.
+    summary: String,
+    /// The Markdown subset, in the node's dialog.
+    detail: String,
+    /// The boundary drawn around this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<NodeId>,
+    anchors: Vec<CodeRef>,
+}
+
+/// What a node stands for, which decides its shape.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum NodeKind {
+    /// Something that runs, or a module or symbol below one.
+    Component,
+    /// Something that holds data.
+    Store,
+    /// Something the repository talks to and does not contain.
+    External,
+    /// A group: a process, a machine, a network.
+    Boundary,
+}
+
+/// An arrow between two nodes of one diagram.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Edge {
+    from: NodeId,
+    to: NodeId,
+    label: String,
+    /// The call, import or field that justifies the edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<CodeRef>,
+}
+
+/// A place in the code, with whether Postil found it (module docs, "Code references").
+///
+/// Stored as one flat object, as a note is: `path`, then `target`, `lines` and `snippet` as a
+/// note has them, and `state`; or, when unverified, `path`, `state` and an optional `reason`.
+/// Read through [`StoredCodeRef`].
+#[derive(Deserialize)]
+#[serde(try_from = "StoredCodeRef")]
+pub(crate) struct CodeRef {
+    /// Relative to the repository root, as the agent cited it.
+    path: String,
+    detail: RefDetail,
+}
+
+impl CodeRef {
+    fn found(path: String, target: Target) -> Self {
+        Self {
+            path,
+            detail: RefDetail::Verified {
+                target,
+                placed: VerifiedState::Found,
+            },
+        }
+    }
+
+    fn unverified(path: String, reason: Option<String>) -> Self {
+        Self {
+            path,
+            detail: RefDetail::Unverified { reason },
+        }
+    }
+}
+
+/// What is known of a [`CodeRef`]'s code.
+enum RefDetail {
+    /// The citation matched the file once, so its target is known.
+    Verified {
+        target: Target,
+        /// Worked out again on every read.
+        placed: VerifiedState,
+    },
+    /// The citation never matched the file.
+    Unverified {
+        /// Why the file could not be checked, when it could not be read.
+        reason: Option<String>,
+    },
+}
+
+/// Whether a verified reference's target is still there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifiedState {
+    Found,
+    /// The snippet is no longer in the file where `locate` may place it, or the path is gone
+    /// or of another kind.
+    Outdated,
+}
+
+/// A [`CodeRef`]'s `state` as the file and the page write it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RefState {
+    /// The default, so a reference written by hand may leave `state` out.
+    #[default]
+    Found,
+    /// The code is gone from where it was.
+    Outdated,
+    /// The agent's citation never matched the file.
+    Unverified,
+}
+
+/// A [`CodeRef`] as stored, before its fields are checked against its state and target.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCodeRef {
+    path: String,
+    target: Option<TargetKind>,
+    lines: Option<LineRange>,
+    snippet: Option<String>,
+    #[serde(default)]
+    state: RefState,
+    reason: Option<String>,
+}
+
+/// A citation as an agent writes it: `lines` and `first`, the text of the first cited line,
+/// or neither for a whole file or folder. The bounds are not checked: zero or reversed lines
+/// make the citation unverified, not the reply unreadable.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "built from the analysis run's reply, step 8.2")
+)]
+pub(crate) struct Cited {
+    path: String,
+    lines: Option<CitedLines>,
+    first: Option<String>,
+}
+
+/// Lines `start` to `end` as an agent cited them, 1-based and inclusive, not yet checked.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "built from the analysis run's reply, step 8.2")
+)]
+pub(crate) struct CitedLines {
+    start: usize,
+    end: usize,
+}
+
+/// A diagram's id, written `D1`: stable, shown in the page and sent to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+struct DiagramId(u32);
+
+/// A node's id, written `D1.3`: its diagram's id, then its number in the diagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+struct NodeId {
+    diagram: DiagramId,
+    node: u32,
+}
+
+/// The id of the analysis run that made a diagram, written `R1`, as a run log names its run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+struct RunId(u64);
+
+/// The positive number `digits` writes in the one way `Display` writes it back: no sign, no
+/// leading zero, so every id has one spelling.
+fn positive(digits: &str) -> Option<u64> {
+    let number: u64 = digits.parse().ok()?;
+    (number > 0 && number.to_string() == digits).then_some(number)
+}
+
+impl DiagramId {
+    fn parse(text: &str) -> Option<Self> {
+        let number = positive(text.strip_prefix('D')?)?;
+        u32::try_from(number).ok().map(Self)
+    }
+}
+
+impl NodeId {
+    fn parse(text: &str) -> Option<Self> {
+        let (diagram, node) = text.split_once('.')?;
+        Some(Self {
+            diagram: DiagramId::parse(diagram)?,
+            node: u32::try_from(positive(node)?).ok()?,
+        })
+    }
+}
+
+impl fmt::Display for DiagramId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "D{}", self.0)
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.diagram, self.node)
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "R{}", self.0)
+    }
+}
+
+impl TryFrom<String> for DiagramId {
+    type Error = String;
+
+    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&text).ok_or_else(|| format!("diagram id {text:?}: expected D and a number"))
+    }
+}
+
+impl TryFrom<String> for NodeId {
+    type Error = String;
+
+    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&text)
+            .ok_or_else(|| format!("node id {text:?}: expected a diagram id, a dot and a number"))
+    }
+}
+
+impl TryFrom<String> for RunId {
+    type Error = String;
+
+    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
+        text.strip_prefix('R')
+            .and_then(positive)
+            .map(Self)
+            .ok_or_else(|| format!("run id {text:?}: expected R and a number"))
+    }
+}
+
+impl From<DiagramId> for String {
+    fn from(id: DiagramId) -> Self {
+        id.to_string()
+    }
+}
+
+impl From<NodeId> for String {
+    fn from(id: NodeId) -> Self {
+        id.to_string()
+    }
+}
+
+impl From<RunId> for String {
+    fn from(id: RunId) -> Self {
+        id.to_string()
+    }
+}
+
+impl TryFrom<StoredCodeRef> for CodeRef {
+    type Error = String;
+
+    fn try_from(stored: StoredCodeRef) -> std::result::Result<Self, Self::Error> {
+        let StoredCodeRef {
+            path,
+            target,
+            lines,
+            snippet,
+            state,
+            reason,
+        } = stored;
+        let placed = match state {
+            RefState::Found => VerifiedState::Found,
+            RefState::Outdated => VerifiedState::Outdated,
+            RefState::Unverified => {
+                if target.is_some() || lines.is_some() || snippet.is_some() {
+                    return Err(format!(
+                        "reference to {path}: an unverified reference has no `target`, \
+                         `lines` or `snippet`"
+                    ));
+                }
+                return Ok(Self::unverified(path, reason));
+            }
+        };
+        if reason.is_some() {
+            return Err(format!(
+                "reference to {path}: only an unverified reference has a `reason`"
+            ));
+        }
+        let Some(kind) = target else {
+            return Err(format!(
+                "reference to {path}: a found or outdated reference needs a `target`"
+            ));
+        };
+        let target = Target::read(kind, lines, snippet, "reference")
+            .map_err(|problem| format!("reference to {path}: {problem}"))?;
+        Ok(Self {
+            path,
+            detail: RefDetail::Verified { target, placed },
+        })
+    }
+}
+
+impl Serialize for CodeRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("CodeRef", 6)?;
+        out.serialize_field("path", &self.path)?;
+        match &self.detail {
+            RefDetail::Verified { target, placed } => {
+                match target {
+                    Target::Lines { lines, snippet } => {
+                        out.serialize_field("target", &TargetKind::Lines)?;
+                        out.serialize_field("lines", lines)?;
+                        out.serialize_field("snippet", snippet)?;
+                    }
+                    Target::Path(kind) => {
+                        let kind = match kind {
+                            PathKind::File => TargetKind::File,
+                            PathKind::Folder => TargetKind::Folder,
+                        };
+                        out.serialize_field("target", &kind)?;
+                        out.skip_field("lines")?;
+                        out.skip_field("snippet")?;
+                    }
+                }
+                let state = match placed {
+                    VerifiedState::Found => RefState::Found,
+                    VerifiedState::Outdated => RefState::Outdated,
+                };
+                out.serialize_field("state", &state)?;
+                out.skip_field("reason")?;
+            }
+            RefDetail::Unverified { reason } => {
+                out.skip_field("target")?;
+                out.skip_field("lines")?;
+                out.skip_field("snippet")?;
+                out.serialize_field("state", &RefState::Unverified)?;
+                match reason {
+                    Some(reason) => out.serialize_field("reason", reason)?,
+                    None => out.skip_field("reason")?,
+                }
+            }
+        }
+        out.end()
+    }
+}
+
+// Debug output shows ids, kinds, paths, states and lines, never the agent's prose or the
+// code it cites: a snippet can quote code that is not meant to leave the machine, and Debug
+// output ends up in logs.
+impl fmt::Debug for Analysis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Analysis")
+            .field("diagrams", &self.diagrams)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Diagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Diagram")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("parent", &self.parent)
+            .field("run", &self.run)
+            .field("nodes", &self.nodes)
+            .field("edges", &self.edges)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("group", &self.group)
+            .field("anchors", &self.anchors)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Edge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Edge")
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for CodeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("CodeRef");
+        out.field("path", &self.path);
+        match &self.detail {
+            RefDetail::Verified { target, placed } => {
+                out.field("target", target).field("state", placed).finish()
+            }
+            RefDetail::Unverified { .. } => out
+                .field("state", &RefState::Unverified)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl fmt::Debug for Cited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cited")
+            .field("path", &self.path)
+            .field("lines", &self.lines)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests;

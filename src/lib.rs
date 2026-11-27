@@ -7,6 +7,7 @@
 
 mod acp;
 mod agents;
+mod analysis;
 mod anchor;
 mod clone;
 mod definitions;

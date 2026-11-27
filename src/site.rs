@@ -17,6 +17,7 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
+use crate::analysis;
 use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
@@ -807,6 +808,7 @@ impl Site {
                 Method::PUT => json_or_error(self.save_layout(body)),
                 _ => not_allowed("GET the pane widths or PUT new ones"),
             },
+            path if path.starts_with("/api/analysis") => self.respond_analysis(path, method),
             "/api/runs" => match *method {
                 Method::GET => json_or_error(self.runner().and_then(|runner| {
                     let ids = runner.ids()?;
@@ -925,6 +927,14 @@ impl Site {
         Ok(to_json(&review))
     }
 
+    /// The reply to `GET /api/analysis`: the diagrams, each code reference placed where its
+    /// code is now, or `null` when there is no analysis. Reads the analysis file and never
+    /// writes it.
+    fn analysis(&self) -> Result<Vec<u8>> {
+        let analysis = analysis::current(&*self.repo()?)?;
+        Ok(to_json(&analysis))
+    }
+
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
     /// notes.
     fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
@@ -999,6 +1009,19 @@ impl Site {
             "/api/definitions/refresh" => match *method {
                 Method::POST => json_or_error(self.refresh_definitions()),
                 _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    /// The replies to `/api/analysis` and the routes under it. [`Site::respond`] sends every
+    /// path that starts with `/api/analysis` here, so a path that is none of these (such as
+    /// `/api/analysisx`) is not found here.
+    fn respond_analysis(&self, path: &str, method: &Method) -> Reply {
+        match path {
+            "/api/analysis" => match *method {
+                Method::GET => json_or_error(self.analysis()),
+                _ => not_allowed("GET"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
@@ -1685,6 +1708,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::NoteTextChanged { .. }
                 | Error::NoProject
                 | Error::ReviewLocked { .. }
+                | Error::AnalysisLocked { .. }
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
                 | Error::TurnRunning
@@ -1729,6 +1753,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::ParseReview { .. }
                 | Error::InvalidReview { .. }
                 | Error::WriteReview { .. }
+                | Error::ReadAnalysis { .. }
+                | Error::ParseAnalysis { .. }
+                | Error::InvalidAnalysis { .. }
+                | Error::WriteAnalysis { .. }
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }

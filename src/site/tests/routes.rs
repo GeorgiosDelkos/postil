@@ -49,6 +49,7 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         "GET the pane widths or PUT new ones",
     ),
     ("/api/file", &[Method::GET], "GET"),
+    ("/api/analysis", &[Method::GET], "GET"),
     (
         "/api/definitions",
         &[Method::GET],
@@ -125,7 +126,14 @@ fn every_route_takes_its_methods_and_refuses_the_others_with_what_it_takes() {
 fn a_path_that_is_no_route_is_not_found_whatever_the_method() {
     let repo = TempRepo::new("routes-none");
     let site = repo.empty_site();
-    for path in ["/api", "/api/nothing", "/api/run/nothing", "/api/runs/R1"] {
+    for path in [
+        "/api",
+        "/api/nothing",
+        "/api/run/nothing",
+        "/api/runs/R1",
+        "/api/analysisx",
+        "/api/analysis/nothing",
+    ] {
         for method in &METHODS {
             assert_eq!(
                 send(&site, method, path),
