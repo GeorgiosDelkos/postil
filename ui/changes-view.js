@@ -132,7 +132,7 @@ export function changesView({
       markCurrent();
     }
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const padding = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;
+    const padding = paddingTop();
     const top =
       target.getBoundingClientRect().top -
       viewEl.getBoundingClientRect().top +
@@ -634,7 +634,7 @@ export function changesView({
     if (next === current && by !== 0) return false;
     current = next;
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const padding = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;
+    const padding = paddingTop();
     viewEl.scrollTo({
       top: blocks[next].offsetTop - padding,
       behavior: reduce ? "auto" : "smooth",

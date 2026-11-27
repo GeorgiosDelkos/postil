@@ -158,3 +158,27 @@ test("a live run that ended after forget() is read final and reported", async (t
   assert.equal(store.byId("R1").status, "ended");
   assert.deepEqual(ended, [false, true]);
 });
+
+test("knownViews is read-only and does not trigger fetches for uncached run ids", async (t) => {
+  const ids = Array.from({ length: 50 }, (_, i) => `R${50 - i}`);
+  const fetched = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    fetched.push(url);
+    if (url === "api/runs") return new Response(JSON.stringify({ runs: ids, live: [] }));
+    return new Response(
+      JSON.stringify({ id: "R50", notes: [], prompt: "", status: "ended", total: 0, entries: [] }),
+    );
+  });
+  const store = runStore({
+    render() {},
+    onChange() {},
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+  await store.sync();
+  const countAfterSync = fetched.length;
+  const views = store.knownViews();
+  assert.equal(views.length, 1);
+  assert.equal(views[0].id, "R50");
+  assert.equal(fetched.length, countAfterSync, "knownViews must not trigger byId fetches");
+});

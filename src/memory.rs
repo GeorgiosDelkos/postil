@@ -331,24 +331,37 @@ impl Memory {
     /// launch that never asks runs no `doctor`. Looks at the disk once when the state names
     /// the program: a program removed since its check is [`State::Missing`] at once.
     pub(crate) fn status(&self) -> Status {
-        let mut inner = self.lock();
-        if inner.job == 0 {
-            // A thread that cannot start leaves the job number at 0, so the next call tries
-            // again; meanwhile the state is unknown, which the page shows as a check.
-            drop(self.start(&mut inner, Job::Check));
+        let (path_to_check, status) = {
+            let mut inner = self.lock();
+            if inner.job == 0 {
+                // A thread that cannot start leaves the job number at 0, so the next call tries
+                // again; meanwhile the state is unknown, which the page shows as a check.
+                drop(self.start(&mut inner, Job::Check));
+            }
+            let path = inner
+                .state
+                .as_ref()
+                .and_then(State::path)
+                .map(Path::to_owned);
+            let status = Status {
+                state: inner.state.clone(),
+                setup: inner.setup.clone(),
+            };
+            (path, status)
+        };
+        if let Some(path) = path_to_check
+            && !agents::is_executable(&path)
+        {
+            let mut inner = self.lock();
+            if inner.state.as_ref().and_then(State::path) == Some(path.as_path()) {
+                inner.state = Some(State::Missing);
+            }
+            return Status {
+                state: inner.state.clone(),
+                setup: inner.setup.clone(),
+            };
         }
-        let removed = inner
-            .state
-            .as_ref()
-            .and_then(State::path)
-            .is_some_and(|path| !agents::is_executable(path));
-        if removed {
-            inner.state = Some(State::Missing);
-        }
-        Status {
-            state: inner.state.clone(),
-            setup: inner.setup.clone(),
-        }
+        status
     }
 
     /// Starts a new check: finds the program and runs `doctor`. The state is unknown until it
@@ -1051,6 +1064,9 @@ impl Memory {
         let recall: Recall = self.found(done)?;
         let mut inner = self.lock();
         if inner.calls.epoch == next.epoch {
+            if inner.calls.recalls.len() >= 256 && !inner.calls.recalls.contains_key(query) {
+                inner.calls.recalls.clear();
+            }
             inner
                 .calls
                 .recalls

@@ -86,6 +86,24 @@ struct RawLineRange {
 /// by `\n`, with no `\r` and no newline at its end, as a note stores its snippet. It is not
 /// normalized: a trailing `\n` asks for an empty line after the snippet.
 pub(crate) fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineRange> {
+    // Fast path: check `last` directly via iterators without collecting every line into a `Vec`.
+    if last.start >= 1 && last.start <= last.end {
+        let wanted_len = last.end - last.start + 1;
+        let mut snippet_lines = snippet.split('\n');
+        let mut text_lines = text.lines().skip(last.start - 1);
+        let mut matched = 0;
+        let mut ok = true;
+        for want in snippet_lines.by_ref() {
+            if matched >= wanted_len || text_lines.next() != Some(want) {
+                ok = false;
+                break;
+            }
+            matched += 1;
+        }
+        if ok && matched == wanted_len && snippet_lines.next().is_none() {
+            return Some(last);
+        }
+    }
     // `str::lines` drops `\r\n` and `\n` alike, as the highlighter does, so the line numbers
     // here are the ones the page shows.
     locate_lines(&text.lines().collect::<Vec<_>>(), snippet, last)
@@ -93,16 +111,18 @@ pub(crate) fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineR
 
 /// [`locate`] in a text already split into `lines`.
 pub(crate) fn locate_lines(lines: &[&str], snippet: &str, last: LineRange) -> Option<LineRange> {
-    let wanted: Vec<&str> = snippet.split('\n').collect();
-
-    // Fast path: when the snippet is still at `last`, no file scan is needed.
+    // Fast path: when the snippet is still at `last`, no allocation or file scan is needed.
     if last.start >= 1
         && last.end <= lines.len()
-        && last.end - last.start + 1 == wanted.len()
-        && lines[last.start - 1..last.end] == wanted[..]
+        && lines[last.start - 1..last.end]
+            .iter()
+            .copied()
+            .eq(snippet.split('\n'))
     {
         return Some(last);
     }
+
+    let wanted: Vec<&str> = snippet.split('\n').collect();
 
     let mut found = lines
         .windows(wanted.len())
@@ -114,11 +134,12 @@ pub(crate) fn locate_lines(lines: &[&str], snippet: &str, last: LineRange) -> Op
         });
 
     let first = found.next()?;
-    let mut others = found.peekable();
-    if first == last || others.peek().is_none() {
-        return Some(first);
+    // If `last` had matched, the fast path above would already have returned it; so a second
+    // match here is always ambiguous.
+    if found.next().is_some() {
+        return None;
     }
-    others.find(|&range| range == last)
+    Some(first)
 }
 
 impl TryFrom<RawLineRange> for LineRange {

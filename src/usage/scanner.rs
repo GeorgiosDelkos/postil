@@ -99,7 +99,7 @@ impl SessionScanner {
         let Some(home) = &self.home else {
             return (Arc::new(Vec::new()), false);
         };
-        let mut prev_cache = None;
+        let mut should_scan = false;
         let (records, in_flight) = {
             let mut state = lock(&self.state);
             let stale = state
@@ -107,24 +107,22 @@ impl SessionScanner {
                 .is_none_or(|at| matches!(fetch, QuotaFetch::Refresh) || at.elapsed() >= CACHE_TTL);
             if !state.in_flight && stale {
                 state.in_flight = true;
-                prev_cache = Some(std::mem::take(&mut state.cache));
+                should_scan = true;
             }
             (Arc::clone(&state.records), state.in_flight)
         };
-        if let Some(cache) = prev_cache {
-            self.spawn_scan(home.clone(), cache);
+        if should_scan {
+            self.spawn_scan(home.clone());
         }
         (records, in_flight)
     }
 
-    fn spawn_scan(&self, home: PathBuf, cache: HashMap<PathBuf, FileStamp>) {
+    fn spawn_scan(&self, home: PathBuf) {
         let shared = Arc::clone(&self.state);
-        // `FileStamp::records` is an `Arc<[LedgerRecord]>`, so cloning the map is shallow.
-        let fallback_cache = cache.clone();
         let spawned = std::thread::Builder::new()
             .name("usage-session-scan".to_owned())
             .spawn(move || {
-                let mut cache = cache;
+                let mut cache = std::mem::take(&mut lock(&shared).cache);
                 let scanned = scan_home(&home, &mut cache);
                 let mut state = lock(&shared);
                 state.records = Arc::new(scanned);
@@ -139,7 +137,6 @@ impl SessionScanner {
             drop(handle);
         } else {
             let mut state = lock(&self.state);
-            state.cache = fallback_cache;
             state.updated = Some(Instant::now());
             state.in_flight = false;
         }
@@ -763,18 +760,15 @@ fn parse_grok_session(
                 .and_then(Value::as_str)
         })
         .filter(|s| !s.is_empty());
-    if let Some(dir) = info_cwd
-        && should_skip_cwd(&normalize_cwd(dir), postil_dir)
-    {
-        return Vec::new();
-    }
-    let git_root = summary_json
-        .as_ref()
-        .and_then(|s| s.get("git_root_dir").and_then(Value::as_str))
-        .filter(|s| !s.is_empty());
-    let cwd = info_cwd
-        .or(git_root)
-        .map_or_else(|| decoded_dir.to_owned(), normalize_cwd);
+    let cwd = if let Some(dir) = info_cwd {
+        normalize_cwd(dir)
+    } else {
+        let git_root = summary_json
+            .as_ref()
+            .and_then(|s| s.get("git_root_dir").and_then(Value::as_str))
+            .filter(|s| !s.is_empty());
+        git_root.map_or_else(|| decoded_dir.to_owned(), normalize_cwd)
+    };
     if should_skip_cwd(&cwd, postil_dir) {
         return Vec::new();
     }

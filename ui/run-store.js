@@ -7,7 +7,7 @@
 // during one is fetched right after it. Older runs are read once each, by id, and kept: a
 // finished run does not change.
 
-import { isLive } from "./run.js";
+import { appendEntries, isLive } from "./run.js";
 
 // The most runs live at once in one repository (src/run/log.rs, `MAX_LIVE`): a send beyond
 // them is refused, so the page offers none.
@@ -40,6 +40,20 @@ export function runStore({ render, onChange, onLoaded, onError }) {
   const others = new Map();
   const asked = new Set();
   const failed = new Map();
+  let notifyScheduled = false;
+  let notifyLoaded = false;
+  function scheduleNotify(loaded) {
+    if (loaded) notifyLoaded = true;
+    if (notifyScheduled) return;
+    notifyScheduled = true;
+    queueMicrotask(() => {
+      notifyScheduled = false;
+      const hadLoaded = notifyLoaded;
+      notifyLoaded = false;
+      render();
+      if (hadLoaded) onLoaded();
+    });
+  }
   function rememberOther(id, view) {
     others.delete(id);
     others.set(id, view);
@@ -63,7 +77,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (reply === null) return null;
     if (run && reply.id === run.id) {
       // A reply from a later entry leaves out the notes and the prompt, which never change.
-      const entries = reply.entries.length === 0 ? run.entries : run.entries.concat(reply.entries);
+      const entries = appendEntries(run.entries, reply.entries);
       return { ...reply, notes: run.notes, prompt: run.prompt, entries };
     }
     if (after === 0) return reply;
@@ -83,6 +97,19 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     }
     const reply = await response.json();
     ids = reply.runs;
+    const valid = new Set(ids);
+    for (const id of others.keys()) {
+      if (!valid.has(id)) {
+        others.delete(id);
+        asked.delete(id);
+      }
+    }
+    for (const id of failed.keys()) {
+      if (!valid.has(id)) {
+        failed.delete(id);
+        asked.delete(id);
+      }
+    }
     liveThreads = new Map((reply.live ?? []).map((live) => [live.id, live.thread]));
   }
 
@@ -93,8 +120,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (!response.ok) throw new Error(await response.text());
     const reply = await response.json();
     if (!known) return reply;
-    const entries =
-      reply.entries.length === 0 ? known.entries : known.entries.concat(reply.entries);
+    const entries = appendEntries(known.entries, reply.entries);
     return { ...reply, notes: known.notes, prompt: known.prompt, entries };
   }
 
@@ -196,13 +222,12 @@ export function runStore({ render, onChange, onLoaded, onError }) {
       .then(async (response) => {
         if (!response.ok) throw new Error(await response.text());
         rememberOther(id, await response.json());
-        render();
-        onLoaded();
+        scheduleNotify(true);
       })
       // The run's card says why, and its notes say "Sent in R2": the tray stays usable.
       .catch((error) => {
         failed.set(id, String(error.message ?? error));
-        render();
+        scheduleNotify(false);
       });
     return null;
   }
@@ -355,10 +380,14 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     return post("api/run/review", { of }).catch((error) => onError(error.message));
   }
 
-  // Every run read so far, to find a run's reviews among them.
+  // Every run read so far, to find a run's reviews among them. Read-only: must not trigger
+  // `byId` fetches (which would thrash `MAX_OTHERS` when a repository has > 40 runs).
   function knownViews() {
-    const known = [...ids, ...liveViews.keys(), run?.id].filter(Boolean);
-    return [...new Set(known)].map(byId).filter(Boolean);
+    const byIdMap = new Map();
+    if (run) byIdMap.set(run.id, run);
+    for (const [id, view] of liveViews) byIdMap.set(id, view);
+    for (const [id, view] of others) if (!byIdMap.has(id)) byIdMap.set(id, view);
+    return [...byIdMap.values()];
   }
 
   return {

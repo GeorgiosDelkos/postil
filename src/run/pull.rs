@@ -284,8 +284,8 @@ impl Runner {
     /// title naming it, and a body saying where it came from only.
     fn pull_request_text(&self, id: &str) -> (String, String) {
         let ids = self
-            .run_by_id(id)
-            .map_or_else(|_| Vec::new(), |run| run.state().header.notes.clone());
+            .header_by_id(id)
+            .map_or_else(|_| Vec::new(), |header| header.notes);
         let title = ids
             .iter()
             .find_map(|note| notes::body(&self.repo, note).ok())

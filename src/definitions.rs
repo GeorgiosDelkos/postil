@@ -27,11 +27,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use serde::Serialize;
-use tree_sitter_tags::{TagsConfiguration, TagsContext};
+use tree_sitter_tags::TagsContext;
 
 use crate::highlight::{self, MAX_HIGHLIGHTED, TagsGrammar};
 use crate::repo::Repo;
@@ -50,6 +52,8 @@ pub(crate) struct Definitions {
 /// What the handles and the thread share.
 struct Shared {
     state: Mutex<State>,
+    /// Lock-free mirror of `State::closed` checked between files without taking `state`.
+    closed: AtomicBool,
     /// Signalled when a refresh is asked for, the handles are closed, or a pass ends.
     changed: Condvar,
 }
@@ -127,6 +131,7 @@ impl Definitions {
     /// Stops the thread, between two files when a pass runs. Does not wait for it. Lookups
     /// answer from the last index after this.
     pub(crate) fn close(&self) {
+        self.shared.closed.store(true, Ordering::Release);
         self.shared.lock().closed = true;
         self.shared.changed.notify_all();
     }
@@ -188,6 +193,7 @@ impl Shared {
                 #[cfg(test)]
                 hold: false,
             }),
+            closed: AtomicBool::new(false),
             changed: Condvar::new(),
         }
     }
@@ -199,7 +205,7 @@ impl Shared {
     }
 
     fn closed(&self) -> bool {
-        self.lock().closed
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Called by a pass before each file: whether to stop, the handles being closed. In the
@@ -299,14 +305,16 @@ impl Index {
             HashMap::with_capacity(files.len().saturating_mul(4));
         for (path, file) in files {
             for symbol in &file.symbols {
-                by_name
-                    .entry(Arc::clone(&symbol.name))
-                    .or_default()
-                    .push(StoredDefinition {
-                        path: Arc::clone(path),
-                        line: symbol.line,
-                        kind: symbol.kind,
-                    });
+                let def = StoredDefinition {
+                    path: Arc::clone(path),
+                    line: symbol.line,
+                    kind: symbol.kind,
+                };
+                if let Some(list) = by_name.get_mut(&symbol.name) {
+                    list.push(def);
+                } else {
+                    by_name.insert(Arc::clone(&symbol.name), vec![def]);
+                }
             }
         }
         Self { by_name }
@@ -437,10 +445,10 @@ struct Indexer<'a> {
     repo: &'a Repo,
     /// Every file indexed by the last pass, by path.
     files: HashMap<Arc<str>, IndexedFile>,
+    /// Monotonic pass counter used to prune deleted files in place without reallocating `files`.
+    pass_id: u64,
     /// Kept between files so the parser is allocated once.
     context: TagsContext,
-    /// Each grammar's configuration, compiled the first time a file of it is parsed.
-    configurations: HashMap<TagsGrammar, TagsConfiguration>,
     /// Scratch buffer reused when reading files, avoiding a fresh `Vec<u8>` per file.
     read_buf: Vec<u8>,
 }
@@ -449,6 +457,7 @@ struct Indexer<'a> {
 struct IndexedFile {
     stamp: Stamp,
     symbols: Vec<FileSymbol>,
+    seen_pass: u64,
 }
 
 /// What tells a changed file apart without reading it, as the design says: its size and
@@ -471,8 +480,8 @@ impl<'a> Indexer<'a> {
         Self {
             repo,
             files: HashMap::new(),
+            pass_id: 0,
             context: TagsContext::new(),
-            configurations: HashMap::new(),
             read_buf: Vec::new(),
         }
     }
@@ -487,9 +496,10 @@ impl<'a> Indexer<'a> {
         let Ok(paths) = self.repo.files() else {
             return Pass::Unchanged;
         };
-        let capacity = self.files.len().max(paths.len());
-        let mut previous = std::mem::replace(&mut self.files, HashMap::with_capacity(capacity));
+        self.pass_id += 1;
+        let pass_id = self.pass_id;
         let mut changed = false;
+        let mut full = PathBuf::from(self.repo.root());
         for path in paths {
             if closed() {
                 return Pass::Closed;
@@ -497,9 +507,12 @@ impl<'a> Indexer<'a> {
             let Some(grammar) = highlight::tags_grammar(&path) else {
                 continue;
             };
+            // Reuse a single `PathBuf` across files to avoid a heap allocation per path.
+            full.clear();
+            full.push(self.repo.root());
+            full.push(&path);
             // A symlink is followed, wherever it points, as `Repo::read` does: the index then
             // holds what opening the file shows.
-            let full = self.repo.root().join(&path);
             let Some(metadata) = fs::metadata(&full).ok().filter(fs::Metadata::is_file) else {
                 continue;
             };
@@ -507,22 +520,42 @@ impl<'a> Indexer<'a> {
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
             };
-            let (path, file) = match previous.remove_entry(path.as_str()) {
-                Some((path, file)) if file.stamp == stamp => (path, file),
-                indexed => {
-                    // A file that cannot be read now is left out, so the next pass tries again;
-                    // the definitions it had go with it.
-                    let Some(symbols) = self.symbols(&full, stamp, grammar) else {
-                        changed |= indexed.is_some();
-                        continue;
-                    };
-                    changed = true;
-                    (Arc::from(path), IndexedFile { stamp, symbols })
-                }
+            if let Some(existing) = self.files.get_mut(path.as_str())
+                && existing.stamp == stamp
+            {
+                existing.seen_pass = pass_id;
+                continue;
+            }
+            // A file that cannot be read now is left out, so the next pass tries again;
+            // the definitions it had go with it.
+            let Some(symbols) = self.symbols(&full, stamp, grammar) else {
+                changed |= self.files.remove(path.as_str()).is_some();
+                continue;
             };
-            self.files.insert(path, file);
+            changed = true;
+            if let Some(existing) = self.files.get_mut(path.as_str()) {
+                existing.stamp = stamp;
+                existing.symbols = symbols;
+                existing.seen_pass = pass_id;
+            } else {
+                self.files.insert(
+                    Arc::from(path),
+                    IndexedFile {
+                        stamp,
+                        symbols,
+                        seen_pass: pass_id,
+                    },
+                );
+            }
         }
-        if changed || !previous.is_empty() {
+        let before_prune = self.files.len();
+        self.files.retain(|_, file| file.seen_pass == pass_id);
+        let removed = self.files.len() < before_prune;
+        // Release peak buffer capacity after scanning large files so idle threads stay light.
+        if self.read_buf.capacity() > 64 * 1024 {
+            self.read_buf.shrink_to(64 * 1024);
+        }
+        if changed || removed {
             Pass::Changed
         } else {
             Pass::Unchanged
@@ -553,10 +586,7 @@ impl<'a> Indexer<'a> {
             return Some(Vec::new());
         }
 
-        let configuration: &TagsConfiguration = self
-            .configurations
-            .entry(grammar)
-            .or_insert_with(|| grammar.configuration());
+        let configuration = grammar.configuration();
         let Ok((tags, _)) = self
             .context
             .generate_tags(configuration, source.as_bytes(), None)

@@ -47,6 +47,22 @@ export function sentIn(note) {
 // be changed by its callers.
 const folds = new WeakMap();
 
+// Maps an extended entries array back to the prefix array it was built from via `appendEntries`,
+// so `startsWith` can verify incremental extensions in O(1) instead of scanning all elements.
+const entryParents = new WeakMap();
+
+export function appendEntries(base, added) {
+  if (added.length === 0) return base;
+  const next = base.concat(added);
+  // Truncate the parent chain at depth 8 (matching `startsWith`'s hop bound) so older
+  // intermediate arrays are not pinned in memory for the lifetime of the run.
+  let node = base;
+  for (let hops = 0; node && hops < 7; hops += 1) node = entryParents.get(node);
+  if (node) entryParents.delete(node);
+  entryParents.set(next, base);
+  return next;
+}
+
 // Recent fold states kept for incremental extension: up to 3 live runs can stream side by
 // side, so a single slot would evict one run on every chunk of another and fall back to O(N^2)
 // full re-folds.
@@ -77,6 +93,13 @@ export function foldRun(entries) {
 function startsWith(entries, prefix) {
   const len = prefix.length;
   if (len === 0 || len > entries.length) return false;
+  // O(1) fast path when `entries` was extended from `prefix` via `appendEntries`.
+  let ancestor = entryParents.get(entries);
+  for (let hops = 0; ancestor && hops < 8; hops += 1) {
+    if (ancestor === prefix) return true;
+    if (ancestor.length < len) break;
+    ancestor = entryParents.get(ancestor);
+  }
   // Fast reject on endpoints before scanning the full prefix.
   if (entries[0] !== prefix[0] || entries[len - 1] !== prefix[len - 1]) return false;
   for (let i = 1; i < len - 1; i += 1) {

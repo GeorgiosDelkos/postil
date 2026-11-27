@@ -135,7 +135,12 @@ export function notesByLine(file, notes) {
   const placed = new Map();
   for (const note of notes) {
     if (!onLines(note) || note.path !== file.path || !shown.has(note.lines.end)) continue;
-    placed.set(note.lines.end, [...(placed.get(note.lines.end) ?? []), note]);
+    let list = placed.get(note.lines.end);
+    if (!list) {
+      list = [];
+      placed.set(note.lines.end, list);
+    }
+    list.push(note);
   }
   return placed;
 }
@@ -205,16 +210,23 @@ export function findingsByLine(file, findings) {
       unplaced.push(finding);
       continue;
     }
-    placed.set(finding.line, [...(placed.get(finding.line) ?? []), finding]);
+    let list = placed.get(finding.line);
+    if (!list) {
+      list = [];
+      placed.set(finding.line, list);
+    }
+    list.push(finding);
   }
   return { placed, unplaced };
 }
 
 // The new-side line numbers `file`'s hunks show.
 function shownLines(file) {
-  return new Set(
-    file.hunks
-      .flatMap((hunk) => hunk.lines.map((line) => line.new))
-      .filter((line) => line !== null),
-  );
+  const lines = new Set();
+  for (const hunk of file.hunks) {
+    for (const line of hunk.lines) {
+      if (line.new !== null) lines.add(line.new);
+    }
+  }
+  return lines;
 }

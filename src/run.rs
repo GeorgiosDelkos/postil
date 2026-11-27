@@ -73,7 +73,7 @@ mod room;
 #[cfg(test)]
 pub(crate) use room::{FLOOR, TestDisk};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -639,17 +639,26 @@ impl Runner {
         ids: &[String],
         memory: TeamMemory,
     ) -> Result<()> {
+        // Fast pre-check before disk/git I/O, then drop `slots` so other threads do not stall.
+        {
+            let slots = self.slots();
+            if let Some((note, run)) = slots.carrying(ids) {
+                return Err(Error::BadRequest(format!(
+                    "{note} is in {run}, which is under way: wait for it, or stop it"
+                )));
+            }
+        }
+        let prompt = notes::prompt(&self.repo, ids, self.prompt_memory(memory))?;
+        let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
+        let title = notes::body(&self.repo, &ids[0])?;
         let slots = self.slots();
         // A note is marked sent only once its agent takes the turn, so until then it reads as
-        // open: a second send would put it in two threads at once.
+        // open: re-check under the lock so a concurrent send cannot put it in two threads at once.
         if let Some((note, run)) = slots.carrying(ids) {
             return Err(Error::BadRequest(format!(
                 "{note} is in {run}, which is under way: wait for it, or stop it"
             )));
         }
-        let prompt = notes::prompt(&self.repo, ids, self.prompt_memory(memory))?;
-        let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
-        let title = notes::body(&self.repo, &ids[0])?;
         let new = NewRun {
             agent,
             memory,
@@ -1096,7 +1105,7 @@ impl Runner {
     /// [`Error::BadRequest`] when `first` is not a run id; as [`thread::find`];
     /// [`Error::ReadRun`] when the runs directory cannot be listed.
     pub(crate) fn thread_tip(&self, first: &str) -> Result<Option<String>> {
-        run_number(first).ok_or_else(|| {
+        let first_number = run_number(first).ok_or_else(|| {
             Error::BadRequest(format!("run id {first:?}: expected R and a number"))
         })?;
         let Some(record) = thread::find(&self.repo, first)? else {
@@ -1105,9 +1114,25 @@ impl Runner {
         if matches!(record.state, State::Applied | State::Discarded) {
             return Ok(None);
         }
+        let dir = self.repo.runs_dir();
+        let mut numbers = run_numbers(&dir).map_err(|source| Error::ReadRun {
+            path: dir.clone(),
+            source,
+        })?;
+        numbers.retain(|&n| n > first_number);
+        numbers.sort_unstable();
         let mut tip = first.to_owned();
-        while let Some(next) = self.followed_by(&tip)? {
-            tip = next;
+        // Follow-ups always have higher run numbers than the run they follow, so one ascending
+        // pass over newer headers finds the tip in O(M) instead of O(K * M).
+        for newer in numbers {
+            if let Ok(header) = read_header(&dir.join(format!("R{newer}.jsonl")))
+                && header
+                    .follow_up
+                    .as_ref()
+                    .is_some_and(|follow_up| follow_up.of == tip)
+            {
+                tip = header.id;
+            }
         }
         Ok(Some(tip))
     }
@@ -1316,6 +1341,34 @@ impl Runner {
             memory,
         };
         self.start_stage(self.slots(), chain, Some(snapshots))
+    }
+
+    /// Reads only the header of run `of` (line 1 of its log), avoiding full `.jsonl` entry
+    /// parsing when callers only need metadata such as `agent`, `notes`, or `follow_up`.
+    fn header_by_id(&self, of: &str) -> Result<log::Header> {
+        let number = run_number(of)
+            .ok_or_else(|| Error::BadRequest(format!("run id {of:?}: expected R and a number")))?;
+        {
+            let slots = self.slots();
+            if let Some(run) = slots
+                .by_thread
+                .values()
+                .filter_map(|slot| slot.run.as_ref())
+                .chain(slots.latest.as_ref())
+                .find(|run| run.state().header.id == of)
+            {
+                return Ok(run.state().header.clone());
+            }
+        }
+        let no_such = |problem: String| Error::NoSuchRun {
+            id: of.to_owned(),
+            problem,
+        };
+        let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
+        if !file.exists() {
+            return Err(no_such("there is no such run log".to_owned()));
+        }
+        read_header(&file).map_err(no_such)
     }
 
     /// The run `of`, this window's when it is one of its threads' latest, else read from its
@@ -1850,11 +1903,16 @@ impl Runner {
     /// As [`Runner::view_of`].
     pub(crate) fn recall_query(&self, id: &str) -> Result<String> {
         let thread = self.thread(id)?;
-        let diffs: Vec<Diff> = thread
-            .iter()
-            .flat_map(|run| run.state().work().diffs)
-            .collect();
-        let mut text = edited_files(&diffs).join("\n");
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        for run in &thread {
+            for path in run.state().edited_paths() {
+                if seen.insert(path.clone()) {
+                    paths.push(path);
+                }
+            }
+        }
+        let mut text = paths.join("\n");
         for run in &thread {
             let state = run.state();
             let prompt = state.header.prompt.as_str();
@@ -1960,28 +2018,42 @@ impl Runner {
     ///
     /// As [`Runner::thread`] for a follow-up and a memory draft, and as [`thread::find`].
     fn thread_of(&self, run: &Run) -> Result<Option<Thread>> {
-        let (id, review, follows, drafted) = {
+        let (id, review, follow_of, drafted) = {
             let state = run.state();
             let review = state.header.review.as_ref().map(|stage| stage.of.clone());
+            let follow_of = state
+                .header
+                .follow_up
+                .as_ref()
+                .map(|follow| follow.of.clone());
             let drafted = state
                 .header
                 .remember
                 .as_ref()
                 .map(|remember| remember.of.clone());
-            (
-                state.header.id.clone(),
-                review,
-                state.header.follow_up.is_some(),
-                drafted,
-            )
+            (state.header.id.clone(), review, follow_of, drafted)
         };
-        let first = match (review, drafted) {
-            (Some(of), _) => of,
-            (None, Some(of)) => self.thread(&of)?[0].state().header.id.clone(),
-            (None, None) if follows => self.thread(&id)?[0].state().header.id.clone(),
-            (None, None) => id,
+        let first = match (review, drafted, follow_of) {
+            (Some(of), _, _) => of,
+            (None, Some(of), _) | (None, None, Some(of)) => self.root_run_id(&of)?,
+            (None, None, None) => id,
         };
         thread::find(&self.repo, &first)
+    }
+
+    /// Walks `header.follow_up.of` backwards using header-only reads to find the thread's first
+    /// run id without parsing full `.jsonl` logs.
+    fn root_run_id(&self, start: &str) -> Result<String> {
+        let mut current = start.to_owned();
+        let mut seen = HashSet::new();
+        while seen.insert(current.clone()) {
+            let header = self.header_by_id(&current)?;
+            match header.follow_up {
+                Some(follow_up) => current = follow_up.of,
+                None => return Ok(header.id),
+            }
+        }
+        Ok(current)
     }
 
     /// Ends the open thread `id` as `ending` says (docs/design.md, "Ending a thread"), and
@@ -2193,7 +2265,7 @@ impl Runner {
     ///
     /// As [`Runner::view_of`].
     pub(crate) fn agent_of(&self, id: &str) -> Result<String> {
-        Ok(self.run_by_id(id)?.state().header.agent.clone())
+        Ok(self.header_by_id(id)?.agent)
     }
 
     /// The ids of the runs on disk, newest first: `["R3", "R2", "R1"]`.

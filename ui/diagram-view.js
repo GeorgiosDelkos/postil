@@ -844,12 +844,27 @@ export function diagramView({
     return startRun("api/analysis", { kind: "deeper", of });
   }
 
+  let stripSig = null;
+
   // The strip under the tools: the run under way, with Open run and Stop; the checkout on
   // another history, with Update; why the forced update could not start; or why the last run
   // stored nothing, with Open run and Retry.
   function renderStrip() {
     const live = liveRun();
     const ended = !live && view.runId ? runs.byId(view.runId) : null;
+    const problem = ended ? runProblem(ended) : null;
+    const diverged = !live && divergedShown();
+    const nextSig = live
+      ? `live:${live.id}:${live.agent}:${view.forced?.run === live.id ? view.forced.commit : ""}`
+      : diverged
+        ? "diverged"
+        : view.check?.state === "blocked"
+          ? `blocked:${view.check.reason}`
+          : problem
+            ? `ended:${ended.id}:${problem}:${Boolean(view.retry)}`
+            : "empty";
+    if (stripSig === nextSig) return;
+    stripSig = nextSig;
     const parts = [];
     if (live) {
       const status =
@@ -860,7 +875,7 @@ export function diagramView({
       parts.push(el("span", "map-run-status", status));
       parts.push(stripButton("Open run", () => runs.openRun(live.id)));
       parts.push(stripButton("Stop", () => runs.stopRun(live.id)));
-    } else if (divergedShown()) {
+    } else if (diverged) {
       parts.push(el("span", "map-run-status", "The checkout moved to another history."));
       const update = stripButton("Update", () => startRun("api/analysis/update", {}));
       update.classList.add("map-update");
@@ -868,8 +883,8 @@ export function diagramView({
       parts.push(update);
     } else if (view.check?.state === "blocked") {
       parts.push(el("span", "map-run-status map-run-problem", view.check.reason));
-    } else if (ended && runProblem(ended)) {
-      parts.push(el("span", "map-run-status map-run-problem", runProblem(ended)));
+    } else if (problem) {
+      parts.push(el("span", "map-run-status map-run-problem", problem));
       parts.push(stripButton("Open run", () => runs.openRun(ended.id)));
       if (view.retry) {
         const { route, request } = view.retry;
@@ -1361,6 +1376,15 @@ export function diagramView({
   // nothing.
   let gesturing = false;
 
+  let cachedBounds = null;
+  function bodyBounds() {
+    if (!cachedBounds) cachedBounds = body.getBoundingClientRect();
+    return cachedBounds;
+  }
+  window.addEventListener("resize", () => {
+    cachedBounds = null;
+  });
+
   body.addEventListener(
     "wheel",
     (event) => {
@@ -1372,7 +1396,7 @@ export function diagramView({
         // The gesture events below zoom a pinch already: a second zoom here would double it.
         if (gesturing) return;
         // A trackpad pinch arrives as a wheel with the control key (WebKit).
-        const bounds = body.getBoundingClientRect();
+        const bounds = bodyBounds();
         const at = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
         setTransform(zoomAt(now, Math.exp(-event.deltaY * PINCH_RATE), at));
       } else setTransform({ ...now, x: now.x - event.deltaX, y: now.y - event.deltaY });
@@ -1387,6 +1411,7 @@ export function diagramView({
     event.preventDefault();
     pinched = 1;
     gesturing = true;
+    cachedBounds = body.getBoundingClientRect();
   });
   body.addEventListener("gestureend", () => {
     gesturing = false;
@@ -1395,7 +1420,7 @@ export function diagramView({
     if (!drawn) return;
     event.preventDefault();
     stopGlide();
-    const bounds = body.getBoundingClientRect();
+    const bounds = bodyBounds();
     const at = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
     setTransform(zoomAt(transform(), event.scale / pinched, at));
     pinched = event.scale;
@@ -1430,6 +1455,7 @@ export function diagramView({
   new ResizeObserver((entries) => {
     const rect = entries[0]?.contentRect;
     if (rect) cachedViewport = { width: rect.width, height: rect.height };
+    cachedBounds = null;
     if (!drawn || viewport().width === 0) return;
     if (!view.transforms.has(drawn.diagram.id)) {
       view.transforms.set(drawn.diagram.id, fitTransform(drawn.positioned, viewport()));
@@ -1494,12 +1520,23 @@ export function diagramView({
     if (switched) onChange();
   }
 
+  let codeSynced = null;
+
   // Follows the code pane's line `line` (1-based) of the file at `path`, or nothing with null:
   // rings the drawn diagram's node for it, and pans to that node when it is wholly off screen.
   // It never opens another diagram, and never pans while the pane is dragged.
   function followCode(path, line) {
-    view.code = path && line ? { path, line } : null;
+    const nextCode = path && line ? { path, line } : null;
+    if (
+      view.code?.path === nextCode?.path &&
+      view.code?.line === nextCode?.line &&
+      codeSynced === drawn
+    ) {
+      return;
+    }
+    view.code = nextCode;
     if (!view.shown || !drawn) return;
+    codeSynced = drawn;
     const next = view.code && nodeAtLine(checkoutDiagram(drawn.diagram), path, line);
     if (next === view.codeNode) return;
     view.codeNode = next;
