@@ -22,12 +22,13 @@ const COMPOSER_HEIGHT_GUESS = 138;
 const DEFINITIONS_POLL_MS = 250;
 
 // `state` is the page's state: the view keeps `file`, `wanted`, `selection` and `composer`,
-// and reads `noteByLine`, `markByLine` and `mapMarkers`. `menu` is the context menu
-// (context-menu.js) and `files` the file list (file-list.js), which `reveal`s the open file.
+// and reads `noteByLine`, `noteMarkByLine`, `markByLine` and `mapMarkers`. `menu` is the context
+// menu (context-menu.js) and `files` the file list (file-list.js), which `reveal`s the open file.
 // The callbacks:
-// - `indexNotes()` derives `noteByLine` and `noteCountByPath` again after the file or the
-//   notes changed, and `indexMarks()` derives `markByLine` after the file changed;
+// - `indexNotes()` derives `noteByLine`, `noteMarkByLine` and `noteCountByPath` again after the
+//   file or the notes changed, and `indexMarks()` derives `markByLine` after the file changed;
 // - `openMapNode(diagramId, nodeId)` opens the map at a node, a click on its stripe or chip;
+// - `openNote(id)` opens a note's detail dialog, a click on its stripe or chip;
 // - `traceFromHere(path)` opens the map's Flows box, to trace a flow from the file at `path`;
 // - `onActiveLine()` follows a change of the line the map follows (`activeLine`);
 // - `deleteNote(note)` deletes a note, from the right-click menu;
@@ -315,7 +316,8 @@ export function codeView({
 
     const noteMark = state.noteMarkByLine.get(index) ?? null;
     row.classList.toggle("noted", Boolean(noteMark));
-    const nextNote = noteMark && state.composer?.end === index && state.noteMarkByLine.get(index + 1);
+    const nextNote =
+      noteMark && state.composer?.end === index && state.noteMarkByLine.get(index + 1);
     const noteContinues = Boolean(nextNote) && nextNote.noteId === noteMark.noteId;
     const noteKey = noteMark && `${noteMark.key}:${noteContinues}`;
     if ((row.dataset.noteKey ?? null) !== noteKey) {
@@ -614,7 +616,7 @@ export function codeView({
     return lines.map((tokens) => tokens.map(([, text]) => text).join("")).join("\n");
   }
 
-  // The code the text selection covers, without the line numbers, map chips and note remarks
+  // The code the text selection covers, without the line numbers, map chips and note chips
   // that sit in the same rows: WebKit's own selection text includes them even though they cannot be
   // selected (seen 2026-11-22: a two-line selection copied the gutter's "3"). Null when the
   // selection is not in the code, or covers other lines than the selected ones (a leftover
