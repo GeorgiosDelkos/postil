@@ -250,8 +250,13 @@ pub(crate) fn join_seam(committed: &str, next: &str) -> String {
         return committed.to_owned();
     }
 
-    let left: Vec<&str> = committed.split_whitespace().collect();
-    let right: Vec<&str> = next.split_whitespace().collect();
+    let mut left: Vec<&str> = committed
+        .split_whitespace()
+        .rev()
+        .take(MAX_SEAM_WORDS)
+        .collect();
+    left.reverse();
+    let right: Vec<&str> = next.split_whitespace().take(MAX_SEAM_WORDS).collect();
     let max_overlap = left.len().min(right.len()).min(MAX_SEAM_WORDS);
 
     let mut overlap = 0;
@@ -267,14 +272,21 @@ pub(crate) fn join_seam(committed: &str, next: &str) -> String {
         }
     }
 
-    let tail = &right[overlap..];
-    if tail.is_empty() {
+    // Advance past the `overlap` leading whitespace-delimited words in `next`.
+    let mut rest = next;
+    for _ in 0..overlap {
+        rest = rest.trim_start();
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[word_end..];
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() {
         committed.to_owned()
     } else {
-        let mut out = String::with_capacity(committed.len() + 1 + next.len());
+        let mut out = String::with_capacity(committed.len() + 1 + rest.len());
         out.push_str(committed);
         out.push(' ');
-        out.push_str(&tail.join(" "));
+        out.push_str(rest);
         out
     }
 }

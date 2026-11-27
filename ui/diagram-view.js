@@ -1012,11 +1012,22 @@ export function diagramView({
 
   // ---- The diagram -------------------------------------------------------------------------
 
+  let cachedViewport = { width: 0, height: 0 };
   function viewport() {
+    if (cachedViewport.width > 0 && cachedViewport.height > 0) return cachedViewport;
     return { width: body.clientWidth, height: body.clientHeight };
   }
 
   function drawDiagram(diagram) {
+    // Skip tearing down and rebuilding the entire SVG when the same diagram and change state
+    // are already drawn (e.g. when `render()` runs for a status-strip update or map open).
+    if (drawn && drawn.diagram === diagram && drawn.change === view.change) {
+      const placed = checkoutDiagram(diagram);
+      view.codeNode = view.code && nodeAtLine(placed, view.code.path, view.code.line);
+      syncRings();
+      centrePending();
+      return;
+    }
     // A glide under way is towards a node of the diagram drawn before: it would pan this one.
     stopGlide();
     let positioned;
@@ -1060,7 +1071,16 @@ export function diagramView({
     // keyboard.
     const focused = body.contains(document.activeElement);
     body.replaceChildren(svg, zoom.bar);
-    drawn = { diagram, positioned, svg, pane, cards, zoomReadout: zoom.readout };
+    drawn = {
+      diagram,
+      change: view.change,
+      positioned,
+      svg,
+      pane,
+      cards,
+      zoomReadout: zoom.readout,
+      lastZoomPct: null,
+    };
     if (focused) (cards.get(view.selected) ?? body).focus({ preventScroll: true });
     if (!view.transforms.has(diagram.id) && viewport().width > 0) {
       view.transforms.set(diagram.id, fitTransform(positioned, viewport()));
@@ -1284,16 +1304,32 @@ export function diagramView({
     return view.transforms.get(drawn.diagram.id) ?? { x: 0, y: 0, scale: 1 };
   }
 
-  function setTransform(next) {
+  let transformRaf = null;
+  function scheduleApplyTransform() {
+    if (transformRaf !== null) return;
+    transformRaf = requestAnimationFrame(() => {
+      transformRaf = null;
+      applyTransform();
+    });
+  }
+
+  function setTransform(next, { immediate = false } = {}) {
     view.transforms.set(drawn.diagram.id, clampTransform(drawn.positioned, viewport(), next));
-    applyTransform();
+    if (immediate) applyTransform();
+    else scheduleApplyTransform();
   }
 
   function applyTransform() {
     if (!drawn) return;
     const { x, y, scale } = transform();
     drawn.pane.setAttribute("transform", `translate(${x} ${y}) scale(${scale})`);
-    if (drawn.zoomReadout) drawn.zoomReadout.textContent = `${Math.round(scale * 100)}%`;
+    if (drawn.zoomReadout) {
+      const pct = Math.round(scale * 100);
+      if (pct !== drawn.lastZoomPct) {
+        drawn.lastZoomPct = pct;
+        drawn.zoomReadout.textContent = `${pct}%`;
+      }
+    }
   }
 
   function stopGlide() {
@@ -1312,7 +1348,10 @@ export function diagramView({
       const t = Math.min(1, (now - started) / GLIDE_MS);
       const eased = 1 - (1 - t) ** 3;
       const at = (a, b) => a + (b - a) * eased;
-      setTransform({ x: at(from.x, target.x), y: at(from.y, target.y), scale: target.scale });
+      setTransform(
+        { x: at(from.x, target.x), y: at(from.y, target.y), scale: target.scale },
+        { immediate: true },
+      );
       glide = t < 1 ? requestAnimationFrame(frame) : null;
     };
     glide = requestAnimationFrame(frame);
@@ -1388,12 +1427,14 @@ export function diagramView({
   // A pane resized (a divider, the window) keeps the pan, brought back if it lost every node;
   // a diagram drawn while the pane had no size is fitted once it has one, or centred on the
   // node `revealNode` asked for.
-  new ResizeObserver(() => {
+  new ResizeObserver((entries) => {
+    const rect = entries[0]?.contentRect;
+    if (rect) cachedViewport = { width: rect.width, height: rect.height };
     if (!drawn || viewport().width === 0) return;
     if (!view.transforms.has(drawn.diagram.id)) {
       view.transforms.set(drawn.diagram.id, fitTransform(drawn.positioned, viewport()));
     }
-    setTransform(transform());
+    setTransform(transform(), { immediate: true });
     centrePending();
   }).observe(body);
 

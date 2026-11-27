@@ -933,6 +933,9 @@ impl Memory {
                     server.call_tool("recall", &arguments, deadline)
                 });
                 self.store(next, done, |calls, answer| {
+                    if calls.recalls.len() >= 256 && !calls.recalls.contains_key(&query.text) {
+                        calls.recalls.clear();
+                    }
                     calls.recalls.insert(query.text.clone(), answer);
                 });
             }
@@ -944,6 +947,9 @@ impl Memory {
                     Ok(Detail::new(note, history))
                 });
                 self.store(next, done, |calls, answer| {
+                    if calls.details.len() >= 256 && !calls.details.contains_key(id) {
+                        calls.details.clear();
+                    }
                     calls.details.insert(id.clone(), answer);
                 });
             }
@@ -1121,6 +1127,9 @@ impl Memory {
             if answer.is_ok() {
                 calls.recalls.clear();
                 calls.details.clear();
+            }
+            if calls.remembered.len() >= 64 && !calls.remembered.contains_key(job) {
+                calls.remembered.clear();
             }
             calls.remembered.insert(job.clone(), answer);
         }

@@ -713,14 +713,72 @@ pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<(
 
 /// Deletes everything in the trash folder `trash` ([`empty`]) on a background thread: freed
 /// worktrees can hold hundreds of thousands of files. A delete cut short by a quit is
-/// finished by the next call.
+/// finished by the next call. At most one thread empties a given `trash` directory at a time;
+/// calls arriving while a sweep is running set a rerun flag so newly trashed folders are not
+/// stranded.
 pub(crate) fn empty_trash(trash: &Path) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    struct ActiveGuard {
+        active: &'static Mutex<HashMap<PathBuf, bool>>,
+        dir: PathBuf,
+        armed: bool,
+    }
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let mut guard = self
+                    .active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.remove(&self.dir);
+            }
+        }
+    }
+
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let active = ACTIVE.get_or_init(|| Mutex::new(HashMap::new()));
     let trash = trash.to_owned();
+    {
+        let mut guard = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rerun) = guard.get_mut(&trash) {
+            *rerun = true;
+            return;
+        }
+        guard.insert(trash.clone(), false);
+    }
+    let dir = trash.clone();
     let spawned = std::thread::Builder::new()
         .name("empty-trash".to_owned())
-        .spawn(move || empty(&trash));
-    // No thread: the folder stays until the next call, which is no harm.
-    drop(spawned);
+        .spawn(move || {
+            let mut active_guard = ActiveGuard {
+                active,
+                dir: dir.clone(),
+                armed: true,
+            };
+            loop {
+                empty(&dir);
+                let mut guard = active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.get(&dir).copied().unwrap_or(false) {
+                    guard.insert(dir.clone(), false);
+                } else {
+                    guard.remove(&dir);
+                    active_guard.armed = false;
+                    break;
+                }
+            }
+        });
+    if spawned.is_err() {
+        let mut guard = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&trash);
+    }
 }
 
 /// Deletes everything in the folder `trash`, keeping the folder. Errors are ignored: what is

@@ -352,15 +352,23 @@ export function fitTransform(positioned, viewport) {
 export function clampTransform(positioned, viewport, transform) {
   const scale = clamp(transform.scale, ZOOM_MIN, ZOOM_MAX);
   let best = null;
-  for (const box of [...positioned.nodes, ...positioned.groups]) {
-    const cx = transform.x + (box.x + box.width / 2) * scale;
-    const cy = transform.y + (box.y + box.height / 2) * scale;
-    const dx = clamp(cx, 0, viewport.width) - cx;
-    const dy = clamp(cy, 0, viewport.height) - cy;
-    if (dx === 0 && dy === 0) return { ...transform, scale };
-    if (!best || Math.hypot(dx, dy) < Math.hypot(best.dx, best.dy)) best = { dx, dy };
-  }
-  if (!best) return { ...transform, scale };
+  let bestDistSq = Infinity;
+  const check = (list) => {
+    for (const box of list) {
+      const cx = transform.x + (box.x + box.width / 2) * scale;
+      const cy = transform.y + (box.y + box.height / 2) * scale;
+      const dx = clamp(cx, 0, viewport.width) - cx;
+      const dy = clamp(cy, 0, viewport.height) - cy;
+      if (dx === 0 && dy === 0) return true;
+      const distSq = dx * dx + dy * dy;
+      if (distSq < bestDistSq) {
+        bestDistSq = distSq;
+        best = { dx, dy };
+      }
+    }
+    return false;
+  };
+  if (check(positioned.nodes) || check(positioned.groups) || !best) return { ...transform, scale };
   return { x: transform.x + best.dx, y: transform.y + best.dy, scale };
 }
 
@@ -512,11 +520,27 @@ export function fileMarks(analysis, path, lineCount, { openDiagramId = null } = 
   const marks = new Map();
   if (!analysis || !path || lineCount === 0) return marks;
 
+  // Precompute diagram depths once (O(D)) instead of rebuilding the diagram map per diagram.
+  const diagramById = new Map(analysis.diagrams.map((d) => [d.id, d]));
+  const depthOf = (diagram) => {
+    let depth = 0;
+    const seen = new Set();
+    for (
+      let at = diagram;
+      at && !seen.has(at.id);
+      at = at.parent ? diagramById.get(diagramOf(at.parent)) : null
+    ) {
+      seen.add(at.id);
+      depth += 1;
+    }
+    return depth - 1;
+  };
+
   // The references on each line, each with its node, its diagram and the diagram's depth.
   const byLine = new Map();
   const steps = new Map();
   for (const diagram of analysis.diagrams) {
-    const depth = breadcrumb(analysis, diagram).length - 1;
+    const depth = depthOf(diagram);
     const open = diagram.id === openDiagramId && diagram.kind === "flow";
     const parents = boundaries(diagram);
     let step = 0;
@@ -560,8 +584,8 @@ export function fileMarks(analysis, path, lineCount, { openDiagramId = null } = 
       step: steps.get(line - 1) ?? null,
       chip,
     };
-    const others = chip?.others.map((other) => other.nodeId) ?? null;
-    mark.key = JSON.stringify([mark.nodeId, mark.label, mark.outdated, mark.step, others]);
+    const others = chip?.others.map((other) => other.nodeId).join(",") ?? "";
+    mark.key = `${mark.nodeId}\0${mark.label}\0${mark.outdated ? 1 : 0}\0${mark.step ?? ""}\0${others}`;
     marks.set(line - 1, mark);
   }
   return marks;

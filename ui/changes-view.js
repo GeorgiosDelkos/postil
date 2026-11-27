@@ -327,7 +327,8 @@ export function changesView({
     }
     if (findings.length) part.append(findingCards(findings));
     const risks = new Map(group.entries.map(({ hunk }) => [hunk, step.risk]));
-    const more = () => redraw(part, stepView(group, total, { marks, findings }, Infinity));
+    const more = () =>
+      redraw(part, stepView(group, total, { marks, findings }, limit + LINES_SHOWN));
     part.append(...entriesView(group.entries, { marks, risks, limit, more }));
     return part;
   }
@@ -341,7 +342,7 @@ export function changesView({
     part.append(el("div", "changes-why", "No step of the report names these changes."));
     if (findings.length) part.append(findingCards(findings));
     const risks = new Map(entries.map(({ hunk }) => [hunk, "eyes"]));
-    const more = () => redraw(part, restView(entries, marks, findings, Infinity));
+    const more = () => redraw(part, restView(entries, marks, findings, limit + LINES_SHOWN));
     part.append(...entriesView(entries, { marks, risks, limit, more }));
     return part;
   }
@@ -406,7 +407,9 @@ export function changesView({
     part.append(rows);
     if (used < total) {
       part.append(
-        moreButton(total - used, () => redraw(part, fileView(file, marks, risks, Infinity))),
+        moreButton(total - used, () =>
+          redraw(part, fileView(file, marks, risks, limit + LINES_SHOWN)),
+        ),
       );
     }
     return part;
@@ -429,7 +432,11 @@ export function changesView({
   }
 
   function moreButton(count, more) {
-    const button = el("button", "button changes-more", `Show the other ${count} lines`);
+    const label =
+      count > LINES_SHOWN
+        ? `Show ${LINES_SHOWN} more of ${count} lines`
+        : `Show the other ${count} lines`;
+    const button = el("button", "button changes-more", label);
     button.type = "button";
     button.addEventListener("click", more);
     return button;
@@ -555,16 +562,24 @@ export function changesView({
     });
   }
 
+  let viewPaddingTop = null;
+  function paddingTop() {
+    if (viewPaddingTop === null)
+      viewPaddingTop = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;
+    return viewPaddingTop;
+  }
+
   // Moves to the next (`by` 1) or previous (-1) step. Nothing at either end.
   function move(by) {
     const all = steps();
     const next = current + by;
     if (next < 0 || next >= all.length) return;
+    // Read layout before mutating `aria-current` so the browser does not force a reflow.
+    const top = all[next].offsetTop - paddingTop();
     current = next;
     markCurrent();
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const padding = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;
-    viewEl.scrollTo({ top: all[next].offsetTop - padding, behavior: reduce ? "auto" : "smooth" });
+    viewEl.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
   }
 
   function close() {

@@ -238,10 +238,13 @@ export function codeView({
     return Math.max(0, Math.min(lineCount(), index));
   }
 
+  let viewportHeight = 0;
+
   function renderCode({ force = false } = {}) {
     const count = lineCount();
+    const viewHeight = viewportHeight || codeEl.clientHeight;
     const visibleFirst = lineAt(codeEl.scrollTop);
-    const visibleLast = Math.min(count, lineAt(codeEl.scrollTop + codeEl.clientHeight) + 1);
+    const visibleLast = Math.min(count, lineAt(codeEl.scrollTop + viewHeight) + 1);
 
     // Scrolling inside the rendered window needs no new elements.
     const { first, last } = rendered;
@@ -254,6 +257,45 @@ export function codeView({
     const newFirst = Math.max(0, visibleFirst - OVERSCAN);
     const newLast = Math.min(count, visibleLast + OVERSCAN);
     rendered = { first: newFirst, last: newLast };
+
+    // When scrolling overlaps the existing rendered window (and no composer is mounted),
+    // incrementally remove exiting edge rows and prepend/append entering edge rows instead
+    // of tearing down and rebuilding all ~120 rows.
+    const canDiff =
+      !force &&
+      !state.composer &&
+      last > first &&
+      newFirst < last &&
+      newLast > first &&
+      rowsEl.childElementCount === last - first;
+    if (canDiff) {
+      if (newFirst > first) {
+        let drop = newFirst - first;
+        while (drop > 0 && rowsEl.firstElementChild) {
+          rowsEl.firstElementChild.remove();
+          drop -= 1;
+        }
+      }
+      if (newLast < last) {
+        let drop = last - newLast;
+        while (drop > 0 && rowsEl.lastElementChild) {
+          rowsEl.lastElementChild.remove();
+          drop -= 1;
+        }
+      }
+      if (newFirst < first) {
+        const before = document.createDocumentFragment();
+        for (let index = newFirst; index < first; index += 1) before.append(lineRow(index));
+        rowsEl.prepend(before);
+      }
+      if (newLast > last) {
+        const after = document.createDocumentFragment();
+        for (let index = last; index < newLast; index += 1) after.append(lineRow(index));
+        rowsEl.append(after);
+      }
+      setRowsPadding();
+      return;
+    }
 
     const fragment = document.createDocumentFragment();
     for (let index = newFirst; index < newLast; index += 1) {
@@ -431,11 +473,9 @@ export function codeView({
     const top = lineAt(codeEl.scrollTop);
     lineHeight = height;
     if (!state.file) return;
-    // Rows are placed by line height, so they are placed again, and the padding that stands
-    // in for the other lines grows or shrinks with them. Only then can the scroll offset go
-    // where the top line now is: before, the browser would cut it to the old height of the
-    // file.
-    renderCode({ force: true });
+    // Update the spacer padding for the new line height first so setting `scrollTop` is not
+    // clamped to the old document height, then render the visible rows once.
+    setRowsPadding();
     codeEl.scrollTop = lineTop(top);
     renderCode({ force: true });
   }
@@ -478,13 +518,24 @@ export function codeView({
     redecorateRows();
   });
 
-  rowsEl.addEventListener("mousemove", (event) => {
-    if (!dragging) return;
-    const line = lineOfEvent(event);
-    if (line === null || line === state.selection.head) return;
-    state.selection.head = line;
-    redecorateRows();
-  });
+  rowsEl.addEventListener(
+    "mousemove",
+    (event) => {
+      if (!dragging) return;
+      const line = lineOfEvent(event);
+      if (line === null || line === state.selection.head) return;
+      const prevHead = state.selection.head;
+      state.selection.head = line;
+      const lo = Math.min(prevHead, line);
+      const hi = Math.max(prevHead, line);
+      for (const row of rowsEl.children) {
+        if (!row.classList.contains("ln")) continue;
+        const idx = Number(row.dataset.line);
+        if (idx >= lo && idx <= hi) row.classList.toggle("selected", isSelected(idx));
+      }
+    },
+    { passive: true },
+  );
 
   // A drag across the code text selects the lines it touches, as a drag in the gutter does, so
   // the next `c` or right-click acts on them. The text stays highlighted for copying. A plain
@@ -1047,12 +1098,20 @@ export function codeView({
     const textarea = node.querySelector("textarea");
     const dictation = attachDictation(textarea);
     node.querySelector(".buttons").prepend(dictation.button);
+    let measureQueued = false;
     textarea.addEventListener("input", () => {
       composer.text = textarea.value;
-      // Grow with the text, then tell the virtual list the new height.
+      // Grow with the text, then tell the virtual list the new height on the next frame so we
+      // do not force two synchronous layouts per keypress.
       textarea.style.height = "auto";
       textarea.style.height = `${textarea.scrollHeight}px`;
-      measureComposer(node);
+      if (!measureQueued) {
+        measureQueued = true;
+        requestAnimationFrame(() => {
+          measureQueued = false;
+          measureComposer(node);
+        });
+      }
     });
     textarea.addEventListener("keydown", (event) => {
       // Cmd-Shift-Enter is Send, which the window's handler answers.
@@ -1073,10 +1132,14 @@ export function codeView({
     return node;
   }
 
+  let composerMargins = null;
   function measureComposer(node) {
     if (!node.isConnected) return;
-    const style = getComputedStyle(node);
-    const height = node.offsetHeight + parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+    if (composerMargins === null) {
+      const style = getComputedStyle(node);
+      composerMargins = parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+    }
+    const height = node.offsetHeight + composerMargins;
     if (height !== composerHeight) {
       composerHeight = height;
       setRowsPadding();
@@ -1103,7 +1166,11 @@ export function codeView({
     { passive: true },
   );
 
-  new ResizeObserver(() => renderCode()).observe(codeEl);
+  new ResizeObserver((entries) => {
+    const height = entries[0]?.contentRect.height ?? 0;
+    if (height > 0) viewportHeight = height;
+    renderCode();
+  }).observe(codeEl);
 
   return {
     fetchFile,

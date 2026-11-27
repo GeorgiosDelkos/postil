@@ -64,6 +64,9 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
     return JSON.parse(text);
   }
 
+  const MAX_POLLS = 45;
+  let polls = 0;
+
   function show(view) {
     const merged = mergeUsageView(ui.view, view);
     const unchanged =
@@ -76,13 +79,35 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
     onTone?.(highestQuotaTone(merged.agents));
     onView?.(merged);
     clearTimeout(ui.pollTimer);
-    if (dialogEl.open && (merged.scanning || merged.polling)) {
+    ui.pollTimer = null;
+    if (
+      dialogEl.open &&
+      (merged.scanning || merged.polling) &&
+      polls < MAX_POLLS &&
+      !document.hidden
+    ) {
+      polls += 1;
       ui.pollTimer = setTimeout(() => {
+        ui.pollTimer = null;
         fetchView().catch(fail);
       }, POLL_MS);
+    } else if (!merged.scanning && !merged.polling) {
+      polls = 0;
     }
     if (!unchanged) render();
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (
+      !document.hidden &&
+      dialogEl.open &&
+      ui.pollTimer === null &&
+      polls < MAX_POLLS &&
+      (ui.view?.scanning || ui.view?.polling)
+    ) {
+      fetchView().catch(fail);
+    }
+  });
 
   function fail(error) {
     ui.error = String(error.message ?? error);

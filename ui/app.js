@@ -1008,12 +1008,28 @@ async function refresh() {
   // The engineer moved on while the replies were in flight: their action wins.
   if (state.composer || state.wanted !== path || generation !== refreshes) return;
 
+  const prevFiles = state.repo?.files ?? null;
+  const prevCounts = state.noteCountByPath;
+  const filesChanged = repo ? !sameStrings(prevFiles, repo.files) : false;
   if (repo) showRepo(repo);
   applyNotes(notes);
+  const countsChanged = !sameCounts(prevCounts, state.noteCountByPath);
   if (file) code.showFile(path, file, { keepView: true });
   else indexNotes();
   tray.render();
-  files.render();
+  if (filesChanged || countsChanged) files.render();
+}
+
+function sameStrings(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function sameCounts(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) if (b.get(k) !== v) return false;
+  return true;
 }
 
 window.addEventListener("focus", () => {
@@ -1046,8 +1062,9 @@ window.addEventListener(
 // ---- Start --------------------------------------------------------------------------------
 
 function showRepo(repo) {
+  const prevFiles = state.repo?.files ?? null;
   state.repo = repo;
-  state.tree = buildTree(repo.files);
+  if (!sameStrings(prevFiles, repo.files)) state.tree = buildTree(repo.files);
   $("repo-name").textContent = repo.name;
   $("repo-name").title = `${repo.root}\nSwitch project (⇧⌘O)`;
   $("repo-branch").textContent = repo.branch || "detached HEAD";
@@ -1383,13 +1400,12 @@ $("repo-name").addEventListener("click", () => liveQuotas.closePopover());
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.
   loadIcons();
-  // Before the first file is drawn, so it is drawn once at the right size. The defaults in
-  // app.css stand when the settings cannot be read; the dialog says why when opened.
-  const [settingsView] = await Promise.all([
+  // Fetch settings, layout, and repo info in parallel to eliminate the startup waterfall.
+  const [settingsView, , response] = await Promise.all([
     settings.load().catch(() => null),
     layout.load().catch(() => {}),
+    fetch("api/repo"),
   ]);
-  const response = await fetch("api/repo");
   if (!response.ok) {
     $("code-empty").textContent = await response.text();
     return;
@@ -1403,11 +1419,24 @@ async function start() {
   }
   state.projectOpen = true;
   showRepo(repo);
-  await files.loadFolders().catch(() => {});
+  // Load open folders, notes, analysis, and latest run in parallel, then render `#files` once.
+  const [, notes, analysis] = await Promise.all([
+    files.loadFolders().catch(() => {}),
+    fetchNotes().catch((error) => {
+      notesEl.replaceChildren(el("div", "empty", String(error)));
+      return null;
+    }),
+    map.fetchAnalysis().catch((error) => {
+      showToast(String(error));
+      return null;
+    }),
+  ]);
+  if (notes) applyNotes(notes);
   files.render();
-  // The analysis too, for the stripes and chips in the code: a repository without one reads
-  // `null`, and the layout library waits for the map to open.
-  await Promise.all([loadNotes(), map.load().catch((error) => showToast(String(error)))]);
+  tray.render();
+  if (analysis) {
+    await map.applyAnalysis(analysis).catch((error) => showToast(String(error)));
+  }
   // The latest run, this session's or one from before a restart.
   await runs.sync();
 

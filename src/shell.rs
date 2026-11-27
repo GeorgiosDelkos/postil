@@ -428,21 +428,53 @@ impl fmt::Debug for Job {
 /// must never wait for this one while its run loop is stopped: the site is closed by a job
 /// while the event loop still runs, and the event loop exits once `closed` tells it.
 fn spawn_site_worker(site: Site, closed: impl Fn() + Send + 'static) -> Result<Sender<Job>> {
+    const WORKER_COUNT: usize = 4;
+    let site = Arc::new(site);
+    let (work_tx, work_rx) = mpsc::channel::<(Request<Vec<u8>>, Answer)>();
+    let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+    let mut workers = Vec::with_capacity(WORKER_COUNT);
+    for index in 0..WORKER_COUNT {
+        let site = Arc::clone(&site);
+        let work_rx = Arc::clone(&work_rx);
+        let handle = thread::Builder::new()
+            .name(format!("page-worker-{index}"))
+            .spawn(move || {
+                loop {
+                    let next = work_rx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv();
+                    let Ok((request, answer)) = next else {
+                        break;
+                    };
+                    answer(site.respond(&request));
+                }
+            })
+            .map_err(Error::SpawnWorker)?;
+        workers.push(handle);
+    }
+
     let (sender, jobs) = mpsc::channel::<Job>();
     thread::Builder::new()
         .name("page-requests".to_owned())
         .spawn(move || {
             let mut site = Some(site);
+            let mut work_tx = Some(work_tx);
+            let mut workers = workers;
             for job in jobs {
                 match job {
                     Job::Answer(request, answer) => {
                         // After a close the request is dropped unanswered: answering goes
                         // through the main run loop, which may have stopped by then.
-                        if let Some(site) = &site {
-                            answer(site.respond(&request));
+                        if let Some(tx) = &work_tx {
+                            drop(tx.send((request, answer)));
                         }
                     }
                     Job::Close => {
+                        drop(work_tx.take());
+                        for worker in workers.drain(..) {
+                            drop(worker.join());
+                        }
                         drop(site.take());
                         closed();
                     }
@@ -945,8 +977,10 @@ mod tests {
             "{end}"
         );
         // The request after the close is dropped unanswered: answering it could wait on a
-        // main run loop that has stopped.
-        let answered: Vec<_> = answers.iter().collect();
+        // main run loop that has stopped. The two requests before the close run on the worker
+        // pool and may finish in either order.
+        let mut answered: Vec<_> = answers.iter().collect();
+        answered.sort_by_key(|(tag, _)| *tag);
         assert_eq!(
             answered,
             [("first", StatusCode::OK), ("second", StatusCode::OK)]

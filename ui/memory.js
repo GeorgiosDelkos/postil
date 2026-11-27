@@ -114,10 +114,48 @@ export function replyProblem(reply) {
 // Asks `url` with `method`, and `body` when given, and again every MEMORY_POLL_MS while the
 // answer is pending, calling `onReply(reply)` with each answer, pending ones included. A failed
 // request is a failed answer. Returns a function that stops asking; no `onReply` comes after it.
+// Progressive backoff for pending memory replies, capped so long waits do not hammer IPC.
+const MEMORY_POLL_MAX_MS = 2000;
+const MEMORY_POLL_TIMEOUT_MS = 60_000;
+
 export function pollMemory(url, { method = "GET", body, onReply }) {
   let stopped = false;
+  let inFlight = false;
   let timer = null;
+  let delay = MEMORY_POLL_MS;
+  const startedAt = Date.now();
+  const hasVisibility =
+    typeof document !== "undefined" && typeof document.addEventListener === "function";
+  const detachVisibility = () => {
+    if (hasVisibility) document.removeEventListener("visibilitychange", onVisible);
+  };
+  const timedOut = () => Date.now() - startedAt >= MEMORY_POLL_TIMEOUT_MS;
+  const schedule = () => {
+    if (stopped) return;
+    if (timedOut()) {
+      detachVisibility();
+      return;
+    }
+    if (hasVisibility && document.hidden) return;
+    timer = setTimeout(ask, delay);
+    delay = Math.min(delay * 2, MEMORY_POLL_MAX_MS);
+  };
+  const onVisible = () => {
+    if (stopped || timedOut()) {
+      detachVisibility();
+      return;
+    }
+    if (hasVisibility && !document.hidden && !inFlight && timer === null) {
+      delay = MEMORY_POLL_MS;
+      void ask();
+    }
+  };
+  if (hasVisibility) {
+    document.addEventListener("visibilitychange", onVisible);
+  }
   async function ask() {
+    timer = null;
+    inFlight = true;
     let reply;
     try {
       const response = await fetch(url, body === undefined ? { method } : { method, body });
@@ -127,13 +165,17 @@ export function pollMemory(url, { method = "GET", body, onReply }) {
     } catch (error) {
       reply = { state: "failed", error: String(error) };
     }
+    inFlight = false;
     if (stopped) return;
     onReply(reply);
-    if (reply.state === "pending") timer = setTimeout(ask, MEMORY_POLL_MS);
+    if (reply.state === "pending") schedule();
+    else detachVisibility();
   }
   void ask();
   return () => {
     stopped = true;
     clearTimeout(timer);
+    timer = null;
+    detachVisibility();
   };
 }

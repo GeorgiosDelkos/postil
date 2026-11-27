@@ -5,11 +5,11 @@
 //! `Site` (`spawn_site_worker`); this module never touches the window.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::SystemTime;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -314,7 +314,7 @@ pub(crate) fn start_site(
     let site = Site::new(config.as_deref(), home.as_deref(), bench, agents, notify)
         .with_session_scanner(sessions);
     if let Some(repo) = startup_repo(dir, &settings, site.recent_file.as_deref())? {
-        site.open(repo, LiveRun::Stop)?;
+        site.open_with_settings(repo, LiveRun::Stop, Some(&settings))?;
     }
     // A benchmark of a file that cannot be read would time an empty pane and report it as a
     // result. Fail here instead, before the window opens.
@@ -349,12 +349,12 @@ fn startup_repo(
 
 /// Everything the page can ask for.
 ///
-/// One thread owns it and answers the requests one at a time (`spawn_site_worker`), so the
-/// open project needs no lock. It is a `RefCell` because requests take `&self`; no borrow of
-/// it is held across a call back into `Site`, so none panics.
+/// Shared across the request worker pool (`spawn_site_worker`), so the open project sits behind
+/// an `RwLock`: read-only routes take a brief read lock to clone `Arc` handles, while project
+/// open/close takes the write lock.
 pub(crate) struct Site {
     /// The open project, if any.
-    project: RefCell<Option<Project>>,
+    project: RwLock<Option<Project>>,
     highlighter: Highlighter,
     /// The file the benchmark opens, when this is a benchmark run.
     bench: Option<String>,
@@ -370,6 +370,9 @@ pub(crate) struct Site {
     layout_file: Option<PathBuf>,
     /// Where completed runs' usage records are appended (`usage/ledger.rs`).
     usage_file: Option<PathBuf>,
+    /// Cached parsed records of `usage_file`, keyed by `(modified, len)` so repeated usage
+    /// polls do not re-read and re-parse `usage.jsonl`.
+    ledger_cache: Mutex<Option<LedgerCache>>,
     /// Postil's home folder, `~/.postil`, under which threads' worktrees live (`thread.rs`);
     /// `None` when the home folder is unknown, which refuses every send.
     home: Option<PathBuf>,
@@ -385,6 +388,13 @@ pub(crate) struct Site {
     memory: Memory,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
+}
+
+/// Cached parsed `usage.jsonl` records, invalidated when `(modified, len)` changes.
+struct LedgerCache {
+    modified: Option<SystemTime>,
+    len: u64,
+    records: Arc<[ledger::LedgerRecord]>,
 }
 
 /// The open project.
@@ -784,13 +794,14 @@ impl Site {
         #[cfg(test)]
         let memory = Memory::new(Scanner::new(OsString::new));
         Self {
-            project: RefCell::new(None),
+            project: RwLock::new(None),
             highlighter: Highlighter::new(),
             bench: bench.map(str::to_owned),
             recent_file: config.map(|dir| dir.join("recent.json")),
             settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
             layout_file: config.map(|dir| dir.join("layout.json")),
             usage_file: config.map(|dir| dir.join("usage.jsonl")),
+            ledger_cache: Mutex::new(None),
             home: home.map(Path::to_owned),
             models: ModelProber::live(agents.clone()),
             memory,
@@ -811,7 +822,11 @@ impl Site {
     #[cfg(test)]
     pub(crate) fn with_memory(mut self, memory: Memory) -> Self {
         self.memory = memory;
-        let open = self.project.borrow_mut().take();
+        let open = self
+            .project
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(open) = open {
             let repo = Repo::open(open.repo.root()).expect("the open project opens again");
             open.definitions.close();
@@ -831,7 +846,8 @@ impl Site {
     /// The open project's repository.
     fn repo(&self) -> Result<Arc<Repo>> {
         self.project
-            .borrow()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|project| Arc::clone(&project.repo))
             .ok_or(Error::NoProject)
@@ -854,7 +870,16 @@ impl Site {
     /// [`Error::RunInOpenProject`] when `live` is [`LiveRun::Refuse`], `repo` is another
     /// project, and the open project has a run or a review under way.
     fn open(&self, repo: Repo, live: LiveRun) -> Result<()> {
-        let mut project = self.project.borrow_mut();
+        self.open_with_settings(repo, live, None)
+    }
+
+    fn open_with_settings(
+        &self,
+        repo: Repo,
+        live: LiveRun,
+        settings: Option<&Settings>,
+    ) -> Result<()> {
+        let mut project = self.project.write().unwrap_or_else(PoisonError::into_inner);
         let open = project.as_ref();
         let same = open.is_some_and(|open| open.repo.root() == repo.root());
         if !same && matches!(live, LiveRun::Refuse) && open.is_some_and(|open| open.runner.busy()) {
@@ -876,7 +901,11 @@ impl Site {
         // A run gives its agent team memory only once a check found hippius-mem Ready, and the
         // first check would otherwise wait for the first send or the settings dialog: the send
         // step's preview would leave out the line about it that the send then has.
-        if self.current_settings().team_memory() == TeamMemory::On {
+        let team_memory = settings.map_or_else(
+            || self.current_settings().team_memory(),
+            Settings::team_memory,
+        );
+        if team_memory == TeamMemory::On {
             drop(self.memory.status());
         }
         let runner = Runner::new(
@@ -945,17 +974,19 @@ impl Site {
             }
             "/api/notes" => self.respond_notes(method, query, body),
             "/api/notes/resolve" => match *method {
-                Method::POST => self.change_note(query, |site, repo, id| {
+                Method::POST => self.change_note(query, |project, id| {
                     // An ask's thread ends first, freeing its worktree; refused while it runs.
-                    if notes::is_ask(repo, id)? {
-                        site.runner()?.end_ask(id)?;
+                    if notes::is_ask(&project.repo, id)? {
+                        project.runner.end_ask(id)?;
                     }
-                    notes::resolve(repo, id)
+                    notes::resolve(&project.repo, id)
                 }),
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/notes/reopen" => match *method {
-                Method::POST => self.change_note(query, |_, repo, id| notes::reopen(repo, id)),
+                Method::POST => {
+                    self.change_note(query, |project, id| notes::reopen(&project.repo, id))
+                }
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/folders" => match *method {
@@ -1009,7 +1040,12 @@ impl Site {
 
     /// The open project, or `null`: the page then shows the welcome screen.
     fn repo_info(&self) -> Result<Vec<u8>> {
-        let Some(Project { repo, warning, .. }) = self.project.borrow().clone() else {
+        let Some(Project { repo, warning, .. }) = self
+            .project
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
             return Ok(b"null".to_vec());
         };
         let info = RepoInfo {
@@ -1062,11 +1098,17 @@ impl Site {
     fn file_view(&self, path: &str) -> Result<Vec<u8>> {
         let text = self.repo()?.read(path)?;
         let lines = self.highlighter.lines(path, &text)?;
-        Ok(to_json(&FileView {
+        let view = FileView {
             path,
             definitions: highlight::tags_grammar(path).is_some(),
             lines,
-        }))
+        };
+        let mut out = Vec::with_capacity(text.len().saturating_mul(2).saturating_add(256));
+        serde_json::to_writer(&mut out, &view).expect(
+            "the reply types are plain structs of strings, numbers, and sequences, which always \
+             serialize",
+        );
+        Ok(out)
     }
 
     /// The reply to `GET /api/definitions?name=x&from=path`: where `x` is defined, those
@@ -1079,21 +1121,28 @@ impl Site {
                 Error::BadRequest("expected ?name=<percent-encoded name>&from=<path>".to_owned())
             })?;
         let from = query_value(query, "from").unwrap_or_default();
-        let project = self.project.borrow();
-        let project = project.as_ref().ok_or(Error::NoProject)?;
-        Ok(to_json(&project.definitions.lookup(&name, &from)))
+        let definitions = self
+            .project
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|project| project.definitions.clone())
+            .ok_or(Error::NoProject)?;
+        Ok(to_json(&definitions.lookup(&name, &from)))
     }
 
     /// The reply to `POST /api/definitions/refresh`, which the page sends when the window
     /// regains focus and when a run moves on (`refresh` in `ui/app.js`): the index looks at
     /// the files again, on its own thread. Answers `{}` at once.
     fn refresh_definitions(&self) -> Result<Vec<u8>> {
-        let project = self.project.borrow();
-        project
+        let definitions = self
+            .project
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .ok_or(Error::NoProject)?
-            .definitions
-            .refresh();
+            .map(|project| project.definitions.clone())
+            .ok_or(Error::NoProject)?;
+        definitions.refresh();
         Ok(b"{}".to_vec())
     }
 
@@ -1193,12 +1242,16 @@ impl Site {
     /// `{"trashed": null}` when there was no file. Refused while an analysis of this window is
     /// under way: its merge would write a new file as this one goes.
     fn start_analysis_over(&self) -> Result<Vec<u8>> {
-        if self.runner()?.analyzing() {
+        // Hold the read lock across the check and trash so `open` cannot switch projects between
+        // checking `runner.analyzing()` and trashing `repo`'s analysis file.
+        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+        let project = guard.as_ref().ok_or(Error::NoProject)?;
+        if project.runner.analyzing() {
             return Err(Error::AnalysisRefused(
                 "an analysis of this window is under way: wait for it, or stop it".to_owned(),
             ));
         }
-        let trashed = analysis::start_over(&*self.repo()?)?;
+        let trashed = analysis::start_over(&project.repo)?;
         Ok(to_json(&serde_json::json!({ "trashed": trashed })))
     }
 
@@ -1240,23 +1293,29 @@ impl Site {
     /// The reply to `DELETE /api/notes?id=N1`: removes the note, saves, and returns the
     /// other notes.
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
-        let review = notes::delete(&*self.repo()?, id)?;
+        // Hold the read lock so both operations target the same open project.
+        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+        let project = guard.as_ref().ok_or(Error::NoProject)?;
+        let review = notes::delete(&project.repo, id)?;
         // A run goes with its last note (docs/design.md, "Runs"). The note is deleted by now:
         // a log that cannot be removed is reported, and tried again at the next delete.
-        self.runner()?.delete_runs_without_notes()?;
+        project.runner.delete_runs_without_notes()?;
         Ok(to_json(&review))
     }
 
     /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
     /// changes the note's state with `change` (around `notes::resolve` or `notes::reopen`),
     /// and returns all notes.
-    fn change_note(&self, query: &str, change: fn(&Self, &Repo, &str) -> Result<Review>) -> Reply {
+    fn change_note(&self, query: &str, change: fn(&Project, &str) -> Result<Review>) -> Reply {
         let Some(id) = query_value(query, "id") else {
             return bad_request("expected ?id=<note id>");
         };
+        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
         json_or_error(
-            self.repo()
-                .and_then(|repo| change(self, &repo, &id))
+            guard
+                .as_ref()
+                .ok_or(Error::NoProject)
+                .and_then(|project| change(project, &id))
                 .map(|review| to_json(&review)),
         )
     }
@@ -1596,7 +1655,8 @@ impl Site {
     /// The open project's runner.
     fn runner(&self) -> Result<Arc<Runner>> {
         self.project
-            .borrow()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|project| Arc::clone(&project.runner))
             .ok_or(Error::NoProject)
@@ -1919,7 +1979,11 @@ impl Site {
 
     /// The reply to `GET /api/usage` and `POST /api/usage/refresh`.
     fn usage_view(&self, query: &str, fetch: QuotaFetch) -> Result<Vec<u8>> {
-        let project = self.project.borrow().clone();
+        let project = self
+            .project
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let has_project = project.is_some();
         let project_name = project.as_ref().map(|proj| proj.repo.name());
         let project_root = project
@@ -1946,11 +2010,13 @@ impl Site {
         };
 
         let records = match self.usage_file.as_deref() {
-            Some(file) => ledger::read(file).map_err(|source| Error::ReadUsage {
-                path: file.to_owned(),
-                source,
-            })?,
-            None => Vec::new(),
+            Some(file) => self
+                .read_ledger_cached(file)
+                .map_err(|source| Error::ReadUsage {
+                    path: file.to_owned(),
+                    source,
+                })?,
+            None => Arc::from([]),
         };
         let settings = self.current_settings();
         let remap_legacy_gemini = !settings.custom_agents().iter().any(|agent| {
@@ -2005,6 +2071,45 @@ impl Site {
             summary,
             agents: Some(agents),
         }))
+    }
+
+    /// Reads `usage.jsonl` with an `(mtime, len)` cache so repeated usage polls skip re-parsing.
+    fn read_ledger_cached(&self, file: &Path) -> std::io::Result<Arc<[ledger::LedgerRecord]>> {
+        let meta = match std::fs::metadata(file) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                *self
+                    .ledger_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                return Ok(Arc::from([]));
+            }
+            Err(error) => return Err(error),
+        };
+        let modified = meta.modified().ok();
+        let len = meta.len();
+        {
+            let guard = self
+                .ledger_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.len == len
+                && cached.modified == modified
+            {
+                return Ok(Arc::clone(&cached.records));
+            }
+        }
+        let records: Arc<[ledger::LedgerRecord]> = Arc::from(ledger::read(file)?);
+        *self
+            .ledger_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(LedgerCache {
+            modified,
+            len,
+            records: Arc::clone(&records),
+        });
+        Ok(records)
     }
 
     fn usage_agents(
@@ -2095,7 +2200,12 @@ impl std::fmt::Debug for Site {
 // leaves no agent behind.
 impl Drop for Site {
     fn drop(&mut self) {
-        if let Some(project) = self.project.borrow_mut().take() {
+        if let Some(project) = self
+            .project
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             // The index first, as in `open`: telling it to stop waits for nothing.
             project.definitions.close();
             project.runner.close();
@@ -2256,6 +2366,9 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
 
 /// The page's own file at `path` (`PAGE`), if it is one.
 pub(crate) fn page_asset(path: &str) -> Option<Reply> {
+    if path.starts_with("/api/") {
+        return None;
+    }
     PAGE.iter()
         .find(|(served, ..)| *served == path)
         .map(|&(_, kind, body)| reply(StatusCode::OK, kind, body))

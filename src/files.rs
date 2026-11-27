@@ -67,6 +67,15 @@ pub(crate) fn version_of(json: &[u8]) -> serde_json::Result<u32> {
     serde_json::from_slice::<VersionOnly>(json).map(|stored| stored.version)
 }
 
+/// Whether `file` exists and holds a JSON object whose `version` is newer than `version`,
+/// without deserializing the rest of the file.
+pub(crate) fn is_newer_version(file: &Path, version: u32) -> bool {
+    let Ok(bytes) = fs::read(file) else {
+        return false;
+    };
+    version_of(&bytes).is_ok_and(|stored| stored > version)
+}
+
 /// Writes `value` to `file` as pretty JSON ending in a newline, through [`write_atomically`].
 ///
 /// # Errors
@@ -79,6 +88,22 @@ pub(crate) fn save_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> 
     );
     json.push(b'\n');
     write_atomically(file, &json)
+}
+
+/// Writes `value` to `file` as pretty JSON ending in a newline using an atomic rename without
+/// `fsync`. Suitable for convenience UI-state files (`folders.json`, `layout.json`, `recent.json`)
+/// where a partial write must never be visible, but power-loss durability is unnecessary.
+///
+/// # Errors
+///
+/// As [`write_atomically`].
+pub(crate) fn save_json_relaxed<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
+    let mut json = serde_json::to_vec_pretty(value).expect(
+        "serde_json fails only on a map key that is not a string or a failing Serialize impl, \
+         and the app's files have neither",
+    );
+    json.push(b'\n');
+    write_atomically_mode(file, &json, false)
 }
 
 /// Writes `bytes` to a temporary file beside `file`, syncs it, and renames it over `file`, so
@@ -106,8 +131,12 @@ pub(crate) fn save_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> 
 /// process or another, never write into each other's; the last rename wins. A crash between
 /// creating the temporary and the rename leaves it behind; readers ignore it.
 fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomically_mode(file, bytes, true)
+}
+
+fn write_atomically_mode(file: &Path, bytes: &[u8], sync: bool) -> io::Result<()> {
     let real = follow_links(file);
-    let written = replace(&real, bytes);
+    let written = replace(&real, bytes, sync);
     if real == file {
         return written;
     }
@@ -119,7 +148,7 @@ fn write_atomically(file: &Path, bytes: &[u8]) -> io::Result<()> {
 static WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// [`write_atomically`] for a `file` that is not a link.
-fn replace(file: &Path, bytes: &[u8]) -> io::Result<()> {
+fn replace(file: &Path, bytes: &[u8], sync: bool) -> io::Result<()> {
     let invalid = |problem| io::Error::new(io::ErrorKind::InvalidInput, problem);
     let dir = file
         .parent()
@@ -127,7 +156,10 @@ fn replace(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = file
         .file_name()
         .ok_or_else(|| invalid("a file to write needs a name"))?;
-    fs::create_dir_all(dir)?;
+    let dir_created = !dir.exists();
+    if dir_created {
+        fs::create_dir_all(dir)?;
+    }
     let permissions = match fs::metadata(file) {
         Ok(metadata) => Some(metadata.permissions()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -167,7 +199,9 @@ fn replace(file: &Path, bytes: &[u8]) -> io::Result<()> {
             out.set_permissions(permissions)?;
         }
         out.write_all(bytes)?;
-        out.sync_all()?;
+        if sync {
+            out.sync_all()?;
+        }
         fs::rename(&temporary, file)
     })();
     if written.is_err() {
@@ -176,9 +210,11 @@ fn replace(file: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     written?;
 
-    drop(File::open(dir).and_then(|dir| dir.sync_all()));
-    if let Some(parent) = dir.parent() {
-        drop(File::open(parent).and_then(|parent| parent.sync_all()));
+    if sync {
+        drop(File::open(dir).and_then(|dir| dir.sync_all()));
+        if dir_created && let Some(parent) = dir.parent() {
+            drop(File::open(parent).and_then(|parent| parent.sync_all()));
+        }
     }
     Ok(())
 }

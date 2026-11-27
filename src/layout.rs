@@ -16,7 +16,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::{Stored, load_versioned, save_json};
+use crate::files::{Stored, is_newer_version, load_versioned, save_json_relaxed};
 
 /// The format version this build reads and writes. Version 2 added the map's width; a version 1
 /// file still reads, with the map at its default width.
@@ -150,7 +150,7 @@ pub(crate) fn load(file: &Path) -> Layout {
 ///
 /// [`Error::WriteLayout`] when the file cannot be written.
 pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
-    if matches!(load_versioned::<LayoutFile>(file, VERSION), Stored::Newer) {
+    if is_newer_version(file, VERSION) {
         return Ok(());
     }
     let stored = LayoutFile {
@@ -159,7 +159,7 @@ pub(crate) fn save(file: &Path, layout: &Layout) -> Result<()> {
         tray: layout.tray,
         map: layout.map,
     };
-    save_json(file, &stored).map_err(|source| Error::WriteLayout {
+    save_json_relaxed(file, &stored).map_err(|source| Error::WriteLayout {
         path: file.to_owned(),
         source,
     })

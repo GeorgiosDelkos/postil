@@ -16,26 +16,51 @@ const PER_CHARACTER = 0.01;
 
 const SEPARATORS = new Set(["/", "_", "-", ".", " "]);
 
-// The paths matching `query`, best first, at most `limit` of them. Each result carries the
-// indexes of the matched characters, for the page to mark. An empty query matches nothing.
+// Precomputes the lowercase form and file-name offset once per file list so keystrokes do
+// not re-allocate `path.toLowerCase()` for every path on every character typed.
+export function preparePaths(paths) {
+  return paths.map((path) => ({
+    path,
+    lower: path.toLowerCase(),
+    nameStart: path.lastIndexOf("/") + 1,
+  }));
+}
+
+function beats(a, b) {
+  return a.score !== b.score ? a.score > b.score : a.path < b.path;
+}
+
+// The paths matching `query`, best first, at most `limit` of them. `paths` may be plain
+// strings or entries from `preparePaths`. Each result carries the indexes of the matched
+// characters, for the page to mark. An empty query matches nothing.
 export function rank(query, paths, limit) {
   const needle = query.replaceAll(" ", "").toLowerCase();
-  if (needle === "") return [];
+  if (needle === "" || limit <= 0) return [];
 
-  const results = [];
-  for (const path of paths) {
-    const match = matchPath(needle, path);
-    if (match) results.push({ path, ...match });
+  const top = [];
+  for (const item of paths) {
+    const path = typeof item === "string" ? item : item.path;
+    const lower = typeof item === "string" ? path.toLowerCase() : item.lower;
+    const nameStart = typeof item === "string" ? path.lastIndexOf("/") + 1 : item.nameStart;
+    const match = matchPath(needle, path, lower, nameStart);
+    if (!match) continue;
+    const entry = { path, positions: match.positions, score: match.score };
+    if (top.length < limit) {
+      let at = top.length;
+      while (at > 0 && beats(entry, top[at - 1])) at -= 1;
+      top.splice(at, 0, entry);
+    } else if (beats(entry, top[limit - 1])) {
+      let at = limit - 1;
+      while (at > 0 && beats(entry, top[at - 1])) at -= 1;
+      top.splice(at, 0, entry);
+      top.length = limit;
+    }
   }
-  results.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
-  return results.slice(0, limit).map(({ path, positions }) => ({ path, positions }));
+  return top.map(({ path, positions }) => ({ path, positions }));
 }
 
 // Tries the file name alone first, then the whole path.
-function matchPath(needle, path) {
-  const lower = path.toLowerCase();
-  const nameStart = path.lastIndexOf("/") + 1;
-
+function matchPath(needle, path, lower, nameStart) {
   const inName = matchFrom(needle, path, lower, nameStart);
   if (inName) return { ...inName, score: inName.score + IN_FILE_NAME };
   return nameStart > 0 ? matchFrom(needle, path, lower, 0) : null;

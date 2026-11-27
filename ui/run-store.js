@@ -34,11 +34,21 @@ export function runStore({ render, onChange, onLoaded, onError }) {
   // run may have been deleted (`reload`).
   let ids = [];
   let listStale = true;
-  // Older runs by id; the ids asked for and not answered yet; and why a run could not be read,
-  // by id (an unreadable or newer log). None is asked again until `reload` or `forget`.
+  // Older runs by id (LRU-capped so long sessions do not retain every historical log in RAM);
+  // the ids asked for and not answered yet; and why a run could not be read, by id.
+  const MAX_OTHERS = 40;
   const others = new Map();
   const asked = new Set();
   const failed = new Map();
+  function rememberOther(id, view) {
+    others.delete(id);
+    others.set(id, view);
+    if (others.size > MAX_OTHERS) {
+      const oldest = others.keys().next().value;
+      others.delete(oldest);
+      asked.delete(oldest);
+    }
+  }
   // Threads by their first run's id (`api/thread`): the worktree, branch and state, or null
   // for a run from before threads had worktrees. Read once each, like older runs, and read
   // again after a thread ends here or the page refreshes.
@@ -53,7 +63,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (reply === null) return null;
     if (run && reply.id === run.id) {
       // A reply from a later entry leaves out the notes and the prompt, which never change.
-      const entries = run.entries.concat(reply.entries);
+      const entries = reply.entries.length === 0 ? run.entries : run.entries.concat(reply.entries);
       return { ...reply, notes: run.notes, prompt: run.prompt, entries };
     }
     if (after === 0) return reply;
@@ -83,7 +93,8 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (!response.ok) throw new Error(await response.text());
     const reply = await response.json();
     if (!known) return reply;
-    const entries = known.entries.concat(reply.entries);
+    const entries =
+      reply.entries.length === 0 ? known.entries : known.entries.concat(reply.entries);
     return { ...reply, notes: known.notes, prompt: known.prompt, entries };
   }
 
@@ -96,17 +107,20 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (previous && previous.id !== run?.id && isLive(previous)) {
       liveViews.set(previous.id, previous);
     }
-    // The runs followed too: a list read after one ended (as after `forget`) no longer names
-    // it, and it is read once more, final, so its end is reported.
-    for (const id of new Set([...liveThreads.keys(), ...liveViews.keys()])) {
-      if (id === run?.id) continue;
-      const view = await fetchLive(id, liveViews.get(id));
+    // Fetch all other live runs concurrently instead of sequentially.
+    const liveIds = [...new Set([...liveThreads.keys(), ...liveViews.keys()])].filter(
+      (id) => id !== run?.id,
+    );
+    const fetched = await Promise.all(
+      liveIds.map(async (id) => [id, await fetchLive(id, liveViews.get(id))]),
+    );
+    for (const [id, view] of fetched) {
       if (isLive(view)) {
         liveViews.set(id, view);
         continue;
       }
       liveViews.delete(id);
-      others.set(id, view);
+      rememberOther(id, view);
       asked.add(id);
       threads.clear();
       listStale = true;
@@ -170,12 +184,18 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     if (run?.id === id) return run;
     if (liveViews.has(id)) return liveViews.get(id);
     const known = others.get(id);
-    if (known || asked.has(id)) return known ?? null;
+    if (known) {
+      // Refresh LRU position on hit.
+      others.delete(id);
+      others.set(id, known);
+      return known;
+    }
+    if (asked.has(id)) return null;
     asked.add(id);
     fetch(`api/run?id=${encodeURIComponent(id)}`)
       .then(async (response) => {
         if (!response.ok) throw new Error(await response.text());
-        others.set(id, await response.json());
+        rememberOther(id, await response.json());
         render();
         onLoaded();
       })

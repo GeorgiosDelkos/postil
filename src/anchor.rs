@@ -95,6 +95,15 @@ pub(crate) fn locate(text: &str, snippet: &str, last: LineRange) -> Option<LineR
 pub(crate) fn locate_lines(lines: &[&str], snippet: &str, last: LineRange) -> Option<LineRange> {
     let wanted: Vec<&str> = snippet.split('\n').collect();
 
+    // Fast path: when the snippet is still at `last`, no file scan is needed.
+    if last.start >= 1
+        && last.end <= lines.len()
+        && last.end - last.start + 1 == wanted.len()
+        && lines[last.start - 1..last.end] == wanted[..]
+    {
+        return Some(last);
+    }
+
     let mut found = lines
         .windows(wanted.len())
         .enumerate()

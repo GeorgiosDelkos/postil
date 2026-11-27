@@ -557,11 +557,16 @@ export function runDialog({
     if (!text) return null;
     const view = el("div", "run-message");
     fillMarkdown(view, text);
+    let raf = null;
     streamed.push(() => {
       const now = replyShown(store.byId(turn.id) ?? turn);
       if (now === text) return;
       text = now;
-      fillMarkdown(view, text);
+      if (raf !== null) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        if (view.isConnected) fillMarkdown(view, text);
+      });
     });
     return section(isLive(turn) ? `${turn.agent} is writing` : `${turn.agent}'s reply`, view);
   }
@@ -861,13 +866,17 @@ export function runDialog({
         return node;
       }
       case "thought": {
-        const words = (thought) => thought.text.trim().replace(/\s+/g, " ");
+        // Slice before collapsing whitespace: the card is single-line ellipsized, so scanning a
+        // multi-kilobyte thought on every streamed chunk is wasted work.
+        const words = (thought) => thought.text.slice(0, 256).trim().replace(/\s+/g, " ");
         const preview = el("span", "run-card-text run-thought-preview", words(item));
         // The thought streams: its words change in place, and the card stays the same node.
         streamed.push(() => {
           const now = foldRun((store.byId(view.id) ?? view).entries).items[index];
-          if (now?.type === "thought" && preview.textContent !== words(now))
-            preview.textContent = words(now);
+          if (now?.type === "thought") {
+            const next = words(now);
+            if (preview.textContent !== next) preview.textContent = next;
+          }
         });
         return card([el("span", "tool-verb", "think"), preview]);
       }

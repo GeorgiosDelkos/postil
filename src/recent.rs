@@ -13,7 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::{Stored, load_versioned, save_json};
+use crate::files::{Stored, load_versioned, save_json_relaxed};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -65,7 +65,7 @@ pub(crate) fn record(file: &Path, root: &Path) -> Result<()> {
         version: VERSION,
         projects,
     };
-    save_json(file, &recent).map_err(|source| Error::WriteRecent {
+    save_json_relaxed(file, &recent).map_err(|source| Error::WriteRecent {
         path: file.to_owned(),
         source,
     })

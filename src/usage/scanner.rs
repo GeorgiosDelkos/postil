@@ -48,7 +48,7 @@ const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 struct FileStamp {
     modified: Option<SystemTime>,
     len: u64,
-    records: Vec<LedgerRecord>,
+    records: Arc<[LedgerRecord]>,
 }
 
 struct ScanState {
@@ -119,6 +119,7 @@ impl SessionScanner {
 
     fn spawn_scan(&self, home: PathBuf, cache: HashMap<PathBuf, FileStamp>) {
         let shared = Arc::clone(&self.state);
+        // `FileStamp::records` is an `Arc<[LedgerRecord]>`, so cloning the map is shallow.
         let fallback_cache = cache.clone();
         let spawned = std::thread::Builder::new()
             .name("usage-session-scan".to_owned())
@@ -170,7 +171,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn scan_home(home: &Path, cache: &mut HashMap<PathBuf, FileStamp>) -> Vec<LedgerRecord> {
     let postil_dir = PathBuf::from(normalize_cwd(&home.join(".postil").to_string_lossy()));
-    let mut next_cache = HashMap::new();
+    let mut next_cache = HashMap::with_capacity(cache.len());
     let mut out = Vec::new();
 
     scan_claude_projects(
@@ -209,35 +210,36 @@ fn scan_home(home: &Path, cache: &mut HashMap<PathBuf, FileStamp>) -> Vec<Ledger
 /// Checks `(modified, len)` on `stamp_file` and reuses `prev`'s parsed records when unchanged.
 fn cached_or_parse(
     stamp_file: &Path,
-    prev: &HashMap<PathBuf, FileStamp>,
+    prev: &mut HashMap<PathBuf, FileStamp>,
     next: &mut HashMap<PathBuf, FileStamp>,
     parse: impl FnOnce(u64) -> Vec<LedgerRecord>,
-) -> Vec<LedgerRecord> {
+) -> Arc<[LedgerRecord]> {
     let Ok(meta) = fs::metadata(stamp_file) else {
-        return Vec::new();
+        return Arc::from([]);
     };
     if !meta.is_file() {
-        return Vec::new();
+        return Arc::from([]);
     }
     let modified = meta.modified().ok();
     let len = meta.len();
-    if let Some(hit) = prev.get(stamp_file)
+    if let Some((key, hit)) = prev.remove_entry(stamp_file)
         && hit.len == len
         && hit.modified == modified
     {
-        next.insert(stamp_file.to_owned(), hit.clone());
-        return hit.records.clone();
+        let records = Arc::clone(&hit.records);
+        next.insert(key, hit);
+        return records;
     }
     let fallback_ts = modified
         .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
-    let records = parse(fallback_ts);
+    let records: Arc<[LedgerRecord]> = Arc::from(parse(fallback_ts));
     next.insert(
         stamp_file.to_owned(),
         FileStamp {
             modified,
             len,
-            records: records.clone(),
+            records: Arc::clone(&records),
         },
     );
     records
@@ -300,7 +302,7 @@ fn should_skip_cwd(cwd: &str, postil_dir: &Path) -> bool {
 fn scan_claude_projects(
     projects_dir: &Path,
     postil_dir: &Path,
-    prev: &HashMap<PathBuf, FileStamp>,
+    prev: &mut HashMap<PathBuf, FileStamp>,
     next: &mut HashMap<PathBuf, FileStamp>,
     out: &mut Vec<LedgerRecord>,
 ) {
@@ -325,9 +327,10 @@ fn scan_claude_projects(
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            out.extend(cached_or_parse(&path, prev, next, |fallback_ts| {
+            let records = cached_or_parse(&path, prev, next, |fallback_ts| {
                 parse_claude_session(&path, postil_dir, fallback_ts)
-            }));
+            });
+            out.extend_from_slice(&records);
         }
     }
 }
@@ -345,6 +348,7 @@ struct ClaudeAccum {
 
 fn parse_claude_session(path: &Path, postil_dir: &Path, fallback_ts: u64) -> Vec<LedgerRecord> {
     let mut acc = ClaudeAccum::default();
+    let mut skipped = false;
     for_each_jsonl_line(path, |entry| {
         if acc.cwd.is_empty()
             && let Some(cwd) = entry
@@ -352,7 +356,11 @@ fn parse_claude_session(path: &Path, postil_dir: &Path, fallback_ts: u64) -> Vec
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
         {
-            cwd.clone_into(&mut acc.cwd);
+            acc.cwd = normalize_cwd(cwd);
+            if should_skip_cwd(&acc.cwd, postil_dir) {
+                skipped = true;
+                return false;
+            }
         }
         if let Some(ts) = entry
             .get("timestamp")
@@ -367,10 +375,10 @@ fn parse_claude_session(path: &Path, postil_dir: &Path, fallback_ts: u64) -> Vec
             Some("assistant") => record_claude_assistant(&entry, &mut acc),
             _ => {}
         }
+        true
     });
 
-    acc.cwd = normalize_cwd(&acc.cwd);
-    if should_skip_cwd(&acc.cwd, postil_dir) {
+    if skipped || should_skip_cwd(&acc.cwd, postil_dir) {
         return Vec::new();
     }
     let session_id = file_stem_id(path, "claude");
@@ -541,7 +549,7 @@ fn claude_from_requests(acc: ClaudeAccum, session_id: &str, fallback_ts: u64) ->
 
 struct CodexWalk<'a> {
     postil_dir: &'a Path,
-    prev: &'a HashMap<PathBuf, FileStamp>,
+    prev: &'a mut HashMap<PathBuf, FileStamp>,
     next: &'a mut HashMap<PathBuf, FileStamp>,
     out: &'a mut Vec<LedgerRecord>,
 }
@@ -549,7 +557,7 @@ struct CodexWalk<'a> {
 fn scan_codex_dir(
     dir: &Path,
     postil_dir: &Path,
-    prev: &HashMap<PathBuf, FileStamp>,
+    prev: &mut HashMap<PathBuf, FileStamp>,
     next: &mut HashMap<PathBuf, FileStamp>,
     out: &mut Vec<LedgerRecord>,
 ) {
@@ -581,13 +589,14 @@ fn walk_codex(dir: &Path, depth: u8, walk: &mut CodexWalk<'_>) {
             let records = cached_or_parse(&path, walk.prev, walk.next, |fallback_ts| {
                 parse_codex_session(&path, postil_dir, fallback_ts)
             });
-            walk.out.extend(records);
+            walk.out.extend_from_slice(&records);
         }
     }
 }
 
 fn parse_codex_session(path: &Path, postil_dir: &Path, fallback_ts: u64) -> Vec<LedgerRecord> {
     let mut cwd = String::new();
+    let mut skipped = false;
     let mut model: Option<String> = None;
     let mut first_ts: Option<u64> = None;
     let mut last_ts: Option<u64> = None;
@@ -604,14 +613,18 @@ fn parse_codex_session(path: &Path, postil_dir: &Path, fallback_ts: u64) -> Vec<
             last_ts = Some(last_ts.map_or(ts, |prev| prev.max(ts)));
         }
         let Some(payload) = entry.get("payload").filter(|v| v.is_object()) else {
-            return;
+            return true;
         };
         match entry.get("type").and_then(Value::as_str) {
             Some("session_meta" | "turn_context") => {
                 if cwd.is_empty()
                     && let Some(dir) = payload.get("cwd").and_then(Value::as_str)
                 {
-                    dir.clone_into(&mut cwd);
+                    cwd = normalize_cwd(dir);
+                    if should_skip_cwd(&cwd, postil_dir) {
+                        skipped = true;
+                        return false;
+                    }
                 }
                 if let Some(m) = payload
                     .get("model")
@@ -643,10 +656,10 @@ fn parse_codex_session(path: &Path, postil_dir: &Path, fallback_ts: u64) -> Vec<
             }
             _ => {}
         }
+        true
     });
 
-    cwd = normalize_cwd(&cwd);
-    if should_skip_cwd(&cwd, postil_dir) {
+    if skipped || should_skip_cwd(&cwd, postil_dir) {
         return Vec::new();
     }
     let Some(tokens) = last_usage else {
@@ -694,7 +707,7 @@ fn parse_codex_token_usage(obj: &Value) -> Option<PromptUsage> {
 fn scan_grok_projects(
     sessions_dir: &Path,
     postil_dir: &Path,
-    prev: &HashMap<PathBuf, FileStamp>,
+    prev: &mut HashMap<PathBuf, FileStamp>,
     next: &mut HashMap<PathBuf, FileStamp>,
     out: &mut Vec<LedgerRecord>,
 ) {
@@ -722,9 +735,10 @@ fn scan_grok_projects(
             }
             let session_dir = session.path();
             let usage_file = session_dir.join("usage.json");
-            out.extend(cached_or_parse(&usage_file, prev, next, |fallback_ts| {
+            let records = cached_or_parse(&usage_file, prev, next, |fallback_ts| {
                 parse_grok_session(&session_dir, &decoded_dir, postil_dir, fallback_ts)
-            }));
+            });
+            out.extend_from_slice(&records);
         }
     }
 }
@@ -873,7 +887,7 @@ fn grok_model_record(
 fn scan_antigravity_brain(
     brain_dir: &Path,
     postil_dir: &Path,
-    prev: &HashMap<PathBuf, FileStamp>,
+    prev: &mut HashMap<PathBuf, FileStamp>,
     next: &mut HashMap<PathBuf, FileStamp>,
     out: &mut Vec<LedgerRecord>,
 ) {
@@ -887,9 +901,10 @@ fn scan_antigravity_brain(
         let conv_dir = conv.path();
         let transcript = conv_dir.join(".system_generated/logs/transcript.jsonl");
         let conv_id = conv.file_name().to_string_lossy().into_owned();
-        out.extend(cached_or_parse(&transcript, prev, next, |fallback_ts| {
+        let records = cached_or_parse(&transcript, prev, next, |fallback_ts| {
             parse_antigravity_transcript(&transcript, &conv_id, postil_dir, fallback_ts)
-        }));
+        });
+        out.extend_from_slice(&records);
     }
 }
 
@@ -900,6 +915,7 @@ fn parse_antigravity_transcript(
     fallback_ts: u64,
 ) -> Vec<LedgerRecord> {
     let mut cwd = String::new();
+    let mut skipped = false;
     let mut first_ts: Option<u64> = None;
     let mut last_ts: Option<u64> = None;
     let mut tool_calls = 0_u64;
@@ -912,10 +928,14 @@ fn parse_antigravity_transcript(
             && let Some(content) = entry.get("content").and_then(Value::as_str)
             && let Some(found) = extract_antigravity_workspace(content)
         {
-            cwd = found;
+            cwd = normalize_cwd(&found);
+            if should_skip_cwd(&cwd, postil_dir) {
+                skipped = true;
+                return false;
+            }
         }
         if entry_type != Some("PLANNER_RESPONSE") {
-            return;
+            return true;
         }
         if let Some(ts) = entry
             .get("created_at")
@@ -933,7 +953,7 @@ fn parse_antigravity_transcript(
         let out_tok = u64_of(&entry, "output_tokens").unwrap_or(0);
         let total = in_tok.saturating_add(out_tok);
         if total == 0 {
-            return;
+            return true;
         }
         let model = entry
             .get("model")
@@ -950,10 +970,10 @@ fn parse_antigravity_transcript(
             total_tokens: Some(total),
         };
         add_prompt_usage(by_model.entry(model).or_default(), &step_usage);
+        true
     });
 
-    cwd = normalize_cwd(&cwd);
-    if should_skip_cwd(&cwd, postil_dir) || by_model.is_empty() {
+    if skipped || should_skip_cwd(&cwd, postil_dir) || by_model.is_empty() {
         return Vec::new();
     }
     let started_at = first_ts.unwrap_or(fallback_ts);
@@ -1003,7 +1023,7 @@ fn extract_antigravity_workspace(content: &str) -> Option<String> {
 
 // ---- Shared helpers -------------------------------------------------------------------------
 
-fn for_each_jsonl_line(path: &Path, mut visit: impl FnMut(Value)) {
+fn for_each_jsonl_line(path: &Path, mut visit: impl FnMut(Value) -> bool) {
     let Ok(file) = File::open(path) else {
         return;
     };
@@ -1030,8 +1050,10 @@ fn for_each_jsonl_line(path: &Path, mut visit: impl FnMut(Value)) {
             }
             continue;
         }
-        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
-            visit(value);
+        if let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && !visit(value)
+        {
+            break;
         }
     }
 }

@@ -15,7 +15,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::files::{Stored, load_versioned, save_json};
+use crate::files::{Stored, is_newer_version, load_versioned, save_json_relaxed};
 
 /// The format version this build reads and writes.
 const VERSION: u32 = 1;
@@ -50,14 +50,14 @@ pub(crate) fn load(file: &Path) -> Folders {
 ///
 /// [`Error::WriteFolders`] when the file cannot be written.
 pub(crate) fn save(file: &Path, folders: Folders) -> Result<()> {
-    if matches!(load_versioned::<FoldersFile>(file, VERSION), Stored::Newer) {
+    if is_newer_version(file, VERSION) {
         return Ok(());
     }
     let stored = FoldersFile {
         version: VERSION,
         open: folders.open,
     };
-    save_json(file, &stored).map_err(|source| Error::WriteFolders {
+    save_json_relaxed(file, &stored).map_err(|source| Error::WriteFolders {
         path: file.to_owned(),
         source,
     })

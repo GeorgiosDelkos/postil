@@ -82,7 +82,12 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
 
     clearTimeout(ui.pollTimer);
     ui.pollTimer = null;
-    if (!fromDialog && (merged.scanning || merged.polling) && ui.polls < MAX_POLLS) {
+    if (
+      !fromDialog &&
+      (merged.scanning || merged.polling) &&
+      ui.polls < MAX_POLLS &&
+      !document.hidden
+    ) {
       ui.polls += 1;
       ui.pollTimer = setTimeout(() => {
         ui.pollTimer = null;
@@ -95,6 +100,19 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     renderStrip();
     if (!popoverEl.hidden) renderPopover();
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (
+      !document.hidden &&
+      ui.started &&
+      ui.pollTimer === null &&
+      !ui.inFlight &&
+      ui.polls < MAX_POLLS &&
+      (ui.view?.scanning || ui.view?.polling)
+    ) {
+      fetchUsage({ force: false, allowStale: true }).catch(() => {});
+    }
+  });
 
   function hasErrorQuota() {
     return (ui.view?.agents ?? []).some((agent) => agent?.quota?.status === "error");

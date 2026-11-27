@@ -295,7 +295,8 @@ struct StoredDefinition {
 
 impl Index {
     fn build(files: &HashMap<Arc<str>, IndexedFile>) -> Self {
-        let mut by_name: HashMap<Arc<str>, Vec<StoredDefinition>> = HashMap::new();
+        let mut by_name: HashMap<Arc<str>, Vec<StoredDefinition>> =
+            HashMap::with_capacity(files.len().saturating_mul(4));
         for (path, file) in files {
             for symbol in &file.symbols {
                 by_name
@@ -316,13 +317,18 @@ impl Index {
     fn lookup(&self, name: &str, from: &str) -> Lookup {
         let found = self.by_name.get(name).map_or(&[][..], Vec::as_slice);
         let mut ranked: Vec<&StoredDefinition> = found.iter().collect();
-        ranked.sort_by_key(|definition| {
-            let path: &str = &definition.path;
-            (nearness(path, from), path, definition.line)
-        });
+        let cmp = |a: &&StoredDefinition, b: &&StoredDefinition| {
+            let ka = (nearness(&a.path, from), &*a.path, a.line);
+            let kb = (nearness(&b.path, from), &*b.path, b.line);
+            ka.cmp(&kb)
+        };
+        if ranked.len() > MAX_LISTED {
+            ranked.select_nth_unstable_by(MAX_LISTED, cmp);
+            ranked.truncate(MAX_LISTED);
+        }
+        ranked.sort_by(cmp);
         let definitions = ranked
             .into_iter()
-            .take(MAX_LISTED)
             .map(|definition| Definition {
                 path: definition.path.to_string(),
                 line: definition.line,
@@ -435,6 +441,8 @@ struct Indexer<'a> {
     context: TagsContext,
     /// Each grammar's configuration, compiled the first time a file of it is parsed.
     configurations: HashMap<TagsGrammar, TagsConfiguration>,
+    /// Scratch buffer reused when reading files, avoiding a fresh `Vec<u8>` per file.
+    read_buf: Vec<u8>,
 }
 
 /// A file as the last pass saw it.
@@ -465,6 +473,7 @@ impl<'a> Indexer<'a> {
             files: HashMap::new(),
             context: TagsContext::new(),
             configurations: HashMap::new(),
+            read_buf: Vec::new(),
         }
     }
 
@@ -478,7 +487,8 @@ impl<'a> Indexer<'a> {
         let Ok(paths) = self.repo.files() else {
             return Pass::Unchanged;
         };
-        let mut previous = std::mem::take(&mut self.files);
+        let capacity = self.files.len().max(paths.len());
+        let mut previous = std::mem::replace(&mut self.files, HashMap::with_capacity(capacity));
         let mut changed = false;
         for path in paths {
             if closed() {
@@ -532,11 +542,11 @@ impl<'a> Indexer<'a> {
             return Some(Vec::new());
         }
         // At most one byte past the limit: the file may have grown since its `stat`.
-        let mut bytes = Vec::new();
+        self.read_buf.clear();
         File::open(full)
-            .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+            .and_then(|file| file.take(limit + 1).read_to_end(&mut self.read_buf))
             .ok()?;
-        let Ok(source) = String::from_utf8(bytes) else {
+        let Ok(source) = std::str::from_utf8(&self.read_buf) else {
             return Some(Vec::new());
         };
         if source.len() > MAX_HIGHLIGHTED {

@@ -6,6 +6,7 @@
 //! `\n`, gives back the input with line endings normalized to `\n` and one trailing newline
 //! removed. The page relies on this: line `n` of the result is line `n` of the file.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -14,6 +15,13 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent};
 use tree_sitter_tags::TagsConfiguration;
 
 use crate::error::{Error, Result};
+
+thread_local! {
+    /// One tree-sitter highlighter per worker thread, reused across file opens so the C parser
+    /// and query cursor are not allocated and freed on every request.
+    static HIGHLIGHTER: RefCell<tree_sitter_highlight::Highlighter> =
+        RefCell::new(tree_sitter_highlight::Highlighter::new());
+}
 
 /// The largest text [`Highlighter::lines`] colors, in bytes: 2 MB, the owner's choice
 /// (2026-11-23). A larger file comes back as plain lines: tree-sitter parses the whole text
@@ -353,24 +361,29 @@ impl Highlighter {
                 path: path.to_owned(),
                 source,
             };
-            let mut highlighter = tree_sitter_highlight::Highlighter::new();
-            let events = highlighter
-                .highlight(configuration, text.as_bytes(), None, None, |_| None)
-                .map_err(failed)?;
+            HIGHLIGHTER.with(|cell| {
+                let mut highlighter = cell.borrow_mut();
+                let events = highlighter
+                    .highlight(configuration, text.as_bytes(), None, None, |_| None)
+                    .map_err(failed)?;
 
-            // Captures nest (a string inside a macro call); the innermost one colors the text.
-            let mut open: Vec<&'static str> = Vec::new();
-            for event in events {
-                match event.map_err(failed)? {
-                    HighlightEvent::HighlightStart(highlight) => open.push(STYLES[highlight.0].1),
-                    HighlightEvent::HighlightEnd => {
-                        open.pop();
-                    }
-                    HighlightEvent::Source { start, end } => {
-                        lines.push(open.last().copied().unwrap_or(""), start..end);
+                // Captures nest (a string inside a macro call); the innermost one colors the text.
+                let mut open: Vec<&'static str> = Vec::new();
+                for event in events {
+                    match event.map_err(failed)? {
+                        HighlightEvent::HighlightStart(highlight) => {
+                            open.push(STYLES[highlight.0].1);
+                        }
+                        HighlightEvent::HighlightEnd => {
+                            open.pop();
+                        }
+                        HighlightEvent::Source { start, end } => {
+                            lines.push(open.last().copied().unwrap_or(""), start..end);
+                        }
                     }
                 }
-            }
+                Ok::<(), Error>(())
+            })?;
         } else {
             lines.push("", 0..text.len());
         }
@@ -395,19 +408,24 @@ impl std::fmt::Debug for Highlighter {
     }
 }
 
-/// Collects styled byte ranges of one text into lines.
+/// Collects styled slices of one text directly into lines, avoiding a second allocation pass.
 struct Lines<'a> {
     text: &'a str,
-    /// Finished and current lines, as byte ranges into `text`. Never empty: the last entry
-    /// is the line being filled.
-    lines: Vec<Vec<(&'static str, Range<usize>)>>,
+    /// Finished and current lines. Never empty: the last entry is the line being filled.
+    rows: Vec<Vec<Token<'a>>>,
+    /// Byte end offset of the most recently pushed token on the current line, used to coalesce
+    /// adjacent tokens of the same class.
+    last_end: usize,
 }
 
 impl<'a> Lines<'a> {
     fn new(text: &'a str) -> Self {
+        let mut rows = Vec::with_capacity(text.len() / 40 + 1);
+        rows.push(Vec::new());
         Self {
             text,
-            lines: vec![Vec::new()],
+            rows,
+            last_end: 0,
         }
     }
 
@@ -430,20 +448,21 @@ impl<'a> Lines<'a> {
     /// The `\r` is removed here and not in `push`, because the highlighter may end one range
     /// between the `\r` and the `\n`.
     fn end_line(&mut self) {
-        let text = self.text;
         let line = self
-            .lines
+            .rows
             .last_mut()
-            .expect("`lines` starts with one line and only grows");
+            .expect("`rows` starts with one line and only grows");
         if let Some((_, last)) = line.last_mut()
-            && text[last.clone()].ends_with('\r')
+            && let Some(stripped) = last.strip_suffix('\r')
         {
-            last.end -= 1;
-            if last.start == last.end {
+            if stripped.is_empty() {
                 line.pop();
+            } else {
+                *last = stripped;
             }
         }
-        self.lines.push(Vec::new());
+        self.rows.push(Vec::new());
+        self.last_end = 0;
     }
 
     fn push_on_line(&mut self, class: &'static str, range: Range<usize>) {
@@ -451,34 +470,28 @@ impl<'a> Lines<'a> {
             return;
         }
         let line = self
-            .lines
+            .rows
             .last_mut()
-            .expect("`lines` starts with one line and only grows");
+            .expect("`rows` starts with one line and only grows");
 
         // Adjacent ranges of one class become one token: fewer elements for the page to build.
         match line.last_mut() {
-            Some((last_class, last)) if *last_class == class && last.end == range.start => {
-                last.end = range.end;
+            Some((last_class, last)) if *last_class == class && self.last_end == range.start => {
+                let merged_start = self.last_end - last.len();
+                *last = &self.text[merged_start..range.end];
             }
-            _ => line.push((class, range)),
+            _ => line.push((class, &self.text[range.clone()])),
         }
+        self.last_end = range.end;
     }
 
     fn finish(mut self) -> Vec<Vec<Token<'a>>> {
         // A file that ends with a newline has no line after it, and an empty file has no
         // lines at all: the count then agrees with `str::lines`, which `notes` uses.
         if self.text.is_empty() || self.text.ends_with('\n') {
-            self.lines.pop();
+            self.rows.pop();
         }
-        let text = self.text;
-        self.lines
-            .into_iter()
-            .map(|line| {
-                line.into_iter()
-                    .map(|(class, range)| (class, &text[range]))
-                    .collect()
-            })
-            .collect()
+        self.rows
     }
 }
 

@@ -200,6 +200,7 @@ export function notesTray({
   function tickBox(note) {
     const box = el("input", "note-tick");
     box.type = "checkbox";
+    box.dataset.noteId = note.id;
     box.checked = state.send.ticked.has(note.id);
     box.setAttribute("aria-label", `Send note ${note.id}`);
     box.addEventListener("change", () => toggleTick(note.id));
@@ -207,9 +208,14 @@ export function notesTray({
   }
 
   function toggleTick(id) {
-    if (state.send.ticked.has(id)) state.send.ticked.delete(id);
-    else state.send.ticked.add(id);
-    renderNotes();
+    const nowTicked = !state.send.ticked.has(id);
+    if (nowTicked) state.send.ticked.add(id);
+    else state.send.ticked.delete(id);
+    // Update the toggled checkbox, count, and send bar in place instead of rebuilding all cards.
+    const box = notesEl.querySelector(`input.note-tick[data-note-id="${CSS.escape(id)}"]`);
+    if (box) box.checked = nowTicked;
+    $("note-count").textContent = `${state.send.ticked.size} of ${state.notes.length} selected`;
+    renderSendBar();
     showPrompt();
   }
 
@@ -246,6 +252,7 @@ export function notesTray({
     return state.notes.filter((note) => state.send.ticked.has(note.id)).map((note) => note.id);
   }
 
+  let lastSendWords = null;
   function renderSendBar() {
     renderFocusPill();
     const open = state.notes.filter(waitsToSend).length;
@@ -271,17 +278,25 @@ export function notesTray({
       : agent
         ? `Send ${noun} to ${agent}`
         : "Choose an agent";
-    button.replaceChildren(el("span", "send-words", words), el("kbd", "", "⌘⇧↵"));
+    if (words !== lastSendWords) {
+      lastSendWords = words;
+      button.replaceChildren(el("span", "send-words", words), el("kbd", "", "⌘⇧↵"));
+    }
     button.disabled = Boolean(state.send) && agent !== null && (count === 0 || state.send.sending);
   }
 
   // Focus mode's pill (app.js, `toggleFocus`): the open notes' count and Send.
+  let lastPillKey = null;
   function renderFocusPill() {
     const pill = $("focus-pill");
     const open = state.notes.filter(waitsToSend).length;
+    const full = runs.full();
+    const key = `${open}|${full}`;
+    if (key === lastPillKey) return;
+    lastPillKey = key;
     pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
-    if (open > 0 && !runs.full()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
-    pill.disabled = open === 0 || runs.full();
+    if (open > 0 && !full) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
+    pill.disabled = open === 0 || full;
   }
 
   // Whether a run of this window under way carries `note`. A note is marked sent only once

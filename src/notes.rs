@@ -149,7 +149,9 @@ pub(crate) fn exists(repo: &Repo, id: &str) -> Result<()> {
 /// As [`body`].
 pub(crate) fn draft_source(repo: &Repo, id: &str) -> Result<DraftSource> {
     let wanted = parse_ids(&[id.to_owned()])?;
-    let note = current(repo)?
+    let mut review = Review::load(&repo.review_file())?;
+    review.relocate_only(repo, &wanted);
+    let note = review
         .notes
         .into_iter()
         .find(|note| note.id == wanted[0])
@@ -478,7 +480,8 @@ pub(crate) fn without_team_memory(text: &str) -> String {
 /// (module docs, "Asks"); [`Error::NoSuchNote`] when no note has one of them.
 pub(crate) fn prompt(repo: &Repo, ids: &[String], memory: TeamMemory) -> Result<Prompt> {
     let wanted = parse_ids(ids)?;
-    let review = current(repo)?;
+    let mut review = Review::load(&repo.review_file())?;
+    review.relocate_only(repo, &wanted);
     let mut text = String::from(INTRO);
     if memory == TeamMemory::On {
         text.push_str(TEAM_MEMORY);
@@ -523,7 +526,8 @@ pub(crate) const ASK_RULES: &str = "Answer from the files in this repository as 
 /// As [`current`], and [`Error::InvalidNote`] for an id that is not `N` and a number.
 pub(crate) fn listed(repo: &Repo, ids: &[String]) -> Result<String> {
     let wanted = parse_ids(ids)?;
-    let review = current(repo)?;
+    let mut review = Review::load(&repo.review_file())?;
+    review.relocate_only(repo, &wanted);
     let mut text = String::new();
     for note in wanted
         .iter()
@@ -547,7 +551,7 @@ pub(crate) fn listed(repo: &Repo, ids: &[String]) -> Result<String> {
 /// [`Error::NoSuchNote`] when no note has it.
 pub(crate) fn body(repo: &Repo, id: &str) -> Result<String> {
     let wanted = parse_ids(&[id.to_owned()])?;
-    current(repo)?
+    Review::load(&repo.review_file())?
         .notes
         .into_iter()
         .find(|note| note.id == wanted[0])
@@ -867,16 +871,27 @@ impl Review {
             problem,
         };
 
-        // The version is read on its own first: a newer format would otherwise fail on its
-        // first new field, with a message that hides the real reason.
-        let version = version_of(json.as_bytes()).map_err(parse_error)?;
-        if !(1..=VERSION).contains(&version) {
+        // Parse directly in the common case; only inspect `version_of` on error so a newer format
+        // still gets the version mismatch diagnostic instead of failing on its first new field.
+        let mut review: Self = match serde_json::from_str(&json) {
+            Ok(review) => review,
+            Err(error) => {
+                if let Ok(version) = version_of(json.as_bytes())
+                    && !(1..=VERSION).contains(&version)
+                {
+                    return Err(invalid(format!(
+                        "version {version}, but this build of Postil reads versions 1 to {VERSION}"
+                    )));
+                }
+                return Err(parse_error(error));
+            }
+        };
+        if !(1..=VERSION).contains(&review.version) {
             return Err(invalid(format!(
-                "version {version}, but this build of Postil reads versions 1 to {VERSION}"
+                "version {}, but this build of Postil reads versions 1 to {VERSION}",
+                review.version
             )));
         }
-
-        let mut review: Self = serde_json::from_str(&json).map_err(parse_error)?;
         // An older file is read as this version, and written as this version next time.
         review.version = VERSION;
         for (index, note) in review.notes.iter().enumerate() {
@@ -906,8 +921,25 @@ impl Review {
     /// again for each note took 17 ms of a `GET /api/notes` with 200 notes on ten files of
     /// 5000 lines, 2 ms once split. Then compares every position in the file with each of its
     /// notes' snippets. A file or folder note costs one `lstat`, and reads nothing.
-    fn relocate(&mut self, repo: &Repo, mut read: HashMap<String, Option<String>>) {
+    fn relocate(&mut self, repo: &Repo, read: HashMap<String, Option<String>>) {
+        self.relocate_filtered(repo, read, None);
+    }
+
+    /// Places only the notes whose ids are in `ids`, avoiding file reads for unrelated notes.
+    fn relocate_only(&mut self, repo: &Repo, ids: &[NoteId]) {
+        self.relocate_filtered(repo, HashMap::new(), Some(ids));
+    }
+
+    fn relocate_filtered(
+        &mut self,
+        repo: &Repo,
+        mut read: HashMap<String, Option<String>>,
+        only: Option<&[NoteId]>,
+    ) {
         for note in &self.notes {
+            if only.is_some_and(|ids| !ids.contains(&note.id)) {
+                continue;
+            }
             let lines = matches!(note.target, Target::Lines { .. });
             if lines && !read.contains_key(&note.path) {
                 read.insert(note.path.clone(), repo.read(&note.path).ok());
@@ -919,6 +951,9 @@ impl Review {
             .filter_map(|(path, text)| Some((path.as_str(), text.as_deref()?.lines().collect())))
             .collect();
         for note in &mut self.notes {
+            if only.is_some_and(|ids| !ids.contains(&note.id)) {
+                continue;
+            }
             let found = match &mut note.target {
                 Target::Lines { lines, snippet } => {
                     let place = split.get(note.path.as_str());

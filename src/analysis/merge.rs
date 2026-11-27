@@ -631,11 +631,9 @@ fn node_of(id: NodeId, body: NodeBody) -> Node {
 /// is cleared. Every group names a node of `nodes` by now. Returns how many were cleared.
 fn break_group_loops(nodes: &mut [Node]) -> usize {
     let mut cleared = 0;
+    let mut group_of: HashMap<NodeId, Option<NodeId>> =
+        nodes.iter().map(|node| (node.id, node.group)).collect();
     for index in 0..nodes.len() {
-        // Read again for each node: a loop cleared at an earlier node ends the walks through
-        // it. At most 200 nodes, so at most 40,000 steps.
-        let group_of: HashMap<NodeId, Option<NodeId>> =
-            nodes.iter().map(|node| (node.id, node.group)).collect();
         let start = nodes[index].id;
         let mut at = nodes[index].group;
         let mut on_loop = false;
@@ -651,6 +649,7 @@ fn break_group_loops(nodes: &mut [Node]) -> usize {
         }
         if on_loop {
             nodes[index].group = None;
+            group_of.insert(start, None);
             cleared += 1;
         }
     }
