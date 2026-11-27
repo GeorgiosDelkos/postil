@@ -5,20 +5,17 @@
 //! The prompts describe the reply in words and never show an example block: the agent's reply
 //! can quote its prompt, and the reply's last json block is the one read ([`super::merge`]).
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Analysis, Diagram, DiagramId, DiagramKind, NodeId, RefDetail, RunId, VerifiedState, current,
-    load,
+    Analysis, Diagram, DiagramId, DiagramKind, NodeId, RefDetail, VerifiedState, current, load,
 };
 use crate::anchor::Target;
 use crate::error::{Error, Result};
 use crate::notes::ASK_RULES;
 use crate::repo::{PathKind, Repo};
-use crate::thread;
 
 /// The longest question a flow takes, in characters (docs/review-assist-plan.md, 8.5).
 /// Arbitrary: a question is a sentence, and the thread's branch is named from it.
@@ -250,7 +247,7 @@ fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Planned> {
         })
         .map(|node| node.id)
         .collect();
-    let new_files = off_the_map(repo, &analysis, scope)?;
+    let new_files = super::off_the_map(repo, &analysis, scope)?;
     if outdated.is_empty() && new_files.is_empty() {
         return Err(Error::BadRequest(
             "nothing is outdated and no file was added since the analysis: there is nothing to \
@@ -268,62 +265,6 @@ fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Planned> {
         title: "update analysis".to_owned(),
         prompt,
     })
-}
-
-/// The files in the file list that no verified reference of the analysis covers and that
-/// were added since the run of a top-level Architecture diagram in scope: what an update asks
-/// to place. A diagram whose run has no thread in the record (an analysis written by hand)
-/// adds nothing: every file would read as new. Sorted, as [`Repo::files`] lists them.
-fn off_the_map(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result<Vec<String>> {
-    let runs: Vec<RunId> = analysis
-        .diagrams
-        .iter()
-        .filter(|diagram| scope.is_none_or(|id| diagram.id == id))
-        .filter(|diagram| {
-            matches!(diagram.kind, DiagramKind::Architecture) && diagram.parent.is_none()
-        })
-        .map(|diagram| diagram.run)
-        .collect();
-    let mut known: Option<HashSet<String>> = None;
-    for run in runs {
-        let Some(fork) = thread::find(repo, &run.to_string())?.map(|thread| thread.fork) else {
-            continue;
-        };
-        // A commit gone from the repository (a history rewritten since) gives no list, so
-        // nothing reads as new.
-        let Ok(at_fork) = repo.files_at(&fork) else {
-            continue;
-        };
-        // A file is new when some diagram's run did not see it: known are the files all saw.
-        known = Some(match known {
-            Some(seen) => seen.intersection(&at_fork).cloned().collect(),
-            None => at_fork,
-        });
-    }
-    let Some(known) = known else {
-        return Ok(Vec::new());
-    };
-    let covers = |file: &str| {
-        analysis.diagrams.iter().any(|diagram| {
-            diagram
-                .nodes
-                .iter()
-                .flat_map(|node| &node.anchors)
-                .chain(diagram.edges.iter().filter_map(|edge| edge.anchor.as_ref()))
-                .filter(|anchor| matches!(anchor.detail, RefDetail::Verified { .. }))
-                .any(|anchor| {
-                    file == anchor.path
-                        || file
-                            .strip_prefix(anchor.path.as_str())
-                            .is_some_and(|rest| rest.starts_with('/'))
-                })
-        })
-    };
-    Ok(repo
-        .files()?
-        .into_iter()
-        .filter(|file| !known.contains(file) && !covers(file))
-        .collect())
 }
 
 /// How a reply's diagrams are written, for Analyze, a deeper analysis and a flow.

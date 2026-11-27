@@ -13,12 +13,14 @@ import {
   arrowTarget,
   breadcrumb,
   centreOn,
+  checkFlowQuestion,
   childDiagram,
   clampTransform,
   diagramCounts,
   firstFound,
   fitTransform,
   layoutDiagram,
+  MAX_UPDATE_FILES,
   nodeAtLine,
   nodeState,
   notesOn,
@@ -26,7 +28,7 @@ import {
   searchNodes,
   zoomAt,
 } from "./diagram.js";
-import { el } from "./dom.js";
+import { actOnSecondClick, el } from "./dom.js";
 import { isLive } from "./run.js";
 import { formatSlot } from "./settings.js";
 
@@ -50,11 +52,13 @@ const KINDS = [
 ];
 
 // `mapEl` is the map's pane and `dialogEl` the node's `<dialog>`. `runs` is the run panel
-// (run-panel.js), which follows the analysis runs. The callbacks:
+// (run-panel.js), which follows the analysis runs, and `menu` the context menu
+// (context-menu.js), which a right-click on a node opens. The callbacks:
 // - `settings()` gives the settings in effect, for the Analyzer's name;
 // - `notes()` gives the notes, for those on a node's code;
 // - `noteCard(note)` builds a note's card, as the tray draws it;
-// - `showAnchor(anchor)` shows a code reference in the code pane;
+// - `showAnchor(anchor)` shows a code reference in the code pane, and a file not on the map as
+//   a reference to the whole file;
 // - `writeNote(anchor, intent)` writes a note ("change") or asks a question ("ask") on it;
 // - `alone()` says whether the map takes the whole code pane (a narrow window): a click then
 //   opens the node's dialog, whose Show in code gives the pane to the code;
@@ -65,6 +69,7 @@ export function diagramView({
   mapEl,
   dialogEl,
   runs,
+  menu,
   settings,
   notes,
   noteCard,
@@ -99,6 +104,13 @@ export function diagramView({
     // the node of the drawn diagram that stands for it, ringed (`followCode`).
     code: null,
     codeNode: null,
+    // The Flows list's box (`renderFlows`): where the flow asked for starts, `{ of, label }`
+    // with `of` a node id or a path as `POST api/analysis` takes it, or null; why the page
+    // refused the question, or null; and whether `focus` gives the box the focus, until it
+    // loses it.
+    flowOf: null,
+    flowProblem: null,
+    focusFlow: false,
   };
   // A node to centre once its diagram is drawn: `revealNode` asked for it while the layout
   // library or the analysis was still loading.
@@ -116,10 +128,36 @@ export function diagramView({
 
   const header = el("header", "pane-header map-header");
   const tools = el("div", "map-tools");
+  const flows = el("section", "map-flows");
+  const unmapped = el("details", "map-unmapped");
   const strip = el("div", "map-run");
   const body = el("div", "map-body");
   body.tabIndex = -1;
-  mapEl.replaceChildren(header, tools, strip, body);
+  mapEl.replaceChildren(header, tools, flows, unmapped, strip, body);
+
+  // The Flows list (`renderFlows`): the box that asks for a flow, and a row per flow. Built once
+  // and changed in place, so a redraw while a run streams keeps what is typed and the caret,
+  // and a row is built again only when the flows change, which keeps a Delete its first click
+  // armed.
+  const flowForm = el("form", "map-flow-form");
+  const flowFrom = el("span", "map-flow-chip");
+  const flowFromLabel = el("span", "map-flow-chip-label");
+  const flowFromClear = el("button", "map-flow-chip-clear", "×");
+  flowFromClear.type = "button";
+  flowFromClear.setAttribute("aria-label", "Trace from anywhere");
+  flowFrom.append(flowFromLabel, flowFromClear);
+  const flowInput = el("input", "field map-flow-question");
+  flowInput.type = "text";
+  flowInput.placeholder = "Trace: how is a note sent?";
+  flowInput.setAttribute("aria-label", "A flow to trace");
+  const flowTrace = el("button", "button map-flow-trace", "Trace");
+  flowTrace.type = "submit";
+  flowForm.append(flowFrom, flowInput, flowTrace);
+  const flowProblem = el("p", "map-flow-problem");
+  const flowList = el("div", "map-flow-list");
+  flows.append(flowForm, flowProblem, flowList);
+  let flowRows = null;
+  let unmappedShown = null;
 
   // ---- Loading -----------------------------------------------------------------------------
 
@@ -158,8 +196,14 @@ export function diagramView({
   // The reply to `api/analysis`, numbered: `{ number, analysis }`, `analysis` as `view.analysis`
   // holds it.
   async function fetchAnalysis() {
+    return readAnalysis(fetch("api/analysis"));
+  }
+
+  // The reply `asked` (a fetch whose body is the analysis, as `GET api/analysis` gives it),
+  // numbered when it was asked for, as `fetchAnalysis` returns it.
+  async function readAnalysis(asked) {
     const number = ++analysisAsked;
-    const response = await fetch("api/analysis");
+    const response = await asked;
     if (!response.ok) {
       return { number, analysis: { status: "error", data: null, error: await response.text() } };
     }
@@ -195,16 +239,25 @@ export function diagramView({
     return diagrams().filter((diagram) => diagram.kind === kind && !diagram.parent);
   }
 
-  // The diagram to draw: the one chosen while it is still there, else the first at the top of
-  // the chosen kind, else the first of any kind.
+  // The diagram to draw: the one chosen while it is still there, whose kind the switcher then
+  // shows, else the first at the top of the chosen kind, else none: that kind's empty card,
+  // which offers to make one.
   function current() {
     const chosen = diagrams().find((diagram) => diagram.id === view.diagramId);
-    const shown = chosen ?? topOf(view.kind)[0] ?? diagrams()[0] ?? null;
-    if (shown) {
-      view.diagramId = shown.id;
-      view.kind = shown.kind;
+    if (chosen) {
+      view.kind = chosen.kind;
+      return chosen;
     }
+    const shown = topOf(view.kind)[0] ?? null;
+    view.diagramId = shown?.id ?? null;
     return shown;
+  }
+
+  // The switcher's `kind`, at its first diagram at the top.
+  function showKind(kind) {
+    view.kind = kind;
+    if (kind !== "flow") view.focusFlow = false;
+    openDiagram(topOf(kind)[0]?.id ?? null);
   }
 
   function openDiagram(id) {
@@ -223,10 +276,12 @@ export function diagramView({
     const diagram = view.analysis.status === "ready" ? current() : null;
     renderHeader(diagram);
     renderTools(diagram);
+    renderFlows();
+    renderUnmapped(diagram);
     renderStrip();
     if (view.analysis.status === "loading") return showCard(el("div", "map-card", "Loading…"));
     if (view.analysis.status === "error") return showCard(errorCard());
-    if (!diagram) return showCard(emptyCard());
+    if (!diagram) return showCard(view.kind === "flow" ? noFlowCard() : emptyCard());
     if (view.dagre === "failed") return showCard(dagreCard());
     if (view.dagre !== "ready") return showCard(el("div", "map-card", "Loading the map…"));
     drawDiagram(diagram);
@@ -262,9 +317,17 @@ export function diagramView({
     header.replaceChildren(crumbs, meta);
   }
 
+  // Whether the analysis can be added to: there is none yet, or one that reads.
+  function usable() {
+    return view.analysis.status === "none" || view.analysis.status === "ready";
+  }
+
+  // The switcher, whose every kind can be chosen, with nothing of it yet too: a flow needs no
+  // Architecture, and an empty kind offers to make one. Then, with a diagram drawn, the node
+  // search and Update.
   function renderTools(diagram) {
-    tools.hidden = !diagram;
-    if (!diagram) return;
+    tools.hidden = !usable();
+    if (tools.hidden) return;
     const kinds = el("div", "map-kinds");
     kinds.setAttribute("role", "group");
     kinds.setAttribute("aria-label", "Diagram");
@@ -272,16 +335,18 @@ export function diagramView({
       const button = el("button", "map-kind", name);
       button.type = "button";
       button.setAttribute("aria-pressed", String(view.kind === kind));
-      button.disabled = topOf(kind).length === 0;
-      button.addEventListener("click", () => {
-        view.kind = kind;
-        openDiagram(topOf(kind)[0].id);
-      });
+      button.addEventListener("click", () => showKind(kind));
       kinds.append(button);
     }
     const parts = [kinds];
-    const flows = topOf("flow");
-    if (view.kind === "flow" && flows.length > 1) parts.push(flowPicker(flows, diagram));
+    if (!diagram) {
+      tools.replaceChildren(...parts);
+      return;
+    }
+    // Analyze deeper of a path no node covers adds an Architecture at the top: there may be
+    // several. The Flows list chooses among flows.
+    const tops = topOf(view.kind);
+    if (view.kind !== "flow" && tops.length > 1) parts.push(topPicker(tops, diagram));
 
     const search = el("input", "field map-search");
     search.type = "search";
@@ -307,10 +372,11 @@ export function diagramView({
     });
     parts.push(search);
 
-    if (diagramCounts(diagram).outdated > 0) {
+    if (diagramCounts(diagram).outdated > 0 || unmappedOf(diagram)) {
       const update = el("button", "button map-update", "Update");
       update.type = "button";
-      update.title = "Asks the Analyzer again for the outdated nodes of this diagram";
+      update.title =
+        "Asks the Analyzer again for the outdated nodes of this diagram, and to place the files not on it";
       update.disabled = Boolean(liveRun());
       update.addEventListener("click", () =>
         startRun("api/analysis/update", { diagram: diagram.id }),
@@ -320,17 +386,178 @@ export function diagramView({
     tools.replaceChildren(...parts);
   }
 
-  function flowPicker(flows, diagram) {
-    const picker = el("select", "field map-flow");
-    picker.setAttribute("aria-label", "Flow");
-    for (const flow of flows) {
-      const option = el("option", "", flow.title);
-      option.value = flow.id;
-      option.selected = flow.id === diagram.id;
+  // A choice among the diagrams `tops` at the top of the shown kind, the one `diagram` is in
+  // selected.
+  function topPicker(tops, diagram) {
+    const top = breadcrumb(view.analysis.data, diagram)[0].id;
+    const picker = el("select", "field map-top");
+    picker.setAttribute("aria-label", "Diagram at the top");
+    for (const each of tops) {
+      const option = el("option", "", each.title);
+      option.value = each.id;
+      option.selected = each.id === top;
       picker.append(option);
     }
     picker.addEventListener("change", () => openDiagram(picker.value));
     return picker;
+  }
+
+  // ---- Flows -------------------------------------------------------------------------------
+
+  // The Flows list, on Flows: the box that asks for a flow, from where Trace from here said,
+  // and a row per flow, which opens it, with a Delete that takes two clicks, as a note's does.
+  function renderFlows() {
+    flows.hidden = !usable() || view.kind !== "flow";
+    if (flows.hidden) return;
+    flowFrom.hidden = !view.flowOf;
+    flowFromLabel.textContent = view.flowOf ? `From ${view.flowOf.label}` : "";
+    flowFromLabel.title = flowFromLabel.textContent;
+    flowTrace.disabled = Boolean(liveRun());
+    flowProblem.hidden = !view.flowProblem;
+    flowProblem.textContent = view.flowProblem ?? "";
+
+    const list = topOf("flow");
+    const key = JSON.stringify([list.map((flow) => [flow.id, flow.title]), view.diagramId]);
+    if (key === flowRows) return;
+    flowRows = key;
+    flowList.replaceChildren(...list.map(flowRow));
+  }
+
+  function flowRow(flow) {
+    const row = el("div", "map-flow-item");
+    const open = el("button", "map-flow-open", flow.title);
+    open.type = "button";
+    if (flow.id === view.diagramId) open.setAttribute("aria-current", "true");
+    open.addEventListener("click", () => openDiagram(flow.id));
+    const remove = el("button", "map-flow-delete", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Delete the flow ${flow.title}`);
+    actOnSecondClick(remove, {
+      area: row,
+      arm: () => {
+        row.classList.add("confirming");
+        remove.textContent = "Delete";
+      },
+      disarm: () => {
+        row.classList.remove("confirming");
+        remove.textContent = "×";
+      },
+      act: () => deleteDiagram(flow.id).catch((error) => onError(String(error))),
+    });
+    row.append(open, remove);
+    return row;
+  }
+
+  flowForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    view.flowProblem = checkFlowQuestion(flowInput.value);
+    if (view.flowProblem) {
+      renderFlows();
+      return;
+    }
+    const request = { kind: "flow", question: flowInput.value.trim() };
+    if (view.flowOf) request.of = view.flowOf.of;
+    if (!(await startRun("api/analysis", request))) return;
+    flowInput.value = "";
+    view.flowOf = null;
+    renderFlows();
+  });
+  flowInput.addEventListener("input", () => {
+    if (!view.flowProblem) return;
+    view.flowProblem = null;
+    renderFlows();
+  });
+  flowFromClear.addEventListener("click", () => {
+    view.flowOf = null;
+    renderFlows();
+    flowInput.focus();
+  });
+  flowInput.addEventListener("blur", () => {
+    view.focusFlow = false;
+  });
+
+  // Deletes diagram `id`, with the diagrams below its nodes, and draws the analysis left,
+  // which the reply holds as a read would.
+  async function deleteDiagram(id) {
+    const route = `api/analysis?diagram=${encodeURIComponent(id)}`;
+    const reply = await readAnalysis(fetch(route, { method: "DELETE" }));
+    if (reply.analysis.status === "error") {
+      onError(reply.analysis.error);
+      return;
+    }
+    await applyAnalysis(reply);
+  }
+
+  // Opens the Flows list's box, the flow it asks for starting at `from` (`{ of, label }`), and
+  // gives it the focus: Trace from here, on a node or in the code.
+  function traceFrom(from) {
+    view.flowOf = from;
+    view.flowProblem = null;
+    openFlowBox();
+  }
+
+  function openFlowBox() {
+    view.focusFlow = true;
+    if (view.kind === "flow") render();
+    else showKind("flow");
+    focus();
+  }
+
+  // Whether the box holds a question not asked yet. A box that cannot show (the analysis cannot
+  // be read) holds none.
+  function hasDraft() {
+    return usable() && Boolean(flowInput.value.trim());
+  }
+
+  // Whether the box holds a question not asked yet, which `action` would lose: the box then
+  // says so and takes the focus, as a note's draft holds the page (app.js, `guardDraft`).
+  function holdDraft(action) {
+    if (!hasDraft()) return false;
+    view.flowProblem = `Trace or clear this question before ${action}.`;
+    openFlowBox();
+    return true;
+  }
+
+  // The map takes the focus: the Flows list's box while it is asked for, until it loses the
+  // focus, else the selected node, else the diagram.
+  function focus() {
+    if (view.focusFlow && !flows.hidden) flowInput.focus();
+    else (drawn?.cards.get(view.selected) ?? body).focus({ preventScroll: true });
+  }
+
+  // ---- Not on the map ----------------------------------------------------------------------
+
+  // The files not on `diagram`, a top-level Architecture (src/analysis.rs, `view`):
+  // `{ files, total }`, the first 20 and their count, or null when there are none.
+  function unmappedOf(diagram) {
+    return view.analysis.data?.unmapped?.[diagram.id] ?? null;
+  }
+
+  // "Not on the map": the files added since the diagram's run that no node covers, each a
+  // button to the file, and how many more there are. Built again only when they change, so
+  // it stays open or closed as the engineer left it.
+  function renderUnmapped(diagram) {
+    const off = diagram && unmappedOf(diagram);
+    unmapped.hidden = !off;
+    const key = off && JSON.stringify(off);
+    if (!off || key === unmappedShown) return;
+    unmappedShown = key;
+    const summary = el("summary", "map-unmapped-title", `Not on the map · ${off.total}`);
+    summary.title = "Files added since this diagram's analysis that no node covers";
+    const list = el("div", "map-unmapped-list");
+    for (const path of off.files) {
+      const file = el("button", "map-unmapped-file", path);
+      file.type = "button";
+      file.addEventListener("click", () => showAnchor({ path, target: "file", state: "found" }));
+      list.append(file);
+    }
+    const parts = [summary, list];
+    const more = off.total - off.files.length;
+    if (more > 0) parts.push(el("p", "map-unmapped-more", `and ${more} more`));
+    if (off.total > MAX_UPDATE_FILES) {
+      parts.push(el("p", "map-unmapped-note", `Update sends at most ${MAX_UPDATE_FILES} paths.`));
+    }
+    unmapped.replaceChildren(...parts);
   }
 
   function showCard(card) {
@@ -365,18 +592,32 @@ export function diagramView({
   }
 
   // No analysis yet: who would make one, what it reads, and the one button that starts it.
+  // With other diagrams there, the kind shown has none yet: Analyze draws it, and the
+  // Architecture's top level again, in place of the one there is.
   function emptyCard() {
     const card = el("div", "map-card map-empty");
     const slot = settings()?.analyzer ?? settings()?.agent;
     const analyzer = slot ? formatSlot(slot) : "the agent";
-    card.append(
-      el("h2", "map-empty-title", "No map of this repository yet"),
-      el(
-        "p",
-        "",
-        `${analyzer} reads the last commit (HEAD), read-only, and draws its parts and how they connect.`,
-      ),
-    );
+    if (diagrams().length) {
+      const name = KINDS.find(([kind]) => kind === view.kind)[1];
+      card.append(
+        el("h2", "map-empty-title", `No ${name} diagram yet`),
+        el(
+          "p",
+          "",
+          `Analyze has ${analyzer} read the last commit (HEAD), read-only, and draw the top-level Architecture and Data diagrams again, in place of those there are.`,
+        ),
+      );
+    } else {
+      card.append(
+        el("h2", "map-empty-title", "No map of this repository yet"),
+        el(
+          "p",
+          "",
+          `${analyzer} reads the last commit (HEAD), read-only, and draws its parts and how they connect.`,
+        ),
+      );
+    }
     const count = view.uncommitted?.uncommitted;
     if (count) {
       const changes = count === 1 ? "1 uncommitted change" : `${count} uncommitted changes`;
@@ -387,6 +628,20 @@ export function diagramView({
     analyze.disabled = Boolean(liveRun());
     analyze.addEventListener("click", () => startRun("api/analysis", { kind: "analyze" }));
     card.append(analyze);
+    return card;
+  }
+
+  // Flows, with none yet: the box above asks for one.
+  function noFlowCard() {
+    const card = el("div", "map-card map-empty");
+    card.append(
+      el("h2", "map-empty-title", "No flow yet"),
+      el(
+        "p",
+        "",
+        "Ask above how something happens, or choose Trace from here on a node or in the code. The Analyzer traces it through the last commit, read-only, as ordered steps.",
+      ),
+    );
     return card;
   }
 
@@ -410,16 +665,23 @@ export function diagramView({
     return runs.liveRuns().find((run) => run.analysis) ?? null;
   }
 
+  // Starts an analysis run as `request` asks at `route`, and resolves to whether it started.
   async function startRun(route, request) {
     const response = await fetch(route, { method: "POST", body: JSON.stringify(request) });
     if (!response.ok) {
       onError(await response.text());
-      return;
+      return false;
     }
     view.runId = (await response.json()).run;
     view.retry = { route, request };
     await runs.track();
     render();
+    return true;
+  }
+
+  // Analyze deeper on `of`, a node id or a path.
+  function analyzeDeeper(of) {
+    return startRun("api/analysis", { kind: "deeper", of });
   }
 
   // The strip under the tools: the run under way, with Open run and Stop, or why the last one
@@ -458,10 +720,23 @@ export function diagramView({
     const tracked = view.runId && runs.byId(view.runId);
     if (tracked && !isLive(tracked) && view.settled !== tracked.id) {
       view.settled = tracked.id;
-      load().catch((error) => onError(String(error)));
+      load()
+        .then(() => openMade(tracked))
+        .catch((error) => onError(String(error)));
       return;
     }
-    if (view.shown) renderStrip();
+    if (!view.shown) return;
+    renderStrip();
+    // Trace waits while a run is under way; the box and the rows are kept as they are.
+    renderFlows();
+  }
+
+  // A deeper analysis or a flow that stored its diagram opens it: it is what was asked for.
+  // Analyze and Update change what is drawn already.
+  function openMade(run) {
+    if (run.analysis?.kind !== "deeper" && run.analysis?.kind !== "flow") return;
+    const made = diagrams().find((diagram) => diagram.run === run.id);
+    if (made) openDiagram(made.id);
   }
 
   // ---- The diagram -------------------------------------------------------------------------
@@ -499,8 +774,11 @@ export function diagramView({
       pane.append(box);
     }
     for (const edge of positioned.edges) pane.append(edgeLine(edge));
-    for (const box of positioned.nodes) {
-      const card = nodeCard(box);
+    // A flow's cards are its steps, in order, numbered as the code's gutter numbers them
+    // (diagram.js, `fileMarks`).
+    const flow = diagram.kind === "flow";
+    for (const [index, box] of positioned.nodes.entries()) {
+      const card = nodeCard(box, flow ? index + 1 : null);
       cards.set(box.id, card);
       pane.append(card);
     }
@@ -559,8 +837,10 @@ export function diagramView({
     return defs;
   }
 
+  // A boundary with its cards in it: drawn dashed, as a card is, when its code is outdated or
+  // was never found.
   function groupBox(box) {
-    const group = svgEl("g", "map-group");
+    const group = svgEl("g", `map-group ${nodeState(box.node)}`);
     const head = svgEl("g", "map-group-head", {
       role: "button",
       tabindex: "0",
@@ -594,8 +874,9 @@ export function diagramView({
   }
 
   // A card: the node's label and summary, or "not found in code"; its shape by its kind; a
-  // mark when a diagram deepens it. A button for the keyboard and assistive technology.
-  function nodeCard(box) {
+  // mark when a diagram deepens it; in a flow, its `step` number before the label. A button
+  // for the keyboard and assistive technology.
+  function nodeCard(box, step) {
     const { node } = box;
     const state = nodeState(node);
     const card = svgEl("g", `map-node kind-${node.kind} ${state}`, {
@@ -604,9 +885,10 @@ export function diagramView({
       tabindex: "0",
       "data-node-id": node.id,
     });
+    const named = step ? `Step ${step}, ${node.label}` : node.label;
     card.setAttribute(
       "aria-label",
-      `${node.label}, ${node.kind}${state === "found" ? "" : `, ${state}`}`,
+      `${named}, ${node.kind}${state === "found" ? "" : `, ${state}`}`,
     );
     const title = svgEl("title");
     title.textContent = node.summary ? `${node.label}\n${node.summary}` : node.label;
@@ -620,9 +902,14 @@ export function diagramView({
       const inset = { x: 3, y: 3, width: box.width - 6, height: box.height - 6, rx: 6 };
       card.append(svgEl("rect", "map-node-inset", inset));
     }
-    const sub = { unverified: "not found in code", outdated: `outdated · ${node.summary}` }[state];
+    const outdated = node.summary ? `outdated · ${node.summary}` : "outdated";
+    const sub = { unverified: "not found in code", outdated }[state];
+    // The number is an element of its own, so the label stays the node's label alone. A digit
+    // of the 12.5 px label is under 8 px wide, and 6 px part the two: read by eye.
+    if (step) card.append(svgText("map-node-step", 12, 22, String(step)));
+    const left = step ? 12 + 8 * String(step).length + 6 : 12;
     card.append(
-      svgText("map-node-label", 12, 22, shorten(node.label, 24)),
+      svgText("map-node-label", left, 22, shorten(node.label, step ? 21 : 24)),
       svgText("map-node-summary", 12, 40, shorten(sub ?? node.summary, 30)),
     );
     if (childDiagram(view.analysis.data, node.id)) {
@@ -826,6 +1113,31 @@ export function diagramView({
     if (card) openNode(drawn.positioned.byId.get(card.dataset.nodeId).node);
   });
 
+  // Right-click on a node: it is selected, and the menu offers what its dialog does to make
+  // more of the map.
+  body.addEventListener("contextmenu", (event) => {
+    const card = event.target.closest("[data-node-id]");
+    if (!card || !drawn) return;
+    event.preventDefault();
+    const { node } = drawn.positioned.byId.get(card.dataset.nodeId);
+    select(node.id, { show: false });
+    // The context-menu key gives no pointer position: the menu opens at the card.
+    const box = card.getBoundingClientRect();
+    menu.open(event.clientX || box.left + 24, event.clientY || box.bottom, [
+      {
+        label: "Analyze Deeper",
+        detail: node.label,
+        disabled: Boolean(liveRun()),
+        run: () => analyzeDeeper(node.id),
+      },
+      {
+        label: "Trace from Here",
+        detail: node.label,
+        run: () => traceFrom({ of: node.id, label: node.label }),
+      },
+    ]);
+  });
+
   mapEl.addEventListener("keydown", (event) => {
     if (event.target.matches("input, select") || event.metaKey || event.ctrlKey) return;
     if (event.key === "/") {
@@ -846,8 +1158,11 @@ export function diagramView({
       event.preventDefault();
       select(id, { show: true });
     } else if (event.key === "Enter") {
+      // Into the node's deeper diagram, else its dialog, which offers Analyze deeper.
       event.preventDefault();
-      openNode(drawn.positioned.byId.get(id).node);
+      const child = childDiagram(view.analysis.data, id);
+      if (child) openDiagram(child.id);
+      else openNode(drawn.positioned.byId.get(id).node);
     } else if (event.key.startsWith("Arrow")) {
       event.preventDefault();
       const next = arrowTarget(drawn.positioned, id, event.key);
@@ -923,7 +1238,31 @@ export function diagramView({
       });
       main.append(deeper);
     }
+    main.append(nodeActions(node));
     return main;
+  }
+
+  // What makes more of the map from `node`: a diagram of its inside, which replaces the one it
+  // has, and a flow that starts there.
+  function nodeActions(node) {
+    const actions = el("div", "node-actions");
+    const action = (text, className, act) => {
+      const button = el("button", `button ${className}`, text);
+      button.type = "button";
+      button.addEventListener("click", () => {
+        dialogEl.close();
+        act();
+      });
+      actions.append(button);
+      return button;
+    };
+    const deeper = action("Analyze deeper", "node-analyze-deeper", () => analyzeDeeper(node.id));
+    deeper.disabled = Boolean(liveRun());
+    if (childDiagram(view.analysis.data, node.id)) {
+      deeper.title = "Draws its inside again, in place of the diagram it has";
+    }
+    action("Trace from here", "node-trace", () => traceFrom({ of: node.id, label: node.label }));
+    return actions;
   }
 
   // Each reference, a button to its code; an unverified one says so, and why when known.
@@ -1037,6 +1376,14 @@ export function diagramView({
     openDiagramId: () => (view.shown ? (current()?.id ?? null) : null),
     revealNode,
     followCode,
-    focus: () => (drawn?.cards.get(view.selected) ?? body).focus({ preventScroll: true }),
+    focus,
+    // Analyze deeper on a node id or a path, Trace from here at `{ of, label }`, as the file
+    // list and the code's menus ask; and whether an analysis of this window is under way, when
+    // Analyze Deeper waits.
+    analyzeDeeper,
+    traceFrom,
+    isAnalyzing: () => Boolean(liveRun()),
+    hasDraft,
+    holdDraft,
   };
 }

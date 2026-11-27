@@ -11,6 +11,7 @@ import {
   ZOOM_MAX,
   ZOOM_MIN,
   breadcrumb,
+  checkFlowQuestion,
   clampTransform,
   diagramCounts,
   fileMarks,
@@ -292,6 +293,29 @@ test("a layout is kept per diagram and run, and each call gives that call's node
   assert.equal(layouts, 2, "a new run is laid out");
 });
 
+test("an update under the same run lays the diagram out again when its shape changed", () => {
+  let layouts = 0;
+  const counting = { ...dagre, layout: (graph) => (layouts += 1) && dagre.layout(graph) };
+  const cache = new Map();
+  const three = [node("D1.1"), node("D1.2"), node("D1.3")];
+  layoutDiagram(diagram(three, [edge("D1.1", "D1.2")]), counting, cache);
+
+  // An update keeps the run: it adds a node, and swaps one edge for another, so the count of
+  // edges stays and a cached route would be drawn for the wrong edge.
+  const updated = diagram([...three, node("D1.4")], [edge("D1.1", "D1.3")]);
+  const laid = layoutDiagram(updated, counting, cache);
+  assert.equal(layouts, 2, "laid out again");
+  assert.ok(laid.byId.get("D1.4").width > 0, "the added node has a box");
+  const same = diagram([...three, node("D1.4")], [edge("D1.1", "D1.3")]);
+  layoutDiagram(same, counting, cache);
+  assert.equal(layouts, 2, "the same shape is not laid out again");
+
+  // The same nodes and as many edges, one of them another: its route is not the old one's.
+  const swapped = diagram([...three, node("D1.4")], [edge("D1.2", "D1.4")]);
+  layoutDiagram(swapped, counting, cache);
+  assert.equal(layouts, 3, "an edge changed");
+});
+
 test("a flow with nested boundaries and an edge beside a step lays out", () => {
   // The case where a weightless step edge beside the real one made dagre 3.1.3 throw.
   const boundary = (id, group) => node(id, { kind: "boundary", group });
@@ -509,4 +533,12 @@ test("the node at a code line is in the diagram given, by its lines, else by its
   assert.equal(nodeAtLine(whole, "src/a.rs", 2), "D1.3");
   assert.equal(nodeAtLine(whole, "src/a.rs", 5), "D1.2", "the node of the whole file");
   assert.equal(nodeAtLine(whole, "src/b.rs", 1), null, "a folder rings nothing");
+});
+
+test("a flow's question is 1 to 300 characters once trimmed, each emoji one", () => {
+  for (const text of ["", "   \n"]) assert.match(checkFlowQuestion(text), /Ask a question/);
+  assert.equal(checkFlowQuestion("  How is a note sent?  "), null);
+  // 600 UTF-16 code units: 300 characters, as the route counts them.
+  assert.equal(checkFlowQuestion("😀".repeat(300)), null);
+  assert.match(checkFlowQuestion(`${"😀".repeat(300)}a`), /at most 300 characters, not 301/);
 });

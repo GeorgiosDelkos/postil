@@ -4,8 +4,9 @@ Status: 2026-11-27. Designed. Built so far: an execute call's command and exit c
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
 Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1),
-analysis runs (8.2), the split pane with the diagram view (8.3), and the link shown in the
-code with code to diagram (8.4). This document adds to
+analysis runs (8.2), the split pane with the diagram view (8.3), the link shown in the
+code with code to diagram (8.4), and Analyze deeper, flows, the Data kind, outdated nodes,
+"Not on the map" and Update in the page (8.5). This document adds to
 `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -262,7 +263,10 @@ because both directions of the link stay visible.
   narrow for both, the diagram takes the whole pane and `Cmd-Shift-M` switches between the
   two. The width is kept in `layout.json`.
 - **The header** holds a breadcrumb (Architecture, then each component deepened into), three
-  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated.
+  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated
+  or files are not on the map. As built (8.5): every kind can be chosen before it has a
+  diagram, whose empty card offers to make one; Flows shows the list of flows with the box
+  that asks for one, and "Not on the map" lists 20 of the files and counts them all.
 - **A node** is a small card: its label, one line of summary, and a mark when it is outdated
   or unverified. Everything else is in its dialog, by the rule of "Cards and dialogs": the
   detail, every anchor, the edges in and out, the notes on its lines, Ask, and Add note.
@@ -464,7 +468,9 @@ pane's header can say it.
 - **Outdated** is worked out on every read, as a note's anchor is: the snippet is no longer
   in the file. A node with an outdated anchor is marked in the diagram and dashed in the code.
 - **Not on the map** is every file in the file list that no anchor covers and that was added
-  since the diagram's run.
+  since the diagram's run. An Update keeps the diagram's run (chosen by the agent 2026-11-27,
+  for the owner to confirm): a file it places is covered and leaves the list, and one it does
+  not place stays listed until an Update places it.
 - **Update** sends the Analyzer only the outdated nodes, each with its old snippet, and the
   files not on the map. The reply replaces those nodes by id, adds nodes and edges, and may
   delete a node whose code is gone. The owner chose this over a full analysis as the only

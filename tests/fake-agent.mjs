@@ -189,7 +189,9 @@ function analysisReply(text) {
     };
   }
   if (text.startsWith("Trace one behavior")) {
-    const steps = ["first", "second", "third"].map((key) => node(key, "component", key, [{ path: "src/a.rs" }]));
+    // In step order, which is neither the keys' order nor the edges': the last step loops back
+    // to the first, as a retry does.
+    const steps = ["send", "check", "apply"].map((key) => node(key, "component", key, [{ path: "src/a.rs" }]));
     return {
       diagrams: [
         {
@@ -197,8 +199,9 @@ function analysisReply(text) {
           title: "A flow",
           nodes: steps,
           edges: [
-            { from: "first", to: "second", label: "then", anchor: null },
-            { from: "second", to: "third", label: "then", anchor: null },
+            { from: "send", to: "check", label: "then", anchor: null },
+            { from: "check", to: "apply", label: "then", anchor: null },
+            { from: "apply", to: "send", label: "again", anchor: null },
           ],
         },
       ],
@@ -211,7 +214,10 @@ function analysisReply(text) {
   const healthy = [...text.matchAll(/^- (D\d+\.\d+) "[^"\n]*"$/gm)].map((match) => match[1]);
   const diagram = text.match(/^Diagram (D\d+)/m)?.[1] ?? null;
   const [first, ...rest] = outdated;
-  const added = node("added", "component", "Added", [{ path: "src/a.rs" }], { group: "nowhere" });
+  // The added node places the first file not on the map, when the prompt lists any, and
+  // leaves the others where they are.
+  const placed = text.match(/as a new node:\n- (\S+)\n/)?.[1] ?? "src/a.rs";
+  const added = node("added", "component", "Added", [{ path: placed }], { group: "nowhere" });
   const nodes = [{ ...added, summary: "S".repeat(200) }];
   const edges = [{ from: "added", to: "ghost", label: "to no node", anchor: null }];
   if (first) {
