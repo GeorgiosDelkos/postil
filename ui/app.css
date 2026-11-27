@@ -4933,13 +4933,15 @@ body.focus-mode .code {
 }
 
 .map-crumb {
+  min-width: 0;
   padding: 2px 5px;
-  margin: 0 -3px;
   background: none;
   border: 0;
   border-radius: 5px;
   color: var(--text-muted);
   font: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
   transition:
     background-color 80ms linear,
@@ -4953,6 +4955,7 @@ body.focus-mode .code {
 
 .map-crumb:focus-visible {
   outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .map-counts {
@@ -5500,7 +5503,7 @@ body.focus-mode .code {
 }
 
 /* When searching, softly dim non-matching cards so matches stand out immediately. */
-.map-canvas.map-searching .map-node:not(.ringed):not(.selected) {
+.map-canvas.map-searching .map-node:not(.matched):not(.selected) {
   opacity: 0.42;
 }
 

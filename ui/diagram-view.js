@@ -1235,6 +1235,7 @@ export function diagramView({
     const sub = { unverified: "not found in code", outdated }[state];
     // The step number sits in a small pill badge before the label.
     let left = 12;
+    let labelMax = 24;
     if (step) {
       const digits = String(step);
       const badgeW = Math.max(18, digits.length * 7 + 8);
@@ -1243,12 +1244,15 @@ export function diagramView({
         svgText("map-node-step", 10 + badgeW / 2, 22, digits),
       );
       left = 10 + badgeW + 6;
+      labelMax = digits.length > 1 ? 17 : 20;
     }
+    const hasChild = Boolean(childDiagram(shownAnalysis(), node.id));
+    if (hasChild) labelMax -= 2;
     card.append(
-      svgText("map-node-label", left, 23, shorten(node.label, step ? 20 : 24)),
+      svgText("map-node-label", left, 23, shorten(node.label, labelMax)),
       svgText("map-node-summary", 12, 41, shorten(sub ?? node.summary, 30)),
     );
-    if (childDiagram(shownAnalysis(), node.id)) {
+    if (hasChild) {
       card.append(svgText("map-node-deeper", box.width - 16, 23, "›"));
     }
     card.classList.toggle("selected", node.id === view.selected);
@@ -1265,7 +1269,9 @@ export function diagramView({
     const matches = new Set(view.search ? searchNodes(drawn.diagram, view.search) : []);
     drawn.svg.classList.toggle("map-searching", matches.size > 0);
     for (const [id, card] of drawn.cards) {
-      card.classList.toggle("ringed", matches.has(id) || id === view.codeNode);
+      const matched = matches.has(id);
+      card.classList.toggle("matched", matched);
+      card.classList.toggle("ringed", matched || id === view.codeNode);
     }
   }
 
