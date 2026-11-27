@@ -13,7 +13,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 #[cfg(test)]
 use std::thread::JoinHandle;
@@ -613,12 +613,9 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
         r#"{"jsonrpc":"2.0","id":3,"method":"account/rateLimits/read","params":{}}"#,
         "\n",
     );
-    let result = query_stdio_server(
-        &mut child,
-        "codex app-server",
-        requests,
-        collect_codex_replies,
-    );
+    let result = query_stdio_server(&mut child, "codex app-server", requests, |_, stdout| {
+        collect_codex_replies(stdout)
+    });
     agents::kill_group(child.id());
     drop(child.kill());
     drop(child.wait());
@@ -630,13 +627,13 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
 }
 
 /// Sends `requests` to a running JSON-RPC stdio server and collects its replies within
-/// [`PROBE_TIMEOUT`]. Ignores `BrokenPipe` on write so a child that exits immediately still
-/// has its stdout/EOF read deterministically. Does not stop the child.
+/// [`PROBE_TIMEOUT`]. `collect` gets the child's stdin too, to send a request that must wait
+/// for an earlier reply; stdin stays open until `collect` returns. Does not stop the child.
 fn query_stdio_server<T: Send + 'static>(
     child: &mut Child,
     server_name: &'static str,
     requests: &str,
-    collect: impl FnOnce(ChildStdout) -> Result<T, String> + Send + 'static,
+    collect: impl FnOnce(&mut ChildStdin, ChildStdout) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let mut stdin = child
         .stdin
@@ -646,18 +643,12 @@ fn query_stdio_server<T: Send + 'static>(
         .stdout
         .take()
         .expect("stdio quota probe starts child with piped stdout");
-    if let Err(error) = stdin
-        .write_all(requests.as_bytes())
-        .and_then(|()| stdin.flush())
-        && error.kind() != ErrorKind::BrokenPipe
-    {
-        return Err(format!("cannot write to {server_name}: {error}"));
-    }
+    send_requests(&mut stdin, server_name, requests)?;
 
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("quota-stdio-read".to_owned())
-        .spawn(move || drop(sender.send(collect(stdout))))
+        .spawn(move || drop(sender.send(collect(&mut stdin, stdout))))
         .map_err(|error| format!("cannot start a thread to read {server_name}: {error}"))?;
     receiver.recv_timeout(PROBE_TIMEOUT).map_err(|_| {
         format!(
@@ -665,6 +656,20 @@ fn query_stdio_server<T: Send + 'static>(
             PROBE_TIMEOUT.as_secs()
         )
     })?
+}
+
+/// Writes `requests` to a stdio server. Ignores `BrokenPipe`, so a child that exits at once
+/// still has its stdout read to the end, and its replies, if any, are judged there.
+fn send_requests(stdin: &mut ChildStdin, server_name: &str, requests: &str) -> Result<(), String> {
+    match stdin
+        .write_all(requests.as_bytes())
+        .and_then(|()| stdin.flush())
+    {
+        Err(error) if error.kind() != ErrorKind::BrokenPipe => {
+            Err(format!("cannot write to {server_name}: {error}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Reads bounded JSON-RPC response lines (ignoring notifications and server-initiated requests
@@ -1151,16 +1156,19 @@ fn probe_grok(search_path: &OsStr) -> QuotaReport {
         }
     };
 
-    let requests = concat!(
+    let initialize = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
         r#""params":{"protocolVersion":1,"clientCapabilities":"#,
         r#"{"fs":{"readTextFile":false,"writeTextFile":false},"#,
         r#""terminal":false,"elicitation":{"form":{}}}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"_x.ai/billing","params":{}}"#,
-        "\n",
     );
-    let result = query_stdio_server(&mut child, "grok agent stdio", requests, collect_grok_reply);
+    let result = query_stdio_server(
+        &mut child,
+        "grok agent stdio",
+        initialize,
+        collect_grok_reply,
+    );
     agents::kill_group(child.id());
     drop(child.kill());
     drop(child.wait());
@@ -1172,14 +1180,25 @@ fn probe_grok(search_path: &OsStr) -> QuotaReport {
     }
 }
 
-/// Reads `grok agent stdio` lines until the `_x.ai/billing` reply (`id: 2`) arrives, stdout
-/// ends, or `initialize` (`id: 1`) returned an error.
-fn collect_grok_reply(stdout: ChildStdout) -> Result<Option<Value>, String> {
+/// Sends `_x.ai/billing` (`id: 2`) once `initialize` (`id: 1`) has answered, then reads
+/// `grok agent stdio` lines until the billing reply arrives, stdout ends, or `initialize`
+/// returned an error.
+fn collect_grok_reply(
+    stdin: &mut ChildStdin,
+    stdout: ChildStdout,
+) -> Result<Option<Value>, String> {
+    // Grok loads its sign-in while it answers `initialize`. A billing request sent before that
+    // reply fails with "Internal error", its data saying "no auth context" (grok 1.0.93,
+    // 2026-11-27), so it waits for the reply.
+    const BILLING: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":2,"method":"_x.ai/billing","params":{}}"#,
+        "\n"
+    );
     let mut billing = None;
     read_jsonrpc_replies(stdout, |id, msg| match id {
         1 => match rpc_init_error(&msg, "grok agent stdio") {
             Some(err) => Err(err),
-            None => Ok(false),
+            None => send_requests(stdin, "grok agent stdio", BILLING).map(|()| false),
         },
         2 => {
             billing = Some(msg);
@@ -1198,11 +1217,12 @@ fn parse_grok_quota(billing: Option<&Value>, has_api_key: bool) -> QuotaReport {
         if error.get("code").and_then(Value::as_i64) == Some(METHOD_NOT_FOUND) {
             return QuotaReport::unavailable("Update Grok CLI (`grok update`) to check live quota");
         }
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
+        // Grok's `message` can be a bare "Internal error" whose `data` says what went wrong.
+        let message = ["data", "message"]
+            .into_iter()
+            .filter_map(|key| error.get(key).and_then(Value::as_str))
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .find(|s| !s.is_empty())
             .unwrap_or("Not signed in — run `grok login` in a terminal");
         return QuotaReport::unavailable(bounded_provider_text(message));
     }
@@ -2228,6 +2248,18 @@ mod tests {
             parse_grok_quota(Some(&blank_err), false).message.as_deref(),
             Some("Not signed in — run `grok login` in a terminal")
         );
+        let internal = serde_json::json!({
+            "id": 2,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": "Billing service error: Invalid or expired credentials"
+            }
+        });
+        assert_eq!(
+            parse_grok_quota(Some(&internal), false).message.as_deref(),
+            Some("Billing service error: Invalid or expired credentials")
+        );
         let long_msg = "x".repeat(MAX_PROVIDER_TEXT_CHARS + 5);
         let auth_err =
             serde_json::json!({ "id": 2, "error": { "code": -32000, "message": long_msg } });
@@ -2467,9 +2499,15 @@ mod tests {
                 "#!/bin/sh\n",
                 "if [ \"$1\" != \"agent\" ] || [ \"$2\" != \"stdio\" ]; then exit 2; fi\n",
                 "case \"$PWD\" in *postil-quota) ;; *) exit 3 ;; esac\n",
+                // As the real Grok does: a billing request that arrives before the
+                // `initialize` reply was written fails for want of a sign-in.
                 "while IFS= read -r line; do\n",
                 "  case \"$line\" in\n",
                 "    *'\"method\":\"initialize\"'*)\n",
+                "      if read -r -t 1 early; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,",
+                "\"message\":\"Internal error\",\"data\":\"no auth context\"}}\\n'\n",
+                "      fi\n",
                 "      printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1},\"error\":null}\\n'\n",
                 "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"fs/read_text_file\",\"params\":{}}\\n'\n",
                 "      printf '%020000d\\n' 0\n",

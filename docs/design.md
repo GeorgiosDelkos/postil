@@ -1114,7 +1114,8 @@ format, and runs whose log is reopened from disk, are not in the ledger.
 The account quotas (`src/usage/quota.rs`) are cached for 60 s so window focus events and menu
 opens do not spam provider endpoints. Codex is asked through `codex app-server`, Antigravity
 through `agy -p /usage --output-format json --print-timeout 12s`, and Grok through
-`grok agent stdio` (`_x.ai/billing`).
+`grok agent stdio` (`_x.ai/billing`, sent only after `initialize` has answered: Grok loads its
+sign-in while it answers, and fails an earlier billing request with "no auth context").
 Claude is asked over HTTPS with the agent's own sign-in: its token from the macOS Keychain item
 Claude Code writes, or `~/.claude/.credentials.json`. The token goes to `/usr/bin/curl` on
 stdin (`--config -`, with `--disable` so no `~/.curlrc` applies), never in its arguments; it is
