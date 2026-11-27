@@ -553,12 +553,21 @@ output. The switch turns on only while the latest check reads Ready.
 
 ### Postil shows memory
 
+Built (step 9.2): `src/memory.rs` and `src/memory/client.rs`, the tray's Memory tab
+(`ui/memory-tab.js`), the run dialog's Memory section and a memory's dialog
+(`ui/memory-dialog.js`). Remember is step 9.4. Postil names the repository on every recall as
+hippius-mem does: the last segment of the project's `origin` (`normalize_remote` in
+hippius-mem's `resolver.rs`), and none without one. The memory's dialog shows where each change
+was anchored, in the vault or on chain; it does not check the Merkle proof itself. The tab
+recalls for the file's path; the map pane passes the selected node's label as `node` once it
+is built (step 8.3).
+
 Postil is an MCP client itself: `src/memory.rs` starts one `hippius-mem` process per window
 on first use and calls `recall`, `get`, `history`, `refresh` and `remember` over its pipes,
 with hand-written serde types as for ACP. The calls run on a thread of their own, never on
 the one thread that answers the page: a slow recall would otherwise freeze every view. A
-route answers "pending" and the page asks again until the result is in. (The agent scan's
-page polls every 250 ms; how memory's page learns it is the plan's open item 7.)
+route answers "pending" and the page asks again every 250 ms until the result is in, as the
+agent scan's page does (the plan's open item 7, settled by the owner on 2026-11-26).
 
 - **A Memory tab in the tray** (Notes, Run, Memory) lists the memories recalled for the open
   file: one card each with the summary, the author and the age. The query is the file's path

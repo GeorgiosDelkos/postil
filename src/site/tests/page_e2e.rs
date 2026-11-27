@@ -25,6 +25,8 @@
 //! - `POST /new-memory` opens a project with the fake agent in `plain`, and a fake
 //!   `hippius-mem` that is installed and not set up until its `quickstart` runs, which takes
 //!   half a second, so the page asks again while it runs.
+//! - `POST /new-memory-server` opens a project with the fake agent in `plain`, and a fake
+//!   `hippius-mem` that is ready and serves MCP: every recall finds one memory and one guess.
 //! - `POST /new-fresh-memory` makes a site as `POST /new-fresh` does, with a fake
 //!   `hippius-mem` whose doctor passes when the body is `{"memory": "ready"}` and fails
 //!   otherwise; the site has finished its first check when the reply comes.
@@ -154,6 +156,7 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
         }
         "/new-fresh" => Some(Start::FirstRun),
         "/new-memory" => Some(Start::Memory),
+        "/new-memory-server" => Some(Start::MemoryServer),
         "/new-fresh-memory" => {
             let asked: serde_json::Value =
                 serde_json::from_slice(request.body()).unwrap_or_default();
@@ -234,6 +237,9 @@ enum Start {
     /// The repository open as the project, with the fake agent in `plain`, and a fake
     /// `hippius-mem` that its set up makes ready.
     Memory,
+    /// The repository open as the project, with the fake agent in `plain`, and a fake
+    /// `hippius-mem` server whose recalls find one memory and one guess.
+    MemoryServer,
     /// As [`Start::FirstRun`], with a fake `hippius-mem` that is ready or not set up.
     FirstRunWithMemory { ready: bool },
 }
@@ -296,6 +302,12 @@ fn bridged(number: usize, start: Start) -> Bridged {
         }
         Start::OpenCode(scenario) => opencode_site(&repo, &scenario, notify),
         Start::Memory => memory_site(&repo, notify),
+        Start::MemoryServer => {
+            let dir = repo.root.join(".git/memory-bin");
+            let script = super::memory::server_script(&dir, "hippius-mem 0.7.1", "");
+            let script = format!("#!/bin/sh\n{script}");
+            agent_site(&repo, "plain", notify).with_memory(fake_memory(&repo, &script))
+        }
         Start::FirstRunWithMemory { ready } => {
             let doctor = if ready { "exit 0" } else { "exit 1" };
             let memory = fake_memory(&repo, &format!("#!/bin/sh\n{doctor}\n"));

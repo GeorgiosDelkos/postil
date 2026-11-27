@@ -171,7 +171,8 @@ schedule three tasks.
 | `src/layout.rs`, `ui/panes.js` | The pane widths, `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
 | `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
-| `src/memory.rs` | Team memory: finding hippius-mem, `doctor` and the trial vault's set up, on threads of their own. |
+| `src/memory.rs`, `src/memory/client.rs` | Team memory: finding hippius-mem, `doctor` and the trial vault's set up, on threads of their own; the MCP client of its server, which the thread named `memory` alone calls. |
+| `ui/memory.js`, `ui/memory-tab.js`, `ui/memory-dialog.js` | Team memory on the page: its rules and polling, the tray's Memory tab and the run dialog's Memory section, and a memory's dialog. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
 | `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
 | `src/menu.rs` | The macOS menu bar through `muda`; its commands run in the page. |

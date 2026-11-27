@@ -24,7 +24,7 @@ use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{self, Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
-use crate::memory::{self, Memory};
+use crate::memory::{self, Memory, MemoryId};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
@@ -200,6 +200,21 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/file-list.js",
         "text/javascript",
         include_bytes!("../ui/file-list.js"),
+    ),
+    (
+        "/memory.js",
+        "text/javascript",
+        include_bytes!("../ui/memory.js"),
+    ),
+    (
+        "/memory-tab.js",
+        "text/javascript",
+        include_bytes!("../ui/memory-tab.js"),
+    ),
+    (
+        "/memory-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/memory-dialog.js"),
     ),
     (
         "/notes-tray.js",
@@ -705,8 +720,12 @@ impl Site {
         }
     }
 
+    /// Replaces the memory; it runs in the open project, when one is open.
     #[cfg(test)]
     pub(crate) fn with_memory(mut self, memory: Memory) -> Self {
+        if let Ok(repo) = self.repo() {
+            memory.open_project(&repo);
+        }
         self.memory = memory;
         self
     }
@@ -760,7 +779,7 @@ impl Site {
             open.warning = warning;
             return Ok(());
         }
-        self.memory.open_project(repo.root());
+        self.memory.open_project(&repo);
         let repo = Arc::new(repo);
         let runner = Runner::new(
             Arc::clone(&repo),
@@ -858,7 +877,9 @@ impl Site {
                 _ => not_allowed("POST with no body"),
             },
             path if path.starts_with("/api/agents/") => self.respond_agents(path, method, body),
-            path if path.starts_with("/api/memory/") => self.respond_memory(path, method),
+            path if path == "/api/memory" || path.starts_with("/api/memory/") => {
+                self.respond_memory(request)
+            }
             "/api/usage" => match *method {
                 Method::GET => json_or_error(self.usage_view(query, QuotaFetch::Cached)),
                 _ => not_allowed("GET"),
@@ -1154,19 +1175,67 @@ impl Site {
         }
     }
 
-    /// The replies to the routes under `/api/memory/`, as [`Site::respond`] gives them: a new
-    /// check of hippius-mem, and a trial vault's set up. Both answer the settings at once and
-    /// run in the background (`memory.rs`).
-    fn respond_memory(&self, path: &str, method: &Method) -> Reply {
-        let start = match path {
-            "/api/memory/check" => Memory::check,
-            "/api/memory/setup" => Memory::setup,
-            _ => return reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
-        };
-        match *method {
-            Method::POST => json_or_error(start(&self.memory).map(|()| self.settings())),
-            _ => not_allowed("POST with no body"),
+    /// The replies to `/api/memory` and the routes under it, as [`Site::respond`] gives them: a
+    /// memory, a recall, Refresh, a new check of hippius-mem and a trial vault's set up. Each
+    /// answers at once with what is known, and the work runs in the background (`memory.rs`).
+    /// Takes the whole request so that dispatch stays one line: `respond` is at clippy's
+    /// length limit.
+    fn respond_memory(&self, request: &Request<Vec<u8>>) -> Reply {
+        let method = request.method();
+        let query = request.uri().query().unwrap_or("");
+        match request.uri().path() {
+            "/api/memory" => match *method {
+                Method::GET => json_or_error(self.memory_detail(query)),
+                _ => not_allowed("GET ?id=mem_..."),
+            },
+            "/api/memory/recall" => match *method {
+                Method::GET => json_or_error(self.memory_recall(query)),
+                _ => not_allowed("GET ?path=<path>&node=<node label>, or ?run=R1"),
+            },
+            "/api/memory/refresh" => match *method {
+                Method::POST => json_or_error(self.memory_refresh()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/memory/check" => match *method {
+                Method::POST => json_or_error(self.memory.check().map(|()| self.settings())),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/memory/setup" => match *method {
+                Method::POST => json_or_error(self.memory.setup().map(|()| self.settings())),
+                _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
+    }
+
+    /// The recall for the open file (`?path=`, with the selected node's label as `?node=`), or
+    /// for the thread that ends with a run (`?run=`): its prompt and changed paths.
+    fn memory_recall(&self, query: &str) -> Result<Vec<u8>> {
+        if let Some(run) = query_value(query, "run") {
+            // The runner holds no lock once this returns: memory is never waited on with a
+            // run's lock held.
+            let text = self.runner()?.recall_query(&run)?;
+            return Ok(to_json(&self.memory.recall_run(text)?));
+        }
+        let path = query_value(query, "path").ok_or_else(|| {
+            Error::BadRequest("expected ?path=<percent-encoded path> or ?run=<run id>".to_owned())
+        })?;
+        self.repo()?.check_path(&path)?;
+        let node = query_value(query, "node").filter(|label| !label.is_empty());
+        Ok(to_json(&self.memory.recall_file(&path, node.as_deref())?))
+    }
+
+    /// Memory `?id=` whole, with its history.
+    fn memory_detail(&self, query: &str) -> Result<Vec<u8>> {
+        self.repo()?;
+        let id = query_value(query, "id")
+            .ok_or_else(|| Error::BadRequest("expected ?id=mem_...".to_owned()))?;
+        Ok(to_json(&self.memory.detail(MemoryId::parse(&id)?)?))
+    }
+
+    fn memory_refresh(&self) -> Result<Vec<u8>> {
+        self.repo()?;
+        Ok(to_json(&self.memory.refresh()?))
     }
 
     /// The replies to `/api/thread` and the routes under it, as [`Site::respond`] gives them:
@@ -1776,6 +1845,8 @@ impl Drop for Site {
         }
         // A model probe's agent would otherwise run on until its timeout.
         self.models.close();
+        // The memory server, a process of its own, would otherwise outlive the window.
+        self.memory.close();
     }
 }
 

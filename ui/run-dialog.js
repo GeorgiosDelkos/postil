@@ -6,6 +6,7 @@
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, agentLogoIcon, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
+import { runMemory } from "./memory-tab.js";
 import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
 import {
@@ -47,7 +48,8 @@ const CHECK_WORDS = {
 // `store` holds the runs (run-store.js); `detailEl` is the `<dialog>`. `noteOf(id)` gives a
 // note by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)`
 // shows a file in the code pane; `reviewers()` names the settings' reviewers, in order;
-// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane.
+// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
+// `openMemory(id)` opens a team memory's dialog.
 export function runDialog({
   store,
   detailEl,
@@ -56,6 +58,7 @@ export function runDialog({
   openFile,
   reviewers,
   showChanges,
+  openMemory,
   onError,
 }) {
   // What the dialog shows while open: `{ kind: "run", id }` or `{ kind: "step", id, key }`;
@@ -71,7 +74,10 @@ export function runDialog({
   // What the dialog writes in place while the stamp it was drawn from holds: the text the
   // agent streams, and the time. Each writes what is now known of its run.
   let streamed = [];
+  // The thread's Memory section: drawn again when its recall comes in.
+  const memory = runMemory({ openMemory, onSettled: () => drawDetail() });
   detailEl.addEventListener("close", () => {
+    memory.stop();
     detail = null;
     detailDrawn = null;
     asking = null;
@@ -138,12 +144,14 @@ export function runDialog({
       const shown = [notes, reviewKey(review), reviewers(), record ?? null];
       const live = root.review ? (isLive(root) ? root : undefined) : liveOf(root.id);
       const liveKey = `${live?.id}:${live?.status}`;
+      const memoryKey = memory.key((thread.at(-1) ?? root).id);
       stamp = [
         `run:${root.id}`,
         threadKey(thread),
         JSON.stringify(shown),
         liveKey,
         busyThread(root.id),
+        memoryKey,
       ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
@@ -283,6 +291,14 @@ export function runDialog({
       noteCards.append(button);
     }
     body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    // What the team recorded about the thread's prompt and changed paths; left out when
+    // hippius-mem cannot run here.
+    const remembered = memory.view(latest.id);
+    if (remembered) {
+      const cards = el("div", "run-cards");
+      cards.append(...remembered);
+      body.append(section("Memory", cards));
+    }
     const branch = threadPart(view, record, latest);
     if (branch) body.append(branch);
 

@@ -797,9 +797,9 @@ boolean today and becomes a lookup.
 - Closing the project stops the process.
 
 **Tests.** Against the real binary with a trial vault in a temporary home (skipped with a
-message when not installed): remember three notes through the CLI, recall by path, read one,
-read its history. Against the fake script: a dead process is restarted once; a slow call is
-reported; a missing tool is named. Page: the tab's cards, the weak group, the pending state.
+message when not installed): remember three notes through its server (hippius-mem 0.7.1 has no
+remember command), recall by path, read one, read its history. Against the fake script: a dead
+process is restarted once; a slow call is reported; a missing tool is named. Page: the tab's cards, the weak group, the pending state.
 e2e: the Memory tab opens and the send bar stays hidden there.
 
 ### 9.3 Agents get it

@@ -1479,6 +1479,38 @@ impl Runner {
         Ok(self.run_by_id(id)?.view(after))
     }
 
+    /// What team memory is recalled for in the dialog of the thread that ends with run `id`
+    /// (docs/review-assist.md, "Postil shows memory"): the files its runs edited, then what it
+    /// was asked, its first prompt without the fixed words every prompt of notes starts with,
+    /// and each follow-up. Takes no lock that outlives the call: the caller then waits on
+    /// memory with none held.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::view_of`].
+    pub(crate) fn recall_query(&self, id: &str) -> Result<String> {
+        let thread = self.thread(id)?;
+        let diffs: Vec<Diff> = thread
+            .iter()
+            .flat_map(|run| run.state().work().diffs)
+            .collect();
+        let mut text = edited_files(&diffs).join("\n");
+        for run in &thread {
+            let state = run.state();
+            let prompt = state.header.prompt.as_str();
+            let asked = match &state.header.follow_up {
+                Some(follow_up) => follow_up.text.as_str(),
+                None => prompt
+                    .strip_prefix(notes::INTRO)
+                    .and_then(|rest| rest.strip_prefix(report::ASK))
+                    .unwrap_or(prompt),
+            };
+            text.push_str("\n\n");
+            text.push_str(asked.trim());
+        }
+        Ok(text.trim().to_owned())
+    }
+
     /// This window's runs under way, oldest first, each as `(run id, thread id)`: the page
     /// follows each, and tells by its thread what it holds back.
     pub(crate) fn live(&self) -> Vec<(String, String)> {

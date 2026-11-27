@@ -410,3 +410,836 @@ fn the_real_hippius_mem_sets_up_a_trial_vault_in_a_temporary_home_that_doctor_re
     let error = view["setup"]["error"].as_str().unwrap();
     assert!(error.contains("a config already exists"), "{error}");
 }
+// ---- The memory server ----------------------------------------------------------------------
+
+const RECALL: &str = "postil://localhost/api/memory/recall";
+const MEMORY: &str = "postil://localhost/api/memory";
+const REFRESH: &str = "postil://localhost/api/memory/refresh";
+
+/// `value` as a tool result's text: JSON in a JSON string, without its quotes, to go in a
+/// shell script's single quotes.
+fn tool_text(value: &serde_json::Value) -> String {
+    let quoted = serde_json::to_string(&value.to_string()).unwrap();
+    quoted[1..quoted.len() - 1].to_owned()
+}
+
+/// `recall`'s result: one strong pointer and one weak one.
+fn pointers() -> String {
+    tool_text(&serde_json::json!({
+        "pointers": [
+            { "id": "mem_01A", "summary": "a.rs parses lazily", "score": 0.9, "repo": "postil",
+              "author": "5CrAuthor", "updated": 1_795_733_249_727_u64 },
+            { "id": "mem_01B", "summary": "maybe related", "score": 0.1, "weak": true,
+              "repo": "global", "author": "5CrOther", "updated": 1_795_733_249_000_u64 },
+        ],
+        "total_matched": 2,
+        "returned": 2,
+        "semantic": true,
+    }))
+}
+
+/// `get`'s and `history`'s results for `mem_01A`: its first op not anchored, its second
+/// anchored in the vault, its third on chain.
+fn note_and_history() -> (String, String) {
+    let note = serde_json::json!({
+        "id": "mem_01A", "note_type": "gotcha", "repo": "postil", "author": "5CrAuthor",
+        "created": 1, "updated": 2, "tags": [], "summary": "a.rs parses lazily",
+        "body": "It *is* lazy.", "version": "ab",
+    });
+    let op = |id: &str, lamport: u64, kind: &str, anchor: serde_json::Value| {
+        serde_json::json!({
+            "op_id": id, "author": "5CrAuthor", "author_key": "22", "lamport": lamport,
+            "kind": kind, "cid": "ab", "op_hash": "cd", "anchor": anchor,
+        })
+    };
+    let anchored = serde_json::json!({
+        "root": "00", "reference": { "Local": { "seq": 3 } }, "proof": {},
+    });
+    let on_chain = serde_json::json!({
+        "root": "00",
+        "reference": { "OnChain": { "block_hash": "0x1", "extrinsic_hash": "0x2" } },
+        "proof": {},
+    });
+    let history = serde_json::json!({
+        "note_id": "mem_01A", "tombstoned": false, "redacted": false, "links": [],
+        "entries": [
+            op("01", 1, "Remember", serde_json::Value::Null),
+            op("02", 2, "Edit", anchored),
+            op("03", 3, "Link", on_chain),
+        ],
+    });
+    (tool_text(&note), tool_text(&history))
+}
+
+/// A `tools/list` result naming `tools`.
+fn tool_list(tools: &[&str]) -> String {
+    let tools: Vec<_> = tools
+        .iter()
+        .map(|name| serde_json::json!({ "name": name }))
+        .collect();
+    serde_json::json!({ "tools": tools }).to_string()
+}
+
+/// Writes a fake `hippius-mem` in `bin` ([`server_script`]).
+fn server(bin: &TempDir, version: &str, arms: &str) -> PathBuf {
+    program(bin, &server_script(bin.path(), version, arms))
+}
+
+/// The body of a fake `hippius-mem` that passes doctor, prints `version` on `--version`, and
+/// with no arguments serves MCP over stdio as hippius-mem 0.7.1 does, line by line. Each server
+/// appends its pid to `dir/servers` and each line it reads to `dir/calls`. `arms` are shell
+/// `case` arms tried before the default ones, matched against the request line; in them `$id`
+/// is the request's id, `reply ID RESULT` answers with a result and `text ID JSON` with a tool
+/// result whose text is `JSON`. The recall finds one strong pointer and one weak one.
+pub(super) fn server_script(dir: &Path, version: &str, arms: &str) -> String {
+    let dir = dir.display();
+    let initialized = serde_json::json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "rmcp", "version": "3.9.0" },
+    });
+    let tools = tool_list(&["recall", "get", "history", "remember", "refresh"]);
+    let (note, history) = note_and_history();
+    let pointers = pointers();
+    let refreshed = tool_text(&serde_json::json!({ "indexed": 3 }));
+    format!(
+        r#"case "$*" in
+--version) echo "{version}"; exit 0 ;;
+doctor) exit 0 ;;
+"") ;;
+*) echo "unexpected arguments: $*" >&2; exit 9 ;;
+esac
+echo $$ >> {dir}/servers
+reply() {{ printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$1" "$2"; }}
+text() {{ reply "$1" "{{\"content\":[{{\"type\":\"text\",\"text\":\"$2\"}}],\"isError\":false}}"; }}
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> {dir}/calls
+  id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+{arms}
+  *'"method":"initialize"'*) reply "$id" '{initialized}' ;;
+  *'"method":"tools/list"'*) reply "$id" '{tools}' ;;
+  *'"name":"recall"'*) text "$id" '{pointers}' ;;
+  *'"name":"get"'*) text "$id" '{note}' ;;
+  *'"name":"history"'*) text "$id" '{history}' ;;
+  *'"name":"refresh"'*) text "$id" '{refreshed}' ;;
+  esac
+done"#
+    )
+}
+
+/// A site whose hippius-mem is looked for in `bin` only, with `repo` open as its project.
+fn server_site(repo: &TempRepo, bin: &TempDir, memory: impl FnOnce(Memory) -> Memory) -> Site {
+    let site = memory_site(repo, bin, memory);
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+    site
+}
+
+/// Calls `method uri` until its answer is no longer pending, and returns it.
+fn settle(site: &Site, method: &Method, uri: &str) -> serde_json::Value {
+    loop {
+        let (status, body) = call(site, method.clone(), uri, "");
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if reply["state"] != "pending" {
+            return reply;
+        }
+        site.memory.wait_idle();
+    }
+}
+
+fn recall(site: &Site, path: &str) -> serde_json::Value {
+    settle(site, &Method::GET, &format!("{RECALL}?path={path}"))
+}
+
+/// The pids of the servers started, in order.
+fn servers(bin: &TempDir) -> Vec<String> {
+    fs::read_to_string(bin.path().join("servers"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The lines the servers read, in order.
+fn calls(bin: &TempDir) -> String {
+    fs::read_to_string(bin.path().join("calls")).unwrap_or_default()
+}
+
+/// Waits until the process `pid` is gone and reaped.
+fn wait_gone(pid: &str) {
+    let deadline = Instant::now() + WAIT;
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "process {pid} still runs");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_file_s_recall_is_pending_then_kept_and_names_the_repository_as_hippius_mem_does() {
+    let repo = TempRepo::new("memory-recall");
+    repo.git(&["remote", "add", "origin", "git@github.com:Owner/postil.git"]);
+    let bin = TempDir::new("memory-recall-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    // A path with a space and a character outside ASCII, as the page encodes it.
+    let uri = format!("{RECALL}?path=src%2Fcaf%C3%A9%20notes.rs");
+    let (status, body) = get(&site, &uri);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, r#"{"state":"pending"}"#);
+    let reply = settle(&site, &Method::GET, &uri);
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "state": "ready",
+            "pointers": [
+                { "id": "mem_01A", "summary": "a.rs parses lazily", "weak": false,
+                  "author": "5CrAuthor", "updated": 1_795_733_249_727_u64 },
+                { "id": "mem_01B", "summary": "maybe related", "weak": true,
+                  "author": "5CrOther", "updated": 1_795_733_249_000_u64 },
+            ],
+        })
+    );
+    let sent = calls(&bin);
+    assert!(
+        sent.contains(r#""arguments":{"repo":"postil","text":"src/café notes.rs"}"#),
+        "the repository is named, and the path arrives whole: {sent}"
+    );
+    assert!(
+        sent.contains(r#""method":"notifications/initialized""#),
+        "{sent}"
+    );
+
+    // Kept for the session: no second call.
+    assert_eq!(get_json(&site, &uri)["state"], "ready");
+    assert_eq!(calls(&bin).matches(r#""name":"recall""#).count(), 1);
+    assert_eq!(servers(&bin).len(), 1);
+}
+
+#[test]
+fn a_memory_is_read_with_its_history_and_refresh_drops_what_was_kept() {
+    let repo = TempRepo::new("memory-detail");
+    let bin = TempDir::new("memory-detail-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    let reply = settle(&site, &Method::GET, &format!("{MEMORY}?id=mem_01A"));
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "state": "ready",
+            "id": "mem_01A",
+            "noteType": "gotcha",
+            "author": "5CrAuthor",
+            "created": 1,
+            "updated": 2,
+            "tags": [],
+            "summary": "a.rs parses lazily",
+            "body": "It *is* lazy.",
+            "history": [
+                { "kind": "Remember", "author": "5CrAuthor", "anchor": "none" },
+                { "kind": "Edit", "author": "5CrAuthor", "anchor": "local" },
+                { "kind": "Link", "author": "5CrAuthor", "anchor": "chain" },
+            ],
+        })
+    );
+    // No repository is named without an origin, as hippius-mem binds none.
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+    assert!(calls(&bin).contains(r#""arguments":{"text":"a.rs"}"#));
+    // An empty node is none: the same recall, kept. A node's label joins the path.
+    assert_eq!(recall(&site, "a.rs&node=")["state"], "ready");
+    assert_eq!(calls(&bin).matches(r#""name":"recall""#).count(), 1);
+    assert_eq!(recall(&site, "a.rs&node=Note%20parser")["state"], "ready");
+    assert!(calls(&bin).contains(r#""arguments":{"text":"a.rs Note parser"}"#));
+
+    let (status, body) = post(&site, REFRESH, "");
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, r#"{"state":"pending"}"#)
+    );
+    let refreshed = settle(&site, &Method::POST, REFRESH);
+    assert_eq!(
+        refreshed,
+        serde_json::json!({ "state": "ready", "indexed": 3 })
+    );
+    // Read once: the next Refresh pulls again.
+    assert_eq!(post(&site, REFRESH, "").1, r#"{"state":"pending"}"#);
+    site.memory.wait_idle();
+    assert_eq!(calls(&bin).matches(r#""name":"refresh""#).count(), 2);
+
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+    assert_eq!(
+        calls(&bin).matches(r#""name":"recall""#).count(),
+        3,
+        "the recall runs again after a refresh"
+    );
+}
+
+#[test]
+fn a_dead_memory_server_restarts_once_and_halts_on_a_second_death_until_rescan() {
+    let repo = TempRepo::new("memory-dies");
+    let bin = TempDir::new("memory-dies-bin");
+    // Each server answers one recall and exits.
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"name\":\"recall\"'*) text \"$id\" '{}'; exit 0 ;;",
+            pointers()
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+    assert_eq!(recall(&site, "b.rs")["state"], "ready", "restarted at once");
+    assert_eq!(servers(&bin).len(), 2);
+
+    let reply = recall(&site, "c.rs");
+    assert_eq!(reply["state"], "failed", "{reply}");
+    let error = reply["error"].as_str().unwrap();
+    assert!(
+        error.contains("hippius-mem exited twice within 60 s"),
+        "{error}"
+    );
+    assert_eq!(recall(&site, "d.rs"), reply, "not retried");
+    assert_eq!(servers(&bin).len(), 2, "no third server");
+
+    assert_eq!(post(&site, RESCAN, "").0, StatusCode::OK);
+    // The rescan's check clears the halt when it ends.
+    site.memory.wait();
+    assert_eq!(recall(&site, "d.rs")["state"], "ready");
+    assert_eq!(servers(&bin).len(), 3);
+}
+
+#[test]
+fn deaths_further_apart_than_the_window_each_restart_the_server() {
+    let repo = TempRepo::new("memory-dies-apart");
+    let bin = TempDir::new("memory-dies-apart-bin");
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"name\":\"recall\"'*) text \"$id\" '{}'; exit 0 ;;",
+            pointers()
+        ),
+    );
+    // No two deaths fall within an empty window.
+    let site = server_site(&repo, &bin, |memory| {
+        memory.with_restart_window(Duration::ZERO)
+    });
+
+    for path in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+        assert_eq!(recall(&site, path)["state"], "ready", "{path}");
+    }
+    assert_eq!(servers(&bin).len(), 4);
+}
+
+#[test]
+fn a_call_that_kills_every_server_is_reported_after_one_restart() {
+    let repo = TempRepo::new("memory-dies-each-call");
+    let bin = TempDir::new("memory-dies-each-call-bin");
+    // Each server exits on a recall, with no answer.
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        "  *'\"name\":\"recall\"'*) echo 'Error: index corrupt' >&2; exit 1 ;;",
+    );
+    // Deaths far apart never halt; the call still ends.
+    let site = server_site(&repo, &bin, |memory| {
+        memory.with_restart_window(Duration::ZERO)
+    });
+
+    assert_eq!(
+        recall(&site, "a.rs"),
+        serde_json::json!({
+            "state": "failed",
+            "error": "hippius-mem exited: Error: index corrupt",
+        })
+    );
+    assert_eq!(servers(&bin).len(), 2, "one restart");
+}
+
+#[test]
+fn a_server_that_exits_before_its_handshake_is_a_death_and_not_a_missing_configuration() {
+    let repo = TempRepo::new("memory-dies-at-start");
+    let bin = TempDir::new("memory-dies-at-start-bin");
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        "  *'\"method\":\"initialize\"'*) echo 'Error: vault locked' >&2; exit 1 ;;",
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    assert_eq!(
+        recall(&site, "a.rs"),
+        serde_json::json!({
+            "state": "failed",
+            "error": "hippius-mem exited twice within 60 s, and is not started again until \
+                      Rescan in Settings: Error: vault locked",
+        })
+    );
+    assert_eq!(servers(&bin).len(), 2, "one restart");
+}
+
+#[test]
+fn the_first_call_on_a_new_server_may_wait_out_its_warmup_and_later_ones_may_not() {
+    let repo = TempRepo::new("memory-warmup");
+    let bin = TempDir::new("memory-warmup-bin");
+    // Every recall for a slow file takes 1.5 s, as a first recall waits for the warmup.
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!("  *slow*) /bin/sleep 1.5; text \"$id\" '{}' ;;", pointers()),
+    );
+    let site = server_site(&repo, &bin, |memory| {
+        memory
+            .with_call_timeout(Duration::from_secs(1))
+            .with_first_call_timeout(Duration::from_secs(30))
+    });
+
+    assert_eq!(recall(&site, "slow-first.rs")["state"], "ready");
+    assert_eq!(
+        recall(&site, "slow-second.rs"),
+        serde_json::json!({
+            "state": "failed",
+            "error": "hippius-mem did not answer within 1 s",
+        })
+    );
+}
+
+#[test]
+fn a_tool_error_a_json_rpc_error_and_an_unreadable_result_are_each_reported() {
+    let repo = TempRepo::new("memory-errors");
+    let bin = TempDir::new("memory-errors-bin");
+    let tool_error = serde_json::json!({
+        "content": [{ "type": "text", "text": "note mem_01Z not found" }],
+        "isError": true,
+    });
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *tool-error*) reply \"$id\" '{tool_error}' ;;\n  \
+             *rpc-error*) printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":\
+             {{\"code\":-32602,\"message\":\"invalid params\"}}}}\\n' \"$id\" ;;\n  \
+             *not-json*) text \"$id\" 'not JSON' ;;"
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    let error = |path: &str| {
+        let reply = recall(&site, path);
+        assert_eq!(reply["state"], "failed", "{path}: {reply}");
+        reply["error"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(error("tool-error.rs"), "note mem_01Z not found");
+    assert_eq!(error("rpc-error.rs"), "invalid params");
+    assert!(
+        error("not-json.rs").starts_with("hippius-mem's recall: "),
+        "names the tool"
+    );
+    // None of them is a death: the one server answers on.
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+    assert_eq!(servers(&bin).len(), 1);
+}
+
+#[test]
+fn a_start_that_fails_after_a_new_check_does_not_mark_the_server_unusable() {
+    let repo = TempRepo::new("memory-check-race");
+    let bin = TempDir::new("memory-check-race-bin");
+    let entered = bin.path().join("entered");
+    let gate = bin.path().join("gate");
+    let first = bin.path().join("first");
+    make_fifo(&entered);
+    make_fifo(&gate);
+    // The first server holds its handshake at the gate, then exits as one with no
+    // configuration does; every later one answers.
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"method\":\"initialize\"'*)\n    \
+             if [ ! -f {first} ]; then\n      \
+             /usr/bin/touch {first}; echo in > {entered}; /bin/cat {gate} > /dev/null\n      \
+             echo 'Error: failed to load configuration' >&2; exit 1\n    \
+             fi\n    \
+             reply \"$id\" '{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\
+             \"serverInfo\":{{\"name\":\"rmcp\",\"version\":\"3.9.0\"}}}}' ;;",
+            first = first.display(),
+            entered = entered.display(),
+            gate = gate.display(),
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+    site.memory.wait();
+
+    assert_eq!(
+        get_json(&site, &format!("{RECALL}?path=a.rs"))["state"],
+        "pending"
+    );
+    read_fifo(&entered, WAIT);
+    // The engineer set the configuration up meanwhile, and checks again.
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+    assert!(matches!(site.memory.wait(), State::Ready { .. }));
+    fs::write(&gate, "go").unwrap();
+
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+}
+
+#[test]
+fn closing_the_window_stops_a_server_whose_handshake_hangs() {
+    let repo = TempRepo::new("memory-hung-start");
+    let bin = TempDir::new("memory-hung-start-bin");
+    let entered = bin.path().join("entered");
+    make_fifo(&entered);
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"method\":\"initialize\"'*) echo in > {}; /bin/sleep 60 & wait ;;",
+            entered.display()
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    assert_eq!(
+        get_json(&site, &format!("{RECALL}?path=a.rs"))["state"],
+        "pending"
+    );
+    read_fifo(&entered, WAIT);
+    let started = Instant::now();
+    drop(site);
+    wait_gone(&servers(&bin)[0]);
+    // Far below the start's limit of 120 s: the close stopped it, not the limit.
+    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+}
+
+#[test]
+fn a_call_over_the_time_limit_is_reported_kills_the_hung_server_and_the_queue_moves_on() {
+    let repo = TempRepo::new("memory-slow");
+    let bin = TempDir::new("memory-slow-bin");
+    let sleeper = bin.path().join("sleeper");
+    // slow.rs hangs with a child of its own; fast.rs answers and its server exits after.
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *slow.rs*) /bin/sleep 30 & echo $! > {sleeper}; wait ;;\n  \
+             *fast.rs*) text \"$id\" '{pointers}'; exit 0 ;;",
+            sleeper = sleeper.display(),
+            pointers = pointers(),
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| {
+        memory
+            .with_call_timeout(Duration::from_secs(2))
+            .with_first_call_timeout(Duration::from_secs(2))
+    });
+
+    let slow = format!("{RECALL}?path=slow.rs");
+    let fast = format!("{RECALL}?path=fast.rs");
+    assert_eq!(get_json(&site, &slow)["state"], "pending");
+    assert_eq!(get_json(&site, &fast)["state"], "pending");
+    site.memory.wait_idle();
+    assert_eq!(
+        get_json(&site, &slow),
+        serde_json::json!({
+            "state": "failed",
+            "error": "hippius-mem did not answer within 2 s",
+        })
+    );
+    assert_eq!(get_json(&site, &fast)["state"], "ready");
+    let started = servers(&bin);
+    assert_eq!(started.len(), 2, "a fresh server answered fast.rs");
+    wait_gone(&started[0]);
+    wait_gone(fs::read_to_string(&sleeper).unwrap().trim());
+
+    // fast.rs's server exited: restarting it is the first death, so the timeout counted for
+    // nothing.
+    assert_eq!(recall(&site, "third.rs")["state"], "ready");
+}
+
+#[test]
+fn a_server_missing_a_required_tool_reports_both_versions() {
+    let repo = TempRepo::new("memory-old");
+    let bin = TempDir::new("memory-old-bin");
+    server(
+        &bin,
+        "hippius-mem 0.6.0",
+        &format!(
+            "  *'\"method\":\"tools/list\"'*) reply \"$id\" '{}' ;;",
+            tool_list(&["recall", "get", "refresh"])
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    let reply = recall(&site, "a.rs");
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "state": "incompatible",
+            "serverVersion": "0.6.0",
+            "postilVersion": env!("CARGO_PKG_VERSION"),
+            "missing": ["history"],
+        })
+    );
+    assert_eq!(recall(&site, "b.rs"), reply, "not asked again");
+    assert!(!calls(&bin).contains("tools/call"), "no tool is called");
+    assert_eq!(servers(&bin).len(), 1);
+}
+
+#[test]
+fn a_recall_without_a_usable_hippius_mem_says_why_until_a_new_check() {
+    let repo = TempRepo::new("memory-unusable");
+    let bin = TempDir::new("memory-unusable-bin");
+    let site = server_site(&repo, &bin, |memory| memory);
+    assert_eq!(
+        recall(&site, "a.rs"),
+        serde_json::json!({
+            "state": "unavailable",
+            "reason": "missing",
+            "message": "hippius-mem is not installed on PATH",
+        })
+    );
+
+    // Installed, with no configuration: its own words.
+    let no_config = "Error: failed to load configuration; run hippius-mem quickstart";
+    program(&bin, &format!("echo \"{no_config}\" >&2\nexit 1"));
+    assert_eq!(
+        recall(&site, "a.rs")["reason"],
+        "missing",
+        "until a new check"
+    );
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+    site.memory.wait();
+    assert_eq!(
+        recall(&site, "a.rs"),
+        serde_json::json!({
+            "state": "unavailable",
+            "reason": "unconfigured",
+            "message": no_config,
+        })
+    );
+}
+
+#[test]
+fn a_full_queue_drops_the_oldest_recall_for_a_closed_file_and_keeps_the_open_file() {
+    let repo = TempRepo::new("memory-full");
+    let bin = TempDir::new("memory-full-bin");
+    let entered = bin.path().join("entered");
+    let gate = bin.path().join("gate");
+    make_fifo(&entered);
+    make_fifo(&gate);
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *first.rs*) echo in > {entered}; /bin/cat {gate} > /dev/null; \
+             text \"$id\" '{pointers}' ;;",
+            entered = entered.display(),
+            gate = gate.display(),
+            pointers = pointers(),
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+    let ask = |uri: String| assert_eq!(get_json(&site, &uri)["state"], "pending", "{uri}");
+
+    ask(format!("{RECALL}?path=first.rs"));
+    read_fifo(&entered, WAIT);
+    // The engineer opens open.rs, then 31 more files, which fills the queue; then comes back
+    // to open.rs, whose recall is the oldest queued.
+    ask(format!("{RECALL}?path=open.rs"));
+    for number in 1..=31 {
+        ask(format!("{RECALL}?path=f{number}.rs"));
+    }
+    ask(format!("{RECALL}?path=open.rs"));
+    // One more task: the oldest recall for a file that is not open goes.
+    ask(format!("{MEMORY}?id=mem_01A"));
+    fs::write(&gate, "go").unwrap();
+    site.memory.wait_idle();
+
+    let sent = calls(&bin);
+    assert!(!sent.contains(r#""text":"f1.rs""#), "f1.rs was dropped");
+    for kept in ["open.rs", "f2.rs", "f31.rs"] {
+        assert!(
+            sent.contains(&format!(r#""text":"{kept}""#)),
+            "{kept}: {sent}"
+        );
+    }
+    assert!(sent.contains(r#""name":"get""#));
+    assert_eq!(
+        sent.matches(r#""text":"open.rs""#).count(),
+        1,
+        "queued once"
+    );
+    assert_eq!(recall(&site, "open.rs")["state"], "ready");
+}
+
+#[test]
+fn memory_ids_and_paths_are_checked_before_use() {
+    let repo = TempRepo::new("memory-ids");
+    let bin = TempDir::new("memory-ids-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    for query in [
+        "?id=mem_lowercase",
+        "?id=mem_",
+        "?id=..%2Fmem_01A",
+        "?id=N1",
+        "?id=mem_01A%0A",
+        "?id=",
+        "",
+    ] {
+        let (status, body) = get(&site, &format!("{MEMORY}{query}"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+    for query in ["?path=..%2Fsecret", "?path=%2Fetc%2Fpasswd", "?path=", ""] {
+        let (status, body) = get(&site, &format!("{RECALL}{query}"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+    assert!(servers(&bin).is_empty(), "no server started");
+}
+
+#[test]
+fn switching_the_project_or_closing_the_window_stops_the_memory_server() {
+    let repo = TempRepo::new("memory-stop");
+    let other = TempRepo::new("memory-stop-other");
+    let bin = TempDir::new("memory-stop-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let site = server_site(&repo, &bin, |memory| memory);
+
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+    site.open(Repo::open(&other.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+    wait_gone(&servers(&bin)[0]);
+
+    // The other project's recalls are its own, from a server started there.
+    assert_eq!(recall(&site, "a.rs")["state"], "ready");
+    let started = servers(&bin);
+    assert_eq!(started.len(), 2);
+    drop(site);
+    wait_gone(&started[1]);
+}
+
+#[test]
+fn a_run_s_recall_is_for_its_notes_and_the_files_it_edited() {
+    let repo = TempRepo::new("memory-run");
+    repo.write("a.txt", "a\n");
+    let bin = TempDir::new("memory-run-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let (site, nudges) = run_site(&repo, "checks");
+    let path = bin.path().as_os_str().to_owned();
+    let site = site.with_memory(Memory::new(Scanner::new(move || path.clone())));
+    post_note(&site, "a.txt", 1, 1, "check it");
+    let (status, body) = send(&site, &["N1"]);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for(&site, &nudges, "ended");
+
+    let reply = settle(&site, &Method::GET, &format!("{RECALL}?run=R1"));
+    assert_eq!(reply["state"], "ready", "{reply}");
+    let sent = calls(&bin);
+    let text = sent
+        .lines()
+        .find(|line| line.contains(r#""name":"recall""#))
+        .unwrap();
+    assert!(
+        text.contains(r#""text":"a.txt\n\n"#),
+        "the edited file first: {text}"
+    );
+    assert!(text.contains("check it"), "the note: {text}");
+    assert!(
+        !text.contains("These are review notes"),
+        "without the words every prompt starts with: {text}"
+    );
+
+    let (status, body) = get(&site, &format!("{RECALL}?run=R9"));
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[test]
+fn the_real_hippius_mem_recalls_by_path_and_reads_a_memory_and_its_history() {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if agents::find_program(memory::PROGRAM, &path).is_none() {
+        eprintln!("skipped: hippius-mem is not installed on PATH");
+        return;
+    }
+    let repo = TempRepo::new("memory-real-server");
+    // hippius-mem names the repository from its origin: memory-real.
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.invalid/team/memory-real.git",
+    ]);
+    let home = TempDir::new("memory-real-server-home");
+    let model_cache = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".cache/hippius-mem/fastembed"))
+        .filter(|cache| cache.is_dir());
+    let scanner = Scanner::new(move || path.clone());
+    // A first start loads the embedding model: allow more than a call has in the app.
+    let memory = Memory::new(scanner.clone())
+        .with_home(home.path(), model_cache.as_deref())
+        .with_call_timeout(Duration::from_secs(120));
+    let site = Site::new(Some(&repo.config()), None, None, scanner, quiet()).with_memory(memory);
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+    site.memory.wait();
+    assert_eq!(post(&site, SETUP, "").0, StatusCode::OK);
+    let view = settled(&site);
+    let error = view["setup"]["error"].as_str().unwrap_or("");
+    if error.contains("embedding model") {
+        eprintln!("skipped: hippius-mem could not get its embedding model (no network?): {error}");
+        return;
+    }
+    assert_eq!(view["state"]["kind"], "ready", "{view}");
+
+    // hippius-mem 0.7.1 has no remember command: the notes go in through its server, before
+    // Postil's starts.
+    let remember = |summary: &str, body: &str| {
+        let note = serde_json::json!({
+            "note_type": "gotcha",
+            "summary": summary,
+            "body": body,
+            "repo": "memory-real",
+        });
+        site.memory.remember(&repo.root, &note)
+    };
+    let body = "# Lazy\n\nThe *parser* in `src/café notes.rs` waits for the first read.";
+    let id = remember(
+        "src/café notes.rs parses its notes lazily, on first use",
+        body,
+    );
+    remember(
+        "the build script regenerates icons.svg from the assets folder",
+        "Run it after adding an icon.",
+    );
+    remember(
+        "release tags are signed with the team's key",
+        "Use git tag -s.",
+    );
+
+    let refreshed = settle(&site, &Method::POST, REFRESH);
+    assert_eq!(refreshed["state"], "ready", "{refreshed}");
+
+    let reply = recall(&site, "src%2Fcaf%C3%A9%20notes.rs");
+    assert_eq!(reply["state"], "ready", "{reply}");
+    let pointers = reply["pointers"].as_array().unwrap();
+    assert!(
+        pointers.iter().any(|pointer| pointer["id"] == id.as_str()),
+        "{reply}"
+    );
+
+    let detail = settle(&site, &Method::GET, &format!("{MEMORY}?id={id}"));
+    assert_eq!(detail["state"], "ready", "{detail}");
+    assert_eq!(detail["body"], body);
+    let history = detail["history"].as_array().unwrap();
+    assert_eq!(history[0]["kind"], "Remember", "{detail}");
+    assert_eq!(history[0]["author"], detail["author"]);
+    assert!(
+        ["none", "local", "chain"].contains(&history[0]["anchor"].as_str().unwrap()),
+        "{detail}"
+    );
+}

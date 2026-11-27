@@ -1,5 +1,6 @@
 //! hippius-mem, the team's shared memory (docs/review-assist.md, "Milestone 9: team memory"):
-//! whether its program is installed and set up, and setting up a trial vault.
+//! whether its program is installed and set up, setting up a trial vault, and the memories
+//! the page shows, which its MCP server answers ("The memory server" below).
 //!
 //! Postil never bundles hippius-mem. It looks for the program on the agents' search path
 //! ([`Scanner`]) and asks `hippius-mem doctor` whether it is set up: exit 0 is
@@ -29,9 +30,46 @@
 //! is refused while the first runs, and so is a check, whose `doctor` would race the set up's
 //! writes. So the set up's own result is always stored, and its job is always the latest. A
 //! set up may start while an older check runs: that check's result is then dropped.
+//!
+//! # The memory server
+//!
+//! The page's recalls, a memory's body and history, and Refresh are calls to one hippius-mem
+//! MCP server per window (`client.rs`), started on the first call, in the open project's root
+//! for the reason doctor runs there. Every call runs on the thread named `memory`, which alone
+//! owns the server; the routes only queue a task and answer with what is known: the answer,
+//! or "pending", and the page asks again every 250 ms (owner decision, 2026-11-26: no new
+//! nudge). The queue holds [`QUEUE_CAP`] tasks at most, each once; a full queue drops the
+//! oldest recall for a file that is no longer open, then the oldest other recall or read.
+//! Answers are kept for the session, a failure only until it is read once, so asking again
+//! runs the call again. Refresh, a new check, a set up, a Rescan and another project drop them.
+//!
+//! - The first call on a server that just started has [`FIRST_CALL_TIMEOUT`], its start
+//!   included, and every later one [`CALL_TIMEOUT`]. A call that runs out of its limit is
+//!   reported, and its server is stopped: a server that hangs must not hold the memory thread,
+//!   and with it every later call. (A reply that came late would do no harm: replies are matched
+//!   by id, `client.rs`.)
+//! - A server that exits is started again once, at once, and the call runs again; a second
+//!   exit within [`RESTART_WINDOW`] is reported, and no server starts again until a new check
+//!   (Rescan, or Check in Settings). A server stopped for a timeout, another project, or the
+//!   window closing did not exit on its own and counts for nothing.
+//! - A server whose `tools/list` lacks a tool Postil calls, or that cannot start for want of
+//!   the program or its configuration, is not asked again until a new check either.
+//!
+//! Every recall passes the repository explicitly, named as hippius-mem names it
+//! ([`Repo::memory_name`]): a server in a checkout that `hippius-mem init` did not provision
+//! binds none (spike S3).
+//!
+//! Lock order: the state's lock is never held while a call waits, and nothing else is locked
+//! under it. Opening another project and closing the window kill the server's group under it,
+//! by the pid the worker clears under it before it reaps the process, so neither signals a pid
+//! that was reused.
 
+mod client;
+
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
+use std::hash::Hash;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -43,6 +81,9 @@ use serde::Serialize;
 
 use crate::agents::{self, Scanner};
 use crate::error::{Error, Result};
+use crate::memory::client::{CallError, Server, StartError};
+pub(crate) use crate::memory::client::{Detail, Recall, Refreshed};
+use crate::repo::Repo;
 
 /// The program's name on the search path.
 pub(crate) const PROGRAM: &str = "hippius-mem";
@@ -55,6 +96,36 @@ const DOCTOR_TIMEOUT: Duration = Duration::from_secs(10);
 /// (bge-small-en-v1.5, spike S3), which takes a minute on a slow link; `doctor`'s limit would
 /// kill every first set up.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long a call to a memory server that answered before may take. Arbitrary: a recall in a
+/// trial vault answered in under 100 ms on 2026-11-26 (hippius-mem 0.7.1).
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the first call on a server that just started may take, the start included.
+/// Arbitrary, chosen to cover the warmup as [`SETUP_TIMEOUT`] covers the model's download:
+/// hippius-mem answers `initialize` before its warmup (the embedding model's load and the
+/// op-log's sync, `hippius-mem/src/server.rs` at db9261b), and the first `recall` waits for it.
+/// A Hippius vault's cold warmup was measured near 20 s, so [`CALL_TIMEOUT`] would end every
+/// one. The page shows the recall pending meanwhile.
+const FIRST_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long `hippius-mem --version` may take. Arbitrary: it prints one line.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A second exit within this long of the first stops restarting the server (module docs).
+/// From the plan's edge case: "a second death in a minute".
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+/// The most tasks queued for the memory thread. Arbitrary: far above the files an engineer
+/// opens in the seconds a slow recall takes, and small enough that the oldest is still wanted.
+const QUEUE_CAP: usize = 32;
+
+/// The longest recall text sent, in bytes. Arbitrary: a query that long is no sharper, and it
+/// keeps a request far below a pipe's 16 KiB buffer (`client.rs`, module docs).
+const RECALL_TEXT_LIMIT: usize = 4096;
+
+/// The words doctor's and the server's error has when there is no configuration (spike S3).
+const NO_CONFIGURATION: &str = "failed to load configuration";
 
 /// The most of each output stream kept, in bytes. Arbitrary: far above the few lines
 /// `doctor` and `quickstart` print; the rest is read and dropped.
@@ -119,6 +190,13 @@ pub(crate) struct Memory {
     shared: Arc<Shared>,
     /// How long `doctor` may take: always [`DOCTOR_TIMEOUT`] outside tests.
     doctor_timeout: Duration,
+    /// How long a call may take: always [`CALL_TIMEOUT`] outside tests.
+    call_timeout: Duration,
+    /// How long the first call on a new server may take: always [`FIRST_CALL_TIMEOUT`] outside
+    /// tests.
+    first_call_timeout: Duration,
+    /// Always [`RESTART_WINDOW`] outside tests.
+    restart_window: Duration,
     /// The home the program runs in, in tests of the real program: the engineer's own
     /// configuration and vault are never touched.
     #[cfg(test)]
@@ -127,19 +205,25 @@ pub(crate) struct Memory {
 
 struct Shared {
     inner: Mutex<Inner>,
-    /// Signalled whenever a job stores its result.
+    /// Signalled whenever a job or a task stores its result.
     changed: Condvar,
+    /// Wakes the memory thread: a task was queued, the project changed, or the window closed.
+    work: Condvar,
 }
 
-/// Locked only to read or replace fields whole; never held while a job runs.
+/// Locked only to read a field, replace one whole, or change one with a single std call (a
+/// push, an insert, a remove, as `calls` is changed in place); never held while a job or a
+/// call runs.
 #[derive(Debug, Default)]
 struct Inner {
     /// The number of the latest job, 0 before the first.
     job: u64,
     state: Option<State>,
     setup: Option<Setup>,
-    /// The open project's root, where the program runs (module docs); `None` with no project.
-    project: Option<PathBuf>,
+    /// The open project, where the program runs (module docs); `None` with no project.
+    project: Option<Project>,
+    /// The memory server's tasks and answers (module docs, "The memory server").
+    calls: Calls,
     /// How many jobs have ended, stored or dropped, so a test can wait for a dropped one.
     #[cfg(test)]
     finished: u64,
@@ -160,8 +244,12 @@ impl Memory {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner::default()),
                 changed: Condvar::new(),
+                work: Condvar::new(),
             }),
             doctor_timeout: DOCTOR_TIMEOUT,
+            call_timeout: CALL_TIMEOUT,
+            first_call_timeout: FIRST_CALL_TIMEOUT,
+            restart_window: RESTART_WINDOW,
             #[cfg(test)]
             isolation: None,
         }
@@ -221,12 +309,19 @@ impl Memory {
         self.start(&mut inner, Job::Setup)
     }
 
-    /// Runs doctor in `root` from now on (module docs), and checks again there unless nothing
-    /// was checked yet (the first check runs there) or a set up runs (its own check follows
-    /// it). Does not wait for the check.
-    pub(crate) fn open_project(&self, root: &Path) {
+    /// Runs doctor and the memory server in `repo`'s root from now on (module docs), and checks
+    /// again there unless nothing was checked yet (the first check runs there) or a set up
+    /// runs (its own check follows it). The last project's server is stopped and its answers
+    /// dropped. Runs `git` once ([`Repo::memory_name`]); does not wait for the check.
+    pub(crate) fn open_project(&self, repo: &Repo) {
+        let project = Project {
+            root: repo.root().to_owned(),
+            repo: repo.memory_name(),
+        };
         let mut inner = self.lock();
-        inner.project = Some(root.to_owned());
+        inner.project = Some(project);
+        inner.calls.switch();
+        self.shared.work.notify_all();
         if inner.job == 0 || inner.setup == Some(Setup::Running) {
             return;
         }
@@ -241,7 +336,10 @@ impl Memory {
     fn start(&self, inner: &mut Inner, job: Job) -> Result<()> {
         let number = inner.job + 1;
         let memory = self.clone();
-        let dir = inner.project.clone().unwrap_or_else(std::env::temp_dir);
+        let dir = inner
+            .project
+            .as_ref()
+            .map_or_else(std::env::temp_dir, |project| project.root.clone());
         let name = match job {
             Job::Check => "memory-check",
             Job::Setup => "memory-setup",
@@ -288,6 +386,13 @@ impl Memory {
         }
         if inner.job == number {
             inner.state = Some(state);
+            // The state the engineer sees is new, so the memory server's is too: what it found
+            // unusable is asked again, and a start or call begun before this check can neither
+            // store what it finds nor mark the server unusable (module docs, "The memory
+            // server"). Here, at the end, and not when the check starts: a server start that
+            // fails during the check would otherwise latch its finding over the new state.
+            inner.calls.reset();
+            self.shared.work.notify_all();
         }
         #[cfg(test)]
         {
@@ -375,8 +480,9 @@ impl Memory {
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        // Poisoning is ignored: every field is replaced whole, so a panic cannot leave one
-        // half-written.
+        // Poisoning is ignored: no code panics with a field half-changed under this lock. Each
+        // field is replaced whole or changed by one std call (a push, an insert, a remove), and
+        // an allocation failure aborts rather than panics.
         self.shared
             .inner
             .lock()
@@ -390,6 +496,720 @@ impl fmt::Debug for Memory {
             .field("inner", &*self.lock())
             .finish_non_exhaustive()
     }
+}
+
+/// The memory server's side of [`Memory`] (module docs, "The memory server").
+impl Memory {
+    /// The recall for the open file `path`, and the label of the node selected in it when
+    /// there is one, as far as it is known. Marks `path` as the file open now, so a full queue
+    /// keeps its recall. Never waits for the call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoProject`] with no project open; [`Error::StartMemory`] when the memory
+    /// thread cannot start.
+    pub(crate) fn recall_file(&self, path: &str, node: Option<&str>) -> Result<Reply<Recall>> {
+        let text = match node {
+            Some(label) => format!("{path} {label}"),
+            None => path.to_owned(),
+        };
+        let query = Query {
+            text: cut(text),
+            file: Some(path.to_owned()),
+        };
+        self.lock().calls.open_file = Some(path.to_owned());
+        self.recall(query)
+    }
+
+    /// The recall for `text`, a run's prompt and changed paths, cut at [`RECALL_TEXT_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::recall_file`].
+    pub(crate) fn recall_run(&self, text: String) -> Result<Reply<Recall>> {
+        self.recall(Query {
+            text: cut(text),
+            file: None,
+        })
+    }
+
+    fn recall(&self, query: Query) -> Result<Reply<Recall>> {
+        let text = query.text.clone();
+        self.ask(Task::Recall(query), |calls| {
+            settled(&mut calls.recalls, &text)
+        })
+    }
+
+    /// Memory `id` whole, its history with it, as far as it is known.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::recall_file`].
+    pub(crate) fn detail(&self, id: MemoryId) -> Result<Reply<Detail>> {
+        let key = id.clone();
+        self.ask(Task::Detail(id), |calls| settled(&mut calls.details, &key))
+    }
+
+    /// Pulls the team's latest notes into the server's index: the first call queues it, and
+    /// each call after answers "pending" until it ended, then once with how it ended. The
+    /// answers kept are dropped when it succeeds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::recall_file`].
+    pub(crate) fn refresh(&self) -> Result<Reply<Refreshed>> {
+        self.ask(Task::Refresh, |calls| calls.refreshed.take())
+    }
+
+    /// Stops the memory thread and its server: the window closes. Does not wait for either.
+    pub(crate) fn close(&self) {
+        let mut inner = self.lock();
+        inner.calls.closed = true;
+        inner.calls.kill_server();
+        self.shared.work.notify_all();
+    }
+
+    /// The answer `answered` finds, else what stops the call, else `task` queued and
+    /// "pending". Starts the memory thread on the first call.
+    fn ask<T>(
+        &self,
+        task: Task,
+        answered: impl FnOnce(&mut Calls) -> Option<Answer<T>>,
+    ) -> Result<Reply<T>> {
+        let mut inner = self.lock();
+        if let Some(answer) = answered(&mut inner.calls) {
+            return Ok(match answer {
+                Ok(found) => Reply::Ready(found),
+                Err(error) => Reply::Failed { error },
+            });
+        }
+        if let Some(reply) = inner.calls.health.reply() {
+            return Ok(reply);
+        }
+        if inner.project.is_none() {
+            return Err(Error::NoProject);
+        }
+        if !inner.calls.worker {
+            let memory = self.clone();
+            std::thread::Builder::new()
+                .name("memory".to_owned())
+                .spawn(move || memory.serve())
+                .map_err(Error::StartMemory)?;
+            inner.calls.worker = true;
+        }
+        inner.calls.enqueue(task);
+        self.shared.work.notify_all();
+        Ok(Reply::Pending)
+    }
+
+    /// The memory thread: runs the queued tasks one at a time on the server it alone owns,
+    /// until the window closes.
+    fn serve(&self) {
+        let mut server: Option<Running> = None;
+        loop {
+            match self.next_task(server.as_ref().map(|running| running.epoch)) {
+                Wake::Closed => return self.stop(server.take()),
+                Wake::Moved => self.stop(server.take()),
+                Wake::Task(next) => self.run_task(&mut server, &next),
+            }
+        }
+    }
+
+    /// Waits for what the memory thread does next, and marks a task it takes as running.
+    /// `server` is the epoch of the server it runs, if any.
+    fn next_task(&self, server: Option<u64>) -> Wake {
+        let mut inner = self.lock();
+        loop {
+            let Inner { calls, project, .. } = &mut *inner;
+            if calls.closed {
+                return Wake::Closed;
+            }
+            if server.is_some_and(|epoch| epoch != calls.epoch) {
+                return Wake::Moved;
+            }
+            if let Some(task) = calls.queue.pop_front() {
+                calls.running = Some(task.clone());
+                return Wake::Task(Next {
+                    task,
+                    epoch: calls.epoch,
+                    project: project
+                        .clone()
+                        .expect("a task is queued only with a project open, which stays open"),
+                });
+            }
+            inner = self
+                .shared
+                .work
+                .wait(inner)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn run_task(&self, server: &mut Option<Running>, next: &Next) {
+        let repo = next.project.repo.as_deref();
+        match &next.task {
+            Task::Recall(query) => {
+                let arguments = RecallArguments {
+                    text: &query.text,
+                    repo,
+                };
+                let done = self.perform(server, next, |server, deadline| {
+                    server.call_tool("recall", &arguments, deadline)
+                });
+                self.store(next, done, |calls, answer| {
+                    calls.recalls.insert(query.text.clone(), answer);
+                });
+            }
+            Task::Detail(id) => {
+                let arguments = serde_json::json!({ "id": id.0 });
+                let done = self.perform(server, next, |server, deadline| {
+                    let note = server.call_tool("get", &arguments, deadline)?;
+                    let history = server.call_tool("history", &arguments, deadline)?;
+                    Ok(Detail::new(note, history))
+                });
+                self.store(next, done, |calls, answer| {
+                    calls.details.insert(id.clone(), answer);
+                });
+            }
+            Task::Refresh => {
+                let done = self.perform(server, next, |server, deadline| {
+                    server.call_tool("refresh", &serde_json::json!({}), deadline)
+                });
+                self.store(next, done, |calls, answer| {
+                    if answer.is_ok() {
+                        calls.recalls.clear();
+                        calls.details.clear();
+                    }
+                    calls.refreshed = Some(answer);
+                });
+            }
+        }
+    }
+
+    /// Runs `call` on the server, starting one first when none runs, and restarting it once
+    /// when it exits (module docs).
+    fn perform<T>(
+        &self,
+        server: &mut Option<Running>,
+        next: &Next,
+        mut call: impl FnMut(&mut Server, Instant) -> std::result::Result<T, CallError>,
+    ) -> Done<T> {
+        let mut restarted = false;
+        loop {
+            let stderr = match self.attempt(server, next, &mut call) {
+                Ok(found) => return Done::Found(found),
+                Err(Failure::Done(done)) => return done,
+                Err(Failure::TimedOut(limit)) => {
+                    self.stop(server.take());
+                    return Done::Failed(format!(
+                        "{PROGRAM} did not answer within {}",
+                        duration_words(limit)
+                    ));
+                }
+                Err(Failure::Exited(stderr)) => stderr,
+            };
+            self.stop(server.take());
+            match self.died(next.epoch, &stderr) {
+                Death::Restart if !restarted => restarted = true,
+                Death::Restart => return Done::Failed(exited(&stderr)),
+                Death::Halted(error) => return Done::Failed(error),
+                Death::Stopped => return Done::Unusable,
+            }
+        }
+    }
+
+    /// Runs `call` once, on the server, starting one first when none runs. One deadline covers
+    /// the start and the call: [`FIRST_CALL_TIMEOUT`] on a new server, else [`CALL_TIMEOUT`].
+    fn attempt<T>(
+        &self,
+        server: &mut Option<Running>,
+        next: &Next,
+        call: &mut impl FnMut(&mut Server, Instant) -> std::result::Result<T, CallError>,
+    ) -> std::result::Result<T, Failure<T>> {
+        let limit = match server {
+            Some(_) => self.call_timeout,
+            None => self.first_call_timeout,
+        };
+        let deadline = Instant::now() + limit;
+        let failure = |error| match error {
+            CallError::Exited { stderr } => Failure::Exited(stderr),
+            CallError::TimedOut => Failure::TimedOut(limit),
+            CallError::Refused(message) | CallError::Unreadable(message) => {
+                Failure::Done(Done::Failed(message))
+            }
+        };
+        if server.is_none() {
+            let running = self.spawn_server(next)?;
+            let running = server.insert(running);
+            if let Err(error) = self.handshake(running, next, deadline) {
+                self.stop(server.take());
+                return Err(error.map_or(Failure::Done(Done::Unusable), failure));
+            }
+        }
+        let running = server.as_mut().expect("a server was started above");
+        call(&mut running.server, deadline).map_err(failure)
+    }
+
+    /// Starts a server for `next`'s project and publishes its pid at once (module docs, "Lock
+    /// order"), so closing the window or opening another project stops it even while its
+    /// handshake hangs. A server that cannot start says why in the state's health.
+    fn spawn_server<T>(&self, next: &Next) -> std::result::Result<Running, Failure<T>> {
+        let search_path = self.agents.wait();
+        let Some(path) = find(&search_path) else {
+            self.unusable(next, Health::Missing);
+            return Err(Failure::Done(Done::Unusable));
+        };
+        let at = Place {
+            search_path: &search_path,
+            dir: &next.project.root,
+        };
+        let server = match Server::spawn(self.command(&path, &at, &[])) {
+            Ok(server) => server,
+            // Removed between the search and the start.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.unusable(next, Health::Missing);
+                return Err(Failure::Done(Done::Unusable));
+            }
+            Err(error) => {
+                let error = format!("cannot start {}: {error}", path.display());
+                return Err(Failure::Done(Done::Failed(error)));
+            }
+        };
+        let mut inner = self.lock();
+        if inner.calls.closed || inner.calls.epoch != next.epoch {
+            drop(inner);
+            drop(server);
+            return Err(Failure::Done(Done::Unusable));
+        }
+        inner.calls.server = Some(server.pid());
+        Ok(Running {
+            server,
+            epoch: next.epoch,
+            path,
+        })
+    }
+
+    /// Runs `running`'s MCP handshake by `deadline`. On failure, what the caller makes of the
+    /// call's error, or `None` when the health now says why (no configuration, or a server
+    /// that lacks a tool); the caller stops the server either way.
+    fn handshake(
+        &self,
+        running: &mut Running,
+        next: &Next,
+        deadline: Instant,
+    ) -> std::result::Result<(), Option<CallError>> {
+        match running.server.handshake(deadline) {
+            Ok(()) => Ok(()),
+            Err(StartError::Failed(CallError::Exited { stderr }))
+                if stderr.contains(NO_CONFIGURATION) =>
+            {
+                self.unusable(next, Health::Unconfigured(stderr));
+                Err(None)
+            }
+            Err(StartError::Failed(error)) => Err(Some(error)),
+            Err(StartError::Incompatible { missing, server }) => {
+                let search_path = self.agents.wait();
+                let at = Place {
+                    search_path: &search_path,
+                    dir: &next.project.root,
+                };
+                let version = self.version(&running.path, &at).unwrap_or(server);
+                let health = Health::Incompatible {
+                    server_version: version,
+                    missing,
+                };
+                self.unusable(next, health);
+                Err(None)
+            }
+        }
+    }
+
+    /// The version `hippius-mem --version` prints, without the program's name; `None` when it
+    /// prints none.
+    fn version(&self, path: &Path, at: &Place<'_>) -> Option<String> {
+        let command = self.command(path, at, &["--version"]);
+        let Outcome::Exited {
+            code: Some(0),
+            stdout,
+            ..
+        } = run(command, VERSION_TIMEOUT)
+        else {
+            return None;
+        };
+        let version = stdout.strip_prefix(PROGRAM).unwrap_or(&stdout).trim();
+        (!version.is_empty()).then(|| version.to_owned())
+    }
+
+    /// Records that the server cannot serve: no task is run until a new check.
+    fn unusable(&self, next: &Next, health: Health) {
+        let mut inner = self.lock();
+        if !inner.calls.closed && inner.calls.epoch == next.epoch {
+            inner.calls.health = health;
+            // Each would fail the same way; the page's next ask reads the health.
+            inner.calls.queue.clear();
+        }
+    }
+
+    /// What the server's exit means: it was stopped (another project, the window closing), or
+    /// it died, once or twice within the window (module docs).
+    fn died(&self, epoch: u64, stderr: &str) -> Death {
+        let mut inner = self.lock();
+        let calls = &mut inner.calls;
+        if calls.closed || calls.epoch != epoch {
+            return Death::Stopped;
+        }
+        let now = Instant::now();
+        let again = calls
+            .last_death
+            .is_some_and(|last| now.duration_since(last) < self.restart_window);
+        calls.last_death = Some(now);
+        if !again {
+            return Death::Restart;
+        }
+        let error = format!(
+            "{PROGRAM} exited twice within {}, and is not started again until Rescan in \
+             Settings{}",
+            duration_words(self.restart_window),
+            last_words(stderr)
+        );
+        calls.health = Health::Halted(error.clone());
+        calls.queue.clear();
+        Death::Halted(error)
+    }
+
+    /// Stores what a task found, unless the project changed while it ran.
+    fn store<T>(&self, next: &Next, done: Done<T>, put: impl FnOnce(&mut Calls, Answer<T>)) {
+        let mut inner = self.lock();
+        let calls = &mut inner.calls;
+        calls.running = None;
+        if calls.epoch == next.epoch {
+            match done {
+                Done::Found(found) => put(calls, Ok(found)),
+                Done::Failed(error) => put(calls, Err(error)),
+                Done::Unusable => {}
+            }
+        }
+        self.shared.changed.notify_all();
+    }
+
+    /// Ends `server`: its pid is cleared under the lock before it is reaped (module docs,
+    /// "Lock order").
+    fn stop(&self, server: Option<Running>) {
+        let Some(running) = server else { return };
+        self.lock().calls.server = None;
+        drop(running);
+    }
+}
+
+/// A memory's id, checked: `mem_` and one or more digits or capital letters, as hippius-mem
+/// writes them (a ULID). Nothing else reaches a call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MemoryId(String);
+
+impl MemoryId {
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] for anything that is not such an id.
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let valid = raw.strip_prefix("mem_").is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+        });
+        if !valid {
+            return Err(Error::BadRequest(format!(
+                "memory id {raw:?}: expected mem_ and digits or capital letters"
+            )));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+}
+
+/// A route's answer, as the page reads it: `state` names the variant.
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum Reply<T> {
+    /// Asked; ask again.
+    Pending,
+    Ready(T),
+    /// hippius-mem cannot run here; `message` says why, in its words when it gave some.
+    Unavailable {
+        reason: UnavailableReason,
+        message: String,
+    },
+    /// This hippius-mem lacks the tools `missing`.
+    #[serde(rename_all = "camelCase")]
+    Incompatible {
+        server_version: String,
+        postil_version: &'static str,
+        missing: Vec<&'static str>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum UnavailableReason {
+    Missing,
+    Unconfigured,
+}
+
+/// What a call found, or why it failed.
+type Answer<T> = std::result::Result<T, String>;
+
+/// The open project, as the program runs in it.
+#[derive(Debug, Clone)]
+struct Project {
+    root: PathBuf,
+    /// The repository's name in hippius-mem ([`Repo::memory_name`]).
+    repo: Option<String>,
+}
+
+/// A call the memory thread runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Task {
+    Recall(Query),
+    Detail(MemoryId),
+    Refresh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Query {
+    /// What is recalled for, and the key its answer is kept under.
+    text: String,
+    /// The file it was asked for while open, for a file's recall.
+    file: Option<String>,
+}
+
+/// The memory server's tasks and answers, in the state's lock (module docs).
+#[derive(Default)]
+struct Calls {
+    /// Whether the memory thread was started; it runs until `closed`.
+    worker: bool,
+    closed: bool,
+    /// Counts the projects opened. A task's answer is stored only in the epoch it was taken
+    /// in, and a server of an older one is stopped.
+    epoch: u64,
+    /// The file the page shows, the one whose recall a full queue keeps.
+    open_file: Option<String>,
+    /// At most [`QUEUE_CAP`] tasks, each once, none of them `running`.
+    queue: VecDeque<Task>,
+    running: Option<Task>,
+    recalls: HashMap<String, Answer<Recall>>,
+    details: HashMap<MemoryId, Answer<Detail>>,
+    /// The last refresh's ending, until read.
+    refreshed: Option<Answer<Refreshed>>,
+    health: Health,
+    /// When the server last exited on its own (module docs).
+    last_death: Option<Instant>,
+    /// The running server's pid, while the memory thread has not reaped it.
+    server: Option<u32>,
+}
+
+impl Calls {
+    /// Forgets what made the server unusable, and the answers kept: a new check. Starts a new
+    /// epoch, so nothing begun before it stores an answer or a health, and its server stops.
+    fn reset(&mut self) {
+        self.epoch += 1;
+        self.health = Health::Usable;
+        self.last_death = None;
+        self.recalls.clear();
+        self.details.clear();
+    }
+
+    /// Another project opened: everything of the last one goes, its server first.
+    fn switch(&mut self) {
+        self.reset();
+        self.queue.clear();
+        self.open_file = None;
+        self.refreshed = None;
+        self.kill_server();
+    }
+
+    /// Kills the running server's group, which the memory thread then reaps.
+    fn kill_server(&self) {
+        if let Some(pid) = self.server {
+            agents::kill_group(pid);
+        }
+    }
+
+    /// Queues `task` unless it is queued or running already. A full queue drops one first:
+    /// the oldest recall for a file that is not open, else the oldest recall or read.
+    fn enqueue(&mut self, task: Task) {
+        if self.running.as_ref() == Some(&task) || self.queue.contains(&task) {
+            return;
+        }
+        if self.queue.len() == QUEUE_CAP {
+            let open = self.open_file.as_deref();
+            let closed_file = self.queue.iter().position(|queued| match queued {
+                Task::Recall(query) => query.file.is_some() && query.file.as_deref() != open,
+                Task::Detail(_) | Task::Refresh => false,
+            });
+            let index = closed_file
+                .or_else(|| {
+                    self.queue
+                        .iter()
+                        .position(|queued| !matches!(queued, Task::Refresh))
+                })
+                .expect("a full queue holds one refresh at most, and more than one task");
+            self.queue.remove(index);
+        }
+        self.queue.push_back(task);
+    }
+}
+
+impl fmt::Debug for Calls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Sizes only: the answers are teammates' notes.
+        f.debug_struct("Calls")
+            .field("worker", &self.worker)
+            .field("closed", &self.closed)
+            .field("epoch", &self.epoch)
+            .field("queued", &self.queue.len())
+            .field("running", &self.running.is_some())
+            .field("recalls", &self.recalls.len())
+            .field("details", &self.details.len())
+            .field("health", &self.health)
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether the server can be asked.
+#[derive(Debug, Clone, Default)]
+enum Health {
+    #[default]
+    Usable,
+    Missing,
+    /// It found no configuration; its message.
+    Unconfigured(String),
+    Incompatible {
+        server_version: String,
+        missing: Vec<&'static str>,
+    },
+    /// It exited twice within the window; the error the page shows.
+    Halted(String),
+}
+
+impl Health {
+    /// What every call answers while the server cannot be asked; `None` when it can.
+    fn reply<T>(&self) -> Option<Reply<T>> {
+        Some(match self {
+            Self::Usable => return None,
+            Self::Missing => Reply::Unavailable {
+                reason: UnavailableReason::Missing,
+                message: format!("{PROGRAM} is not installed on PATH"),
+            },
+            Self::Unconfigured(message) => Reply::Unavailable {
+                reason: UnavailableReason::Unconfigured,
+                message: message.clone(),
+            },
+            Self::Incompatible {
+                server_version,
+                missing,
+            } => Reply::Incompatible {
+                server_version: server_version.clone(),
+                postil_version: env!("CARGO_PKG_VERSION"),
+                missing: missing.clone(),
+            },
+            Self::Halted(error) => Reply::Failed {
+                error: error.clone(),
+            },
+        })
+    }
+}
+
+/// What the memory thread does next.
+enum Wake {
+    Closed,
+    /// Another project opened: its server stops.
+    Moved,
+    Task(Next),
+}
+
+/// A task taken from the queue, with what it runs in.
+struct Next {
+    task: Task,
+    epoch: u64,
+    project: Project,
+}
+
+/// The memory thread's server, the epoch it was started in, and its program.
+#[derive(Debug)]
+struct Running {
+    server: Server,
+    epoch: u64,
+    path: PathBuf,
+}
+
+/// How a task ended.
+enum Done<T> {
+    Found(T),
+    Failed(String),
+    /// Nothing to store: the server cannot be asked (the health says why), or the project
+    /// changed.
+    Unusable,
+}
+
+/// Why an attempt at a call did not find its answer.
+enum Failure<T> {
+    /// The server's output ended; the end of its standard error.
+    Exited(String),
+    /// No answer came within this limit.
+    TimedOut(Duration),
+    Done(Done<T>),
+}
+
+/// What a server's exit means (`Memory::died`).
+enum Death {
+    Restart,
+    Halted(String),
+    Stopped,
+}
+
+#[derive(Serialize)]
+struct RecallArguments<'a> {
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<&'a str>,
+}
+
+/// The answer kept in `answers` under `key`: a found one stays, a failure is read once.
+fn settled<K: Hash + Eq, T: Clone>(
+    answers: &mut HashMap<K, Answer<T>>,
+    key: &K,
+) -> Option<Answer<T>> {
+    match answers.get(key)? {
+        Ok(found) => Some(Ok(found.clone())),
+        Err(_) => answers.remove(key),
+    }
+}
+
+/// `text` cut at [`RECALL_TEXT_LIMIT`], on a character boundary.
+fn cut(mut text: String) -> String {
+    text.truncate(text.floor_char_boundary(RECALL_TEXT_LIMIT));
+    text
+}
+
+fn exited(stderr: &str) -> String {
+    format!("{PROGRAM} exited{}", last_words(stderr))
+}
+
+/// `stderr`, the end of what the server printed there, after a colon; nothing when empty.
+fn last_words(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
+/// `duration` as the page says it, in whole seconds: every limit here is.
+fn duration_words(duration: Duration) -> String {
+    format!("{} s", duration.as_secs())
 }
 
 /// Why team memory cannot be turned on in `state`, or `None` when it is ready.
@@ -545,6 +1365,61 @@ impl Memory {
     pub(crate) fn with_doctor_timeout(mut self, timeout: Duration) -> Self {
         self.doctor_timeout = timeout;
         self
+    }
+
+    /// Replaces how long a call to the memory server may take.
+    pub(crate) fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    /// Replaces how long the first call on a new server may take.
+    pub(crate) fn with_first_call_timeout(mut self, timeout: Duration) -> Self {
+        self.first_call_timeout = timeout;
+        self
+    }
+
+    /// Replaces the window within which a second exit halts the server.
+    pub(crate) fn with_restart_window(mut self, window: Duration) -> Self {
+        self.restart_window = window;
+        self
+    }
+
+    /// Remembers `note` (the arguments of hippius-mem's `remember`) through a server of its
+    /// own in `dir`, which exits before this returns, and gives the memory's id. hippius-mem
+    /// 0.7.1 has no command that remembers: a test seeds its vault this way.
+    pub(crate) fn remember(&self, dir: &Path, note: &serde_json::Value) -> String {
+        #[derive(serde::Deserialize)]
+        struct Remembered {
+            id: String,
+        }
+        let search_path = self.agents.wait();
+        let path = find(&search_path).expect("the test checked that hippius-mem is installed");
+        let at = Place {
+            search_path: &search_path,
+            dir,
+        };
+        let deadline = Instant::now() + self.call_timeout;
+        let mut server = Server::spawn(self.command(&path, &at, &[])).expect("the server starts");
+        server
+            .handshake(deadline)
+            .expect("the server answers its handshake");
+        let remembered: Remembered = server
+            .call_tool("remember", note, deadline)
+            .expect("hippius-mem remembers the note");
+        remembered.id
+    }
+
+    /// Waits until the memory thread has run every task queued.
+    pub(crate) fn wait_idle(&self) {
+        let mut inner = self.lock();
+        while !inner.calls.queue.is_empty() || inner.calls.running.is_some() {
+            inner = self
+                .shared
+                .changed
+                .wait(inner)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Runs the program in `home`, reading the embedding model from `model_cache`.

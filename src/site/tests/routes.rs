@@ -40,6 +40,13 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         &[Method::POST],
         "POST {\"agents\": [...], \"customAgents\": [...]}",
     ),
+    ("/api/memory", &[Method::GET], "GET ?id=mem_..."),
+    (
+        "/api/memory/recall",
+        &[Method::GET],
+        "GET ?path=<path>&node=<node label>, or ?run=R1",
+    ),
+    ("/api/memory/refresh", &[Method::POST], "POST with no body"),
     ("/api/memory/check", &[Method::POST], "POST with no body"),
     ("/api/memory/setup", &[Method::POST], "POST with no body"),
     ("/api/usage", &[Method::GET], "GET"),
@@ -144,7 +151,6 @@ fn a_path_that_is_no_route_is_not_found_whatever_the_method() {
         "/api/runs/R1",
         "/api/analysisx",
         "/api/analysis/nothing",
-        "/api/memory",
         "/api/memoryx",
         "/api/memory/nothing",
     ] {

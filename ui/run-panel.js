@@ -17,7 +17,8 @@ import { foldRun, isLive, openPermission, permissionKey, permissionKeys } from "
 // tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
 // by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
 // file in the code pane; `reviewers()` names the settings' reviewers, in order;
-// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane.
+// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
+// `openMemory(id)` opens a team memory's dialog.
 export function runPanel({
   panelEl,
   headerEl,
@@ -31,6 +32,7 @@ export function runPanel({
   openFile,
   reviewers,
   showChanges,
+  openMemory,
 }) {
   // `tab` is built below: the store draws only after a fetch, never while it is built.
   const store = runStore({ render: () => tab.render(), onChange, onLoaded, onError });
@@ -42,6 +44,7 @@ export function runPanel({
     openFile,
     reviewers,
     showChanges,
+    openMemory,
     onError,
   });
   const tab = runTab({ store, dialog, panelEl, headerEl, statusEl });

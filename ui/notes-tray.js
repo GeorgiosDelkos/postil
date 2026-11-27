@@ -20,7 +20,8 @@ import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 // - `deleteNote(note)` deletes a note;
 // - `openSettings()` opens the settings;
 // - `beforeSend()` clears the way for the send step, and returns false when it cannot open;
-// - `restoreHeader()` gives the code pane's header back to the open file.
+// - `restoreHeader()` gives the code pane's header back to the open file;
+// - `onTab(tab)` is told the tab shown, "notes", "run" or "memory", each time one is chosen.
 export function notesTray({
   state,
   notesEl,
@@ -32,6 +33,7 @@ export function notesTray({
   openSettings,
   beforeSend,
   restoreHeader,
+  onTab,
 }) {
   const previewEl = $("prompt-preview");
   const sendBarEl = $("send-bar");
@@ -467,21 +469,30 @@ export function notesTray({
 
   // ---- The tabs ---------------------------------------------------------------------------
 
+  // Each tab's button, panel and part of the tray header, by element id.
+  const TABS = {
+    notes: { tab: "tab-notes", panel: "notes", header: "note-count" },
+    run: { tab: "tab-run", panel: "run", header: "run-header" },
+    memory: { tab: "tab-memory", panel: "memory", header: "memory-header" },
+  };
+
   function showTab(tab) {
     state.tab = tab;
-    const run = tab === "run";
-    if (run) closeSend();
-    $("tab-notes").setAttribute("aria-selected", String(!run));
-    $("tab-run").setAttribute("aria-selected", String(run));
-    notesEl.hidden = run;
-    $("run").hidden = !run;
-    $("note-count").hidden = run;
-    $("run-header").hidden = !run;
+    // The send step belongs to the notes: another tab ends it, and the send bar hides.
+    if (tab !== "notes") closeSend();
+    for (const [name, ids] of Object.entries(TABS)) {
+      const chosen = name === tab;
+      $(ids.tab).setAttribute("aria-selected", String(chosen));
+      $(ids.panel).hidden = !chosen;
+      $(ids.header).hidden = !chosen;
+    }
     renderSendBar();
+    onTab(tab);
   }
 
   $("tab-notes").addEventListener("click", () => showTab("notes"));
   $("tab-run").addEventListener("click", () => showTab("run"));
+  $("tab-memory").addEventListener("click", () => showTab("memory"));
   $("agent-status").addEventListener("click", () => showTab("run"));
 
   return {

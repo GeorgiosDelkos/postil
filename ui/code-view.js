@@ -30,7 +30,8 @@ const DEFINITIONS_POLL_MS = 250;
 // - `headerHeld()` says whether another view holds the pane's header, so a file read again
 //   under it leaves the header alone;
 // - `onComposerClosed()` redraws what a saved note changes outside the code;
-// - `onAsked()` follows the run a question asked from the composer started.
+// - `onAsked()` follows the run a question asked from the composer started;
+// - `onFileOpened()` is told a file was opened, not read again (the Memory tab recalls for it).
 export function codeView({
   state,
   codeEl,
@@ -44,6 +45,7 @@ export function codeView({
   headerHeld,
   onComposerClosed,
   onAsked,
+  onFileOpened,
 }) {
   // One code line's height in px: `--line-height` in app.css until the settings arrive, then
   // what they give (`setLineHeight`).
@@ -86,6 +88,7 @@ export function codeView({
       return "missing";
     }
     showFile(path, reply, { keepView: false });
+    onFileOpened();
     return "shown";
   }
 

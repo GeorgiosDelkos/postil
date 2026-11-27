@@ -371,6 +371,11 @@ fn change_notes(
     Ok(review)
 }
 
+/// How a prompt of notes starts, before `report::ASK` and the notes.
+pub(crate) const INTRO: &str = "These are review notes an engineer wrote while reading this \
+     repository.\nAddress every note. Change nothing the notes do not ask for.\nWhen you \
+     finish, list each note id with one line on what you did.\n";
+
 /// The prompt that sends the notes `ids` to an agent, in that order (docs/design.md, "The
 /// prompt"): an introduction, then each note's heading, a line note's quoted snippet, and its
 /// body. The quoted snippet travels with a line note because line numbers go stale the moment
@@ -384,11 +389,7 @@ fn change_notes(
 pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
     let wanted = parse_ids(ids)?;
     let review = current(repo)?;
-    let mut text = String::from(
-        "These are review notes an engineer wrote while reading this repository.\n\
-         Address every note. Change nothing the notes do not ask for.\n\
-         When you finish, list each note id with one line on what you did.\n",
-    );
+    let mut text = String::from(INTRO);
     text.push_str(report::ASK);
     let mut files: Vec<String> = Vec::new();
     for id in &wanted {

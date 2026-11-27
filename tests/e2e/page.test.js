@@ -757,6 +757,60 @@ test("Set up a trial vault shows what quickstart printed and turns team memory o
   assert.equal((await api("api/settings")).settings.agentMemory, true);
 });
 
+test("the Memory tab recalls only while it shows, keeps the send bar hidden, and opens a memory", async (t) => {
+  const { page, api } = await openProject(t, "plain", "new-memory-server");
+  const recalls = [];
+  page.on("request", (request) => {
+    if (request.url().includes("api/memory/recall")) recalls.push(request.url());
+  });
+  // An open note puts the send bar on the Review tab.
+  await addNote(api, "check this");
+  await page.reload();
+  await page.locator("#send-bar").waitFor();
+
+  await openFile(page, "src/a.rs");
+  await openFile(page, "src/b.rs");
+  assert.deepEqual(recalls, [], "no recall while the Memory tab is closed");
+
+  await page.locator("#tab-memory").click();
+  assert.equal(await page.locator("#send-bar").isVisible(), false);
+  const cards = page.locator("#memory .memory-card");
+  await cards.first().waitFor();
+  assert.equal(recalls.length >= 1 && recalls[0].endsWith("path=src%2Fb.rs"), true, recalls.join());
+  assert.equal(await page.locator("#memory .memory-weak .memory-card").count(), 1);
+  assert.match(await page.locator("#memory .memory-weak").textContent(), /^Possibly related/);
+
+  // A file opened while the tab shows is recalled for.
+  const recalled = page.waitForRequest((request) => request.url().endsWith("path=src%2Fc.rs"));
+  await openFile(page, "src/c.rs");
+  await recalled;
+
+  await cards.filter({ hasText: "a.rs parses lazily" }).click();
+  const dialog = page.locator("#memory-dialog");
+  await dialog.locator(".run-message").filter({ hasText: "It is lazy." }).waitFor();
+  assert.equal(await dialog.locator(".run-message em").textContent(), "is");
+  await dialog.getByText("Edit · 5CrAuthor · anchored in the vault").waitFor();
+  await page.keyboard.press("Escape");
+
+  await page.locator("#tab-notes").click();
+  await page.locator("#send-bar").waitFor();
+});
+
+test("a run's dialog shows what the team recorded about its notes and changes", async (t) => {
+  const { page, api } = await openProject(t, "plain", "new-memory-server");
+  const note = await addNote(api, "Rename two.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  // Pending first, then the cards, the guess under "Possibly related".
+  const section = detail.locator(".note-dialog-section").filter({ hasText: /^Memory/ });
+  await section.locator(".memory-card").first().waitFor();
+  assert.equal(await section.locator(".memory-weak .memory-card").count(), 1);
+  await section.locator(".memory-card").filter({ hasText: "a.rs parses lazily" }).click();
+  await page.locator("#memory-dialog .run-message").filter({ hasText: "It is lazy." }).waitFor();
+});
+
 // The longest name a custom agent may have (MAX_NAME in src/settings.rs).
 const LONG_NAME = "An agent whose name runs to forty chars!";
 

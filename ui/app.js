@@ -13,6 +13,8 @@ import { contextMenu } from "./context-menu.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
+import { memoryDialog } from "./memory-dialog.js";
+import { memoryTab } from "./memory-tab.js";
 import { noteDialog } from "./note-dialog.js";
 import { onLines } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
@@ -70,7 +72,7 @@ const state = {
   // The send step while it is open: the ids of the notes ticked, and the agent chosen for
   // this send. The code pane then shows the prompt instead of the file.
   send: null,
-  // Which of the tray's tabs shows: "notes" or "run".
+  // Which of the tray's tabs shows: "notes", "run" or "memory".
   tab: "notes",
 };
 
@@ -111,6 +113,7 @@ const code = codeView({
   },
   // The ask's card shows its run, as a note sent alone does.
   onAsked: () => runs.sync(),
+  onFileOpened: () => memory.fileOpened(),
 });
 
 const runs = runPanel({
@@ -126,6 +129,7 @@ const runs = runPanel({
   openNote: (id) => noteDetail.open(id),
   openFile: (path) => code.openFile(path),
   reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
+  openMemory: (id) => memoryDetail.open(id),
   showChanges: (from, to) => {
     tray.closeSend();
     // A walkthrough belongs to one run (docs/review-assist.md, "Guided walkthrough and risk").
@@ -149,6 +153,18 @@ const tray = notesTray({
   openSettings: () => settings.open(),
   beforeSend,
   restoreHeader: () => code.restoreHeader(),
+  onTab: (tab) => (tab === "memory" ? memory.show() : memory.hide()),
+});
+
+// Team memory: the tray's Memory tab and a memory's dialog. The node is the map's selected
+// node's label, which the map pane (step 8.3) gives; none until then.
+const memoryDetail = memoryDialog($("memory-dialog"));
+const memory = memoryTab({
+  panelEl: $("memory"),
+  headerEl: $("memory-header"),
+  currentFile: () => (state.file ? { path: state.file.path, node: null } : null),
+  openMemory: (id) => memoryDetail.open(id),
+  openSettings: () => settings.open(),
 });
 
 // What a run changed, over the open file; Esc, or opening a file, gives the pane back.
