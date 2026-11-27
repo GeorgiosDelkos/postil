@@ -832,7 +832,13 @@ window.postil = {
       return () => dictationListeners.delete(listener);
     },
     emit(event) {
-      for (const listener of dictationListeners) listener(event);
+      for (const listener of Array.from(dictationListeners)) {
+        try {
+          listener(event);
+        } catch (error) {
+          console.error(error);
+        }
+      }
     },
   },
 };

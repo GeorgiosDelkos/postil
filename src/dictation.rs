@@ -147,9 +147,18 @@ const MAX_SEAM_WORDS: usize = 6;
 ///
 /// Non-finite samples are ignored so malformed buffers cannot produce `NaN`.
 pub(crate) fn level(samples: &[f32]) -> f32 {
+    level_strided(samples, 1)
+}
+
+/// Computes a normalized RMS level in `0.0..=1.0` stepping through `samples` by `stride`
+/// (1 for deinterleaved mono, channel count for interleaved buffers).
+pub(crate) fn level_strided(samples: &[f32], stride: usize) -> f32 {
+    if stride == 0 {
+        return 0.0;
+    }
     let mut sum_sq: f64 = 0.0;
     let mut count: usize = 0;
-    for &sample in samples {
+    for &sample in samples.iter().step_by(stride) {
         if sample.is_finite() {
             let clamped = f64::from(sample.clamp(-1.0, 1.0));
             sum_sq += clamped * clamped;
@@ -249,11 +258,10 @@ pub(crate) fn join_seam(committed: &str, next: &str) -> String {
     for width in (1..=max_overlap).rev() {
         let left_tail = &left[left.len() - width..];
         let right_head = &right[..width];
-        if left_tail
-            .iter()
-            .zip(right_head.iter())
-            .all(|(a, b)| normalize_word(a) == normalize_word(b))
-        {
+        if left_tail.iter().zip(right_head.iter()).all(|(a, b)| {
+            let na = normalize_word(a);
+            !na.is_empty() && na == normalize_word(b)
+        }) {
             overlap = width;
             break;
         }
@@ -272,10 +280,10 @@ pub(crate) fn join_seam(committed: &str, next: &str) -> String {
 }
 
 /// Normalizes a single whitespace-delimited token for seam comparison: strips surrounding
-/// punctuation and lowercases.
+/// non-alphanumeric punctuation (including Unicode smart quotes/dashes) and lowercases.
 fn normalize_word(word: &str) -> String {
-    word.trim_matches(|ch: char| ch.is_ascii_punctuation())
-        .to_ascii_lowercase()
+    word.trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_lowercase()
 }
 
 // ---- Public preflight check (used by tests/cli_errors.rs) ----------------------------------
@@ -348,6 +356,13 @@ impl Dictation {
         self.inner.stop();
     }
 
+    /// Handles the app window losing focus: stops only if actively recording (`Listening`), so
+    /// macOS TCC permission alerts shown during `Starting` do not abort the start flow.
+    pub(crate) fn on_focus_lost(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.inner.on_focus_lost();
+    }
+
     /// Cancels recording immediately, discarding any pending partial and releasing the engine.
     pub(crate) fn cancel(&mut self) {
         #[cfg(target_os = "macos")]
@@ -381,6 +396,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use block2::RcBlock;
+    use objc2::AnyThread;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool, ProtocolObject};
     use objc2_avf_audio::{
@@ -395,7 +411,7 @@ mod macos {
         SFSpeechRecognitionTaskHint, SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
     };
 
-    use super::{Callbacks, Event, Internal, Rollover, StartOptions, State, level};
+    use super::{Callbacks, Event, Internal, Rollover, StartOptions, State, level, level_strided};
 
     /// Minimum interval between `Event::Level` updates (~25 Hz).
     const LEVEL_INTERVAL_MS: u64 = 40;
@@ -415,7 +431,10 @@ mod macos {
 
     // SAFETY: `SFSpeechAudioBufferRecognitionRequest` is documented by Apple to accept
     // `appendAudioPCMBuffer:` calls from the real-time audio tap thread while controlled from
-    // the main thread. Access is additionally serialized by a `Mutex`.
+    // the main thread. `ActiveSession` keeps its own retained clone on the main thread, and
+    // Objective-C retain/release is atomic; the main thread only calls `endAudio()` after
+    // `TapShared::swap_request` acquires the mutex and removes the tap's reference, establishing
+    // a happens-after edge so `endAudio()` never races with `appendAudioPCMBuffer:`.
     unsafe impl Send for SendRequest {}
 
     /// Shared handle between the main thread and the audio tap closure.
@@ -544,6 +563,14 @@ mod macos {
                     drop(spawned);
                 }
                 State::Idle | State::Stopping | State::Denied | State::Restricted => {}
+            }
+        }
+
+        pub(super) fn on_focus_lost(&mut self) {
+            // Only stop when actively capturing audio; macOS TCC permission dialogs steal
+            // window focus during `State::Starting` and must not abort the permission flow.
+            if self.state == State::Listening {
+                self.stop();
             }
         }
 
@@ -690,9 +717,16 @@ mod macos {
         }
 
         fn begin_listening(&mut self) {
-            // SAFETY: `SFSpeechRecognizer::new` allocates and initializes a recognizer for the
-            // system locale; we check availability and on-device support before starting a task.
-            let recognizer = unsafe { SFSpeechRecognizer::new() };
+            let alloc = SFSpeechRecognizer::alloc();
+            // SAFETY: `SFSpeechRecognizer::init` is the failable designated initializer for the
+            // system locale; returning `None` on an unsupported locale avoids `new()` panicking.
+            let Some(recognizer) = (unsafe { SFSpeechRecognizer::init(alloc) }) else {
+                self.emit(Event::Error {
+                    message: NO_ON_DEVICE_MSG.to_owned(),
+                });
+                self.set_state(State::Idle, None);
+                return;
+            };
             // SAFETY: `supportsOnDeviceRecognition` is a read-only property on the recognizer.
             let on_device = unsafe { recognizer.supportsOnDeviceRecognition() };
             if !on_device {
@@ -779,6 +813,7 @@ mod macos {
                 return;
             }
 
+            let mut emitted_final = false;
             if let Some(text) = text {
                 let combined = if is_final {
                     active.rollover.on_final(&text)
@@ -786,9 +821,11 @@ mod macos {
                     active.rollover.on_partial(&text)
                 };
                 if !combined.is_empty() {
+                    let final_flag = is_final && self.state == State::Stopping;
+                    emitted_final = final_flag;
                     self.emit(Event::Transcript {
                         text: combined,
-                        is_final: is_final && self.state == State::Stopping,
+                        is_final: final_flag,
                     });
                 }
             }
@@ -796,6 +833,15 @@ mod macos {
             if self.state == State::Stopping {
                 if is_final || error.is_some() {
                     if let Some(mut active) = self.active.take() {
+                        if !emitted_final {
+                            let flushed = active.rollover.text();
+                            if !flushed.is_empty() {
+                                self.emit(Event::Transcript {
+                                    text: flushed,
+                                    is_final: true,
+                                });
+                            }
+                        }
                         teardown_session(&mut active);
                     }
                     self.set_state(State::Idle, None);
@@ -883,6 +929,9 @@ mod macos {
                 self.set_state(State::Idle, None);
             } else {
                 active.tap_installed = true;
+                // Start a fresh recognition request/task for the new hardware input format and
+                // install it into `active.tap` (which `stop_audio_capture` cleared to `None`).
+                self.rollover_task();
             }
         }
     }
@@ -1099,16 +1148,32 @@ mod macos {
             return 0.0;
         }
         // SAFETY: `floatChannelData` returns null when the buffer is not float32 PCM, or a
-        // pointer to `channels` channel pointers each of length `frameLength`.
+        // pointer to `channels` channel pointers each covering `frameLength` frames with `stride`.
         let channel_ptrs = unsafe { pcm.floatChannelData() };
         if channel_ptrs.is_null() {
             return 0.0;
         }
+        // SAFETY: `stride` is the sample spacing for channel 0 (1 when deinterleaved).
+        let stride = unsafe { pcm.stride() };
+        let Some(total) = frames.checked_mul(stride) else {
+            return 0.0;
+        };
+        if stride == 0 || total == 0 {
+            return 0.0;
+        }
         // SAFETY: `channel_ptrs` is non-null and `channels >= 1`, so index 0 is valid.
         let ch0 = unsafe { *channel_ptrs };
-        // SAFETY: `ch0` points to `frames` contiguous `f32` samples valid for this callback.
-        let samples = unsafe { std::slice::from_raw_parts(ch0.as_ptr(), frames) };
-        level(samples)
+        if !ch0.as_ptr().is_aligned() {
+            return 0.0;
+        }
+        // SAFETY: `ch0` is aligned and points to `frames * stride` contiguous `f32` samples valid
+        // for this callback.
+        let samples = unsafe { std::slice::from_raw_parts(ch0.as_ptr(), total) };
+        if stride == 1 {
+            level(samples)
+        } else {
+            level_strided(samples, stride)
+        }
     }
 
     fn observe_config_change(
@@ -1184,6 +1249,9 @@ mod tests {
         // Out-of-range and non-finite samples never produce NaN or exceed 1.0.
         assert_eq!(level(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]), 0.0);
         assert!((level(&[f32::NAN, 2.0, -2.0]) - 1.0).abs() < 1e-6);
+        // Strided (interleaved stereo) reads only channel 0.
+        assert!((level_strided(&[0.5, 0.0, 0.5, 0.0], 2) - 0.5).abs() < 1e-6);
+        assert_eq!(level_strided(&[1.0, 1.0], 0), 0.0);
     }
 
     #[test]
@@ -1215,6 +1283,10 @@ mod tests {
             join_seam("Hello, world.", "world next sentence"),
             "Hello, world. next sentence"
         );
+        // Standalone punctuation tokens must not match each other as empty words.
+        assert_eq!(join_seam("one -", ", two"), "one - , two");
+        // Unicode smart punctuation and case across the seam.
+        assert_eq!(join_seam("“Café”", "café au lait"), "“Café” au lait");
         // Disjoint tasks join with a single space.
         assert_eq!(
             join_seam("first part", "second part"),

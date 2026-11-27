@@ -286,7 +286,7 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
         Event::WindowEvent {
             event: WindowEvent::Focused(false),
             ..
-        } => app.dictation.stop(),
+        } => app.dictation.on_focus_lost(),
         Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
         // The system switched between light and dark while the window follows it.
         Event::WindowEvent {
