@@ -89,13 +89,13 @@ pub(crate) enum TeamMemory {
 /// The settings in effect, each rule in the module docs kept: made only from a
 /// [`RawSettings`] that passes them, so settings that break one never reach the file, the
 /// page, or a run. Serialized as the [`RawSettings`] it holds.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct Settings(RawSettings);
 
 /// The settings as the page sends them and the file stores them, before the rules are
 /// checked. A field missing from the file takes its default, so a file written by hand may
 /// name only what it changes.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub(crate) struct RawSettings {
     theme: Theme,
@@ -127,7 +127,7 @@ pub(crate) struct RawSettings {
 
 /// A place in the workflow: the agent notes are sent to, or one reviewer. One type for both,
 /// so the two cannot drift apart.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentSlot {
     /// The agent's name, an enabled agent.
@@ -427,7 +427,7 @@ impl Default for RawSettings {
 }
 
 /// An agent the engineer added.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CustomAgent {
     pub(crate) name: String,
@@ -445,7 +445,7 @@ struct SettingsFile<S> {
 }
 
 /// The settings in effect, and why the file was not used when it was not.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Loaded {
     pub(crate) settings: Settings,
     /// Set when the file exists but cannot be used; saving is blocked until Reset.

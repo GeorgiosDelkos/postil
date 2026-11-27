@@ -557,6 +557,10 @@ function editsDone(run) {
   ).length;
 }
 
+// Coalesces edit-triggered refreshes and prevents overlapping `loadNotes` polls during streaming.
+let editRefreshTimer = null;
+let notesPolling = false;
+
 // Called after every change to the run. `liveEnded` says another live run ended: an analysis,
 // or a run whose end frees one of the 3 places a forced update waits for, so the page refreshes
 // and checks HEAD again (`map.check`).
@@ -580,14 +584,23 @@ function followRun(run, previous, { liveEnded } = {}) {
   // The agent edits files, and the notes are marked sent once it has the prompt: both are
   // read again when the run moves on and when an edit finishes. There is no file watcher
   // (docs/design.md, "Working with the repository").
-  const moved =
-    !fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run));
-  if (moved || liveEnded) {
+  const statusChanged = !fresh && previous.status !== run.status;
+  const edited = !fresh && !statusChanged && editsDone(previous) !== editsDone(run);
+  if (statusChanged || liveEnded) {
+    clearTimeout(editRefreshTimer);
+    editRefreshTimer = null;
     refresh().catch((error) => showToast(String(error)));
-    if (run.status === "ended" && previous.status !== run.status) {
+    if (run.status === "ended" && previous?.status !== run.status) {
       liveQuotas.refresh({ force: true });
     }
+  } else if (edited) {
+    clearTimeout(editRefreshTimer);
+    editRefreshTimer = setTimeout(() => {
+      editRefreshTimer = null;
+      refresh().catch((error) => showToast(String(error)));
+    }, 150);
   } else if (
+    !notesPolling &&
     !run.problem &&
     // A follow-up marks no note sent, so it is not waited for.
     !run.followUp &&
@@ -596,7 +609,12 @@ function followRun(run, previous, { liveEnded } = {}) {
     // Its notes are marked sent once the agent takes the turn, which is no status change and
     // no edit: read them until they show it. A run whose notes could not be marked says so
     // in `problem`, and they are not read on every update after that.
-    loadNotes().catch((error) => showToast(String(error)));
+    notesPolling = true;
+    loadNotes()
+      .catch((error) => showToast(String(error)))
+      .finally(() => {
+        notesPolling = false;
+      });
   }
   tray.render();
 }

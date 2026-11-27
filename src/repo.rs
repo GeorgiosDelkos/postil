@@ -3,7 +3,7 @@
 //! No git library is linked: the app needs a file list, a branch name, snapshots of the
 //! working tree and the diffs between them, and `git` already knows the ignore rules.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
@@ -198,7 +198,17 @@ impl Repo {
     /// checkout.
     pub(crate) fn files(&self) -> Result<Vec<String>> {
         let tracked_args = ["ls-files", "-z", "--stage", "-t"];
-        let tracked = git(&self.root, &tracked_args)?;
+        let untracked_args = ["ls-files", "-z", "--others", "--exclude-standard"];
+        let (tracked, untracked) = std::thread::scope(|scope| {
+            let untracked_handle = scope.spawn(|| git(&self.root, &untracked_args));
+            let tracked = git(&self.root, &tracked_args);
+            let untracked = untracked_handle
+                .join()
+                .expect("git ls-files worker does not panic");
+            (tracked, untracked)
+        });
+        let tracked = tracked?;
+        let untracked = untracked?;
         let mut files = Vec::new();
         for entry in tracked.split_terminator('\0') {
             // `<tag> <mode> <object> <stage>\t<path>`. A submodule is mode 160000, a gitlink.
@@ -220,10 +230,6 @@ impl Repo {
                 files.push(path.to_owned());
             }
         }
-        let untracked = git(
-            &self.root,
-            &["ls-files", "-z", "--others", "--exclude-standard"],
-        )?;
         // git lists an untracked repository as its directory, with a trailing slash.
         files.extend(
             untracked
@@ -351,15 +357,26 @@ impl Repo {
             "--ignored",
             "--exclude-standard",
         ];
-        let listed = |index: Option<&Path>| -> Option<HashSet<String>> {
-            let list = run_git(&self.root, index, &args).ok()?;
-            // During a merge conflict a path is listed once per stage.
-            Some(list.split_terminator('\0').map(str::to_owned).collect())
-        };
-        match (listed(Some(index)), listed(None)) {
-            (Some(ours), Some(real)) => ours
-                .symmetric_difference(&real)
-                .any(|path| self.root.join(path).symlink_metadata().is_ok()),
+        let (ours_raw, real_raw) = std::thread::scope(|scope| {
+            let real_handle = scope.spawn(|| run_git(&self.root, None, &args).ok());
+            let ours = run_git(&self.root, Some(index), &args).ok();
+            let real = real_handle
+                .join()
+                .expect("git ls-files worker does not panic");
+            (ours, real)
+        });
+        match (ours_raw, real_raw) {
+            (Some(ours), Some(real)) => {
+                // Fast path: raw outputs match (most commonly both empty), no HashSet needed.
+                if ours == real {
+                    return false;
+                }
+                // During a merge conflict a path is listed once per stage.
+                let ours: HashSet<&str> = ours.split_terminator('\0').collect();
+                let real: HashSet<&str> = real.split_terminator('\0').collect();
+                ours.symmetric_difference(&real)
+                    .any(|path| self.root.join(path).symlink_metadata().is_ok())
+            }
             // The real index unreadable: the copy then says why.
             _ => true,
         }
@@ -995,13 +1012,36 @@ impl Repo {
     /// text.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
         let path = self.inside(file)?;
-        // At most one byte past the limit is read, so a file is refused without reading more
-        // than that, whatever its size. Bytes, then text: the limit can cut a character in
-        // two, and a large file must be refused as large, not as "not text".
-        let mut bytes = Vec::new();
-        let read =
-            File::open(&path).and_then(|opened| opened.take(MAX_READ + 1).read_to_end(&mut bytes));
-        match read {
+        let opened = File::open(&path).map_err(|source| Error::Read {
+            path: path.clone(),
+            source,
+        })?;
+        // Check size from the already-open fd before reading so oversized regular files are
+        // rejected without reading 20 MB, and valid files allocate once instead of doubling.
+        let mut capacity = 0usize;
+        if let Ok(meta) = opened.metadata()
+            && meta.is_file()
+        {
+            if meta.len() > MAX_READ {
+                return Err(Error::FileTooLarge {
+                    path,
+                    bytes: meta.len(),
+                });
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "meta.len() <= MAX_READ (20 MB), which always fits in usize"
+            )]
+            {
+                capacity = meta.len() as usize;
+            }
+        }
+        // At most one byte past the limit is read, so a file that grows after `fstat` (or a
+        // special file) is still refused without reading more than that. Bytes, then text: the
+        // limit can cut a character in two, and a large file must be refused as large, not as
+        // "not text".
+        let mut bytes = Vec::with_capacity(capacity);
+        match opened.take(MAX_READ + 1).read_to_end(&mut bytes) {
             Ok(read) if read as u64 > MAX_READ => {
                 // The size on disk says how far past the limit it is, and one past the limit is
                 // the floor: the file may have shrunk, or vanished, since it was read.
@@ -1030,6 +1070,7 @@ impl Repo {
     /// [`Error::OutsideRepository`] as for [`Repo::read`]; the git error when the commit or
     /// the file in it does not exist; [`Error::FileTooLarge`] above [`MAX_READ`] bytes, and
     /// [`Error::Read`] when the blob is not UTF-8 text.
+    #[cfg(test)]
     pub(crate) fn read_at(&self, commit: &str, file: &str) -> Result<String> {
         check_object_id("commit", commit)?;
         let path = self.inside(file)?;
@@ -1075,6 +1116,107 @@ impl Repo {
         })
     }
 
+    /// Reads multiple files as commit `commit` holds them in a single `git cat-file --batch`
+    /// subprocess, returning a map from path to UTF-8 text for every valid blob within
+    /// [`MAX_READ`]. Missing, non-blob, oversized, or non-UTF-8 entries are omitted.
+    pub(crate) fn read_many_at(&self, commit: &str, paths: &[&str]) -> HashMap<String, String> {
+        let mut results = HashMap::new();
+        if paths.is_empty() || check_object_id("commit", commit).is_err() {
+            return results;
+        }
+        let valid_paths: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|file| self.inside(file).is_ok())
+            .collect();
+        if valid_paths.is_empty() {
+            return results;
+        }
+        let Ok(mut child) = git_command(&self.root, Search::Here)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return results;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            drop(child.kill());
+            drop(child.wait());
+            return results;
+        };
+        let Some(stdout) = child.stdout.take() else {
+            drop(child.kill());
+            drop(child.wait());
+            return results;
+        };
+        // Write all object specs on a scoped thread so large batches never deadlock on pipe
+        // buffers while the main thread drains stdout.
+        let valid_slice = valid_paths.as_slice();
+        std::thread::scope(|scope| {
+            use std::io::BufRead as _;
+
+            scope.spawn(move || {
+                use std::io::Write as _;
+                let mut writer = io::BufWriter::new(&mut stdin);
+                for file in valid_slice {
+                    if writeln!(writer, "{commit}:{file}").is_err() {
+                        break;
+                    }
+                }
+                drop(writer.flush());
+            });
+
+            let mut reader = io::BufReader::new(stdout);
+            let mut header = String::new();
+            for &file in valid_slice {
+                header.clear();
+                let Ok(read) = reader.read_line(&mut header) else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                let trimmed = header.trim_end_matches(['\r', '\n']);
+                // `<oid> <type> <size>` for existing objects; `<spec> missing` otherwise.
+                let mut parts = trimmed.split_whitespace();
+                let (_oid, kind, size) = (parts.next(), parts.next(), parts.next());
+                let Some(size) = size.and_then(|s| s.parse::<u64>().ok()) else {
+                    continue;
+                };
+                if kind == Some("blob") && size <= MAX_READ {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "size <= MAX_READ (20 MB), which always fits in usize"
+                    )]
+                    let len = size as usize;
+                    let mut buf = vec![0u8; len];
+                    if reader.read_exact(&mut buf).is_err() {
+                        break;
+                    }
+                    // Consume the trailing LF that `git cat-file --batch` writes after each object.
+                    let mut lf = [0u8; 1];
+                    if reader.read_exact(&mut lf).is_err() {
+                        break;
+                    }
+                    if let Ok(text) = String::from_utf8(buf) {
+                        results.insert(file.to_owned(), text);
+                    }
+                } else {
+                    // Skip oversized or non-blob payloads plus the trailing LF without allocating
+                    // the whole payload.
+                    let to_skip = size.saturating_add(1);
+                    if io::copy(&mut reader.by_ref().take(to_skip), &mut io::sink()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        drop(child.wait());
+        results
+    }
+
     /// What `path` is in the working tree now: a file, a folder, or `None` when nothing is
     /// there or it is neither (a socket, a FIFO). One `lstat`; reads no file.
     ///
@@ -1115,7 +1257,7 @@ impl Repo {
     /// single `/`, none of them `.` or `..`, with no leading or trailing `/`. So it cannot
     /// climb above the root or be absolute, and each file or folder has one spelling, the one
     /// a note stores and a prompt shows.
-    fn inside(&self, file: &str) -> Result<PathBuf> {
+    pub(crate) fn inside(&self, file: &str) -> Result<PathBuf> {
         let plain = !file.is_empty()
             && file
                 .split('/')

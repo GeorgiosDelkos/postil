@@ -22,7 +22,7 @@ use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::folders::{self, Folders};
-use crate::highlight::{self, Highlighter, Token};
+use crate::highlight::{self, HighlightedLines, Highlighter};
 use crate::layout::{self, Layout, RawLayout};
 use crate::memory::{self, Memory, MemoryId, RememberRequest};
 use crate::models::{ModelProber, ModelReport};
@@ -355,6 +355,8 @@ fn startup_repo(
 pub(crate) struct Site {
     /// The open project, if any.
     project: RwLock<Option<Project>>,
+    /// Serializes `open_with_settings` so slow project setup runs outside `project.write()`.
+    open_lock: Mutex<()>,
     highlighter: Highlighter,
     /// The file the benchmark opens, when this is a benchmark run.
     bench: Option<String>,
@@ -365,6 +367,8 @@ pub(crate) struct Site {
     /// Where the settings are kept (`settings.rs`); `None`, for the same reason as
     /// `recent_file`, turns them off: the defaults apply and saving fails.
     settings_file: Option<PathBuf>,
+    /// Cached loaded settings keyed by `(modified, len)` so repeated polls skip re-parsing.
+    settings_cache: Mutex<Option<SettingsCache>>,
     /// Where the pane widths are kept (`layout.rs`); `None`, for the same reason as
     /// `recent_file`, keeps them in each window only, until it closes.
     layout_file: Option<PathBuf>,
@@ -397,6 +401,55 @@ struct LedgerCache {
     records: Arc<[ledger::LedgerRecord]>,
 }
 
+/// Cached `settings.json` load result, invalidated when `(modified, len)` changes.
+struct SettingsCache {
+    /// `None` when the file did not exist at the cached check.
+    stamp: Option<(Option<SystemTime>, u64)>,
+    loaded: settings::Loaded,
+}
+
+/// Bounded LRU cache of serialized `GET /api/file` JSON responses for the open project.
+const FILE_CACHE_CAP: usize = 24;
+
+#[derive(Debug, Default)]
+struct FileCache {
+    entries: Vec<CachedFile>,
+}
+
+#[derive(Debug)]
+struct CachedFile {
+    path: String,
+    modified: Option<SystemTime>,
+    len: u64,
+    json: Arc<[u8]>,
+}
+
+impl FileCache {
+    fn get(&mut self, path: &str, modified: Option<SystemTime>, len: u64) -> Option<Arc<[u8]>> {
+        let index = self.entries.iter().position(|entry| {
+            entry.path == path && entry.modified == modified && entry.len == len
+        })?;
+        let entry = self.entries.remove(index);
+        let json = Arc::clone(&entry.json);
+        self.entries.push(entry);
+        Some(json)
+    }
+
+    fn insert(&mut self, path: String, modified: Option<SystemTime>, len: u64, json: Arc<[u8]>) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            self.entries.remove(index);
+        } else if self.entries.len() >= FILE_CACHE_CAP {
+            self.entries.remove(0);
+        }
+        self.entries.push(CachedFile {
+            path,
+            modified,
+            len,
+            json,
+        });
+    }
+}
+
 /// The open project.
 #[derive(Debug, Clone)]
 struct Project {
@@ -408,6 +461,8 @@ struct Project {
     /// Why the recent projects could not be updated when this project opened, shown under
     /// the branch name. Kept with the project, so every page load of it shows the line.
     warning: Option<String>,
+    /// Bounded cache of highlighted file JSON payloads, validated by `(modified, len)`.
+    file_cache: Arc<Mutex<FileCache>>,
 }
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
@@ -771,7 +826,7 @@ struct FileView<'a> {
     path: &'a str,
     /// Whether the file's language has definitions to jump to.
     definitions: bool,
-    lines: Vec<Vec<Token<'a>>>,
+    lines: HighlightedLines<'a>,
 }
 
 pub(crate) type Reply = Response<Cow<'static, [u8]>>;
@@ -795,10 +850,12 @@ impl Site {
         let memory = Memory::new(Scanner::new(OsString::new));
         Self {
             project: RwLock::new(None),
+            open_lock: Mutex::new(()),
             highlighter: Highlighter::new(),
             bench: bench.map(str::to_owned),
             recent_file: config.map(|dir| dir.join("recent.json")),
             settings_file: config.map(|dir| dir.join(SETTINGS_FILE)),
+            settings_cache: Mutex::new(None),
             layout_file: config.map(|dir| dir.join("layout.json")),
             usage_file: config.map(|dir| dir.join("usage.jsonl")),
             ledger_cache: Mutex::new(None),
@@ -879,12 +936,24 @@ impl Site {
         live: LiveRun,
         settings: Option<&Settings>,
     ) -> Result<()> {
-        let mut project = self.project.write().unwrap_or_else(PoisonError::into_inner);
-        let open = project.as_ref();
-        let same = open.is_some_and(|open| open.repo.root() == repo.root());
-        if !same && matches!(live, LiveRun::Refuse) && open.is_some_and(|open| open.runner.busy()) {
-            return Err(Error::RunInOpenProject);
-        }
+        // Serialize concurrent `open` calls without holding `self.project.write()` across disk
+        // I/O, settings parsing, and runner/definitions construction.
+        let _opening = self
+            .open_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let same = {
+            let project = self.project.read().unwrap_or_else(PoisonError::into_inner);
+            let open = project.as_ref();
+            let same = open.is_some_and(|open| open.repo.root() == repo.root());
+            if !same
+                && matches!(live, LiveRun::Refuse)
+                && open.is_some_and(|open| open.runner.busy())
+            {
+                return Err(Error::RunInOpenProject);
+            }
+            same
+        };
         let warning = match (&self.recent_file, &self.bench) {
             (_, Some(_)) => None,
             (None, None) => Some(format!("recent projects are off: {}", Error::NoHome)),
@@ -892,9 +961,12 @@ impl Site {
                 .err()
                 .map(|error| error_chain(&error)),
         };
-        if let Some(open) = project.as_mut().filter(|_| same) {
-            open.warning = warning;
-            return Ok(());
+        if same {
+            let mut project = self.project.write().unwrap_or_else(PoisonError::into_inner);
+            if let Some(open) = project.as_mut() {
+                open.warning = warning;
+                return Ok(());
+            }
         }
         let repo = Arc::new(repo);
         self.memory.open_project(&repo);
@@ -917,13 +989,25 @@ impl Site {
             self.usage_file.clone(),
         );
         let definitions = Definitions::new(Arc::clone(&repo));
-        let old = project.replace(Project {
+        let next = Project {
             repo,
             runner,
             definitions,
             warning,
-        });
-        drop(project);
+            file_cache: Arc::new(Mutex::new(FileCache::default())),
+        };
+        let old = {
+            let mut project = self.project.write().unwrap_or_else(PoisonError::into_inner);
+            if matches!(live, LiveRun::Refuse)
+                && project.as_ref().is_some_and(|open| open.runner.busy())
+            {
+                drop(project);
+                next.definitions.close();
+                next.runner.close();
+                return Err(Error::RunInOpenProject);
+            }
+            project.replace(next)
+        };
         // Stops the index and the agent of the project this one replaces, after the borrow
         // ends: stopping the agent waits for its process. The index is told first, as that
         // waits for nothing.
@@ -1040,22 +1124,35 @@ impl Site {
 
     /// The open project, or `null`: the page then shows the welcome screen.
     fn repo_info(&self) -> Result<Vec<u8>> {
-        let Some(Project { repo, warning, .. }) = self
+        let Some((repo, warning)) = self
             .project
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .as_ref()
+            .map(|project| (Arc::clone(&project.repo), project.warning.clone()))
         else {
             return Ok(b"null".to_vec());
         };
+        let (branch, files, memory_repo) = std::thread::scope(|scope| {
+            let files_handle = scope.spawn(|| repo.files());
+            let memory_handle = scope.spawn(|| repo.memory_name());
+            let branch = repo.branch();
+            let files = files_handle
+                .join()
+                .expect("repo.files worker does not panic");
+            let memory_repo = memory_handle
+                .join()
+                .expect("repo.memory_name worker does not panic");
+            (branch, files, memory_repo)
+        });
         let info = RepoInfo {
             name: repo.name(),
             root: repo.root().to_string_lossy().into_owned(),
-            branch: repo.branch()?,
-            files: repo.files()?,
+            branch: branch?,
+            files: files?,
             bench: self.bench.as_deref(),
             warning,
-            memory_repo: repo.memory_name(),
+            memory_repo,
         };
         Ok(to_json(&info))
     }
@@ -1096,7 +1193,26 @@ impl Site {
     }
 
     fn file_view(&self, path: &str) -> Result<Vec<u8>> {
-        let text = self.repo()?.read(path)?;
+        let (repo, file_cache) = {
+            let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+            let project = guard.as_ref().ok_or(Error::NoProject)?;
+            (Arc::clone(&project.repo), Arc::clone(&project.file_cache))
+        };
+        let stamp = repo
+            .inside(path)
+            .ok()
+            .and_then(|full| std::fs::metadata(full).ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|meta| (meta.modified().ok(), meta.len()));
+        if let Some((modified, len)) = stamp
+            && let Some(cached) = file_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(path, modified, len)
+        {
+            return Ok(cached.to_vec());
+        }
+        let text = repo.read(path)?;
         let lines = self.highlighter.lines(path, &text)?;
         let view = FileView {
             path,
@@ -1108,6 +1224,12 @@ impl Site {
             "the reply types are plain structs of strings, numbers, and sequences, which always \
              serialize",
         );
+        if let Some((modified, len)) = stamp {
+            file_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(path.to_owned(), modified, len, Arc::from(out.as_slice()));
+        }
         Ok(out)
     }
 
@@ -1242,16 +1364,18 @@ impl Site {
     /// `{"trashed": null}` when there was no file. Refused while an analysis of this window is
     /// under way: its merge would write a new file as this one goes.
     fn start_analysis_over(&self) -> Result<Vec<u8>> {
-        // Hold the read lock across the check and trash so `open` cannot switch projects between
-        // checking `runner.analyzing()` and trashing `repo`'s analysis file.
-        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
-        let project = guard.as_ref().ok_or(Error::NoProject)?;
-        if project.runner.analyzing() {
+        // Snapshot repo and runner from the same project, then drop the read lock before disk I/O.
+        let (repo, runner) = {
+            let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+            let project = guard.as_ref().ok_or(Error::NoProject)?;
+            (Arc::clone(&project.repo), Arc::clone(&project.runner))
+        };
+        if runner.analyzing() {
             return Err(Error::AnalysisRefused(
                 "an analysis of this window is under way: wait for it, or stop it".to_owned(),
             ));
         }
-        let trashed = analysis::start_over(&project.repo)?;
+        let trashed = analysis::start_over(&repo)?;
         Ok(to_json(&serde_json::json!({ "trashed": trashed })))
     }
 
@@ -1293,13 +1417,16 @@ impl Site {
     /// The reply to `DELETE /api/notes?id=N1`: removes the note, saves, and returns the
     /// other notes.
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
-        // Hold the read lock so both operations target the same open project.
-        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
-        let project = guard.as_ref().ok_or(Error::NoProject)?;
-        let review = notes::delete(&project.repo, id)?;
+        // Snapshot repo and runner from the same project, then drop the read lock before disk/git I/O.
+        let (repo, runner) = {
+            let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+            let project = guard.as_ref().ok_or(Error::NoProject)?;
+            (Arc::clone(&project.repo), Arc::clone(&project.runner))
+        };
+        let review = notes::delete(&repo, id)?;
         // A run goes with its last note (docs/design.md, "Runs"). The note is deleted by now:
         // a log that cannot be removed is reported, and tried again at the next delete.
-        project.runner.delete_runs_without_notes()?;
+        runner.delete_runs_without_notes()?;
         Ok(to_json(&review))
     }
 
@@ -1310,9 +1437,13 @@ impl Site {
         let Some(id) = query_value(query, "id") else {
             return bad_request("expected ?id=<note id>");
         };
-        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+        let project = self
+            .project
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         json_or_error(
-            guard
+            project
                 .as_ref()
                 .ok_or(Error::NoProject)
                 .and_then(|project| change(project, &id))
@@ -1850,12 +1981,43 @@ impl Site {
         Ok(b"{}".to_vec())
     }
 
+    /// Loads `settings.json` with an `(mtime, len)` cache so repeated polls skip re-parsing.
+    fn load_settings_cached(&self, file: &Path) -> settings::Loaded {
+        let stamp = match std::fs::metadata(file) {
+            Ok(meta) => Some((meta.modified().ok(), meta.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return settings::load(file),
+        };
+        {
+            let guard = self
+                .settings_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.stamp == stamp
+            {
+                return cached.loaded.clone();
+            }
+        }
+        let loaded = settings::load(file);
+        *self
+            .settings_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(SettingsCache {
+            stamp,
+            loaded: loaded.clone(),
+        });
+        loaded
+    }
+
     /// The settings in effect: the file's, or the defaults when it cannot be used or there is
-    /// no configuration directory. Reads the file each time.
+    /// no configuration directory.
     fn current_settings(&self) -> Settings {
         self.settings_file
             .as_deref()
-            .map_or_else(Settings::default, |file| settings::load(file).settings)
+            .map_or_else(Settings::default, |file| {
+                self.load_settings_cached(file).settings
+            })
     }
 
     /// The reply to `GET /api/settings`, and to every request that changes them: the
@@ -1863,7 +2025,7 @@ impl Site {
     fn settings(&self) -> Vec<u8> {
         let (loaded, file) = match &self.settings_file {
             Some(file) => (
-                settings::load(file),
+                self.load_settings_cached(file),
                 Some(file.to_string_lossy().into_owned()),
             ),
             None => (
@@ -1979,16 +2141,17 @@ impl Site {
 
     /// The reply to `GET /api/usage` and `POST /api/usage/refresh`.
     fn usage_view(&self, query: &str, fetch: QuotaFetch) -> Result<Vec<u8>> {
-        let project = self
-            .project
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let has_project = project.is_some();
-        let project_name = project.as_ref().map(|proj| proj.repo.name());
-        let project_root = project
-            .as_ref()
-            .map(|proj| proj.repo.root().to_string_lossy().into_owned());
+        let (has_project, project_name, project_root) = {
+            let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(proj) => (
+                    true,
+                    Some(proj.repo.name()),
+                    Some(proj.repo.root().to_string_lossy().into_owned()),
+                ),
+                None => (false, None, None),
+            }
+        };
 
         let requested_scope = match query_value(query, "scope") {
             Some(value) => Scope::parse(&value).ok_or_else(|| {

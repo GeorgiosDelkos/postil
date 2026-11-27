@@ -184,7 +184,7 @@ export function runDialog({
     } else {
       const index = steps.findIndex((step) => step.key === detail.key);
       if (index < 0) return;
-      const { item } = steps[index];
+      const { item, index: itemIndex } = steps[index];
       // An answer as JSON, compared by its content: a question's is an object, and a fold
       // made from the whole run again (run.js, `foldRun`) builds a new one.
       const answer = JSON.stringify(item.answer);
@@ -194,11 +194,12 @@ export function runDialog({
         // A non-zero exit fails a call its status calls completed (run.js, `toolRow`).
         item.exit,
         item.output,
-        item.text,
+        // A thought streams in place via `streamed` below rather than rebuilding the dialog.
+        item.type === "thought" ? "" : item.text,
         answer,
         isLive(view),
       ];
-      draw = () => stepDetail(view, item, index, steps.length);
+      draw = () => stepDetail(view, item, index, steps.length, itemIndex);
     }
     if (detailDrawn && stamp.every((part, i) => part === detailDrawn[i])) {
       for (const write of streamed) write();
@@ -903,7 +904,7 @@ export function runDialog({
     }
   }
 
-  function stepDetail(view, item, index, count) {
+  function stepDetail(view, item, index, count, itemIndex) {
     const body = el("div", "note-dialog-body");
     const nav = el("div", "run-detail-nav");
     const back = el("button", "button", `‹ ${view.id}`);
@@ -929,7 +930,15 @@ export function runDialog({
     body.append(nav);
 
     if (item.type === "thought") {
-      body.append(el("div", "run-detail-text", item.text.trim()));
+      const text = el("div", "run-detail-text", item.text.trim());
+      streamed.push(() => {
+        const now = foldRun((store.byId(view.id) ?? view).entries).items[itemIndex];
+        if (now?.type === "thought") {
+          const next = now.text.trim();
+          if (text.textContent !== next) text.textContent = next;
+        }
+      });
+      body.append(text);
       return [detailHeader(null, "Thinking", view.id), body];
     }
     if (item.type === "permission") {

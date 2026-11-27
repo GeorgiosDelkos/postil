@@ -824,6 +824,10 @@ impl<F: FnMut(Event)> Reader<F> {
             if !text.trim().is_empty() {
                 self.handle(&text);
             }
+            // Release peak buffer capacity after a huge diff so kept agents do not pin megabytes.
+            if line.capacity() > 64 * 1024 {
+                line = Vec::new();
+            }
         }
 
         // Gone at once, so a caller that asks during the wait below starts a fresh agent

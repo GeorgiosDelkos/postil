@@ -127,20 +127,29 @@ pub(crate) fn at(repo: &Repo, commit: &str) -> Result<Option<Analysis>> {
 }
 
 /// Places every verified reference of `analysis` where its code is in commit `commit`, whose
-/// files are `files` ([`Repo::files_at`]), as [`at`] does: with `git show`, each cited file of
-/// the commit once.
+/// files are `files` ([`Repo::files_at`]), as [`at`] does: batching all cited files in one
+/// `git cat-file --batch` call.
 fn place_at(analysis: &mut Analysis, repo: &Repo, commit: &str, files: &HashSet<String>) {
     // Every folder above a file of the commit. A folder with no file in it is not in git.
     let folders = folders_above(files.iter().map(String::as_str));
+    let mut wanted_set: HashSet<String> = HashSet::new();
+    for anchor in analysis.anchors_mut() {
+        if matches!(
+            anchor.detail,
+            RefDetail::Verified {
+                target: Target::Lines { .. },
+                ..
+            }
+        ) && files.contains(&anchor.path)
+        {
+            wanted_set.insert(anchor.path.clone());
+        }
+    }
+    let wanted: Vec<&str> = wanted_set.iter().map(String::as_str).collect();
+    let mut blobs = repo.read_many_at(commit, &wanted);
     place_with(
         analysis,
-        // Only a file of the commit is shown: `git show <commit>:<folder>` lists the folder.
-        |path| {
-            files
-                .contains(path)
-                .then(|| repo.read_at(commit, path).ok())
-                .flatten()
-        },
+        |path| blobs.remove(path),
         |path, kind| match kind {
             PathKind::File => files.contains(path),
             PathKind::Folder => folders.contains(path),
@@ -183,15 +192,27 @@ pub(crate) fn load(file: &Path) -> Result<Option<Analysis>> {
         problem,
     };
 
-    // The version is read on its own first: a newer format would otherwise fail on its first
-    // new field, with a message that hides the real reason.
-    let version = version_of(json.as_bytes()).map_err(parse_error)?;
-    if !(1..=VERSION).contains(&version) {
+    // Parse directly in the common case; only inspect `version_of` on error so a newer format
+    // still gets the version mismatch diagnostic instead of failing on its first new field.
+    let stored: AnalysisFile = match serde_json::from_str(&json) {
+        Ok(stored) => stored,
+        Err(error) => {
+            if let Ok(version) = version_of(json.as_bytes())
+                && !(1..=VERSION).contains(&version)
+            {
+                return Err(invalid(format!(
+                    "version {version}, but this build of Postil reads versions 1 to {VERSION}"
+                )));
+            }
+            return Err(parse_error(error));
+        }
+    };
+    if !(1..=VERSION).contains(&stored.version) {
         return Err(invalid(format!(
-            "version {version}, but this build of Postil reads versions 1 to {VERSION}"
+            "version {}, but this build of Postil reads versions 1 to {VERSION}",
+            stored.version
         )));
     }
-    let stored: AnalysisFile = serde_json::from_str(&json).map_err(parse_error)?;
     check_graph(&stored.diagrams).map_err(invalid)?;
     Ok(Some(Analysis {
         checked: stored.checked,
@@ -873,10 +894,6 @@ impl fmt::Debug for Unmapped {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnalysisFile {
-    #[expect(
-        dead_code,
-        reason = "declared so `deny_unknown_fields` accepts it; `version_of` reads it first"
-    )]
     version: u32,
     /// Absent in every file of version 1 and 2.
     #[serde(default)]

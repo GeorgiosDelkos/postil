@@ -11,6 +11,8 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent};
 use tree_sitter_tags::TagsConfiguration;
 
@@ -263,18 +265,25 @@ fn tags(
     )
 }
 
+/// Process-wide cache of compiled tags configurations, one slot per row of [`GRAMMARS`], so
+/// switching projects never recompiles tree-sitter tags queries.
+static TAGS_CONFIGURATIONS: OnceLock<Vec<OnceLock<TagsConfiguration>>> = OnceLock::new();
+
 /// A grammar that has a tags query, by its row in [`GRAMMARS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TagsGrammar(usize);
 
 impl TagsGrammar {
-    /// Builds its tags configuration: compiles the query, which takes milliseconds, so the
-    /// caller keeps it.
-    pub(crate) fn configuration(self) -> TagsConfiguration {
-        let build = GRAMMARS[self.0]
-            .tags
-            .expect("a TagsGrammar is made only by tags_grammar, for a row with a tags query");
-        build()
+    /// Returns its cached tags configuration, compiling the query once per process.
+    pub(crate) fn configuration(self) -> &'static TagsConfiguration {
+        let slots =
+            TAGS_CONFIGURATIONS.get_or_init(|| GRAMMARS.iter().map(|_| OnceLock::new()).collect());
+        slots[self.0].get_or_init(|| {
+            let build = GRAMMARS[self.0]
+                .tags
+                .expect("a TagsGrammar is made only by tags_grammar, for a row with a tags query");
+            build()
+        })
     }
 }
 
@@ -350,12 +359,13 @@ impl Highlighter {
     /// # Errors
     ///
     /// [`Error::Highlight`], naming `path`, when tree-sitter fails on the text.
-    pub(crate) fn lines<'a>(&self, path: &str, text: &'a str) -> Result<Vec<Vec<Token<'a>>>> {
+    pub(crate) fn lines<'a>(&self, path: &str, text: &'a str) -> Result<HighlightedLines<'a>> {
         let mut lines = Lines::new(text);
 
-        let grammar = self
-            .configuration(path)
-            .filter(|_| text.len() <= MAX_HIGHLIGHTED);
+        // Check size before compiling the grammar's highlight query.
+        let grammar = (text.len() <= MAX_HIGHLIGHTED)
+            .then(|| self.configuration(path))
+            .flatten();
         if let Some(configuration) = grammar {
             let failed = |source| Error::Highlight {
                 path: path.to_owned(),
@@ -392,6 +402,57 @@ impl Highlighter {
     }
 }
 
+/// Flat CSR storage of highlighted lines: all tokens live in one contiguous `Vec` and
+/// `line_ends[i]` stores the exclusive end index into `tokens` for line `i`. Serializes as the
+/// exact JSON array-of-arrays `[[class, text], ...]` expected by the page while using 2 heap
+/// allocations instead of one `Vec` per line.
+#[derive(Debug)]
+pub(crate) struct HighlightedLines<'a> {
+    tokens: Vec<Token<'a>>,
+    line_ends: Vec<usize>,
+}
+
+impl<'a> HighlightedLines<'a> {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.line_ends.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &[Token<'a>]> {
+        let mut start = 0;
+        self.line_ends.iter().map(move |&end| {
+            let slice = &self.tokens[start..end];
+            start = end;
+            slice
+        })
+    }
+}
+
+#[cfg(test)]
+impl<'a> std::ops::Index<usize> for HighlightedLines<'a> {
+    type Output = [Token<'a>];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let start = if index == 0 {
+            0
+        } else {
+            self.line_ends[index - 1]
+        };
+        let end = self.line_ends[index];
+        &self.tokens[start..end]
+    }
+}
+
+impl Serialize for HighlightedLines<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.line_ends.len()))?;
+        for line in self.iter() {
+            seq.serialize_element(line)?;
+        }
+        seq.end()
+    }
+}
+
 impl std::fmt::Debug for Highlighter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The grammars built so far, each by its first extension; the configurations
@@ -408,11 +469,15 @@ impl std::fmt::Debug for Highlighter {
     }
 }
 
-/// Collects styled slices of one text directly into lines, avoiding a second allocation pass.
+/// Collects styled slices of one text directly into flat line storage, avoiding per-line `Vec`
+/// allocations.
 struct Lines<'a> {
     text: &'a str,
-    /// Finished and current lines. Never empty: the last entry is the line being filled.
-    rows: Vec<Vec<Token<'a>>>,
+    tokens: Vec<Token<'a>>,
+    /// Exclusive end indices into `tokens` for every completed line.
+    line_ends: Vec<usize>,
+    /// Start index into `tokens` of the line currently being filled.
+    line_start: usize,
     /// Byte end offset of the most recently pushed token on the current line, used to coalesce
     /// adjacent tokens of the same class.
     last_end: usize,
@@ -420,11 +485,12 @@ struct Lines<'a> {
 
 impl<'a> Lines<'a> {
     fn new(text: &'a str) -> Self {
-        let mut rows = Vec::with_capacity(text.len() / 40 + 1);
-        rows.push(Vec::new());
+        let estimated_lines = text.len() / 40 + 1;
         Self {
             text,
-            rows,
+            tokens: Vec::with_capacity(estimated_lines.saturating_mul(2)),
+            line_ends: Vec::with_capacity(estimated_lines),
+            line_start: 0,
             last_end: 0,
         }
     }
@@ -448,20 +514,19 @@ impl<'a> Lines<'a> {
     /// The `\r` is removed here and not in `push`, because the highlighter may end one range
     /// between the `\r` and the `\n`.
     fn end_line(&mut self) {
-        let line = self
-            .rows
-            .last_mut()
-            .expect("`rows` starts with one line and only grows");
-        if let Some((_, last)) = line.last_mut()
+        if self.tokens.len() > self.line_start
+            && let Some((_, last)) = self.tokens.last_mut()
             && let Some(stripped) = last.strip_suffix('\r')
         {
             if stripped.is_empty() {
-                line.pop();
+                self.tokens.pop();
             } else {
                 *last = stripped;
             }
         }
-        self.rows.push(Vec::new());
+        let end = self.tokens.len();
+        self.line_ends.push(end);
+        self.line_start = end;
         self.last_end = 0;
     }
 
@@ -469,29 +534,31 @@ impl<'a> Lines<'a> {
         if range.is_empty() {
             return;
         }
-        let line = self
-            .rows
-            .last_mut()
-            .expect("`rows` starts with one line and only grows");
 
         // Adjacent ranges of one class become one token: fewer elements for the page to build.
-        match line.last_mut() {
-            Some((last_class, last)) if *last_class == class && self.last_end == range.start => {
-                let merged_start = self.last_end - last.len();
-                *last = &self.text[merged_start..range.end];
-            }
-            _ => line.push((class, &self.text[range.clone()])),
+        if self.tokens.len() > self.line_start
+            && let Some((last_class, last)) = self.tokens.last_mut()
+            && *last_class == class
+            && self.last_end == range.start
+        {
+            let merged_start = self.last_end - last.len();
+            *last = &self.text[merged_start..range.end];
+        } else {
+            self.tokens.push((class, &self.text[range.clone()]));
         }
         self.last_end = range.end;
     }
 
-    fn finish(mut self) -> Vec<Vec<Token<'a>>> {
+    fn finish(mut self) -> HighlightedLines<'a> {
         // A file that ends with a newline has no line after it, and an empty file has no
         // lines at all: the count then agrees with `str::lines`, which `notes` uses.
-        if self.text.is_empty() || self.text.ends_with('\n') {
-            self.rows.pop();
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            self.line_ends.push(self.tokens.len());
         }
-        self.rows
+        HighlightedLines {
+            tokens: self.tokens,
+            line_ends: self.line_ends,
+        }
     }
 }
 
@@ -500,7 +567,7 @@ mod tests {
     use super::*;
 
     /// The module invariant, as a function: what the tokens say the file contains.
-    fn rejoin(lines: &[Vec<Token<'_>>]) -> String {
+    fn rejoin(lines: &HighlightedLines<'_>) -> String {
         let lines: Vec<String> = lines
             .iter()
             .map(|line| line.iter().map(|(_, text)| *text).collect())
@@ -566,7 +633,7 @@ mod tests {
                     );
                 }
                 // Adjacent text of one class is one token: fewer elements for the page.
-                for line in &lines {
+                for line in lines.iter() {
                     let repeated = line.windows(2).any(|pair| pair[0].0 == pair[1].0);
                     assert!(!repeated, "{path} {text:?}: {line:?}");
                 }
@@ -593,9 +660,9 @@ mod tests {
 
         let rust = highlighter.lines("main.rs", text).unwrap();
         assert_eq!(rust[0], [("m", "// note")]);
-        assert!(rust[1].contains(&("k", "fn")), "{:?}", rust[1]);
-        assert!(rust[1].contains(&("f", "main")), "{:?}", rust[1]);
-        assert!(rust[1].contains(&("s", "\"hi\"")), "{:?}", rust[1]);
+        assert!(rust[1].contains(&("k", "fn")), "{:?}", &rust[1]);
+        assert!(rust[1].contains(&("f", "main")), "{:?}", &rust[1]);
+        assert!(rust[1].contains(&("s", "\"hi\"")), "{:?}", &rust[1]);
 
         let plain = highlighter.lines("main.txt", text).unwrap();
         assert_eq!(plain[1], [("", "fn main() { let s = \"hi\"; }")]);
@@ -656,7 +723,7 @@ mod tests {
                 assert!(
                     lines[0].contains(token),
                     "{path}: {token:?} in {:?}",
-                    lines[0]
+                    &lines[0]
                 );
             }
             assert_eq!(rejoin(&lines), normalized(text), "{path}");

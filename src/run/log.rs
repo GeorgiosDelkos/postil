@@ -191,6 +191,8 @@ pub(super) struct RunState {
     entries: Vec<Entry>,
     /// The log, open for appending while live; `None` after it ended or a write failed.
     log: Option<std::io::BufWriter<File>>,
+    /// Reusable serialization buffer for `Run::write`, avoiding a `Vec<u8>` allocation per entry.
+    write_buf: Vec<u8>,
     /// The exclusive lock on its thread's `threads/<id>.lock` ([`hold_thread_lock`]), held
     /// from the run's creation until it ends: whether it is held is whether the run is live
     /// (`RunState::live`). A log read from disk has none.
@@ -234,7 +236,7 @@ pub(super) struct RunState {
 }
 
 /// The first line of a run log.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Header {
     version: u32,
@@ -704,24 +706,16 @@ impl Run {
             if fs::metadata(&file).is_ok_and(|meta| meta.len() == 0) {
                 continue;
             }
-            match read_header(&file) {
-                Ok(header) if header.analysis.is_some() || header.remember.is_some() => continue,
-                Ok(_) => {}
-                Err(problem) => {
-                    skipped.get_or_insert(format!(
-                        "{} is not shown: {problem} (move it aside to hide this)",
-                        file.display()
-                    ));
-                    continue;
-                }
-            }
-            match Self::read(&file) {
-                Ok(run) => {
+            match Self::read_if(&file, |header| {
+                header.analysis.is_none() && header.remember.is_none()
+            }) {
+                Ok(Some(run)) => {
                     if let Some(skipped) = skipped {
                         run.state().problem.get_or_insert(skipped);
                     }
                     return Ok(Some(run));
                 }
+                Ok(None) => {}
                 Err(problem) => {
                     skipped.get_or_insert(format!(
                         "{} is not shown: {problem} (move it aside to hide this)",
@@ -736,9 +730,21 @@ impl Run {
     /// Reads a run log. Its lines are decoded lossily, so a character torn by a crash spoils
     /// one line, not the log. The error says why the header cannot be read.
     pub(super) fn read(file: &Path) -> std::result::Result<Self, String> {
+        Self::read_if(file, |_| true).map(|run| run.expect("predicate always returns true"))
+    }
+
+    /// Reads a run log in a single pass when `keep(&header)` is true, or returns `Ok(None)`
+    /// without parsing the body entries when false.
+    fn read_if(
+        file: &Path,
+        keep: impl FnOnce(&Header) -> bool,
+    ) -> std::result::Result<Option<Self>, String> {
         let bytes = fs::read(file).map_err(|error| format!("it cannot be read ({error})"))?;
         let mut lines = bytes.split(|&byte| byte == b'\n');
         let header = parse_header(lines.next().unwrap_or_default())?;
+        if !keep(&header) {
+            return Ok(None);
+        }
 
         let mut state = RunState::new(header, None, None);
         for (index, line) in lines.enumerate() {
@@ -763,11 +769,11 @@ impl Run {
                 }
             }
         }
-        Ok(Self {
+        Ok(Some(Self {
             file: file.to_owned(),
             usage: None,
             state: Mutex::new(state),
-        })
+        }))
     }
 
     pub(super) fn state(&self) -> MutexGuard<'_, RunState> {
@@ -828,9 +834,16 @@ impl Run {
     fn write(&self, state: &mut RunState, entry: Entry) -> Option<RunOutcome> {
         let flush = !matches!(entry, Entry::Message { .. } | Entry::Thought { .. });
         if let Some(log) = &mut state.log {
+            state.write_buf.clear();
+            serde_json::to_writer(&mut state.write_buf, &entry)
+                .expect("run log entries are plain JSON values");
+            state.write_buf.push(b'\n');
             let result = log
-                .write_all(&json_line(&entry))
+                .write_all(&state.write_buf)
                 .and_then(|()| if flush { log.flush() } else { Ok(()) });
+            if state.write_buf.capacity() > 64 * 1024 {
+                state.write_buf.shrink_to(64 * 1024);
+            }
             if let Err(error) = result {
                 state.log = None;
                 state.problem.get_or_insert(format!(
@@ -1077,6 +1090,7 @@ impl RunState {
             header,
             entries: Vec::new(),
             log: log.map(std::io::BufWriter::new),
+            write_buf: Vec::new(),
             lock,
             started: false,
             cancel_requested: false,

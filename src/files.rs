@@ -254,9 +254,11 @@ fn follow_links(file: &Path) -> PathBuf {
 /// answer.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(2);
 
-/// How often [`lock`] tries again while it waits. Arbitrary: small against [`LOCK_WAIT`], and
-/// rare enough that waiting costs no noticeable CPU.
-const LOCK_RETRY: Duration = Duration::from_millis(20);
+/// Initial and maximum retry backoff while [`lock`] waits for another writer to release a lock.
+/// Lock holds are typically 1-2 ms, so starting at 1 ms avoids a fixed 20 ms stall on contention
+/// while capping at 20 ms keeps waiting CPU-light.
+const LOCK_RETRY_MIN: Duration = Duration::from_millis(1);
+const LOCK_RETRY_MAX: Duration = Duration::from_millis(20);
 
 /// Takes the exclusive lock on the file at `path`, creating it and its directory when they
 /// are missing, and waiting up to [`LOCK_WAIT`] for another window or process to release it.
@@ -282,11 +284,13 @@ pub(crate) fn lock(path: &Path) -> std::result::Result<File, TryLockError> {
         .open(path)
         .map_err(TryLockError::Error)?;
     let deadline = Instant::now() + LOCK_WAIT;
+    let mut delay = LOCK_RETRY_MIN;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                thread::sleep(LOCK_RETRY);
+                thread::sleep(delay);
+                delay = (delay * 2).min(LOCK_RETRY_MAX);
             }
             Err(error) => return Err(error),
         }

@@ -453,10 +453,16 @@ function nodeTouchesFile(node, file) {
 // out: the change map is drawn on the Architecture.
 export function touched(analysis, files) {
   const diagrams = (analysis?.diagrams ?? []).filter((diagram) => diagram.kind === "architecture");
+  const filesByPath = new Map(files.map((file) => [file.path, file]));
   const nodes = new Set();
   for (const diagram of diagrams) {
     for (const node of diagram.nodes) {
-      if (files.some((file) => nodeTouchesFile(node, file))) nodes.add(node.id);
+      const hit = node.anchors.some((anchor) => {
+        if (anchor.state === "unverified" || anchor.target === "folder") return false;
+        const file = filesByPath.get(anchor.path);
+        return file ? nodeTouchesFile(node, file) : false;
+      });
+      if (hit) nodes.add(node.id);
     }
   }
   const near = new Set();
@@ -466,15 +472,23 @@ export function touched(analysis, files) {
       if (nodes.has(to) && !nodes.has(from)) near.add(from);
     }
   }
-  const placedAnchors = diagrams.flatMap((diagram) =>
-    diagram.nodes.flatMap((node) => node.anchors.filter((anchor) => anchor.state !== "unverified")),
-  );
-  const covers = (anchor, path) =>
-    anchor.path === path || (anchor.target === "folder" && path.startsWith(`${anchor.path}/`));
+  const coveredFiles = new Set();
+  const folderPrefixes = [];
+  for (const diagram of diagrams) {
+    for (const node of diagram.nodes) {
+      for (const anchor of node.anchors) {
+        if (anchor.state === "unverified") continue;
+        coveredFiles.add(anchor.path);
+        if (anchor.target === "folder") folderPrefixes.push(`${anchor.path}/`);
+      }
+    }
+  }
   const unmapped = files
     .filter(
       (file) =>
-        file.status === "added" || !placedAnchors.some((anchor) => covers(anchor, file.path)),
+        file.status === "added" ||
+        (!coveredFiles.has(file.path) &&
+          !folderPrefixes.some((prefix) => file.path.startsWith(prefix))),
     )
     .map((file) => file.path);
   return { nodes, near, unmapped };
@@ -613,13 +627,34 @@ function chipOf(winner, cited, line) {
   return { diagramId: winner.diagram.id, nodeId: winner.node.id, label: winner.node.label, others };
 }
 
+// Cached per-diagram index of anchors by path, avoiding full-diagram allocations on every scroll frame.
+const anchorsByPathCache = new WeakMap();
+
+function anchorsForPath(diagram, path) {
+  let byPath = anchorsByPathCache.get(diagram);
+  if (!byPath) {
+    byPath = new Map();
+    for (const node of diagram.nodes) {
+      for (const anchor of node.anchors) {
+        let list = byPath.get(anchor.path);
+        if (!list) {
+          list = [];
+          byPath.set(anchor.path, list);
+        }
+        list.push({ ...anchor, node });
+      }
+    }
+    anchorsByPathCache.set(diagram, byPath);
+  }
+  return byPath.get(path) ?? [];
+}
+
 // The id of the node of `diagram` that 1-based `line` of the file at `path` stands in: the one
 // whose referenced lines are innermost there, else the first that references the whole file,
 // else null. A folder's node rings nothing: every line of every file in it would ring it.
 export function nodeAtLine(diagram, path, line) {
-  const cited = diagram.nodes.flatMap((node) =>
-    node.anchors.filter((anchor) => anchor.path === path).map((anchor) => ({ ...anchor, node })),
-  );
+  const cited = anchorsForPath(diagram, path);
+  if (cited.length === 0) return null;
   const inner = innermost(cited, line);
   if (inner) return inner.node.id;
   const whole = cited.find((anchor) => anchor.target === "file" && placed(anchor));

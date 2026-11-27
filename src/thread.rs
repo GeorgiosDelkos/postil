@@ -35,8 +35,9 @@
 //! folder whose `.git` names a worktree record of this repository, and branches under
 //! `postil/`. The record is a file a hand edit can change.
 
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
-use std::fs::{self, File};
+use std::fs::{self, TryLockError};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -533,7 +534,7 @@ pub(crate) fn sweep(repo: &Repo, home: &Path) -> Result<()> {
         return Ok(());
     };
     let folders: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    let named: Vec<PathBuf> = all(repo)?.iter().map(|t| resolved(&t.path)).collect();
+    let named: HashSet<PathBuf> = all(repo)?.iter().map(|t| resolved(&t.path)).collect();
     for path in folders {
         if named.contains(&resolved(&path)) {
             continue;
@@ -804,8 +805,11 @@ pub(crate) fn trash_for(root: &Path, home: &Path) -> PathBuf {
 /// clones stay on one volume. A repository that is its volume's root uses the home folder all
 /// the same: a folder there would be inside the repository.
 fn base_for(root: &Path, home: &Path) -> PathBuf {
+    if device(home) == device(root) {
+        return home.to_owned();
+    }
     let volume = volume_root(root);
-    if device(home) == device(root) || volume == root {
+    if volume == root {
         home.to_owned()
     } else {
         volume.join(".postil")
@@ -912,21 +916,32 @@ fn read(file: &Path) -> Result<Threads> {
         }
         Err(error) => return Err(problem(error.to_string())),
     };
-    match version_of(&json) {
-        // Version 1 has no `lastRun`, which reads as 0, and no thread evicted; neither 1 nor 2
-        // has a pull request, and none before 4 a `mode`, which reads as `Work`. Each is
-        // written back as the current version at the next change.
-        Ok(1..=THREADS_VERSION) => {
-            let mut threads: Threads =
-                serde_json::from_slice(&json).map_err(|e| problem(e.to_string()))?;
-            threads.version = THREADS_VERSION;
-            Ok(threads)
+    // Parse directly in the common case; only inspect `version_of` on error so a newer format
+    // still gets the version mismatch diagnostic instead of failing on its first new field.
+    let mut threads: Threads = match serde_json::from_slice(&json) {
+        Ok(threads) => threads,
+        Err(error) => {
+            if let Ok(version) = version_of(&json)
+                && !(1..=THREADS_VERSION).contains(&version)
+            {
+                return Err(problem(format!(
+                    "version {version}, and this Postil reads versions 1 to {THREADS_VERSION}"
+                )));
+            }
+            return Err(problem(error.to_string()));
         }
-        Ok(version) => Err(problem(format!(
-            "version {version}, and this Postil reads versions 1 to {THREADS_VERSION}"
-        ))),
-        Err(error) => Err(problem(error.to_string())),
+    };
+    if !(1..=THREADS_VERSION).contains(&threads.version) {
+        return Err(problem(format!(
+            "version {}, and this Postil reads versions 1 to {THREADS_VERSION}",
+            threads.version
+        )));
     }
+    // Version 1 has no `lastRun`, which reads as 0, and no thread evicted; neither 1 nor 2
+    // has a pull request, and none before 4 a `mode`, which reads as `Work`. Each is
+    // written back as the current version at the next change.
+    threads.version = THREADS_VERSION;
+    Ok(threads)
 }
 
 /// Reads the record, lets `update` change its threads, and writes it, under the lock. An
@@ -934,23 +949,17 @@ fn read(file: &Path) -> Result<Threads> {
 fn change(repo: &Repo, update: impl FnOnce(&mut Vec<Thread>) -> Result<()>) -> Result<()> {
     let file = threads_file(repo);
     let lock_path = file.with_extension("lock");
-    let error = |source| Error::WriteThreads {
+    // Bounded wait matches `notes::lock` so a stalled process never wedges a page worker.
+    let _lock = crate::files::lock(&lock_path).map_err(|error| Error::WriteThreads {
         path: lock_path.clone(),
-        source,
-    };
-    let dir = file
-        .parent()
-        .expect("threads.json is in <git dir>/postil, which has a parent");
-    fs::create_dir_all(dir).map_err(error)?;
-    let lock = File::options()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(error)?;
-    // Held for one read and one write, milliseconds, so a wait for another window's change
-    // is that short. Released when `lock` drops, after the write.
-    lock.lock().map_err(error)?;
+        source: match error {
+            TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another window is changing the threads record",
+            ),
+            TryLockError::Error(source) => source,
+        },
+    })?;
     let mut threads = read(&file)?;
     update(&mut threads.threads)?;
     save_json(&file, &threads).map_err(|source| Error::WriteThreads { path: file, source })

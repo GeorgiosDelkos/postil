@@ -298,8 +298,17 @@ export function fileList({
     event.preventDefault();
   });
 
+  let filterFrame = 0;
   filterEl.addEventListener("input", () => {
     activeMatch = 0;
+    if ((state.repo?.files.length ?? 0) > 5000) {
+      if (filterFrame) return;
+      filterFrame = requestAnimationFrame(() => {
+        filterFrame = 0;
+        renderFiles();
+      });
+      return;
+    }
     renderFiles();
   });
   filterEl.addEventListener("keydown", (event) => {

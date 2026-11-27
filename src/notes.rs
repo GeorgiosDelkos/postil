@@ -58,8 +58,8 @@
 //! already sent in that run, which it belongs to whatever becomes of it. It is never sent with
 //! change notes: [`prompt`] refuses it, and [`save_ask`] gives its own prompt.
 
-use std::collections::HashMap;
-use std::fmt;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Write as _};
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::Path;
@@ -624,11 +624,12 @@ fn parse_ids(ids: &[String]) -> Result<Vec<NoteId>> {
         return Err(Error::BadRequest("no notes were chosen".to_owned()));
     }
     let mut wanted = Vec::with_capacity(ids.len());
+    let mut seen = HashSet::with_capacity(ids.len());
     for text in ids {
         let id = NoteId::parse(text).ok_or_else(|| {
             Error::BadRequest(format!("note id {text:?}: expected N and a number"))
         })?;
-        if wanted.contains(&id) {
+        if !seen.insert(id) {
             return Err(Error::BadRequest(format!("note {text} is chosen twice")));
         }
         wanted.push(id);
@@ -697,19 +698,21 @@ impl Note {
     /// unless it is there already.
     fn quote(&self, text: &mut String, files: &mut Vec<String>) {
         let lost = self.anchor == Anchor::Lost;
-        text.push_str(&format!("\n[{}] {}\n", self.id, self.place()));
+        writeln!(text, "\n[{}] {}", self.id, self.place())
+            .expect("writing to a String is infallible");
         match &self.target {
             Target::Lines { snippet, .. } => {
                 if lost {
                     text.push_str("(These lines are no longer in the file; they were:)\n");
                 }
                 for line in snippet.split('\n') {
-                    text.push_str(&format!("> {line}\n"));
+                    writeln!(text, "> {line}").expect("writing to a String is infallible");
                 }
             }
             Target::Path(kind) => {
                 if lost {
-                    text.push_str(&format!("(This {kind} is no longer in the repository.)\n"));
+                    writeln!(text, "(This {kind} is no longer in the repository.)")
+                        .expect("writing to a String is infallible");
                 }
             }
         }
@@ -815,7 +818,7 @@ struct RawNewNote {
 }
 
 /// A note's number, written `N1`, `N2`: shown in the page and sent to the agent.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NoteId(u32);
 
 impl NoteId {
@@ -894,11 +897,9 @@ impl Review {
         }
         // An older file is read as this version, and written as this version next time.
         review.version = VERSION;
-        for (index, note) in review.notes.iter().enumerate() {
-            if review.notes[..index]
-                .iter()
-                .any(|other| other.id == note.id)
-            {
+        let mut seen = HashSet::with_capacity(review.notes.len());
+        for note in &review.notes {
+            if !seen.insert(note.id) {
                 return Err(invalid(format!("note id {} is used twice", note.id)));
             }
         }

@@ -383,8 +383,13 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     true,
   );
   window.addEventListener("blur", closePopover);
+  let resizeFrame = 0;
   window.addEventListener("resize", () => {
-    if (!popoverEl.hidden) positionPopover();
+    if (popoverEl.hidden || resizeFrame) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = 0;
+      if (!popoverEl.hidden) positionPopover();
+    });
   });
 
   // ---- Inline Picker Badge --------------------------------------------------------------

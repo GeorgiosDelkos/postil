@@ -378,7 +378,7 @@ pub(crate) fn aggregate<'a>(
 ) -> (Totals, BTreeMap<String, AgentActivity>) {
     let cutoff = range.cutoff(now);
     let mut summary = Totals::default();
-    let mut by_agent: BTreeMap<String, (Totals, BTreeMap<String, Totals>)> = BTreeMap::new();
+    let mut by_agent: BTreeMap<&'a str, (Totals, BTreeMap<&'a str, Totals>)> = BTreeMap::new();
 
     let kept = records.into_iter().filter(|record| {
         record.started_at >= cutoff
@@ -387,11 +387,11 @@ pub(crate) fn aggregate<'a>(
     for record in kept {
         let count_session = !record.secondary_model;
         summary.add(record, count_session);
-        let agent_name = canonical_agent_name(&record.agent, remap_legacy_gemini).to_owned();
+        let agent_name = canonical_agent_name(&record.agent, remap_legacy_gemini);
         let (agent_totals, models) = by_agent.entry(agent_name).or_default();
         agent_totals.add(record, count_session);
         models
-            .entry(record.model_label().to_owned())
+            .entry(record.model_label())
             .or_default()
             .add(record, true);
     }
@@ -401,7 +401,10 @@ pub(crate) fn aggregate<'a>(
         .map(|(agent, (totals, models))| {
             let mut models: Vec<ModelStats> = models
                 .into_iter()
-                .map(|(model, totals)| ModelStats { model, totals })
+                .map(|(model, totals)| ModelStats {
+                    model: model.to_owned(),
+                    totals,
+                })
                 .collect();
             models.sort_by(|a, b| {
                 b.totals
@@ -410,7 +413,7 @@ pub(crate) fn aggregate<'a>(
                     .then_with(|| b.totals.total_tokens.cmp(&a.totals.total_tokens))
                     .then_with(|| a.model.cmp(&b.model))
             });
-            (agent, AgentActivity { totals, models })
+            (agent.to_owned(), AgentActivity { totals, models })
         })
         .collect();
 
