@@ -233,8 +233,10 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// The git error, such as a commit the repository does not have.
+    /// [`Error::BadRequest`] when `commit` is not a hexadecimal object id, and the git error,
+    /// such as a commit the repository does not have.
     pub(crate) fn files_at(&self, commit: &str) -> Result<HashSet<String>> {
+        check_object_id("commit", commit)?;
         let listed = git(&self.root, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
         // `<mode> <type> <object>\t<path>`. A submodule is mode 160000, a gitlink.
         Ok(listed
@@ -367,13 +369,8 @@ impl Repo {
     /// logs, which a hand edit can change), and the git errors, such as a snapshot that
     /// `git gc` pruned.
     pub(crate) fn diff(&self, before: &str, after: &str) -> Result<String> {
-        for id in [before, after] {
-            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(Error::BadRequest(format!(
-                    "snapshot {id:?}: expected a git object id"
-                )));
-            }
-        }
+        check_object_id("snapshot", before)?;
+        check_object_id("snapshot", after)?;
         git(
             &self.root,
             &[
@@ -841,13 +838,8 @@ impl Repo {
     /// [`Error::BadRequest`] when `from` or `to` is not a hexadecimal object id, and the git
     /// errors, such as an id that names no commit.
     pub(crate) fn patch(&self, from: &str, to: &str) -> Result<Vec<u8>> {
-        for id in [from, to] {
-            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(Error::BadRequest(format!(
-                    "commit {id:?}: expected a git object id"
-                )));
-            }
-        }
+        check_object_id("commit", from)?;
+        check_object_id("commit", to)?;
         run_git_bytes(
             &self.root,
             None,
@@ -949,6 +941,63 @@ impl Repo {
         }
     }
 
+    /// Reads one file as commit `commit` holds it, as text: `git show <commit>:<file>`, the
+    /// blob as git stores it, with no textconv driver and no smudge filter. `commit` may also
+    /// be a tree, as the snapshots of runs from before threads are. `file` is written as for
+    /// [`Repo::read`]; a folder's path shows git's listing of it, so a caller that needs a
+    /// file checks the path against [`Repo::files_at`] first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when `commit` is not a hexadecimal object id;
+    /// [`Error::OutsideRepository`] as for [`Repo::read`]; the git error when the commit or
+    /// the file in it does not exist; [`Error::FileTooLarge`] above [`MAX_READ`] bytes, and
+    /// [`Error::Read`] when the blob is not UTF-8 text.
+    pub(crate) fn read_at(&self, commit: &str, file: &str) -> Result<String> {
+        check_object_id("commit", commit)?;
+        let path = self.inside(file)?;
+        let object = format!("{commit}:{file}");
+        let args = ["show", "--no-color", "--no-textconv", object.as_str()].map(OsStr::new);
+        let mut child = git_command(&self.root, Search::Here)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(Error::SpawnGit)?;
+        // At most one byte past the limit is read, as `Repo::read` reads a file, so a large
+        // blob is refused without holding it. git's error output is a line or two, which the
+        // pipe holds while stdout is read.
+        let stdout = child.stdout.take().expect("stdout is piped above");
+        let mut bytes = Vec::new();
+        let read = stdout.take(MAX_READ + 1).read_to_end(&mut bytes);
+        if bytes.len() as u64 > MAX_READ {
+            // git is still writing the rest: stopped, as nothing more of it is read. Its exit
+            // status says nothing once it is killed.
+            drop(child.kill());
+            drop(child.wait());
+            // The blob's size is not read: one past the limit is the floor, as for `read`.
+            return Err(Error::FileTooLarge {
+                path,
+                bytes: MAX_READ + 1,
+            });
+        }
+        let output = child.wait_with_output().map_err(Error::SpawnGit)?;
+        if !output.status.success() {
+            return Err(Error::Git {
+                command: args.map(OsStr::to_string_lossy).join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        if let Err(source) = read {
+            return Err(Error::Read { path, source });
+        }
+        String::from_utf8(bytes).map_err(|error| Error::Read {
+            path,
+            source: io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()),
+        })
+    }
+
     /// What `path` is in the working tree now: a file, a folder, or `None` when nothing is
     /// there or it is neither (a socket, a FIFO). One `lstat`; reads no file.
     ///
@@ -1024,6 +1073,22 @@ fn is_home_or_root(dir: &Path) -> bool {
     };
     let home = std::env::var_os("HOME").and_then(|home| Path::new(&home).canonicalize().ok());
     dir.parent().is_none() || home.is_some_and(|home| home == dir)
+}
+
+/// Checks that `id`, a `kind` of object ("commit", "snapshot") from a run log or a request,
+/// is a hexadecimal git object id, so neither a name git would resolve some other way nor a
+/// leading `-` read as an option reaches git.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] naming the id when it is not one.
+fn check_object_id(kind: &str, id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::BadRequest(format!(
+            "{kind} {id:?}: expected a git object id"
+        )));
+    }
+    Ok(())
 }
 
 /// Runs `git` in `dir` and returns what it printed.
@@ -1210,5 +1275,37 @@ mod tests {
             matches!(&error, Error::Git { stderr, .. } if stderr.contains("not a git repository")),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn read_at_reads_the_blob_and_refuses_what_is_not_text_within_the_limit() {
+        let dir = TempDir::new("repo-read-at");
+        git(dir.path(), &["init", "--quiet"]).unwrap();
+        let repo = Repo::open(dir.path()).unwrap();
+        fs::write(dir.path().join("a.txt"), "then\n").unwrap();
+        fs::write(dir.path().join("binary"), [0xff, 0xfe]).unwrap();
+        let too_large = usize::try_from(MAX_READ + 1).expect("20 MB fits in usize");
+        fs::write(dir.path().join("large"), vec![b'x'; too_large]).unwrap();
+        let tree = repo.snapshot().unwrap();
+        fs::write(dir.path().join("a.txt"), "now\n").unwrap();
+
+        assert_eq!(repo.read_at(&tree, "a.txt").unwrap(), "then\n");
+        let binary = repo.read_at(&tree, "binary").unwrap_err();
+        let not_text = matches!(
+            &binary,
+            Error::Read { source, .. } if source.kind() == io::ErrorKind::InvalidData
+        );
+        assert!(not_text, "{binary:?}");
+        let large = repo.read_at(&tree, "large").unwrap_err();
+        assert!(matches!(large, Error::FileTooLarge { .. }), "{large:?}");
+        let missing = repo.read_at(&tree, "gone.txt").unwrap_err();
+        assert!(matches!(missing, Error::Git { .. }), "{missing:?}");
+        let outside = repo.read_at(&tree, "../a.txt").unwrap_err();
+        assert!(
+            matches!(outside, Error::OutsideRepository { .. }),
+            "{outside:?}"
+        );
+        let named = repo.read_at("HEAD", "a.txt").unwrap_err();
+        assert!(matches!(named, Error::BadRequest(_)), "{named:?}");
     }
 }

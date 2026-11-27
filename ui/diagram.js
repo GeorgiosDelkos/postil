@@ -323,6 +323,72 @@ export function notesOn(notes, anchors) {
   return notes.filter((note) => placed.some((anchor) => touches(note, anchor)));
 }
 
+// ---- The change map (docs/review-assist-plan.md, 8.6) -------------------------------------
+
+// Whether code reference `anchor`, placed at the run's fork (`GET api/analysis?at=`), is in
+// the change `hunk` (ui/patch.js) of the changed `file`, or in the file's change when `hunk` is
+// null (a binary file, or one whose mode alone changed). The anchor's lines are of the old
+// side, so only the hunk's old side is compared. A deleted file is a change of every
+// reference placed in it, wherever its lines were; an added file had none. A folder is not
+// touched by the files in it: every change under `src` would light up its boundary.
+function anchorTouchesHunk(anchor, file, hunk) {
+  if (file.status === "added" || anchor.state === "unverified") return false;
+  if (anchor.target === "folder" || anchor.path !== file.path) return false;
+  if (file.status === "deleted") return true;
+  // An outdated reference's lines are where its code last was, not where it is at the fork.
+  if (anchor.state !== "found") return false;
+  if (anchor.target === "file") return true;
+  if (!hunk || hunk.oldCount === 0) return false;
+  const last = hunk.oldStart + hunk.oldCount - 1;
+  return anchor.lines.start <= last && hunk.oldStart <= anchor.lines.end;
+}
+
+// Whether a reference of `node` is in the change `hunk` of `file` (`anchorTouchesHunk`): what a
+// click on a touched node scrolls the changes view to.
+export function nodeTouchesHunk(node, file, hunk) {
+  return node.anchors.some((anchor) => anchorTouchesHunk(anchor, file, hunk));
+}
+
+function nodeTouchesFile(node, file) {
+  if (file.hunks.length === 0) return nodeTouchesHunk(node, file, null);
+  return file.hunks.some((hunk) => nodeTouchesHunk(node, file, hunk));
+}
+
+// What the changed `files` of a run (ui/patch.js, `parsePatch`) touch on the Architecture
+// diagrams of `analysis`, placed at the run's fork: `{ nodes, near, unmapped }`, `nodes` the
+// ids of the touched nodes, `near` those one edge from a touched node and not touched
+// themselves, `unmapped` the paths, in the diff's order, that no Architecture node covers (one
+// a file the run added, which no node can have cited). Flows and Data diagrams are left out:
+// the change map is drawn on the Architecture.
+export function touched(analysis, files) {
+  const diagrams = (analysis?.diagrams ?? []).filter((diagram) => diagram.kind === "architecture");
+  const nodes = new Set();
+  for (const diagram of diagrams) {
+    for (const node of diagram.nodes) {
+      if (files.some((file) => nodeTouchesFile(node, file))) nodes.add(node.id);
+    }
+  }
+  const near = new Set();
+  for (const diagram of diagrams) {
+    for (const { from, to } of diagram.edges) {
+      if (nodes.has(from) && !nodes.has(to)) near.add(to);
+      if (nodes.has(to) && !nodes.has(from)) near.add(from);
+    }
+  }
+  const placedAnchors = diagrams.flatMap((diagram) =>
+    diagram.nodes.flatMap((node) => node.anchors.filter((anchor) => anchor.state !== "unverified")),
+  );
+  const covers = (anchor, path) =>
+    anchor.path === path || (anchor.target === "folder" && path.startsWith(`${anchor.path}/`));
+  const unmapped = files
+    .filter(
+      (file) =>
+        file.status === "added" || !placedAnchors.some((anchor) => covers(anchor, file.path)),
+    )
+    .map((file) => file.path);
+  return { nodes, near, unmapped };
+}
+
 // ---- The link shown in the code (docs/review-assist.md) ------------------------------------
 
 // Whether code reference `anchor` was placed in the code: found, or outdated at its last lines

@@ -395,6 +395,7 @@ test("Escape closes the nearest thing on screen, and stops the run only when non
     composer: false,
     send: false,
     changes: false,
+    changeMap: false,
     selection: false,
     live: false,
   };
@@ -405,6 +406,8 @@ test("Escape closes the nearest thing on screen, and stops the run only when non
     [{ focusMode: true, composer: true }, "close-composer", "a draft closes even in focus mode"],
     [{ composer: true, send: true, live: true }, "close-composer", ""],
     [{ send: true, changes: true, live: true }, "close-send", ""],
+    [{ changes: true, changeMap: true }, "close-changes", "the changes view over the map first"],
+    [{ changeMap: true, selection: true, live: true }, "leave-change-map", "not the run"],
     [{ selection: true, live: true }, "clear-selection", ""],
     [{ live: true }, "stop", ""],
     [{}, null, "nothing to do"],

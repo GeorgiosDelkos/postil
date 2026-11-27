@@ -21,9 +21,11 @@ import {
   nearestNode,
   nodeAtLine,
   nodeState,
+  nodeTouchesHunk,
   notesOn,
   runProblem,
   searchNodes,
+  touched,
   zoomAt,
 } from "./diagram.js";
 
@@ -542,3 +544,231 @@ test("a flow's question is 1 to 300 characters once trimmed, each emoji one", ()
   assert.equal(checkFlowQuestion("😀".repeat(300)), null);
   assert.match(checkFlowQuestion(`${"😀".repeat(300)}a`), /at most 300 characters, not 301/);
 });
+
+// ---- The change map (touched) -------------------------------------------------------------
+
+// A changed file as ui/patch.js reads it, with hunks of the given old-side ranges.
+const changed = (path, status, ranges = []) => ({
+  path,
+  status,
+  binary: false,
+  added: 0,
+  removed: 0,
+  hunks: ranges.map(([oldStart, oldCount]) => ({
+    header: `@@ -${oldStart},${oldCount} @@`,
+    oldStart,
+    oldCount,
+    newStart: oldStart,
+    newCount: oldCount,
+    lines: [],
+  })),
+});
+const lines = (path, start, end, state = "found") => ({
+  path,
+  target: "lines",
+  lines: { start, end },
+  snippet: "",
+  state,
+});
+const whole = (path, target = "file", state = "found") => ({ path, target, state });
+const analysisOf = (...diagrams) => ({ diagrams });
+
+test("a node is touched when a hunk's old side overlaps its lines, not one line further", () => {
+  // Lines 10 to 12; a hunk's old side runs from oldStart to oldStart + oldCount - 1.
+  const cited = node("D1.1", { anchors: [lines("src/a.rs", 10, 12)] });
+  const at = (oldStart, oldCount) => {
+    const file = changed("src/a.rs", "modified", [[oldStart, oldCount]]);
+    return touched(analysisOf(diagram([cited])), [file]).nodes.has("D1.1");
+  };
+  assert.equal(at(8, 3), true, "the hunk's last line is the anchor's first");
+  assert.equal(at(12, 4), true, "the hunk's first line is the anchor's last");
+  assert.equal(at(7, 3), false, "ends the line before");
+  assert.equal(at(13, 2), false, "starts the line after");
+  assert.equal(at(11, 0), false, "an old side of no lines overlaps nothing");
+  // The anchor was placed against the old side: a hunk whose new side alone lands on the
+  // anchor's lines touches nothing.
+  const shifted = changed("src/a.rs", "modified", [[30, 2]]);
+  shifted.hunks[0].newStart = 10;
+  assert.equal(touched(analysisOf(diagram([cited])), [shifted]).nodes.has("D1.1"), false);
+  const hunk = { oldStart: 12, oldCount: 1 };
+  assert.equal(nodeTouchesHunk(cited, changed("src/a.rs", "modified"), hunk), true);
+  assert.equal(nodeTouchesHunk(cited, changed("src/b.rs", "modified"), hunk), false);
+});
+
+test("a whole file is touched by any hunk; a folder, an outdated or unverified anchor never", () => {
+  const nodes = [
+    node("D1.1", { anchors: [whole("src/a.rs")] }),
+    node("D1.2", { anchors: [whole("src", "folder")] }),
+    node("D1.3", { anchors: [lines("src/a.rs", 1, 40, "outdated")] }),
+    node("D1.4", { anchors: [{ path: "src/a.rs", state: "unverified" }] }),
+  ];
+  const result = touched(analysisOf(diagram(nodes)), [changed("src/a.rs", "modified", [[5, 2]])]);
+  assert.deepEqual([...result.nodes], ["D1.1"]);
+  assert.deepEqual(result.unmapped, []);
+});
+
+test("only Architecture diagrams are touched, at the top level and below", () => {
+  const cites = (id) => node(id, { anchors: [whole("src/a.rs")] });
+  const bare = (id) => node(id, { anchors: [] });
+  const analysis = analysisOf(
+    diagram([cites("D1.1")]),
+    diagram([cites("D2.1"), bare("D2.2")], [edge("D2.1", "D2.2")], { id: "D2", parent: "D1.1" }),
+    diagram([cites("D3.1"), bare("D3.2")], [edge("D3.1", "D3.2")], { id: "D3", kind: "flow" }),
+    diagram([cites("D4.1")], [], { id: "D4", kind: "data" }),
+  );
+  const result = touched(analysis, [changed("src/a.rs", "modified", [[1, 1]])]);
+  assert.deepEqual([...result.nodes], ["D1.1", "D2.1"]);
+  assert.deepEqual([...result.near], ["D2.2"]);
+});
+
+test("a changed file only a Flow or Data node covers is not on the map", () => {
+  const analysis = analysisOf(
+    diagram([node("D1.1", { anchors: [] })]),
+    diagram([node("D2.1", { anchors: [whole("src/a.rs")] })], [], { id: "D2", kind: "flow" }),
+  );
+  const result = touched(analysis, [changed("src/a.rs", "modified", [[1, 1]])]);
+  assert.deepEqual(result.unmapped, ["src/a.rs"]);
+});
+
+test("an added file is not on the map, even inside a folder a node covers", () => {
+  const analysis = analysisOf(
+    diagram([
+      node("D1.1", { anchors: [whole("src", "folder")] }),
+      node("D1.2", { anchors: [whole("src/new.rs")] }),
+    ]),
+  );
+  const files = [
+    changed("src/new.rs", "added", [[0, 0]]),
+    changed("src/old.rs", "modified", [[1, 1]]),
+    changed("docs/a.md", "modified", [[1, 1]]),
+    changed("srcx/a.rs", "modified", [[1, 1]]),
+  ];
+  const result = touched(analysis, files);
+  assert.deepEqual(result.unmapped, ["src/new.rs", "docs/a.md", "srcx/a.rs"]);
+  assert.deepEqual([...result.nodes], [], "an added file touches no node, and a folder none");
+});
+
+test("a deleted file touches every node citing it, with hunks or none", () => {
+  const analysis = analysisOf(
+    diagram([
+      node("D1.1", { anchors: [lines("src/a.rs", 90, 95)] }),
+      node("D1.2", { anchors: [lines("src/b.bin", 1, 1, "outdated")] }),
+      node("D1.3", { anchors: [{ path: "src/a.rs", state: "unverified" }] }),
+    ]),
+  );
+  // A hunk deleting lines 1 to 3 of a file whose cited lines were further down.
+  const deleted = changed("src/a.rs", "deleted", [[1, 3]]);
+  deleted.hunks[0].newCount = 0;
+  const binary = { ...changed("src/b.bin", "deleted"), binary: true };
+  const result = touched(analysis, [deleted, binary]);
+  assert.deepEqual([...result.nodes], ["D1.1", "D1.2"]);
+  assert.deepEqual(result.unmapped, []);
+  assert.equal(nodeTouchesHunk(analysis.diagrams[0].nodes[0], deleted, null), true);
+});
+
+test("near is one edge away either way, never two, and never a touched node", () => {
+  const ids = ["D1.1", "D1.2", "D1.3", "D1.4", "D1.5"];
+  const nodes = ids.map((id) => node(id, { anchors: [] }));
+  nodes[0].anchors = [whole("src/a.rs")];
+  nodes[1].anchors = [whole("src/a.rs")];
+  const edges = [
+    edge("D1.1", "D1.2"),
+    edge("D1.3", "D1.1"),
+    edge("D1.2", "D1.4"),
+    edge("D1.4", "D1.5"),
+  ];
+  const result = touched(analysisOf(diagram(nodes, edges)), [
+    changed("src/a.rs", "modified", [[1, 1]]),
+  ]);
+  assert.deepEqual([...result.nodes].sort(), ["D1.1", "D1.2"]);
+  assert.deepEqual([...result.near].sort(), ["D1.3", "D1.4"]);
+});
+
+test("no analysis touches nothing, and every changed file is not on the map", () => {
+  const result = touched(null, [changed("src/a.rs", "modified", [[1, 1]])]);
+  assert.deepEqual([result.nodes.size, result.near.size, result.unmapped], [0, 0, ["src/a.rs"]]);
+});
+
+test("touched matches a line-by-line model, and near never holds a touched node", () => {
+  for (let seed = 1; seed <= 300; seed += 1) {
+    const next = random(seed);
+    const paths = ["a", "b", "c"];
+    const nodes = Array.from({ length: 2 + next(6) }, (_, index) => {
+      const anchors = Array.from({ length: next(3) }, () => {
+        const path = paths[next(paths.length)];
+        const state = ["found", "found", "outdated", "unverified"][next(4)];
+        if (next(4) === 0) return whole(path, "file", state);
+        const start = 1 + next(20);
+        return lines(path, start, start + next(4), state);
+      });
+      return node(`D1.${index + 1}`, { anchors });
+    });
+    const edges = Array.from({ length: next(8) }, () => {
+      const from = next(nodes.length);
+      const to = (from + 1 + next(nodes.length - 1)) % nodes.length;
+      return edge(nodes[from].id, nodes[to].id);
+    });
+    const files = paths
+      .filter(() => next(2) === 0)
+      .map((path) => {
+        const status = ["modified", "modified", "added", "deleted"][next(4)];
+        const ranges = Array.from({ length: next(3) }, () => [1 + next(24), next(4)]);
+        return changed(path, status, ranges);
+      });
+    const result = touched(analysisOf(diagram(nodes, edges)), files);
+
+    // The model: a found anchor on lines touches a modified file's hunk when some line is on
+    // both, a found whole file any change of its file, and any placed anchor a deleted file.
+    const covers = (anchor, file, hunk) => {
+      if (anchor.state === "unverified" || anchor.path !== file.path) return false;
+      if (file.status === "deleted") return true;
+      if (file.status === "added" || anchor.state !== "found") return false;
+      if (anchor.target === "file") return true;
+      if (!hunk) return false;
+      for (let line = hunk.oldStart; line < hunk.oldStart + hunk.oldCount; line += 1) {
+        if (anchor.lines.start <= line && line <= anchor.lines.end) return true;
+      }
+      return false;
+    };
+    const hits = (each) =>
+      files.some((file) =>
+        each.anchors.some((anchor) =>
+          file.hunks.length
+            ? file.hunks.some((hunk) => covers(anchor, file, hunk))
+            : covers(anchor, file, null),
+        ),
+      );
+    const expected = nodes.filter(hits).map((each) => each.id);
+    assert.deepEqual([...result.nodes].sort(), expected.sort(), `seed ${seed}`);
+    for (const id of result.near) {
+      assert.equal(result.nodes.has(id), false, `seed ${seed}: ${id} is touched and near`);
+      const linked = edges.some(
+        (each) =>
+          (each.from === id && result.nodes.has(each.to)) ||
+          (each.to === id && result.nodes.has(each.from)),
+      );
+      assert.ok(linked, `seed ${seed}: ${id} is near no touched node`);
+    }
+    for (const each of edges) {
+      for (const [one, other] of [
+        [each.from, each.to],
+        [each.to, each.from],
+      ]) {
+        if (result.nodes.has(one) && !result.nodes.has(other)) {
+          assert.ok(result.near.has(other), `seed ${seed}: ${other} is one edge from ${one}`);
+        }
+      }
+    }
+  }
+});
+
+// A small seeded generator (mulberry32), so a failing case is the same on every run.
+function random(seed) {
+  let state = seed;
+  return (below) => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) % below;
+  };
+}

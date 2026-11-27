@@ -47,7 +47,10 @@ const CHECK_WORDS = {
 // `store` holds the runs (run-store.js); `detailEl` is the `<dialog>`. `noteOf(id)` gives a
 // note by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)`
 // shows a file in the code pane; `reviewers()` names the settings' reviewers, in order;
-// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane.
+// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
+// `changeMapState()` says whether the map can show what they touched: "none" with no analysis,
+// "no-architecture" when it has no Architecture diagram, else "ready"; `showChangeMap(from,
+// to)` shows it.
 export function runDialog({
   store,
   detailEl,
@@ -56,6 +59,8 @@ export function runDialog({
   openFile,
   reviewers,
   showChanges,
+  changeMapState,
+  showChangeMap,
   onError,
 }) {
   // What the dialog shows while open: `{ kind: "run", id }` or `{ kind: "step", id, key }`;
@@ -144,6 +149,8 @@ export function runDialog({
         JSON.stringify(shown),
         liveKey,
         busyThread(root.id),
+        // An analysis read since, or deleted, changes the Change map button.
+        changeMapState(),
       ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
@@ -344,6 +351,8 @@ export function runDialog({
         showChanges(view.id, latest.id);
       });
       actions.push(button);
+      const map = changeMapButton(view, latest);
+      if (map) actions.push(map);
     }
     const head = detailHeader(statusIcon(iconKind(latest)), title, status(), actions);
     const where = head.querySelector(".note-dialog-where");
@@ -351,6 +360,30 @@ export function runDialog({
       where.textContent = status();
     });
     return [head, body];
+  }
+
+  // Change map, beside Changes: what runs `view` to `latest` touched on the map's Architecture
+  // (docs/review-assist.md, "The four kinds"). None without an analysis; disabled, with why,
+  // when it has no Architecture diagram.
+  function changeMapButton(view, latest) {
+    const state = changeMapState();
+    if (state === "none") return null;
+    const button = el("button", "button run-detail-change-map", "Change map");
+    button.type = "button";
+    if (state === "no-architecture") {
+      button.disabled = true;
+      button.title = "The map has no Architecture diagram";
+      return button;
+    }
+    button.title =
+      latest.id === view.id
+        ? `What ${view.id} touched on the map`
+        : `What ${view.id} to ${latest.id} touched on the map`;
+    button.addEventListener("click", () => {
+      detailEl.close();
+      showChangeMap(view.id, latest.id);
+    });
+    return button;
   }
 
   // The thread's branch, and what ends the thread (docs/design.md, "Ending a thread"): Apply

@@ -52,7 +52,7 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     (
         "/api/analysis",
         &[Method::GET, Method::POST, Method::DELETE],
-        "GET, POST {\"kind\": ...}, or DELETE ?diagram=<diagram id>",
+        "GET, GET ?at=<commit>, POST {\"kind\": ...}, or DELETE ?diagram=<id>",
     ),
     (
         "/api/analysis/update",

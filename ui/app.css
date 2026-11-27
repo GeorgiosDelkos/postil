@@ -4484,7 +4484,9 @@ body.focus-mode .code {
   gap: 10px;
 }
 
+/* The room between the change map's esc and the counts, cut with an ellipsis when short. */
 .map-crumbs {
+  flex: 1;
   min-width: 0;
 }
 
@@ -4919,6 +4921,42 @@ body.focus-mode .code {
   fill: var(--map);
   font-size: 12.5px;
   font-weight: 600;
+}
+
+/* A change map's touched node: filled with the added color mixed into the card's own, opaque, so
+   the edges drawn straight behind cards do not show through, and light enough that the label
+   and summary keep their contrast in both palettes. */
+.map-node.touched .map-node-box {
+  fill: color-mix(in srgb, var(--added) 18%, var(--raised));
+  stroke: var(--added);
+  stroke-width: 1.5;
+}
+
+.map-node.touched:hover .map-node-box {
+  fill: color-mix(in srgb, var(--added) 18%, var(--hover));
+}
+
+.map-node.touched .map-node-band,
+.map-node.touched .map-node-inset {
+  stroke: var(--added);
+}
+
+/* One edge from a touched node: outlined only. Before the ring and the selection, which win. */
+.map-node.near .map-node-box,
+.map-group.near .map-group-box {
+  stroke: var(--added);
+  stroke-width: 1.5;
+}
+
+.map-group.touched .map-group-box {
+  fill: color-mix(in srgb, var(--added) 12%, var(--card));
+  stroke: var(--added);
+  stroke-width: 1.5;
+}
+
+/* The change map's way back: never shrunk, so the crumbs beside it take the ellipsis. */
+.map-change-exit {
+  flex: none;
 }
 
 /* A search match, or the node of the code pane's line. */
