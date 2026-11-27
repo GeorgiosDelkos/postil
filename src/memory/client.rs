@@ -3,9 +3,13 @@
 //! the hand-written types of the tools Postil calls.
 //!
 //! One request is in flight at a time: [`Server::call_tool`] writes a request and reads until
-//! the reply with its id, skipping any other. A request is small (a recall's text is cut at
-//! [`super::RECALL_TEXT_LIMIT`]), and the server had read every earlier one before it answered
-//! it, so writing one never blocks on a full pipe.
+//! the reply with its id, skipping any other. The server had read every earlier request before
+//! it answered it, so it is reading its input when a request is written. A recall is small (its
+//! text is cut at [`super::RECALL_TEXT_LIMIT`]) and never fills the pipe. A remember carries a
+//! body of up to [`super::BODY_WRITE_LIMIT`], 16 KiB, more once escaped as JSON, which can be
+//! over a pipe's 16 KiB buffer: its write waits while the server reads it, and that wait is not
+//! bounded by the call's deadline. A server that stopped reading would hold the memory thread
+//! until it exits, or is killed with its group when the project changes or the window closes.
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -21,7 +25,7 @@ use serde_json::Value;
 use crate::agents;
 
 /// The tools Postil calls. A server whose `tools/list` lacks one does not match this Postil.
-pub(super) const REQUIRED_TOOLS: [&str; 4] = ["get", "history", "recall", "refresh"];
+pub(super) const REQUIRED_TOOLS: [&str; 5] = ["get", "history", "recall", "refresh", "remember"];
 
 /// The MCP version Postil speaks: hippius-mem 0.7.1's (spike S3, 2026-11-26).
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -479,6 +483,13 @@ pub(crate) enum Anchor {
     Local,
     /// Committed on chain.
     Chain,
+}
+
+/// `remember`'s result: the new memory's id, unchecked, and the scope it was written to.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawRemembered {
+    pub(super) id: String,
+    pub(super) repo: String,
 }
 
 /// What `refresh` did: how many notes it indexed.

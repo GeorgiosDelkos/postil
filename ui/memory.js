@@ -11,6 +11,46 @@ export const MEMORY_POLL_MS = 250;
 // step 9.2): a teammate's text can be any length.
 export const MEMORY_BODY_LIMIT = 64 * 1024;
 
+// The longest summary and body a Save sends, in UTF-8 bytes (src/memory.rs,
+// `SUMMARY_WRITE_LIMIT` and `BODY_WRITE_LIMIT`): checked here too, so the dialog says so before
+// the server refuses.
+export const MEMORY_SUMMARY_LIMIT = 1024;
+export const MEMORY_WRITE_LIMIT = 16 * 1024;
+
+// The kinds a memory can be, as hippius-mem's `remember` names them, the likeliest first.
+export const NOTE_TYPES = ["gotcha", "convention", "decision", "context", "reference"];
+
+// How many UTF-8 bytes `text` is.
+export function utf8Length(text) {
+  return new TextEncoder().encode(text).length;
+}
+
+// Why the Remember dialog's text cannot be saved as it is, or null when it can: a blank
+// summary or body, one over its limit, or the repository's scope when the repository has no
+// name in team memory (`memoryRepo` null: no origin remote).
+export function checkMemoryDraft({ summary, body, scope, memoryRepo }) {
+  if (!summary.trim()) return "Write a summary.";
+  if (!body.trim()) return "Write the memory.";
+  const summaryBytes = utf8Length(summary);
+  if (summaryBytes > MEMORY_SUMMARY_LIMIT) {
+    return `The summary is ${summaryBytes} bytes; at most ${MEMORY_SUMMARY_LIMIT} are sent.`;
+  }
+  const bodyBytes = utf8Length(body);
+  if (bodyBytes > MEMORY_WRITE_LIMIT) {
+    return `The memory is ${bodyBytes} bytes; at most ${MEMORY_WRITE_LIMIT} (16 KiB) are sent.`;
+  }
+  if (scope === "repo" && !memoryRepo) {
+    return "This repository has no origin remote, which names it in team memory: save it for the whole team.";
+  }
+  return null;
+}
+
+// Whether a failed Save is hippius-mem refusing a summary close to one it holds, which
+// "Save anyway" writes all the same (src/memory.rs, "Only the engineer's Save writes").
+export function isNearDuplicateError(error) {
+  return typeof error === "string" && error.includes("near-duplicate");
+}
+
 // A memory id as hippius-mem writes them; nothing else is sent (src/memory.rs, `MemoryId`).
 export function isMemoryId(id) {
   return typeof id === "string" && /^mem_[0-9A-Z]+$/.test(id);
@@ -71,16 +111,16 @@ export function replyProblem(reply) {
   return null;
 }
 
-// Asks `url` with `method`, and again every MEMORY_POLL_MS while the answer is pending, calling
-// `onReply(reply)` with each answer, pending ones included. A failed request is a failed
-// answer. Returns a function that stops asking; no `onReply` comes after it.
-export function pollMemory(url, { method = "GET", onReply }) {
+// Asks `url` with `method`, and `body` when given, and again every MEMORY_POLL_MS while the
+// answer is pending, calling `onReply(reply)` with each answer, pending ones included. A failed
+// request is a failed answer. Returns a function that stops asking; no `onReply` comes after it.
+export function pollMemory(url, { method = "GET", body, onReply }) {
   let stopped = false;
   let timer = null;
   async function ask() {
     let reply;
     try {
-      const response = await fetch(url, { method });
+      const response = await fetch(url, body === undefined ? { method } : { method, body });
       reply = response.ok
         ? await response.json()
         : { state: "failed", error: await response.text() };

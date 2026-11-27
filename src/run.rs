@@ -82,7 +82,7 @@ use serde_json::Value;
 
 use crate::acp::{
     Agent, ContentBlock, ElicitationReply, Event, Launch, McpServer, Opened, PermissionKind,
-    PermissionOption, PermissionRequest, StopReason, Stopper, ToolKind, TurnEnd,
+    PermissionOption, StopReason, Stopper, ToolKind, TurnEnd,
 };
 use crate::agents::{self, AgentChoice, Scanner};
 use crate::analysis::{self, AnalysisJob, Planned};
@@ -93,8 +93,9 @@ use crate::repo::Repo;
 use crate::report;
 use crate::review::{self, Diff, Finding, Stage, Work};
 use crate::run::log::{
-    Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
-    held_threads, hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
+    Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Remember, Run,
+    RunView, held_threads, hold_thread_lock, read_header, remove_thread_lock, run_number,
+    run_numbers,
 };
 use crate::settings::TeamMemory;
 use crate::thread::{self, Mode, State, Thread};
@@ -230,7 +231,13 @@ enum Held {
     /// Its process runs and its session is being opened, on the start thread.
     Starting(Stopper),
     /// Its session is open; it is kept for the next run while it is the one chosen.
-    Ready(AgentChoice, Agent),
+    Ready {
+        choice: AgentChoice,
+        agent: Agent,
+        /// Whether its session got hippius-mem's server: a memory draft never goes to it then
+        /// (`Runner::draft`).
+        memory: TeamMemory,
+    },
 }
 
 impl Slots {
@@ -270,15 +277,15 @@ impl Slots {
     }
 
     /// The live run of notes of this window started most recently, if any: the latest run once
-    /// the one before is gone. An analysis run is never the latest: the Run tab lists runs of
-    /// notes.
+    /// the one before is gone. An analysis run and a memory draft are never the latest: the Run
+    /// tab lists runs of notes.
     fn newest_live(&self) -> Option<Arc<Run>> {
         self.by_thread
             .values()
             .filter_map(|slot| slot.run.as_ref())
             .filter(|run| {
                 let state = run.state();
-                state.live() && state.header.analysis.is_none()
+                state.live() && state.header.analysis.is_none() && state.header.remember.is_none()
             })
             .max_by_key(|run| run_number(&run.state().header.id))
             .cloned()
@@ -302,7 +309,15 @@ impl Slots {
     /// Whether `thread` holds a live ready agent matching `choice`.
     fn has_live_agent(&self, thread: &str, choice: &AgentChoice) -> bool {
         self.by_thread.get(thread).is_some_and(|slot| {
-            matches!(&slot.agent, Held::Ready(kept, live) if kept == choice && live.is_alive())
+            let Held::Ready {
+                choice: kept,
+                agent: live,
+                ..
+            } = &slot.agent
+            else {
+                return false;
+            };
+            kept == choice && live.is_alive()
         })
     }
 
@@ -797,7 +812,8 @@ impl Runner {
     ///
     /// [`Error::TurnRunning`] while a run of this thread is under way in this window, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] for a blank
-    /// text, a run that is a review, or a run another run already follows; as
+    /// text, a run that is a review, an analysis or a memory draft, or a run another run
+    /// already follows; as
     /// [`Runner::view_of`] for `of` and the runs it follows, and [`Error::NoSuchRun`] when one
     /// follows a run that is not older; [`Error::ReadRun`] when the runs directory cannot be
     /// listed; [`Error::WriteRun`] when the run log cannot be created; and as
@@ -830,6 +846,14 @@ impl Runner {
                     "{of} is an analysis: analyze again to go on"
                 )));
             }
+            // A draft is no turn of its thread: a follow-up of it would start a thread whose
+            // history is the draft alone.
+            if let Some(remember) = &state.header.remember {
+                return Err(Error::BadRequest(format!(
+                    "{of} is a memory draft: follow up {}",
+                    remember.of
+                )));
+            }
             state.header.notes.clone()
         };
         // Two follow-ups of one run would make two threads that each leave the other out.
@@ -844,26 +868,7 @@ impl Runner {
         let record = self.open_thread(&first)?;
         let evicted = record.state == State::Evicted;
         let slots = self.slots();
-        // The thread's kept agent ran `followed`, the slot's run. An evicted thread's agent,
-        // kept in another window, worked in a worktree that is gone. The kept agent goes on
-        // with its own choice, model included, whatever the settings now say: a slot changed
-        // since must not drop the conversation or switch its model (decided 2026-11-26). Only
-        // a fresh agent takes `agent`, the settings' choice.
-        let kept = slots
-            .by_thread
-            .get(&first)
-            .filter(|_| !evicted)
-            .filter(|slot| {
-                slot.run
-                    .as_ref()
-                    .is_some_and(|run| Arc::ptr_eq(run, followed))
-            })
-            .and_then(|slot| match &slot.agent {
-                // The slot's run is `followed`, and `agent` is named from that run, so the kept
-                // agent is always the run's own agent: only whether it still runs is checked.
-                Held::Ready(kept, live) if live.is_alive() => Some(kept.clone()),
-                Held::Ready(..) | Held::Starting(_) | Held::None => None,
-            });
+        let kept = kept_agent(&slots, &first, evicted, followed).map(|kept| kept.choice);
         let same_conversation = kept.is_some();
         let agent = kept.unwrap_or(agent);
         let prompt = match (same_conversation, record.mode) {
@@ -878,23 +883,10 @@ impl Runner {
                 text: text.to_owned(),
                 files: Vec::new(),
             },
-            (false, mode) => {
-                // Edits a read-only run made were undone: there is no file to link for them.
-                let files = match mode {
-                    Mode::Work => {
-                        let diffs: Vec<Diff> = thread
-                            .iter()
-                            .flat_map(|run| run.state().work().diffs)
-                            .collect();
-                        edited_files(&diffs)
-                    }
-                    Mode::Read => Vec::new(),
-                };
-                Prompt {
-                    text: fresh_follow_up(&thread, text, mode),
-                    files,
-                }
-            }
+            (false, mode) => Prompt {
+                text: fresh_follow_up(&thread, text, mode),
+                files: thread_files(&thread, mode),
+            },
         };
         let new = NewRun {
             agent,
@@ -912,6 +904,123 @@ impl Runner {
             place: Place::Open(record),
         };
         self.launch(slots, new, |_| Ok(Content { notes, prompt }))
+    }
+
+    /// The latest turn of the thread that starts with run `first`, the run a note was sent in:
+    /// `first` or its latest follow-up, where a memory is drafted ([`Runner::draft`]). `None`
+    /// when the run has no thread (it ran before threads had worktrees), or its thread ended
+    /// (applied or discarded): the Remember dialog then starts from the note's text. Reads the
+    /// record, and the header of every newer run for each follow-up.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when `first` is not a run id; as [`thread::find`];
+    /// [`Error::ReadRun`] when the runs directory cannot be listed.
+    pub(crate) fn thread_tip(&self, first: &str) -> Result<Option<String>> {
+        run_number(first).ok_or_else(|| {
+            Error::BadRequest(format!("run id {first:?}: expected R and a number"))
+        })?;
+        let Some(record) = thread::find(&self.repo, first)? else {
+            return Ok(None);
+        };
+        if matches!(record.state, State::Applied | State::Discarded) {
+            return Ok(None);
+        }
+        let mut tip = first.to_owned();
+        while let Some(next) = self.followed_by(&tip)? {
+            tip = next;
+        }
+        Ok(Some(tip))
+    }
+
+    /// Asks the thread whose latest turn is run `of` to draft a team memory about `note`, as a
+    /// note's prompt quotes it, and returns the draft run's id (docs/review-assist.md, "Postil
+    /// writes memory"). The run is read-only whatever its thread's mode, marked `remember: {of}`
+    /// in its header, and its reply ends with the draft ([`RunView`]'s `draft`). It goes to the
+    /// thread's kept agent when that agent ran `of`, as a follow-up does, and otherwise to a
+    /// fresh `agent` told the thread so far. It carries `of`'s notes, so it goes with them, and
+    /// is never the Run tab's latest run. Waits for locks as [`Runner::follow_up`] does.
+    ///
+    /// A fresh agent gets no team memory: a draft run must not write memory itself, and the
+    /// recall it would offer is the engineer's next step, in the dialog. A kept agent whose
+    /// session got hippius-mem's server is never used: a fresh agent takes its place.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] for a run that is a review, an analysis or a memory draft, or one
+    /// another run already follows; and as [`Runner::follow_up`] for the thread and its launch.
+    pub(crate) fn draft(
+        self: &Arc<Self>,
+        of: &str,
+        agent: AgentChoice,
+        note: &str,
+    ) -> Result<String> {
+        let thread = self.thread(of)?;
+        let followed = thread
+            .last()
+            .expect("a thread holds at least the run it ends with");
+        let notes = {
+            let state = followed.state();
+            let kind = if state.header.review.is_some() {
+                Some("a review")
+            } else if state.header.analysis.is_some() {
+                Some("an analysis")
+            } else if state.header.remember.is_some() {
+                Some("a memory draft")
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                return Err(Error::BadRequest(format!(
+                    "{of} is {kind}: draft from the thread of a note"
+                )));
+            }
+            state.header.notes.clone()
+        };
+        if let Some(next) = self.followed_by(of)? {
+            return Err(Error::BadRequest(format!(
+                "{next} already follows {of}: draft after {next}"
+            )));
+        }
+        let first = thread[0].state().header.id.clone();
+        let record = self.open_thread(&first)?;
+        let evicted = record.state == State::Evicted;
+        let slots = self.slots();
+        // Never an agent whose session has hippius-mem's server (decided 2026-11-27): a memory
+        // it wrote would be an external write the engineer did not save, and its session cannot
+        // be taken back. A fresh agent then starts, told the thread so far, with none; the kept
+        // agent is let go, and its conversation with it.
+        let kept = kept_agent(&slots, &first, evicted, followed)
+            .filter(|kept| kept.memory == TeamMemory::Off)
+            .map(|kept| kept.choice);
+        let prompt = match &kept {
+            Some(_) => Prompt {
+                text: draft_ask(note),
+                files: Vec::new(),
+            },
+            None => Prompt {
+                text: fresh_draft(&thread, note, record.mode),
+                files: thread_files(&thread, record.mode),
+            },
+        };
+        let new = NewRun {
+            conversation: if kept.is_some() {
+                Conversation::Kept
+            } else {
+                Conversation::Fresh
+            },
+            agent: kept.unwrap_or(agent),
+            memory: TeamMemory::Off,
+            origin: Origin::Remember(Remember { of: of.to_owned() }),
+            review: None,
+            place: Place::Open(record),
+        };
+        let mut id = None;
+        self.launch(slots, new, |run| {
+            id = Some(run.to_owned());
+            Ok(Content { notes, prompt })
+        })?;
+        Ok(id.expect("launch succeeded, so Run::create called the content closure"))
     }
 
     /// The runs of the thread that ends with run `of`: the run of notes it started from, then
@@ -1124,7 +1233,9 @@ impl Runner {
     ///
     /// A run in a thread that only reads ([`Mode::Read`]) is read-only in its header, so every
     /// run of the thread is, follow-ups included, whatever started them; it takes no snapshot.
-    /// A proposing reviewer takes none either.
+    /// A proposing reviewer takes none either, and a memory draft, read-only in any thread,
+    /// neither: it commits what was left in the worktree before it, as every run does, and its
+    /// edits are undone.
     ///
     /// # Errors
     ///
@@ -1154,8 +1265,9 @@ impl Runner {
             place,
         } = new;
         let snapshot = place.mode() == Mode::Work
-            && !matches!(&origin, Origin::Review(stage) if !stage.judges());
-        let analysis = matches!(origin, Origin::Analysis(_));
+            && !matches!(&origin, Origin::Review(stage) if !stage.judges())
+            && !matches!(origin, Origin::Remember(_));
+        let listed = !matches!(origin, Origin::Analysis(_) | Origin::Remember(_));
         let Created { run, prompt, marks } =
             self.create_run(&agent.name, origin, &place, content)?;
         let (thread, worktree) = match self.place(&run, place, snapshot) {
@@ -1185,7 +1297,7 @@ impl Runner {
         slots.launches += 1;
         let used = slots.launches;
         // The Run tab follows the latest run, and lists runs of notes only.
-        if !analysis {
+        if listed {
             slots.latest = Some(Arc::clone(&run));
         }
         let slot = slots
@@ -1199,7 +1311,7 @@ impl Runner {
         slot.run = Some(Arc::clone(&run));
         slot.thread = thread.clone();
         slot.used = used;
-        let replaced = if reuse && let Held::Ready(_, kept) = &slot.agent {
+        let replaced = if reuse && let Held::Ready { agent: kept, .. } = &slot.agent {
             run.set_cost_baseline(prev_session_cost);
             begin(kept, &run, &marks, &prompt, &thread.path);
             Held::None
@@ -1241,7 +1353,7 @@ impl Runner {
 
     /// Creates the log of a run of `agent` in `place`, started as `origin` says
     /// ([`Run::create`]), with the notes and prompt `content` gives once the run has its place.
-    /// Its header is read-only when its thread only reads.
+    /// Its header is read-only when its thread only reads, and for a memory draft.
     ///
     /// # Errors
     ///
@@ -1253,7 +1365,7 @@ impl Runner {
         place: &Place,
         content: impl FnOnce(&str) -> Result<Content>,
     ) -> Result<Created> {
-        let read_only = place.mode() == Mode::Read;
+        let read_only = place.mode() == Mode::Read || matches!(origin, Origin::Remember(_));
         // A follow-up and a review mark no note sent: the notes went to the run they follow or
         // review. An ask, the run of notes in a thread that only reads, is saved sent in its
         // run already (`notes::save_ask`).
@@ -1403,7 +1515,7 @@ impl Runner {
             (true, None) => {
                 run.state().cancel_asked = Some(Instant::now());
                 run.record(Entry::CancelRequested);
-                if let Held::Ready(_, agent) = &slot.agent {
+                if let Held::Ready { agent, .. } = &slot.agent {
                     // The requests this answered `cancelled` on the wire are closed in the log
                     // too, including one whose event is still on its way.
                     match agent.cancel() {
@@ -1458,7 +1570,7 @@ impl Runner {
         let mut slots = self.slots();
         let Some(Slot {
             run: Some(run),
-            agent: Held::Ready(_, agent),
+            agent: Held::Ready { agent, .. },
             ..
         }) = slots.live_slot(id)
         else {
@@ -1488,7 +1600,7 @@ impl Runner {
         let mut slots = self.slots();
         let Some(Slot {
             run: Some(run),
-            agent: Held::Ready(_, agent),
+            agent: Held::Ready { agent, .. },
             ..
         }) = slots.live_slot(id)
         else {
@@ -1651,26 +1763,33 @@ impl Runner {
     }
 
     /// The thread run `run` belongs to: its own for a run of notes, the reviewed run's for a
-    /// review stage, the first run's for a follow-up. `None` for a run from before threads
-    /// had worktrees.
+    /// review stage, the first run's for a follow-up, and for a memory draft that of the turn
+    /// it drafts after. `None` for a run from before threads had worktrees.
     ///
     /// # Errors
     ///
-    /// As [`Runner::thread`] for a follow-up, and as [`thread::find`].
+    /// As [`Runner::thread`] for a follow-up and a memory draft, and as [`thread::find`].
     fn thread_of(&self, run: &Run) -> Result<Option<Thread>> {
-        let (id, review, follows) = {
+        let (id, review, follows, drafted) = {
             let state = run.state();
             let review = state.header.review.as_ref().map(|stage| stage.of.clone());
+            let drafted = state
+                .header
+                .remember
+                .as_ref()
+                .map(|remember| remember.of.clone());
             (
                 state.header.id.clone(),
                 review,
                 state.header.follow_up.is_some(),
+                drafted,
             )
         };
-        let first = match review {
-            Some(of) => of,
-            None if follows => self.thread(&id)?[0].state().header.id.clone(),
-            None => id,
+        let first = match (review, drafted) {
+            (Some(of), _) => of,
+            (None, Some(of)) => self.thread(&of)?[0].state().header.id.clone(),
+            (None, None) if follows => self.thread(&id)?[0].state().header.id.clone(),
+            (None, None) => id,
         };
         thread::find(&self.repo, &first)
     }
@@ -2250,7 +2369,11 @@ impl Runner {
                     let prompt = pending.prompt.for_memory(given);
                     let root = &pending.thread.path;
                     begin(&agent, &pending.run, &pending.ids, &prompt, root);
-                    slot.agent = Held::Ready(pending.agent, agent);
+                    slot.agent = Held::Ready {
+                        choice: pending.agent,
+                        agent,
+                        memory: given,
+                    };
                 }
             }
             drop(slots);
@@ -2576,15 +2699,18 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         }
         let slot = slots.by_thread.get_mut(id).expect("let_go found the slot");
         let thread = Some(slot.thread.clone());
-        let (review, read_only_thread, analyzing) =
-            slot.run.as_ref().map_or((None, false, false), |run| {
-                let state = run.state();
-                (
-                    state.header.review.clone(),
-                    state.header.read_only,
-                    state.header.analysis.is_some(),
-                )
-            });
+        let (review, read_only_thread, analyzing, drafting) =
+            slot.run
+                .as_ref()
+                .map_or((None, false, false, false), |run| {
+                    let state = run.state();
+                    (
+                        state.header.review.clone(),
+                        state.header.read_only,
+                        state.header.analysis.is_some(),
+                        state.header.remember.is_some(),
+                    )
+                });
         // Answered before the request is logged, and logged with it at once: a page that read
         // the request alone would show the run waiting for the engineer.
         // From the run's header, which never changes: a Stop that ends the chain does not lift
@@ -2596,12 +2722,7 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
                 .as_ref()
                 .is_some_and(|chain| chain.stage == *stage)
         });
-        let answer = match (&event, &slot.agent) {
-            (Event::Permission(request), Held::Ready(_, agent)) => {
-                auto_answer(agent, request, read_only)
-            }
-            _ => None,
-        };
+        let answer = auto_answer(&slot.agent, &event, read_only);
         // A stage that does not end well ends its review.
         if ends_turn && !ended_well && stage.is_some() {
             slot.chain = None;
@@ -2610,12 +2731,6 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
             event,
             Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
         );
-        // An analysis's agent goes with its turn: its thread ends with the run.
-        let released = if ends_agent || (ends_turn && analyzing) {
-            slot.release()
-        } else {
-            Held::None
-        };
         let run = slot.run.clone();
         // However a read-only run's turn ends, what it changed is put back before the end is
         // logged, under the lock, so no run starts in the worktree first.
@@ -2628,6 +2743,13 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
             .and_then(|run| undo_read_only(&runner, run, thread.as_ref()));
         // An analysis that changed files stores nothing: its tree is not the one it was given.
         let edited = undone.is_some();
+        // An analysis's agent goes with its turn: its thread ends with the run. So does a memory
+        // draft's: the draft is the slot's run now, so no turn could reuse its agent.
+        let released = if ends_agent || (ends_turn && (analyzing || drafting)) {
+            slot.release()
+        } else {
+            Held::None
+        };
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
         // next stage starts once the end is logged.
@@ -2701,14 +2823,17 @@ fn decide(slot: &mut Slot, run: &Run, stage: &Stage, undone: Option<String>) -> 
     goes
 }
 
-/// Answers a permission request as Postil does on the engineer's behalf (docs/design.md,
-/// "Runs", decided with the owner on 2026-11-23: only a question stops for the engineer), and
-/// returns the entry that logs the answer. A run that may only read (a proposing reviewer's,
-/// or one in a thread that only reads) is kept so: only its reads, searches, fetches and
-/// thinking are allowed. `None` when no option fits, or when a Stop already answered the
-/// request (and logged that) or the agent is gone; the run then shows the request open until
-/// it ends.
-fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> Option<Entry> {
+/// Answers `event` when it is a permission request to `held`, a ready agent, as Postil does on
+/// the engineer's behalf (docs/design.md, "Runs", decided with the owner on 2026-11-23: only a
+/// question stops for the engineer), and returns the entry that logs the answer. A run that
+/// may only read (a proposing reviewer's, a memory draft's, or one in a thread that only
+/// reads) is kept so: only its reads, searches, fetches and thinking are allowed. `None` for
+/// any other event, when no option fits, or when a Stop already answered the request (and
+/// logged that) or the agent is gone; the run then shows the request open until it ends.
+fn auto_answer(held: &Held, event: &Event, read_only: bool) -> Option<Entry> {
+    let (Event::Permission(request), Held::Ready { agent, .. }) = (event, held) else {
+        return None;
+    };
     let reads = matches!(
         request.tool_call.kind,
         Some(ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think)
@@ -2776,12 +2901,12 @@ fn undo_if_live(runner: &Runner, run: &Run, thread: Option<&Thread>) {
     }
 }
 
-/// When `run` may only read (a proposing reviewer's, or any run of a thread that only reads)
-/// and changed `thread`'s worktree, puts the worktree back to the thread's branch at its tip
-/// ([`Repo::reset_to`], ignored files kept) and returns what the run says about it; `None`
-/// for any other run, or one that changed nothing. Called however the turn ends, a Stop and a
-/// close included: edits left there would be taken in by the next run's commit, and by Apply
-/// with it.
+/// When `run` may only read (a proposing reviewer's, a memory draft's in any thread, or any run
+/// of a thread that only reads) and changed `thread`'s worktree, puts the worktree back to the
+/// thread's branch at its tip ([`Repo::reset_to`], ignored files kept) and returns what the run
+/// says about it; `None` for any other run, or one that changed nothing. Called however the
+/// turn ends, a Stop and a close included: edits left there would be taken in by the next run's
+/// commit, and by Apply with it.
 ///
 /// Such a run may only read, but an agent that edits without asking is not stopped by the
 /// permission rule. An edit made through a command reports no diff, one it committed leaves
@@ -2791,7 +2916,7 @@ fn undo_if_live(runner: &Runner, run: &Run, thread: Option<&Thread>) {
 /// `status`, `branch`, `rev-parse`, and the reset when needed.
 fn undo_read_only(runner: &Runner, run: &Run, thread: Option<&Thread>) -> Option<String> {
     // Who changed files: a proposing reviewer, by its place in the review, or the agent of a
-    // thread that only reads.
+    // read-only run: a run of a thread that only reads, or a memory draft in any thread.
     let reviewer = {
         let state = run.state();
         match &state.header.review {
@@ -2849,14 +2974,109 @@ fn first_option(options: &[PermissionOption], kinds: [PermissionKind; 2]) -> Opt
         .map(|option| option.option_id.clone())
 }
 
+/// The agent `slots` keep for the thread `first` when it ran `followed`, the slot's run, and
+/// still runs: the one a follow-up or a memory draft of `followed` goes on with. An evicted
+/// thread's agent, kept in another window, worked in a worktree that is gone. The kept agent
+/// goes on with its own choice, model included, whatever the settings now say: a slot changed
+/// since must not drop the conversation or switch its model (decided 2026-11-26). Only a fresh
+/// agent takes the settings' choice.
+fn kept_agent(slots: &Slots, first: &str, evicted: bool, followed: &Arc<Run>) -> Option<Kept> {
+    slots
+        .by_thread
+        .get(first)
+        .filter(|_| !evicted)
+        .filter(|slot| {
+            slot.run
+                .as_ref()
+                .is_some_and(|run| Arc::ptr_eq(run, followed))
+        })
+        .and_then(|slot| match &slot.agent {
+            // The slot's run is `followed`, and the caller names the agent from that run, so
+            // the kept agent is always the run's own agent: only whether it still runs is
+            // checked.
+            Held::Ready {
+                choice,
+                agent,
+                memory,
+            } if agent.is_alive() => Some(Kept {
+                choice: choice.clone(),
+                memory: *memory,
+            }),
+            Held::Ready { .. } | Held::Starting(_) | Held::None => None,
+        })
+}
+
+/// A thread's kept agent, as [`kept_agent`] finds it: its choice, and whether its session got
+/// hippius-mem's server.
+struct Kept {
+    choice: AgentChoice,
+    memory: TeamMemory,
+}
+
+/// The files a fresh agent's prompt links in a thread in `mode`: every file its runs edited.
+/// Edits a read-only run made were undone: there is no file to link for them.
+fn thread_files(thread: &[Arc<Run>], mode: Mode) -> Vec<String> {
+    match mode {
+        Mode::Work => {
+            let diffs: Vec<Diff> = thread
+                .iter()
+                .flat_map(|run| run.state().work().diffs)
+                .collect();
+            edited_files(&diffs)
+        }
+        Mode::Read => Vec::new(),
+    }
+}
+
+/// What a memory draft asks before the note it drafts from (docs/review-assist.md, "Postil
+/// writes memory"). The owner chose a draft over the note's raw text: a note written for one
+/// agent in one moment does not stand on its own. The block's shape is what `run/log.rs`
+/// (`draft_of`) reads.
+const DRAFT_ASK: &str = "The engineer wants to record what this work taught as a team memory: \
+     a note that teammates and their agents recall later, without this conversation. Draft it \
+     from the note below and what you know of the work on it.\nDo not edit, create or delete \
+     any file, do not run a command that changes one, do not commit, and do not call any tool \
+     that writes team memory: the engineer reads your draft, edits it, and saves it.\nWrite one \
+     self-contained fact: a decision, a convention, a gotcha, a reference, or context, with its \
+     reason and where it applies. End your reply with a ```json block holding one object: \
+     {\"summary\": \"one line, with the words a teammate would search for\", \"body\": \"the \
+     fact in full\"}.\n";
+
+/// The prompt of a memory draft about `note`, quoted as a prompt quotes a note, to the agent
+/// that ran the thread.
+fn draft_ask(note: &str) -> String {
+    format!("{DRAFT_ASK}\n{note}")
+}
+
+/// The prompt of a memory draft about `note` to a fresh agent in a thread in `mode`: the
+/// thread so far ([`thread_so_far`]), then [`draft_ask`].
+fn fresh_draft(thread: &[Arc<Run>], note: &str, mode: Mode) -> String {
+    let mut prompt = thread_so_far(thread, mode);
+    write!(prompt, "\n{}", draft_ask(note)).expect("writing to a String cannot fail");
+    prompt
+}
+
 /// The prompt of a follow-up that goes to a fresh agent in a thread in `mode`: the thread so
-/// far, each run's prompt and reply in order, then the engineer's `text`, then the ask for a
-/// report ([`report_ask`]), or, in a thread that only reads, the rule that nothing is changed
-/// ([`notes::ASK_RULES`]). The diffs stay out: the agent reads the files as they are now,
-/// linked after the text.
+/// far ([`thread_so_far`]), then the engineer's `text`, then the ask for a report
+/// ([`report_ask`]), or, in a thread that only reads, the rule that nothing is changed
+/// ([`notes::ASK_RULES`]).
 fn fresh_follow_up(thread: &[Arc<Run>], text: &str, mode: Mode) -> String {
-    // The page tells this prompt from a kept agent's by its start (`ui/status.js`,
-    // `freshAgent`), whatever the sentence.
+    let mut prompt = thread_so_far(thread, mode);
+    let ending = match mode {
+        Mode::Work => report_ask(&thread[0].state().header.prompt),
+        Mode::Read => notes::ASK_RULES,
+    };
+    write!(prompt, "\nThe engineer now asks:\n\n{text}\n\n{ending}")
+        .expect("writing to a String cannot fail");
+    prompt
+}
+
+/// What a fresh agent is told of a thread in `mode` before what it is asked: each run's prompt
+/// and reply in order. The diffs stay out: the agent reads the files as they are now, linked
+/// after the text.
+fn thread_so_far(thread: &[Arc<Run>], mode: Mode) -> String {
+    // The page tells a fresh follow-up's prompt from a kept agent's by its start
+    // (`ui/status.js`, `freshAgent`), whatever the sentence.
     let mut prompt = String::from(match mode {
         Mode::Work => {
             "You are continuing work another coding agent did in this repository; its \
@@ -2886,12 +3106,6 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str, mode: Mode) -> String {
         )
         .expect("writing to a String cannot fail");
     }
-    let ending = match mode {
-        Mode::Work => report_ask(&thread[0].state().header.prompt),
-        Mode::Read => notes::ASK_RULES,
-    };
-    write!(prompt, "\nThe engineer now asks:\n\n{text}\n\n{ending}")
-        .expect("writing to a String cannot fail");
     prompt
 }
 

@@ -4,13 +4,15 @@ import { mock, test } from "node:test";
 import {
   MEMORY_BODY_LIMIT,
   MEMORY_POLL_MS,
+  checkMemoryDraft,
   cutBody,
   isMemoryId,
+  isNearDuplicateError,
   memoryAge,
   partitionPointers,
   replyProblem,
 } from "./memory.js";
-import { memoryDialog } from "./memory-dialog.js";
+import { memoryDialog, rememberDialog } from "./memory-dialog.js";
 import { memoryTab, runMemory } from "./memory-tab.js";
 
 const strong = {
@@ -70,6 +72,28 @@ test("isMemoryId takes mem_ and digits or capital letters only", () => {
   }
 });
 
+test("checkMemoryDraft counts UTF-8 bytes, refuses blank text, and a scope with no name", () => {
+  const draft = { summary: "s", body: "b", scope: "global", memoryRepo: null };
+  assert.equal(checkMemoryDraft(draft), null);
+  // 16 KiB of two-byte characters is at the limit; one byte more is over it.
+  const atLimit = "é".repeat(8 * 1024);
+  assert.equal(checkMemoryDraft({ ...draft, body: atLimit }), null);
+  assert.equal(
+    checkMemoryDraft({ ...draft, body: `${atLimit}a` }),
+    "The memory is 16385 bytes; at most 16384 (16 KiB) are sent.",
+  );
+  assert.equal(
+    checkMemoryDraft({ ...draft, summary: "é".repeat(513) }),
+    "The summary is 1026 bytes; at most 1024 are sent.",
+  );
+  assert.equal(checkMemoryDraft({ ...draft, summary: " \n" }), "Write a summary.");
+  assert.equal(checkMemoryDraft({ ...draft, body: "\t" }), "Write the memory.");
+  assert.match(checkMemoryDraft({ ...draft, scope: "repo" }), /no origin remote/);
+  assert.equal(checkMemoryDraft({ ...draft, scope: "repo", memoryRepo: "postil" }), null);
+  assert.equal(isNearDuplicateError("near-duplicate of note mem_01A: retry with force"), true);
+  assert.equal(isNearDuplicateError("hippius-mem exited"), false);
+});
+
 test("replyProblem names both versions and the missing tools", () => {
   const reply = {
     state: "incompatible",
@@ -96,7 +120,18 @@ class FakeElement extends EventTarget {
     this.hidden = false;
     this.disabled = false;
     this.open = false;
+    this.value = "";
     this.attributes = new Map();
+    const classes = () => new Set(this.className.split(" ").filter(Boolean));
+    this.classList = {
+      contains: (name) => classes().has(name),
+      toggle: (name, on) => {
+        const set = classes();
+        if (on ?? !set.has(name)) set.add(name);
+        else set.delete(name);
+        this.className = [...set].join(" ");
+      },
+    };
   }
 
   setAttribute(name, value) {
@@ -153,15 +188,19 @@ class FakeElement extends EventTarget {
   }
 }
 
-// Runs `run` with the fake DOM and `fetch` answering each request from `answer(url, method)`,
-// recording the requests; setTimeout is mocked, so `mock.timers.tick` moves the polls on.
+// Runs `run` with the fake DOM and `fetch` answering each request from `answer(url, method,
+// body)`, recording the requests and their bodies; setTimeout is mocked, so `mock.timers.tick`
+// moves the polls on.
 async function withPage(answer, run) {
   const previous = { document: globalThis.document, fetch: globalThis.fetch };
   const asked = [];
+  // Beside the requests, by index, and left out of comparisons of `asked`.
+  Object.defineProperty(asked, "bodies", { value: [] });
   globalThis.document = { createElement: (tag) => new FakeElement(tag) };
-  globalThis.fetch = async (url, { method = "GET" } = {}) => {
+  globalThis.fetch = async (url, { method = "GET", body } = {}) => {
     asked.push(`${method} ${url}`);
-    const reply = answer(url, method);
+    asked.bodies.push(body);
+    const reply = answer(url, method, body);
     return { ok: true, json: async () => reply };
   };
   mock.timers.enable({ apis: ["setTimeout"] });
@@ -378,5 +417,224 @@ test("the run dialog's Memory section is left out when hippius-mem cannot run", 
       assert.equal(memory.key("R2"), "ready");
       assert.equal(memory.view("R2")[0].textContent, "Nothing recorded for this run.");
       assert.equal(asked.length, 2, "answers are kept while the dialog is open");
+    },
+  ));
+
+// ---- The Remember dialog ---------------------------------------------------------------------
+
+// The Remember dialog on the fake DOM, and what it told the page.
+function rememberOn(dialogEl, memoryRepo = "postil") {
+  const told = { opened: [], started: 0, saved: [] };
+  const dialog = rememberDialog(dialogEl, {
+    memoryRepo: () => memoryRepo,
+    openMemory: (id) => told.opened.push(id),
+    onDraftStarted: () => (told.started += 1),
+    onSaved: (reply) => told.saved.push(reply),
+  });
+  return { dialog, told };
+}
+
+const one = (root, className) => root.find(className)[0];
+
+function type(input, text) {
+  input.value = text;
+  input.dispatchEvent(new Event("input"));
+}
+
+test("Remember drafts in the thread, checks for a duplicate, and saves the text as shown", () => {
+  let polls = 0;
+  let saves = 0;
+  return withPage(
+    (url, method) => {
+      if (url === "api/memory/draft") return { kind: "run", run: "R2", fallback: "keep it short" };
+      if (url.startsWith("api/run?")) {
+        polls += 1;
+        return polls === 1
+          ? { total: 3, status: "running" }
+          : { total: 5, draft: { state: "ready", summary: "a.txt is one line", body: "Why." } };
+      }
+      if (url.startsWith("api/memory/recall")) return { state: "ready", pointers: [strong] };
+      assert.equal(`${method} ${url}`, "POST api/memory/remember");
+      saves += 1;
+      return saves === 1
+        ? { state: "pending" }
+        : { state: "ready", id: "mem_01NEW", repo: "postil" };
+    },
+    async (asked) => {
+      const dialogEl = new FakeElement("dialog");
+      const { dialog, told } = rememberOn(dialogEl);
+      dialog.open({ note: "N1", where: "N1 · a.txt:1", body: "keep it short" });
+      assert.equal(dialogEl.open, true);
+      assert.ok(dialogEl.text.includes("Drafting from the thread…"));
+      await settle();
+      assert.equal(told.started, 1, "the runs are told a draft started");
+      mock.timers.tick(MEMORY_POLL_MS);
+      await settle();
+      assert.deepEqual(asked.slice(0, 3), [
+        "POST api/memory/draft",
+        "GET api/run?id=R2&after=0",
+        "GET api/run?id=R2&after=3",
+      ]);
+      const summary = one(dialogEl, "remember-summary");
+      const body = one(dialogEl, "remember-body");
+      assert.equal(summary.value, "a.txt is one line");
+      assert.equal(body.value, "Why.");
+      assert.ok(asked.includes("GET api/memory/recall?text=a.txt%20is%20one%20line"));
+      // A duplicate's card opens it over the draft, which stays.
+      one(dialogEl, "memory-card").click();
+      assert.deepEqual(told.opened, ["mem_01A"]);
+      assert.equal(dialogEl.open, true);
+
+      // The check runs again once the summary rests.
+      type(summary, "  a.txt is one line, on purpose ");
+      assert.equal(asked.filter((line) => line.includes("recall")).length, 1);
+      mock.timers.tick(300);
+      await settle();
+      assert.equal(asked.filter((line) => line.includes("recall")).length, 2);
+
+      // Two clicks write once; the text goes untrimmed, with nothing added.
+      one(dialogEl, "remember-save").click();
+      one(dialogEl, "remember-save").click();
+      await settle();
+      const posts = () => asked.filter((line) => line === "POST api/memory/remember");
+      assert.equal(posts().length, 1);
+      assert.equal(one(dialogEl, "remember-save").disabled, true);
+      const sent = JSON.parse(asked.bodies[asked.indexOf("POST api/memory/remember")]);
+      assert.deepEqual(sent, {
+        summary: "  a.txt is one line, on purpose ",
+        body: "Why.",
+        scope: "repo",
+        noteType: "gotcha",
+        note: "N1",
+      });
+      mock.timers.tick(MEMORY_POLL_MS);
+      await settle();
+      assert.equal(posts().length, 2, "asked again while pending");
+      assert.deepEqual(told.saved, [{ state: "ready", id: "mem_01NEW", repo: "postil" }]);
+      assert.equal(dialogEl.open, false);
+    },
+  );
+});
+
+test("a check that cannot run leaves Save, and a near-duplicate offers Save anyway", () => {
+  let saves = 0;
+  return withPage(
+    (url) => {
+      if (url === "api/memory/draft") return { kind: "fallback", body: "never sent" };
+      if (url.startsWith("api/memory/recall")) {
+        return {
+          state: "unavailable",
+          reason: "missing",
+          message: "hippius-mem is not installed on PATH",
+        };
+      }
+      saves += 1;
+      return saves === 1
+        ? { state: "failed", error: "near-duplicate of note mem_01OLD: retry with force" }
+        : { state: "ready", id: "mem_01NEW", repo: "global" };
+    },
+    async (asked) => {
+      const dialogEl = new FakeElement("dialog");
+      // No origin remote: the whole team's memory is the only scope.
+      const { dialog, told } = rememberOn(dialogEl, null);
+      dialog.open({ note: "N1", where: "N1 · a.txt:1", body: "never sent" });
+      await settle();
+      assert.equal(one(dialogEl, "remember-body").value, "never sent");
+      assert.ok(dialogEl.text.includes("A summary is checked once written."));
+      const summary = one(dialogEl, "remember-summary");
+      type(summary, "a.txt is one line");
+      mock.timers.tick(300);
+      await settle();
+      assert.ok(
+        dialogEl.text.includes("Check did not run: hippius-mem is not installed on PATH."),
+        dialogEl.text,
+      );
+
+      const save = one(dialogEl, "remember-save");
+      const anyway = one(dialogEl, "remember-anyway");
+      assert.equal(anyway.hidden, true);
+      save.click();
+      await settle();
+      assert.ok(dialogEl.text.includes("Not saved: near-duplicate of note mem_01OLD"));
+      assert.equal(dialogEl.open, true, "the text stays");
+      assert.equal(summary.value, "a.txt is one line");
+      assert.equal(save.disabled, false);
+      assert.equal(anyway.hidden, false);
+
+      anyway.click();
+      await settle();
+      const bodies = asked
+        .map((line, index) => [line, asked.bodies[index]])
+        .filter(([line]) => line === "POST api/memory/remember")
+        .map(([, body]) => JSON.parse(body));
+      assert.deepEqual(
+        bodies.map((body) => [body.scope, body.force]),
+        [
+          ["global", undefined],
+          ["global", true],
+        ],
+      );
+      assert.equal(told.saved.length, 1);
+    },
+  );
+});
+
+test("a draft that fails falls back to the note's text, and closing early stops the draft", () => {
+  let draft = { state: "failed", problem: "the agent's reply holds no draft: no block" };
+  return withPage(
+    (url) => {
+      if (url === "api/memory/draft") return { kind: "run", run: "R2", fallback: "keep it short" };
+      if (url.startsWith("api/run?")) return draft ? { total: 1, draft } : { total: 1 };
+      if (url.startsWith("api/memory/recall")) return { state: "ready", pointers: [] };
+      return {};
+    },
+    async (asked) => {
+      const dialogEl = new FakeElement("dialog");
+      const { dialog } = rememberOn(dialogEl);
+      dialog.open({ note: "N1", where: "N1 · a.txt:1", body: "keep it short" });
+      await settle();
+      assert.equal(one(dialogEl, "remember-body").value, "keep it short");
+      assert.equal(
+        one(dialogEl, "run-notice").textContent,
+        "No draft: the agent's reply holds no draft: no block",
+      );
+      // Text in the dialog holds a quit until it is saved or cancelled.
+      assert.equal(dialog.holdDraft("quitting"), true);
+      assert.ok(dialogEl.text.includes("Save or cancel this memory before quitting."));
+      dialogEl.close();
+      assert.equal(dialog.holdDraft("quitting"), false);
+
+      // Closed while the agent drafts: its run is stopped, and no poll follows.
+      draft = null;
+      dialog.open({ note: "N1", where: "N1 · a.txt:1", body: "keep it short" });
+      await settle();
+      dialogEl.close();
+      await settle();
+      const cancel = asked.indexOf("POST api/run/cancel");
+      assert.notEqual(cancel, -1, asked.join("\n"));
+      assert.deepEqual(JSON.parse(asked.bodies[cancel]), { run: "R2" });
+      const before = asked.length;
+      mock.timers.tick(MEMORY_POLL_MS * 4);
+      await settle();
+      assert.equal(asked.length, before);
+    },
+  );
+});
+
+test("closing before the draft's start is answered stops the run it started", () =>
+  withPage(
+    (url) =>
+      url === "api/memory/draft" ? { kind: "run", run: "R2", fallback: "keep it short" } : {},
+    async (asked) => {
+      const dialogEl = new FakeElement("dialog");
+      const { dialog, told } = rememberOn(dialogEl);
+      dialog.open({ note: "N1", where: "N1 · a.txt:1", body: "keep it short" });
+      dialogEl.close();
+      await settle();
+      const cancel = asked.indexOf("POST api/run/cancel");
+      assert.notEqual(cancel, -1, asked.join("\n"));
+      assert.deepEqual(JSON.parse(asked.bodies[cancel]), { run: "R2" });
+      assert.equal(told.started, 0);
+      assert.ok(!asked.some((line) => line.startsWith("GET api/run?")), "nothing follows it");
     },
   ));

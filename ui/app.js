@@ -13,14 +13,14 @@ import { contextMenu } from "./context-menu.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
-import { memoryDialog } from "./memory-dialog.js";
+import { memoryDialog, rememberDialog } from "./memory-dialog.js";
 import { memoryTab } from "./memory-tab.js";
 import { noteDialog } from "./note-dialog.js";
-import { onLines } from "./note-place.js";
+import { fullPlace, onLines } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
 import { pathNoteDialog } from "./path-note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { escapeAction, foldRun, isAsk, isOpen, isResolved } from "./run.js";
+import { escapeAction, foldRun, isAsk, isOpen, isResolved, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics, formatSlot } from "./settings.js";
 import { reportOf, reviewOf } from "./status.js";
@@ -36,7 +36,7 @@ const notesEl = $("notes");
 const welcomeEl = $("welcome");
 
 const state = {
-  repo: { name: "", branch: "", files: [] },
+  repo: { name: "", branch: "", files: [], memoryRepo: null },
   // The file shown in the code pane: { path, lines }, where a line is a list of
   // [cssClass, text] tokens.
   file: null,
@@ -53,7 +53,8 @@ const state = {
   // anchor, state, intent }, lines 1-based and inclusive, anchor "found" or "lost". `target`
   // is "lines", "file" or "folder", and only a note on lines has `lines` and `snippet`
   // (note-place.js). A lost note is shown as outdated. `intent` is "change", or "ask" for a
-  // question, which is never sent with the notes (run.js, `isAsk`).
+  // question, which is never sent with the notes (run.js, `isAsk`). `memory`, when there, is
+  // the id of the team memory remembered from the note.
   notes: [],
   // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
   // file, and the number of notes on each file or folder path.
@@ -167,6 +168,22 @@ const memory = memoryTab({
   openSettings: () => settings.open(),
 });
 
+// The Remember dialog: a team memory drafted from a note, edited and saved by the engineer.
+const remember = rememberDialog($("remember-dialog"), {
+  memoryRepo: () => state.repo.memoryRepo ?? null,
+  openMemory: (id) => memoryDetail.open(id),
+  onDraftStarted: () => runs.started(),
+  onSaved: (reply) => {
+    showToast(
+      reply.noteError
+        ? `Saved to team memory, but the note was not marked: ${reply.noteError}`
+        : "Saved to team memory.",
+    );
+    memory.remembered();
+    void loadNotes();
+  },
+});
+
 // What a run changed, over the open file; Esc, or opening a file, gives the pane back.
 const changes = changesView({
   viewEl: $("changes-view"),
@@ -210,6 +227,14 @@ const noteDetail = noteDialog($("note-dialog"), {
   busy: (id) => runs.busyThread(id),
   makeNote,
   openRun: (id) => runs.openRun(id),
+  remember: (note) =>
+    remember.open({ note: note.id, where: `${note.id} · ${fullPlace(note)}`, body: note.body }),
+  // The thread a note was sent in starts with that run (src/run.rs, `Runner::thread_tip`).
+  threadLive: (note) => {
+    const root = sentIn(note);
+    return root !== null && runs.threadLive(root);
+  },
+  openMemory: (id) => memoryDetail.open(id),
 });
 
 // A note on a whole file or folder, or a question about one, from the file list.
@@ -529,7 +554,9 @@ window.addEventListener("keydown", (event) => {
 function guardDraft(action) {
   // A draft in an open dialog (a note's text being edited, a follow-up) keeps its dialog,
   // which says why.
-  if ([noteDetail, pathNote, runs].some((dialog) => dialog.holdDraft(action))) return true;
+  if ([noteDetail, pathNote, runs, remember].some((dialog) => dialog.holdDraft(action))) {
+    return true;
+  }
   if (!state.composer?.text.trim()) return false;
   // The note must be in view to be saved or discarded: a dialog over it would make it inert.
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();

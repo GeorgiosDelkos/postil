@@ -47,9 +47,7 @@
 mod connection;
 mod wire;
 
-pub(crate) use crate::acp::connection::{
-    Agent, Event, Launch, Opened, PermissionRequest, Stopper, TurnEnd,
-};
+pub(crate) use crate::acp::connection::{Agent, Event, Launch, Opened, Stopper, TurnEnd};
 pub(crate) use crate::acp::wire::{
     AUTH_REQUIRED, ContentBlock, ElicitationReply, EnvVariable, Location, McpServer, ModelOption,
     PermissionKind, PermissionOption, PlanEntryStatus, PromptUsage, SessionUpdate, StopReason,

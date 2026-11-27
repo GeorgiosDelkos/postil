@@ -195,6 +195,9 @@ pub enum Error {
     MemoryNotReady(String),
     /// A hippius-mem set up or check was asked for while a set up runs.
     MemorySetupRunning,
+    /// A memory write was asked for while the memory thread's queue holds nothing it may drop
+    /// (`memory.rs`, `Calls::enqueue`).
+    MemoryBusy,
     /// The thread that checks or sets up hippius-mem could not start.
     StartMemory(io::Error),
     /// The settings file could not be written.
@@ -524,6 +527,10 @@ impl fmt::Display for Error {
                 f,
                 "the hippius-mem set up is still running (wait for it to finish)"
             ),
+            Self::MemoryBusy => write!(
+                f,
+                "too many team memory writes are queued: wait for them to finish"
+            ),
             Self::StartMemory(_) => write!(f, "cannot start a thread to run hippius-mem"),
             Self::SettingsChanged => write!(
                 f,
@@ -786,6 +793,7 @@ impl std::error::Error for Error {
             | Self::SettingsChanged
             | Self::MemoryNotReady(_)
             | Self::MemorySetupRunning
+            | Self::MemoryBusy
             | Self::AgentNotFound { .. }
             | Self::AgentSilent { .. }
             | Self::AgentExited { .. }

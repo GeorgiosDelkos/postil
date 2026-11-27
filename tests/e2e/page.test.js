@@ -811,6 +811,107 @@ test("a run's dialog shows what the team recorded about its notes and changes", 
   await page.locator("#memory-dialog .run-message").filter({ hasText: "It is lazy." }).waitFor();
 });
 
+test("a sent note's thread drafts the memory, and is free again once the draft ended", async (t) => {
+  const { page, api } = await openProject(t, "memory-draft", "new-memory-server");
+  const note = await addNote(api, "Keep src/a.rs to three lines.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  for (let tries = 0; (await api("api/run"))?.status !== "ended"; tries += 1) {
+    assert.ok(tries < 200, "the run did not end");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await page.locator("#tab-notes").click();
+  const card = page
+    .locator("#notes .note")
+    .filter({ has: page.locator(".note-id", { hasText: new RegExp(`^${note.id}$`) }) });
+  const noteDialog = page.locator("#note-dialog");
+  await card.click();
+  await noteDialog.locator(".note-dialog-remember:not(:disabled)").click();
+
+  // The agent's draft fills the form once its run ended.
+  const dialog = page.locator("#remember-dialog");
+  const summary = dialog.locator(".remember-summary");
+  await summary.waitFor();
+  assert.equal(await summary.inputValue(), "a.txt holds one line on purpose");
+  assert.equal(
+    await dialog.locator(".remember-body").inputValue(),
+    "The parser reads a.txt whole: keep it to one line.",
+  );
+  await dialog.locator(".remember-save").click();
+  await dialog.waitFor({ state: "hidden" });
+
+  // The draft ended: its thread is free, so Remember is offered again, beside the chip.
+  await card.click();
+  await noteDialog.locator(".remembered-chip").waitFor();
+  const remember = noteDialog.locator(".note-dialog-remember");
+  assert.equal(await remember.isDisabled(), false);
+  assert.notEqual(await remember.getAttribute("title"), "Wait for the run");
+});
+
+test("Remember waits for the thread's run, saves a note's text, and the note opens its memory", async (t) => {
+  // `hang`: the run never ends, so its thread stays busy for the whole test.
+  const { page, api } = await openProject(t, "hang", "new-memory-server");
+  const running = await addNote(api, "In the run.");
+  const unsent = await addNote(api, "Keep src/a.rs to three lines.");
+  await startRun(page, api, [running]);
+  await page.locator("#tab-notes").click();
+  const card = (id) =>
+    page
+      .locator("#notes .note")
+      .filter({ has: page.locator(".note-id", { hasText: new RegExp(`^${id}$`) }) });
+  const noteDialog = page.locator("#note-dialog");
+
+  // The thread's run is under way: its agent would get the draft.
+  await card(running.id).click();
+  const disabled = noteDialog.locator(".note-dialog-remember");
+  await disabled.waitFor();
+  assert.equal(await disabled.isDisabled(), true);
+  assert.equal(await disabled.getAttribute("title"), "Wait for the run");
+  await page.keyboard.press("Escape");
+
+  // Never sent: no draft run, the dialog opens with the note's text.
+  await card(unsent.id).click();
+  await noteDialog.locator(".note-dialog-remember").click();
+  const dialog = page.locator("#remember-dialog");
+  const body = dialog.locator(".remember-body");
+  await body.waitFor();
+  assert.equal(await body.inputValue(), "Keep src/a.rs to three lines.");
+  await dialog.locator(".remember-summary").fill("src/a.rs holds three lines");
+
+  // A duplicate opens over the draft, and Escape closes it back to the draft as it was.
+  const duplicate = dialog
+    .locator(".remember-check .memory-card")
+    .filter({ has: page.locator(".note-body", { hasText: /^a\.rs parses lazily$/ }) });
+  await duplicate.click();
+  const memory = page.locator("#memory-dialog");
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+  await page.keyboard.press("Escape");
+  await memory.waitFor({ state: "hidden" });
+  assert.equal(await dialog.isVisible(), true);
+  assert.equal(
+    await dialog.locator(".remember-summary").inputValue(),
+    "src/a.rs holds three lines",
+  );
+
+  await dialog.locator(".remember-save").click();
+  await dialog.waitFor({ state: "hidden" });
+  const saved = (await api("api/notes")).notes.find((note) => note.id === unsent.id);
+  assert.equal(saved.memory, "mem_01SAVED");
+
+  // The note shows it was remembered, and opens the memory.
+  await card(unsent.id).click();
+  const chip = noteDialog.locator(".remembered-chip");
+  await chip.waitFor();
+  assert.equal(await chip.textContent(), "Remembered");
+  await chip.click();
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+});
+
 // The longest name a custom agent may have (MAX_NAME in src/settings.rs).
 const LONG_NAME = "An agent whose name runs to forty chars!";
 

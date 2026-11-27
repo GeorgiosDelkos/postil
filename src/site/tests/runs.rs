@@ -2070,8 +2070,8 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         ("\n", "its first line is not a run header"),
         ("not a header\n", "its first line is not a run header"),
         (
-            r#"{"version":9,"id":"R3","newField":1}"#,
-            "it is version 9, and this build of Postil reads versions 1 to 8",
+            r#"{"version":10,"id":"R3","newField":1}"#,
+            "it is version 10, and this build of Postil reads versions 1 to 9",
         ),
         (
             &*header("R3").replace(
@@ -2081,7 +2081,7 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
                     r#""followUp":{"of":"R2","text":"x"}"#,
                 ),
             ),
-            "its header is more than one of a review, a follow-up and an analysis",
+            "its header is more than one of a review, a follow-up, an analysis and a memory draft",
         ),
         (
             &*header("R3").replace(
@@ -2091,7 +2091,31 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
                     r#""analysis":{"kind":"analyze"}"#,
                 ),
             ),
-            "its header is more than one of a review, a follow-up and an analysis",
+            "its header is more than one of a review, a follow-up, an analysis and a memory draft",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                concat!(
+                    r#""startedAt":1,"readOnly":true,"analysis":{"kind":"analyze"},"#,
+                    r#""remember":{"of":"R2"}"#,
+                ),
+            ),
+            "its header is more than one of a review, a follow-up, an analysis and a memory draft",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                r#""startedAt":1,"remember":{"of":"R2"}"#,
+            ),
+            "its header is a memory draft that may change files",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                r#""startedAt":1,"readOnly":true,"remember":{"of":"R02"}"#,
+            ),
+            r#"its header drafts a memory after "R02", which is not a run id"#,
         ),
         (
             &*header("R3").replace(
@@ -2136,6 +2160,36 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
     let (status, body) = get(&site, RUN);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("cannot read the run log"), "{body}");
+}
+
+#[test]
+fn a_memory_draft_is_passed_over_as_no_run_of_notes_and_one_unfinished_has_no_draft() {
+    let repo = TempRepo::new("run-draft-log");
+    let runs = repo.root.join(".git/postil/runs");
+    fs::create_dir_all(&runs).unwrap();
+    // A version 8 header reads as no memory draft.
+    let older = header("R2").replace(r#""version":1"#, r#""version":8"#);
+    fs::write(runs.join("R2.jsonl"), format!("{older}\n")).unwrap();
+    let draft = header("R3").replace(
+        r#""startedAt":1"#,
+        r#""startedAt":1,"readOnly":true,"remember":{"of":"R2"}"#,
+    );
+    fs::write(runs.join("R3.jsonl"), format!("{draft}\n")).unwrap();
+    let site = repo.site();
+
+    let run = get_json(&site, RUN);
+    assert_eq!(
+        (run["id"].as_str(), run["problem"].as_str()),
+        (Some("R2"), None)
+    );
+    let shown = get_json(&site, &format!("{RUN}?id=R3"));
+    assert_eq!(shown["remember"], serde_json::json!({ "of": "R2" }));
+    assert_eq!(
+        shown["draft"],
+        serde_json::json!({ "state": "failed", "problem": "the draft run did not finish" })
+    );
+    let plain = get_json(&site, &format!("{RUN}?id=R2"));
+    assert_eq!((plain.get("remember"), plain.get("draft")), (None, None));
 }
 
 #[test]

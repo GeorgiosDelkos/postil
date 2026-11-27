@@ -208,6 +208,7 @@ struct Note {
     anchor: Anchor,                // Whether the target is still there.
     state: NoteState,              // Where the note is in the loop. From milestone 3 on.
     intent: Intent,                // Change, or Ask: a question answered read-only. Version 5 on.
+    memory: Option<MemoryId>,      // The team memory remembered from it. Version 6 on.
 }
 
 enum Target {
@@ -284,6 +285,10 @@ As built in milestone 2 (`src/notes.rs`):
   reads with every note a change. `POST /api/notes` makes change notes only: an ask is made by
   `POST /api/run/ask`, which saves it only once its run starts, and a send or a preview that
   names one is refused (400). See `docs/review-assist.md`, "Ask without changing".
+- **Version 6** adds `memory`: the id of the team memory remembered from the note
+  (`mem_` and digits or capital letters, checked on every read), written only on a note that
+  has one. An older file reads with none. Deleting the note leaves the memory. See
+  `docs/review-assist.md`, "Postil writes memory".
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
@@ -466,7 +471,10 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   (docs/review-assist.md, "An analysis run"), which carries no notes and is read-only, and the
   `noAnalysis` entry, logged with the end of one whose turn ended well and stored nothing,
   which becomes its problem. An analysis run's log is kept when notes are deleted: its
-  diagrams name it. Older logs read as no analysis.
+  diagrams name it. Older logs read as no analysis. Run log version 9 adds `remember: {of}`
+  to the header of a memory draft (docs/review-assist.md, "Postil writes memory"): a read-only
+  run in the thread whose latest turn is `of`, whatever the thread's mode, never the latest run
+  of the Run tab, whose reply ends with the draft. Older logs read as no draft.
 - **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
   first update, a permission request, or a stop. A run that fails to start, or whose prompt
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,

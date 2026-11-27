@@ -4,6 +4,7 @@
 
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
+import { isMemoryId } from "./memory.js";
 import { fullPlace, onLines } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { foldRun, isAsk, isLive, isResolved, openQuestion, statusLine } from "./run.js";
@@ -31,7 +32,9 @@ import {
 // `busy(runId)` says why a review of run `runId` cannot start now, or "" when it can. An ask
 // (run.js, `isAsk`) shows its answer instead: `makeNote(note)` makes a change note of it and
 // resolves to null, or the reason it was refused, and `openRun(runId)` opens its run's dialog,
-// where its follow-ups go.
+// where its follow-ups go. `remember(note)` opens the Remember dialog for the note, which
+// `threadLive(note)` disables while a run of its thread is under way; `openMemory(id)` opens
+// the memory remembered from it.
 export function noteDialog(
   dialogEl,
   {
@@ -52,6 +55,9 @@ export function noteDialog(
     busy,
     makeNote,
     openRun,
+    remember,
+    threadLive,
+    openMemory,
   },
 ) {
   let shownId = null;
@@ -109,6 +115,7 @@ export function noteDialog(
       agent(),
       reviewers(),
       run ? busy(run.id) : "",
+      threadLive(note),
     ]);
     if (key === drawn) return;
     drawn = key;
@@ -125,7 +132,14 @@ export function noteDialog(
     // The footer's buttons are kept while what they show and act on stays the same. A reply
     // that streams a line about the note changes the body on every part, many times a second,
     // and a footer drawn again with it would drop clicks and disarm the two-click Delete.
-    const footKey = JSON.stringify([note, canSend(note), agent(), run?.id ?? null, isLive(run)]);
+    const footKey = JSON.stringify([
+      note,
+      canSend(note),
+      agent(),
+      run?.id ?? null,
+      isLive(run),
+      threadLive(note),
+    ]);
     if (foot?.key === footKey && foot.node.parentNode === dialogEl) {
       dialogEl.firstElementChild.replaceWith(header(note, run));
       dialogEl.querySelector(".note-dialog-body").replaceWith(body(note, run));
@@ -263,6 +277,14 @@ export function noteDialog(
     const button = el("button", "button note-dialog-edit", "Edit");
     button.type = "button";
     button.addEventListener("click", () => startEditing(note));
+    // The team memory remembered from it (src/notes.rs, review.json version 6).
+    if (isMemoryId(note.memory)) {
+      const chip = el("button", "button remembered-chip", "Remembered");
+      chip.type = "button";
+      chip.title = "Open the team memory saved from this note";
+      chip.addEventListener("click", () => openMemory(note.memory));
+      part.firstChild.append(chip);
+    }
     part.firstChild.append(button);
     return part;
   }
@@ -416,14 +438,21 @@ export function noteDialog(
   function footer(note, run) {
     const foot = el("footer", "note-dialog-footer");
     const remove = deleteButton(note);
+    const keep = rememberButton(note);
     // An ask is never sent: it was asked once, and goes on as follow-ups of its run. Resolving
     // ends its thread, which the server refuses while it runs.
     if (isAsk(note)) {
       const resolve = resolveButton(note);
       const answering = isLive(run) && !isResolved(note);
       resolve.disabled = answering;
-      const why = answering ? "Wait for the answer, or stop the run." : "";
-      foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), resolve);
+      const why = answering ? "Wait for the answer, or stop the run." : keep.why;
+      foot.append(
+        remove,
+        el("span", "spacer"),
+        el("span", "note-dialog-why", why),
+        keep.button,
+        resolve,
+      );
       return foot;
     }
     const sendable = canSend(note);
@@ -442,7 +471,7 @@ export function noteDialog(
     });
     // A disabled button says why beside it, not only in a tooltip.
     const why = sendable
-      ? ""
+      ? keep.why
       : isResolved(note)
         ? "Reopen it to send it again."
         : "Wait for the run under way, or stop it.";
@@ -450,10 +479,29 @@ export function noteDialog(
       remove,
       el("span", "spacer"),
       el("span", "note-dialog-why", why),
+      keep.button,
       resolveButton(note),
       button,
     );
     return foot;
+  }
+
+  // Remember drafts a team memory from the note, in its thread; not while a run of the thread
+  // is under way, whose agent the draft would go to (docs/review-assist-plan.md, step 9.4).
+  // `why` says so beside the buttons.
+  function rememberButton(note) {
+    const button = el("button", "button note-dialog-remember", "Remember");
+    button.type = "button";
+    const live = threadLive(note);
+    button.disabled = live;
+    button.title = live
+      ? "Wait for the run"
+      : "Draft a team memory from this note, to edit and save";
+    button.addEventListener("click", () => {
+      dialogEl.close();
+      remember(note);
+    });
+    return { button, why: live ? "Wait for the run." : "" };
   }
 
   // Resolve ends the note's loop, kept with the run it was sent in; Reopen undoes it.

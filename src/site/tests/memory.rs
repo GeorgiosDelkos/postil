@@ -492,7 +492,8 @@ fn server(bin: &TempDir, version: &str, arms: &str) -> PathBuf {
 /// appends its pid to `dir/servers` and each line it reads to `dir/calls`. `arms` are shell
 /// `case` arms tried before the default ones, matched against the request line; in them `$id`
 /// is the request's id, `reply ID RESULT` answers with a result and `text ID JSON` with a tool
-/// result whose text is `JSON`. The recall finds one strong pointer and one weak one.
+/// result whose text is `JSON`. The recall finds one strong pointer and one weak one; a remember
+/// writes `mem_01SAVED` to the repository it names.
 pub(super) fn server_script(dir: &Path, version: &str, arms: &str) -> String {
     let dir = dir.display();
     let initialized = serde_json::json!({
@@ -525,6 +526,9 @@ while IFS= read -r line; do
   *'"name":"get"'*) text "$id" '{note}' ;;
   *'"name":"history"'*) text "$id" '{history}' ;;
   *'"name":"refresh"'*) text "$id" '{refreshed}' ;;
+  *'"name":"remember"'*)
+    repo=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"repo":"\([^"]*\)".*/\1/p')
+    text "$id" '{{\"id\":\"mem_01SAVED\",\"repo\":\"'"$repo"'\"}}' ;;
   esac
 done"#
     )
@@ -984,7 +988,7 @@ fn a_server_missing_a_required_tool_reports_both_versions() {
             "state": "incompatible",
             "serverVersion": "0.6.0",
             "postilVersion": env!("CARGO_PKG_VERSION"),
-            "missing": ["history"],
+            "missing": ["history", "remember"],
         })
     );
     assert_eq!(recall(&site, "b.rs"), reply, "not asked again");
@@ -1207,7 +1211,7 @@ fn the_real_hippius_mem_recalls_by_path_and_reads_a_memory_and_its_history() {
             "body": body,
             "repo": "memory-real",
         });
-        site.memory.remember(&repo.root, &note)
+        site.memory.seed_vault(&repo.root, &note)
     };
     let body = "# Lazy\n\nThe *parser* in `src/café notes.rs` waits for the first read.";
     let id = remember(
@@ -1776,4 +1780,737 @@ fn a_repository_s_configuration_file_does_not_override_the_engineer_s() {
     // Postil's own server, in the project's root, reads the engineer's file too.
     let reply = recall(&site, "a.txt");
     assert_eq!(reply["state"], "ready", "{reply}");
+}
+
+// ---- Postil writes memory --------------------------------------------------------------------
+
+const DRAFT: &str = "postil://localhost/api/memory/draft";
+const REMEMBER: &str = "postil://localhost/api/memory/remember";
+
+/// Asks for a draft from note `note`, and returns the reply.
+fn draft(site: &Site, note: &str) -> serde_json::Value {
+    let (status, body) = post(
+        site,
+        DRAFT,
+        &serde_json::json!({ "note": note }).to_string(),
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// Posts `request` to Remember, as the dialog does, until its answer is no longer pending, and
+/// returns it.
+fn remember(site: &Site, request: &serde_json::Value) -> serde_json::Value {
+    loop {
+        let (status, body) = post(site, REMEMBER, &request.to_string());
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if reply["state"] != "pending" {
+            return reply;
+        }
+        site.memory.wait_idle();
+    }
+}
+
+/// Note `id` as `GET /api/notes` gives it.
+fn note_of(site: &Site, id: &str) -> serde_json::Value {
+    get_json(site, NOTES)["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|note| note["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no note {id}"))
+}
+
+/// The arguments of every `remember` the fake servers were called with, in order.
+fn remembered(bin: &TempDir) -> Vec<serde_json::Value> {
+    calls(bin)
+        .lines()
+        .filter(|line| line.contains(r#""name":"remember""#))
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["params"]["arguments"].clone()
+        })
+        .collect()
+}
+
+#[test]
+fn drafting_and_remembering_writes_to_hippius_mem_recalls_it_and_records_the_id_on_the_note() {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if agents::find_program(memory::PROGRAM, &path).is_none() {
+        eprintln!("skipped: hippius-mem is not installed on PATH");
+        return;
+    }
+    let repo = TempRepo::new("memory-real-remember");
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.invalid/team/memory-remember.git",
+    ]);
+    repo.write("a.txt", "a\n");
+    let home = TempDir::new("memory-real-remember-home");
+    let model_cache = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".cache/hippius-mem/fastembed"))
+        .filter(|cache| cache.is_dir());
+    let (site, nudges) = run_site(&repo, "memory-draft");
+    // A first start loads the embedding model: allow more than a call has in the app.
+    let memory = Memory::new(Scanner::new(move || path.clone()))
+        .with_home(home.path(), model_cache.as_deref())
+        .with_call_timeout(Duration::from_secs(120));
+    let site = site.with_memory(memory);
+    site.memory.wait();
+    assert_eq!(post(&site, SETUP, "").0, StatusCode::OK);
+    let view = settled(&site);
+    let error = view["setup"]["error"].as_str().unwrap_or("");
+    if error.contains("embedding model") {
+        eprintln!("skipped: hippius-mem could not get its embedding model (no network?): {error}");
+        return;
+    }
+    assert_eq!(view["state"]["kind"], "ready", "{view}");
+
+    post_note(&site, "a.txt", 1, 1, "keep a.txt to one line");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+    let reply = draft(&site, "N1");
+    assert_eq!(reply["kind"], "run", "{reply}");
+    assert_eq!(reply["fallback"], "keep a.txt to one line");
+    let run = run_ended(&site, &nudges, reply["run"].as_str().unwrap());
+    assert_eq!(run["remember"], serde_json::json!({ "of": "R1" }), "{run}");
+    let drafted = &run["draft"];
+    assert_eq!(drafted["state"], "ready", "{run}");
+
+    let saved = remember(
+        &site,
+        &serde_json::json!({
+            "note": "N1",
+            "noteType": "gotcha",
+            "summary": drafted["summary"],
+            "body": drafted["body"],
+            "scope": "repo",
+        }),
+    );
+    assert_eq!(saved["state"], "ready", "{saved}");
+    assert_eq!(saved["repo"], "memory-remember", "{saved}");
+    let id = saved["id"].as_str().unwrap().to_owned();
+    assert_eq!(note_of(&site, "N1")["memory"], id.as_str());
+
+    // The write dropped the recalls kept, so this one asks the server, and finds it.
+    // The fake agent's summary has no character to encode but spaces.
+    let text = drafted["summary"].as_str().unwrap().replace(' ', "%20");
+    let found = settle(&site, &Method::GET, &format!("{RECALL}?text={text}"));
+    assert_eq!(found["state"], "ready", "{found}");
+    assert!(
+        found["pointers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pointer| pointer["id"] == id.as_str()),
+        "{found}"
+    );
+
+    // Deleting the note leaves the memory: nothing in Postil forgets one.
+    assert_eq!(delete(&site, &format!("{NOTES}?id=N1")).0, StatusCode::OK);
+    let detail = settle(&site, &Method::GET, &format!("{MEMORY}?id={id}"));
+    assert_eq!(detail["state"], "ready", "{detail}");
+    assert_eq!(detail["noteType"], "gotcha");
+    assert_eq!(detail["summary"], drafted["summary"]);
+}
+
+#[test]
+fn a_failed_save_keeps_the_note_unmarked_and_a_near_duplicate_can_retry_with_force() {
+    let repo = TempRepo::new("memory-save-fails");
+    repo.write("a.txt", "a\n");
+    let bin = TempDir::new("memory-save-fails-bin");
+    // The request line holds the arguments, keys sorted, before the tool's name.
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        concat!(
+            r#"  *'"summary":"dies'*'"name":"remember"'*) exit 3 ;;"#,
+            "\n",
+            r#"  *'"force":true'*'"name":"remember"'*) "#,
+            r#"text "$id" '{\"id\":\"mem_01FORCED\",\"repo\":\"global\"}' ;;"#,
+            "\n",
+            r#"  *'"name":"remember"'*) reply "$id" '{"content":[{"type":"text","#,
+            r#""text":"near-duplicate of note mem_01OLD: edit that note, link it, or retry "#,
+            r#"with force"}],"isError":true}' ;;"#,
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+    post_note(&site, "a.txt", 1, 1, "keep it short");
+    let review = repo.root.join(".git/postil/review.json");
+    post_note(&site, "a.txt", 1, 1, "and this one");
+    let request = |note: &str, summary: &str, force: bool| {
+        serde_json::json!({
+            "note": note,
+            "summary": summary,
+            "body": "The parser reads a.txt whole.",
+            "scope": "global",
+            "force": force,
+        })
+    };
+
+    // A refused near-duplicate: hippius-mem's words, and the note stays unmarked on disk.
+    let refused = remember(&site, &request("N1", "a.txt is one line", false));
+    assert_eq!(refused["state"], "failed", "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("near-duplicate"),
+        "{refused}"
+    );
+    assert!(!fs::read_to_string(&review).unwrap().contains("\"memory\""));
+    // A failure is read once: the same Save again is a new call, not the failure kept.
+    let again = remember(&site, &request("N1", "a.txt is one line", false));
+    assert_eq!(again["state"], "failed", "{again}");
+    assert_eq!(remembered(&bin).len(), 2);
+
+    // Save anyway passes force, and the note is marked with the memory it wrote.
+    let forced = remember(&site, &request("N1", "a.txt is one line", true));
+    assert_eq!(forced["state"], "ready", "{forced}");
+    assert_eq!(forced["id"], "mem_01FORCED");
+    assert_eq!(note_of(&site, "N1")["memory"], "mem_01FORCED");
+    let sent = remembered(&bin);
+    let forces: Vec<_> = sent
+        .iter()
+        .map(|arguments| arguments.get("force"))
+        .collect();
+    assert_eq!(
+        forces.last(),
+        Some(&Some(&serde_json::json!(true))),
+        "Save anyway passes force: {sent:?}"
+    );
+    assert!(
+        forces[..forces.len() - 1].iter().all(Option::is_none),
+        "a plain Save sends none: {sent:?}"
+    );
+
+    // A server that dies on the call, twice: reported, and nothing is written to the note.
+    let died = remember(&site, &request("N2", "dies on the call", false));
+    assert_eq!(died["state"], "failed", "{died}");
+    assert!(died["error"].as_str().unwrap().contains("exited"), "{died}");
+    assert_eq!(note_of(&site, "N2").get("memory"), None);
+}
+
+#[test]
+fn remember_validates_inputs_and_sends_only_the_shown_fields() {
+    let repo = TempRepo::new("memory-fields");
+    repo.write("a.txt", "a\n");
+    let bin = TempDir::new("memory-fields-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let site = server_site(&repo, &bin, |memory| memory);
+    post_note(&site, "a.txt", 1, 1, "keep it short");
+    let request = |changes: serde_json::Value| {
+        let mut request = serde_json::json!({
+            "note": "N1",
+            "noteType": "gotcha",
+            "summary": "a summary",
+            "body": "a body",
+            "scope": "global",
+        });
+        for (key, value) in changes.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        request.to_string()
+    };
+    // 16 KiB of two-byte characters, at the limit by bytes and far below it by characters.
+    let at_limit = "é".repeat(8 * 1024);
+
+    for (changes, status, why) in [
+        (
+            serde_json::json!({ "summary": "" }),
+            StatusCode::BAD_REQUEST,
+            "summary is blank",
+        ),
+        (
+            serde_json::json!({ "summary": " \n\t" }),
+            StatusCode::BAD_REQUEST,
+            "summary is blank",
+        ),
+        (
+            serde_json::json!({ "body": "  " }),
+            StatusCode::BAD_REQUEST,
+            "body is blank",
+        ),
+        (
+            serde_json::json!({ "body": format!("{at_limit}a") }),
+            StatusCode::BAD_REQUEST,
+            "body is 16385 bytes, over the limit of 16384",
+        ),
+        (
+            serde_json::json!({ "summary": "s".repeat(1025) }),
+            StatusCode::BAD_REQUEST,
+            "summary is 1025 bytes, over the limit of 1024",
+        ),
+        (
+            serde_json::json!({ "noteType": "rumour" }),
+            StatusCode::BAD_REQUEST,
+            "unknown variant",
+        ),
+        (
+            serde_json::json!({ "tags": ["x"] }),
+            StatusCode::BAD_REQUEST,
+            "unknown field `tags`",
+        ),
+        (
+            serde_json::json!({ "scope": "repo" }),
+            StatusCode::BAD_REQUEST,
+            "the repository has no origin remote",
+        ),
+        (
+            serde_json::json!({ "note": "N9" }),
+            StatusCode::NOT_FOUND,
+            "there is no note N9",
+        ),
+        (
+            serde_json::json!({ "note": "R1" }),
+            StatusCode::BAD_REQUEST,
+            "note id \"R1\"",
+        ),
+    ] {
+        let (got, body) = post(&site, REMEMBER, &request(changes.clone()));
+        assert_eq!(got, status, "{changes}: {body}");
+        assert!(body.contains(why), "{changes}: {body}");
+    }
+    assert!(
+        servers(&bin).is_empty(),
+        "refused before any server started"
+    );
+
+    // At the limit: sent. The text goes as shown, spaces and all, with no tags and no force;
+    // with no note named, no note is marked.
+    let shown = "  Keep a.txt to \"one\" line  ";
+    let body = format!("{}\n\n", "é".repeat(8 * 1024 - 1));
+    let reply = remember(
+        &site,
+        &serde_json::json!({ "summary": shown, "body": body, "scope": "global" }),
+    );
+    assert_eq!(reply["state"], "ready", "{reply}");
+    assert_eq!(reply["repo"], "global");
+    assert_eq!(
+        remembered(&bin),
+        [serde_json::json!({
+            "body": body,
+            "note_type": "context",
+            "repo": "global",
+            "summary": shown,
+        })]
+    );
+    assert_eq!(note_of(&site, "N1").get("memory"), None);
+}
+
+#[test]
+fn the_repository_s_scope_names_it_as_hippius_mem_does_and_marks_the_note() {
+    let repo = TempRepo::new("memory-scope");
+    repo.write("a.txt", "a\n");
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:Owner/memory-scope.git",
+    ]);
+    let bin = TempDir::new("memory-scope-bin");
+    server(&bin, "hippius-mem 0.7.1", "");
+    let site = server_site(&repo, &bin, |memory| memory);
+    post_note(&site, "a.txt", 1, 1, "keep it short");
+    assert_eq!(
+        get_json(&site, "postil://localhost/api/repo")["memoryRepo"],
+        "memory-scope"
+    );
+
+    let reply = remember(
+        &site,
+        &serde_json::json!({
+            "note": "N1",
+            "noteType": "gotcha",
+            "summary": "a summary",
+            "body": "a body",
+            "scope": "repo",
+        }),
+    );
+    assert_eq!(reply["state"], "ready", "{reply}");
+    assert_eq!(reply["repo"], "memory-scope");
+    assert_eq!(remembered(&bin)[0]["repo"], "memory-scope");
+    assert_eq!(remembered(&bin)[0]["note_type"], "gotcha");
+    assert_eq!(note_of(&site, "N1")["memory"], "mem_01SAVED");
+}
+
+#[test]
+fn two_remember_polls_while_running_call_the_server_once_and_a_full_queue_keeps_remember() {
+    let repo = TempRepo::new("memory-queue-writes");
+    let bin = TempDir::new("memory-queue-writes-bin");
+    let entered = bin.path().join("entered");
+    let gate = bin.path().join("gate");
+    make_fifo(&entered);
+    make_fifo(&gate);
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"summary\":\"slow'*'\"name\":\"remember\"'*) echo in > {entered}; \
+             /bin/cat {gate} > /dev/null; \
+             text \"$id\" '{{\\\"id\\\":\\\"mem_01SLOW\\\",\\\"repo\\\":\\\"global\\\"}}' ;;",
+            entered = entered.display(),
+            gate = gate.display(),
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+    let write = |summary: &str| {
+        serde_json::json!({ "summary": summary, "body": "b", "scope": "global" }).to_string()
+    };
+    let pending = |uri: &str, body: &str| {
+        let (status, reply) = call(&site, Method::POST, uri, body);
+        assert_eq!(
+            (status, reply.as_str()),
+            (StatusCode::OK, r#"{"state":"pending"}"#),
+            "{body}"
+        );
+    };
+
+    pending(REMEMBER, &write("slow one"));
+    read_fifo(&entered, WAIT);
+    // Asked again while it runs, as the dialog's poll does: still the one call.
+    pending(REMEMBER, &write("slow one"));
+    pending(REMEMBER, &write("queued behind it"));
+    // 32 files opened fill the queue; each recall over it drops a recall, never the write.
+    for number in 1..=32 {
+        let (status, body) = get(&site, &format!("{RECALL}?path=f{number}.rs"));
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    fs::write(&gate, "go").unwrap();
+    site.memory.wait_idle();
+    let summaries: Vec<_> = remembered(&bin)
+        .iter()
+        .map(|arguments| arguments["summary"].clone())
+        .collect();
+    assert_eq!(summaries, ["slow one", "queued behind it"]);
+    assert!(
+        !calls(&bin).contains(r#""text":"f1.rs""#),
+        "f1.rs's recall was dropped"
+    );
+    assert_eq!(
+        remember(&site, &serde_json::from_str(&write("slow one")).unwrap())["id"],
+        "mem_01SLOW"
+    );
+
+    // A queue of writes alone drops none: the next one is refused, and says why.
+    pending(REMEMBER, &write("slow two"));
+    read_fifo(&entered, WAIT);
+    for number in 1..=32 {
+        pending(REMEMBER, &write(&format!("write {number}")));
+    }
+    let (status, body) = post(&site, REMEMBER, &write("one too many"));
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("too many team memory writes are queued"),
+        "{body}"
+    );
+    fs::write(&gate, "go").unwrap();
+    site.memory.wait_idle();
+    assert_eq!(remembered(&bin).len(), 2 + 1 + 32);
+}
+
+#[test]
+fn a_draft_run_cannot_edit() {
+    let repo = TempRepo::new("memory-draft-edits");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "memory-draft-writes");
+    post_note(&site, "a.txt", 1, 1, "check it");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+    // The engineer's own work in the thread's worktree, left uncommitted.
+    let worktree = PathBuf::from(
+        super::threads::thread(&site, "R1")["path"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+
+    let reply = draft(&site, "N1");
+    assert_eq!(
+        reply,
+        serde_json::json!({ "kind": "run", "run": "R2", "fallback": "check it" })
+    );
+    let run = run_ended(&site, &nudges, "R2");
+    assert_eq!(
+        run["readOnly"], true,
+        "read-only in a thread that works: {run}"
+    );
+    assert_eq!(said(&run, "edit "), "no", "its ask to edit was refused");
+    assert_eq!(
+        run["draft"],
+        serde_json::json!({
+            "state": "failed",
+            "problem": "the agent changed files, though it may only read: its changes were undone",
+        }),
+        "a block from a turn that changed files is no draft"
+    );
+    assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(
+        fs::read_to_string(worktree.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+    assert!(
+        git_out(&worktree, &["log", "--format=%s"]).contains("work left in the worktree before R2"),
+        "the engineer's work was committed before the draft, and kept"
+    );
+    assert!(
+        !run["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "snapshot"),
+        "{run}"
+    );
+
+    // Never the Run tab's latest; and the thread's next turn goes to a fresh agent, which
+    // may edit, with no word of the draft.
+    assert_eq!(get_json(&site, RUN)["id"], "R1");
+    let follow = serde_json::json!({ "of": "R1", "text": "and b" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let run = wait_for_run(&site, &nudges, "R3");
+    let prompt = run["prompt"].as_str().unwrap();
+    assert!(prompt.starts_with("You are continuing work"), "{prompt}");
+    assert!(!prompt.contains("as a team memory"), "{prompt}");
+    assert_eq!(run["readOnly"], false, "{run}");
+}
+
+#[test]
+fn a_never_sent_note_drafts_from_its_text() {
+    let repo = TempRepo::new("memory-draft-fallback");
+    repo.write("a.txt", "a\nb\nc\n");
+    let (site, nudges) = run_site(&repo, "memory-draft");
+    post_note(&site, "a.txt", 1, 1, "never sent");
+    post_note(&site, "a.txt", 2, 2, "resolved unsent");
+    assert_eq!(
+        post(&site, &format!("{NOTES}/resolve?id=N2"), "").0,
+        StatusCode::OK
+    );
+    post_note(&site, "a.txt", 3, 3, "discarded");
+    post_note(&site, "a.txt", 1, 1, "applied");
+    for (note, run, ending) in [("N3", "R1", "discard"), ("N4", "R2", "apply")] {
+        assert_eq!(send(&site, &[note]).0, StatusCode::OK);
+        wait_for_run(&site, &nudges, run);
+        let (status, body) = super::threads::end(&site, ending, run);
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let runs = get_json(&site, RUNS)["runs"].clone();
+
+    for (note, text) in [
+        ("N1", "never sent"),
+        ("N2", "resolved unsent"),
+        ("N3", "discarded"),
+        ("N4", "applied"),
+    ] {
+        assert_eq!(
+            draft(&site, note),
+            serde_json::json!({ "kind": "fallback", "body": text }),
+            "{note}"
+        );
+    }
+    assert_eq!(get_json(&site, RUNS)["runs"], runs, "no draft run was made");
+    let (status, body) = post(&site, DRAFT, r#"{"note": "N9"}"#);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // An agent that answers without the block: the run ends, and its draft says why.
+    let repo = TempRepo::new("memory-draft-no-block");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "check it");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+    let reply = draft(&site, "N1");
+    let run = run_ended(&site, &nudges, reply["run"].as_str().unwrap());
+    assert_eq!(run["draft"]["state"], "failed", "{run}");
+    let problem = run["draft"]["problem"].as_str().unwrap();
+    assert!(
+        problem.starts_with("the agent's reply holds no draft"),
+        "{problem}"
+    );
+}
+#[test]
+fn a_draft_never_goes_to_an_agent_that_has_team_memory() {
+    let repo = TempRepo::new("memory-draft-server");
+    repo.write("a.txt", "a\nb\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+    let run = sent(&site, &nudges, "N1");
+    assert_eq!(servers_of(&run), serde_json::json!([agents.server()]));
+
+    // The thread's agent was given hippius-mem: a fresh agent drafts, with none, and the kept
+    // one never sees the draft's prompt (its second would be "prompt 2").
+    let reply = draft(&site, "N1");
+    let drafted = run_ended(&site, &nudges, reply["run"].as_str().unwrap());
+    assert_eq!(servers_of(&drafted), serde_json::json!([]), "{drafted}");
+    assert_eq!(said(&drafted, "prompt "), "1", "{drafted}");
+    assert!(
+        said(&drafted, "got ").starts_with("You are continuing"),
+        "{drafted}"
+    );
+
+    // An agent given none is kept for the draft, as for a follow-up.
+    set_memory_agent(&site, "echo-session", TeamMemory::Off);
+    post_note(&site, "a.txt", 2, 2, "and this");
+    let run = sent(&site, &nudges, "N2");
+    assert_eq!(servers_of(&run), serde_json::json!([]));
+    let reply = draft(&site, "N2");
+    let drafted = run_ended(&site, &nudges, reply["run"].as_str().unwrap());
+    assert_eq!(
+        said(&drafted, "prompt "),
+        "2",
+        "the thread's own agent: {drafted}"
+    );
+}
+#[test]
+fn a_check_that_ends_while_a_save_runs_keeps_its_answer_and_writes_once() {
+    let repo = TempRepo::new("memory-check-during-save");
+    let bin = TempDir::new("memory-check-during-save-bin");
+    let entered = bin.path().join("entered");
+    let gate = bin.path().join("gate");
+    make_fifo(&entered);
+    make_fifo(&gate);
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"summary\":\"slow'*'\"name\":\"remember\"'*) echo in > {entered}; \
+             /bin/cat {gate} > /dev/null; \
+             text \"$id\" '{{\\\"id\\\":\\\"mem_01SLOW\\\",\\\"repo\\\":\\\"global\\\"}}' ;;",
+            entered = entered.display(),
+            gate = gate.display(),
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+    site.memory.wait();
+    let write = serde_json::json!({ "summary": "slow one", "body": "b", "scope": "global" });
+    let (status, body) = post(&site, REMEMBER, &write.to_string());
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, r#"{"state":"pending"}"#)
+    );
+    read_fifo(&entered, WAIT);
+    // Check in Settings while the write runs, which ends first: a new epoch.
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+    site.memory.wait();
+    fs::write(&gate, "go").unwrap();
+    site.memory.wait_idle();
+
+    let reply = remember(&site, &write);
+    assert_eq!(reply["state"], "ready", "{reply}");
+    assert_eq!(reply["id"], "mem_01SLOW");
+    assert_eq!(remembered(&bin).len(), 1, "one Save, one write");
+}
+
+#[test]
+fn a_server_that_exits_during_a_save_is_not_asked_to_write_again() {
+    let repo = TempRepo::new("memory-dies-saving");
+    let bin = TempDir::new("memory-dies-saving-bin");
+    // The first server writes, as far as anyone can tell, and exits before it answers.
+    let marker = bin.path().join("written");
+    server(
+        &bin,
+        "hippius-mem 0.7.1",
+        &format!(
+            "  *'\"name\":\"remember\"'*) if [ ! -e {m} ]; then /usr/bin/touch {m}; exit 3; fi; \
+             text \"$id\" '{{\\\"id\\\":\\\"mem_01TWO\\\",\\\"repo\\\":\\\"global\\\"}}' ;;",
+            m = marker.display()
+        ),
+    );
+    let site = server_site(&repo, &bin, |memory| memory);
+    let write = serde_json::json!({ "summary": "s", "body": "b", "scope": "global" });
+
+    let reply = remember(&site, &write);
+    assert_eq!(
+        reply,
+        serde_json::json!({
+            "state": "failed",
+            "error": "hippius-mem exited during the save: it may have been written; check the \
+                      Memory tab before saving again",
+        })
+    );
+    assert_eq!(remembered(&bin).len(), 1, "never sent twice");
+    assert_eq!(servers(&bin).len(), 1, "no server started to send it again");
+
+    // The engineer's Save again is a new write, to a new server.
+    let reply = remember(&site, &write);
+    assert_eq!(reply["state"], "ready", "{reply}");
+    assert_eq!(remembered(&bin).len(), 2);
+}
+
+#[test]
+fn a_draft_or_a_follow_up_while_a_draft_runs_is_refused() {
+    let repo = TempRepo::new("memory-draft-live");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "memory-draft-hang");
+    post_note(&site, "a.txt", 1, 1, "check it");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+    assert_eq!(draft(&site, "N1")["run"], "R2");
+
+    let (status, body) = post(&site, DRAFT, r#"{"note":"N1"}"#);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let follow = |of: &str| {
+        let body = serde_json::json!({ "of": of, "text": "and b" }).to_string();
+        post(&site, &format!("{RUN}/follow"), &body)
+    };
+    let (status, body) = follow("R1");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // A draft is no turn of the thread: nothing follows it.
+    let (status, body) = follow("R2");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("R2 is a memory draft: follow up R1"),
+        "{body}"
+    );
+    assert_eq!(get_json(&site, RUN)["id"], "R1");
+}
+
+#[test]
+fn an_answered_ask_drafts_in_its_thread() {
+    let repo = TempRepo::new("memory-draft-ask");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "memory-draft");
+    let body = serde_json::json!({
+        "note": { "path": "a.txt", "lines": { "start": 1, "end": 1 },
+                  "snippet": "a", "body": "why one line?" },
+    });
+    let (status, reply) = post(&site, &format!("{RUN}/ask"), &body.to_string());
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    wait_for(&site, &nudges, "ended");
+
+    let reply = draft(&site, "N1");
+    assert_eq!(reply["fallback"], "why one line?", "{reply}");
+    let run = run_ended(&site, &nudges, reply["run"].as_str().unwrap());
+    assert_eq!(run["remember"], serde_json::json!({ "of": "R1" }));
+    assert_eq!(run["readOnly"], true);
+    assert_eq!(run["draft"]["state"], "ready", "{run}");
+}
+
+#[test]
+fn a_draft_after_a_follow_up_drafts_after_the_thread_s_latest_turn() {
+    let repo = TempRepo::new("memory-draft-tip");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "memory-draft");
+    post_note(&site, "a.txt", 1, 1, "check it");
+    assert_eq!(send(&site, &["N1"]).0, StatusCode::OK);
+    wait_for(&site, &nudges, "ended");
+    let follow = serde_json::json!({ "of": "R1", "text": "and b" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/follow"), &follow).0,
+        StatusCode::OK
+    );
+    run_ended(&site, &nudges, "R2");
+
+    let reply = draft(&site, "N1");
+    let run = run_ended(&site, &nudges, reply["run"].as_str().unwrap());
+    assert_eq!(run["remember"], serde_json::json!({ "of": "R2" }), "{run}");
+    // A second draft after the first: the first is no turn, so it drafts after R2 again.
+    let again = draft(&site, "N1");
+    let run = run_ended(&site, &nudges, again["run"].as_str().unwrap());
+    assert_eq!(run["remember"], serde_json::json!({ "of": "R2" }), "{run}");
+    assert_eq!(run["draft"]["state"], "ready", "{run}");
 }

@@ -144,6 +144,13 @@ export function memoryTab({ panelEl, headerEl, currentFile, openMemory, openSett
       stopAsking();
     },
     fileOpened: recall,
+    // A memory was saved: what was kept may lack it, as the server's recalls did (src/memory.rs,
+    // `run_remember`). Asks again when the tab shows.
+    remembered() {
+      kept.clear();
+      stopAsking();
+      recall();
+    },
   };
 }
 

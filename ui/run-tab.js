@@ -93,13 +93,14 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       }
     }
     // Reviewers' runs show inside the run they review, and follow-ups inside the run they
-    // follow, not here. An analysis run is not a run of notes: the map shows it (8.3). A run
+    // follow, not here. An analysis run is not a run of notes: the map shows it (8.3); nor is a
+    // memory draft, whose dialog is the Remember dialog (memory-dialog.js). A run
     // not read yet is left out until it is, since it may be one; a run that could not be read
     // shows its card, which says why.
     const shown = list.filter((id) => {
       const view = store.byId(id);
       if (!view) return Boolean(store.failure(id));
-      return !view.review && !view.followUp && !view.analysis;
+      return !view.review && !view.followUp && !view.analysis && !view.remember;
     });
     // No run of notes, and nothing waits for an answer.
     if (shown.length === 0 && wanted.length === 0) {

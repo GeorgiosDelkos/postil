@@ -24,7 +24,7 @@ use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{self, Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
-use crate::memory::{self, Memory, MemoryId};
+use crate::memory::{self, Memory, MemoryId, RememberRequest};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
@@ -361,6 +361,7 @@ struct Project {
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoInfo<'a> {
     name: String,
     root: String,
@@ -368,6 +369,9 @@ struct RepoInfo<'a> {
     files: Vec<String>,
     bench: Option<&'a str>,
     warning: Option<String>,
+    /// The repository's name in team memory ([`Repo::memory_name`]); `None` without an
+    /// `origin` remote, when the Remember dialog offers only the whole team's memory.
+    memory_repo: Option<String>,
 }
 
 /// An entry of the reply to `/api/recent`.
@@ -590,6 +594,24 @@ struct EditNote {
     body: String,
 }
 
+/// The body of `POST /api/memory/draft`: the note a memory is drafted from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftRequest {
+    note: String,
+}
+
+/// The reply to `POST /api/memory/draft`. `fallback` is the note's text, which the dialog opens
+/// with when no draft comes.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum DraftReply {
+    /// No draft run: the note was never sent, or its thread ended or has no worktree record.
+    Fallback { body: String },
+    /// The draft run started; its view's `draft` holds the draft once it is over.
+    Run { run: String, fallback: String },
+}
+
 /// The body of `POST /api/run/follow`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -785,6 +807,7 @@ impl Site {
             open.warning = warning;
             return Ok(());
         }
+        let repo = Arc::new(repo);
         self.memory.open_project(&repo);
         // A run gives its agent team memory only once a check found hippius-mem Ready, and the
         // first check would otherwise wait for the first send or the settings dialog: the send
@@ -792,7 +815,6 @@ impl Site {
         if self.current_settings().team_memory() == TeamMemory::On {
             drop(self.memory.status());
         }
-        let repo = Arc::new(repo);
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
@@ -933,6 +955,7 @@ impl Site {
             files: repo.files()?,
             bench: self.bench.as_deref(),
             warning,
+            memory_repo: repo.memory_name(),
         };
         Ok(to_json(&info))
     }
@@ -1190,8 +1213,9 @@ impl Site {
     }
 
     /// The replies to `/api/memory` and the routes under it, as [`Site::respond`] gives them: a
-    /// memory, a recall, Refresh, a new check of hippius-mem and a trial vault's set up. Each
-    /// answers at once with what is known, and the work runs in the background (`memory.rs`).
+    /// memory, a recall, Refresh, a draft and a remember, a new check of hippius-mem and a trial
+    /// vault's set up. Each answers at once with what is known, and the work runs in the
+    /// background (`memory.rs`, and the draft run, `run.rs`).
     /// Takes the whole request so that dispatch stays one line: `respond` is at clippy's
     /// length limit.
     fn respond_memory(&self, request: &Request<Vec<u8>>) -> Reply {
@@ -1204,7 +1228,18 @@ impl Site {
             },
             "/api/memory/recall" => match *method {
                 Method::GET => json_or_error(self.memory_recall(query)),
-                _ => not_allowed("GET ?path=<path>&node=<node label>, or ?run=R1"),
+                _ => not_allowed("GET ?path=<path>&node=<node label>, ?run=R1, or ?text=<query>"),
+            },
+            "/api/memory/draft" => match *method {
+                Method::POST => json_or_error(self.memory_draft(request.body())),
+                _ => not_allowed("POST {\"note\": \"N1\"}"),
+            },
+            "/api/memory/remember" => match *method {
+                Method::POST => json_or_error(self.memory_remember(request.body())),
+                _ => not_allowed(
+                    "POST {\"note\": \"N1\", \"noteType\": ..., \"summary\": ..., \"body\": ..., \
+                     \"scope\": \"repo\" or \"global\"}",
+                ),
             },
             "/api/memory/refresh" => match *method {
                 Method::POST => json_or_error(self.memory_refresh()),
@@ -1222,9 +1257,19 @@ impl Site {
         }
     }
 
-    /// The recall for the open file (`?path=`, with the selected node's label as `?node=`), or
-    /// for the thread that ends with a run (`?run=`): its prompt and changed paths.
+    /// The recall for the open file (`?path=`, with the selected node's label as `?node=`), for
+    /// the thread that ends with a run (`?run=`): its prompt and changed paths, or for a text
+    /// (`?text=`), a draft's summary, which the Remember dialog checks for duplicates.
     fn memory_recall(&self, query: &str) -> Result<Vec<u8>> {
+        if let Some(text) = query_value(query, "text") {
+            if text.trim().is_empty() {
+                return Err(Error::BadRequest(
+                    "expected ?text=<a query that is not blank>".to_owned(),
+                ));
+            }
+            self.repo()?;
+            return Ok(to_json(&self.memory.recall_run(text)?));
+        }
         if let Some(run) = query_value(query, "run") {
             // The runner holds no lock once this returns: memory is never waited on with a
             // run's lock held.
@@ -1232,7 +1277,9 @@ impl Site {
             return Ok(to_json(&self.memory.recall_run(text)?));
         }
         let path = query_value(query, "path").ok_or_else(|| {
-            Error::BadRequest("expected ?path=<percent-encoded path> or ?run=<run id>".to_owned())
+            Error::BadRequest(
+                "expected ?path=<percent-encoded path>, ?run=<run id> or ?text=<query>".to_owned(),
+            )
         })?;
         self.repo()?.check_path(&path)?;
         let node = query_value(query, "node").filter(|label| !label.is_empty());
@@ -1250,6 +1297,41 @@ impl Site {
     fn memory_refresh(&self) -> Result<Vec<u8>> {
         self.repo()?;
         Ok(to_json(&self.memory.refresh()?))
+    }
+
+    /// The reply to `POST /api/memory/draft` (docs/review-assist.md, "Postil writes memory"):
+    /// starts a draft run in the thread the note was sent in ([`Runner::draft`]), with the
+    /// settings' choice for the agent that ran its latest turn should a fresh one start; or,
+    /// when the note was never sent or its thread ended, the note's text alone, and no run.
+    fn memory_draft(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: DraftRequest = parse_body(body, Error::BadRequest)?;
+        let repo = self.repo()?;
+        let source = notes::draft_source(&repo, &request.note)?;
+        let runner = self.runner()?;
+        let tip = match &source.run {
+            Some(run) => runner.thread_tip(run)?,
+            None => None,
+        };
+        let Some(of) = tip else {
+            return Ok(to_json(&DraftReply::Fallback { body: source.body }));
+        };
+        let agent = self
+            .current_settings()
+            .chosen_agent(&runner.agent_of(&of)?)?;
+        let run = runner.draft(&of, agent, &source.quoted)?;
+        Ok(to_json(&DraftReply::Run {
+            run,
+            fallback: source.body,
+        }))
+    }
+
+    /// The reply to `POST /api/memory/remember`: the write, checked here and then queued for
+    /// the memory thread ([`Memory::remember`]), as far as it is known.
+    fn memory_remember(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: RememberRequest = parse_body(body, Error::BadRequest)?;
+        let repo = self.repo()?;
+        let job = request.into_job(&repo)?;
+        Ok(to_json(&self.memory.remember(job)?))
     }
 
     /// The replies to `/api/thread` and the routes under it, as [`Site::respond`] gives them:
@@ -1950,6 +2032,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::SettingsChanged
                 | Error::MemoryNotReady(_)
                 | Error::MemorySetupRunning
+                | Error::MemoryBusy
                 | Error::TurnRunning
                 | Error::RunElsewhere
                 | Error::TooManyRuns { .. }

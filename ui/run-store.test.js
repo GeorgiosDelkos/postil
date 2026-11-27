@@ -67,3 +67,36 @@ test("a later reply updates the run and keeps its notes and prompt, which it lea
     entries: ["a", "b"],
   });
 });
+
+test("a memory draft's thread is busy while the draft runs, and free once it ended", async (t) => {
+  const r1 = { id: "R1", notes: ["N1"], prompt: "p", status: "ended", total: 0, entries: [] };
+  let draft = { id: "R2", status: "running", total: 0, entries: [], remember: { of: "R1" } };
+  let live = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    const reply = url.startsWith("api/runs")
+      ? { runs: live.length ? ["R2", "R1"] : ["R1"], live }
+      : url.startsWith("api/run?id=R2")
+        ? draft
+        : r1;
+    return new Response(JSON.stringify(reply));
+  });
+  const store = runStore({
+    render() {},
+    onChange() {},
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+  await store.sync();
+  assert.equal(store.threadLive("R1"), false);
+
+  // The draft never becomes the latest run: `started` reads the list itself.
+  live = [{ id: "R2", thread: "R1" }];
+  await store.started();
+  assert.equal(store.threadLive("R1"), true);
+  assert.equal(store.run().id, "R1");
+
+  // Its end's nudge: the list read last still names it.
+  draft = { ...draft, status: "ended" };
+  await store.sync();
+  assert.equal(store.threadLive("R1"), false);
+});

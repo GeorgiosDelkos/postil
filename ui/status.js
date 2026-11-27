@@ -415,6 +415,8 @@ function turnShown(turn) {
     turn.followUp ?? null,
     turn.followUp ? freshAgent(turn) : null,
     turn.analysis ?? null,
+    turn.remember ?? null,
+    turn.draft ?? null,
     plan,
     items.map((item) => itemShown(item, live)),
     // Whether the reply shows at all: its text is written in place.

@@ -43,8 +43,10 @@
 //! with every note open. Version 3 added the resolved state. Version 4 added each note's
 //! `target` (`lines`, `file` or `folder`); an older file reads with every note on lines, and
 //! a file or folder note has no `lines` or `snippet`. Version 5 added each note's `intent`
-//! (`change` or `ask`); an older file reads with every note a change. The next write makes an
-//! older file version 5. A path in the file must be written as git writes paths
+//! (`change` or `ask`); an older file reads with every note a change. Version 6 added each
+//! note's `memory`, the id of the team memory remembered from it, written only when it has
+//! one; an older file reads with none. The next write makes an older file version 6. A path
+//! in the file must be written as git writes paths
 //! (`Repo::kind`): one written another way (`./a.rs`, `src//a.rs`), which the page never sent,
 //! reads as lost.
 //!
@@ -69,13 +71,14 @@ use serde::{Deserialize, Serialize};
 use crate::anchor::{LineRange, Target, TargetKind, locate, locate_lines};
 use crate::error::{Error, Result};
 use crate::files::{self, save_json, version_of};
+use crate::memory::MemoryId;
 use crate::repo::{PathKind, Repo};
 use crate::report;
 use crate::settings::TeamMemory;
 
 /// The format version this build writes. It reads this one and every older one; a file with
 /// a newer version is refused, not rewritten.
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 /// Reads the review file and places every note: a line note where its snippet is now, a file
 /// or folder note by whether its path is still there. Does not write.
@@ -119,6 +122,70 @@ pub(crate) fn is_ask(repo: &Repo, id: &str) -> Result<bool> {
         .notes
         .iter()
         .any(|note| note.id == wanted[0] && note.intent == Intent::Ask))
+}
+
+/// Checks that note `id` exists, read from the review file as it is, as [`ids`] reads it: no
+/// source file is read.
+///
+/// # Errors
+///
+/// As [`current`] for reading the review file; [`Error::BadRequest`] when `id` is not a note
+/// id, and [`Error::NoSuchNote`] when no note has it.
+pub(crate) fn exists(repo: &Repo, id: &str) -> Result<()> {
+    let wanted = parse_ids(&[id.to_owned()])?;
+    let review = Review::load(&repo.review_file())?;
+    if review.notes.iter().any(|note| note.id == wanted[0]) {
+        Ok(())
+    } else {
+        Err(Error::NoSuchNote { id: id.to_owned() })
+    }
+}
+
+/// What a team memory is drafted from for note `id` (docs/review-assist.md, "Postil writes
+/// memory"), read with every note placed, as [`current`] reads them.
+///
+/// # Errors
+///
+/// As [`body`].
+pub(crate) fn draft_source(repo: &Repo, id: &str) -> Result<DraftSource> {
+    let wanted = parse_ids(&[id.to_owned()])?;
+    let note = current(repo)?
+        .notes
+        .into_iter()
+        .find(|note| note.id == wanted[0])
+        .ok_or_else(|| Error::NoSuchNote { id: id.to_owned() })?;
+    let mut quoted = String::new();
+    note.quote(&mut quoted, &mut Vec::new());
+    let run = match &note.state {
+        NoteState::Sent { run } | NoteState::Resolved { run: Some(run) } => Some(run.clone()),
+        NoteState::Open {} | NoteState::Resolved { run: None } => None,
+    };
+    Ok(DraftSource {
+        body: note.body,
+        quoted: quoted.trim_start().to_owned(),
+        run,
+    })
+}
+
+/// What [`draft_source`] read of a note. Its `Debug` output leaves out the text, as for
+/// [`Note`].
+pub(crate) struct DraftSource {
+    /// The note's text: what the dialog opens with when no draft run can be made.
+    pub(crate) body: String,
+    /// The note as a prompt quotes it: its heading, a line note's snippet, and its text.
+    pub(crate) quoted: String,
+    /// The run it was sent in last, if any: its thread is the one a draft runs in.
+    pub(crate) run: Option<String>,
+}
+
+/// Records on note `id` that team memory `memory` was remembered from it, saves, and returns
+/// all notes. A note remembered again keeps the newest id. Its text, state and lines stay.
+///
+/// # Errors
+///
+/// As [`delete`].
+pub(crate) fn remember(repo: &Repo, id: &str, memory: MemoryId) -> Result<Review> {
+    change_note(repo, id, |note| note.memory = Some(memory))
 }
 
 /// Adds a change note and saves the review file with every note at its current place, then
@@ -254,6 +321,7 @@ fn save_note(
         anchor: Anchor::Found,
         state,
         intent,
+        memory: None,
     });
     review.relocate(repo, HashMap::new());
     review.save(&file)?;
@@ -575,8 +643,9 @@ pub(crate) struct Review {
 /// A note the engineer wrote on lines, a file or a folder.
 ///
 /// Stored as one flat object: `id`, `path`, `target`, then `lines` and `snippet` for a line
-/// note only, `body`, `anchor`, `state`, `intent`. A script reads every note the same way, and
-/// a line note keeps the fields it had before version 4. Read through [`StoredNote`].
+/// note only, `body`, `anchor`, `state`, `intent`, then `memory` for a note remembered only. A
+/// script reads every note the same way, and a line note keeps the fields it had before
+/// version 4. Read through [`StoredNote`].
 #[derive(Deserialize)]
 #[serde(try_from = "StoredNote")]
 struct Note {
@@ -589,6 +658,9 @@ struct Note {
     anchor: Anchor,
     state: NoteState,
     intent: Intent,
+    /// The team memory remembered from it, if any (`memory.rs`). Deleting the note leaves the
+    /// memory: nothing in Postil forgets one.
+    memory: Option<MemoryId>,
 }
 
 /// What a note asks of an agent (module docs, "Asks").
@@ -709,6 +781,9 @@ struct StoredNote {
     /// Absent before version 5, where every note is a change.
     #[serde(default)]
     intent: Intent,
+    /// Absent before version 6, and on a note nothing was remembered from.
+    #[serde(default)]
+    memory: Option<MemoryId>,
 }
 
 /// What the page sends to create a note: `{path, lines, snippet, body}` for lines, as before
@@ -895,6 +970,15 @@ impl fmt::Debug for Note {
             .field("anchor", &self.anchor)
             .field("state", &self.state)
             .field("intent", &self.intent)
+            .field("memory", &self.memory)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for DraftSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DraftSource")
+            .field("run", &self.run)
             .finish_non_exhaustive()
     }
 }
@@ -933,7 +1017,7 @@ impl Serialize for Note {
             Target::Path(PathKind::File) => (TargetKind::File, None),
             Target::Path(PathKind::Folder) => (TargetKind::Folder, None),
         };
-        let mut note = serializer.serialize_struct("Note", 9)?;
+        let mut note = serializer.serialize_struct("Note", 10)?;
         note.serialize_field("id", &self.id)?;
         note.serialize_field("path", &self.path)?;
         note.serialize_field("target", &kind)?;
@@ -948,6 +1032,10 @@ impl Serialize for Note {
         note.serialize_field("anchor", &self.anchor)?;
         note.serialize_field("state", &self.state)?;
         note.serialize_field("intent", &self.intent)?;
+        match &self.memory {
+            Some(memory) => note.serialize_field("memory", memory)?,
+            None => note.skip_field("memory")?,
+        }
         note.end()
     }
 }
@@ -966,6 +1054,7 @@ impl TryFrom<StoredNote> for Note {
             anchor,
             state,
             intent,
+            memory,
         } = stored;
         let target = Target::read(target, lines, snippet, "note")
             .map_err(|problem| format!("{id}: {problem}"))?;
@@ -977,6 +1066,7 @@ impl TryFrom<StoredNote> for Note {
             anchor,
             state,
             intent,
+            memory,
         })
     }
 }
@@ -1067,6 +1157,7 @@ mod tests {
                 run: "R1".to_owned(),
             },
             intent: Intent::Ask,
+            memory: None,
         };
         let review = Review {
             version: VERSION,
@@ -1112,10 +1203,15 @@ mod tests {
             anchor: Anchor::Found,
             state,
             intent: Intent::Change,
+            memory: None,
         };
         let ask = Note {
             intent: Intent::Ask,
             ..note(6, "b.rs", Target::Path(PathKind::File), NoteState::Open {})
+        };
+        let remembered = Note {
+            memory: Some(MemoryId::parse("mem_01M8D25Z88AZRBGW9EGJMYKSW4").unwrap()),
+            ..note(7, "b.rs", Target::Path(PathKind::File), NoteState::Open {})
         };
         let review = Review {
             version: VERSION,
@@ -1133,6 +1229,7 @@ mod tests {
                 note(4, "src", Target::Path(PathKind::Folder), NoteState::Open {}),
                 note(5, "b.rs", Target::Path(PathKind::File), NoteState::Open {}),
                 ask,
+                remembered,
             ],
         };
 
@@ -1140,6 +1237,11 @@ mod tests {
 
         let open = "        \"kind\": \"open\"";
         let note_json = |id: u32, path: &str, target: &str, state: &str, intent: &str| {
+            let memory = if id == 7 {
+                ",\n      \"memory\": \"mem_01M8D25Z88AZRBGW9EGJMYKSW4\""
+            } else {
+                ""
+            };
             let lines = if target == "lines" {
                 "      \"lines\": {\n        \"start\": 2,\n        \"end\": 3\n      },\n      \
                  \"snippet\": \"b\\nc\",\n"
@@ -1150,11 +1252,11 @@ mod tests {
                 "    {{\n      \"id\": \"N{id}\",\n      \"path\": \"{path}\",\n      \
                  \"target\": \"{target}\",\n{lines}      \"body\": \"Why?\",\n      \
                  \"anchor\": \"found\",\n      \"state\": {{\n{state}\n      }},\n      \
-                 \"intent\": \"{intent}\"\n    }}"
+                 \"intent\": \"{intent}\"{memory}\n    }}"
             )
         };
         let expected = format!(
-            "{{\n  \"version\": 5,\n  \"notes\": [\n{},\n{},\n{},\n{},\n{},\n{}\n  ]\n}}\n",
+            "{{\n  \"version\": 6,\n  \"notes\": [\n{},\n{},\n{},\n{},\n{},\n{},\n{}\n  ]\n}}\n",
             note_json(1, "src/a.rs", "lines", open, "change"),
             note_json(
                 2,
@@ -1173,6 +1275,7 @@ mod tests {
             note_json(4, "src", "folder", open, "change"),
             note_json(5, "b.rs", "file", open, "change"),
             note_json(6, "b.rs", "file", open, "ask"),
+            note_json(7, "b.rs", "file", open, "change"),
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), expected);
         drop(fs::remove_dir_all(&dir));

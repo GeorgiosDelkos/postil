@@ -86,10 +86,11 @@ pub(super) enum InThread<'a> {
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
 /// on the `tool` and `toolUpdate` entries; version 6 the `report` entry; version 7 `readOnly`
 /// in the header and the `undone` entry; version 8 an analysis run (`analysis` in the header,
-/// the `noAnalysis` entry). Every older version reads: a log before version 4 has no snapshots,
-/// one before version 5 no commands or exit codes, one before version 6 no report, one before
-/// version 7 is a run that may change files, and one before version 8 is no analysis.
-const LOG_VERSION: u32 = 8;
+/// the `noAnalysis` entry); version 9 a memory draft (`remember` in the header). Every older
+/// version reads: a log before version 4 has no snapshots, one before version 5 no commands or
+/// exit codes, one before version 6 no report, one before version 7 is a run that may change
+/// files, one before version 8 is no analysis, and one before version 9 no memory draft.
+const LOG_VERSION: u32 = 9;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -240,16 +241,49 @@ pub(super) struct Header {
     /// `review` or `follow_up` ([`Origin`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) analysis: Option<AnalysisRun>,
+    /// Set when the run drafts a team memory (`Runner::draft`): the thread's latest turn it
+    /// drafts after. Such a run is read-only, whatever its thread's mode, and is not listed with
+    /// the runs of notes; its reply ends with the draft ([`RunView::draft`]). Absent in every log
+    /// written before version 9. Never set together with `review`, `follow_up` or `analysis`
+    /// ([`Origin`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) remember: Option<Remember>,
 }
 
-/// What a new run is: a send of notes, a reviewer's stage, a follow-up, or an analysis. One
-/// value, so a header never holds two of them.
+/// What a new run is: a send of notes, a reviewer's stage, a follow-up, an analysis, or a
+/// memory draft. One value, so a header never holds two of them.
 #[derive(Debug)]
 pub(super) enum Origin {
     Notes,
     Review(Stage),
     FollowUp(FollowUp),
     Analysis(AnalysisRun),
+    Remember(Remember),
+}
+
+/// A memory draft's link to its thread: `of` is the thread's latest turn when the draft was
+/// asked for (`R1`, or its latest follow-up).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Remember {
+    pub(crate) of: String,
+}
+
+/// A finished memory draft, as the Remember dialog reads it: the agent's `{summary, body}`, or
+/// why there is none, which the dialog shows above the note's text it falls back to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum DraftView {
+    Ready { summary: String, body: String },
+    Failed { problem: String },
+}
+
+/// The block a draft's reply ends with. Other fields are passed over: an agent that adds one
+/// still drafted.
+#[derive(Deserialize)]
+struct DraftBlock {
+    summary: String,
+    body: String,
 }
 
 /// A follow-up run's link to its thread: `of` is the run it follows, `text` what the engineer
@@ -486,6 +520,12 @@ pub(crate) struct RunView {
     read_only: bool,
     /// For an analysis run, what it was asked ([`Header::analysis`]).
     analysis: Option<AnalysisRun>,
+    /// For a memory draft, the turn it drafts after ([`Header::remember`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remember: Option<Remember>,
+    /// For a memory draft that is over, the draft or why there is none ([`draft_of`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft: Option<DraftView>,
 }
 
 impl Run {
@@ -563,12 +603,14 @@ impl Run {
                 path: file.clone(),
                 source,
             })?;
-        let (review, follow_up, analysis) = match origin {
-            Origin::Notes => (None, None, None),
-            Origin::Review(stage) => (Some(stage), None, None),
-            Origin::FollowUp(follow_up) => (None, Some(follow_up), None),
-            Origin::Analysis(analysis) => (None, None, Some(analysis)),
-        };
+        let (mut review, mut follow_up, mut analysis, mut remember) = (None, None, None, None);
+        match origin {
+            Origin::Notes => {}
+            Origin::Review(stage) => review = Some(stage),
+            Origin::FollowUp(followed) => follow_up = Some(followed),
+            Origin::Analysis(asked) => analysis = Some(asked),
+            Origin::Remember(drafted) => remember = Some(drafted),
+        }
         let header = Header {
             version: LOG_VERSION,
             id,
@@ -582,6 +624,7 @@ impl Run {
             follow_up,
             read_only,
             analysis,
+            remember,
         };
         if let Err(source) = log.write_all(&json_line(&header)) {
             // A log without its header would be skipped as unreadable on every restart.
@@ -610,8 +653,9 @@ impl Run {
     }
 
     /// The newest readable run log of notes in `dir`, read as a run this process does not run;
-    /// `None` when there is none. An analysis run is passed over: the Run tab lists runs of
-    /// notes. A newer log that cannot be read is skipped, and the run shown says why.
+    /// `None` when there is none. An analysis run and a memory draft are passed over: the Run
+    /// tab lists runs of notes. A newer log that cannot be read is skipped, and the run shown
+    /// says why.
     pub(super) fn latest(dir: &Path) -> Result<Option<Self>> {
         let mut numbers = match run_numbers(dir) {
             Ok(numbers) => numbers,
@@ -632,6 +676,7 @@ impl Run {
             }
             match Self::read(&file) {
                 Ok(run) if run.state().header.analysis.is_some() => {}
+                Ok(run) if run.state().header.remember.is_some() => {}
                 Ok(run) => {
                     if let Some(skipped) = skipped {
                         run.state().problem.get_or_insert(skipped);
@@ -855,6 +900,8 @@ impl Run {
             RunOrigin::FollowUp
         } else if state.header.analysis.is_some() {
             RunOrigin::Analysis
+        } else if state.header.remember.is_some() {
+            RunOrigin::Remember
         } else {
             RunOrigin::Notes
         };
@@ -915,7 +962,50 @@ impl Run {
             follow_up: state.header.follow_up.clone(),
             read_only: state.header.read_only,
             analysis: state.header.analysis.clone(),
+            remember: state.header.remember.clone(),
+            draft: draft_of(&state),
         }
+    }
+}
+
+/// The draft of a memory draft run that is over ([`DraftView`]); `None` for any other run, and
+/// for one still under way. A draft whose agent changed files is refused whatever its reply
+/// says: what it read is not the thread's tree. Reads the reply from its end once.
+fn draft_of(state: &RunState) -> Option<DraftView> {
+    state.header.remember.as_ref()?;
+    if state.live() {
+        return None;
+    }
+    let failed = |problem: String| Some(DraftView::Failed { problem });
+    let undone = state.entries.iter().find_map(|entry| match entry {
+        Entry::Undone { text } => Some(text.clone()),
+        _ => None,
+    });
+    if let Some(text) = undone {
+        return failed(text);
+    }
+    let end = state.entries.iter().rev().find_map(|entry| match entry {
+        Entry::Ended { reason } => Some(Ok(*reason)),
+        Entry::Failed { error } => Some(Err(error.clone())),
+        _ => None,
+    });
+    match end {
+        Some(Ok(StopReason::EndTurn)) => {}
+        Some(Ok(StopReason::Cancelled)) => {
+            return failed("the draft was stopped before the agent finished it".to_owned());
+        }
+        Some(Ok(_)) => return failed("the agent's turn ended before it finished".to_owned()),
+        Some(Err(error)) => return failed(format!("the draft run failed: {error}")),
+        None => return failed("the draft run did not finish".to_owned()),
+    }
+    match crate::review::last_json_block::<DraftBlock>(&state.reply()) {
+        Ok(DraftBlock { summary, body })
+            if !summary.trim().is_empty() && !body.trim().is_empty() =>
+        {
+            Some(DraftView::Ready { summary, body })
+        }
+        Ok(_) => failed("the agent's draft has a blank summary or body".to_owned()),
+        Err(problem) => failed(format!("the agent's reply holds no draft: {problem}")),
     }
 }
 
@@ -1379,20 +1469,34 @@ fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
     }
     let header: Header = serde_json::from_slice(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
-    // `Origin` makes the three exclusive when Postil writes a header, and an analysis read-only;
-    // this holds a hand edit to it.
+    // `Origin` makes the four exclusive when Postil writes a header, and an analysis and a
+    // memory draft read-only; this holds a hand edit to it.
     let origins = [
         header.review.is_some(),
         header.follow_up.is_some(),
         header.analysis.is_some(),
+        header.remember.is_some(),
     ];
     if origins.into_iter().filter(|set| *set).count() > 1 {
         return Err(
-            "its header is more than one of a review, a follow-up and an analysis".to_owned(),
+            "its header is more than one of a review, a follow-up, an analysis and a \
+                    memory draft"
+                .to_owned(),
         );
     }
     if header.analysis.is_some() && !header.read_only {
         return Err("its header is an analysis that may change files".to_owned());
+    }
+    if let Some(remember) = &header.remember {
+        if !header.read_only {
+            return Err("its header is a memory draft that may change files".to_owned());
+        }
+        if run_number(&remember.of).is_none() {
+            return Err(format!(
+                "its header drafts a memory after {:?}, which is not a run id",
+                remember.of
+            ));
+        }
     }
     Ok(header)
 }

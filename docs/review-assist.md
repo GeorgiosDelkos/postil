@@ -579,7 +579,7 @@ the session it has.
 
 Built (step 9.2): `src/memory.rs` and `src/memory/client.rs`, the tray's Memory tab
 (`ui/memory-tab.js`), the run dialog's Memory section and a memory's dialog
-(`ui/memory-dialog.js`). Remember is step 9.4. Postil names the repository on every recall as
+(`ui/memory-dialog.js`). Remember is below. Postil names the repository on every recall as
 hippius-mem does: the last segment of the project's `origin` (`normalize_remote` in
 hippius-mem's `resolver.rs`), and none without one. The memory's dialog shows where each change
 was anchored, in the vault or on chain; it does not check the Merkle proof itself. The tab
@@ -605,6 +605,34 @@ agent scan's page does (the plan's open item 7, settled by the owner on 2026-11-
 - Memory text is a teammate's writing. Postil draws it as text and never acts on it.
 
 ### Postil writes memory
+
+Built (step 9.4) for a note and an answered ask, from the note's dialog: `Runner::draft` in
+`src/run.rs`, `POST /api/memory/draft` and `POST /api/memory/remember` in `src/site.rs`,
+`Memory::remember` in `src/memory.rs`, `Note.memory` in `src/notes.rs` (`review.json` version
+6), the `remember` header of run log version 9, and the Remember dialog (`rememberDialog` in
+`ui/memory-dialog.js`). Remember from a finding or a run is not built: the owner left those
+out of 9.4.
+
+- The draft is a read-only run in the note's thread, after its latest turn, whatever the
+  thread's mode: it commits what was left in the worktree first, takes no snapshot, its asks
+  to edit are refused, and edits it makes anyway are undone, which fails the draft. It goes
+  to the thread's kept agent when that agent ran the latest turn, else to a fresh agent told
+  the thread so far, which gets no team memory: a draft run never writes memory. A kept agent
+  whose session got hippius-mem's server is never used for a draft (decided 2026-11-27): a
+  memory it wrote would be an external write the engineer did not save. A fresh agent with no
+  server drafts instead, and the kept agent, with its conversation, is let go. It is never the
+  Run tab's latest run, and the thread's next follow-up goes to a fresh agent.
+- A note never sent, or whose thread was applied or discarded, gets no draft run: the dialog
+  opens with the note's text. A draft that fails, or whose reply ends without a
+  `{"summary", "body"}` block, falls back the same way and says why.
+- While a run of the thread is under way, Remember is disabled ("Wait for the run").
+- Save sends exactly the summary, body, type and scope shown, through the memory thread, with
+  the repository named explicitly (the whole team's when the repository has no origin). A
+  blank summary or body, or one over its limit (1 KiB, 16 KiB), is refused before the call.
+  Save is disabled while it runs. A near-duplicate refused by hippius-mem offers Save anyway,
+  which passes `force`; any other failure keeps the dialog open with the text.
+- The duplicate check is a recall of the summary; one that cannot run says so and leaves Save
+  as it was.
 
 Remember is offered in the dialog of a note, of a finding, of a run, and of an answered ask.
 

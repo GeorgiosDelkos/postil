@@ -609,6 +609,33 @@ async function prompt(id, params) {
       writeFileSync(`${process.cwd()}/a.txt`, "edited\n");
       say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]), null, 2)}\n\`\`\``);
       return send({ id, result: { stopReason: "end_turn" } });
+    case "memory-draft":
+    case "memory-draft-writes": {
+      // A thread's agent that answers its notes with a line, and a memory draft (src/run.rs,
+      // `DRAFT_ASK`) with the block it asks for. `memory-draft-writes` breaks the draft's rules
+      // first: it asks to edit, then edits a.txt without asking.
+      if (!blocks[0].includes("as a team memory")) {
+        say("N1: done");
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      if (scenario === "memory-draft-writes") {
+        const edit = await permission("w1");
+        say(`edit ${edit.result.outcome.optionId}`);
+        writeFileSync(`${process.cwd()}/a.txt`, "drafted over\n");
+      }
+      say(
+        'Here is the draft.\n\n```json\n{"summary": "a.txt holds one line on purpose", "body": "The parser reads a.txt whole: keep it to one line."}\n```',
+      );
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "memory-draft-hang":
+      // Answers its notes, and never ends a memory draft's turn: the draft stays under way.
+      if (!blocks[0].includes("as a team memory")) {
+        say("N1: done");
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      say("drafting");
+      return;
     case "hang":
       // Never ends the turn, and ignores the cancel.
       return;

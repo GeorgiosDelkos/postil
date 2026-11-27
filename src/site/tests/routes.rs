@@ -44,7 +44,18 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     (
         "/api/memory/recall",
         &[Method::GET],
-        "GET ?path=<path>&node=<node label>, or ?run=R1",
+        "GET ?path=<path>&node=<node label>, ?run=R1, or ?text=<query>",
+    ),
+    (
+        "/api/memory/draft",
+        &[Method::POST],
+        "POST {\"note\": \"N1\"}",
+    ),
+    (
+        "/api/memory/remember",
+        &[Method::POST],
+        "POST {\"note\": \"N1\", \"noteType\": ..., \"summary\": ..., \"body\": ..., \
+         \"scope\": \"repo\" or \"global\"}",
     ),
     ("/api/memory/refresh", &[Method::POST], "POST with no body"),
     ("/api/memory/check", &[Method::POST], "POST with no body"),

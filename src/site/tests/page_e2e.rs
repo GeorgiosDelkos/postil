@@ -25,8 +25,10 @@
 //! - `POST /new-memory` opens a project with the fake agent in `plain`, and a fake
 //!   `hippius-mem` that is installed and not set up until its `quickstart` runs, which takes
 //!   half a second, so the page asks again while it runs.
-//! - `POST /new-memory-server` opens a project with the fake agent in `plain`, and a fake
-//!   `hippius-mem` that is ready and serves MCP: every recall finds one memory and one guess.
+//! - `POST /new-memory-server` opens a project with the fake agent in the scenario its body
+//!   names as `POST /new` does, `plain` without one, and a fake `hippius-mem` that is ready and
+//!   serves MCP: every recall finds one memory and one guess, and every remember writes
+//!   `mem_01SAVED`.
 //! - `POST /new-fresh-memory` makes a site as `POST /new-fresh` does, with a fake
 //!   `hippius-mem` whose doctor passes when the body is `{"memory": "ready"}` and fails
 //!   otherwise; the site has finished its first check when the reply comes.
@@ -156,7 +158,12 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
         }
         "/new-fresh" => Some(Start::FirstRun),
         "/new-memory" => Some(Start::Memory),
-        "/new-memory-server" => Some(Start::MemoryServer),
+        "/new-memory-server" => {
+            let asked: serde_json::Value =
+                serde_json::from_slice(request.body()).unwrap_or_default();
+            let scenario = asked["scenario"].as_str().unwrap_or("plain");
+            Some(Start::MemoryServer(scenario.to_owned()))
+        }
         "/new-fresh-memory" => {
             let asked: serde_json::Value =
                 serde_json::from_slice(request.body()).unwrap_or_default();
@@ -237,9 +244,9 @@ enum Start {
     /// The repository open as the project, with the fake agent in `plain`, and a fake
     /// `hippius-mem` that its set up makes ready.
     Memory,
-    /// The repository open as the project, with the fake agent in `plain`, and a fake
+    /// The repository open as the project, with the fake agent in this scenario, and a fake
     /// `hippius-mem` server whose recalls find one memory and one guess.
-    MemoryServer,
+    MemoryServer(String),
     /// As [`Start::FirstRun`], with a fake `hippius-mem` that is ready or not set up.
     FirstRunWithMemory { ready: bool },
 }
@@ -302,11 +309,11 @@ fn bridged(number: usize, start: Start) -> Bridged {
         }
         Start::OpenCode(scenario) => opencode_site(&repo, &scenario, notify),
         Start::Memory => memory_site(&repo, notify),
-        Start::MemoryServer => {
+        Start::MemoryServer(scenario) => {
             let dir = repo.root.join(".git/memory-bin");
             let script = super::memory::server_script(&dir, "hippius-mem 0.7.1", "");
             let script = format!("#!/bin/sh\n{script}");
-            agent_site(&repo, "plain", notify).with_memory(fake_memory(&repo, &script))
+            agent_site(&repo, &scenario, notify).with_memory(fake_memory(&repo, &script))
         }
         Start::FirstRunWithMemory { ready } => {
             let doctor = if ready { "exit 0" } else { "exit 1" };
