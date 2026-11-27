@@ -1540,6 +1540,37 @@ fn readers_reviewers_and_fresh_follow_ups_get_it_too() {
 }
 
 #[test]
+fn the_forced_update_gets_it_too() {
+    let repo = TempRepo::new("memory-agents-forced");
+    repo.write("src/a.rs", "fn a() {\n    one();\n}\n");
+    repo.write("src/b.rs", "// b\n\nfn two() {\n}\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    let (status, body) = post(
+        &site,
+        "postil://localhost/api/analysis",
+        r#"{"kind": "analyze"}"#,
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    run_ended(&site, &nudges, "R1");
+    // The check refuses an update while the analysis's thread is still open.
+    while super::threads::thread(&site, "R1")["state"] == "open" {
+        nudges
+            .recv_timeout(WAIT)
+            .expect("the analysis's thread ends with its run");
+    }
+
+    // A commit that changes a cited line (src/a.rs line 2) starts the forced update.
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.commit();
+    let (status, body) = post(&site, "postil://localhost/api/analysis/check", "");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(answer["state"], "updated", "{answer}");
+    let update = run_ended(&site, &nudges, answer["run"].as_str().unwrap());
+    assert_eq!(servers_of(&update), serde_json::json!([agents.server()]));
+}
+
+#[test]
 fn the_setting_off_gives_none_and_no_prompt_line() {
     let repo = TempRepo::new("memory-agents-off");
     repo.write("a.txt", "a\n");

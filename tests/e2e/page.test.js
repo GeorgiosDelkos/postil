@@ -2737,3 +2737,35 @@ test("Change map waits for an Architecture, marks what the run touched at its fo
   await map.locator(".map-change-label").waitFor({ state: "detached" });
   assert.equal(await map.locator(".map-node.touched, .map-node.near").count(), 0);
 });
+
+test("a hunk a change map node opened stays whole when the changes are drawn again", async (t) => {
+  // The run cuts big.txt from 300 lines to its own 150, none in common: one hunk of 450 lines,
+  // past the 400 a step draws before "Show the other lines" (ui/changes-view.js).
+  const files = { ...CHANGE_FILES, "big.txt": numbered("b", 300) };
+  const { page, api } = await openProject(t, "change-map", "new", { files });
+  const request = { path: "lib.txt", lines: { start: 1, end: 1 }, snippet: "l1", body: "Do it." };
+  const review = await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  const notes = review.notes.map((note) => note.id);
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  await detail.locator(".run-check code", { hasText: /^cargo test$/ }).waitFor();
+  await writeAnalysis(api, CHANGE_ANALYSIS);
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await detail.locator(".run-detail-change-map:enabled").click();
+  await page.locator('#map .map-node.touched[data-node-id="D1.4"]').click();
+
+  const changes = page.locator("#changes-view");
+  const big = changes.locator('.changes-hunk-block[data-path="big.txt"]');
+  const whole = async () => {
+    await big.locator(".changes-line").nth(449).waitFor();
+    assert.equal(await changes.locator(".changes-more").count(), 0, "nothing left to show");
+  };
+  await whole();
+
+  // Another order draws the changes again, without the click's scroll: the hunk stays whole.
+  await page.locator('[data-key="changes-risk-eyes"]').click();
+  await page.locator('[data-key="changes-risk-eyes"][aria-checked="true"]').waitFor();
+  await whole();
+});
