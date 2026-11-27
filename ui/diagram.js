@@ -304,6 +304,136 @@ export function notesOn(notes, anchors) {
   return notes.filter((note) => placed.some((anchor) => touches(note, anchor)));
 }
 
+// ---- The link shown in the code (docs/review-assist.md) ------------------------------------
+
+// Whether code reference `anchor` was placed in the code: found, or outdated at its last lines
+// (src/analysis.rs, `place`). An unverified one points at nothing.
+const placed = (anchor) => anchor.state === "found" || anchor.state === "outdated";
+
+// The one of `anchors` that 1-based `line` shows: of the placed references to lines that
+// cover it, the smallest range; of equal ranges, the deepest under the top level (`depth`,
+// 0 when absent); of those, the first. Null when none covers it.
+export function innermost(anchors, line) {
+  let best = null;
+  for (const anchor of anchors) {
+    if (anchor.target !== "lines" || !placed(anchor)) continue;
+    const { start, end } = anchor.lines;
+    if (line < start || end < line) continue;
+    const span = end - start;
+    const depth = anchor.depth ?? 0;
+    if (!best || span < best.span || (span === best.span && depth > best.depth)) {
+      best = { anchor, span, depth };
+    }
+  }
+  return best?.anchor ?? null;
+}
+
+// The stripes and chips of the file at `path`, `lineCount` lines long, from `analysis` (`GET
+// api/analysis`), as a Map from each covered 0-based line to `{ diagramId, nodeId, label,
+// outdated, step, chip, key }`:
+// - the node is the innermost (`innermost`) of the Architecture kind on that line, else of any
+//   kind, and `outdated` says its reference is;
+// - `chip`, on the first line a reference of the node shows, unless the line before shows the
+//   same node, is `{ diagramId, nodeId, label, others }`, `others` the innermost node on that
+//   line of each other diagram, `{ diagramId, diagramTitle, nodeId, label }`, else null;
+// - `step` is the step number of a card of the flow `openDiagramId` on the first line of its
+//   first reference in the file, else null;
+// - `key` changes whenever anything above does, so a row compares it to redraw.
+// A reference past the end of a file that shrank draws only up to its end.
+export function fileMarks(analysis, path, lineCount, { openDiagramId = null } = {}) {
+  const marks = new Map();
+  if (!analysis || !path || lineCount === 0) return marks;
+
+  // The references on each line, each with its node, its diagram and the diagram's depth.
+  const byLine = new Map();
+  const steps = new Map();
+  for (const diagram of analysis.diagrams) {
+    const depth = breadcrumb(analysis, diagram).length - 1;
+    const open = diagram.id === openDiagramId && diagram.kind === "flow";
+    const parents = boundaries(diagram);
+    let step = 0;
+    for (const node of diagram.nodes) {
+      if (open && !parents.has(node.id)) step += 1;
+      let first = true;
+      for (const anchor of node.anchors) {
+        if (anchor.path !== path || anchor.target !== "lines" || !placed(anchor)) continue;
+        // Past the end of a file that shrank: nothing to draw, and no step to number.
+        if (anchor.lines.start > lineCount) continue;
+        if (open && first && !parents.has(node.id)) steps.set(anchor.lines.start - 1, step);
+        first = false;
+        const cited = { ...anchor, depth, diagram, node };
+        const last = Math.min(anchor.lines.end, lineCount);
+        for (let line = anchor.lines.start; line <= last; line += 1) {
+          if (!byLine.has(line)) byLine.set(line, []);
+          byLine.get(line).push(cited);
+        }
+      }
+    }
+  }
+
+  // The references that won a line already: each is chipped the first time it wins one, which
+  // for an outer node whose first lines an inner one wins is below them.
+  const shown = new Set();
+  const lines = [...byLine.keys()].sort((a, b) => a - b);
+  for (const line of lines) {
+    const cited = byLine.get(line);
+    const architecture = cited.filter((each) => each.diagram.kind === "architecture");
+    const winner = innermost(architecture, line) ?? innermost(cited, line);
+    const before = marks.get(line - 2);
+    // A node's second reference right after its first continues its stripe, unchipped.
+    const opens = !shown.has(winner) && before?.nodeId !== winner.node.id;
+    shown.add(winner);
+    const chip = opens ? chipOf(winner, cited, line) : null;
+    const mark = {
+      diagramId: winner.diagram.id,
+      nodeId: winner.node.id,
+      label: winner.node.label,
+      outdated: winner.state === "outdated",
+      step: steps.get(line - 1) ?? null,
+      chip,
+    };
+    const others = chip?.others.map((other) => other.nodeId) ?? null;
+    mark.key = JSON.stringify([mark.nodeId, mark.label, mark.outdated, mark.step, others]);
+    marks.set(line - 1, mark);
+  }
+  return marks;
+}
+
+// The chip of `winner` on `line`: its node, and the innermost node of each other diagram among
+// the references `cited` there, in the file's order of diagrams.
+function chipOf(winner, cited, line) {
+  const others = [];
+  const seen = new Set([winner.diagram.id]);
+  for (const { diagram } of cited) {
+    if (seen.has(diagram.id)) continue;
+    seen.add(diagram.id);
+    const inner = innermost(
+      cited.filter((each) => each.diagram === diagram),
+      line,
+    );
+    others.push({
+      diagramId: diagram.id,
+      diagramTitle: diagram.title,
+      nodeId: inner.node.id,
+      label: inner.node.label,
+    });
+  }
+  return { diagramId: winner.diagram.id, nodeId: winner.node.id, label: winner.node.label, others };
+}
+
+// The id of the node of `diagram` that 1-based `line` of the file at `path` stands in: the one
+// whose referenced lines are innermost there, else the first that references the whole file,
+// else null. A folder's node rings nothing: every line of every file in it would ring it.
+export function nodeAtLine(diagram, path, line) {
+  const cited = diagram.nodes.flatMap((node) =>
+    node.anchors.filter((anchor) => anchor.path === path).map((anchor) => ({ ...anchor, node })),
+  );
+  const inner = innermost(cited, line);
+  if (inner) return inner.node.id;
+  const whole = cited.find((anchor) => anchor.target === "file" && placed(anchor));
+  return whole?.node.id ?? null;
+}
+
 // The arrow keys' directions, as the unit step along x and y.
 const DIRECTIONS = {
   ArrowLeft: { x: -1, y: 0 },
