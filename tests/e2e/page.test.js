@@ -644,6 +644,14 @@ test("Usage button opens the usage report, switches filters, and Refresh settles
   await dialog.waitFor({ state: "hidden" });
 });
 
+test("the Usage button's warning dot stays a dot beside the label", async (t) => {
+  const { page } = await openProject(t);
+  // The dot shows only when a quota is near its limit, which the fake agents never report.
+  await page.locator("#usage-warn-dot").evaluate((dot) => (dot.hidden = false));
+  const dot = await page.locator("#usage-warn-dot").boundingBox();
+  assert.deepEqual([dot.width, dot.height], [6, 6]);
+});
+
 test("OpenCode's logo shows wherever the page names it, and a custom agent has none", async (t) => {
   const { page, api } = await openProject(t, null, "new-opencode");
   const logo = 'svg.agent-logo use[href="#agent-opencode"]';

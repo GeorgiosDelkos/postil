@@ -1238,7 +1238,8 @@ button.repo-name:hover {
   outline: none;
 }
 
-.settings-button span {
+/* Only the label grows: a later span, the Usage button's warning dot, keeps its size. */
+.settings-button > span:first-of-type {
   flex: 1;
 }
 
