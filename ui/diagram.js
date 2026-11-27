@@ -152,10 +152,19 @@ function layoutWith(diagram, dagre) {
 
     if (diagram.kind === "flow") {
       // A trace's steps are in step order: each step sits below the one before, by an edge only
-      // the layout sees, so steps the agent did not join still read top to bottom.
-      const cards = members.filter((node) => card(node.id));
-      for (let index = 1; index < cards.length; index += 1) {
-        graph.setEdge(cards[index - 1].id, cards[index].id, {}, `step${index}`);
+      // the layout sees, so steps the agent did not join still read top to bottom — including
+      // when consecutive steps sit in different boundaries.
+      const allCards = diagram.nodes.filter((node) => card(node.id));
+      const stepped = new Set();
+      for (let index = 1; index < allCards.length; index += 1) {
+        const from = childAt(allCards[index - 1].id, container);
+        const to = childAt(allCards[index].id, container);
+        if (!from || !to || from === to) continue;
+        const key = `${from}\0${to}`;
+        if (!stepped.has(key)) {
+          stepped.add(key);
+          graph.setEdge(from, to, {}, `step:${key}`);
+        }
       }
     }
 
@@ -249,7 +258,7 @@ export function checkFlowQuestion(text) {
   const length = [...text.trim()].length;
   if (length === 0) return "Ask a question: how does something happen?";
   if (length > MAX_FLOW_QUESTION) {
-    return `A flow's question is at most ${MAX_FLOW_QUESTION} characters, not ${length}.`;
+    return `A trace's question is at most ${MAX_FLOW_QUESTION} characters, not ${length}.`;
   }
   return null;
 }
@@ -432,8 +441,8 @@ function nodeTouchesFile(node, file) {
 // diagrams of `analysis`, placed at the run's fork: `{ nodes, near, unmapped }`, `nodes` the
 // ids of the touched nodes, `near` those one edge from a touched node and not touched
 // themselves, `unmapped` the paths, in the diff's order, that no Architecture node covers (one
-// a file the run added, which no node can have cited). Flows and Data diagrams are left out:
-// the change map is drawn on the Architecture.
+// a file the run added, which no node can have cited). Traces and User Flow diagrams are left
+// out: the change map is drawn on the Architecture.
 export function touched(analysis, files) {
   const diagrams = (analysis?.diagrams ?? []).filter((diagram) => diagram.kind === "architecture");
   const nodes = new Set();

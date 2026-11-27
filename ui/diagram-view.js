@@ -178,7 +178,7 @@ export function diagramView({
   const flowInput = el("input", "field map-flow-question");
   flowInput.type = "text";
   flowInput.placeholder = "Trace: how is a note sent?";
-  flowInput.setAttribute("aria-label", "A flow to trace");
+  flowInput.setAttribute("aria-label", "A behavior to trace");
   const flowTrace = el("button", "button map-flow-trace", "Trace");
   flowTrace.type = "submit";
   const flowDictation = attachDictation(flowInput);
@@ -535,7 +535,7 @@ export function diagramView({
     open.addEventListener("click", () => openDiagram(flow.id));
     const remove = el("button", "map-flow-delete", "×");
     remove.type = "button";
-    remove.setAttribute("aria-label", `Delete the flow ${flow.title}`);
+    remove.setAttribute("aria-label", `Delete the trace ${flow.title}`);
     actOnSecondClick(remove, {
       area: row,
       arm: () => {
@@ -1365,12 +1365,7 @@ export function diagramView({
   // A drag on the background pans; one that starts on a card or zoom control leaves the click to it.
   let panning = null;
   body.addEventListener("pointerdown", (event) => {
-    if (
-      !drawn ||
-      event.button !== 0 ||
-      event.target.closest("[data-node-id], .map-zoom")
-    )
-      return;
+    if (!drawn || event.button !== 0 || event.target.closest("[data-node-id], .map-zoom")) return;
     stopGlide();
     body.setPointerCapture(event.pointerId);
     panning = { x: event.clientX, y: event.clientY, from: transform() };

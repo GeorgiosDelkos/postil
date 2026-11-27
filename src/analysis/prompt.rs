@@ -286,7 +286,7 @@ fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Plan> {
 /// The run of a forced update (docs/review-assist-plan.md, 8.7): an Update of the Architecture
 /// diagrams of `analysis`, which is placed where its code is in the commit the run starts from,
 /// whose files are `files`; `added` are the files added since `checked` that no reference
-/// covers. Flow and Data diagrams wait for an Update the engineer asks for. Reads the record
+/// covers. Flow and User Flow diagrams wait for an Update the engineer asks for. Reads the record
 /// of threads.
 ///
 /// # Errors

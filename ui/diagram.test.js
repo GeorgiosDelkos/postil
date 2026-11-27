@@ -155,6 +155,43 @@ test("cross-boundary edges rank external nodes below their source boundary", () 
   assert.ok(group.y + group.height < ext.y, "external target is ranked below the boundary");
 });
 
+test("cross-boundary trace steps, deeply nested boundaries, lifted cycles, and empty diagrams lay out", () => {
+  // Trace steps across different boundaries without explicit edges still read top to bottom.
+  const traceNodes = [
+    node("D1.1", { kind: "boundary" }),
+    node("D1.2", { group: "D1.1" }),
+    node("D1.3", { kind: "boundary" }),
+    node("D1.4", { group: "D1.3" }),
+    node("D1.5"),
+  ];
+  const trace = layoutDiagram(diagram(traceNodes, [], { kind: "flow" }), dagre, new Map());
+  assert.ok(trace.byId.get("D1.2").y < trace.byId.get("D1.4").y);
+  assert.ok(trace.byId.get("D1.4").y < trace.byId.get("D1.5").y);
+
+  // 3-level nesting with cross-level lifted edges forming a cycle.
+  const nestedNodes = [
+    node("D1.1", { kind: "boundary" }),
+    node("D1.2", { kind: "boundary", group: "D1.1" }),
+    node("D1.3", { group: "D1.2" }),
+    node("D1.4", { kind: "boundary" }),
+    node("D1.5", { group: "D1.4" }),
+  ];
+  const nested = layoutDiagram(
+    diagram(nestedNodes, [edge("D1.3", "D1.5"), edge("D1.5", "D1.3")]),
+    dagre,
+    new Map(),
+  );
+  assert.ok([...nested.nodes, ...nested.groups].every(finite));
+  assert.ok(inside(nested.byId.get("D1.3"), nested.byId.get("D1.2")));
+  assert.ok(inside(nested.byId.get("D1.2"), nested.byId.get("D1.1")));
+
+  // Empty diagram lays out cleanly without NaN.
+  const empty = layoutDiagram(diagram([], []), dagre, new Map());
+  assert.equal(empty.nodes.length, 0);
+  assert.equal(empty.groups.length, 0);
+  assert.equal(empty.edges.length, 0);
+});
+
 test("search ranks a label that starts with the words, then one that holds them, then a summary", () => {
   const nodes = [
     node("D1.1", { label: "Store", summary: "keeps the run log" }),
@@ -636,13 +673,17 @@ test("only Architecture diagrams are touched, at the top level and below", () =>
   assert.deepEqual([...result.near], ["D2.2"]);
 });
 
-test("a changed file only a Flow or Data node covers is not on the map", () => {
+test("a changed file only a Trace or User Flow node covers is not on the map", () => {
   const analysis = analysisOf(
     diagram([node("D1.1", { anchors: [] })]),
     diagram([node("D2.1", { anchors: [whole("src/a.rs")] })], [], { id: "D2", kind: "flow" }),
+    diagram([node("D3.1", { anchors: [whole("src/b.rs")] })], [], { id: "D3", kind: "user_flow" }),
   );
-  const result = touched(analysis, [changed("src/a.rs", "modified", [[1, 1]])]);
-  assert.deepEqual(result.unmapped, ["src/a.rs"]);
+  const result = touched(analysis, [
+    changed("src/a.rs", "modified", [[1, 1]]),
+    changed("src/b.rs", "modified", [[1, 1]]),
+  ]);
+  assert.deepEqual(result.unmapped, ["src/a.rs", "src/b.rs"]);
 });
 
 test("an added file is not on the map, even inside a folder a node covers", () => {

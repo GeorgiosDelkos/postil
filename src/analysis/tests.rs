@@ -286,6 +286,49 @@ fn a_version_2_analysis_reads_without_checked_and_legacy_data_kind_upgrades_to_v
 }
 
 #[test]
+fn a_version_3_analysis_preserves_checked_and_upgrades_data_kind_to_user_flow() {
+    let dir = TempDir::new("analysis-version-3");
+    let file = dir.path().join("postil/analysis.json");
+    let _lock = lock(&file).unwrap();
+    let version_3 = EVERY_KIND_JSON
+        .replace("\"version\": 4,", "\"version\": 3,")
+        .replace("\"kind\": \"user_flow\"", "\"kind\": \"data\"");
+    fs::write(&file, &version_3).unwrap();
+
+    let loaded = load(&file).unwrap().unwrap();
+    assert_eq!(
+        loaded.checked,
+        Some(CommitId(
+            "0123456789abcdef0123456789abcdef01234567".to_owned()
+        ))
+    );
+    assert_eq!(loaded.diagrams[1].kind, DiagramKind::UserFlow);
+    save(&file, &loaded).unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), EVERY_KIND_JSON);
+}
+
+#[test]
+fn analyze_merge_accepts_user_flow_and_userflow_kinds() {
+    let dir = TempDir::new("analysis-merge-user-flow");
+    let worktree = Repo::init(dir.path()).unwrap();
+    for kind in ["user_flow", "userflow"] {
+        let mut analysis = empty();
+        let reply =
+            replied(&json!({"diagrams": [{"kind": kind, "nodes": [plain_node("a", None)]}]}));
+        merge::merge_into(
+            &mut analysis,
+            &reply,
+            &worktree,
+            1,
+            &asked(AnalysisKind::Analyze, None, &[]),
+        )
+        .unwrap();
+        assert_eq!(analysis.diagrams.len(), 1);
+        assert_eq!(analysis.diagrams[0].kind, DiagramKind::UserFlow);
+    }
+}
+
+#[test]
 fn an_analysis_that_breaks_the_graph_rules_is_not_saved() {
     let dir = TempDir::new("analysis-save-invalid");
     let file = dir.path().join("analysis.json");
