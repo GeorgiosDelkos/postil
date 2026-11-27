@@ -276,3 +276,15 @@ fn a_folder_that_cannot_be_looked_at_keeps_git_s_explanation() {
     assert!(stderr.starts_with("postil: git rev-parse"), "{stderr}");
     assert!(!stderr.contains("is not a folder"), "{stderr}");
 }
+
+#[test]
+fn a_bare_binary_refuses_dictation_and_does_not_exit() {
+    // This integration test runs as a bare executable with no .app bundle or Info.plist.
+    // Calling macOS Speech/AVAudio APIs directly would cause TCC to abort the process;
+    // preflight_bundle must refuse cleanly with a message instead.
+    let error = postil::preflight_bundle().expect_err("a bare binary has no Info.plist");
+    assert!(
+        error.contains("Postil.app") || error.contains("Info.plist") || error.contains("macOS"),
+        "{error}"
+    );
+}

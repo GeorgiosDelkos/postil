@@ -33,6 +33,7 @@ use wry::http::{Request, StatusCode};
 use wry::{DragDropEvent, PageLoadEvent, WebView, WebViewBuilder};
 
 use crate::dialog;
+use crate::dictation::{self, Dictation, StartOptions};
 use crate::error::{Error, Result};
 #[cfg(target_os = "macos")]
 use crate::menu::Command;
@@ -124,6 +125,16 @@ enum AppEvent {
     BenchDone(String),
     /// The request thread has closed the site, so the app may exit ([`Job::Close`]).
     SiteClosed,
+    /// The page asked to start native dictation with optional vocabulary hints.
+    DictationStart(StartOptions),
+    /// The page asked to stop dictation gracefully (delivering any pending final result).
+    DictationStop,
+    /// The page or window asked to cancel dictation immediately.
+    DictationCancel,
+    /// Native dictation produced an event for `window.postil.dictation`.
+    DictationEvent(dictation::Event),
+    /// Internal dictation callback marshaled back to the main event loop.
+    DictationInternal(dictation::Internal),
 }
 
 impl AppEvent {
@@ -137,9 +148,17 @@ impl AppEvent {
             "theme:system" => Some(Self::SetTheme(settings::Theme::System)),
             "theme:light" => Some(Self::SetTheme(settings::Theme::Light)),
             "theme:dark" => Some(Self::SetTheme(settings::Theme::Dark)),
-            _ => body
-                .strip_prefix("bench:")
-                .map(|report| Self::BenchDone(report.to_owned())),
+            "dictation:start" => Some(Self::DictationStart(StartOptions::default())),
+            "dictation:stop" => Some(Self::DictationStop),
+            "dictation:cancel" => Some(Self::DictationCancel),
+            _ => {
+                if let Some(json) = body.strip_prefix("dictation:start:") {
+                    StartOptions::parse_json(json).map(Self::DictationStart)
+                } else {
+                    body.strip_prefix("bench:")
+                        .map(|report| Self::BenchDone(report.to_owned()))
+                }
+            }
         }
     }
 }
@@ -188,6 +207,18 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
 
     let committed = Rc::new(Cell::new(false));
     let webview = build_webview(&event_loop, &window, jobs.clone(), Rc::clone(&committed))?;
+    let dict_event_proxy = event_loop.create_proxy();
+    let dict_internal_proxy = event_loop.create_proxy();
+    let dictation = Dictation::new(dictation::Callbacks {
+        on_event: Arc::new(move |event| {
+            // Fails only once the event loop is gone.
+            drop(dict_event_proxy.send_event(AppEvent::DictationEvent(event)));
+        }),
+        on_internal: Arc::new(move |internal| {
+            // Fails only once the event loop is gone.
+            drop(dict_internal_proxy.send_event(AppEvent::DictationInternal(internal)));
+        }),
+    });
 
     let mut app = App {
         page: Page {
@@ -198,12 +229,14 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         window: &window,
         jobs: &jobs,
         unnudge: &unnudge,
+        dictation,
         started,
         quit_by: None,
         launch_to_paint: None,
         report: None,
     };
     event_loop.run_return(|event, _, control_flow| on_event(&mut app, event, control_flow));
+    app.dictation.cancel();
     let report = app.report;
 
     // The webview draws into the window, so it goes first. The request thread is not joined:
@@ -223,6 +256,8 @@ struct App<'a> {
     jobs: &'a Sender<Job>,
     /// Set by the notifier when a run changed, until the page is told (see `serve`).
     unnudge: &'a AtomicBool,
+    /// On-device dictation controller, owned strictly on the main thread.
+    dictation: Dictation,
     /// When `serve` started, for the benchmark's launch-to-paint time.
     started: Instant,
     /// Set by the first quit: the event loop exits by then even if the site never closes.
@@ -242,11 +277,16 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
             ..
         } => ask_page(&app.page, "close-window", Unanswered::Quit),
         Event::UserEvent(AppEvent::Quit) => {
+            app.dictation.cancel();
             // Gone from the screen at once: closing the site can take a while (a slow git
             // call queued ahead of it, the snapshot after a live run).
             app.window.set_visible(false);
             close_site(app.jobs, &mut app.quit_by, control_flow);
         }
+        Event::WindowEvent {
+            event: WindowEvent::Focused(false),
+            ..
+        } => app.dictation.stop(),
         Event::UserEvent(AppEvent::SiteClosed) => *control_flow = ControlFlow::Exit,
         // The system switched between light and dark while the window follows it.
         Event::WindowEvent {
@@ -302,6 +342,22 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
                 app.page
                     .webview
                     .evaluate_script("window.postil?.runChanged?.()"),
+            );
+        }
+        Event::UserEvent(AppEvent::DictationStart(options)) => app.dictation.start(options),
+        Event::UserEvent(AppEvent::DictationStop) => app.dictation.stop(),
+        Event::UserEvent(AppEvent::DictationCancel) => app.dictation.cancel(),
+        Event::UserEvent(AppEvent::DictationInternal(internal)) => {
+            app.dictation.handle_internal(internal);
+        }
+        Event::UserEvent(AppEvent::DictationEvent(event)) => {
+            let json =
+                serde_json::to_string(&event).expect("a dictation event always serializes to JSON");
+            // Fails only when the webview is being torn down.
+            drop(
+                app.page
+                    .webview
+                    .evaluate_script(&format!("window.postil?.dictation?.emit?.({json})")),
             );
         }
         Event::UserEvent(AppEvent::BenchPainted) => {
@@ -496,6 +552,7 @@ fn build_webview(
 ) -> Result<WebView> {
     let page_proxy = event_loop.create_proxy();
     let drop_proxy = event_loop.create_proxy();
+    let load_proxy = event_loop.create_proxy();
     let file_drag = RefCell::new(FileDrag::default());
     WebViewBuilder::new()
         .with_background_color(canvas_color(window.theme()))
@@ -565,6 +622,9 @@ fn build_webview(
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Started) {
                 committed.set(true);
+                // Switching or reloading a project stops any active dictation and releases the
+                // microphone.
+                drop(load_proxy.send_event(AppEvent::DictationCancel));
             }
         })
         .with_url("postil://localhost/")
@@ -763,6 +823,23 @@ mod tests {
             AppEvent::parse("bench:{\"a\":1}"),
             Some(AppEvent::BenchDone(report)) if report == "{\"a\":1}"
         ));
+        assert!(matches!(
+            AppEvent::parse("dictation:start"),
+            Some(AppEvent::DictationStart(opts)) if opts.context.is_empty()
+        ));
+        assert!(matches!(
+            AppEvent::parse(r#"dictation:start:{"context":["src/run.rs"]}"#),
+            Some(AppEvent::DictationStart(opts)) if opts.context == ["src/run.rs"]
+        ));
+        assert!(matches!(
+            AppEvent::parse("dictation:stop"),
+            Some(AppEvent::DictationStop)
+        ));
+        assert!(matches!(
+            AppEvent::parse("dictation:cancel"),
+            Some(AppEvent::DictationCancel)
+        ));
+        assert!(AppEvent::parse("dictation:start:not-json").is_none());
         assert!(AppEvent::parse("nonsense").is_none());
     }
 

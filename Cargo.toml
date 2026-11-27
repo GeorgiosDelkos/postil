@@ -41,12 +41,18 @@ tree-sitter-bash = "0.25.1"
 # more of the same crate and adds none.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
+    "block2",
     "NSArray",
+    "NSBundle",
     "NSDictionary",
     "NSError",
     "NSFileManager",
+    "NSLocale",
+    "NSNotification",
+    "NSOperation",
     "NSString",
     "NSURL",
     "NSValue",
@@ -59,6 +65,31 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSResponder",
     "NSSavePanel",
     "NSWindow",
+] }
+# On-device dictation (`src/dictation.rs`): Apple's Speech and AVFAudio frameworks, typed
+# bindings with only the classes used (docs/review-assist.md, "Dictation").
+objc2-speech = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-avf-audio",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask",
+    "SFSpeechRecognitionTaskHint",
+    "SFSpeechRecognizer",
+    "SFTranscription",
+] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "AVAudioApplication",
+    "AVAudioBuffer",
+    "AVAudioEngine",
+    "AVAudioFormat",
+    "AVAudioIONode",
+    "AVAudioNode",
+    "AVAudioTime",
+    "AVAudioTypes",
 ] }
 # The menu bar (Tauri's menu crate, made for tao). It adds 13 crates (119 to 132), measured
 # 2026-11-22. The alternative, NSMenu through objc2-app-kit, needs an Objective-C class for the
@@ -78,10 +109,10 @@ panic = "abort"
 baseline = true
 
 [lints.rust]
-# Unsafe code only in `src/clone.rs`, which calls clonefile(2) and says so with an `expect`.
-# The owner allowed that one module on 2026-11-24: a folder clone takes 3 s where the safe
-# route, `cp -c -R`, takes 34 s (docs/design.md, "Worktrees"). No Miri job: Miri cannot run
-# that FFI call, the only unsafe code, and its two tests are ignored under Miri.
+# Unsafe code only in `src/clone.rs` (clonefile(2), allowed 2026-11-24: a folder clone takes 3 s
+# where `cp -c -R` takes 34 s, docs/design.md, "Worktrees") and `src/dictation.rs` (Apple's
+# Speech and AVFAudio frameworks via objc2, allowed 2026-11-25, docs/review-assist.md,
+# "Dictation"). Both say so with an `expect`. No Miri job: Miri cannot run either FFI call.
 unsafe_code = "deny"
 # [ref] The rustc baseline: Tokio sets all five; Jon's crates and Cranelift set subsets
 # (missing_docs in nearly every library of all three).

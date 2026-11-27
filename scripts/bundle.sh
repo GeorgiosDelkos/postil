@@ -64,6 +64,10 @@ cat >"$staged/Contents/Info.plist" <<PLIST
   <string>NSApplication</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>A coding agent Postil started wants to control another app.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Postil uses the microphone for on-device dictation and voice commands.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Postil uses on-device speech recognition for dictation and voice commands.</string>
 </dict>
 </plist>
 PLIST

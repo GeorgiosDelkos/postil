@@ -1,6 +1,8 @@
 # Postil: review assist, implementation plan
 
-Status: 2026-11-25. Nothing here is built. This plan turns `docs/review-assist.md` (the
+Status: 2026-11-27. Milestones 7, 8 and 9 are built and merged (PRs #53 to #79), and step
+10.1 (native dictation) is built. Steps 10.2 (the dictation widget) and 10.3 (voice commands)
+remain. This plan turns `docs/review-assist.md` (the
 design) into pull requests. It was written against the code at `53442a6`; every function and
 line it names was read there. `b7286bc` (#50, Open pull request) landed after it: line numbers
 in `src/notes.rs`, `src/run.rs`, `src/site.rs`, `src/thread.rs` and `ui/run-dialog.js` moved,

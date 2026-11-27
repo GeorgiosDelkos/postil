@@ -175,7 +175,8 @@ schedule three tasks.
 | `src/anchor.rs` | `LineRange`, `Target` and `locate`: placing lines that move, for notes and the analysis. |
 | `src/analysis.rs` | The diagrams, checking an agent's citations, and reading and writing `analysis.json`. |
 | `src/thread.rs` | Threads: their worktrees, branches, `threads.json`, and freeing them. |
-| `src/clone.rs` | One `clonefile(2)` call that clones a build folder: the crate's one `unsafe`. |
+| `src/clone.rs` | One `clonefile(2)` call that clones a build folder: one of the crate's two `unsafe` modules. |
+| `src/dictation.rs` | Native on-device dictation (`SFSpeechRecognizer`, `AVAudioEngine` via objc2): the crate's second `unsafe` module. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
 | `src/layout.rs`, `ui/panes.js` | The pane widths (the file list, the tray, the map), `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
@@ -1359,6 +1360,16 @@ Milestones 7 to 10 (reviewer aids, the map, team memory, voice) are in
   Development).
 - **The page's look and the rest of its input handling** are checked by eye. Pixel tests are
   not planned for version 1.
+
+### Dictation
+
+On-device dictation (`src/dictation.rs`, step 10.1) adds `objc2-speech` 0.3.2 and
+`objc2-avf-audio` 0.3.2 (default features off, only the classes used) plus `block2` 0.6.2 (already
+in `Cargo.lock` through `objc2-foundation`), all MIT/Apache-2.0. It adds 2 unique crates to the
+macOS dependency tree (116 to 118, measured 2026-11-27 with `cargo tree --target
+aarch64-apple-darwin -e normal,build`), and `cargo deny check` passes with no new exception.
+Typed bindings were chosen over raw `msg_send!` by the owner on 2026-11-25 so the compiler checks
+the selectors and argument types.
 
 ## Decisions
 

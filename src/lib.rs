@@ -12,6 +12,7 @@ mod anchor;
 mod clone;
 mod definitions;
 mod dialog;
+mod dictation;
 mod disk;
 mod error;
 mod files;
@@ -37,5 +38,6 @@ mod testing;
 mod thread;
 mod usage;
 
+pub use crate::dictation::preflight_bundle;
 pub use crate::error::{Error, error_chain};
 pub use crate::shell::{BenchReport, bench, run};
