@@ -144,6 +144,23 @@ export function codeView({
     }
   }
 
+  // The lines of the map's node last shown in the code, tinted while that file is open:
+  // `{ path, start, end }`, 0-based and inclusive, or null.
+  let mapped = null;
+
+  // Opens the file of the map's code reference `anchor` (diagram.js), with its lines a third
+  // of the way down and tinted, or at the top for a whole file. A folder has no file: the
+  // caller shows it in the file list.
+  async function showAnchor(anchor) {
+    const lines = anchor.target === "lines" ? anchor.lines : null;
+    mapped = lines && { path: anchor.path, start: lines.start - 1, end: lines.end - 1 };
+    if (state.file?.path !== anchor.path && !(await openFile(anchor.path))) return;
+    redecorateRows();
+    const top = lines ? lineTop(lines.start - 1) - codeEl.clientHeight / 3 : 0;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    codeEl.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
+  }
+
   // Opens a line or file note's file, at the note's lines or at the top. A folder note has no
   // file: the file list shows it (file-list.js, `showFolder`).
   async function showNote(note) {
@@ -245,6 +262,8 @@ export function codeView({
   function decorateRow(row, index) {
     row.classList.toggle("selected", isSelected(index));
     row.classList.toggle("jumped", jumped?.path === state.file?.path && jumped.index === index);
+    const onMap = mapped?.path === state.file?.path && mapped.start <= index && index <= mapped.end;
+    row.classList.toggle("mapped", onMap);
 
     const note = state.noteByLine.get(index);
     row.classList.toggle("noted", Boolean(note));
@@ -893,6 +912,7 @@ export function codeView({
     showFile,
     restoreHeader,
     showNote,
+    showAnchor,
     lineCount,
     render: renderCode,
     redecorate: redecorateRows,

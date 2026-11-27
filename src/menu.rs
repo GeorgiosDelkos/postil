@@ -20,10 +20,11 @@ pub(crate) enum Command {
     SetupWizard,
     Quit,
     FocusMode,
+    Map,
 }
 
 impl Command {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
@@ -33,6 +34,7 @@ impl Command {
         Self::SetupWizard,
         Self::Quit,
         Self::FocusMode,
+        Self::Map,
     ];
 
     /// The menu item's id, which is also the name `window.postil.menu` takes in `ui/app.js`.
@@ -47,6 +49,7 @@ impl Command {
             Self::SetupWizard => "setup-wizard",
             Self::Quit => "quit",
             Self::FocusMode => "focus-mode",
+            Self::Map => "map",
         }
     }
 
@@ -136,6 +139,7 @@ fn build() -> muda::Result<Menu> {
         true,
         &[
             &Command::Usage.item("Usage…", shift_command(Code::KeyU)),
+            &Command::Map.item("Map", shift_command(Code::KeyM)),
             &Command::FocusMode.item("Focus Mode", command(Code::Backslash)),
             &separator(),
             &PredefinedMenuItem::fullscreen(None),

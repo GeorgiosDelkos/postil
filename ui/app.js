@@ -10,6 +10,7 @@ import { runBench } from "./bench.js";
 import { changesView } from "./changes-view.js";
 import { codeView } from "./code-view.js";
 import { contextMenu } from "./context-menu.js";
+import { diagramView } from "./diagram-view.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
@@ -208,7 +209,28 @@ const pathNote = pathNoteDialog($("path-note-dialog"), {
   openSend: () => state.projectOpen && tray.openSend(),
 });
 
-const layout = dividers();
+// Whether the map shows (View > Map, Cmd-Shift-M), for this window's session, and which of
+// the map and the code a window too narrow for both shows (ui/panes.js, `fit`).
+const mapMode = { open: false, shows: "map" };
+
+const layout = dividers({ onNarrow: drawMapMode });
+
+const map = diagramView({
+  mapEl: $("map"),
+  dialogEl: $("node-dialog"),
+  runs,
+  settings: () => state.settings,
+  notes: () => state.notes,
+  noteCard: (note) => tray.noteCard(tray.cardOf(note), () => noteDetail.open(note.id)),
+  showAnchor: (anchor) => {
+    showCode();
+    if (anchor.target === "folder") files.showFolder(anchor.path);
+    else code.showAnchor(anchor);
+  },
+  writeNote: writeOnAnchor,
+  alone: () => mapMode.open && layout.isNarrow(),
+  onError: showToast,
+});
 
 const welcome = welcomeScreen({
   state,
@@ -409,6 +431,8 @@ function editsDone(run) {
 
 // Called after every change to the run.
 function followRun(run, previous) {
+  // An analysis is never the latest run: the map follows it.
+  map.runChanged();
   $("tab-run").hidden = run === null;
   if (run === null) {
     if (state.tab === "run") tray.showTab("notes");
@@ -547,6 +571,8 @@ async function refresh() {
     return;
   }
   if (!state.projectOpen) return;
+  // Another window may have analyzed the repository, or the code under a node moved.
+  map.refresh().catch((error) => showToast(String(error)));
   // The definitions index looks at the files again on its own thread (src/definitions.rs);
   // nothing here waits for it. Even with the composer open: the index moves no line.
   void fetch("api/definitions/refresh", { method: "POST" });
@@ -636,6 +662,7 @@ window.postil = {
       wizard.open();
     } else if (command === "usage") usage.open();
     else if (command === "focus-mode") toggleFocus();
+    else if (command === "map") toggleMap();
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
@@ -657,12 +684,15 @@ function toggleFocus() {
   // The send step's ticks live in the tray, which focus mode hides: it closes first.
   tray.closeSend();
   movePanes(() => document.body.classList.add("focus-mode"));
+  drawMapMode();
   // A control in a hidden pane would keep the keys.
   codeEl.focus();
 }
 
 function leaveFocus() {
-  if (inFocus()) movePanes(() => document.body.classList.remove("focus-mode"));
+  if (!inFocus()) return;
+  movePanes(() => document.body.classList.remove("focus-mode"));
+  drawMapMode();
 }
 
 // Eases the side panes while `change` opens or closes them, and only then (app.css,
@@ -680,6 +710,72 @@ function movePanes(change) {
 
 function inFocus() {
   return document.body.classList.contains("focus-mode");
+}
+
+// ---- The map ------------------------------------------------------------------------------
+
+// Cmd-Shift-M: opens the map, or closes it; in a window too narrow for the map beside the code,
+// switches between the two, and the sidebar's Map button closes it. Focus mode hides the map,
+// so it gives way, and an open map shows again rather than closing unseen.
+function toggleMap() {
+  if (welcome.isShown()) return;
+  const hidden = inFocus();
+  // Out of focus mode onto the map, which is what was asked for, in a narrow window too.
+  if (hidden) mapMode.shows = "map";
+  leaveFocus();
+  if (!mapMode.open) setMapOpen(true);
+  else if (hidden) map.focus();
+  else if (layout.isNarrow()) {
+    mapMode.shows = mapMode.shows === "map" ? "code" : "map";
+    drawMapMode();
+    if (mapMode.shows === "map") map.focus();
+    else codeEl.focus();
+  } else setMapOpen(false);
+}
+
+function setMapOpen(open) {
+  mapMode.open = open;
+  mapMode.shows = "map";
+  // The panes are fitted again for the map, and draw the mode through `drawMapMode`.
+  layout.setMapOpen(open);
+  if (open) map.focus();
+}
+
+$("toggle-map").addEventListener("click", () => {
+  if (welcome.isShown()) return;
+  leaveFocus();
+  setMapOpen(!mapMode.open);
+});
+
+// Shows the map beside the code, or, in a narrow window, the one of them `mapMode.shows`.
+// Focus mode shows the code alone, whatever the window: the map waits, open, for its end.
+function drawMapMode(narrow = layout.isNarrow()) {
+  const open = mapMode.open && !inFocus();
+  const shown = open && (!narrow || mapMode.shows === "map");
+  $("map").hidden = !shown;
+  $("code-pane").classList.toggle("map-full", open && narrow && mapMode.shows === "map");
+  $("toggle-map").setAttribute("aria-pressed", String(mapMode.open));
+  map.setShown(shown);
+}
+
+// A narrow window showing the map alone gives the pane to the code, where a node's code shows.
+function showCode() {
+  if (!mapMode.open || !layout.isNarrow() || mapMode.shows === "code") return;
+  mapMode.shows = "code";
+  drawMapMode();
+}
+
+// Writes a note on the code a map node's reference `anchor` points at, or asks about it
+// (`intent` "ask"): on its lines in the composer, or on its whole file or folder.
+async function writeOnAnchor(anchor, intent) {
+  if (anchor.target !== "lines") {
+    pathNote.open(anchor.path, anchor.target, { intent });
+    return;
+  }
+  showCode();
+  if (state.file?.path !== anchor.path && !(await code.openFile(anchor.path))) return;
+  const range = { start: anchor.lines.start - 1, end: anchor.lines.end - 1 };
+  code.openComposer(range, { intent });
 }
 
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.

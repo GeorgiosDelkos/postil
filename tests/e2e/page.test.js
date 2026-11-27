@@ -7,8 +7,9 @@
 // the node under the pointer while it drew the run again (docs/review-2026-11-23.md, D4).
 
 import assert from "node:assert/strict";
-import { unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, sep } from "node:path";
 import { after, before, test } from "node:test";
 
 import { webkit } from "playwright-core";
@@ -1234,4 +1235,305 @@ test("Cmd-[ comes back to where the file was scrolled", async (t) => {
   await page.keyboard.press("Meta+BracketLeft");
   await page.locator("#crumbs b").filter({ hasText: "long.rs" }).waitFor();
   await page.waitForFunction((top) => document.getElementById("code").scrollTop === top, scrolled);
+});
+
+// ---- The map (docs/review-assist-plan.md, 8.3) --------------------------------------------
+
+// An analysis of the default files, written by hand as an agent's run would leave it: a
+// component on line 2 of src/a.rs inside a boundary, a store on src/b.rs, and an edge between
+// the two cards (src/analysis.rs, "The file").
+const ANALYSIS = {
+  version: 2,
+  diagrams: [
+    {
+      id: "D1",
+      kind: "architecture",
+      title: "System",
+      run: "R1",
+      nodes: [
+        {
+          id: "D1.1",
+          kind: "component",
+          label: "Parser",
+          summary: "reads the input",
+          detail: "Turns **text** into tokens.",
+          group: "D1.3",
+          anchors: [
+            { path: "src/a.rs", target: "lines", lines: { start: 2, end: 2 }, snippet: "two" },
+          ],
+        },
+        {
+          id: "D1.2",
+          kind: "store",
+          label: "Cache",
+          summary: "keeps tokens",
+          detail: "",
+          anchors: [{ path: "src/b.rs", target: "file", state: "found" }],
+        },
+        {
+          id: "D1.3",
+          kind: "boundary",
+          label: "Process",
+          summary: "",
+          detail: "",
+          anchors: [{ path: "src", target: "folder" }],
+        },
+      ],
+      edges: [{ from: "D1.1", to: "D1.2", label: "fills" }],
+    },
+  ],
+};
+
+// Writes `ANALYSIS` into the open project's analysis file, as an analysis run would.
+async function writeAnalysis(api) {
+  const { root } = await api("api/repo");
+  mkdirSync(join(root, ".git/postil"), { recursive: true });
+  writeFileSync(join(root, ".git/postil/analysis.json"), JSON.stringify(ANALYSIS));
+}
+
+// Opens a project with `ANALYSIS` written, and counts the page's requests for the layout
+// library.
+async function openMapped(t, scenario = "flood", options = {}) {
+  const opened = await openProject(t, scenario, "new", options);
+  await writeAnalysis(opened.api);
+  const dagre = [];
+  opened.page.on("request", (request) => {
+    if (request.url().endsWith("vendor/dagre.min.js")) dagre.push(request.url());
+  });
+  return { ...opened, dagre };
+}
+
+const node = (page, label) => page.locator(".map-node").filter({ hasText: label });
+
+test("the map loads its layout only when opened, and a node's click opens its lines", async (t) => {
+  const { page, dagre } = await openMapped(t);
+  assert.deepEqual(dagre, [], "a window that never opens the map never loads dagre");
+
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").waitFor();
+  assert.equal(dagre.length, 1);
+  assert.equal(await page.locator("#toggle-map").getAttribute("aria-pressed"), "true");
+
+  await node(page, "Parser").click();
+  await page.locator("#crumbs b").filter({ hasText: "a.rs" }).waitFor();
+  await page.locator('#code-rows .ln.mapped[data-line="1"]').waitFor();
+  assert.equal(await page.locator("#code-rows .ln.mapped").count(), 1, "line 2 alone");
+  assert.match(await node(page, "Parser").getAttribute("class"), /\bselected\b/);
+
+  // Closing and opening again loads nothing more.
+  await page.evaluate(() => window.postil.menu("map"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.equal(dagre.length, 1);
+});
+
+test("the changes view opens beside the map, and Escape closes it, not the map", async (t) => {
+  const { page, api } = await openMapped(t);
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").waitFor();
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  await page.locator("#run .run-entry").click();
+  await page.locator("#run-detail").getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  await changes.waitFor();
+
+  const map = await page.locator("#map").boundingBox();
+  const covered = await changes.boundingBox();
+  assert.ok(covered.x >= map.x + map.width - 1, "the changes view covers the code, not the map");
+  await node(page, "Parser").waitFor();
+
+  await page.locator("#tab-notes").focus();
+  await page.keyboard.press("Escape");
+  await changes.waitFor({ state: "hidden" });
+  assert.ok(await page.locator("#map").isVisible(), "the map stays");
+});
+
+test("the map's divider resizes the map and keeps its width; focus mode hides the map", async (t) => {
+  const { page, api } = await openMapped(t);
+  // Room for the map to grow beside the code (ui/panes.js, `fit`).
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").waitFor();
+  const divider = page.locator("#divider-map");
+  const before = await page.locator("#map").boundingBox();
+  const box = await divider.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + 200);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 60, box.y + 200, { steps: 4 });
+  await page.mouse.up();
+  const after = await page.locator("#map").boundingBox();
+  assert.ok(Math.abs(after.width - before.width - 60) <= 2, `${before.width} to ${after.width}`);
+  // The width is saved after 300 ms of quiet (dividers.js): read until it lands.
+  const deadline = Date.now() + WAIT;
+  let saved = (await api("api/layout")).map;
+  while (Math.abs(saved - after.width) > 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    saved = (await api("api/layout")).map;
+  }
+  assert.ok(Math.abs(saved - after.width) <= 2, `saved ${saved}, drawn ${after.width}`);
+
+  await page.evaluate(() => window.postil.menu("focus-mode"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.ok(!(await divider.isVisible()), "nor its divider");
+  // Cmd-Shift-M leaves focus mode, the map open as it was.
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+});
+
+test("a node's dialog shows its detail, code, connections and notes, and Add note writes there", async (t) => {
+  const { page, api } = await openMapped(t);
+  const request = {
+    path: "src/a.rs",
+    lines: { start: 2, end: 2 },
+    snippet: "two",
+    body: "On two.",
+  };
+  await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  // The page read the notes as it opened, before this one: the window's focus reads them again,
+  // as it does on returning from another app.
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator("#notes").getByText("On two.").waitFor();
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").dblclick();
+
+  const dialog = page.locator("#node-dialog");
+  await dialog.waitFor();
+  assert.equal(await dialog.locator(".note-dialog-title").textContent(), "Parser");
+  // The detail is the Markdown subset, drawn as elements, never as HTML.
+  assert.equal(await dialog.locator(".node-detail strong").textContent(), "text");
+  await dialog.locator(".node-anchor").filter({ hasText: "src/a.rs:2" }).waitFor();
+  await dialog.locator(".node-edge").filter({ hasText: "Cache" }).waitFor();
+  await dialog.getByText("On two.").waitFor();
+
+  await dialog.getByRole("button", { name: "Add note" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  await page.locator("#note-body").waitFor();
+  assert.equal(await page.locator("#code-rows .ln.selected").getAttribute("data-line"), "1");
+});
+
+test("the keyboard moves between nodes, and Enter opens the dialog", async (t) => {
+  const { page } = await openMapped(t);
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").focus();
+  // The arrow that points from Parser to Cache as dagre placed them: the edge between them
+  // crosses a boundary, so it is not laid out and does not put Cache to the right
+  // (ui/diagram.js, `layoutDiagram`).
+  const from = await node(page, "Parser").boundingBox();
+  const to = await node(page, "Cache").boundingBox();
+  const [dx, dy] = [to.x - from.x, to.y - from.y];
+  const vertical = Math.abs(dy) > Math.abs(dx);
+  const arrow = vertical ? (dy > 0 ? "ArrowDown" : "ArrowUp") : dx > 0 ? "ArrowRight" : "ArrowLeft";
+  await page.keyboard.press(arrow);
+  await page.waitForFunction(() => document.activeElement?.dataset?.nodeId === "D1.2");
+  await page.keyboard.press("Enter");
+  await page.locator("#node-dialog .note-dialog-title").filter({ hasText: "Cache" }).waitFor();
+  await page.keyboard.press("Escape");
+  await page.locator("#node-dialog").waitFor({ state: "hidden" });
+  await page.locator("#map .map-body").focus();
+  await page.keyboard.press("/");
+  await page.waitForFunction(() => document.activeElement?.classList.contains("map-search"));
+});
+
+test("a failed load of the layout library offers Retry, and the code still opens", async (t) => {
+  const { page } = await openMapped(t);
+  await page.route("**/vendor/dagre.min.js", (route) => route.abort());
+  await page.locator("#toggle-map").click();
+  const retry = page.locator(".map-retry");
+  await retry.waitFor();
+
+  await openFile(page, "src/b.rs");
+  await page.locator("#code-rows .ln").first().waitFor();
+
+  await page.unroute("**/vendor/dagre.min.js");
+  await retry.click();
+  await node(page, "Parser").waitFor();
+});
+
+test("with no analysis the map names the Analyzer, and Analyze draws one that keeps the selection", async (t) => {
+  // The repository the fake agent's analysis cites (tests/fake-agent.mjs, `analysisReply`).
+  const files = { "src/a.rs": "fn a() {\n    one();\n}\n", "src/b.rs": "x\ny\nfn two() {\n}\n" };
+  const { page } = await openProject(t, "analysis", "new", { files });
+  await page.locator("#toggle-map").click();
+  const empty = page.locator(".map-empty");
+  await empty.waitFor();
+  assert.match(await empty.textContent(), /Fake reads the last commit \(HEAD\), read-only/);
+
+  await empty.getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  await node(page, "Page").click();
+  await page.locator('#code-rows .ln.mapped[data-line="1"]').waitFor();
+
+  // The window regains focus: the analysis is read again, and the node stays selected.
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.waitForFunction(() =>
+    document.querySelector(".map-node.selected")?.textContent.includes("Page"),
+  );
+});
+
+test("a window too narrow for the map and the code shows one at a time", async (t) => {
+  const { page } = await openMapped(t);
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.ok(!(await page.locator("#code").isVisible()), "the map takes the whole pane");
+  assert.ok(!(await page.locator("#divider-map").isVisible()));
+
+  await page.evaluate(() => window.postil.menu("map"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.ok(await page.locator("#code").isVisible(), "Cmd-Shift-M switches to the code");
+  await page.evaluate(() => window.postil.menu("map"));
+  // A click opens the node's dialog, so a double-click is not cut short by the switch; its
+  // Show in code gives the pane to the code.
+  await node(page, "Parser").click();
+  const dialog = page.locator("#node-dialog");
+  await dialog.waitFor();
+  assert.ok(await page.locator("#map").isVisible(), "the map stays until asked");
+  await dialog.getByRole("button", { name: "Show in code" }).click();
+  await page.locator('#code-rows .ln.mapped[data-line="1"]').waitFor();
+  assert.ok(!(await page.locator("#map").isVisible()));
+});
+
+test("focus mode in a narrow window shows the code, and Cmd-Shift-M comes back to the map", async (t) => {
+  const { page } = await openMapped(t);
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+
+  await page.evaluate(() => window.postil.menu("focus-mode"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.ok(await page.locator("#code").isVisible(), "focus mode shows the code, not nothing");
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.ok(!(await page.locator("#code").isVisible()), "out of focus mode onto the map");
+
+  // Switched to the code first, then focus mode and Cmd-Shift-M: the map, all the same.
+  await page.evaluate(() => window.postil.menu("map"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  await page.evaluate(() => window.postil.menu("focus-mode"));
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.ok(!(await page.locator("#code").isVisible()));
+});
+
+test("an analysis file this build cannot read offers Start over, which clears the map", async (t) => {
+  const { page, api } = await openProject(t);
+  const { root } = await api("api/repo");
+  mkdirSync(join(root, ".git/postil"), { recursive: true });
+  writeFileSync(join(root, ".git/postil/analysis.json"), "{ not json");
+  await page.locator("#toggle-map").click();
+  const error = page.locator(".map-error");
+  await error.waitFor();
+  assert.match(await error.textContent(), /analysis\.json/);
+
+  const response = page.waitForResponse((each) => each.url().endsWith("api/analysis/start-over"));
+  await error.getByRole("button", { name: "Start over" }).click();
+  const { trashed } = await (await response).json();
+  // Out of the engineer's Trash again, but only the file this test wrote, found in a Trash.
+  const inTrash =
+    trashed.startsWith(join(homedir(), ".Trash") + sep) || trashed.split(sep).includes(".Trashes");
+  assert.ok(inTrash, `${trashed} is in no Trash`);
+  assert.equal(readFileSync(trashed, "utf8"), "{ not json");
+  unlinkSync(trashed);
+  await page.locator(".map-empty").waitFor();
 });

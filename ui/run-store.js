@@ -125,7 +125,9 @@ export function runStore({ render, onChange, onLoaded, onError }) {
         again = false;
         const previous = run;
         const next = await fetchRun();
-        if (next === null && previous === null && !listStale) continue;
+        // With no latest run there is nothing to read, unless a live run of another thread is
+        // followed: an analysis is never the latest run (src/run.rs, `Runner::analyze`).
+        if (next === null && previous === null && !listStale && liveThreads.size === 0) continue;
         run = next;
         if (listStale || previous?.id !== run?.id || previous?.status !== run?.status) {
           await fetchIds();
@@ -307,6 +309,13 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     return live.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)));
   }
 
+  // Follows a run this page started outside the Run tab, an analysis (`POST api/analysis`):
+  // it is in no list the store has read yet, so the list is read again.
+  function track() {
+    listStale = true;
+    return sync();
+  }
+
   // Starts the settings' reviewers on run `of`.
   function startReview(of) {
     return post("api/run/review", { of }).catch((error) => onError(error.message));
@@ -328,6 +337,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     answer,
     stop,
     liveRuns,
+    track,
     // The thread live run `id` works in, by its first run's id; undefined for a run not live.
     liveThread: (id) => liveThreads.get(id),
     startReview,

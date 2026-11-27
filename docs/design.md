@@ -80,7 +80,10 @@ steel accent `#a7b4c6`). We take the principles, not the pixels.
 Rules for this app:
 
 - **One accent, used rarely.** Steel blue for focus, selection, and the primary button. Amber is
-  reserved for notes. Red appears only when the agent needs the engineer.
+  reserved for notes. Red appears only when the agent needs the engineer. The map has a second
+  rare accent, `--map`, a muted orchid: `#d79ad0` in Graphite and `#a33a8a` in Paper, with a
+  wash of the same color at 10% and 8% for the lines a node stands for
+  (`docs/review-assist.md`, "The link shown in the code").
 - **Cards on a canvas.** Three rounded panes with hairline borders and 8 px gaps. No toolbars, no
   icon rows, no status bar full of counters.
 - **Resizable panes.** The file list (200 to 480 px) and the tray (280 to 720 px) are sized by
@@ -88,15 +91,21 @@ Rules for this app:
   a double-click resets one. The file list does not fold: at 200 px its foot still shows the
   Settings button whole, and the owner asked on 2026-11-23 for no narrower list. The code pane
   keeps at least 420 px: in a narrow window the tray gives way first, then the file list. The
-  widths are kept per Mac in `~/.config/postil/layout.json`, chosen by the owner on 2026-11-23
-  over per project; like `recent.json` it is a convenience, so a file that cannot be used
-  counts as the defaults.
+  map (View > Map, `Cmd-Shift-M`) opens inside the code pane, left of the code, 320 to 960 px
+  wide with a third divider; while it is open the tray gives way first, then the map, then the
+  file list. A window too narrow for the map at 320 px beside the code at 420 px shows one of
+  them across the pane, and `Cmd-Shift-M` switches. Whether the map is open is kept for the
+  window's session only. The widths are kept per Mac in `~/.config/postil/layout.json`
+  (version 2 added the map's; a version 1 file reads with the map at 400 px), chosen by the
+  owner on 2026-11-23 over per project; like `recent.json` it is a convenience, so a file that
+  cannot be used counts as the defaults.
 - **Code is the largest and brightest thing on screen.** Chrome text is dimmer than code text.
 - **Two themes at launch:** Graphite (dark, default) and Paper (light). Each is a small palette
   of named colors, as in Herdr; a third theme is a new palette, not new code.
-- **Focus mode.** `Cmd-\` (View > Focus Mode) hides both side panes. The code column centers at a
-  readable width (at most 1100 px) and a single pill in the corner carries the open notes'
-  count and Send, which leaves focus mode for the send step. Built in milestone 5.
+- **Focus mode.** `Cmd-\` (View > Focus Mode) hides both side panes, and the map. The code
+  column centers at a readable width (at most 1100 px) and a single pill in the corner carries
+  the open notes' count and Send, which leaves focus mode for the send step. Built in
+  milestone 5. An open map waits for its end: `Cmd-Shift-M` leaves focus mode onto the map.
 - **Fonts are bundled** (Geist, Geist Mono; SIL Open Font License). Bundling skips the system
   font scan at startup and makes the app look the same on every machine.
 
@@ -168,7 +177,7 @@ schedule three tasks.
 | `src/thread.rs` | Threads: their worktrees, branches, `threads.json`, and freeing them. |
 | `src/clone.rs` | One `clonefile(2)` call that clones a build folder: the crate's one `unsafe`. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
-| `src/layout.rs`, `ui/panes.js` | The pane widths, `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
+| `src/layout.rs`, `ui/panes.js` | The pane widths (the file list, the tray, the map), `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
 | `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
@@ -190,6 +199,8 @@ schedule three tasks.
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 | `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
+| `ui/diagram.js`, `ui/diagram-view.js` | The map: its rules (layout through dagre, a node's state, search, pan and zoom arithmetic, tested with `node --test`), and the SVG, the keyboard and the node's dialog. |
+| `ui/vendor/dagre.min.js` | `@dagrejs/dagre`, the map's layout, vendored with `dagre.LICENSE` and loaded by a script element when the map first opens. |
 | `ui/definitions.js`, `ui/definitions-dialog.js` | Jump to definition: the name under a click and the history of places (tested with `node --test`), and the list a name defined more than once opens. |
 
 ### Data structures
@@ -1149,6 +1160,29 @@ ship. It adds one crate, 115 to 116 (its other dependencies, `tree-sitter`, `reg
 check` passes with no new exception. The stripped release binary grew from 11,089,152 to
 11,207,920 bytes (0.12 MB). Measured 2026-11-26. Writing the definition patterns by hand over
 `tree-sitter` was the alternative: the same queries, maintained here instead of upstream.
+
+### The map's layout
+
+`@dagrejs/dagre` 3.1.3 (MIT, published 2026-10-24: the newest release at least two weeks old;
+3.1.4 is from 2026-11-24), `dist/dagre.min.js` from
+https://registry.npmjs.org/@dagrejs/dagre/-/dagre-3.1.3.tgz, vendored byte for byte as
+`ui/vendor/dagre.min.js`: 49,326 bytes, sha256
+`54a503e346f93ca0bb10abe7999587e037262935687aca45eb4e4b0f64bbb578`, recorded with its license in
+`ui/vendor/dagre.LICENSE` and checked by `every_vendor_file_is_served`. No crate is added; the
+binary grows by the file's bytes, which `include_bytes!` keeps as they are. It is an IIFE that
+defines `window.dagre` with graphlib bundled, loaded when the map first opens. Spike S4
+(2026-11-26) laid out 200 nodes (160 by 48 px) and 260 edges, left to right and compound, in
+Playwright's WebKit under a load average of 13 in 35 to 52 ms (median 41), the first layout in
+a page in 63 to 77 ms. `--bench` lays out 200 nodes in boundaries of ten with 260 edges,
+reports the time, and exits with an error when it is over its budget of 150 ms.
+
+dagre 3.1.3 throws ("Not possible to find intersection inside of the rectangle") on some
+compound graphs with an edge between cards in two boundaries, after about 290 ms of work on the
+bench's diagram. So `layoutDiagram` (`ui/diagram.js`) never gives dagre such an edge: it lays
+out the edges inside one boundary and those between cards in none, and draws every other edge
+straight between its two boxes. The downside accepted (decided 2026-11-26): an edge across
+boundaries does not order them left to right. On the bench's diagram, in Node 22 on the
+development Mac, a layout takes 37 ms the first time and 23 to 28 ms after (2026-11-26).
 
 ### Expected total
 

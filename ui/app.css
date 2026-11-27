@@ -66,6 +66,13 @@
   --added-wash: rgb(166 201 149 / 10%);
   --removed: #e0949b;
   --removed-wash: rgb(224 148 155 / 10%);
+  /* The map (ui/diagram-view.js): a node's selection and the lines it stands for in the code.
+     A muted orchid (hue about 307 degrees here, 314 in Paper), in the gap between the keyword
+     color's violet (about 265) and the removed rose (about 355), and apart from the accent's
+     blue, the note's amber and the added green: a mapped line's keywords stay readable as
+     keywords. A violet (#b8a5d6) was tried first and was the keyword color's twin. */
+  --map: #d79ad0;
+  --map-wash: rgb(215 154 208 / 10%);
   --attention: #f0907f;
   --attention-border: #5a3b38;
 
@@ -135,6 +142,8 @@
     --added-wash: rgb(28 115 52 / 9%);
     --removed: #b3261e;
     --removed-wash: rgb(179 38 30 / 8%);
+    --map: #a33a8a;
+    --map-wash: rgb(163 58 138 / 8%);
     --attention: #b4471f;
     --attention-border: #e7b9a6;
 
@@ -476,6 +485,15 @@ kbd {
   padding-right: 24px;
   user-select: text;
   cursor: text;
+}
+
+/* Before the note rules: a note on the lines a map node stands for shows as noted. */
+.ln.mapped {
+  background: var(--map-wash);
+}
+
+.ln.mapped .n {
+  color: var(--map);
 }
 
 .ln.noted {
@@ -2284,8 +2302,19 @@ body.keyboard-input .slot-add:focus-visible {
   accent-color: var(--accent);
 }
 
+/* The code pane holds the map, when open, and the code column beside it. The send step's
+   prompt and the changes view cover the code column only, so the map stays beside them. */
 .code-pane {
+  flex-direction: row;
+}
+
+.code-column {
   position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .prompt-preview {
@@ -2884,6 +2913,11 @@ body.keyboard-input .slot-add:focus-visible {
 
 #divider-tray {
   right: calc(var(--tray-width, 320px) + 8px);
+}
+
+/* On the map's right border: the map starts a gap right of the file list (ui/panes.js). */
+#divider-map {
+  left: calc(var(--sidebar-width, 248px) + var(--map-width, 400px) + 4px);
 }
 
 .divider::after {
@@ -3857,7 +3891,8 @@ body.focus-mode > .tray {
   overflow: hidden;
 }
 
-body.focus-mode > .divider {
+body.focus-mode > .divider,
+body.focus-mode .map-pane {
   display: none;
 }
 
@@ -4306,4 +4341,409 @@ body.focus-mode .code {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* The map (docs/review-assist.md, "What the engineer sees"; ui/diagram-view.js): the diagrams
+   in the code pane, left of the code. Drawn as SVG at fixed sizes in CSS px (ui/diagram.js), so
+   the code's font size never moves a node. */
+
+.repo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.repo-row .repo-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.map-toggle {
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.map-toggle:hover {
+  background: var(--hover);
+}
+
+.map-toggle[aria-pressed="true"] {
+  border-color: var(--map);
+  color: var(--map);
+}
+
+.map-pane {
+  flex: none;
+  width: var(--map-width, 400px);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+
+/* A window too narrow for both shows the map alone, across the code pane (ui/panes.js). */
+.code-pane.map-full > .map-pane {
+  width: auto;
+  flex: 1;
+  border-right: 0;
+}
+
+.code-pane.map-full > .code-column {
+  display: none;
+}
+
+.map-header {
+  gap: 10px;
+}
+
+.map-crumbs {
+  min-width: 0;
+}
+
+.map-crumb {
+  padding: 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.map-crumb:hover {
+  color: var(--text-strong);
+}
+
+.map-dropped {
+  color: var(--attention);
+}
+
+.map-tools {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.map-kinds {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.map-kind {
+  height: 26px;
+  padding: 0 10px;
+  background: transparent;
+  border: 0;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.map-kind + .map-kind {
+  border-left: 1px solid var(--border-strong);
+}
+
+.map-kind[aria-pressed="true"] {
+  background: var(--raised);
+  color: var(--text-strong);
+}
+
+.map-kind:disabled {
+  opacity: var(--disabled-opacity);
+  cursor: default;
+}
+
+.map-search {
+  flex: 1;
+  min-width: 120px;
+  height: 26px;
+  padding: 0 8px;
+}
+
+.map-flow {
+  height: 26px;
+}
+
+.map-update {
+  height: 26px;
+}
+
+.map-run {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.map-run .button {
+  height: 26px;
+}
+
+.map-run-status {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+}
+
+.map-run-problem {
+  color: var(--attention);
+}
+
+.map-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  outline: none;
+  cursor: grab;
+}
+
+.map-body.panning {
+  cursor: grabbing;
+}
+
+.map-card {
+  margin: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  cursor: default;
+  user-select: text;
+}
+
+.map-card p {
+  margin: 0;
+}
+
+.map-empty-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.map-empty-note {
+  color: var(--text-muted);
+}
+
+.map-error p {
+  color: var(--attention);
+  overflow-wrap: anywhere;
+}
+
+.map-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.map-group-box {
+  fill: var(--card);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.map-group-label {
+  fill: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.map-group-head {
+  cursor: pointer;
+  outline: none;
+}
+
+.map-group-head:hover .map-group-label {
+  fill: var(--text-strong);
+}
+
+.map-group-head.selected .map-group-label,
+.map-group-head:focus-visible .map-group-label {
+  fill: var(--map);
+}
+
+.map-edge-line {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.map-arrow {
+  fill: var(--border-strong);
+}
+
+.map-edge-label {
+  fill: var(--text-muted);
+  font-size: 11px;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+}
+
+.map-node {
+  cursor: pointer;
+  outline: none;
+}
+
+.map-node-box {
+  fill: var(--raised);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.map-node-band,
+.map-node-inset {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.map-node-label {
+  fill: var(--text-strong);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.map-node-summary {
+  fill: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.map-node-deeper {
+  fill: var(--text-muted);
+  font-size: 14px;
+}
+
+.map-node:hover .map-node-box {
+  fill: var(--hover);
+}
+
+/* The agent's citation never matched the code: the card says so and is drawn dashed. */
+.map-node.unverified .map-node-box {
+  stroke-dasharray: 4 3;
+}
+
+.map-node.unverified .map-node-summary {
+  fill: var(--attention);
+}
+
+.map-node.outdated .map-node-summary {
+  fill: var(--note);
+}
+
+.map-node.ringed .map-node-box {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+/* After the ring: the selected node shows as selected when a search also matches it. */
+.map-node.selected .map-node-box {
+  stroke: var(--map);
+  stroke-width: 2;
+}
+
+.map-node:focus-visible .map-node-box,
+body.keyboard-input .map-node:focus .map-node-box {
+  stroke: var(--map);
+  stroke-width: 2.5;
+}
+
+.node-show,
+.node-deeper {
+  align-self: flex-start;
+}
+
+.node-detail {
+  user-select: text;
+}
+
+.node-anchors,
+.node-edges,
+.node-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.node-anchor,
+.node-edge-node,
+.node-edge-code {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 8px;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font: 12px var(--font-mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.node-anchor:hover:not(:disabled),
+.node-edge-node:hover,
+.node-edge-code:hover {
+  background: var(--hover);
+}
+
+.node-anchor:disabled {
+  cursor: default;
+}
+
+.node-anchor-place {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.node-anchor-state {
+  color: var(--attention);
+  font-family: "Geist", system-ui, sans-serif;
+}
+
+.node-anchor.outdated .node-anchor-state {
+  color: var(--note);
+}
+
+.node-edge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.node-edge-node {
+  font-family: "Geist", system-ui, sans-serif;
+  font-size: 12.5px;
+}
+
+.node-edge-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.node-edge-code {
+  color: var(--text-muted);
 }

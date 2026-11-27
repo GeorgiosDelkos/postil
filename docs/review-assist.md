@@ -4,7 +4,7 @@ Status: 2026-11-26. Designed. Built so far: an execute call's command and exit c
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
 Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1), and
-analysis runs (8.2), with no page beyond the settings' Analyzer yet. This document adds to
+analysis runs (8.2), and the split pane with the diagram view (8.3). This document adds to
 `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -288,7 +288,7 @@ The owner asked for the link to be visible in the code, as notes are.
 
 - **A stripe** at the gutter's left edge spans the node's lines, and **a chip** at the end of
   the first line names the node. A click on either opens the map at that node.
-- **A color of its own,** `--map`, a muted violet in both palettes. Amber stays reserved for
+- **A color of its own,** `--map`, a muted orchid in both palettes. Amber stays reserved for
   notes, steel for focus. This is a second rare accent, which "Look and feel" does not allow
   yet; the owner approved the stripe and chip on 2026-11-25 and that section is amended.
 - **One stripe per line.** Lines covered by nested nodes show the innermost node of the
@@ -344,6 +344,9 @@ which comes with the code that reads it in step 8.7 (version 3),
 checking a citation, and placing every verified reference on each read. As built, an unverified
 reference has no `target`, only its path and, when its file could not be read, a `reason`:
 its lines may be zero, reversed or past the end of a file that may not exist.
+A file the page cannot use (unreadable, not of the format, or from a newer build) shows its
+reason in the map with Start over (step 8.3, `POST /api/analysis/start-over`), which moves the
+file to the macOS Trash, refused while an analysis runs in the window.
 
 Looked up: every anchor of the open file, on each file open. Iterated: one diagram's nodes
 and edges, on each draw. Changed: whole diagrams, by an analysis run. A repository holds tens
@@ -513,9 +516,10 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
   no document (which node covers a line, which nodes a diff touches) with tests beside it.
 - **Layout comes from one vendored file**, the page's first third-party JavaScript:
   `@dagrejs/dagre` (MIT), kept as `ui/vendor/dagre.min.js` with its license, the way
-  `ui/icons.svg` is kept at a pinned commit. Version 3.1.4 was published on 2026-11-24; the
-  pin is a release at least two weeks old on the day it is vendored. Its size in the binary
-  is measured then and recorded in `docs/design.md`, "Dependencies".
+  `ui/icons.svg` is kept at a pinned commit. As built (8.3): version 3.1.3, the newest at
+  least two weeks old on 2026-11-26 (3.1.4 is from 2026-11-24), 49,326 bytes, recorded in
+  `docs/design.md`, "Dependencies", with why edges across boundaries are drawn straight and
+  not laid out by dagre.
 - **It loads when the map first opens**, so launch pays nothing for it.
 - **Rejected:** `elkjs` 0.12.1 (EPL-2.0 or GPL-3.0-or-later, 8.2 MB unpacked on npm against
   1.4 MB) and a layout of our own (the owner chose a vendored one: layout quality on large
@@ -696,7 +700,9 @@ Postil writes outside itself.
 3. **Keys.** `q` to ask, `Cmd`-click to jump, `Cmd-Shift-M` for the map, `n` and `p` for
    steps. The key held to talk is not chosen: Right Option is the proposal, since Fn
    belongs to macOS dictation.
-4. **The map's color.** A muted violet; the mockups show it for approval.
+4. **The map's color.** A muted violet; the mockups show it for approval. As built (8.3):
+   `--map` is a muted orchid, `#d79ad0` in Graphite and `#a33a8a` in Paper, its wash the same at
+   10% and 8%: the violet first tried matched the keyword color (`--syntax-keyword`).
 5. **Exit status: answered by spike S1, 2026-11-25.** Claude (`claude-agent-acp` 0.94.0)
    and Grok (1.0.92) ran `echo hello`, `sh -c 'echo failing >&2; exit 3'`,
    `ls no-such-directory` and a Python test through Postil's own connection, in a scratch

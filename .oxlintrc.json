@@ -1,6 +1,7 @@
 {
   "plugins": ["eslint", "unicorn", "oxc", "import"],
   "env": { "browser": true, "es2024": true },
+  "ignorePatterns": ["ui/vendor/**"],
   "rules": {
     "no-undef": "error",
     "import/named": "error",
