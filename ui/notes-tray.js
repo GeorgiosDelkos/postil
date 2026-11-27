@@ -9,7 +9,7 @@
 
 import { $, actOnSecondClick, agentLogoIcon, el, showToast, statusIcon } from "./dom.js";
 import { fullPlace, shortPlace } from "./note-place.js";
-import { isOpen, isResolved, promptLines, sendable } from "./run.js";
+import { isAsk, isResolved, promptLines, sendable, waitsToSend } from "./run.js";
 import { formatSlot } from "./settings.js";
 import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 
@@ -20,7 +20,8 @@ import { groupNotes, noteStatus, planProgress, runOf } from "./status.js";
 // - `deleteNote(note)` deletes a note;
 // - `openSettings()` opens the settings;
 // - `beforeSend()` clears the way for the send step, and returns false when it cannot open;
-// - `restoreHeader()` gives the code pane's header back to the open file.
+// - `restoreHeader()` gives the code pane's header back to the open file;
+// - `onTab(tab)` is told the tab shown, "notes", "run" or "memory", each time one is chosen.
 export function notesTray({
   state,
   notesEl,
@@ -33,6 +34,7 @@ export function notesTray({
   openSettings,
   beforeSend,
   restoreHeader,
+  onTab,
 }) {
   const previewEl = $("prompt-preview");
   const sendBarEl = $("send-bar");
@@ -63,8 +65,9 @@ export function notesTray({
     }
     if (state.send) {
       drawnNotes = null;
-      // A resolved note is sent only once reopened (src/notes.rs, `resolve`).
-      notesEl.replaceChildren(...state.notes.filter((note) => !isResolved(note)).map(sendItem));
+      // A resolved note is sent only once reopened (src/notes.rs, `resolve`), and an ask never.
+      const offered = state.notes.filter((note) => !isResolved(note) && !isAsk(note));
+      notesEl.replaceChildren(...offered.map(sendItem));
       return;
     }
 
@@ -131,7 +134,7 @@ export function notesTray({
       body: note.body,
       outdated: note.anchor === "lost",
       status,
-      sendable: canSendAlone() && !isResolved(note) && !inLiveRun(note),
+      sendable: canSendAlone() && !isResolved(note) && !isAsk(note) && !inLiveRun(note),
     };
   }
 
@@ -245,7 +248,7 @@ export function notesTray({
 
   function renderSendBar() {
     renderFocusPill();
-    const open = state.notes.filter(isOpen).length;
+    const open = state.notes.filter(waitsToSend).length;
     const shown =
       state.projectOpen &&
       state.tab === "notes" &&
@@ -275,7 +278,7 @@ export function notesTray({
   // Focus mode's pill (app.js, `toggleFocus`): the open notes' count and Send.
   function renderFocusPill() {
     const pill = $("focus-pill");
-    const open = state.notes.filter(isOpen).length;
+    const open = state.notes.filter(waitsToSend).length;
     pill.replaceChildren(open === 1 ? "1 open note" : `${open} open notes`);
     if (open > 0 && !runs.full()) pill.append(" · Send", el("kbd", "", "⌘⇧↵"));
     pill.disabled = open === 0 || runs.full();
@@ -468,21 +471,30 @@ export function notesTray({
 
   // ---- The tabs ---------------------------------------------------------------------------
 
+  // Each tab's button, panel and part of the tray header, by element id.
+  const TABS = {
+    notes: { tab: "tab-notes", panel: "notes", header: "note-count" },
+    run: { tab: "tab-run", panel: "run", header: "run-header" },
+    memory: { tab: "tab-memory", panel: "memory", header: "memory-header" },
+  };
+
   function showTab(tab) {
     state.tab = tab;
-    const run = tab === "run";
-    if (run) closeSend();
-    $("tab-notes").setAttribute("aria-selected", String(!run));
-    $("tab-run").setAttribute("aria-selected", String(run));
-    notesEl.hidden = run;
-    $("run").hidden = !run;
-    $("note-count").hidden = run;
-    $("run-header").hidden = !run;
+    // The send step belongs to the notes: another tab ends it, and the send bar hides.
+    if (tab !== "notes") closeSend();
+    for (const [name, ids] of Object.entries(TABS)) {
+      const chosen = name === tab;
+      $(ids.tab).setAttribute("aria-selected", String(chosen));
+      $(ids.panel).hidden = !chosen;
+      $(ids.header).hidden = !chosen;
+    }
     renderSendBar();
+    onTab(tab);
   }
 
   $("tab-notes").addEventListener("click", () => showTab("notes"));
   $("tab-run").addEventListener("click", () => showTab("run"));
+  $("tab-memory").addEventListener("click", () => showTab("memory"));
   $("agent-status").addEventListener("click", () => showTab("run"));
 
   return {

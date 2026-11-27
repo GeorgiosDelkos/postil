@@ -21,6 +21,8 @@ serde = { version = "1.0.229", default-features = false, features = ["derive", "
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 # Syntax colors. One grammar crate per language.
 tree-sitter-highlight = "0.27.2"
+# Jump to definition: runs the grammars' tags queries (`src/definitions.rs`).
+tree-sitter-tags = "0.27.2"
 tree-sitter-rust = "0.24.2"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-typescript = "0.23.2"
@@ -30,10 +32,13 @@ tree-sitter-json = "0.24.8"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-bash = "0.25.1"
 
-# The native Open Folder dialog (NSOpenPanel), and the free space on a volume (NSURL's
-# resource values, `src/disk.rs`). wry and tao already build these three crates, at these
+# The native Open Folder dialog (NSOpenPanel), the free space on a volume (NSURL's
+# resource values, `src/disk.rs`), and moving a file to the Trash (NSFileManager,
+# `src/files.rs`). wry and tao already build these three crates, at these
 # versions and with these features, so depending on them adds no crate. Their default features
-# bind all of Foundation and AppKit, hence the explicit lists.
+# bind all of Foundation and AppKit, hence the explicit lists. `NSFileManager` is the one
+# feature here they do not enable (checked 2026-11-27 with `cargo tree -e features`): it binds
+# more of the same crate and adds none.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
@@ -41,6 +46,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
     "NSDictionary",
     "NSError",
+    "NSFileManager",
     "NSString",
     "NSURL",
     "NSValue",

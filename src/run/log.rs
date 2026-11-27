@@ -37,10 +37,11 @@ use crate::acp::{
     ContentBlock, Event, Location, PermissionKind, PlanEntryStatus, PromptUsage, SessionUpdate,
     StopReason, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd, UsageCost,
 };
+use crate::analysis::AnalysisRun;
 use crate::error::{Error, Result};
 use crate::files::version_of;
 use crate::report::Report;
-use crate::review::{Diff, Finding, Stage, Work};
+use crate::review::{Diff, Finding, MemoryBlock, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 use crate::usage::ledger::{self, LedgerRecord, LedgerSink, RECORD_VERSION, RunOrigin, RunOutcome};
 use crate::usage::now_secs;
@@ -61,10 +62,15 @@ pub(super) struct Opening<'a> {
     /// The agent's name, as the settings give it.
     pub(super) agent: &'a str,
     /// The notes the run carries: it goes with the last of them.
-    pub(super) notes: &'a [String],
-    /// The prompt's text, as the agent receives it.
-    pub(super) prompt: &'a str,
+    pub(super) notes: Vec<String>,
+    /// The prompt's text as it is built when the run is sent. The agent receives it without
+    /// the line about team memory, or with it, when the run's start finds otherwise
+    /// (`Runner::start`); a review's first stage receives it with the review's team memories,
+    /// which its start recalls after this is logged (`Runner::recall_for_review`).
+    pub(super) prompt: String,
     pub(super) origin: Origin,
+    /// Whether the run's thread only reads ([`Header::read_only`]).
+    pub(super) read_only: bool,
 }
 
 /// The thread a new run works in, whose lock it holds while live.
@@ -79,10 +85,15 @@ pub(super) enum InThread<'a> {
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
-/// on the `tool` and `toolUpdate` entries; version 6 the `report` entry. Every older version
+/// on the `tool` and `toolUpdate` entries; version 6 the `report` entry; version 7 `readOnly`
+/// in the header and the `undone` entry; version 8 an analysis run (`analysis` in the header,
+/// the `noAnalysis` entry); version 9 a memory draft (`remember` in the header); version 10 a
+/// finding's team memory (`memory` on a finding of the `findings` entry). Every older version
 /// reads: a log before version 4 has no snapshots, one before version 5 no commands or exit
-/// codes, and one before version 6 no report.
-const LOG_VERSION: u32 = 6;
+/// codes, one before version 6 no report, one before version 7 is a run that may change files,
+/// one before version 8 is no analysis, one before version 9 no memory draft, and one before
+/// version 10 no finding names a memory.
+const LOG_VERSION: u32 = 10;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -171,6 +182,10 @@ fn valid_cost(cost: &UsageCost) -> bool {
     cost.amount.is_finite() && cost.amount >= 0.0 && !cost.currency.is_empty()
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a fact of its own, set once by its own caller; no two make one state"
+)]
 pub(super) struct RunState {
     pub(super) header: Header,
     entries: Vec<Entry>,
@@ -189,6 +204,12 @@ pub(super) struct RunState {
     /// reader thread, a forced Stop, a close), so only it commits: two `git commit`s in one
     /// worktree at once would fail on its index lock. Not logged.
     pub(super) after_claimed: bool,
+    /// Set by the first caller that ends the run while it holds the thread's lock for work
+    /// after the agent's turn: an analysis run's merge (`run.rs`, `finish_analysis`), a forced
+    /// Stop, or a close ([`Run::claim_end`]). The others leave the end to it: a forced Stop
+    /// that logged the end during the merge would release the thread's lock, and the thread's
+    /// worktree would be freed under the merge's reads. Not logged.
+    end_claimed: bool,
     /// The notes sent, until the agent shows it took the turn; then they are marked sent.
     pub(super) unmarked: Option<Vec<String>>,
     /// The underlying model id the agent reported for its session, if any.
@@ -205,6 +226,11 @@ pub(super) struct RunState {
     kinds: HashMap<String, ToolKind>,
     /// Why the log is incomplete, the notes were not marked sent, or a review stopped here.
     pub(super) problem: Option<String>,
+    /// Why the agent started without team memory, when the run was the one to say so
+    /// (`memory.rs`, "Agents"). Kept apart from `problem`, whose first text wins: set as the
+    /// agent starts, it would hide every later one, and the page reads `problem` as the run's
+    /// trouble. Not in the log, as `problem` is not.
+    pub(super) memory_notice: Option<String>,
 }
 
 /// The first line of a run log.
@@ -218,7 +244,10 @@ pub(super) struct Header {
     pub(super) agent: String,
     /// The ids of the notes sent.
     pub(super) notes: Vec<String>,
-    /// The prompt's text, as the agent received it.
+    /// The prompt's text as it was built when the run was sent; the agent may have received
+    /// it with or without the line about team memory (`Runner::start`). A review's first stage
+    /// also received the review's team memories, which this does not hold: they were recalled
+    /// after it was logged (`Runner::recall_for_review`). The stages after it hold them.
     pub(super) prompt: String,
     /// Seconds since the Unix epoch.
     started_at: u64,
@@ -231,15 +260,60 @@ pub(super) struct Header {
     /// ([`Origin`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) follow_up: Option<FollowUp>,
+    /// Set when the run's thread only reads (`thread::Mode::Read`): an ask, or a follow-up of
+    /// one. Such a run takes no snapshot and reads no report, and every tool call it asks for
+    /// but a read is refused. Absent, as false, in every log written before version 7.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) read_only: bool,
+    /// Set when the run is an analysis (`analysis.rs`): what it was asked, which says what its
+    /// reply may change. Such a run carries no notes, is read-only, and is not listed with the
+    /// runs of notes. Absent in every log written before version 8. Never set together with
+    /// `review` or `follow_up` ([`Origin`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) analysis: Option<AnalysisRun>,
+    /// Set when the run drafts a team memory (`Runner::draft`): the thread's latest turn it
+    /// drafts after. Such a run is read-only, whatever its thread's mode, and is not listed with
+    /// the runs of notes; its reply ends with the draft ([`RunView::draft`]). Absent in every log
+    /// written before version 9. Never set together with `review`, `follow_up` or `analysis`
+    /// ([`Origin`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) remember: Option<Remember>,
 }
 
-/// What a new run is: a send of notes, a reviewer's stage, or a follow-up. One value, so a
-/// header never holds both a review and a follow-up.
+/// What a new run is: a send of notes, a reviewer's stage, a follow-up, an analysis, or a
+/// memory draft. One value, so a header never holds two of them.
 #[derive(Debug)]
 pub(super) enum Origin {
     Notes,
     Review(Stage),
     FollowUp(FollowUp),
+    Analysis(AnalysisRun),
+    Remember(Remember),
+}
+
+/// A memory draft's link to its thread: `of` is the thread's latest turn when the draft was
+/// asked for (`R1`, or its latest follow-up).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Remember {
+    pub(crate) of: String,
+}
+
+/// A finished memory draft, as the Remember dialog reads it: the agent's `{summary, body}`, or
+/// why there is none, which the dialog shows above the note's text it falls back to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum DraftView {
+    Ready { summary: String, body: String },
+    Failed { problem: String },
+}
+
+/// The block a draft's reply ends with. Other fields are passed over: an agent that adds one
+/// still drafted.
+#[derive(Deserialize)]
+struct DraftBlock {
+    summary: String,
+    body: String,
 }
 
 /// A follow-up run's link to its thread: `of` is the run it follows, `text` what the engineer
@@ -350,6 +424,15 @@ pub(crate) enum Entry {
     Report { report: Report },
     /// Where a [`Entry::Report`] would be: why no report could be read.
     NoReport { problem: String },
+    /// An analysis run's turn ended well and nothing was stored: `problem` says why (its reply
+    /// was empty, or did not read, or the file could not be written). Logged with the run's
+    /// end, and becomes the run's problem. A run whose analysis was stored logs nothing: its
+    /// diagrams name it.
+    NoAnalysis { problem: String },
+    /// The run changed files it may only read, and Postil put the worktree back: `text` says
+    /// so, and becomes the run's problem. Logged before the run's end, for a run whose end
+    /// logs no findings (a proposer's that ended well says it there).
+    Undone { text: String },
     /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]), taken before the
     /// agent gets the prompt or as its turn ends.
     ///
@@ -452,6 +535,9 @@ pub(crate) struct RunView {
     /// How many entries the run has; the page asks for the ones after it next time.
     total: usize,
     problem: Option<String>,
+    /// Why the agent started without team memory, when the run says so (`memory.rs`,
+    /// "Agents"). Apart from `problem`, which the page reads as the run's trouble.
+    memory_notice: Option<String>,
     /// Milliseconds until a second Stop ends the agent, 0 once it would, while this process
     /// is stopping the run; the page offers Force stop from then on, after a reload too.
     force_in: Option<u64>,
@@ -459,13 +545,30 @@ pub(crate) struct RunView {
     review: Option<Stage>,
     /// For a follow-up, the run it follows and the engineer's words.
     follow_up: Option<FollowUp>,
+    /// Whether the run's thread only reads ([`Header::read_only`]): the page offers no Apply,
+    /// pull request or review for it.
+    read_only: bool,
+    /// For an analysis run, what it was asked ([`Header::analysis`]).
+    analysis: Option<AnalysisRun>,
+    /// For a memory draft, the turn it drafts after ([`Header::remember`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remember: Option<Remember>,
+    /// For a memory draft that is over, the draft or why there is none ([`draft_of`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft: Option<DraftView>,
 }
 
 impl Run {
     /// Creates the log for a new run in `dir`, with the next free id, takes the lock of the
-    /// run's thread, `thread`, and writes the header. `runs/active.lock` is held only for
-    /// this: it makes taking a number, counting the live runs and taking a thread's lock one
-    /// step across windows, so no two windows both see a place under [`MAX_LIVE`].
+    /// run's thread, `thread`, and writes the header, which `opening` gives. `runs/active.lock`
+    /// is held only for this: it makes taking a number, counting the live runs and taking a
+    /// thread's lock one step across windows, so no two windows both see a place under
+    /// [`MAX_LIVE`].
+    ///
+    /// `opening` is called with the run's id once the run has its place, under
+    /// `runs/active.lock`, before the log exists: an ask saves its note there, sent in this run,
+    /// so an ask refused at the cap saves nothing, and every log on disk names notes saved
+    /// before it (`Runner::delete_runs_without_notes`).
     ///
     /// # Errors
     ///
@@ -473,19 +576,13 @@ impl Run {
     /// window holds a lock this takes past [`LOCK_PATIENCE`]; [`Error::TooManyRuns`] when
     /// [`MAX_LIVE`] runs are live in the repository; [`Error::BadRequest`] for a thread id
     /// that is not a run's; [`Error::ReadRun`] when the thread locks cannot be listed or
-    /// opened; and [`Error::WriteRun`] when a file cannot be written.
-    pub(super) fn create(
+    /// opened; the error of `opening`; and [`Error::WriteRun`] when a file cannot be written.
+    pub(super) fn create<'a>(
         dir: &Path,
-        opening: Opening<'_>,
         thread: InThread<'_>,
         usage: Option<LedgerSink>,
+        opening: impl FnOnce(&str) -> Result<Opening<'a>>,
     ) -> Result<Self> {
-        let Opening {
-            agent,
-            notes,
-            prompt,
-            origin,
-        } = opening;
         let error = |path: &Path| {
             let path = path.to_owned();
             move |source| Error::WriteRun { path, source }
@@ -511,36 +608,53 @@ impl Run {
         if live.len() >= MAX_LIVE {
             return Err(Error::TooManyRuns { live });
         }
-
         // A deleted run's number is not given again (`last_run`): a page that read the old R5
-        // would show a new R5 as the old one.
+        // would show a new R5 as the old one. Every window takes a number under
+        // `runs/active.lock`, held here, and the highest log on disk counts, so the number is
+        // free until the file below claims it.
         let used = last_run(&mut active).map_err(error(&active_path))?;
-        let mut number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
-        // Creating the file claims the id; another window may have claimed it first.
-        let (file, mut log) = loop {
-            let file = dir.join(format!("R{number}.jsonl"));
-            match File::options().append(true).create_new(true).open(&file) {
-                Ok(log) => break (file, log),
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => number += 1,
-                Err(source) => return Err(Error::WriteRun { path: file, source }),
-            }
-        };
-        let (review, follow_up) = match origin {
-            Origin::Notes => (None, None),
-            Origin::Review(stage) => (Some(stage), None),
-            Origin::FollowUp(follow_up) => (None, Some(follow_up)),
-        };
+        let number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
+        let id = format!("R{number}");
+        let Opening {
+            agent,
+            notes,
+            prompt,
+            origin,
+            read_only,
+        } = opening(&id)?;
+        // `create_new` all the same: a file something other than Postil made meanwhile is
+        // refused, never written over.
+        let file = dir.join(format!("{id}.jsonl"));
+        let mut log = File::options()
+            .append(true)
+            .create_new(true)
+            .open(&file)
+            .map_err(|source| Error::WriteRun {
+                path: file.clone(),
+                source,
+            })?;
+        let (mut review, mut follow_up, mut analysis, mut remember) = (None, None, None, None);
+        match origin {
+            Origin::Notes => {}
+            Origin::Review(stage) => review = Some(stage),
+            Origin::FollowUp(followed) => follow_up = Some(followed),
+            Origin::Analysis(asked) => analysis = Some(asked),
+            Origin::Remember(drafted) => remember = Some(drafted),
+        }
         let header = Header {
             version: LOG_VERSION,
-            id: format!("R{number}"),
+            id,
             agent: agent.to_owned(),
-            notes: notes.to_vec(),
-            prompt: prompt.to_owned(),
+            notes,
+            prompt,
             started_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
             review,
             follow_up,
+            read_only,
+            analysis,
+            remember,
         };
         if let Err(source) = log.write_all(&json_line(&header)) {
             // A log without its header would be skipped as unreadable on every restart.
@@ -568,9 +682,10 @@ impl Run {
         })
     }
 
-    /// The newest readable run log in `dir`, read as a run this process does not run; `None`
-    /// when there is none. A newer log that cannot be read is skipped, and the run shown says
-    /// why.
+    /// The newest readable run log of notes in `dir`, read as a run this process does not run;
+    /// `None` when there is none. An analysis run and a memory draft are passed over: the Run
+    /// tab lists runs of notes. A newer log that cannot be read is skipped, and the run shown
+    /// says why.
     pub(super) fn latest(dir: &Path) -> Result<Option<Self>> {
         let mut numbers = match run_numbers(dir) {
             Ok(numbers) => numbers,
@@ -590,6 +705,8 @@ impl Run {
                 continue;
             }
             match Self::read(&file) {
+                Ok(run) if run.state().header.analysis.is_some() => {}
+                Ok(run) if run.state().header.remember.is_some() => {}
                 Ok(run) => {
                     if let Some(skipped) = skipped {
                         run.state().problem.get_or_insert(skipped);
@@ -664,6 +781,15 @@ impl Run {
     /// The latest cumulative session cost reported on this run (or its baseline if none).
     pub(super) fn session_cost(&self) -> Option<UsageCost> {
         self.state().usage.session_cost()
+    }
+
+    /// Claims the run's end for the caller: true when the run is live and no one claimed it
+    /// before, under one hold of the state ([`RunState::end_claimed`]).
+    pub(super) fn claim_end(&self) -> bool {
+        let mut state = self.state();
+        let claimed = state.live() && !state.end_claimed;
+        state.end_claimed |= claimed;
+        claimed
     }
 
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
@@ -807,6 +933,10 @@ impl Run {
             RunOrigin::Review
         } else if state.header.follow_up.is_some() {
             RunOrigin::FollowUp
+        } else if state.header.analysis.is_some() {
+            RunOrigin::Analysis
+        } else if state.header.remember.is_some() {
+            RunOrigin::Remember
         } else {
             RunOrigin::Notes
         };
@@ -859,13 +989,59 @@ impl Run {
             entries: state.entries.get(after..).unwrap_or_default().to_vec(),
             total: state.entries.len(),
             problem: state.problem.clone(),
+            memory_notice: state.memory_notice.clone(),
             force_in: state.cancel_asked.filter(|_| state.live()).map(|at| {
                 u64::try_from(FORCE_AFTER.saturating_sub(at.elapsed()).as_millis())
                     .expect("at most FORCE_AFTER, 3 s")
             }),
             review: state.header.review.clone(),
             follow_up: state.header.follow_up.clone(),
+            read_only: state.header.read_only,
+            analysis: state.header.analysis.clone(),
+            remember: state.header.remember.clone(),
+            draft: draft_of(&state),
         }
+    }
+}
+
+/// The draft of a memory draft run that is over ([`DraftView`]); `None` for any other run, and
+/// for one still under way. A draft whose agent changed files is refused whatever its reply
+/// says: what it read is not the thread's tree. Reads the reply from its end once.
+fn draft_of(state: &RunState) -> Option<DraftView> {
+    state.header.remember.as_ref()?;
+    if state.live() {
+        return None;
+    }
+    let failed = |problem: String| Some(DraftView::Failed { problem });
+    let undone = state.entries.iter().find_map(|entry| match entry {
+        Entry::Undone { text } => Some(text.clone()),
+        _ => None,
+    });
+    if let Some(text) = undone {
+        return failed(text);
+    }
+    let end = state.entries.iter().rev().find_map(|entry| match entry {
+        Entry::Ended { reason } => Some(Ok(*reason)),
+        Entry::Failed { error } => Some(Err(error.clone())),
+        _ => None,
+    });
+    match end {
+        Some(Ok(StopReason::EndTurn)) => {}
+        Some(Ok(StopReason::Cancelled)) => {
+            return failed("the draft was stopped before the agent finished it".to_owned());
+        }
+        Some(Ok(_)) => return failed("the agent's turn ended before it finished".to_owned()),
+        Some(Err(error)) => return failed(format!("the draft run failed: {error}")),
+        None => return failed("the draft run did not finish".to_owned()),
+    }
+    match crate::review::last_json_block::<DraftBlock>(&state.reply()) {
+        Ok(DraftBlock { summary, body })
+            if !summary.trim().is_empty() && !body.trim().is_empty() =>
+        {
+            Some(DraftView::Ready { summary, body })
+        }
+        Ok(_) => failed("the agent's draft has a blank summary or body".to_owned()),
+        Err(problem) => failed(format!("the agent's reply holds no draft: {problem}")),
     }
 }
 
@@ -893,6 +1069,7 @@ impl RunState {
             cancel_requested: false,
             cancel_asked: None,
             after_claimed: false,
+            end_claimed: false,
             unmarked: None,
             model: None,
             usage: RunUsage::default(),
@@ -901,6 +1078,7 @@ impl RunState {
             answered: BTreeSet::new(),
             kinds: HashMap::new(),
             problem: None,
+            memory_notice: None,
         }
     }
 
@@ -947,6 +1125,8 @@ impl RunState {
                 | Entry::Findings { .. }
                 | Entry::Report { .. }
                 | Entry::NoReport { .. }
+                | Entry::NoAnalysis { .. }
+                | Entry::Undone { .. }
                 | Entry::Snapshot { .. } => {}
             }
         }
@@ -1014,6 +1194,7 @@ impl RunState {
             reply: self.reply(),
             diffs,
             report,
+            memories: MemoryBlock::default(),
         }
     }
 
@@ -1045,6 +1226,14 @@ impl RunState {
             Entry::Failed { .. } => {
                 self.finish(Status::Failed);
                 return Some(RunOutcome::Failed);
+            }
+            // The run is not failed: the worktree was put back, and what the agent said stands
+            // (docs/review-assist-plan.md, "Corrections to the design", 3).
+            Entry::Undone { text } => {
+                self.problem.get_or_insert_with(|| text.clone());
+            }
+            Entry::NoAnalysis { problem } => {
+                self.problem.get_or_insert_with(|| problem.clone());
             }
             Entry::Tool { id, tool, .. }
             | Entry::ToolUpdate {
@@ -1184,6 +1373,19 @@ pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
     }
 }
 
+/// The ids of the threads whose lock is held now, in any window, this one's included
+/// ([`live_threads`]), counted under `runs/active.lock` as every count is. A thread's id is its
+/// first run's, so an analysis run, whose thread has no other, is live exactly while its id is
+/// here.
+///
+/// # Errors
+///
+/// As [`hold_run_lock`] and [`live_threads`].
+pub(super) fn held_threads(dir: &Path) -> Result<Vec<String>> {
+    let _active = hold_run_lock(dir)?;
+    live_threads(dir, None)
+}
+
 /// The ids of the threads whose lock a run holds now, in any window, `except` the one the
 /// caller holds; sorted. Each lock is only tried, never waited for, so a lock released a moment
 /// ago can read as held ([`Run::create`] counts again). Every count runs under
@@ -1304,9 +1506,34 @@ fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
     }
     let header: Header = serde_json::from_slice(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
-    // `Origin` makes the two exclusive when Postil writes a header; this holds a hand edit to it.
-    if header.review.is_some() && header.follow_up.is_some() {
-        return Err("its header is both a review and a follow-up".to_owned());
+    // `Origin` makes the four exclusive when Postil writes a header, and an analysis and a
+    // memory draft read-only; this holds a hand edit to it.
+    let origins = [
+        header.review.is_some(),
+        header.follow_up.is_some(),
+        header.analysis.is_some(),
+        header.remember.is_some(),
+    ];
+    if origins.into_iter().filter(|set| *set).count() > 1 {
+        return Err(
+            "its header is more than one of a review, a follow-up, an analysis and a \
+                    memory draft"
+                .to_owned(),
+        );
+    }
+    if header.analysis.is_some() && !header.read_only {
+        return Err("its header is an analysis that may change files".to_owned());
+    }
+    if let Some(remember) = &header.remember {
+        if !header.read_only {
+            return Err("its header is a memory draft that may change files".to_owned());
+        }
+        if run_number(&remember.of).is_none() {
+            return Err(format!(
+                "its header drafts a memory after {:?}, which is not a run id",
+                remember.of
+            ));
+        }
     }
     Ok(header)
 }
@@ -1536,15 +1763,20 @@ fn json_line<T: Serialize>(value: &T) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// What a run of note N1 by agent "Fake" opens with.
+    fn opening(prompt: &str) -> Opening<'static> {
+        Opening {
+            agent: "Fake",
+            notes: vec!["N1".to_owned()],
+            prompt: prompt.to_owned(),
+            origin: Origin::Notes,
+            read_only: false,
+        }
+    }
+
     /// A run of note N1 by agent "Fake", in a new thread, in the runs directory `dir`.
     fn create(dir: &Path, prompt: &str) -> Run {
-        let opening = Opening {
-            agent: "Fake",
-            notes: &["N1".to_owned()],
-            prompt,
-            origin: Origin::Notes,
-        };
-        Run::create(dir, opening, InThread::New, None).unwrap()
+        Run::create(dir, InThread::New, None, |_| Ok(opening(prompt))).unwrap()
     }
 
     #[test]
@@ -1604,17 +1836,11 @@ mod tests {
 
     /// A run like [`create`]'s whose usage record goes to `ledger`.
     fn create_with_ledger(dir: &Path, ledger: &Path) -> Run {
-        let opening = Opening {
-            agent: "Fake",
-            notes: &["N1".to_owned()],
-            prompt: "p",
-            origin: Origin::Notes,
-        };
         let sink = LedgerSink {
             file: ledger.to_owned(),
             repo: "/repo".to_owned(),
         };
-        Run::create(dir, opening, InThread::New, Some(sink)).unwrap()
+        Run::create(dir, InThread::New, Some(sink), |_| Ok(opening("p"))).unwrap()
     }
 
     #[test]
@@ -1833,6 +2059,78 @@ mod tests {
         run.record_snapshot(Point::Before, "b".to_owned());
         assert_eq!(points(&run), 1, "an ended run takes no snapshot");
         drop(run);
+        drop(fs::remove_dir_all(dir.parent().unwrap()));
+    }
+
+    /// Version 10 adds a finding's memory: a log of 8 or 9 reads with none, a finding without
+    /// one is written as before, one with it reads back, and version 11 is refused.
+    #[test]
+    fn a_finding_s_memory_is_written_from_version_10_and_older_logs_read_without() {
+        let dir = std::env::temp_dir()
+            .join(format!("postil-run-memory-{}", std::process::id()))
+            .join("runs");
+        fs::create_dir_all(&dir).unwrap();
+        let finding = |memory: Option<&str>| Finding {
+            id: "F1".to_owned(),
+            note: None,
+            path: None,
+            line: None,
+            text: "eager".to_owned(),
+            fix: None,
+            memory: memory.map(str::to_owned),
+        };
+        let run = create(&dir, "p");
+        run.record(Entry::Findings {
+            findings: vec![finding(Some("mem_01A")), finding(None)],
+            problem: None,
+        });
+        drop(run);
+        let file = dir.join("R1.jsonl");
+        let written = fs::read_to_string(&file).unwrap();
+        let (head, entries) = written.split_once('\n').unwrap();
+        assert!(head.starts_with(r#"{"version":10,"#), "{head}");
+        assert!(
+            entries.contains(r#""fix":null,"memory":"mem_01A"},{"id":"F1""#),
+            "{entries}"
+        );
+        assert!(
+            entries.contains(r#""fix":null}]"#),
+            "no memory, no field: {entries}"
+        );
+        let read = |file: &Path| -> Vec<Option<String>> {
+            Run::read(file)
+                .unwrap()
+                .state()
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Findings { findings, .. } => {
+                        Some(findings.iter().map(|f| f.memory.clone()).collect())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(read(&file), [Some("mem_01A".to_owned()), None]);
+
+        let older = |version: u32| {
+            let line = concat!(
+                r#"{"kind":"findings","findings":[{"id":"F1","note":null,"path":null,"#,
+                r#""line":null,"text":"x","fix":null}],"problem":null}"#,
+            );
+            let head = head.replace(r#""version":10"#, &format!(r#""version":{version}"#));
+            let file = dir.join(format!("V{version}.jsonl"));
+            fs::write(&file, format!("{head}\n{line}\n")).unwrap();
+            file
+        };
+        for version in [8, 9] {
+            assert_eq!(read(&older(version)), [None], "version {version}");
+        }
+        let problem = Run::read(&older(11)).unwrap_err();
+        assert!(
+            problem.contains("it is version 11, and this build of Postil reads versions 1 to 10"),
+            "{problem}"
+        );
         drop(fs::remove_dir_all(dir.parent().unwrap()));
     }
 }

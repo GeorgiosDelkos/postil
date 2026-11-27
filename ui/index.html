@@ -11,7 +11,10 @@
 <nav class="sidebar" aria-label="Files">
   <div class="drag-strip" data-drag></div>
   <div class="repo" data-drag>
-    <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
+    <div class="repo-row">
+      <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
+      <button type="button" class="map-toggle" id="toggle-map" aria-pressed="false" aria-controls="map" title="Map (⇧⌘M)">Map</button>
+    </div>
     <div class="repo-branch" id="repo-branch"></div>
     <div class="repo-warning" id="repo-warning" hidden></div>
   </div>
@@ -44,18 +47,21 @@
   </div>
 </nav>
 
-<main class="pane code-pane">
-  <header class="pane-header" data-drag>
-    <div class="crumbs" id="crumbs"></div>
-    <div class="meta" id="file-meta"></div>
-  </header>
-  <div class="code" id="code" tabindex="0">
-    <div class="code-rows" id="code-rows"></div>
-    <div class="empty" id="code-empty">Pick a file on the left.</div>
+<main class="pane code-pane" id="code-pane">
+  <section class="map-pane" id="map" aria-label="Map" hidden></section>
+  <div class="code-column" id="code-column">
+    <header class="pane-header" data-drag>
+      <div class="crumbs" id="crumbs"></div>
+      <div class="meta" id="file-meta"></div>
+    </header>
+    <div class="code" id="code" tabindex="0">
+      <div class="code-rows" id="code-rows"></div>
+      <div class="empty" id="code-empty">Pick a file on the left.</div>
+    </div>
+    <div class="prompt-preview" id="prompt-preview" tabindex="0" hidden></div>
+    <div class="changes-view" id="changes-view" tabindex="0" hidden></div>
+    <button type="button" class="focus-pill" id="focus-pill"></button>
   </div>
-  <div class="prompt-preview" id="prompt-preview" tabindex="0" hidden></div>
-  <div class="changes-view" id="changes-view" tabindex="0" hidden></div>
-  <button type="button" class="focus-pill" id="focus-pill"></button>
 </main>
 
 <aside class="pane tray" id="tray" aria-label="Review">
@@ -63,14 +69,17 @@
     <div class="tray-tabs" role="tablist" aria-label="Tray">
       <button type="button" role="tab" class="tray-tab" id="tab-notes" aria-selected="true" aria-controls="notes">Review</button>
       <button type="button" role="tab" class="tray-tab" id="tab-run" aria-selected="false" aria-controls="run" hidden>Run</button>
+      <button type="button" role="tab" class="tray-tab" id="tab-memory" aria-selected="false" aria-controls="memory">Memory</button>
     </div>
     <div class="meta" id="note-count">0 notes</div>
     <div class="run-header" id="run-header" hidden></div>
+    <div class="memory-header" id="memory-header" hidden></div>
   </header>
   <div class="notes" id="notes" role="tabpanel" aria-labelledby="tab-notes">
     <div class="empty">Select lines, then press <kbd>c</kbd> to write a note.</div>
   </div>
   <div class="run" id="run" role="tabpanel" aria-labelledby="tab-run" hidden></div>
+  <div class="notes memory" id="memory" role="tabpanel" aria-labelledby="tab-memory" hidden></div>
   <footer class="send-bar" id="send-bar" hidden>
     <button type="button" class="button primary send" id="send-button"></button>
     <button type="button" class="button primary agent-picker" id="agent-picker" aria-haspopup="menu" aria-label="Choose the agent"><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 6.5 5 3.5 8 6.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
@@ -78,6 +87,7 @@
 </aside>
 
 <div class="divider" id="divider-files" role="separator" aria-orientation="vertical" aria-label="File list width" aria-controls="files" tabindex="0" title="Drag to resize · double-click to reset"></div>
+<div class="divider" id="divider-map" role="separator" aria-orientation="vertical" aria-label="Map width" aria-controls="map" tabindex="0" title="Drag to resize · double-click to reset" hidden></div>
 <div class="divider" id="divider-tray" role="separator" aria-orientation="vertical" aria-label="Tray width" aria-controls="tray" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
 <section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>
@@ -103,7 +113,11 @@
 
 <dialog class="note-dialog" id="note-dialog" aria-labelledby="note-dialog-title"></dialog>
 <dialog class="note-dialog path-note" id="path-note-dialog" aria-labelledby="path-note-title"></dialog>
+<dialog class="note-dialog node-dialog" id="node-dialog" aria-labelledby="node-dialog-title"></dialog>
+<dialog class="note-dialog definitions-dialog" id="definitions-dialog" aria-labelledby="definitions-title"></dialog>
 <dialog class="note-dialog run-detail" id="run-detail" aria-labelledby="run-detail-title" tabindex="-1"></dialog>
+<dialog class="note-dialog remember-dialog" id="remember-dialog" aria-labelledby="remember-dialog-title" tabindex="-1"></dialog>
+<dialog class="note-dialog memory-dialog" id="memory-dialog" aria-labelledby="memory-dialog-title" tabindex="-1"></dialog>
 <dialog class="settings" id="settings" aria-labelledby="settings-title" tabindex="-1"></dialog>
 <dialog class="settings usage-dialog" id="usage" aria-labelledby="usage-title" tabindex="-1"></dialog>
 <dialog class="wizard" id="wizard" aria-labelledby="wizard-title" tabindex="-1"></dialog>

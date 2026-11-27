@@ -75,13 +75,6 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
     renderHeader();
     const ids = store.ids();
     const list = ids.length ? ids : run ? [run.id] : [];
-    if (list.length === 0) {
-      views = new Map();
-      const empty = "No run yet. Send notes to an agent to start one.";
-      panelEl.replaceChildren(el("div", "empty", empty));
-      dialog.closeIfGone(list);
-      return;
-    }
     const wanted = [];
     // What needs an answer now shows above the runs, for each live run: a question, as a card
     // that opens the run's dialog where it is answered, and a permission request Postil could
@@ -100,10 +93,28 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
       }
     }
     // Reviewers' runs show inside the run they review, and follow-ups inside the run they
-    // follow, not here.
-    const shown = list.filter((id) => !store.byId(id)?.review && !store.byId(id)?.followUp);
-    const label = shown.length === 1 ? "Run" : `Runs · ${shown.length}`;
-    wanted.push(["label", label, () => el("div", "run-label", label)]);
+    // follow, not here. An analysis run is not a run of notes: the map shows it (8.3); nor is a
+    // memory draft, whose dialog is the Remember dialog (memory-dialog.js). A run
+    // not read yet is left out until it is, since it may be one; a run that could not be read
+    // shows its card, which says why.
+    const shown = list.filter((id) => {
+      const view = store.byId(id);
+      if (!view) return Boolean(store.failure(id));
+      return !view.review && !view.followUp && !view.analysis && !view.remember;
+    });
+    // No run of notes, and nothing waits for an answer.
+    if (shown.length === 0 && wanted.length === 0) {
+      views = new Map();
+      const empty = "No run yet. Send notes to an agent to start one.";
+      panelEl.replaceChildren(el("div", "empty", empty));
+      dialog.closeIfGone(list);
+      return;
+    }
+    // A question alone, of an analysis run, has no runs to name.
+    if (shown.length > 0) {
+      const label = shown.length === 1 ? "Run" : `Runs · ${shown.length}`;
+      wanted.push(["label", label, () => el("div", "run-label", label)]);
+    }
     const latests = latestOfThreads(store.knownViews());
     for (const id of shown) {
       const view = store.byId(id);

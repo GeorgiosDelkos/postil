@@ -40,6 +40,26 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         &[Method::POST],
         "POST {\"agents\": [...], \"customAgents\": [...]}",
     ),
+    ("/api/memory", &[Method::GET], "GET ?id=mem_..."),
+    (
+        "/api/memory/recall",
+        &[Method::GET],
+        "GET ?path=<path>&node=<node label>, ?run=R1, or ?text=<query>",
+    ),
+    (
+        "/api/memory/draft",
+        &[Method::POST],
+        "POST {\"note\": \"N1\"}",
+    ),
+    (
+        "/api/memory/remember",
+        &[Method::POST],
+        "POST {\"note\": \"N1\", \"noteType\": ..., \"summary\": ..., \"body\": ..., \
+         \"scope\": \"repo\" or \"global\"}",
+    ),
+    ("/api/memory/refresh", &[Method::POST], "POST with no body"),
+    ("/api/memory/check", &[Method::POST], "POST with no body"),
+    ("/api/memory/setup", &[Method::POST], "POST with no body"),
     ("/api/usage", &[Method::GET], "GET"),
     ("/api/usage/refresh", &[Method::POST], "POST"),
     ("/api/runs", &[Method::GET], "GET"),
@@ -49,6 +69,32 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         "GET the pane widths or PUT new ones",
     ),
     ("/api/file", &[Method::GET], "GET"),
+    (
+        "/api/analysis",
+        &[Method::GET, Method::POST, Method::DELETE],
+        "GET, GET ?at=<commit>, POST {\"kind\": ...}, or DELETE ?diagram=<id>",
+    ),
+    (
+        "/api/analysis/update",
+        &[Method::POST],
+        "POST {\"diagram\": ...}, or with no body for every diagram",
+    ),
+    (
+        "/api/analysis/start-over",
+        &[Method::POST],
+        "POST with no body",
+    ),
+    ("/api/analysis/check", &[Method::POST], "POST with no body"),
+    (
+        "/api/definitions",
+        &[Method::GET],
+        "GET ?name=<name>&from=<path>",
+    ),
+    (
+        "/api/definitions/refresh",
+        &[Method::POST],
+        "POST with no body",
+    ),
     (
         "/api/run",
         &[Method::GET, Method::POST],
@@ -61,6 +107,12 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     ("/api/run/question", &[Method::POST], "POST"),
     ("/api/run/review", &[Method::POST], "POST"),
     ("/api/run/follow", &[Method::POST], "POST"),
+    ("/api/run/ask", &[Method::POST], "POST {\"note\": {...}}"),
+    (
+        "/api/run/uncommitted",
+        &[Method::GET],
+        "GET, with ?file=<path> for a file",
+    ),
 ];
 
 const METHODS: [Method; 5] = [
@@ -109,7 +161,16 @@ fn every_route_takes_its_methods_and_refuses_the_others_with_what_it_takes() {
 fn a_path_that_is_no_route_is_not_found_whatever_the_method() {
     let repo = TempRepo::new("routes-none");
     let site = repo.empty_site();
-    for path in ["/api", "/api/nothing", "/api/run/nothing", "/api/runs/R1"] {
+    for path in [
+        "/api",
+        "/api/nothing",
+        "/api/run/nothing",
+        "/api/runs/R1",
+        "/api/analysisx",
+        "/api/analysis/nothing",
+        "/api/memoryx",
+        "/api/memory/nothing",
+    ] {
         for method in &METHODS {
             assert_eq!(
                 send(&site, method, path),

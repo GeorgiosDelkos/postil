@@ -11,7 +11,8 @@
 //!   `src/c.rs`, and answers `{"base": "/sN/"}`, `N` counting from 0, so that every test
 //!   starts from nothing. Its body `{"scenario": "..."}` names the fake agent's scenario
 //!   (`openProject` in the tests sends `flood` unless told another); without one it is
-//!   refused.
+//!   refused. An optional `"files": {"path": "text"}` holds the repository's files instead of
+//!   the three.
 //! - `POST /new-fresh` makes a site the same way, but it opens no project, has no
 //!   `settings.json` and finds no agents, so the page starts on the welcome screen with the
 //!   startup wizard open. `POST /new-fresh-antigravity` does the same with an `agy` program on
@@ -21,6 +22,16 @@
 //!   reviewer, and the custom Fake agent turned on beside it: the agents' logos show on
 //!   OpenCode's runs and are absent on Fake's. Its body may name the fake agent's scenario
 //!   as `POST /new` does; without one it is `reviewer-silent`, a reply with no findings.
+//! - `POST /new-memory` opens a project with the fake agent in `plain`, and a fake
+//!   `hippius-mem` that is installed and not set up until its `quickstart` runs, which takes
+//!   half a second, so the page asks again while it runs.
+//! - `POST /new-memory-server` opens a project with the fake agent in the scenario its body
+//!   names as `POST /new` does, `plain` without one, and a fake `hippius-mem` that is ready and
+//!   serves MCP: every recall finds one memory and one guess, and every remember writes
+//!   `mem_01SAVED`.
+//! - `POST /new-fresh-memory` makes a site as `POST /new-fresh` does, with a fake
+//!   `hippius-mem` whose doctor passes when the body is `{"memory": "ready"}` and fails
+//!   otherwise; the site has finished its first check when the reply comes.
 //! - `/sN/<path>` is that site's [`Site::respond`] for `postil://localhost/<path>`. Every URL
 //!   the page uses is relative, so the page works under the prefix.
 //! - `GET /sN/events` is a stream of server-sent events, one per nudge of the site's
@@ -30,6 +41,7 @@
 //! One thread owns the sites and answers every request, one at a time, as
 //! `spawn_site_worker` does in the app; a thread per connection reads its request.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::PoisonError;
@@ -124,10 +136,42 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
                 );
                 return;
             };
-            Some(Start::FakeAgent(scenario.to_owned()))
+            // Refused when not a map of path to text, for the reason above.
+            let files = match asked.get("files") {
+                None => None,
+                Some(files) => match serde_json::from_value(files.clone()) {
+                    Ok(files) => Some(files),
+                    Err(error) => {
+                        let body = format!("POST /new: files must map paths to text: {error}");
+                        write_reply(
+                            &mut stream,
+                            &reply(StatusCode::BAD_REQUEST, "text/plain", body.into_bytes()),
+                        );
+                        return;
+                    }
+                },
+            };
+            Some(Start::FakeAgent {
+                scenario: scenario.to_owned(),
+                files,
+            })
         }
         "/new-fresh" => Some(Start::FirstRun),
         "/new-fresh-antigravity" => Some(Start::FirstRunWithAntigravity),
+        "/new-memory" => Some(Start::Memory),
+        "/new-memory-server" => {
+            let asked: serde_json::Value =
+                serde_json::from_slice(request.body()).unwrap_or_default();
+            let scenario = asked["scenario"].as_str().unwrap_or("plain");
+            Some(Start::MemoryServer(scenario.to_owned()))
+        }
+        "/new-fresh-memory" => {
+            let asked: serde_json::Value =
+                serde_json::from_slice(request.body()).unwrap_or_default();
+            Some(Start::FirstRunWithMemory {
+                ready: asked["memory"] == "ready",
+            })
+        }
         "/new-opencode" => {
             let asked: serde_json::Value =
                 serde_json::from_slice(request.body()).unwrap_or_default();
@@ -181,8 +225,12 @@ fn answer(sites: &mut Vec<Bridged>, mut request: Request<Vec<u8>>, mut stream: T
 /// What a new bridged site starts from.
 #[derive(Debug)]
 enum Start {
-    /// The repository open as the project, with the fake agent in this scenario.
-    FakeAgent(String),
+    /// The repository open as the project, with the fake agent in `scenario`, holding `files`
+    /// in place of the three default files when given.
+    FakeAgent {
+        scenario: String,
+        files: Option<BTreeMap<String, String>>,
+    },
     /// No project, no `settings.json` and an empty search path, as on a first launch: the
     /// page shows the welcome screen with the startup wizard over it.
     FirstRun,
@@ -193,6 +241,14 @@ enum Start {
     /// and reviewing, played by the fake agent in this scenario, and the custom Fake agent
     /// (`plain`) turned on.
     OpenCode(String),
+    /// The repository open as the project, with the fake agent in `plain`, and a fake
+    /// `hippius-mem` that its set up makes ready.
+    Memory,
+    /// The repository open as the project, with the fake agent in this scenario, and a fake
+    /// `hippius-mem` server whose recalls find one memory and one guess.
+    MemoryServer(String),
+    /// As [`Start::FirstRun`], with a fake `hippius-mem` that is ready or not set up.
+    FirstRunWithMemory { ready: bool },
 }
 
 /// A new site, the `number`th the bridge opened, on a new repository holding `src/a.rs`,
@@ -200,10 +256,19 @@ enum Start {
 /// configuration and home directories.
 fn bridged(number: usize, start: Start) -> Bridged {
     let repo = TempRepo::new(&format!("e2e-{number}"));
-    repo.write("src/a.rs", "one\ntwo\nthree\n");
-    // For the file filter to list several matches.
-    repo.write("src/b.rs", "bee\n");
-    repo.write("src/c.rs", "sea\n");
+    if let Start::FakeAgent {
+        files: Some(files), ..
+    } = &start
+    {
+        for (path, text) in files {
+            repo.write(path, text);
+        }
+    } else {
+        repo.write("src/a.rs", "one\ntwo\nthree\n");
+        // For the file filter to list several matches.
+        repo.write("src/b.rs", "bee\n");
+        repo.write("src/c.rs", "sea\n");
+    }
     let listeners = Listeners::default();
     let notify: Notify = {
         let listeners = Arc::clone(&listeners);
@@ -215,7 +280,7 @@ fn bridged(number: usize, start: Start) -> Bridged {
         })
     };
     let site = match start {
-        Start::FakeAgent(scenario) => agent_site(&repo, &scenario, notify),
+        Start::FakeAgent { scenario, .. } => agent_site(&repo, &scenario, notify),
         // An empty search path, so agents installed on the developer's or runner's PATH
         // cannot change the wizard's first-run defaults.
         Start::FirstRun => Site::new(
@@ -243,6 +308,28 @@ fn bridged(number: usize, start: Start) -> Bridged {
             )
         }
         Start::OpenCode(scenario) => opencode_site(&repo, &scenario, notify),
+        Start::Memory => memory_site(&repo, notify),
+        Start::MemoryServer(scenario) => {
+            let dir = repo.root.join(".git/memory-bin");
+            let script = super::memory::server_script(&dir, "hippius-mem 0.7.1", "");
+            let script = format!("#!/bin/sh\n{script}");
+            agent_site(&repo, &scenario, notify).with_memory(fake_memory(&repo, &script))
+        }
+        Start::FirstRunWithMemory { ready } => {
+            let doctor = if ready { "exit 0" } else { "exit 1" };
+            let memory = fake_memory(&repo, &format!("#!/bin/sh\n{doctor}\n"));
+            let site = Site::new(
+                Some(&repo.config()),
+                Some(&repo.home()),
+                None,
+                no_agents(),
+                notify,
+            )
+            .with_memory(memory);
+            // The page's first read then shows the state, so Skip saves from it.
+            site.memory.wait();
+            site
+        }
     };
     Bridged {
         // A stub quota source: a live one would read the developer's real credentials and
@@ -290,6 +377,38 @@ fn opencode_site(repo: &TempRepo, scenario: &str, notify: Notify) -> Site {
     let (status, body) = save(&site, &settings.to_string());
     assert_eq!(status, StatusCode::OK, "{body}");
     site
+}
+
+/// The site of [`Start::Memory`] on `repo`: hippius-mem is a script in a folder of its own,
+/// configured once its `quickstart --no-wire` ran.
+fn memory_site(repo: &TempRepo, notify: Notify) -> Site {
+    let configured = repo.root.join(".git/memory-bin/configured");
+    let script = format!(
+        r#"#!/bin/sh
+case "$*" in
+doctor) [ -f {configured} ] && exit 0; exit 1 ;;
+"quickstart --no-wire")
+  /bin/sleep 0.5
+  /usr/bin/touch {configured}
+  echo "Trial vault ready at /tmp/postil-e2e-vault." ;;
+*) exit 9 ;;
+esac
+"#,
+        configured = configured.display()
+    );
+    agent_site(repo, "plain", notify).with_memory(fake_memory(repo, &script))
+}
+
+/// A memory whose `hippius-mem` is `script`, alone in a folder of its own in `repo`'s git
+/// directory.
+fn fake_memory(repo: &TempRepo, script: &str) -> crate::memory::Memory {
+    let bin = repo.root.join(".git/memory-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let program = bin.join(crate::memory::PROGRAM);
+    fs::write(&program, script).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path = bin.into_os_string();
+    crate::memory::Memory::new(Scanner::new(move || search_path.clone()))
 }
 
 /// Reads one HTTP/1.1 request: its line, its headers (only `content-length` is used) and

@@ -44,7 +44,7 @@ fn notes_are_stored_in_the_git_dir_and_survive_a_restart() {
         file.display()
     );
     let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["version"], 6);
     assert_eq!(stored["notes"], review["notes"]);
     assert_eq!(note["state"], serde_json::json!({ "kind": "open" }));
 
@@ -173,14 +173,16 @@ fn notes_written_into_the_file_by_hand_are_read_and_ids_continue_after_them() {
         [anchor("N5", 2, 2, "found"), anchor("N6", 1, 1, "found")]
     );
     // A version 1 file has no states or targets: its notes read as open and on lines, and
-    // the write that added N6 made it version 4.
+    // the write that added N6 made it version 6.
     let stored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["version"], 6);
     assert_eq!(
         stored["notes"][0]["state"],
         serde_json::json!({ "kind": "open" })
     );
     assert_eq!(stored["notes"][0]["target"], "lines");
+    // Nothing was remembered from it: written with no `memory`, as before version 6.
+    assert_eq!(stored["notes"][0].get("memory"), None, "{stored}");
 }
 
 #[test]
@@ -395,7 +397,7 @@ fn a_note_is_resolved_with_its_run_and_reopened_to_where_it_was() {
     );
     let stored: serde_json::Value =
         serde_json::from_slice(&fs::read(site.repo().unwrap().review_file()).unwrap()).unwrap();
-    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["version"], 6);
 }
 
 #[test]
@@ -446,8 +448,8 @@ fn a_broken_review_file_is_reported_and_never_overwritten() {
     let cases = [
         ("{\"version\": 1, \"notes\": [", "cannot parse".to_owned()),
         (
-            r#"{"version": 5, "notes": []}"#,
-            "version 5, but this build of Postil reads versions 1 to 4".to_owned(),
+            r#"{"version": 7, "notes": []}"#,
+            "version 7, but this build of Postil reads versions 1 to 6".to_owned(),
         ),
         (r#"{"version": 0, "notes": []}"#, "version 0".to_owned()),
         (r#"{"notes": []}"#, "cannot parse".to_owned()),
@@ -490,6 +492,22 @@ fn a_broken_review_file_is_reported_and_never_overwritten() {
                 note.replace(r#""body":"b""#, r#""body":"b","target":"dir""#)
             ),
             "unknown variant `dir`".to_owned(),
+        ),
+        (
+            &*format!(
+                r#"{{"version": 5, "notes": [{}]}}"#,
+                note.replace(r#""body":"b""#, r#""body":"b","intent":"question""#)
+            ),
+            "unknown variant `question`".to_owned(),
+        ),
+        // A memory id is checked as one from a request is: it reaches hippius-mem when the
+        // Remembered chip opens it.
+        (
+            &*format!(
+                r#"{{"version": 6, "notes": [{}]}}"#,
+                note.replace(r#""body":"b""#, r#""body":"b","memory":"../mem_01A""#)
+            ),
+            r#"memory id "../mem_01A": expected mem_"#.to_owned(),
         ),
     ];
     for (contents, expected) in cases {

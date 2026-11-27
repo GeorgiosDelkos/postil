@@ -11,7 +11,11 @@
 //! Format version 2 names the agent notes are sent to, and each reviewer, as a slot: an
 //! agent's name and the model it runs (`{"name": "Claude", "model": "opus"}`, `null` for the
 //! agent's own default). A version 1 file, where they are plain names, is still read: each
-//! name becomes a slot with no model, and the next save writes version 2.
+//! name becomes a slot with no model, and the next save writes version 4. Version 3 adds the
+//! Analyzer, a slot like the others, which draws the map (docs/review-assist.md, "An analysis
+//! run"); a version 2 file has none, and analyses go to the agent notes are sent to. Version 4
+//! adds `agentMemory`, whether agents get team memory (docs/review-assist.md, "Milestone 9:
+//! team memory"); an older file has it off.
 //!
 //! The rules, checked when a [`RawSettings`] becomes a [`Settings`] (`TryFrom`), the only way
 //! to make one:
@@ -20,8 +24,8 @@
 //!   whatever the case, built-in ones included, and a command of plain words (no quotes)
 //!   whose program is a name on the search path or an absolute path;
 //! - the enabled agents are known agents, each once;
-//! - the agent notes are sent to, and every reviewer, is an enabled agent. A reviewer may be
-//!   listed more than once: each entry is one independent review;
+//! - the agent notes are sent to, the analyzer, and every reviewer, is an enabled agent. A
+//!   reviewer may be listed more than once: each entry is one independent review;
 //! - a slot's model, when set, is 1 to 200 characters with no space at either end and no
 //!   control character. Whether the agent offers it is checked when a run starts, against
 //!   the list the agent reports then (`acp`, `Starting::open_session`).
@@ -38,8 +42,14 @@ use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
 
-/// The format version this build writes. It also reads [`V1`].
-const VERSION: u32 = 2;
+/// The format version this build writes. It also reads [`V3`], [`V2`] and [`V1`].
+const VERSION: u32 = 4;
+
+/// The format before team memory: read as it is, with it off.
+const V3: u32 = 3;
+
+/// The format before the analyzer: read as it is, with no analyzer.
+const V2: u32 = 2;
 
 /// The format before slots: the agent and the reviewers as plain names ([`upgrade_v1`]).
 const V1: u32 = 1;
@@ -67,6 +77,13 @@ pub(crate) enum Theme {
     System,
     Light,
     Dark,
+}
+
+/// Whether agents get team memory: the `agentMemory` switch, as runs take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamMemory {
+    Off,
+    On,
 }
 
 /// The settings in effect, each rule in the module docs kept: made only from a
@@ -97,8 +114,15 @@ pub(crate) struct RawSettings {
     enabled_agents: Vec<String>,
     /// The agent notes are sent to, and its model.
     agent: Option<AgentSlot>,
+    /// The agent that analyzes the repository for the map, and its model; `None` for the
+    /// agent notes are sent to, with its model.
+    analyzer: Option<AgentSlot>,
     /// The agents that review the agent's work, in order, each with its model.
     reviewers: Vec<AgentSlot>,
+
+    /// Whether agents get team memory (hippius-mem). Off by default: it is turned on only
+    /// once hippius-mem is ready (`site.rs`, `save_settings`), which a file does not know.
+    agent_memory: bool,
 }
 
 /// A place in the workflow: the agent notes are sent to, or one reviewer. One type for both,
@@ -122,6 +146,14 @@ impl Settings {
 
     pub(crate) fn reopen_last_project(&self) -> bool {
         self.0.reopen_last_project
+    }
+
+    pub(crate) fn team_memory(&self) -> TeamMemory {
+        if self.0.agent_memory {
+            TeamMemory::On
+        } else {
+            TeamMemory::Off
+        }
     }
 
     pub(crate) fn custom_agents(&self) -> &[CustomAgent] {
@@ -160,6 +192,19 @@ impl Settings {
             .filter(|slot| slot.name == name)
             .and_then(|slot| slot.model.clone());
         self.choice(name, model)
+    }
+
+    /// The agent that analyzes the repository, with its command and model: the analyzer, or
+    /// the agent notes are sent to when no analyzer is chosen.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when neither is chosen.
+    pub(crate) fn analyzer(&self) -> Result<AgentChoice> {
+        match &self.0.analyzer {
+            Some(slot) => self.choice(&slot.name, slot.model.clone()),
+            None => self.default_agent(),
+        }
     }
 
     /// The reviewers, in order, each with its command and model.
@@ -295,6 +340,15 @@ impl RawSettings {
             }
             check_model(agent)?;
         }
+        if let Some(analyzer) = &self.analyzer {
+            if !enabled(analyzer) {
+                return Err(format!(
+                    "{:?} cannot analyze: it is not an enabled agent",
+                    analyzer.name
+                ));
+            }
+            check_model(analyzer)?;
+        }
         for reviewer in &self.reviewers {
             if !enabled(reviewer) {
                 return Err(format!(
@@ -365,7 +419,9 @@ impl Default for RawSettings {
             custom_agents: Vec::new(),
             enabled_agents: Vec::new(),
             agent: None,
+            analyzer: None,
             reviewers: Vec::new(),
+            agent_memory: false,
         }
     }
 }
@@ -468,7 +524,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Some(version) if version != VERSION && version != V1 => {
+        Some(version) if ![VERSION, V3, V2, V1].contains(&version) => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
@@ -511,12 +567,12 @@ impl RawSettings {
             }
         }
         self.enabled_agents = upgraded;
-        if let Some(slot) = &mut self.agent
-            && slot.name == "Gemini"
-        {
-            "Antigravity".clone_into(&mut slot.name);
-        }
-        for slot in &mut self.reviewers {
+        let slots = self
+            .agent
+            .iter_mut()
+            .chain(self.analyzer.iter_mut())
+            .chain(self.reviewers.iter_mut());
+        for slot in slots {
             if slot.name == "Gemini" {
                 "Antigravity".clone_into(&mut slot.name);
             }
@@ -524,9 +580,10 @@ impl RawSettings {
     }
 }
 
-/// Rewrites a version 1 file, as parsed, into version 2's shape: the agent and each reviewer,
-/// plain names there, become slots with no model. Anything else is left as it is, so a value
-/// of another type still fails the parse that follows, with serde's message.
+/// Rewrites a version 1 file, as parsed, into version 2's shape, which version 4 reads: the
+/// agent and each reviewer, plain names there, become slots with no model. Anything else is
+/// left as it is, so a value of another type still fails the parse that follows, with serde's
+/// message.
 fn upgrade_v1(file: &mut Value) {
     let slot = |value: &mut Value| {
         if let Value::String(name) = value {
@@ -612,10 +669,12 @@ mod tests {
             "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
             "enabledAgents": ["Claude", "Local"],
             "agent": { "name": "Local" },
+            "analyzer": { "name": "Claude", "model": "sonnet" },
             "reviewers": [
                 { "name": "Claude", "model": "opus" },
                 { "name": "Claude", "model": null },
             ],
+            "agentMemory": true,
         }))
         .unwrap();
         let settings = Settings::try_from(raw).unwrap();
@@ -623,7 +682,7 @@ mod tests {
         save(&file, &settings, "").unwrap();
 
         let expected = r#"{
-  "version": 2,
+  "version": 4,
   "settings": {
     "theme": "dark",
     "codeFontSize": 14,
@@ -643,6 +702,10 @@ mod tests {
       "name": "Local",
       "model": null
     },
+    "analyzer": {
+      "name": "Claude",
+      "model": "sonnet"
+    },
     "reviewers": [
       {
         "name": "Claude",
@@ -652,7 +715,8 @@ mod tests {
         "name": "Claude",
         "model": null
       }
-    ]
+    ],
+    "agentMemory": true
   }
 }
 "#;
@@ -684,6 +748,24 @@ mod tests {
             loaded.settings.reviewer_choices().unwrap()[0].name,
             "Antigravity"
         );
+
+        // The analyzer slot, new in version 4, is renamed too: left as "Gemini" it would name
+        // an agent that is no longer enabled, and the file would fail to load.
+        fs::write(
+            &file,
+            r#"{
+                "version": 4,
+                "settings": {
+                    "enabledAgents": ["Claude", "Gemini"],
+                    "agent": { "name": "Claude", "model": null },
+                    "analyzer": { "name": "Gemini", "model": "gemini-4-carbon" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let analyzer = load(&file);
+        assert!(analyzer.problem.is_none(), "{analyzer:?}");
+        assert_eq!(analyzer.settings.analyzer().unwrap().name, "Antigravity");
 
         // A user-defined custom agent named "Gemini" keeps its own name untouched.
         fs::write(

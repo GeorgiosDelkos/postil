@@ -49,9 +49,9 @@ from a thread's branch and reads back only that pull request's state.
    also copies the selection (code only, never the line numbers) and its `path:lines`
    reference. `v`/`j`/`k` is not built yet.
    A note can also be on a whole file or folder: right-click its row in the file list and
-   choose Add Note (or press `c` on a focused row). A dialog takes the text and offers Save,
-   which keeps the note in the tray, and Send to the default agent, which keeps it and sends it
-   alone at once. Both store the note first, so a send that fails leaves it to send again.
+   choose Add Note (or press `c` on a focused row). A dialog takes the text and saves the note to
+   the tray (`Save note` or `Cmd-Enter`, `Discard` or `Esc`), just like the inline composer, so
+   the engineer decides when and how to send it from the tray or its detail dialog.
    Asked for by the owner on 2026-11-24, as a modal over the window rather than the inline
    composer, which belongs to lines of code.
 4. **Collect.** Notes list in the tray on the right, grouped by file. Clicking one jumps to its
@@ -80,7 +80,10 @@ steel accent `#a7b4c6`). We take the principles, not the pixels.
 Rules for this app:
 
 - **One accent, used rarely.** Steel blue for focus, selection, and the primary button. Amber is
-  reserved for notes. Red appears only when the agent needs the engineer.
+  reserved for notes. Red appears only when the agent needs the engineer. The map has a second
+  rare accent, `--map`, a muted orchid: `#d79ad0` in Graphite and `#a33a8a` in Paper, with a
+  wash of the same color at 10% and 8% for the lines a node stands for
+  (`docs/review-assist.md`, "The link shown in the code").
 - **Cards on a canvas.** Three rounded panes with hairline borders and 8 px gaps. No toolbars, no
   icon rows, no status bar full of counters.
 - **Resizable panes.** The file list (200 to 480 px) and the tray (280 to 720 px) are sized by
@@ -88,15 +91,21 @@ Rules for this app:
   a double-click resets one. The file list does not fold: at 200 px its foot still shows the
   Settings button whole, and the owner asked on 2026-11-23 for no narrower list. The code pane
   keeps at least 420 px: in a narrow window the tray gives way first, then the file list. The
-  widths are kept per Mac in `~/.config/postil/layout.json`, chosen by the owner on 2026-11-23
-  over per project; like `recent.json` it is a convenience, so a file that cannot be used
-  counts as the defaults.
+  map (View > Map, `Cmd-Shift-M`) opens inside the code pane, left of the code, 320 to 960 px
+  wide with a third divider; while it is open the tray gives way first, then the map, then the
+  file list. A window too narrow for the map at 320 px beside the code at 420 px shows one of
+  them across the pane, and `Cmd-Shift-M` switches. Whether the map is open is kept for the
+  window's session only. The widths are kept per Mac in `~/.config/postil/layout.json`
+  (version 2 added the map's; a version 1 file reads with the map at 400 px), chosen by the
+  owner on 2026-11-23 over per project; like `recent.json` it is a convenience, so a file that
+  cannot be used counts as the defaults.
 - **Code is the largest and brightest thing on screen.** Chrome text is dimmer than code text.
 - **Two themes at launch:** Graphite (dark, default) and Paper (light). Each is a small palette
   of named colors, as in Herdr; a third theme is a new palette, not new code.
-- **Focus mode.** `Cmd-\` (View > Focus Mode) hides both side panes. The code column centers at a
-  readable width (at most 1100 px) and a single pill in the corner carries the open notes'
-  count and Send, which leaves focus mode for the send step. Built in milestone 5.
+- **Focus mode.** `Cmd-\` (View > Focus Mode) hides both side panes, and the map. The code
+  column centers at a readable width (at most 1100 px) and a single pill in the corner carries
+  the open notes' count and Send, which leaves focus mode for the send step. Built in
+  milestone 5. An open map waits for its end: `Cmd-Shift-M` leaves focus mode onto the map.
 - **Fonts are bundled** (Geist, Geist Mono; SIL Open Font License). Bundling skips the system
   font scan at startup and makes the app look the same on every machine.
 
@@ -163,12 +172,16 @@ schedule three tasks.
 | `src/app.rs` | `App` state and `App::update(Event)`. No drawing, no I/O: testable headless. |
 | `src/repo.rs` | File listing, snapshots, and diffs by running the `git` binary. |
 | `src/notes.rs` | `Note`, anchoring, and reading and writing `review.json`. |
+| `src/anchor.rs` | `LineRange`, `Target` and `locate`: placing lines that move, for notes and the analysis. |
+| `src/analysis.rs` | The diagrams, checking an agent's citations, and reading and writing `analysis.json`. |
 | `src/thread.rs` | Threads: their worktrees, branches, `threads.json`, and freeing them. |
 | `src/clone.rs` | One `clonefile(2)` call that clones a build folder: the crate's one `unsafe`. |
 | `src/recent.rs` | The recent projects, `~/.config/postil/recent.json`, for the welcome screen. |
-| `src/layout.rs`, `ui/panes.js` | The pane widths, `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
+| `src/layout.rs`, `ui/panes.js` | The pane widths (the file list, the tray, the map), `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
 | `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
+| `src/memory.rs`, `src/memory/client.rs` | Team memory: finding hippius-mem, `doctor` and the trial vault's set up, on threads of their own; the MCP client of its server, which the thread named `memory` alone calls. |
+| `ui/memory.js`, `ui/memory-tab.js`, `ui/memory-dialog.js` | Team memory on the page: its rules and polling, the tray's Memory tab and the run dialog's Memory section, and a memory's dialog. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
 | `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
 | `src/menu.rs` | The macOS menu bar through `muda`; its commands run in the page. |
@@ -179,14 +192,18 @@ schedule three tasks.
 | `src/run/log.rs` | The run log: a run in memory and its file on disk. |
 | `src/usage/ledger.rs`, `src/usage/quota.rs` | The usage ledger (`usage.jsonl`) and its totals; the providers' account quotas, probed on demand. |
 | `src/highlight.rs` | tree-sitter highlighting: a file becomes lines of styled tokens. |
+| `src/definitions.rs` | Jump to definition: an index from a name to where it is defined, built from the grammars' tags queries on a thread per open project (`index-definitions`). |
 | `ui/index.html`, `ui/app.css`, `ui/app.js` | The page. `app.css` holds the two palettes as CSS variables; `app.js` holds the page's state and wires the views. |
-| `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection and composer, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
+| `ui/code-view.js`, `ui/file-list.js`, `ui/notes-tray.js`, `ui/context-menu.js`, `ui/welcome.js`, `ui/dividers.js` | One view each: the code pane with its selection, composer, and the map's stripes and chips, the file tree, the tray's notes and the send step, the right-click menu, the welcome screen, the pane dividers. |
 | `ui/dom.js`, `ui/dialog-parts.js`, `ui/question-form.js` | Helpers the views share: `el()`, icons, the toast and two-click delete; the parts both dialogs draw; the question form. |
 | `ui/settings.js`, `ui/settings-controls.js`, `ui/settings-dialog.js` | The settings dialog: its rules (tested with `node --test`), shared controls, and drawing. |
 | `ui/wizard.js`, `ui/wizard-dialog.js` | The first-run startup wizard: its rules (tested with `node --test`) and 4-step dialog. |
 | `ui/run.js`, `ui/run-panel.js` | The send step's and the run panel's rules (tested with `node --test`), and the run panel: `run-store.js` reads the runs, `run-tab.js` and `run-dialog.js` draw them. |
 | `ui/status.js`, `ui/note-dialog.js` | Each note's status from its run (tested with `node --test`), and the note detail dialog. |
 | `ui/usage.js`, `ui/usage-dialog.js` | The Usage dialog: its formatting rules (tested with `node --test`) and its drawing. |
+| `ui/diagram.js`, `ui/diagram-view.js` | The map: its rules (layout through dagre, a node's state, search, pan and zoom arithmetic, the stripes and chips a file shows (`fileMarks`, `innermost`) and the node of a code line, tested with `node --test`), and the SVG, the keyboard, the node's dialog and following the code pane's line. |
+| `ui/vendor/dagre.min.js` | `@dagrejs/dagre`, the map's layout, vendored with `dagre.LICENSE` and loaded by a script element when the map first opens. |
+| `ui/definitions.js`, `ui/definitions-dialog.js` | Jump to definition: the name under a click and the history of places (tested with `node --test`), and the list a name defined more than once opens. |
 
 ### Data structures
 
@@ -201,6 +218,8 @@ struct Note {
     body: String,
     anchor: Anchor,                // Whether the target is still there.
     state: NoteState,              // Where the note is in the loop. From milestone 3 on.
+    intent: Intent,                // Change, or Ask: a question answered read-only. Version 5 on.
+    memory: Option<MemoryId>,      // The team memory remembered from it. Version 6 on.
 }
 
 enum Target {
@@ -273,6 +292,14 @@ As built in milestone 2 (`src/notes.rs`):
   tracks it and the file list shows it. A folder note's dialog lists the files the run changed
   below the folder, each with its counts, rather than their diffs, which the run's Changes
   view shows.
+- **Version 5** adds `intent`: `"change"` or `"ask"`, written for every note. An older file
+  reads with every note a change. `POST /api/notes` makes change notes only: an ask is made by
+  `POST /api/run/ask`, which saves it only once its run starts, and a send or a preview that
+  names one is refused (400). See `docs/review-assist.md`, "Ask without changing".
+- **Version 6** adds `memory`: the id of the team memory remembered from the note
+  (`mem_` and digits or capital letters, checked on every read), written only on a note that
+  has one. An older file reads with none. Deleting the note leaves the memory. See
+  `docs/review-assist.md`, "Postil writes memory".
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
@@ -320,7 +347,7 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 | Direction | Method | Used for |
 |---|---|---|
 | app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false, and form questions (`elicitation.form`). |
-| app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
+| app to agent | `session/new` | `cwd` is the run's worktree. `mcpServers` holds hippius-mem in the stdio form when team memory is on and Ready, else it is empty; an agent that refuses the server is asked once more with none (docs/review-assist.md, "Agents get it"). The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
 | app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn; its token counts (`usage`, or Grok's `_meta.usage`) and per-turn cost (Grok's `_meta.usage.costUsdTicks`) go to the usage ledger. |
 | app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`, every open question `cancel`. |
 | agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, and `usage_update` (context fill and the session's cumulative cost, for the usage ledger, never shown in the run panel). Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
@@ -397,6 +424,8 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 | `POST /api/run/permission` `{run, request, option}` | Answers run `run`'s permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
 | `POST /api/run/question` `{run, request, content}` | Answers run `run`'s question with the form's values, or skips it (`content` `null`). |
 | `POST /api/run/cancel` `{run}` | Cancels run `run`; open permission requests are answered `cancelled`. |
+| `POST /api/run/ask` `{note}` | Asks the question `note` (a new note, as `POST /api/notes` takes one) of the settings' agent, read-only, in a new thread that only reads; saves it as an ask, sent in that run, only once the run has its place, and answers every note. |
+| `GET /api/run/uncommitted?file=<path>` | The engineer's changes since the last commit, which a new thread does not see, and whether the file is among them, as the preview says for its notes. |
 
 - **Each thread keeps its agent between its runs**, with its session, so a follow-up
   reaches the same conversation: the owner chose this on 2026-11-23 over a fresh agent per
@@ -444,7 +473,22 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   a restart the newest readable log is shown; one without an end reads as unfinished (the
   app quit during it, or another window runs it). Lines are decoded one by one, so a torn
   write spoils only its line, which is reported; an unreadable newer log is skipped and
-  named. Nothing is synced: a crash costs at most the last lines.
+  named. Nothing is synced: a crash costs at most the last lines. Run log version 7 adds
+  `readOnly` to the header of every run in a thread that only reads (an ask and its
+  follow-ups: no snapshot, no report, every tool call but a read refused), and the `undone`
+  entry, logged before the end of a read-only run whose edits Postil put back, which becomes
+  the run's problem after a restart too. Older logs read as runs that may change files. Run
+  log version 8 adds `analysis: {kind, of, nodes}` to the header of an analysis run
+  (docs/review-assist.md, "An analysis run"), which carries no notes and is read-only, and the
+  `noAnalysis` entry, logged with the end of one whose turn ended well and stored nothing,
+  which becomes its problem. An analysis run's log is kept when notes are deleted: its
+  diagrams name it. Older logs read as no analysis. Run log version 9 adds `remember: {of}`
+  to the header of a memory draft (docs/review-assist.md, "Postil writes memory"): a read-only
+  run in the thread whose latest turn is `of`, whatever the thread's mode, never the latest run
+  of the Run tab, whose reply ends with the draft. Older logs read as no draft. Run log version
+  10 adds `memory` to a finding of the `findings` entry: the id of the team memory the finding
+  names, one the review's memory block held (docs/review-assist.md, "Review checks against
+  memory"), and absent otherwise. Older logs read as findings that name no memory.
 - **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
   first update, a permission request, or a stop. A run that fails to start, or whose prompt
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
@@ -515,6 +559,10 @@ owner on 2026-11-23:
   of notes; a run's dialog has a Review section with a card per reviewer (it opens that
   reviewer's run) and a card per finding with its verdict (it opens the finding whole), and a
   note's dialog shows the findings about that note, in full.
+- **With team memory on, every stage checks the work against it.** The first stage's start
+  recalls memories for the reviewed run's prompt and changed paths, and every stage's prompt
+  carries them as reference data written by teammates; a finding may name one, which its card
+  opens (docs/review-assist.md, "Review checks against memory").
 
 ### Follow-ups
 
@@ -580,6 +628,10 @@ owner on 2026-11-23: snapshots are git trees, and the view is a unified diff per
   that file at that line with the composer: the next note goes on the change itself, and a
   follow-up sends it. A file draws its first 400 lines, and the rest on a click. Esc, the
   header's esc, or opening a file gives the pane back.
+- **Walkthrough order.** A single run whose author's report names steps opens in
+  Walkthrough order instead, with each hunk's rating and the review's findings beside their
+  lines; the 400-line limit is then per step (`docs/review-assist.md`, "Guided walkthrough and
+  risk"). A thread of several runs keeps the order above.
 
 ### Worktrees
 
@@ -637,9 +689,12 @@ patterns.
   before or after a run; `lastRun`, when its latest run started, in milliseconds since the
   Unix epoch; `skipped`, what the worktree was not given; and `state`: `open`, `evicted`,
   `applied` or `discarded`; and `pullRequest`, once one is opened, with its `url` and `state`
-  (`open`, `merged` or `closed`) as last read. This is version 3. Version 1 had no `lastRun`
-  and no evicted state, and neither 1 nor 2 a pull request; both are still read, version 1's
-  threads as having run at time 0, and written back as version 3. A change reads the file,
+  (`open`, `merged` or `closed`) as last read; and `mode`, `work` or `read` (an ask's thread,
+  which clones no build folders and cannot be applied, reviewed or opened as a pull request).
+  This is version 4. Version 1 had no `lastRun` and no evicted state, neither 1 nor 2 a pull
+  request, and none before 4 a mode; all are still read, version 1's threads as having run at
+  time 0, every older thread as one that works, and written back as version 4. A change reads
+  the file,
   changes one thread and writes it whole, under `threads.lock`; a new thread is written
   before `git worktree add`, so a crash leaves a
   record pointing at whatever was made. Run logs stay append-only, so this file holds what
@@ -922,8 +977,10 @@ view on 2026-11-23.
 
 ### The Run tab
 
-The Run tab (`ui/run-tab.js`) lists the runs, newest first, one card each: the status's
-icon, the run id, the agent, the notes sent, and the status (`GET /api/runs` gives the ids).
+The Run tab (`ui/run-tab.js`) lists the runs of notes, newest first, one card each (an
+analysis run is not one: `GET /api/run` never gives it as the latest, and the tab leaves it
+out): the status's icon, the run id, the agent, the notes sent, and the status
+(`GET /api/runs` gives the ids).
 A card opens the run's dialog, which holds everything about it: the plan, one card per note
 (it opens the note's detail), one card per step (it opens the step whole: its command, diffs
 and output, with the arrow keys or ‹ › to move between steps and the run's id to go back),
@@ -996,14 +1053,18 @@ authentication, the run panel says which command to run in a terminal.
 button at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change saves at once. The
 settings are the theme (system, light, dark), the code font size (11 to 20 px; the line
 height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
-reopens the last project, and the agents above.
+reopens the last project, the agents above, and whether agents get team memory
+(`agentMemory`, docs/review-assist.md, "Milestone 9: team memory").
 
-The file is format version 2: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
-`null` for the agent's default), and `reviewers` a list of slots. A version 1 file, where both
-are plain names, is read as slots with no model, and the next save writes version 2; an older
-Postil then reads the file as one from a newer Postil and leaves it alone. A model id is 1 to
-200 characters with no space at either end and no control character; whether the agent offers
-it is checked when a run starts (section "Runs").
+The file is format version 4: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
+`null` for the agent's default), `analyzer` a slot or `null` (analyses then go to `agent`, on
+its model), `reviewers` a list of slots, and `agentMemory` a boolean, off by default. Each slot
+names an enabled agent, so an agent in use cannot be turned off or removed. A version 3 file has
+no `agentMemory` and reads with it off; a version 2 file has no `analyzer` either; a version 1
+file, where the agent and reviewers are plain names, is read as slots with no model. The next
+save writes version 4; an older Postil then reads the file as one from a newer Postil and
+leaves it alone. A model id is 1 to 200 characters with no space at either end and no control
+character; whether the agent offers it is checked when a run starts (section "Runs").
 
 The theme is set on the window, and WebKit answers the page's `prefers-color-scheme` from the
 window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:
@@ -1020,7 +1081,7 @@ through installed agents, the default agent and optional reviewers with their mo
 appearance (with a live code preview) and startup behavior, and a readiness summary (`git`,
 `npx`, `gh`). It is drawn as the main window's panes are (section "Look and feel"). Completing or
 skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
-installed built-in agents turned on); closing it mid-way reverts any preview without writing the
+installed built-in agents turned on, and team memory when hippius-mem is ready); closing it mid-way reverts any preview without writing the
 file. The wizard's save names a revision like the dialog's, and when the file changes under it
 (another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
 from Settings.
@@ -1115,6 +1176,37 @@ Languages built in: Rust, JavaScript, TypeScript and TSX, Python, Go, JSON, TOML
 files show as plain text. Markdown is not included yet: its grammar is two grammars joined by
 injections, which the highlighter does not run. Each grammar is compiled on first use, so launch
 pays for none of them. The eight grammars took the release binary from 3.6 MB to 9.1 MB.
+
+Jump to definition adds `tree-sitter-tags` 0.27.2, the highlighter's release line, which runs
+the `tags.scm` that the Rust, JavaScript, TypeScript, Python and Go grammar crates already
+ship. It adds one crate, 115 to 116 (its other dependencies, `tree-sitter`, `regex`, `memchr`,
+`streaming-iterator` and `thiserror`, are in the tree already), MIT-licensed, and `cargo deny
+check` passes with no new exception. The stripped release binary grew from 11,089,152 to
+11,207,920 bytes (0.12 MB). Measured 2026-11-26. Writing the definition patterns by hand over
+`tree-sitter` was the alternative: the same queries, maintained here instead of upstream.
+
+### The map's layout
+
+`@dagrejs/dagre` 3.1.3 (MIT, published 2026-10-24: the newest release at least two weeks old;
+3.1.4 is from 2026-11-24), `dist/dagre.min.js` from
+https://registry.npmjs.org/@dagrejs/dagre/-/dagre-3.1.3.tgz, vendored byte for byte as
+`ui/vendor/dagre.min.js`: 49,326 bytes, sha256
+`54a503e346f93ca0bb10abe7999587e037262935687aca45eb4e4b0f64bbb578`, recorded with its license in
+`ui/vendor/dagre.LICENSE` and checked by `every_vendor_file_is_served`. No crate is added; the
+binary grows by the file's bytes, which `include_bytes!` keeps as they are. It is an IIFE that
+defines `window.dagre` with graphlib bundled, loaded when the map first opens. Spike S4
+(2026-11-26) laid out 200 nodes (160 by 48 px) and 260 edges, left to right and compound, in
+Playwright's WebKit under a load average of 13 in 35 to 52 ms (median 41), the first layout in
+a page in 63 to 77 ms. `--bench` lays out 200 nodes in boundaries of ten with 260 edges,
+reports the time, and exits with an error when it is over its budget of 150 ms.
+
+dagre 3.1.3 throws ("Not possible to find intersection inside of the rectangle") on some
+compound graphs with an edge between cards in two boundaries, after about 290 ms of work on the
+bench's diagram. So `layoutDiagram` (`ui/diagram.js`) never gives dagre such an edge: it lays
+out the edges inside one boundary and those between cards in none, and draws every other edge
+straight between its two boxes. The downside accepted (decided 2026-11-26): an edge across
+boundaries does not order them left to right. On the bench's diagram, in Node 22 on the
+development Mac, a layout takes 37 ms the first time and 23 to 28 ms after (2026-11-26).
 
 ### Expected total
 

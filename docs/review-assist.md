@@ -1,12 +1,19 @@
 # Postil: review assist
 
-Status: 2026-11-25. Designed. Built so far: an execute call's command and exit code (step
-7.2), the author's report (7.3), read and logged, and the evidence on the run (7.4); the
-walkthrough is not. This document adds to `docs/design.md`, which stays
-the reference for everything built so far. `docs/review-assist-plan.md` turns it into pull
-requests, with the edge cases and tests of each. Section "Decisions" lists what the owner settled on
-2026-11-25; section "Open questions" lists what this document assumes and the owner has not
-confirmed.
+Status: 2026-11-27. Designed. Built so far: an execute call's command and exit code (step
+7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
+walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
+Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1),
+analysis runs (8.2), the split pane with the diagram view (8.3), the link shown in the
+code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated nodes,
+"Not on the map" and Update in the page (8.5), the change map (8.6), the forced update
+(8.7), finding and setting up hippius-mem (9.1), the memory client with the Memory tab and
+the run's Memory section (9.2), team memory given to agents (9.3), Remember (9.4), and
+reviews checked against memory (9.5). Milestone 10 (voice) is not built. This document adds
+to `docs/design.md`, which stays the reference for everything built so far.
+`docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
+Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
+what this document assumes and the owner has not confirmed.
 
 Mockups: https://claude.ai/code/artifact/61c79ac1-1498-4f37-9ec0-f2824cf3f92f (private to the owner until shared).
 
@@ -133,8 +140,10 @@ struct Check {
 
 ### Guided walkthrough and risk
 
-The changes view gains an order: Walkthrough (the default when the run has a report) or Files
-(today's order).
+Built in step 7.5 (`ui/changes-view.js`, `walkthrough` in `ui/patch.js`). The changes view has
+an order: Walkthrough (the default when the run's report names a step) or Files (the diff's
+order). A hunk two steps overlap belongs to the first, and the later one says "shown in step
+N"; a step that names no changed line is listed last.
 
 - **A step covers the hunks its lines overlap.** `n` and `p` move between steps; the step's
   `why` shows above its hunks.
@@ -190,6 +199,12 @@ edited.
 - **From an answer:** Make it a note (a `Change` note on the same lines, with the engineer's
   text), or Remember (milestone 9).
 
+Built in step 7.6, as the owner settled it on 2026-11-26: `POST /api/run/ask` takes the new
+note and saves it only once its run has a place, so an ask refused at the cap of 3 live runs
+leaves nothing; Delete of a live ask succeeds, and its thread goes when its run ends; Resolve
+of a live ask is refused (409), and of an idle one ends its thread and frees its worktree; an
+undo notice is logged (`undone`, run log version 7), so it survives a restart.
+
 ### Jump to definition
 
 `Cmd`-click on a name, or Go to Definition in the right-click menu, goes to where the name is
@@ -199,15 +214,31 @@ to stand on a name.
 - **Source:** `tree-sitter-tags` 0.27.2 (the same release line as the highlighter) with the
   `tags.scm` each grammar crate ships. Rust, JavaScript, TypeScript, Python and Go ship one;
   JSON, TOML and Bash do not and have no definitions.
-- **The index** maps a name to its definitions: `HashMap<String, Vec<Definition>>`, a
-  definition being a path, a line and a kind. It is looked up by name on a click and rebuilt
-  per file. A worker thread builds it after the project opens and again for the files whose
-  stat data changed when the window regains focus or a run ends. It lives in memory only.
+- **The index** maps a name to its definitions, a definition being a path, a line and a kind.
+  It is looked up by name on a click and rebuilt per file. A worker thread, `index-definitions`,
+  builds it after the project opens and again for the files whose size or modification time
+  changed when the page refreshes: on window focus and when a run's status changes, through
+  `POST /api/definitions/refresh`. A lookup during a refresh answers from the index as it
+  was; before the first build ends it says `{"state": "building"}`, and the page asks again
+  every 250 ms. It lives in memory only. Built (`src/definitions.rs`, step 7.7). Measured
+  2026-11-26 on a release build: this repository (145 files) builds in 0.19 to 0.33 s and
+  refreshes in 10 to 17 ms; a synthetic one of 50,000 small Rust and JavaScript files builds
+  in 1.4 to 6.3 s and refreshes in 150 to 250 ms, of which listing the files with git takes
+  40 to 60 ms. The ignored test `fifty_thousand_files_build_and_refresh` measures it again:
+  `cargo test --release --lib fifty_thousand -- --ignored --nocapture`.
 - **One definition** jumps. **Several** open a list of one-line cards ranked: same file, same
-  folder, then the rest by path. **None** shows a toast.
+  folder, then the rest by path, at most 50 with the count. **None** shows a toast, and so
+  does the clicked name being its own only definition.
 - **It matches names, not types.** Two functions named `new` both list. The list's header
   says "by name".
-- `Cmd-[` and `Cmd-]` move back and forward through the places jumped from and to.
+- **What a click finds**: the name under the pointer, Unicode identifier characters and `$`.
+  A click on whitespace, punctuation, a number, a string, a keyword or a comment does nothing.
+  A file whose language has no tags query says "No definitions for this file type." Files over
+  2 MB or not UTF-8 are not indexed.
+- `Cmd-[` and `Cmd-]` move back and forward through the places jumped from and to, at most
+  50; going back restores the scroll and the selection, and a place whose file is gone is
+  skipped. The history lives in the page, so opening another project, which reloads it, clears
+  it. The changes view and the prompt preview do not jump.
 
 ## Milestone 8: the map
 
@@ -235,7 +266,10 @@ because both directions of the link stay visible.
   narrow for both, the diagram takes the whole pane and `Cmd-Shift-M` switches between the
   two. The width is kept in `layout.json`.
 - **The header** holds a breadcrumb (Architecture, then each component deepened into), three
-  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated.
+  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated
+  or files are not on the map. As built (8.5): every kind can be chosen before it has a
+  diagram, whose empty card offers to make one; Flows shows the list of flows with the box
+  that asks for one, and "Not on the map" lists 20 of the files and counts them all.
 - **A node** is a small card: its label, one line of summary, and a mark when it is outdated
   or unverified. Everything else is in its dialog, by the rule of "Cards and dialogs": the
   detail, every anchor, the edges in and out, the notes on its lines, Ask, and Add note.
@@ -262,7 +296,7 @@ The owner asked for the link to be visible in the code, as notes are.
 
 - **A stripe** at the gutter's left edge spans the node's lines, and **a chip** at the end of
   the first line names the node. A click on either opens the map at that node.
-- **A color of its own,** `--map`, a muted violet in both palettes. Amber stays reserved for
+- **A color of its own,** `--map`, a muted orchid in both palettes. Amber stays reserved for
   notes, steel for focus. This is a second rare accent, which "Look and feel" does not allow
   yet; the owner approved the stripe and chip on 2026-11-25 and that section is amended.
 - **One stripe per line.** Lines covered by nested nodes show the innermost node of the
@@ -308,18 +342,30 @@ The owner asked for the link to be visible in the code, as notes are.
   of the run's diff overlaps one of its anchors, placed in the run's snapshot before the run.
   Touched nodes fill with the added color, nodes one edge from a touched node get an outline,
   and changed files that no node covers list under "Not on the map". A click on a touched
-  node opens the changes view at its hunks.
+  node opens the changes view at its hunks. Built in step 8.6: `GET /api/analysis?at=<commit>`
+  places the analysis with `git show` at the snapshot before the run, so a checkout that moved
+  since does not mark the wrong nodes; only Architecture diagrams are drawn.
 
 ### Data structures
+
+Built in step 8.1 (`src/analysis.rs`, `GET /api/analysis`): the types below, the file at
+version 1 (version 2 from step 8.2, which adds each diagram's `dropped`; version 3 from step
+8.7, which adds `checked`, absent until a run stores an Architecture and in files of version 1
+and 2), checking a citation, and placing every verified reference on each read. As built, an
+unverified reference has no `target`, only its path and, when its file could not be read, a
+`reason`: its lines may be zero, reversed or past the end of a file that may not exist.
+A file the page cannot use (unreadable, not of the format, or from a newer build) shows its
+reason in the map with Start over (step 8.3, `POST /api/analysis/start-over`), which moves the
+file to the macOS Trash, refused while an analysis runs in the window.
 
 Looked up: every anchor of the open file, on each file open. Iterated: one diagram's nodes
 and edges, on each draw. Changed: whole diagrams, by an analysis run. A repository holds tens
 of diagrams of tens of nodes, so every operation is a scan, as for notes.
 
 ```rust
-/// `<git dir>/postil/analysis.json`, version 1.
+/// `<git dir>/postil/analysis.json`, version 3.
 struct Analysis {
-    checked: CommitId,        // The commit the Architecture was last compared with.
+    checked: Option<CommitId>, // The commit the Architecture was last compared with.
     diagrams: Vec<Diagram>,
 }
 
@@ -386,12 +432,29 @@ enum RefState {
 
 ### An analysis run
 
+Built in step 8.2 (`src/analysis/prompt.rs`, `src/analysis/merge.rs`, `Runner::analyze`,
+`POST /api/analysis`, `POST /api/analysis/update`, `DELETE /api/analysis?diagram=D3`), with
+`analysis.json` at version 2: each diagram keeps what its runs left out (`dropped`), so the
+pane's header can say it.
+
 - **The agent** is the settings' Analyzer, a new choice beside the default agent and the
-  reviewers, which starts as the default agent.
-- **The run** is read-only in a thread of its own. Its header is marked
-  `analysis: {kind, of}` (run log version 8). It counts toward the cap
-  of 3 live runs and is not listed in the Run tab, which lists runs of notes; the diagram
-  pane's header shows its status and Stop, and opens its dialog.
+  reviewers, which starts as the default agent (`settings.json` version 3).
+- **The run** is read-only in a thread of its own, which ends with it: its worktree and branch
+  are freed, and its record kept, with the commit the run started from, which Update compares
+  the files with. Its header is marked `analysis: {kind, of, nodes}` (run log version 8);
+  `nodes` is what an update may change. It counts toward the cap of 3 live runs and is not
+  listed in the Run tab, which lists runs of notes; the diagram pane's header shows its status
+  and Stop, and opens its dialog. One analysis runs at a time in a window; two windows may
+  each run one, and the later merge wins.
+- **The merge** happens as the turn ends well, before the run's end is logged: the citations
+  are checked in the worktree first, then `analysis.lock` is held only to read the file as
+  stored, merge and save. A run that is stopped, fails, or edits files stores nothing, and one
+  whose reply gives nothing says why in its dialog (the `noAnalysis` entry). Ids are Postil's:
+  the agent names nodes with keys of its own.
+- **A diagram's parent** is a node of another diagram, and parents never loop: `analysis.json`
+  refuses a file that breaks this. A replaced or deleted diagram, or a node Update deletes,
+  takes the diagrams below it with it; a node Update replaces in place keeps its id, and the
+  diagrams below it stay.
 - **The reply** ends with one `json` block: diagrams of nodes and edges, where a citation is
   `{path, lines, first}` and `first` is the text of the first cited line.
 - **Checking a citation.** Postil reads the file in the run's worktree. The citation holds
@@ -410,7 +473,9 @@ enum RefState {
 - **Outdated** is worked out on every read, as a note's anchor is: the snippet is no longer
   in the file. A node with an outdated anchor is marked in the diagram and dashed in the code.
 - **Not on the map** is every file in the file list that no anchor covers and that was added
-  since the diagram's run.
+  since the diagram's run. An Update keeps the diagram's run (chosen by the agent 2026-11-27,
+  for the owner to confirm): a file it places is covered and leaves the list, and one it does
+  not place stays listed until an Update places it.
 - **Update** sends the Analyzer only the outdated nodes, each with its old snippet, and the
   files not on the map. The reply replaces those nodes by id, adds nodes and edges, and may
   delete a node whose code is gone. The owner chose this over a full analysis as the only
@@ -455,6 +520,27 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
   Update, and `checked` moves when it is pressed. Decided 2026-11-25 while planning.
 - A repository with no analysis has nothing to update, and nothing runs.
 
+As built (8.7): `POST /api/analysis/check` (`src/analysis/check.rs`, `analysis::check_head`)
+runs on the page's start, on each refresh (the window's focus, a run's status change, another
+live run's end) and when the settings change, whether or not the map is open. It reads the
+two commits only (`Repo::changed_paths`, `git diff --name-status --no-renames
+--ignore-submodules=all`; `git ls-tree`; `git show`), never the working tree, and holds no lock
+while it does: every write of `checked` is a compare and swap under `analysis.lock`. Only a
+reference whose path, or a folder above it, changed between `checked` and `HEAD` can start a
+run: after an update that failed at one commit, a later commit that touches none of its nodes
+starts none. The update is the Architecture's alone; a node whose only outdated reference is
+an edge's is sent. An update that replaces a node drops its edges out, which its prompt lists
+for the reply to give back, so a broken edge cannot force an update on every later commit.
+`checked` is claimed inside the run's creation, once the cap of 3 is checked and before the
+run's log exists, so of two windows one starts the run. A refused start answers `{"state":
+"blocked", "reason"}`, shown in the pane's strip, not an HTTP error. An Update of every diagram
+moves `checked` as it starts (on another history with nothing outdated it starts no run and
+answers `{"run": null}`); an Update of one diagram does not. A run that stores an Architecture
+sets `checked` to its fork when it is Analyze or the analysis had none; any other run leaves
+it. A file of version 1 or 2 is compared from the fork of its newest top-level Architecture
+diagram's run, or from `HEAD` when that run's thread is not in the record (an analysis written
+by hand); an analysis with no Architecture is not compared, and not written.
+
 ### Drawing and layout
 
 - **Postil draws the SVG**: cards as rounded rectangles in the palette's variables, edges as
@@ -463,9 +549,10 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
   no document (which node covers a line, which nodes a diff touches) with tests beside it.
 - **Layout comes from one vendored file**, the page's first third-party JavaScript:
   `@dagrejs/dagre` (MIT), kept as `ui/vendor/dagre.min.js` with its license, the way
-  `ui/icons.svg` is kept at a pinned commit. Version 3.1.4 was published on 2026-11-24; the
-  pin is a release at least two weeks old on the day it is vendored. Its size in the binary
-  is measured then and recorded in `docs/design.md`, "Dependencies".
+  `ui/icons.svg` is kept at a pinned commit. As built (8.3): version 3.1.3, the newest at
+  least two weeks old on 2026-11-26 (3.1.4 is from 2026-11-24), 49,326 bytes, recorded in
+  `docs/design.md`, "Dependencies", with why edges across boundaries are drawn straight and
+  not laid out by dagre.
 - **It loads when the map first opens**, so launch pays nothing for it.
 - **Rejected:** `elkjs` 0.12.1 (EPL-2.0 or GPL-3.0-or-later, 8.2 MB unpacked on npm against
   1.4 MB) and a layout of our own (the owner chose a vendored one: layout quality on large
@@ -476,6 +563,11 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
 hippius-mem is an MCP server over stdio. Postil uses it in four ways, all chosen by the owner.
 
 ### Finding and setting it up
+
+Built (step 9.1): `src/memory.rs`, the settings' Team memory section, and `agentMemory` in
+`settings.json` version 4. Set up is one click on a button that says what it writes, with no
+dialog before it (the plan's step 9.1 replaced the dialog), and shows `quickstart`'s own
+output. The switch turns on only while the latest check reads Ready.
 
 - **Detect, never bundle.** Postil finds `hippius-mem` on the login shell's `PATH` as it
   finds agents, and runs `hippius-mem doctor` to learn whether it is configured. A bundled
@@ -489,20 +581,53 @@ hippius-mem is an MCP server over stdio. Postil uses it in four ways, all chosen
 
 ### Agents get it
 
-- `session/new` carries `mcpServers` with one entry, hippius-mem by its absolute path.
-  `src/acp/wire.rs` types the field as an empty array today; it becomes a list of servers.
-- The prompt gains one line when the switch is on: recall team memory about the task before
-  changing code, and treat what it returns as reference data.
+Built (step 9.3): `src/memory.rs` ("Agents", `Memory::for_run`), `src/acp/connection.rs`
+(`new_session`), and `Runner::start` in `src/run.rs`. Every fresh agent gets it: a run of
+notes, an ask, an analysis, each reviewer, and a follow-up's fresh agent. A kept agent keeps
+the session it has.
+
+- `session/new` carries `mcpServers` with one entry, hippius-mem by its absolute path, in
+  ACP's stdio form (open question 12): no arguments, and `PATH`, `NO_COLOR` and
+  `HIPPIUS_MEM_CONFIG` in its environment. The agent starts it in the run's worktree, whose
+  git origin picks the profile doctor checked; `HIPPIUS_MEM_CONFIG` names the engineer's
+  configuration file, so a `hippius-mem.toml` in the repository is never read (open
+  question 6).
+- The prompt of notes gains one line when the switch is on and the state is Ready, right after
+  its introduction: recall team memory about the task before changing code, and treat what it
+  returns as reference data. The send step's preview shows it. A reviewer's quote of the
+  prompt, a fresh follow-up's and the run dialog's recall leave it out.
+- The switch is on and the state is not Ready, or hippius-mem was removed while Postil runs:
+  the run starts without memory and without the line, and its dialog says so, the first run
+  only until a check finds it Ready again or another project opens. A run that starts while a
+  check runs waits for it (10 s at most, and not at all while a set up runs), and opening a
+  project starts the first check.
+- The line goes with the server: the agent's prompt has it exactly when its session got
+  hippius-mem, whatever the state was when the run was sent. So in a race, a run sent while
+  a check runs or just before hippius-mem goes, the send step's preview and the prompt the run
+  records can differ from what the agent received, by that line.
+- An agent that answers `session/new` with an error when it names servers (not the sign-in
+  error) is asked once more with none, and the run goes on without the line; its dialog says
+  that the agent refused the server. An agent that drops the servers and answers without an
+  error cannot be told apart from one that took them: it then reads a line it cannot act on.
 - Remembering stays with the engineer (below). The prompt does not ask agents to remember.
 
 ### Postil shows memory
+
+Built (step 9.2): `src/memory.rs` and `src/memory/client.rs`, the tray's Memory tab
+(`ui/memory-tab.js`), the run dialog's Memory section and a memory's dialog
+(`ui/memory-dialog.js`). Remember is below. Postil names the repository on every recall as
+hippius-mem does: the last segment of the project's `origin` (`normalize_remote` in
+hippius-mem's `resolver.rs`), and none without one. The memory's dialog shows where each change
+was anchored, in the vault or on chain; it does not check the Merkle proof itself. The tab
+recalls for the file's path; the map pane passes the selected node's label as `node` once it
+is built (step 8.3).
 
 Postil is an MCP client itself: `src/memory.rs` starts one `hippius-mem` process per window
 on first use and calls `recall`, `get`, `history`, `refresh` and `remember` over its pipes,
 with hand-written serde types as for ACP. The calls run on a thread of their own, never on
 the one thread that answers the page: a slow recall would otherwise freeze every view. A
-route answers "pending" and the page asks again until the result is in. (The agent scan's
-page polls every 250 ms; how memory's page learns it is the plan's open item 7.)
+route answers "pending" and the page asks again every 250 ms until the result is in, as the
+agent scan's page does (the plan's open item 7, settled by the owner on 2026-11-26).
 
 - **A Memory tab in the tray** (Notes, Run, Memory) lists the memories recalled for the open
   file: one card each with the summary, the author and the age. The query is the file's path
@@ -516,6 +641,34 @@ page polls every 250 ms; how memory's page learns it is the plan's open item 7.)
 - Memory text is a teammate's writing. Postil draws it as text and never acts on it.
 
 ### Postil writes memory
+
+Built (step 9.4) for a note and an answered ask, from the note's dialog: `Runner::draft` in
+`src/run.rs`, `POST /api/memory/draft` and `POST /api/memory/remember` in `src/site.rs`,
+`Memory::remember` in `src/memory.rs`, `Note.memory` in `src/notes.rs` (`review.json` version
+6), the `remember` header of run log version 9, and the Remember dialog (`rememberDialog` in
+`ui/memory-dialog.js`). Remember from a finding or a run is not built: the owner left those
+out of 9.4.
+
+- The draft is a read-only run in the note's thread, after its latest turn, whatever the
+  thread's mode: it commits what was left in the worktree first, takes no snapshot, its asks
+  to edit are refused, and edits it makes anyway are undone, which fails the draft. It goes
+  to the thread's kept agent when that agent ran the latest turn, else to a fresh agent told
+  the thread so far, which gets no team memory: a draft run never writes memory. A kept agent
+  whose session got hippius-mem's server is never used for a draft (decided 2026-11-27): a
+  memory it wrote would be an external write the engineer did not save. A fresh agent with no
+  server drafts instead, and the kept agent, with its conversation, is let go. It is never the
+  Run tab's latest run, and the thread's next follow-up goes to a fresh agent.
+- A note never sent, or whose thread was applied or discarded, gets no draft run: the dialog
+  opens with the note's text. A draft that fails, or whose reply ends without a
+  `{"summary", "body"}` block, falls back the same way and says why.
+- While a run of the thread is under way, Remember is disabled ("Wait for the run").
+- Save sends exactly the summary, body, type and scope shown, through the memory thread, with
+  the repository named explicitly (the whole team's when the repository has no origin). A
+  blank summary or body, or one over its limit (1 KiB, 16 KiB), is refused before the call.
+  Save is disabled while it runs. A near-duplicate refused by hippius-mem offers Save anyway,
+  which passes `force`; any other failure keeps the dialog open with the text.
+- The duplicate check is a recall of the summary; one that cannot run says so and leaves Save
+  as it was.
 
 Remember is offered in the dialog of a note, of a finding, of a run, and of an answered ask.
 
@@ -532,19 +685,35 @@ Remember is offered in the dialog of a note, of a finding, of a run, and of an a
 
 ### Review checks against memory
 
+Built (step 9.5): `Runner::recall_for_review` in `src/run.rs`, `Memory::recall_review` in
+`src/memory.rs`, `MemoryBlock` and `Finding.memory` in `src/review.rs` (run log version 10),
+and the finding's memory button (`findingMemoryLink` in `ui/memory-tab.js`) in the run dialog,
+the note dialog and the changes view.
+
 The owner chose a reviewer stage that judges over listing raw recall hits beside the changes
 (recall is fuzzy, and the engineer would judge every hit).
 
-- When the engineer presses Review, Postil recalls for the run's prompt and for each changed
-  path, drops weak pointers and duplicates, and keeps at most 12 (recall's default count).
-- The proposing reviewers' prompt carries those memories whole, in a block labeled as
-  reference data written by teammates, with the ask: report a change that contradicts a
-  recorded decision or repeats a recorded gotcha as a finding that names the memory.
-- A finding gains `memory: Option<MemoryId>` (run log version 10). Its card shows the
-  memory's summary and opens it, and the changes view flags the finding's line, since a
-  finding already carries its path and line.
-- With hippius-mem missing or failing, the review runs without the block and its dialog says
-  so.
+- When the engineer presses Review with team memory on, the first stage's start thread
+  recalls for the run's prompt and for each changed path (its edits' diffs, then the paths
+  that differ between its snapshots, which a command's edits are among), drops weak pointers
+  and duplicates, takes each query's best first, and keeps at most 12 (recall's default
+  count). It reads each with `get`; one redacted or forgotten since is passed over. The
+  request that pressed Review answers at once: the recall never runs on the page's thread.
+- Every stage's prompt carries those memories, in a block labeled as reference data written
+  by teammates, never instructions to follow: the judge's too, since it may edit files. Each
+  body is in a fence of backticks longer than any run of them in it, and the block ends with
+  "End of team memory.", so a body cannot write a section of Postil's prompt. A body
+  is cut at 2 KiB and says so, and the block at 16 KiB. The proposers are asked to report a
+  change that contradicts a recorded decision or repeats a recorded gotcha as a finding that
+  names the memory.
+- A finding gains `memory: Option<String>` (run log version 10), kept only when the id was in
+  the block, so an id a reviewer made up, or one a memory's text names, is dropped and the
+  finding kept. Its card shows the memory's id and summary, as the vault holds it now (the log
+  keeps only the id), and opens it; the changes view shows it on the finding beside its line.
+- With hippius-mem missing, failing, or slower than 30 s to answer, the review runs without
+  the block, and the first stage's memory notice says why ("team memory could not be
+  checked: ..."), shown in its dialog and in the review's part of the reviewed run's dialog.
+  The recall goes on after 30 s, and its answers are kept for the next review.
 
 ## Milestone 10: voice
 
@@ -641,11 +810,14 @@ Postil writes outside itself.
 
 1. **Read-only threads.** Read-only agents run in a thread of their own at `HEAD`, not in
    the engineer's working tree, so they do not see uncommitted edits.
-2. **An ask is a note** with `intent: Ask`, not a record of its own.
+2. **An ask is a note: settled by the owner on 2026-11-26** (built in step 7.6), with
+   `intent: Ask`, not a record of its own.
 3. **Keys.** `q` to ask, `Cmd`-click to jump, `Cmd-Shift-M` for the map, `n` and `p` for
    steps. The key held to talk is not chosen: Right Option is the proposal, since Fn
    belongs to macOS dictation.
-4. **The map's color.** A muted violet; the mockups show it for approval.
+4. **The map's color.** A muted violet; the mockups show it for approval. As built (8.3):
+   `--map` is a muted orchid, `#d79ad0` in Graphite and `#a33a8a` in Paper, its wash the same at
+   10% and 8%: the violet first tried matched the keyword color (`--syntax-keyword`).
 5. **Exit status: answered by spike S1, 2026-11-25.** Claude (`claude-agent-acp` 0.94.0)
    and Grok (1.0.92) ran `echo hello`, `sh -c 'echo failing >&2; exit 3'`,
    `ls no-such-directory` and a Python test through Postil's own connection, in a scratch
@@ -695,11 +867,30 @@ Postil writes outside itself.
      the status says.
 
 6. **hippius-mem's repository scope in a worktree.** Agents run in `~/.postil/worktrees/...`;
-   whether the server binds the right repository from there is not checked yet.
+   whether the server binds the right repository from there is not checked yet. `doctor`
+   picks its profile by the git origin of its working directory, so step 9.1 runs it in the
+   open project's root (a worktree of it shares its origin), in the temporary directory with
+   no project open, and checks again when another project opens. With no project open, only
+   a catch-all or trial profile reads Ready. hippius-mem also reads a `./hippius-mem.toml`
+   before the global configuration when `HIPPIUS_MEM_CONFIG` is unset
+   (`Config::from_env_and_file`, `hippius-mem/src/config.rs` at db9261b), and a reviewed
+   repository could ship one that names its own endpoint, which would receive the engineer's
+   notes and prompts and answer recalls with notes of its choosing. **Decided by the main
+   session on 2026-11-27 in step 9.3, for the owner to confirm: not acceptable.** Every
+   hippius-mem Postil starts (doctor, Set up, Postil's own server, each agent's server) gets
+   `HIPPIUS_MEM_CONFIG`: the value in Postil's own environment when the engineer set one,
+   else `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`, the file
+   `quickstart` writes. With it set, hippius-mem reads that file only, and a missing one still
+   fails with "failed to load configuration", which offers Set up. The working directory still
+   picks the profile by its git origin. This changes steps 9.1's and 9.2's spawns. The downside
+   accepted: an engineer who relies on a project's own `hippius-mem.toml` must start Postil with
+   `HIPPIUS_MEM_CONFIG` naming it, which hippius-mem's own `install` already pins for its MCP
+   server.
 7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
-   This document does not offer it from Postil.
+   This document does not offer it from Postil. Step 9.1 is built that way, not confirmed.
 8. **The trial vault.** Set up runs `quickstart`, which makes a local vault. Moving to a
-   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret.
+   shared bucket (`upgrade`) stays in the terminal, since it prompts for a secret. Step 9.1 is
+   built that way: Set up makes a trial vault only.
 9. **The language of dictation.** The system's language is assumed. When on-device
    recognition is not available for it, dictation reports that and does not use the network.
 10. **Remember without the thread's agent.** A note that was never sent has no agent to draft
@@ -727,6 +918,19 @@ Postil writes outside itself.
     - Both are above the plan's 8 of 10, so no second turn is needed.
     - Both agents ran with the owner's own configuration, as Postil runs them. In 2 of
       Claude's runs that configuration had the agent write a note to hippius-mem.
+12. **MCP servers in `session/new`: answered by spike S7, 2026-11-27,** from the version 1
+    schema at the commit `src/acp/wire.rs` pins (01a54c84):
+    - `mcpServers` is required, a list of `McpServer`, which is one of three forms. HTTP and
+      SSE carry `"type": "http"` or `"sse"`, and an agent offers them only when its
+      `mcpCapabilities` says so. The stdio form carries no `type`, and "all Agents MUST
+      support" it: `McpServerStdio` requires `name`, `command` ("absolute path to the MCP
+      server executable"), `args` (strings) and `env`, a list of `{name, value}`.
+    - It has no working directory: the agent starts the server in the session's `cwd`, the
+      run's worktree.
+    - The schema names no error for `session/new`, so an agent may answer it with any
+      JSON-RPC error, a refused server among them. Postil asks once more with no servers, and
+      the run says that memory was not given (section "Agents get it"). An agent that accepts
+      the session and drops the server unseen cannot be detected.
 
 ## Testing
 

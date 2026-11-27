@@ -22,9 +22,21 @@ const rowTarget = (row) => (row.classList.contains("dir") ? "folder" : "file");
 // `state` is the page's state: the list reads `repo.files`, `tree`, `expanded`,
 // `noteCountByPath` and `file`, and keeps `expanded`. `openFile(path)` opens a file in the code
 // pane and resolves to whether it was shown; `codeEl` takes the focus when the filter is left.
-// `menu` is the context menu (context-menu.js), and `writeNote(path, target)` opens the dialog
-// for a note on the whole file or folder (`target` "file" or "folder").
-export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, writeNote }) {
+// `menu` is the context menu (context-menu.js), and `writeNote(path, target, { intent })` opens
+// the dialog for a note on the whole file or folder (`target` "file" or "folder"), or for a
+// question about it (`intent` "ask"). `analyzeDeeper(path)` starts Analyze deeper on it, which
+// waits while `isAnalyzing()`.
+export function fileList({
+  state,
+  filesEl,
+  filterEl,
+  codeEl,
+  openFile,
+  menu,
+  writeNote,
+  analyzeDeeper,
+  isAnalyzing,
+}) {
   // The index of the highlighted row while the file filter has text.
   let activeMatch = 0;
 
@@ -191,7 +203,7 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, wri
     }
   });
 
-  // Right-click on a row: a note on the whole file or folder, for an agent.
+  // Right-click on a row: a note on the whole file or folder, for an agent, or a diagram of it.
   filesEl.addEventListener("contextmenu", (event) => {
     const row = event.target.closest(".file, .dir");
     if (!row) return;
@@ -208,6 +220,19 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, wri
         key: "C",
         matches: (key) => key.key === "c" && !key.metaKey,
         run: () => writeNote(row.dataset.path, target),
+      },
+      {
+        label: "Ask…",
+        detail: `about this ${target}`,
+        key: "Q",
+        matches: (key) => key.key === "q" && !key.metaKey,
+        run: () => writeNote(row.dataset.path, target, { intent: "ask" }),
+      },
+      {
+        label: "Analyze Deeper",
+        detail: `this ${target}`,
+        disabled: isAnalyzing(),
+        run: () => analyzeDeeper(row.dataset.path),
       },
     ]);
   });

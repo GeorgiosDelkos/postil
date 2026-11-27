@@ -32,6 +32,7 @@ import {
 import {
   STEPS,
   applyDetectedDefaults,
+  applyMemoryDefault,
   clampStep,
   npxWarning,
   readinessItems,
@@ -156,7 +157,9 @@ export function wizardDialog(
     if (fileChanged) apply(ui.draft);
     if (dialogEl.open && !view.problem) models.request(ui.draft);
     clearTimeout(ui.pollTimer);
-    if (scanning && dialogEl.open) {
+    // hippius-mem's first check ends after the scan, so it is waited for too: a first run's
+    // save turns team memory on from the state it shows then (`commit`).
+    if ((scanning || view.memory.pending) && dialogEl.open) {
       ui.pollTimer = setTimeout(
         () => refresh({ session }).catch((e) => fail(e, session)),
         SCAN_POLL_MS,
@@ -195,8 +198,12 @@ export function wizardDialog(
     if (body) body.scrollTop = 0;
   }
 
-  async function commit(settingsToSave, { andOpenFolder = false } = {}) {
+  // Saves `draft`. On a first run, team memory follows hippius-mem's state as the save goes
+  // out, not as it was when the draft was made: a state that stopped being ready since would
+  // have the save refused, again on every try.
+  async function commit(draft, { andOpenFolder = false } = {}) {
     if (ui.saving || !ui.view) return;
+    const settingsToSave = ui.firstRun ? applyMemoryDefault(draft, ui.view.memory) : draft;
     const session = ui.session;
     ui.saving = true;
     ui.error = null;
@@ -609,7 +616,8 @@ export function wizardDialog(
     const node = el("footer", "wizard-footer");
     const left = el("div", "wizard-footer-left");
     if (ui.firstRun && !ui.view?.problem) {
-      // Skip drops the edits but keeps what step 1 showed as found: the installed agents on.
+      // Skip drops the edits but keeps what was found: the installed agents on, and team memory
+      // when hippius-mem is ready (`commit`).
       const skip = controlButton("Skip", "wizard-skip", () =>
         commit(applyDetectedDefaults(ui.baseline, ui.view.agents)),
       );

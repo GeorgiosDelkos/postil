@@ -23,17 +23,23 @@ import {
   segmented,
   settingRow,
   settingSection,
+  stateMark,
   toggleSwitch,
 } from "./settings-controls.js";
 import {
   addReviewer,
   agentRows,
+  canSetUp,
+  memoryState,
   moveReviewer,
   removeCustomAgent,
   removeReviewer,
   saveCustomAgent,
   setAgent,
   setAgentModel,
+  setAnalyzer,
+  setAnalyzerModel,
+  setAgentMemory,
   setEnabled,
   setReviewerModel,
 } from "./settings.js";
@@ -64,6 +70,10 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     // Whether an agent scan runs. The agents of the last scan stay listed meanwhile, so the
     // dialog does not jump.
     scanning: false,
+    // Whether this dialog started the hippius-mem set up that runs, so that its success turns
+    // team memory on: on by default once ready (docs/review-assist.md, "Finding and setting
+    // it up").
+    settingUp: false,
     pollTimer: null,
   };
 
@@ -80,9 +90,9 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
   // is waiting: until then the screen holds changes the reply does not know of, and the next
   // change must start from them, or a quick second change would undo the first.
   //
-  // While a scan runs, the reply is asked for again shortly; a reply that changes nothing is
-  // not drawn, since a redraw replaces every control and a click pressed on one of them and
-  // released on its replacement does nothing.
+  // While a scan, or a check or set up of hippius-mem, runs, the reply is asked for again
+  // shortly; a reply that changes nothing is not drawn, since a redraw replaces every control
+  // and a click pressed on one of them and released on its replacement does nothing.
   function show(view) {
     const ahead = ui.pending > 0 && ui.view !== null;
     const scanning = view.agents === null;
@@ -97,10 +107,17 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     if (!ahead) apply(view.settings);
     if (dialogEl.open && !view.problem) models.request(ui.view.settings);
     clearTimeout(ui.pollTimer);
-    if (scanning && dialogEl.open) {
+    if ((scanning || view.memory.pending) && dialogEl.open) {
       ui.pollTimer = setTimeout(() => refresh().catch(fail), SCAN_POLL_MS);
     }
     if (!unchanged && dialogEl.open) render();
+    const setupEnded = ui.settingUp && ["succeeded", "failed"].includes(view.memory.setup?.status);
+    if (!setupEnded) return;
+    ui.settingUp = false;
+    const ready = view.memory.setup.status === "succeeded" && view.memory.state?.kind === "ready";
+    if (ready && !locked() && !ui.view.settings.agentMemory) {
+      void save(setAgentMemory(ui.view.settings, true, view.memory.state));
+    }
   }
 
   function fail(error) {
@@ -184,7 +201,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     if (!ui.view) body.append(el("p", "settings-hint", "Loading…"));
     else {
       if (ui.view.problem) body.append(problem());
-      body.append(appearance(), startup(), agents());
+      body.append(appearance(), startup(), agents(), teamMemory());
     }
     node.append(header, body, footer());
     return node;
@@ -327,21 +344,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
       openForm({ previous: null, name: "", command: "" });
     });
     add.disabled = locked() || ui.form !== null;
-    // One scan at a time: every click would start another login shell. The button is off
-    // from the click until the scan's result arrives.
-    const rescan = controlButton("Rescan", "rescan", async () => {
-      ui.scanning = true;
-      render();
-      try {
-        const view = await fetchSettingsJson("api/agents/rescan", { method: "POST" });
-        // The rescan forgot every agent's models too: they are asked for again.
-        models.reset();
-        show(view);
-      } catch (error) {
-        ui.scanning = false;
-        fail(error);
-      }
-    });
+    const rescan = controlButton("Rescan", "rescan", rescanAgents);
     rescan.disabled = ui.scanning;
     if (ui.scanning) actions.append(el("span", "settings-hint", "Looking for installed agents…"));
     actions.append(add, rescan);
@@ -357,8 +360,25 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
         }),
       );
     }
-    node.append(actions, chosenAgent(), reviewers());
+    node.append(actions, chosenAgent(), analyzer(), reviewers());
     return node;
+  }
+
+  // One scan at a time: every click would start another login shell. Each Rescan button is
+  // off from the click until the scan's result arrives. A rescan looks for hippius-mem again
+  // too.
+  async function rescanAgents() {
+    ui.scanning = true;
+    render();
+    try {
+      const view = await fetchSettingsJson("api/agents/rescan", { method: "POST" });
+      // The rescan forgot every agent's models too: they are asked for again.
+      models.reset();
+      show(view);
+    } catch (error) {
+      ui.scanning = false;
+      fail(error);
+    }
   }
 
   // Opens the custom agent form below the list, scrolled into view, on its name field.
@@ -405,6 +425,24 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     return node;
   }
 
+  function analyzer() {
+    const control = agentSlotControl("analyzer", ui.view.settings, models.models, {
+      slot: ui.view.settings.analyzer,
+      label: "Analyzer",
+      emptyLabel: "Same as Send notes to",
+      disabled: locked(),
+      onAgent: (name) => save(setAnalyzer(ui.view.settings, name)),
+      onModel: (model) => save(setAnalyzerModel(ui.view.settings, model)),
+    });
+    const node = settingRow(
+      "Analyzer",
+      "The agent that draws the map of the repository, read-only, and its model",
+      control,
+    );
+    node.classList.add("stacked");
+    return node;
+  }
+
   function reviewers() {
     const control = reviewerControls(ui.view.settings, models.models, {
       disabled: locked(),
@@ -426,6 +464,134 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     );
     node.classList.add("stacked");
     return node;
+  }
+
+  // hippius-mem: where it stands, what to do next, the output of the last set up as it printed
+  // it, and the switch. The switch shows once hippius-mem is ready, or while it is on, so a
+  // removed hippius-mem can be let go.
+  function teamMemory() {
+    const memory = ui.view.memory;
+    const state = memory.state;
+    const on = ui.view.settings.agentMemory;
+    const node = settingSection(
+      "Team memory",
+      el(
+        "p",
+        "settings-hint",
+        "hippius-mem keeps the team's decisions and gotchas, for agents to recall before they " +
+          "change code.",
+      ),
+    );
+
+    const shown = memoryState(memory, on);
+    const row = el("div", `agent-row ${shown.kind}`);
+    const text = el("div", "agent-text");
+    text.append(el("span", "agent-name", "hippius-mem"), el("span", "agent-usage", shown.label));
+    if (state?.path) {
+      text.append(el("span", "agent-command", state.path));
+      row.title = `${shown.label}: ${state.path}`;
+    }
+    row.append(stateMark(shown), text);
+    const card = el("div", "agent-list");
+    card.append(row);
+    node.append(card);
+
+    // doctor's own message, as it printed it, over several lines.
+    if (state?.problem) node.append(el("pre", "memory-output failed", state.problem));
+    if (state?.kind === "missing") {
+      node.append(
+        el(
+          "p",
+          "settings-hint",
+          "Install hippius-mem (its install script, or cargo install) so that it is on PATH, " +
+            "then Rescan.",
+        ),
+      );
+    }
+    if (canSetUp(state)) {
+      node.append(
+        el(
+          "p",
+          "settings-hint",
+          "Set up runs hippius-mem quickstart --no-wire: it writes hippius-mem's configuration " +
+            "and a local trial vault in your home folder, and prints where. It changes no " +
+            "other tool's settings.",
+        ),
+      );
+    } else if (state?.kind === "unconfigured") {
+      node.append(
+        el(
+          "p",
+          "settings-hint",
+          "hippius-mem doctor did not pass: fix what it says in a terminal " +
+            "(hippius-mem doctor), then Check.",
+        ),
+      );
+    }
+    const setup = memory.setup;
+    if (setup?.status === "succeeded" || setup?.status === "failed") {
+      const failed = setup.status === "failed";
+      node.append(
+        el("pre", `memory-output${failed ? " failed" : ""}`, setup.output ?? setup.error),
+      );
+    }
+
+    node.append(memoryActions(state, setup?.status === "running"));
+    if (state?.kind === "ready" || on) {
+      const flip = () => save(setAgentMemory(ui.view.settings, !on, state));
+      const control = toggleSwitch("agent-memory", on, flip, {
+        label: "Give agents team memory",
+        disabled: locked() || (!on && state?.kind !== "ready"),
+      });
+      node.append(
+        settingRow("Give agents team memory", "hippius-mem joins every agent's session", control),
+      );
+    }
+    return node;
+  }
+
+  // The buttons under hippius-mem's state: Rescan when it is missing, Check once it is found,
+  // and Set up while it is not configured. None starts while a set up runs.
+  function memoryActions(state, settingUp) {
+    const actions = el("div", "settings-actions");
+    if (settingUp) {
+      actions.append(
+        el("span", "settings-hint", "Setting up… the first set up downloads a 129 MB model."),
+      );
+    } else if (state === null) {
+      actions.append(el("span", "settings-hint", "Checking hippius-mem…"));
+    }
+    if (state?.kind === "missing") {
+      const rescan = controlButton("Rescan", "memory-rescan", rescanAgents);
+      rescan.disabled = ui.scanning || settingUp;
+      actions.append(rescan);
+      return actions;
+    }
+    const check = controlButton("Check", "memory-check", () => memoryJob("api/memory/check"));
+    check.disabled = state === null || settingUp;
+    actions.append(check);
+    if (canSetUp(state)) {
+      const setUp = controlButton("Set up a trial vault", "memory-setup", () =>
+        memoryJob("api/memory/setup", { setUp: true }),
+      );
+      setUp.disabled = settingUp;
+      actions.append(setUp);
+    }
+    return actions;
+  }
+
+  // Starts a check or a set up of hippius-mem; the reply says it runs, and `show` asks again
+  // until it ends. A set up is marked as this dialog's only once its reply is in: the process
+  // answers in order, so every reply after it knows of the set up, and an older poll's reply
+  // with an earlier set up's end cannot end this one.
+  async function memoryJob(route, { setUp = false } = {}) {
+    try {
+      const view = await fetchSettingsJson(route, { method: "POST" });
+      if (setUp) ui.settingUp = true;
+      show(view);
+    } catch (error) {
+      fail(error);
+    }
   }
 
   function footer() {

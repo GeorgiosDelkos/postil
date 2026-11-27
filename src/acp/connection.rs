@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::acp::wire::{
     self, CancelParams, CancelRequestParams, ClientCapabilities, ContentBlock,
     ElicitationCapabilities, ElicitationParams, ElicitationReply, Empty, FsCapabilities, Incoming,
-    InitializeParams, InitializeResult, ModelConfig, ModelOption, NewSessionParams,
+    InitializeParams, InitializeResult, McpServer, ModelConfig, ModelOption, NewSessionParams,
     NewSessionResult, Notification, Outcome, PermissionOption, PermissionOutcome, PermissionParams,
     PermissionResult, PromptParams, PromptResult, PromptUsage, Request, Response, RpcError,
     SessionUpdate, SetConfigOptionParams, SetConfigOptionResult, StopReason, ToolCallUpdate,
@@ -54,6 +54,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) cwd: &'a Path,
     /// Where the program, and the programs it starts (`npx` runs `node`), are looked for.
     pub(crate) search_path: &'a OsStr,
+    /// The MCP servers the session gets (`session/new`): hippius-mem, or none.
+    pub(crate) mcp_servers: &'a [McpServer],
     /// How long each start-up request (`initialize`, `session/new`, and
     /// `session/set_config_option` when a model is set) may take.
     pub(crate) timeout: Duration,
@@ -129,7 +131,18 @@ pub(crate) enum TurnEnd {
 pub(crate) struct Starting {
     process: Process,
     cwd: PathBuf,
+    mcp_servers: Vec<McpServer>,
     timeout: Duration,
+}
+
+/// An agent whose session [`Starting::open_session`] opened.
+#[derive(Debug)]
+pub(crate) struct Opened {
+    pub(crate) agent: Agent,
+    /// Why the session has none of the MCP servers the launch named: the agent refused
+    /// `session/new` with them, and took it without. `None` when it took them, or when none
+    /// were named.
+    pub(crate) servers_refused: Option<String>,
 }
 
 /// Kills an agent's process group from another thread, while its process is not reaped yet.
@@ -183,6 +196,7 @@ impl Agent {
         Ok(Starting {
             process: Process::spawn(launch, on_event)?,
             cwd: launch.cwd.to_owned(),
+            mcp_servers: launch.mcp_servers.to_vec(),
             timeout: launch.timeout,
         })
     }
@@ -197,9 +211,10 @@ impl Starting {
     }
 
     /// Introduces the app (`initialize`) and opens a session in the repository
-    /// (`session/new`), then, when `model` is given, sets the session to it
-    /// (`session/set_config_option`), so no prompt can reach the agent before its model is
-    /// set. Blocks until each step is answered, up to the launch's timeout each.
+    /// (`session/new`) with the launch's MCP servers, then, when `model` is given, sets the
+    /// session to it (`session/set_config_option`), so no prompt can reach the agent before its
+    /// model is set. Blocks until each step is answered, up to the launch's timeout each. An
+    /// agent that refuses the servers is asked once more without them ([`new_session`]).
     ///
     /// The model is checked against the ones the agent offers first: an agent may take an id
     /// it does not know and fall back to another model without a word.
@@ -208,11 +223,12 @@ impl Starting {
     ///
     /// [`Error::AgentSilent`] when a step is not answered in time (an agent that waits for a
     /// sign-in in a browser does this); [`Error::AgentExited`] when the process ends first,
-    /// or is stopped; [`Error::AgentRefused`] when the agent answers with an error;
-    /// [`Error::AgentProtocol`] when it speaks another version or replies in a shape the app
-    /// cannot read; [`Error::ModelNotChoosable`] when `model` is given and the agent offers
-    /// no model choice, and [`Error::ModelNotOffered`] when it does not offer `model`.
-    pub(crate) fn open_session(self, model: Option<&str>) -> Result<Agent> {
+    /// or is stopped; [`Error::AgentRefused`] when the agent answers with an error (a second
+    /// time, when it refused the servers); [`Error::AgentProtocol`] when it speaks another
+    /// version or replies in a shape the app cannot read; [`Error::ModelNotChoosable`] when
+    /// `model` is given and the agent offers no model choice, and [`Error::ModelNotOffered`]
+    /// when it does not offer `model`.
+    pub(crate) fn open_session(self, model: Option<&str>) -> Result<Opened> {
         let initialize = InitializeParams {
             protocol_version: wire::PROTOCOL_VERSION,
             client_capabilities: ClientCapabilities {
@@ -242,11 +258,10 @@ impl Starting {
                 self.cwd.display()
             ))
         })?;
-        let session = NewSessionParams {
-            cwd,
-            mcp_servers: [],
-        };
-        let reply: NewSessionResult = process.call("session/new", &session, self.timeout)?;
+        let NewSession {
+            reply,
+            servers_refused,
+        } = new_session(&process, cwd, &self.mcp_servers, self.timeout)?;
         let model_config = reply.model_config();
         let model = match model {
             None => reply.current_model(),
@@ -258,13 +273,62 @@ impl Starting {
                 self.timeout,
             )?),
         };
-        Ok(Agent {
+        let agent = Agent {
             process,
             session: reply.session_id,
             model,
             offered: model_config.map_or_else(Vec::new, |config| config.options),
+        };
+        Ok(Opened {
+            agent,
+            servers_refused,
         })
     }
+}
+
+/// A session [`new_session`] opened: the agent's reply, and why the session has none of the
+/// servers it was asked with, when it has none.
+struct NewSession {
+    reply: NewSessionResult,
+    servers_refused: Option<String>,
+}
+
+/// Opens a session in `cwd` with `servers`. An agent may answer `session/new` with an error
+/// (spike S7, docs/review-assist.md, "Open questions", 12): one that refuses the servers is
+/// asked once more with none, so a run never fails for want of team memory. A refusal that
+/// asks for a sign-in ([`wire::AUTH_REQUIRED`]) is not about the servers, and is not asked again.
+fn new_session(
+    process: &Process,
+    cwd: &str,
+    servers: &[McpServer],
+    timeout: Duration,
+) -> Result<NewSession> {
+    let session = NewSessionParams {
+        cwd,
+        mcp_servers: servers,
+    };
+    let refused = match process.call("session/new", &session, timeout) {
+        Ok(reply) => {
+            return Ok(NewSession {
+                reply,
+                servers_refused: None,
+            });
+        }
+        Err(Error::AgentRefused { code, message, .. })
+            if !servers.is_empty() && code != wire::AUTH_REQUIRED =>
+        {
+            format!("the agent refused session/new with its MCP servers: {message} ({code})")
+        }
+        Err(error) => return Err(error),
+    };
+    let session = NewSessionParams {
+        cwd,
+        mcp_servers: &[],
+    };
+    Ok(NewSession {
+        reply: process.call("session/new", &session, timeout)?,
+        servers_refused: Some(refused),
+    })
 }
 
 /// Sets session `session` to the model `wanted`, which `config`, the agent's model select,
@@ -1173,10 +1237,12 @@ mod tests {
             command,
             cwd: Path::new(env!("CARGO_MANIFEST_DIR")),
             search_path: &search_path,
+            mcp_servers: &[],
             timeout,
         };
-        let agent =
-            Agent::spawn(&launch, move |event| drop(sender.send(event)))?.open_session(None)?;
+        let agent = Agent::spawn(&launch, move |event| drop(sender.send(event)))?
+            .open_session(None)?
+            .agent;
         Ok((agent, events))
     }
 
@@ -1600,6 +1666,7 @@ mod tests {
             command: &command,
             cwd: Path::new(env!("CARGO_MANIFEST_DIR")),
             search_path: &search_path,
+            mcp_servers: &[],
             // Far longer than the test: only the stop can end the wait.
             timeout: Duration::from_secs(600),
         };

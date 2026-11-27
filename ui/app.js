@@ -10,18 +10,22 @@ import { runBench } from "./bench.js";
 import { changesView } from "./changes-view.js";
 import { codeView } from "./code-view.js";
 import { contextMenu } from "./context-menu.js";
+import { diagramView } from "./diagram-view.js";
+import { fileMarks } from "./diagram.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
+import { memoryDialog, rememberDialog } from "./memory-dialog.js";
+import { memoryTab } from "./memory-tab.js";
 import { noteDialog } from "./note-dialog.js";
-import { onLines } from "./note-place.js";
+import { fullPlace, onLines } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
 import { pathNoteDialog } from "./path-note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { escapeAction, foldRun, isOpen, isResolved } from "./run.js";
+import { escapeAction, foldRun, isAsk, isOpen, isResolved, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics, formatSlot } from "./settings.js";
-import { reviewOf } from "./status.js";
+import { reportOf, reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
 import { usageBar } from "./usage-bar.js";
 import { usageDialog } from "./usage-dialog.js";
@@ -35,7 +39,7 @@ const notesEl = $("notes");
 const welcomeEl = $("welcome");
 
 const state = {
-  repo: { name: "", branch: "", files: [] },
+  repo: { name: "", branch: "", files: [], memoryRepo: null },
   // The file shown in the code pane: { path, lines }, where a line is a list of
   // [cssClass, text] tokens.
   file: null,
@@ -43,19 +47,28 @@ const state = {
   wanted: null,
   // Selected lines as 0-based indexes, both inclusive: { anchor, head }.
   selection: null,
-  // The open note composer: { start, end, text, saving, node }, lines 0-based and inclusive.
+  // The open note composer: { start, end, intent, text, saving, node }, lines 0-based and
+  // inclusive; `intent` "ask" when it asks a question instead (code-view.js, `openComposer`).
   // `node` is built once and moved, never rebuilt, when the rows re-render: a rebuilt
   // textarea would lose its focus, caret, and grown height while the engineer types.
   composer: null,
   // As `api/notes` returns them: { id, path, target, lines: { start, end }, snippet, body,
-  // anchor, state }, lines 1-based and inclusive, anchor "found" or "lost". `target` is
-  // "lines", "file" or "folder", and only a note on lines has `lines` and `snippet`
-  // (note-place.js). A lost note is shown as outdated.
+  // anchor, state, intent }, lines 1-based and inclusive, anchor "found" or "lost". `target`
+  // is "lines", "file" or "folder", and only a note on lines has `lines` and `snippet`
+  // (note-place.js). A lost note is shown as outdated. `intent` is "change", or "ask" for a
+  // question, which is never sent with the notes (run.js, `isAsk`). `memory`, when there, is
+  // the id of the team memory remembered from the note.
   notes: [],
   // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
   // file, and the number of notes on each file or folder path.
   noteByLine: new Map(),
   noteCountByPath: new Map(),
+  // Derived from the map's analysis (diagram-view.js, read from `api/analysis` at start, so
+  // they show before the map is first opened) by `indexMarks`: the stripe and chip on each
+  // 0-based line of the open file (diagram.js, `fileMarks`).
+  markByLine: new Map(),
+  // Whether the stripes and chips show (View > Map Markers), for this window's session.
+  mapMarkers: true,
   // The repository's files as a tree (tree.js), rebuilt when the file list changes, and the
   // paths of the folders open in it.
   tree: buildTree([]),
@@ -69,7 +82,7 @@ const state = {
   // The send step while it is open: the ids of the notes ticked, and the agent chosen for
   // this send. The code pane then shows the prompt instead of the file.
   send: null,
-  // Which of the tray's tabs shows: "notes" or "run".
+  // Which of the tray's tabs shows: "notes", "run" or "memory".
   tab: "notes",
 };
 
@@ -87,7 +100,12 @@ const files = fileList({
   codeEl,
   openFile: (path) => code.openFile(path),
   menu,
-  writeNote: (path, target) => pathNote.open(path, target),
+  writeNote: (path, target, options) => pathNote.open(path, target, options),
+  analyzeDeeper: (path) => {
+    showMap();
+    return map.analyzeDeeper(path);
+  },
+  isAnalyzing: () => map.isAnalyzing(),
 });
 
 const code = codeView({
@@ -98,6 +116,13 @@ const code = codeView({
   menu,
   files,
   indexNotes,
+  indexMarks,
+  openMapNode: openNodeInMap,
+  traceFromHere: (path) => {
+    showMap();
+    map.traceFrom({ of: path, label: path });
+  },
+  onActiveLine: syncCodeToMap,
   deleteNote,
   beforeOpen: () => {
     changes.close();
@@ -108,6 +133,9 @@ const code = codeView({
     tray.render();
     files.render();
   },
+  // The ask's card shows its run, as a note sent alone does.
+  onAsked: () => runs.sync(),
+  onFileOpened: () => memory.fileOpened(),
 });
 
 const runs = runPanel({
@@ -116,18 +144,47 @@ const runs = runPanel({
   statusEl: $("agent-status"),
   detailEl: $("run-detail"),
   onChange: followRun,
-  // An older run was read: the notes sent in it show its status.
-  onLoaded: () => tray.render(),
+  // An older run was read: the notes sent in it show its status, and the map reads an
+  // analysis run that ended before the list of runs saw it live.
+  onLoaded: () => {
+    tray.render();
+    map.runChanged();
+  },
   onError: showToast,
   noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
   openNote: (id) => noteDetail.open(id),
   openFile: (path) => code.openFile(path),
   reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
-  showChanges: (from, to) => {
-    tray.closeSend();
-    changes.show(from, to);
+  openMemory: (id) => memoryDetail.open(id),
+  showChanges: (from, to) => showChangesAt(from, to, null),
+  changeMapState: () => map.changeMapState(),
+  showChangeMap: (from, to) => {
+    showMap();
+    map.showChangeMap(from, to);
   },
 });
+
+// Shows what runs `from` to `to` changed in the code pane, scrolled to the first hunk
+// `match(file, hunk)` holds when given (changes-view.js, `show`).
+function showChangesAt(from, to, match) {
+  tray.closeSend();
+  // A window too narrow for both panes gives this one to the code, where the changes show.
+  showCode();
+  changes.show(from, to, walkOf(from, to), { match });
+}
+
+// What a walkthrough of runs `from` to `to` needs, `{ report, findings }`, or null for a thread
+// of several runs: a walkthrough belongs to one run (docs/review-assist.md, "Guided
+// walkthrough and risk").
+function walkOf(from, to) {
+  const run = from === to ? runs.byId(from) : null;
+  return (
+    run && {
+      report: reportOf(run)?.report ?? null,
+      findings: reviewOf(run.id, runs.knownViews())?.findings ?? [],
+    }
+  );
+}
 
 const tray = notesTray({
   state,
@@ -141,18 +198,46 @@ const tray = notesTray({
   openSettings: () => settings.open(),
   beforeSend,
   restoreHeader: () => code.restoreHeader(),
+  onTab: (tab) => (tab === "memory" ? memory.show() : memory.hide()),
+});
+
+// Team memory: the tray's Memory tab and a memory's dialog. The node is the map's selected
+// node's label, which the map pane (step 8.3) gives; none until then.
+const memoryDetail = memoryDialog($("memory-dialog"));
+const memory = memoryTab({
+  panelEl: $("memory"),
+  headerEl: $("memory-header"),
+  currentFile: () => (state.file ? { path: state.file.path, node: null } : null),
+  openMemory: (id) => memoryDetail.open(id),
+  openSettings: () => settings.open(),
+});
+
+// The Remember dialog: a team memory drafted from a note, edited and saved by the engineer.
+const remember = rememberDialog($("remember-dialog"), {
+  memoryRepo: () => state.repo.memoryRepo ?? null,
+  openMemory: (id) => memoryDetail.open(id),
+  onDraftStarted: () => runs.started(),
+  onSaved: (reply) => {
+    showToast(
+      reply.noteError
+        ? `Saved to team memory, but the note was not marked: ${reply.noteError}`
+        : "Saved to team memory.",
+    );
+    memory.remembered();
+    void loadNotes();
+  },
 });
 
 // What a run changed, over the open file; Esc, or opening a file, gives the pane back.
 const changes = changesView({
   viewEl: $("changes-view"),
-  setHeader: (title, meta) => {
+  setHeader: (title, meta, controls) => {
     const close = el("button", "button changes-close", "esc");
     close.type = "button";
     close.title = "Back to the file";
     close.addEventListener("click", () => changes.close());
     $("crumbs").replaceChildren(el("b", "", title), close);
-    $("file-meta").textContent = meta;
+    $("file-meta").replaceChildren(...controls, meta);
   },
   notes: () => state.notes,
   noteCard: (note) => tray.noteCard(tray.cardOf(note), () => noteDetail.open(note.id)),
@@ -161,6 +246,7 @@ const changes = changesView({
   },
   onError: showToast,
   onClose: () => code.restoreHeader(),
+  openMemory: (id) => memoryDetail.open(id),
 });
 
 const noteDetail = noteDialog($("note-dialog"), {
@@ -168,7 +254,8 @@ const noteDetail = noteDialog($("note-dialog"), {
     const note = state.notes.find((candidate) => candidate.id === id);
     return note ? { note, run: tray.runFor(note) } : null;
   },
-  canSend: (note) => tray.canSendAlone() && !isResolved(note) && !tray.inLiveRun(note),
+  canSend: (note) =>
+    tray.canSendAlone() && !isResolved(note) && !isAsk(note) && !tray.inLiveRun(note),
   agent: () => state.settings?.agent?.name ?? null,
   showInCode: (note) =>
     note.target === "folder" ? files.showFolder(note.path) : code.showNote(note),
@@ -183,16 +270,61 @@ const noteDetail = noteDialog($("note-dialog"), {
   reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
   startReview: (id) => runs.startReview(id),
   busy: (id) => runs.busyThread(id),
+  makeNote,
+  openRun: (id) => runs.openRun(id),
+  remember: (note) =>
+    remember.open({ note: note.id, where: `${note.id} · ${fullPlace(note)}`, body: note.body }),
+  // The thread a note was sent in starts with that run (src/run.rs, `Runner::thread_tip`).
+  threadLive: (note) => {
+    const root = sentIn(note);
+    return root !== null && runs.threadLive(root);
+  },
+  openMemory: (id) => memoryDetail.open(id),
 });
 
-// A note on a whole file or folder, from the file list.
+// A note on a whole file or folder, or a question about one, from the file list.
 const pathNote = pathNoteDialog($("path-note-dialog"), {
   add: addPathNote,
-  send: (note, options) => tray.sendAlone(note, options),
-  agent: () => state.settings?.agent?.name ?? null,
+  ask: askAboutPath,
+  uncommitted: async (path, target) => {
+    const query = target === "file" ? `?file=${encodeURIComponent(path)}` : "";
+    const response = await fetch(`api/run/uncommitted${query}`);
+    return response.ok ? await response.json() : null;
+  },
+  openSend: () => state.projectOpen && tray.openSend(),
 });
 
-const layout = dividers();
+// Whether the map shows (View > Map, Cmd-Shift-M), for this window's session, and which of
+// the map and the code a window too narrow for both shows (ui/panes.js, `fit`).
+const mapMode = { open: false, shows: "map" };
+
+const layout = dividers({ onNarrow: drawMapMode });
+
+const map = diagramView({
+  mapEl: $("map"),
+  dialogEl: $("node-dialog"),
+  runs,
+  menu,
+  settings: () => state.settings,
+  notes: () => state.notes,
+  noteCard: (note) => tray.noteCard(tray.cardOf(note), () => noteDetail.open(note.id)),
+  showAnchor: (anchor) => {
+    showCode();
+    if (anchor.target === "folder") files.showFolder(anchor.path);
+    else code.showAnchor(anchor);
+  },
+  writeNote: writeOnAnchor,
+  showChangesAt,
+  alone: () => mapMode.open && layout.isNarrow(),
+  // A new analysis, or a flow opened or closed, changes the stripes, chips and step numbers,
+  // and whether a run's dialog offers Change map.
+  onChange: () => {
+    indexMarks();
+    code.redecorate();
+    runs.drawDialog();
+  },
+  onError: showToast,
+});
 
 const welcome = welcomeScreen({
   state,
@@ -259,8 +391,16 @@ function indexNotes() {
   }
 }
 
+// Rebuilds `markByLine` for the open file from the map's analysis, with the step numbers of
+// the flow the map shows.
+function indexMarks() {
+  const lineCount = code.lineCount();
+  const openDiagramId = map.openDiagramId();
+  state.markByLine = fileMarks(map.analysis(), state.file?.path, lineCount, { openDiagramId });
+}
+
 // Stores a note on the whole file or folder at `path` (`target` "file" or "folder") and draws
-// the notes the reply holds. Resolves to `{ note }`, the note stored, or `{ error }`.
+// the notes the reply holds. Resolves to null when stored, or the reason it was refused.
 async function addPathNote(path, target, body) {
   // Numbered as a read is: a read sent before the save that answers after it holds the notes
   // without this one, and `applyNotes` drops it instead of drawing it over them.
@@ -269,11 +409,43 @@ async function addPathNote(path, target, body) {
     method: "POST",
     body: JSON.stringify({ path, target, body }),
   });
-  if (!response.ok) return { error: await response.text() };
+  if (!response.ok) return await response.text();
   const { notes } = await response.json();
   if (applyNotes({ ok: true, body: notes, number })) redrawNotes();
-  // The Rust process adds a note last (src/notes.rs, `add`).
-  return { note: notes.at(-1) };
+  return null;
+}
+
+// Asks `body` about the whole file or folder at `path` (`target` "file" or "folder") of the
+// default agent (src/run.rs, `Runner::ask`), and draws the notes the reply holds, the ask
+// among them. Resolves to null when asked, or the reason it was refused: nothing is saved then.
+async function askAboutPath(path, target, body) {
+  const number = ++notesAsked;
+  const response = await fetch("api/run/ask", {
+    method: "POST",
+    body: JSON.stringify({ note: { path, target, body } }),
+  });
+  if (!response.ok) return await response.text();
+  const { notes } = await response.json();
+  if (applyNotes({ ok: true, body: notes, number })) redrawNotes();
+  await runs.sync();
+  return null;
+}
+
+// Makes a change note of the ask `ask`, on what it asks about, with its text, from its
+// answer's dialog: the ask stays as it is (docs/review-assist.md, "Ask without changing").
+// Lines no longer in the file make a note on the whole file. Resolves to null when made, or the
+// reason it was refused.
+async function makeNote(ask) {
+  const onLines = ask.target === "lines" && ask.anchor === "found";
+  const note = onLines
+    ? { path: ask.path, lines: ask.lines, snippet: ask.snippet, body: ask.body }
+    : { path: ask.path, target: ask.target === "folder" ? "folder" : "file", body: ask.body };
+  const number = ++notesAsked;
+  const response = await fetch("api/notes", { method: "POST", body: JSON.stringify(note) });
+  if (!response.ok) return await response.text();
+  const { notes } = await response.json();
+  if (applyNotes({ ok: true, body: notes, number })) redrawNotes();
+  return null;
 }
 
 // Deletes the note, and with it every run none of whose notes is left (src/run.rs,
@@ -326,6 +498,12 @@ async function changeNote(action, note) {
   }
   state.notes = (await response.json()).notes;
   redrawNotes();
+  // Resolving an ask ended its thread (src/run.rs, `Runner::end_ask`): the thread the run
+  // dialog holds is read again, or it would offer Discard on a thread already ended.
+  if (action === "resolve" && isAsk(note)) {
+    runs.forget();
+    await runs.sync();
+  }
 }
 
 // ---- Send and run -------------------------------------------------------------------------
@@ -356,11 +534,16 @@ function editsDone(run) {
   ).length;
 }
 
-// Called after every change to the run.
-function followRun(run, previous) {
+// Called after every change to the run. `liveEnded` says another live run ended: an analysis,
+// or a run whose end frees one of the 3 places a forced update waits for, so the page refreshes
+// and checks HEAD again (`map.check`).
+function followRun(run, previous, { liveEnded } = {}) {
+  // An analysis is never the latest run: the map follows it.
+  map.runChanged();
   $("tab-run").hidden = run === null;
   if (run === null) {
     if (state.tab === "run") tray.showTab("notes");
+    if (liveEnded) refresh().catch((error) => showToast(String(error)));
     return;
   }
   const fresh = previous?.id !== run.id;
@@ -374,7 +557,9 @@ function followRun(run, previous) {
   // The agent edits files, and the notes are marked sent once it has the prompt: both are
   // read again when the run moves on and when an edit finishes. There is no file watcher
   // (docs/design.md, "Working with the repository").
-  if (!fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run))) {
+  const moved =
+    !fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run));
+  if (moved || liveEnded) {
     refresh().catch((error) => showToast(String(error)));
     if (["ended", "cancelled", "failed"].includes(run.status) && previous.status !== run.status) {
       liveQuotas.refresh({ force: true });
@@ -414,15 +599,25 @@ window.addEventListener("keydown", (event) => {
   }
 
   const typing = event.target.matches("input, textarea");
+  // Cmd-[ and Cmd-] go back and forward through the places jumped from and to (code-view.js).
+  // Claimed even when they do nothing, so WebKit never takes them for page history.
+  if (event.metaKey && (event.key === "[" || event.key === "]")) {
+    event.preventDefault();
+    if (!typing && !state.send && !changes.isOpen()) code.stepHistory(event.key === "[" ? -1 : 1);
+    return;
+  }
   // `a`, Shift-`a` and `r` answer a permission request while the run shows; focus mode hides it.
   const runKeys = !typing && !state.composer && state.tab === "run" && !inFocus();
   if (runKeys && runs.keydown(event)) return;
   if (event.key === "Escape") {
+    // A jump still waiting for the index is not wanted any more.
+    code.cancelJump();
     const action = escapeAction({
       focusMode: inFocus(),
       composer: Boolean(state.composer),
       send: Boolean(state.send),
       changes: changes.isOpen(),
+      changeMap: map.showsChangeMap(),
       selection: Boolean(state.selection),
       live: runs.live(),
     });
@@ -430,6 +625,7 @@ window.addEventListener("keydown", (event) => {
     else if (action === "close-composer") code.closeComposer({ save: false });
     else if (action === "close-send") tray.closeSend();
     else if (action === "close-changes") changes.close();
+    else if (action === "leave-change-map") map.leaveChangeMap();
     else if (action === "clear-selection") code.clearSelection();
     else if (action === "stop") runs.stop();
   } else if (state.send) {
@@ -442,6 +638,12 @@ window.addEventListener("keydown", (event) => {
     const row = files.focusedRow();
     if (row) pathNote.open(row.path, row.target);
     else code.openComposer();
+  } else if (event.key === "q" && !typing && !event.metaKey && !event.ctrlKey) {
+    event.preventDefault();
+    // A question about the selected lines, or the file or folder of a row of the file list.
+    const row = files.focusedRow();
+    if (row) pathNote.open(row.path, row.target, { intent: "ask" });
+    else code.askOnSelection();
   }
 });
 
@@ -450,13 +652,26 @@ window.addEventListener("keydown", (event) => {
 function guardDraft(action) {
   // A draft in an open dialog (a note's text being edited, a follow-up) keeps its dialog,
   // which says why.
-  if ([noteDetail, pathNote, runs].some((dialog) => dialog.holdDraft(action))) return true;
+  if ([noteDetail, pathNote, runs, remember].some((dialog) => dialog.holdDraft(action))) {
+    return true;
+  }
+  // A flow's question in the map's box: the box must be in view to be asked or cleared. It
+  // takes the focus last: `welcome.hide` gives it to the code, which would blur the box.
+  if (map.hasDraft()) {
+    for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
+    welcome.hide();
+    showMap();
+    map.holdDraft(action);
+    return true;
+  }
   if (!state.composer?.text.trim()) return false;
   // The note must be in view to be saved or discarded: a dialog over it would make it inert.
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   welcome.hide();
   const label = state.composer.node.querySelector(".composer-label");
-  label.textContent = `Save or discard this note before ${action}.`;
+  const draft =
+    state.composer.intent === "ask" ? "Ask or discard this question" : "Save or discard this note";
+  label.textContent = `${draft} before ${action}.`;
   label.classList.add("failed");
   state.composer.node.querySelector("textarea").focus();
   return true;
@@ -469,7 +684,9 @@ function quit() {
 // There is no file watcher (docs/design.md, "Working with the repository"): the file list,
 // the open file, and the notes change while the engineer is in another app, so all three are
 // read again on return and drawn once, so the notes never show on the old text. Not while
-// the composer is open: reading the file again would move its lines under the text.
+// the composer is open: reading the file again would move its lines under the text. The
+// analysis is read again either way, and then compared with HEAD, which may start the forced
+// update (`map.check`).
 let refreshes = 0;
 async function refresh() {
   // A project being opened replaces this page: what a refresh drew would be thrown away,
@@ -481,16 +698,37 @@ async function refresh() {
     await welcome.loadRecent();
     return;
   }
-  if (!state.projectOpen || state.composer) return;
+  if (!state.projectOpen) return;
+  // The definitions index looks at the files again on its own thread (src/definitions.rs);
+  // nothing here waits for it. Even with the composer open: the index moves no line.
+  void fetch("api/definitions/refresh", { method: "POST" });
+  // Another window may have analyzed the repository, or the code under a node moved. With the
+  // composer open the file is not read again, but the map is.
+  if (state.composer) {
+    map
+      .load()
+      .then(() => map.check())
+      .catch((error) => showToast(String(error)));
+    return;
+  }
   const path = state.wanted;
   // A later refresh may answer first, as a run's edits come one after another: only the
   // latest refresh draws, or an older file would be painted over a newer one.
   const generation = ++refreshes;
-  const [repo, notes, file] = await Promise.all([
+  const [repo, notes, analysis, file] = await Promise.all([
     fetch("api/repo").then(async (response) => (response.ok ? response.json() : null)),
     fetchNotes(),
+    map.fetchAnalysis(),
     path ? code.fetchFile(path) : null,
   ]);
+  // Before the check below, and before the file, which indexes the stripes and chips with the
+  // notes, so both are drawn on the new text. Even when the engineer moved on: a file opened
+  // meanwhile is indexed against the analysis the map holds, and dropping this reply would
+  // leave it without its stripes until the next focus. Its number keeps a newer reply's.
+  void map
+    .applyAnalysis(analysis)
+    .then(() => map.check())
+    .catch((error) => showToast(String(error)));
   // The engineer moved on while the replies were in flight: their action wins.
   if (state.composer || state.wanted !== path || generation !== refreshes) return;
 
@@ -570,6 +808,8 @@ window.postil = {
       wizard.open();
     } else if (command === "usage") usage.open();
     else if (command === "focus-mode") toggleFocus();
+    else if (command === "map") toggleMap();
+    else if (command === "map-markers") toggleMapMarkers();
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
@@ -592,12 +832,15 @@ function toggleFocus() {
   liveQuotas.closePopover();
   tray.closeSend();
   movePanes(() => document.body.classList.add("focus-mode"));
+  drawMapMode();
   // A control in a hidden pane would keep the keys.
   codeEl.focus();
 }
 
 function leaveFocus() {
-  if (inFocus()) movePanes(() => document.body.classList.remove("focus-mode"));
+  if (!inFocus()) return;
+  movePanes(() => document.body.classList.remove("focus-mode"));
+  drawMapMode();
 }
 
 // Eases the side panes while `change` opens or closes them, and only then (app.css,
@@ -615,6 +858,103 @@ function movePanes(change) {
 
 function inFocus() {
   return document.body.classList.contains("focus-mode");
+}
+
+// ---- The map ------------------------------------------------------------------------------
+
+// Cmd-Shift-M: opens the map, or closes it; in a window too narrow for the map beside the code,
+// switches between the two, and the sidebar's Map button closes it. Focus mode hides the map,
+// so it gives way, and an open map shows again rather than closing unseen.
+function toggleMap() {
+  if (welcome.isShown()) return;
+  const hidden = inFocus();
+  // Out of focus mode onto the map, which is what was asked for, in a narrow window too.
+  if (hidden) mapMode.shows = "map";
+  leaveFocus();
+  if (!mapMode.open) setMapOpen(true);
+  else if (hidden) map.focus();
+  else if (layout.isNarrow()) {
+    mapMode.shows = mapMode.shows === "map" ? "code" : "map";
+    drawMapMode();
+    if (mapMode.shows === "map") map.focus();
+    else codeEl.focus();
+  } else setMapOpen(false);
+}
+
+function setMapOpen(open) {
+  mapMode.open = open;
+  mapMode.shows = "map";
+  // The panes are fitted again for the map, and draw the mode through `drawMapMode`.
+  layout.setMapOpen(open);
+  if (open) map.focus();
+}
+
+$("toggle-map").addEventListener("click", () => {
+  if (welcome.isShown()) return;
+  leaveFocus();
+  setMapOpen(!mapMode.open);
+});
+
+// Shows the map beside the code, or, in a narrow window, the one of them `mapMode.shows`.
+// Focus mode shows the code alone, whatever the window: the map waits, open, for its end.
+function drawMapMode(narrow = layout.isNarrow()) {
+  const open = mapMode.open && !inFocus();
+  const shown = open && (!narrow || mapMode.shows === "map");
+  $("map").hidden = !shown;
+  $("code-pane").classList.toggle("map-full", open && narrow && mapMode.shows === "map");
+  $("toggle-map").setAttribute("aria-pressed", String(mapMode.open));
+  map.setShown(shown);
+  syncCodeToMap();
+}
+
+// Shows the map: out of focus mode, opened, and in a narrow window in place of the code.
+function showMap() {
+  leaveFocus();
+  if (!mapMode.open) setMapOpen(true);
+  else if (layout.isNarrow() && mapMode.shows !== "map") {
+    mapMode.shows = "map";
+    drawMapMode();
+  }
+}
+
+// Opens the map at node `nodeId` of diagram `diagramId`, a click on its stripe or chip in the
+// code.
+function openNodeInMap(diagramId, nodeId) {
+  showMap();
+  map.revealNode(diagramId, nodeId);
+}
+
+// The map follows the code pane's line while it shows.
+function syncCodeToMap() {
+  if (!map.isShown()) return;
+  const active = code.activeLine();
+  map.followCode(active?.path ?? null, active?.line ?? null);
+}
+
+// View > Map Markers: the stripes and chips go, or come back.
+function toggleMapMarkers() {
+  state.mapMarkers = !state.mapMarkers;
+  code.redecorate();
+}
+
+// A narrow window showing the map alone gives the pane to the code, where a node's code shows.
+function showCode() {
+  if (!mapMode.open || !layout.isNarrow() || mapMode.shows === "code") return;
+  mapMode.shows = "code";
+  drawMapMode();
+}
+
+// Writes a note on the code a map node's reference `anchor` points at, or asks about it
+// (`intent` "ask"): on its lines in the composer, or on its whole file or folder.
+async function writeOnAnchor(anchor, intent) {
+  if (anchor.target !== "lines") {
+    pathNote.open(anchor.path, anchor.target, { intent });
+    return;
+  }
+  showCode();
+  if (state.file?.path !== anchor.path && !(await code.openFile(anchor.path))) return;
+  const range = { start: anchor.lines.start - 1, end: anchor.lines.end - 1 };
+  code.openComposer(range, { intent });
 }
 
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
@@ -649,6 +989,8 @@ function applySettings(settings) {
   appliedTheme = settings.theme;
   liveQuotas.setSettings(settings);
   tray.renderSendBar();
+  // Another Analyzer may start the forced update a missing one held back.
+  if (state.projectOpen) void map.check().catch((error) => showToast(String(error)));
 }
 
 const liveQuotas = usageBar({
@@ -716,7 +1058,9 @@ async function start() {
   showRepo(repo);
   await files.loadFolders().catch(() => {});
   files.render();
-  await loadNotes();
+  // The analysis too, for the stripes and chips in the code: a repository without one reads
+  // `null`, and the layout library waits for the map to open.
+  await Promise.all([loadNotes(), map.load().catch((error) => showToast(String(error)))]);
   // The latest run, this session's or one from before a restart.
   await runs.sync();
 
@@ -725,6 +1069,8 @@ async function start() {
     return;
   }
   liveQuotas.start();
+  // Commits made while Postil was closed are checked once it opens.
+  void map.check().catch((error) => showToast(String(error)));
   if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });
 }
 

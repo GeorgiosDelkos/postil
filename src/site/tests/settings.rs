@@ -18,10 +18,12 @@ fn custom_settings() -> serde_json::Value {
         "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
         "enabledAgents": ["Grok", "Local"],
         "agent": { "name": "Local", "model": null },
+        "analyzer": { "name": "Grok", "model": "grok-4.7-fast" },
         "reviewers": [
             { "name": "Grok", "model": "grok-4.7" },
             { "name": "Grok", "model": null },
         ],
+        "agentMemory": false,
     })
 }
 
@@ -55,7 +57,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     assert_eq!(restarted["settings"], custom_settings());
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 2);
+    assert_eq!(stored["version"], 4);
     assert_eq!(stored["settings"], custom_settings());
 }
 
@@ -168,7 +170,7 @@ fn settings_that_break_a_rule_are_refused_and_nothing_is_written() {
     let longest = "a".repeat(40);
     let mut at_limits = custom_settings();
     at_limits["customAgents"] = serde_json::json!([{ "name": longest, "command": "x" }]);
-    at_limits["enabledAgents"] = serde_json::json!([longest]);
+    at_limits["enabledAgents"] = serde_json::json!([longest, "Grok"]);
     at_limits["agent"] = serde_json::json!({ "name": longest, "model": "m".repeat(200) });
     at_limits["reviewers"] = serde_json::json!([]);
     for size in [11, 20] {
@@ -195,8 +197,8 @@ fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
             "is not valid settings JSON",
         ),
         (
-            "{\"version\": 3, \"settings\": {}}",
-            "written by a newer Postil (format version 3)",
+            "{\"version\": 5, \"settings\": {}}",
+            "written by a newer Postil (format version 5)",
         ),
         (
             "{\"version\": 1, \"settings\": {\"agent\": 7}}",
@@ -400,7 +402,7 @@ fn agents_are_found_on_the_search_path_and_custom_ones_by_their_command() {
 }
 
 #[test]
-fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_2() {
+fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_4() {
     let repo = TempRepo::new("settings-v1");
     let file = repo.config().join("settings.json");
     fs::create_dir_all(repo.config()).unwrap();
@@ -441,9 +443,114 @@ fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_2() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 2);
+    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["settings"]["analyzer"], serde_json::Value::Null);
     assert_eq!(stored["settings"]["agent"], view["settings"]["agent"]);
     assert_eq!(stored["settings"]["reviewers"][0]["model"], "grok-4.7");
+}
+
+#[test]
+fn a_version_2_settings_file_still_reads() {
+    let repo = TempRepo::new("settings-v2");
+    let file = repo.config().join("settings.json");
+    fs::create_dir_all(repo.config()).unwrap();
+    let v2 = serde_json::json!({
+        "version": 2,
+        "settings": {
+            "enabledAgents": ["Grok"],
+            "agent": { "name": "Grok", "model": "grok-4.7" },
+            "reviewers": [],
+        },
+    });
+    fs::write(&file, v2.to_string()).unwrap();
+    let site = repo.empty_site();
+
+    let view = get_json(&site, SETTINGS);
+    assert_eq!(view["problem"], serde_json::Value::Null, "{view}");
+    assert_eq!(view["settings"]["analyzer"], serde_json::Value::Null);
+    assert_eq!(view["settings"]["agent"]["model"], "grok-4.7");
+    let analyzer = crate::settings::load(&file).settings.analyzer().unwrap();
+    assert_eq!(
+        (analyzer.name.as_str(), analyzer.model.as_deref()),
+        ("Grok", Some("grok-4.7")),
+        "with no analyzer, analyses go to the agent notes are sent to, on its model"
+    );
+}
+
+#[test]
+fn a_version_3_settings_file_still_reads_with_team_memory_off() {
+    let repo = TempRepo::new("settings-v3");
+    let file = repo.config().join("settings.json");
+    fs::create_dir_all(repo.config()).unwrap();
+    let v3 = serde_json::json!({
+        "version": 3,
+        "settings": {
+            "enabledAgents": ["Grok"],
+            "agent": { "name": "Grok", "model": null },
+            "analyzer": { "name": "Grok", "model": "grok-4.7-fast" },
+        },
+    });
+    fs::write(&file, v3.to_string()).unwrap();
+
+    let view = get_json(&repo.empty_site(), SETTINGS);
+    assert_eq!(view["problem"], serde_json::Value::Null, "{view}");
+    assert_eq!(view["settings"]["analyzer"]["model"], "grok-4.7-fast");
+    assert_eq!(view["settings"]["agentMemory"], false);
+}
+
+#[test]
+fn the_analyzer_falls_back_to_the_default_agent() {
+    let repo = TempRepo::new("settings-analyzer");
+    let site = repo.empty_site();
+    let file = repo.config().join("settings.json");
+    let mut chosen = custom_settings();
+    chosen["enabledAgents"] = serde_json::json!(["Grok", "Local"]);
+    chosen["agent"] = serde_json::json!({ "name": "Grok", "model": "grok-4.7" });
+    chosen["analyzer"] = serde_json::json!({ "name": "Local", "model": "big" });
+    let (status, reply) = save(&site, &chosen.to_string());
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let analyzer = crate::settings::load(&file).settings.analyzer().unwrap();
+    assert_eq!(
+        (analyzer.name.as_str(), analyzer.model.as_deref()),
+        ("Local", Some("big")),
+        "the analyzer's own slot, model included"
+    );
+    assert_eq!(analyzer.command, "local-agent --acp");
+
+    // An agent in use as the analyzer cannot be turned off: the save is refused.
+    let mut off = chosen.clone();
+    off["enabledAgents"] = serde_json::json!(["Grok"]);
+    let (status, reply) = save(&site, &off.to_string());
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(reply.contains("\"Local\" cannot analyze"), "{reply}");
+    // Its model is checked as the other slots' are.
+    let mut stray = chosen.clone();
+    stray["analyzer"]["model"] = " big".into();
+    let (status, reply) = save(&site, &stray.to_string());
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(
+        reply.contains("the model of \"Local\" must be 1 to 200"),
+        "{reply}"
+    );
+
+    chosen["analyzer"] = serde_json::Value::Null;
+    let (status, reply) = save(&site, &chosen.to_string());
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let analyzer = crate::settings::load(&file).settings.analyzer().unwrap();
+    assert_eq!(
+        (analyzer.name.as_str(), analyzer.model.as_deref()),
+        ("Grok", Some("grok-4.7"))
+    );
+
+    // With no agent chosen either, there is nothing to analyze with.
+    chosen["agent"] = serde_json::Value::Null;
+    let (status, reply) = save(&site, &chosen.to_string());
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let error = crate::settings::load(&file)
+        .settings
+        .analyzer()
+        .unwrap_err();
+    assert!(error.to_string().contains("choose the agent"), "{error}");
 }
 
 #[test]
@@ -754,18 +861,22 @@ const LAYOUT: &str = "postil://localhost/api/layout";
 fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
     let repo = TempRepo::new("layout");
     let site = repo.empty_site();
-    let defaults = serde_json::json!({ "sidebar": 248, "tray": 320 });
+    let defaults = serde_json::json!({ "sidebar": 248, "tray": 320, "map": 400 });
     let fresh = get_json(&site, LAYOUT);
     assert_eq!(
         fresh,
         serde_json::json!({
-            "sidebar": 248, "tray": 320,
+            "sidebar": 248, "tray": 320, "map": 400,
             "defaults": defaults,
-            "limits": { "sidebar": [200, 480], "tray": [280, 720] },
+            "limits": { "sidebar": [200, 480], "tray": [280, 720], "map": [320, 960] },
         })
     );
 
-    let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
+    let (status, body) = put(
+        &site,
+        LAYOUT,
+        r#"{"sidebar": 300, "tray": 460, "map": 520}"#,
+    );
     assert_eq!(status, StatusCode::OK, "{body}");
     // Another window, or the next start, reads the same widths: they are the Mac's, not
     // the project's.
@@ -776,19 +887,30 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         .unwrap();
     let kept = get_json(&again, LAYOUT);
     assert_eq!(
-        (kept["sidebar"].clone(), kept["tray"].clone()),
-        (300.into(), 460.into())
+        (
+            kept["sidebar"].clone(),
+            kept["tray"].clone(),
+            kept["map"].clone()
+        ),
+        (300.into(), 460.into(), 520.into())
     );
 
     // The whole message, as the page shows it: no serde position, no "unreadable" prefix.
-    let (status, reply) = put(&site, LAYOUT, r#"{"sidebar": 248, "tray": 900}"#);
+    let (status, reply) = put(
+        &site,
+        LAYOUT,
+        r#"{"sidebar": 248, "tray": 900, "map": 400}"#,
+    );
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(reply, "the tray is 900 px wide, outside 280 to 720 px");
     for (body, words) in [
-        (r#"{"sidebar": 100, "tray": 320}"#, "outside 200 to 480"),
+        (
+            r#"{"sidebar": 100, "tray": 320, "map": 400}"#,
+            "outside 200 to 480",
+        ),
         (r#"{"sidebar": 248}"#, "unreadable layout"),
         (
-            r#"{"sidebar": 248, "tray": 320, "x": 1}"#,
+            r#"{"sidebar": 248, "tray": 320, "map": 400, "x": 1}"#,
             "unreadable layout",
         ),
     ] {
@@ -828,7 +950,11 @@ fn a_hand_edited_layout_with_a_width_out_of_range_reads_as_the_defaults() {
 fn without_a_configuration_directory_widths_are_the_defaults_and_not_kept() {
     let site = Site::new(None, None, None, no_agents(), quiet());
     assert_eq!(get_json(&site, LAYOUT)["tray"], 320);
-    let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
+    let (status, body) = put(
+        &site,
+        LAYOUT,
+        r#"{"sidebar": 300, "tray": 460, "map": 520}"#,
+    );
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("HOME"), "{body}");
 }

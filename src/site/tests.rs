@@ -1,9 +1,13 @@
 //! Tests of the page's API ([`Site`]), through requests as the page sends them, one file per
 //! area. The helpers here are shared by the areas and by the window's tests in `shell.rs`.
-//! The `notes` and `settings` areas hide `crate::notes` and `crate::settings` from
+//! The `analysis`, `memory`, `notes` and `settings` areas hide those crate modules from
 //! `use super::*`: an area that needs those modules imports them by path.
 
+mod analysis;
+mod asks;
+mod definitions;
 mod files;
+mod memory;
 mod notes;
 mod page_e2e;
 mod projects;
@@ -77,8 +81,11 @@ impl TempRepo {
         assert!(status.success(), "git {args:?}");
     }
 
+    /// Writes `file`, making its folders first.
     pub(crate) fn write(&self, file: &str, text: &str) {
-        fs::write(self.root.join(file), text).unwrap();
+        let path = self.root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
     }
 
     /// A site with this repository open.

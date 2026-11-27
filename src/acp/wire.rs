@@ -19,6 +19,10 @@ use serde_json::Value;
 /// integration").
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
+/// The JSON-RPC error code an agent answers with when the engineer must sign in first: the
+/// schema's `ErrorCode` "Authentication required", `auth_required`.
+pub(crate) const AUTH_REQUIRED: i64 = -32000;
+
 /// A JSON-RPC 2.0 request from the app. Every request the app sends has a numeric id.
 #[derive(Debug, Serialize)]
 pub(crate) struct Request<'a, P> {
@@ -151,10 +155,32 @@ pub(crate) struct InitializeResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NewSessionParams<'a> {
-    /// The repository root: an absolute path, as the protocol requires.
+    /// The session's working directory, the run's worktree: an absolute path, as the protocol
+    /// requires.
     pub(crate) cwd: &'a str,
-    /// Always empty: the agent keeps the MCP servers of its own configuration.
-    pub(crate) mcp_servers: [(); 0],
+    /// The MCP servers the agent starts for this session, besides those of its own
+    /// configuration: hippius-mem when team memory is on, else none.
+    pub(crate) mcp_servers: &'a [McpServer],
+}
+
+/// An MCP server the agent starts over stdio: the schema's `McpServerStdio`, the one form
+/// every agent must support. It has no `type` field, which only the HTTP and SSE forms carry,
+/// and no working directory: the agent starts it in the session's `cwd`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct McpServer {
+    pub(crate) name: String,
+    /// The program, by its absolute path, as the schema requires.
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    /// Set on top of the environment the agent gives it.
+    pub(crate) env: Vec<EnvVariable>,
+}
+
+/// One variable of an [`McpServer`]'s environment.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EnvVariable {
+    pub(crate) name: String,
+    pub(crate) value: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -42,8 +42,8 @@ pull request tool: the agent edits, and you read and write notes.
 3. **Note** a line range: select lines and press `c` (or right-click, Add note), type, and
    press `Cmd-Enter`. A note keeps the text of its lines, so it follows that text when the file
    changes. For a note on a whole file or folder, right-click it in the file tree and choose
-   Add Note (or press `c` on its row). The dialog saves the note to the tray, or saves it and
-   sends it to the default agent at once.
+   Add Note (or press `c` on its row). Like a line note, it saves to the tray first so you can
+   decide when and how to send it.
 4. **Send** notes to an agent. The send step shows the exact prompt the agent will receive.
    A single note can also be sent from its card or its dialog. Each send starts a thread: the
    agent works in a git worktree of its own, on a branch `postil/r<n>-<slug>` that starts at

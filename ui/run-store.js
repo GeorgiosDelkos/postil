@@ -13,9 +13,10 @@ import { isLive } from "./run.js";
 // them is refused, so the page offers none.
 export const MAX_LIVE = 3;
 
-// `render()` is called after anything the store holds changed; `onChange(run, previous)` after
-// every fetch that changed the latest run; `onLoaded()` after an older run was read;
-// `onError(text)` with the reason a request failed.
+// `render()` is called after anything the store holds changed; `onChange(run, previous,
+// { liveEnded })` after every fetch that changed the latest run, `liveEnded` whether a live run
+// other than the latest ended in it (an analysis, or a run that frees one of the 3 places);
+// `onLoaded()` after an older run was read; `onError(text)` with the reason a request failed.
 export function runStore({ render, onChange, onLoaded, onError }) {
   // The latest run, followed as it changes.
   let run = null;
@@ -86,14 +87,18 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     return { ...reply, notes: known.notes, prompt: known.prompt, entries };
   }
 
-  // Follows the live runs other than the latest. One that ended is kept with the older runs,
-  // final, and the list is read again: its thread changed, and it is live no more.
+  // Follows the live runs other than the latest, and resolves to whether one of them ended. One
+  // that ended is kept with the older runs, final, and the list is read again: its thread
+  // changed, and it is live no more.
   async function followLive(previous) {
+    let ended = false;
     // The run the latest replaced may still run: a send started another thread.
     if (previous && previous.id !== run?.id && isLive(previous)) {
       liveViews.set(previous.id, previous);
     }
-    for (const id of liveThreads.keys()) {
+    // The runs followed too: a list read after one ended (as after `forget`) no longer names
+    // it, and it is read once more, final, so its end is reported.
+    for (const id of new Set([...liveThreads.keys(), ...liveViews.keys()])) {
       if (id === run?.id) continue;
       const view = await fetchLive(id, liveViews.get(id));
       if (isLive(view)) {
@@ -105,10 +110,12 @@ export function runStore({ render, onChange, onLoaded, onError }) {
       asked.add(id);
       threads.clear();
       listStale = true;
+      ended = true;
     }
     for (const id of liveViews.keys()) {
       if (id === run?.id || !liveThreads.has(id)) liveViews.delete(id);
     }
+    return ended;
   }
 
   async function sync() {
@@ -125,12 +132,14 @@ export function runStore({ render, onChange, onLoaded, onError }) {
         again = false;
         const previous = run;
         const next = await fetchRun();
-        if (next === null && previous === null && !listStale) continue;
+        // With no latest run there is nothing to read, unless a live run of another thread is
+        // followed: an analysis is never the latest run (src/run.rs, `Runner::analyze`).
+        if (next === null && previous === null && !listStale && liveThreads.size === 0) continue;
         run = next;
         if (listStale || previous?.id !== run?.id || previous?.status !== run?.status) {
           await fetchIds();
         }
-        await followLive(previous);
+        const liveEnded = await followLive(previous);
         // A run that started or ended changed its thread: the worktree was made (`skipped`),
         // its tip moved, or a run elsewhere ended it.
         if (previous?.id !== run?.id || previous?.status !== run?.status) threads.clear();
@@ -140,7 +149,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
           if (work && work.kind !== "failed") threads.delete(id);
         }
         render();
-        onChange(run, previous);
+        onChange(run, previous, { liveEnded });
       } while (again);
       retryIn = 1000;
     } catch (error) {
@@ -300,11 +309,25 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     return post("api/run/cancel", { run: id }).catch((error) => onError(error.message));
   }
 
+  // A run started that never becomes the latest (a memory draft, src/run.rs `Runner::draft`):
+  // the list is read again at once, so its thread shows busy before the run sends a nudge.
+  function started() {
+    listStale = true;
+    return sync();
+  }
+
   // This window's live runs, oldest first.
   function liveRuns() {
     const live = [...liveViews.values()];
     if (isLive(run)) live.push(run);
     return live.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)));
+  }
+
+  // Follows a run this page started outside the Run tab, an analysis (`POST api/analysis`):
+  // it is in no list the store has read yet, so the list is read again.
+  function track() {
+    listStale = true;
+    return sync();
   }
 
   // Starts the settings' reviewers on run `of`.
@@ -328,8 +351,14 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     answer,
     stop,
     liveRuns,
+    track,
     // The thread live run `id` works in, by its first run's id; undefined for a run not live.
     liveThread: (id) => liveThreads.get(id),
+    // Whether a run of the thread that starts at run `root` is under way in this window.
+    // From the live runs followed, as the run dialog's `liveOf` does: `liveThreads` keeps an ended
+    // run until the list is read again, which a run that is never the latest does not cause.
+    threadLive: (root) => liveRuns().some((view) => liveThreads.get(view.id) === root),
+    started,
     startReview,
     thread,
     endThread,

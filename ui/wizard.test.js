@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   STEPS,
   applyDetectedDefaults,
+  applyMemoryDefault,
   clampStep,
   npxWarning,
   readinessItems,
@@ -25,7 +26,9 @@ function defaults() {
     customAgents: [],
     enabledAgents: [],
     agent: null,
+    analyzer: null,
     reviewers: [],
+    agentMemory: false,
   };
 }
 
@@ -67,6 +70,18 @@ test("first-run defaults enable every found built-in agent and pick the first as
   assert.equal(applyDetectedDefaults(empty, none), empty);
 });
 
+test("a first run's team memory follows whether hippius-mem is ready, both ways", () => {
+  const memory = (kind) => ({ pending: false, state: kind && { kind, path: "/p" }, setup: null });
+  const on = applyMemoryDefault(defaults(), memory("ready"));
+  assert.equal(on.agentMemory, true);
+  for (const unready of [memory("unconfigured"), memory("missing"), memory(null)]) {
+    const draft = defaults();
+    assert.equal(applyMemoryDefault(draft, unready), draft);
+    // A draft made while it was ready turns it off again once it is not.
+    assert.equal(applyMemoryDefault(on, unready).agentMemory, false);
+  }
+});
+
 test("toggling an agent in the wizard reconciles the default agent and reviewers", () => {
   let draft = defaults();
   draft = toggleWizardAgent(draft, "Claude", true);
@@ -80,9 +95,13 @@ test("toggling an agent in the wizard reconciles the default agent and reviewers
   draft = {
     ...draft,
     agent: slot("Claude", "opus"),
+    analyzer: slot("Antigravity", "gemini-4-carbon"),
     reviewers: [slot("Claude"), slot("Antigravity", "gemini-4-neon"), slot("Claude", "haiku")],
   };
+  const analyzerOff = toggleWizardAgent(draft, "Antigravity", false);
+  assert.equal(analyzerOff.analyzer, null, "analyses go to the default agent then");
   draft = toggleWizardAgent(draft, "Claude", false);
+  assert.deepEqual(draft.analyzer, slot("Antigravity", "gemini-4-carbon"), "another's stays");
   assert.deepEqual(draft.enabledAgents, ["Antigravity"]);
   assert.deepEqual(
     draft.agent,

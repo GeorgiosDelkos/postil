@@ -17,17 +17,20 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
+use crate::analysis::{self, AnalysisJob, AnalyzeRequest, UpdateRequest, Verdict};
+use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::folders::{self, Folders};
-use crate::highlight::{Highlighter, Token};
+use crate::highlight::{self, Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
+use crate::memory::{self, Memory, MemoryId, RememberRequest};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
-use crate::run::{Ending, Notify, Runner};
-use crate::settings::{self, CustomAgent, RawSettings, Settings};
+use crate::run::{Ending, Notify, Runner, StartedUpdate};
+use crate::settings::{self, CustomAgent, RawSettings, Settings, TeamMemory};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
@@ -51,6 +54,16 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/tree.js",
         "text/javascript",
         include_bytes!("../ui/tree.js"),
+    ),
+    (
+        "/definitions.js",
+        "text/javascript",
+        include_bytes!("../ui/definitions.js"),
+    ),
+    (
+        "/definitions-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/definitions-dialog.js"),
     ),
     (
         "/icons.js",
@@ -195,6 +208,21 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/file-list.js"),
     ),
     (
+        "/memory.js",
+        "text/javascript",
+        include_bytes!("../ui/memory.js"),
+    ),
+    (
+        "/memory-tab.js",
+        "text/javascript",
+        include_bytes!("../ui/memory-tab.js"),
+    ),
+    (
+        "/memory-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/memory-dialog.js"),
+    ),
+    (
         "/notes-tray.js",
         "text/javascript",
         include_bytes!("../ui/notes-tray.js"),
@@ -203,6 +231,23 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/welcome.js",
         "text/javascript",
         include_bytes!("../ui/welcome.js"),
+    ),
+    (
+        "/diagram.js",
+        "text/javascript",
+        include_bytes!("../ui/diagram.js"),
+    ),
+    (
+        "/diagram-view.js",
+        "text/javascript",
+        include_bytes!("../ui/diagram-view.js"),
+    ),
+    // The map's layout library (ui/vendor/dagre.LICENSE), loaded by a script element when the
+    // map first opens, not imported.
+    (
+        "/vendor/dagre.min.js",
+        "text/javascript",
+        include_bytes!("../ui/vendor/dagre.min.js"),
     ),
     (
         "/icons.svg",
@@ -326,6 +371,8 @@ pub(crate) struct Site {
     sessions: SessionScanner,
     /// On-demand background probes for the models each agent offers (`models.rs`).
     models: ModelProber,
+    /// Whether hippius-mem is installed and set up, checked in the background (`memory.rs`).
+    memory: Memory,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
 }
@@ -336,6 +383,8 @@ struct Project {
     repo: Arc<Repo>,
     /// The project's runs and the agent kept between them.
     runner: Arc<Runner>,
+    /// Where each name is defined, indexed on a thread of its own.
+    definitions: Definitions,
     /// Why the recent projects could not be updated when this project opened, shown under
     /// the branch name. Kept with the project, so every page load of it shows the line.
     warning: Option<String>,
@@ -343,6 +392,7 @@ struct Project {
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoInfo<'a> {
     name: String,
     root: String,
@@ -350,6 +400,9 @@ struct RepoInfo<'a> {
     files: Vec<String>,
     bench: Option<&'a str>,
     warning: Option<String>,
+    /// The repository's name in team memory ([`Repo::memory_name`]); `None` without an
+    /// `origin` remote, when the Remember dialog offers only the whole team's memory.
+    memory_repo: Option<String>,
 }
 
 /// An entry of the reply to `/api/recent`.
@@ -377,11 +430,57 @@ struct SettingsView<'a> {
     first_run: bool,
     /// Every agent, built-in ones first; `None` while the agent scan runs.
     agents: Option<Vec<AgentView<'a>>>,
+    /// Team memory: whether hippius-mem is installed and set up.
+    memory: MemoryView,
     /// External tools found on the search path; `None` while the agent scan runs.
     tools: Option<ToolsView>,
     /// The smallest and largest code font size.
     font_sizes: [u8; 2],
     tab_widths: [u8; 3],
+}
+
+/// Team memory as the settings dialog shows it.
+#[derive(Debug, Serialize)]
+struct MemoryView {
+    /// Whether a check or a set up runs, so the page asks again shortly.
+    pending: bool,
+    /// `None` while a check runs.
+    state: Option<MemoryStateView>,
+    /// The last set up; `None` before the first.
+    setup: Option<memory::Setup>,
+}
+
+/// [`memory::State`] with its path as text.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum MemoryStateView {
+    Missing,
+    Unconfigured {
+        path: String,
+        problem: Option<String>,
+    },
+    Ready {
+        path: String,
+    },
+}
+
+impl From<memory::Status> for MemoryView {
+    fn from(status: memory::Status) -> Self {
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        let state = status.state.map(|state| match state {
+            memory::State::Missing => MemoryStateView::Missing,
+            memory::State::Unconfigured { path, problem } => MemoryStateView::Unconfigured {
+                path: text(&path),
+                problem,
+            },
+            memory::State::Ready { path } => MemoryStateView::Ready { path: text(&path) },
+        });
+        Self {
+            pending: state.is_none() || status.setup == Some(memory::Setup::Running),
+            state,
+            setup: status.setup,
+        }
+    }
 }
 
 /// External tools found on the search path, for the startup wizard's readiness check.
@@ -477,6 +576,7 @@ struct LayoutView {
 struct LayoutLimits {
     sidebar: [u32; 2],
     tray: [u32; 2],
+    map: [u32; 2],
 }
 
 /// The body of `POST /api/run`.
@@ -526,6 +626,24 @@ struct EditNote {
     body: String,
 }
 
+/// The body of `POST /api/memory/draft`: the note a memory is drafted from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftRequest {
+    note: String,
+}
+
+/// The reply to `POST /api/memory/draft`. `fallback` is the note's text, which the dialog opens
+/// with when no draft comes.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum DraftReply {
+    /// No draft run: the note was never sent, or its thread ended or has no worktree record.
+    Fallback { body: String },
+    /// The draft run started; its view's `draft` holds the draft once it is over.
+    Run { run: String, fallback: String },
+}
+
 /// The body of `POST /api/run/follow`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -564,14 +682,31 @@ struct PreviewView {
     /// The files linked after the text, relative to the repository root. A folder note's
     /// folder is not among them (`notes::Prompt::files`).
     files: Vec<String>,
+    #[serde(flatten)]
+    uncommitted: UncommittedView,
+}
+
+/// The reply to `/api/run/uncommitted`, and part of `/api/run/preview`'s.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UncommittedView {
     /// How many changes the engineer's working tree has since the last commit, as `git status`
     /// lists them, which the thread, started from that commit, does not see (docs/design.md,
     /// "Threads"); `None` when the status could not be read, which the page says.
     uncommitted: Option<usize>,
-    /// The linked files among them: their notes' lines may not match the agent's copy.
+    /// The files asked about among them (the linked files of a preview, the file of an ask):
+    /// their notes' lines may not match the agent's copy.
     uncommitted_noted: Vec<String>,
     /// Why `git status` failed, when `uncommitted` is `None`.
     uncommitted_error: Option<String>,
+}
+
+/// The body of `POST /api/run/ask`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AskRun {
+    /// The question, a new note as `POST /api/notes` takes one.
+    note: NewNote,
 }
 
 /// The body of `POST /api/open` and `POST /api/init`.
@@ -594,10 +729,28 @@ enum LiveRun {
     Stop,
 }
 
+/// The reply to `POST /api/analysis/check` ([`Site::check_analysis`]), as `{"state": ...}`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum CheckView {
+    /// `checked` is `HEAD`, or another window started the update for it.
+    Same,
+    /// `checked` moved to `HEAD` with no run.
+    Untouched,
+    /// `checked` is gone, or no ancestor of `HEAD`: the pane offers Update.
+    Diverged,
+    /// The forced update `run` started at the commit whose short id is `commit`.
+    Updated { run: String, commit: String },
+    /// The update could not start, for `reason`; the next check tries again.
+    Blocked { reason: String },
+}
+
 /// The reply to `/api/file`.
 #[derive(Debug, Serialize)]
 struct FileView<'a> {
     path: &'a str,
+    /// Whether the file's language has definitions to jump to.
+    definitions: bool,
     lines: Vec<Vec<Token<'a>>>,
 }
 
@@ -614,6 +767,12 @@ impl Site {
         agents: Scanner,
         notify: Notify,
     ) -> Self {
+        // A test that sets no memory up must not run the machine's hippius-mem, whose `doctor`
+        // writes a probe into the engineer's vault: its memory finds no program.
+        #[cfg(not(test))]
+        let memory = Memory::new(agents.clone());
+        #[cfg(test)]
+        let memory = Memory::new(Scanner::new(OsString::new));
         Self {
             project: RefCell::new(None),
             highlighter: Highlighter::new(),
@@ -624,6 +783,7 @@ impl Site {
             usage_file: config.map(|dir| dir.join("usage.jsonl")),
             home: home.map(Path::to_owned),
             models: ModelProber::live(agents.clone()),
+            memory,
             agents,
             quotas: QuotaPoller::live(),
             sessions: SessionScanner::disabled(),
@@ -633,6 +793,22 @@ impl Site {
 
     pub(crate) fn with_session_scanner(mut self, sessions: SessionScanner) -> Self {
         self.sessions = sessions;
+        self
+    }
+
+    /// Replaces the memory; it runs in the open project, when one is open, which is opened
+    /// again so that its runner hands this memory to its runs.
+    #[cfg(test)]
+    pub(crate) fn with_memory(mut self, memory: Memory) -> Self {
+        self.memory = memory;
+        let open = self.project.borrow_mut().take();
+        if let Some(open) = open {
+            let repo = Repo::open(open.repo.root()).expect("the open project opens again");
+            open.definitions.close();
+            open.runner.close();
+            self.open(repo, LiveRun::Stop)
+                .expect("no project is open, so none refuses");
+        }
         self
     }
 
@@ -686,22 +862,34 @@ impl Site {
             return Ok(());
         }
         let repo = Arc::new(repo);
+        self.memory.open_project(&repo);
+        // A run gives its agent team memory only once a check found hippius-mem Ready, and the
+        // first check would otherwise wait for the first send or the settings dialog: the send
+        // step's preview would leave out the line about it that the send then has.
+        if self.current_settings().team_memory() == TeamMemory::On {
+            drop(self.memory.status());
+        }
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
+            self.memory.clone(),
             Arc::clone(&self.notify),
             self.home.clone(),
             self.usage_file.clone(),
         );
+        let definitions = Definitions::new(Arc::clone(&repo));
         let old = project.replace(Project {
             repo,
             runner,
+            definitions,
             warning,
         });
         drop(project);
-        // Stops the agent of the project this one replaces, after the borrow ends: that waits
-        // for its process.
+        // Stops the index and the agent of the project this one replaces, after the borrow
+        // ends: stopping the agent waits for its process. The index is told first, as that
+        // waits for nothing.
         if let Some(old) = old {
+            old.definitions.close();
             old.runner.close();
         }
         Ok(())
@@ -742,13 +930,22 @@ impl Site {
                 },
                 _ => not_allowed("GET"),
             },
+            path if path == "/api/definitions" || path.starts_with("/api/definitions/") => {
+                self.respond_definitions(path, method, query)
+            }
             "/api/notes" => self.respond_notes(method, query, body),
             "/api/notes/resolve" => match *method {
-                Method::POST => self.change_note(query, notes::resolve),
+                Method::POST => self.change_note(query, |site, repo, id| {
+                    // An ask's thread ends first, freeing its worktree; refused while it runs.
+                    if notes::is_ask(repo, id)? {
+                        site.runner()?.end_ask(id)?;
+                    }
+                    notes::resolve(repo, id)
+                }),
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/notes/reopen" => match *method {
-                Method::POST => self.change_note(query, notes::reopen),
+                Method::POST => self.change_note(query, |_, repo, id| notes::reopen(repo, id)),
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/folders" => match *method {
@@ -769,6 +966,9 @@ impl Site {
                 _ => not_allowed("POST with no body"),
             },
             path if path.starts_with("/api/agents/") => self.respond_agents(path, method, body),
+            path if path == "/api/memory" || path.starts_with("/api/memory/") => {
+                self.respond_memory(request)
+            }
             "/api/usage" => match *method {
                 Method::GET => json_or_error(self.usage_view(query, QuotaFetch::Cached)),
                 _ => not_allowed("GET"),
@@ -782,16 +982,9 @@ impl Site {
                 Method::PUT => json_or_error(self.save_layout(body)),
                 _ => not_allowed("GET the pane widths or PUT new ones"),
             },
+            path if path.starts_with("/api/analysis") => self.respond_analysis(request),
             "/api/runs" => match *method {
-                Method::GET => json_or_error(self.runner().and_then(|runner| {
-                    let ids = runner.ids()?;
-                    let live: Vec<_> = runner
-                        .live()
-                        .into_iter()
-                        .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
-                        .collect();
-                    Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
-                })),
+                Method::GET => json_or_error(self.runs()),
                 _ => not_allowed("GET"),
             },
             path if path == "/api/run" || path.starts_with("/api/run/") => {
@@ -816,6 +1009,7 @@ impl Site {
             files: repo.files()?,
             bench: self.bench.as_deref(),
             warning,
+            memory_repo: repo.memory_name(),
         };
         Ok(to_json(&info))
     }
@@ -858,7 +1052,39 @@ impl Site {
     fn file_view(&self, path: &str) -> Result<Vec<u8>> {
         let text = self.repo()?.read(path)?;
         let lines = self.highlighter.lines(path, &text)?;
-        Ok(to_json(&FileView { path, lines }))
+        Ok(to_json(&FileView {
+            path,
+            definitions: highlight::tags_grammar(path).is_some(),
+            lines,
+        }))
+    }
+
+    /// The reply to `GET /api/definitions?name=x&from=path`: where `x` is defined, those
+    /// nearest the file `from` first, or `{"state": "building"}` until the index is first
+    /// built. Reads no file: the index is built on its own thread.
+    fn definitions(&self, query: &str) -> Result<Vec<u8>> {
+        let name = query_value(query, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                Error::BadRequest("expected ?name=<percent-encoded name>&from=<path>".to_owned())
+            })?;
+        let from = query_value(query, "from").unwrap_or_default();
+        let project = self.project.borrow();
+        let project = project.as_ref().ok_or(Error::NoProject)?;
+        Ok(to_json(&project.definitions.lookup(&name, &from)))
+    }
+
+    /// The reply to `POST /api/definitions/refresh`, which the page sends when the window
+    /// regains focus and when a run moves on (`refresh` in `ui/app.js`): the index looks at
+    /// the files again, on its own thread. Answers `{}` at once.
+    fn refresh_definitions(&self) -> Result<Vec<u8>> {
+        let project = self.project.borrow();
+        project
+            .as_ref()
+            .ok_or(Error::NoProject)?
+            .definitions
+            .refresh();
+        Ok(b"{}".to_vec())
     }
 
     /// The reply to `GET /api/notes`: every note, moved to where its snippet is now. Reads
@@ -866,6 +1092,115 @@ impl Site {
     fn notes(&self) -> Result<Vec<u8>> {
         let review = notes::current(&*self.repo()?)?;
         Ok(to_json(&review))
+    }
+
+    /// The reply to `GET /api/analysis`: the diagrams, each code reference placed where its
+    /// code is now, with the files not on the map (`analysis::view`), or `null` when there is
+    /// no analysis. With `?at=<commit>`, the diagrams alone, placed where the code is in that
+    /// commit (`analysis::at`), for a run's change map. Reads the analysis file and never
+    /// writes it.
+    fn analysis(&self, query: &str) -> Result<Vec<u8>> {
+        let repo = self.repo()?;
+        if let Some(commit) = query_value(query, "at") {
+            return Ok(to_json(&analysis::at(&repo, &commit)?));
+        }
+        let analysis = analysis::current(&repo)?.map(|analysis| analysis::view(&repo, analysis));
+        Ok(to_json(&analysis))
+    }
+
+    /// The reply to `POST /api/analysis` `{"kind": ..., "of": ..., "question": ...}`: starts an
+    /// analysis run of the settings' Analyzer (`Runner::analyze`), and answers `{"run": "R5"}`.
+    /// The page follows that run by its id: it is not the Run tab's latest.
+    fn start_analysis(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: AnalyzeRequest = parse_body(body, Error::BadRequest)?;
+        self.analyze(AnalysisJob::New(request))
+    }
+
+    /// The reply to `POST /api/analysis/update`, with `{"diagram": "D1"}` or no body for every
+    /// diagram: starts an update of the outdated nodes and the files not on the map, as
+    /// [`Site::start_analysis`] starts an analysis. An update of every diagram with nothing
+    /// to send, while the checkout moved to another history, starts no run, moves `checked`,
+    /// and answers `{"run": null}`.
+    fn update_analysis(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: UpdateRequest = if body.is_empty() {
+            UpdateRequest::default()
+        } else {
+            parse_body(body, Error::BadRequest)?
+        };
+        self.analyze(AnalysisJob::Update(request))
+    }
+
+    fn analyze(&self, job: AnalysisJob) -> Result<Vec<u8>> {
+        let settings = self.current_settings();
+        let agent = settings.analyzer()?;
+        let run = self.runner()?.analyze(agent, job, settings.team_memory())?;
+        Ok(to_json(&serde_json::json!({ "run": run })))
+    }
+
+    /// The reply to `POST /api/analysis/check`, which the page sends on each refresh: compares
+    /// the analysis's `checked` with `HEAD` (`analysis::check_head`), and starts the forced
+    /// update of the settings' Analyzer when the move needs one (`Runner::analyze_checked`).
+    /// Answers what happened ([`CheckView`]); a start that is refused is an answer, not an
+    /// error, since the page checks with the map closed too. The body is not read.
+    fn check_analysis(&self) -> Result<Vec<u8>> {
+        let repo = self.repo()?;
+        let runner = self.runner()?;
+        let view = match analysis::check_head(&repo)? {
+            Verdict::Same => CheckView::Same,
+            Verdict::Untouched => CheckView::Untouched,
+            Verdict::Diverged => CheckView::Diverged,
+            Verdict::Update {
+                expected,
+                head,
+                planned,
+            } => {
+                let settings = self.current_settings();
+                match settings.analyzer() {
+                    Err(error) => CheckView::Blocked {
+                        reason: error_chain(&error),
+                    },
+                    Ok(agent) => match runner.analyze_checked(
+                        agent,
+                        settings.team_memory(),
+                        expected.as_ref(),
+                        &head,
+                        planned,
+                    )? {
+                        StartedUpdate::Started { run, commit } => {
+                            CheckView::Updated { run, commit }
+                        }
+                        StartedUpdate::AlreadyChecked => CheckView::Same,
+                        StartedUpdate::Blocked(reason) => CheckView::Blocked { reason },
+                    },
+                }
+            }
+        };
+        Ok(to_json(&view))
+    }
+
+    /// The reply to `POST /api/analysis/start-over`: moves the analysis file to the Trash, one
+    /// this build cannot read included, and answers `{"trashed": "<where it went>"}`, or
+    /// `{"trashed": null}` when there was no file. Refused while an analysis of this window is
+    /// under way: its merge would write a new file as this one goes.
+    fn start_analysis_over(&self) -> Result<Vec<u8>> {
+        if self.runner()?.analyzing() {
+            return Err(Error::AnalysisRefused(
+                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
+            ));
+        }
+        let trashed = analysis::start_over(&*self.repo()?)?;
+        Ok(to_json(&serde_json::json!({ "trashed": trashed })))
+    }
+
+    /// The reply to `DELETE /api/analysis?diagram=D3`: deletes the diagram, with the diagrams
+    /// below its nodes, and returns the analysis left as `GET /api/analysis` does: placed, with
+    /// the files not on the map.
+    fn delete_diagram(&self, query: &str) -> Result<Vec<u8>> {
+        let id = query_value(query, "diagram")
+            .ok_or_else(|| Error::BadRequest("expected ?diagram=<diagram id>".to_owned()))?;
+        let repo = self.repo()?;
+        let left = analysis::delete(&repo, &id)?;
+        Ok(to_json(&analysis::view(&repo, left)))
     }
 
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
@@ -903,15 +1238,15 @@ impl Site {
     }
 
     /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
-    /// changes the note's state with `change` (`notes::resolve` or `notes::reopen`), and
-    /// returns all notes.
-    fn change_note(&self, query: &str, change: fn(&Repo, &str) -> Result<Review>) -> Reply {
+    /// changes the note's state with `change` (around `notes::resolve` or `notes::reopen`),
+    /// and returns all notes.
+    fn change_note(&self, query: &str, change: fn(&Self, &Repo, &str) -> Result<Review>) -> Reply {
         let Some(id) = query_value(query, "id") else {
             return bad_request("expected ?id=<note id>");
         };
         json_or_error(
             self.repo()
-                .and_then(|repo| change(&repo, &id))
+                .and_then(|repo| change(self, &repo, &id))
                 .map(|review| to_json(&review)),
         )
     }
@@ -932,6 +1267,53 @@ impl Site {
         }
     }
 
+    /// The replies to `/api/definitions` and `/api/definitions/refresh`.
+    fn respond_definitions(&self, path: &str, method: &Method, query: &str) -> Reply {
+        match path {
+            "/api/definitions" => match *method {
+                Method::GET => json_or_error(self.definitions(query)),
+                _ => not_allowed("GET ?name=<name>&from=<path>"),
+            },
+            "/api/definitions/refresh" => match *method {
+                Method::POST => json_or_error(self.refresh_definitions()),
+                _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    /// The replies to `/api/analysis` and the routes under it. [`Site::respond`] sends every
+    /// path that starts with `/api/analysis` here, so a path that is none of these (such as
+    /// `/api/analysisx`) is not found here. Takes the whole request so that dispatch stays one
+    /// line: `respond` is at clippy's length limit.
+    fn respond_analysis(&self, request: &Request<Vec<u8>>) -> Reply {
+        let (method, body) = (request.method(), request.body());
+        let query = request.uri().query().unwrap_or("");
+        match request.uri().path() {
+            "/api/analysis" => match *method {
+                Method::GET => json_or_error(self.analysis(query)),
+                Method::POST => json_or_error(self.start_analysis(body)),
+                Method::DELETE => json_or_error(self.delete_diagram(query)),
+                _ => not_allowed(
+                    "GET, GET ?at=<commit>, POST {\"kind\": ...}, or DELETE ?diagram=<id>",
+                ),
+            },
+            "/api/analysis/update" => match *method {
+                Method::POST => json_or_error(self.update_analysis(body)),
+                _ => not_allowed("POST {\"diagram\": ...}, or with no body for every diagram"),
+            },
+            "/api/analysis/start-over" => match *method {
+                Method::POST => json_or_error(self.start_analysis_over()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/analysis/check" => match *method {
+                Method::POST => json_or_error(self.check_analysis()),
+                _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
     /// The replies to the routes under `/api/agents/`, as [`Site::respond`] gives them: a new
     /// agent scan, and the models agents offer.
     fn respond_agents(&self, path: &str, method: &Method, body: &[u8]) -> Reply {
@@ -941,7 +1323,14 @@ impl Site {
                     self.agents.rescan();
                     // An agent found again may be another version, with other models.
                     self.models.rescan();
-                    reply(StatusCode::OK, "application/json", self.settings())
+                    // hippius-mem is looked for on the same path. A set up under way checks
+                    // it again when it ends.
+                    match self.memory.check() {
+                        Ok(()) | Err(Error::MemorySetupRunning) => {
+                            reply(StatusCode::OK, "application/json", self.settings())
+                        }
+                        Err(error) => json_or_error(Err(error)),
+                    }
                 }
                 _ => not_allowed("POST with no body"),
             },
@@ -951,6 +1340,128 @@ impl Site {
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
+    }
+
+    /// The replies to `/api/memory` and the routes under it, as [`Site::respond`] gives them: a
+    /// memory, a recall, Refresh, a draft and a remember, a new check of hippius-mem and a trial
+    /// vault's set up. Each answers at once with what is known, and the work runs in the
+    /// background (`memory.rs`, and the draft run, `run.rs`).
+    /// Takes the whole request so that dispatch stays one line: `respond` is at clippy's
+    /// length limit.
+    fn respond_memory(&self, request: &Request<Vec<u8>>) -> Reply {
+        let method = request.method();
+        let query = request.uri().query().unwrap_or("");
+        match request.uri().path() {
+            "/api/memory" => match *method {
+                Method::GET => json_or_error(self.memory_detail(query)),
+                _ => not_allowed("GET ?id=mem_..."),
+            },
+            "/api/memory/recall" => match *method {
+                Method::GET => json_or_error(self.memory_recall(query)),
+                _ => not_allowed("GET ?path=<path>&node=<node label>, ?run=R1, or ?text=<query>"),
+            },
+            "/api/memory/draft" => match *method {
+                Method::POST => json_or_error(self.memory_draft(request.body())),
+                _ => not_allowed("POST {\"note\": \"N1\"}"),
+            },
+            "/api/memory/remember" => match *method {
+                Method::POST => json_or_error(self.memory_remember(request.body())),
+                _ => not_allowed(
+                    "POST {\"note\": \"N1\", \"noteType\": ..., \"summary\": ..., \"body\": ..., \
+                     \"scope\": \"repo\" or \"global\"}",
+                ),
+            },
+            "/api/memory/refresh" => match *method {
+                Method::POST => json_or_error(self.memory_refresh()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/memory/check" => match *method {
+                Method::POST => json_or_error(self.memory.check().map(|()| self.settings())),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/memory/setup" => match *method {
+                Method::POST => json_or_error(self.memory.setup().map(|()| self.settings())),
+                _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    /// The recall for the open file (`?path=`, with the selected node's label as `?node=`), for
+    /// the thread that ends with a run (`?run=`): its prompt and changed paths, or for a text
+    /// (`?text=`), a draft's summary, which the Remember dialog checks for duplicates.
+    fn memory_recall(&self, query: &str) -> Result<Vec<u8>> {
+        if let Some(text) = query_value(query, "text") {
+            if text.trim().is_empty() {
+                return Err(Error::BadRequest(
+                    "expected ?text=<a query that is not blank>".to_owned(),
+                ));
+            }
+            self.repo()?;
+            return Ok(to_json(&self.memory.recall_run(text)?));
+        }
+        if let Some(run) = query_value(query, "run") {
+            // The runner holds no lock once this returns: memory is never waited on with a
+            // run's lock held.
+            let text = self.runner()?.recall_query(&run)?;
+            return Ok(to_json(&self.memory.recall_run(text)?));
+        }
+        let path = query_value(query, "path").ok_or_else(|| {
+            Error::BadRequest(
+                "expected ?path=<percent-encoded path>, ?run=<run id> or ?text=<query>".to_owned(),
+            )
+        })?;
+        self.repo()?.check_path(&path)?;
+        let node = query_value(query, "node").filter(|label| !label.is_empty());
+        Ok(to_json(&self.memory.recall_file(&path, node.as_deref())?))
+    }
+
+    /// Memory `?id=` whole, with its history.
+    fn memory_detail(&self, query: &str) -> Result<Vec<u8>> {
+        self.repo()?;
+        let id = query_value(query, "id")
+            .ok_or_else(|| Error::BadRequest("expected ?id=mem_...".to_owned()))?;
+        Ok(to_json(&self.memory.detail(MemoryId::parse(&id)?)?))
+    }
+
+    fn memory_refresh(&self) -> Result<Vec<u8>> {
+        self.repo()?;
+        Ok(to_json(&self.memory.refresh()?))
+    }
+
+    /// The reply to `POST /api/memory/draft` (docs/review-assist.md, "Postil writes memory"):
+    /// starts a draft run in the thread the note was sent in ([`Runner::draft`]), with the
+    /// settings' choice for the agent that ran its latest turn should a fresh one start; or,
+    /// when the note was never sent or its thread ended, the note's text alone, and no run.
+    fn memory_draft(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: DraftRequest = parse_body(body, Error::BadRequest)?;
+        let repo = self.repo()?;
+        let source = notes::draft_source(&repo, &request.note)?;
+        let runner = self.runner()?;
+        let tip = match &source.run {
+            Some(run) => runner.thread_tip(run)?,
+            None => None,
+        };
+        let Some(of) = tip else {
+            return Ok(to_json(&DraftReply::Fallback { body: source.body }));
+        };
+        let agent = self
+            .current_settings()
+            .chosen_agent(&runner.agent_of(&of)?)?;
+        let run = runner.draft(&of, agent, &source.quoted)?;
+        Ok(to_json(&DraftReply::Run {
+            run,
+            fallback: source.body,
+        }))
+    }
+
+    /// The reply to `POST /api/memory/remember`: the write, checked here and then queued for
+    /// the memory thread ([`Memory::remember`]), as far as it is known.
+    fn memory_remember(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: RememberRequest = parse_body(body, Error::BadRequest)?;
+        let repo = self.repo()?;
+        let job = request.into_job(&repo)?;
+        Ok(to_json(&self.memory.remember(job)?))
     }
 
     /// The replies to `/api/thread` and the routes under it, as [`Site::respond`] gives them:
@@ -1030,6 +1541,14 @@ impl Site {
                 Method::POST => json_or_error(self.follow_up(body)),
                 _ => not_allowed("POST"),
             },
+            "/api/run/ask" => match *method {
+                Method::POST => json_or_error(self.ask(body)),
+                _ => not_allowed("POST {\"note\": {...}}"),
+            },
+            "/api/run/uncommitted" => match *method {
+                Method::GET => json_or_error(self.uncommitted(query)),
+                _ => not_allowed("GET, with ?file=<path> for a file"),
+            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -1046,6 +1565,7 @@ impl Site {
             limits: LayoutLimits {
                 sidebar: [*layout::SIDEBAR.start(), *layout::SIDEBAR.end()],
                 tray: [*layout::TRAY.start(), *layout::TRAY.end()],
+                map: [*layout::MAP.start(), *layout::MAP.end()],
             },
         })
     }
@@ -1070,6 +1590,18 @@ impl Site {
             .as_ref()
             .map(|project| Arc::clone(&project.runner))
             .ok_or(Error::NoProject)
+    }
+
+    /// The reply to `GET /api/runs`: every run's id, and the live ones with their threads.
+    fn runs(&self) -> Result<Vec<u8>> {
+        let runner = self.runner()?;
+        let ids = runner.ids()?;
+        let live: Vec<_> = runner
+            .live()
+            .into_iter()
+            .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
+            .collect();
+        Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
     }
 
     /// The reply to `GET /api/run`: with `?id=R2`, that run, else the latest run, or `null`
@@ -1109,17 +1641,52 @@ impl Site {
             Some(name) => settings.chosen_agent(name)?,
             None => settings.default_agent()?,
         };
-        self.runner()?.send(agent, &request.notes)?;
+        self.runner()?
+            .send(agent, &request.notes, settings.team_memory())?;
         Ok(b"{}".to_vec())
+    }
+
+    /// The reply to `POST /api/run/ask` `{"note": {...}}`: asks the question in the body, a new
+    /// note as `POST /api/notes` takes one, of the settings' agent, and returns every note, the
+    /// ask last (`Runner::ask`). The page fetches the run, as after a send.
+    fn ask(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: AskRun = parse_body(body, Error::InvalidNote)?;
+        let settings = self.current_settings();
+        let agent = settings.default_agent()?;
+        let review = self
+            .runner()?
+            .ask(agent, request.note, settings.team_memory())?;
+        Ok(to_json(&review))
+    }
+
+    /// The reply to `GET /api/run/uncommitted`, with `?file=<path>` for an ask on a file: the
+    /// engineer's changes since the last commit, which a new thread does not see, and whether
+    /// the file is among them, as the send step's preview says for its notes.
+    fn uncommitted(&self, query: &str) -> Result<Vec<u8>> {
+        let files: Vec<String> = query_value(query, "file").into_iter().collect();
+        // Answers no-project as the other run routes do, before reading the working tree.
+        self.runner()?;
+        Ok(to_json(&self.uncommitted_among(&files)?))
     }
 
     /// The reply to `GET /api/run/preview?notes=N1,N2`.
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
-        let prompt = self.runner()?.preview(&ids)?;
-        // One `git status` each time the send step reads the prompt, on the request thread:
-        // as long as `git status` in a terminal ([`Repo::uncommitted`]). One that fails costs
-        // the warning, not the prompt.
+        let memory = self.current_settings().team_memory();
+        let prompt = self.runner()?.preview(&ids, memory)?;
+        let uncommitted = self.uncommitted_among(&prompt.files)?;
+        Ok(to_json(&PreviewView {
+            prompt: prompt.text,
+            files: prompt.files,
+            uncommitted,
+        }))
+    }
+
+    /// The engineer's changes since the last commit, and which of `files` are among them.
+    fn uncommitted_among(&self, files: &[String]) -> Result<UncommittedView> {
+        // One `git status` each time the send step reads the prompt or an ask opens, on the
+        // request thread: as long as `git status` in a terminal ([`Repo::uncommitted`]). One
+        // that fails costs the warning, not the prompt or the question.
         let (entries, uncommitted_error) = match self.repo()?.uncommitted() {
             Ok(entries) => (Some(entries), None),
             Err(error) => (None, Some(error_chain(&error))),
@@ -1137,20 +1704,16 @@ impl Site {
                 .iter()
                 .any(|path| *path == file || (path.ends_with('/') && file.starts_with(*path)))
         };
-        let uncommitted_noted = prompt
-            .files
+        let uncommitted_noted = files
             .iter()
             .filter(|file| is_uncommitted(file))
             .cloned()
             .collect();
-        let uncommitted = entries.as_ref().map(Vec::len);
-        Ok(to_json(&PreviewView {
-            prompt: prompt.text,
-            files: prompt.files,
-            uncommitted,
+        Ok(UncommittedView {
+            uncommitted: entries.as_ref().map(Vec::len),
             uncommitted_noted,
             uncommitted_error,
-        }))
+        })
     }
 
     /// The reply to `POST /api/run/permission`.
@@ -1168,7 +1731,8 @@ impl Site {
         // Loaded once, so every reviewer is checked against the same revision of the file.
         let settings = self.current_settings();
         let reviewers = settings.reviewer_choices()?;
-        self.runner()?.review(&review.of, reviewers)?;
+        self.runner()?
+            .review(&review.of, reviewers, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1178,10 +1742,9 @@ impl Site {
     fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
         let follow: FollowRun = parse_body(body, Error::BadRequest)?;
         let runner = self.runner()?;
-        let agent = self
-            .current_settings()
-            .chosen_agent(&runner.agent_of(&follow.of)?)?;
-        runner.follow_up(&follow.of, agent, &follow.text)?;
+        let settings = self.current_settings();
+        let agent = settings.chosen_agent(&runner.agent_of(&follow.of)?)?;
+        runner.follow_up(&follow.of, agent, &follow.text, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1255,6 +1818,7 @@ impl Site {
             file,
             first_run: loaded.first_run,
             agents,
+            memory: MemoryView::from(self.memory.status()),
             tools,
             font_sizes: [*settings::FONT_SIZES.start(), *settings::FONT_SIZES.end()],
             tab_widths: settings::TAB_WIDTHS,
@@ -1268,6 +1832,17 @@ impl Site {
         let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
         // Checked here, not by serde, for the same reason as `save_layout`.
         let settings = Settings::try_from(request.settings).map_err(Error::InvalidSettings)?;
+        // Only turning it on is refused, so a hippius-mem removed later does not block every
+        // other change. The state is the latest check's, never waited for: a check can take
+        // seconds, and the dialog offers the switch only once it is ready.
+        if settings.team_memory() == TeamMemory::On
+            && self.current_settings().team_memory() == TeamMemory::Off
+        {
+            let state = self.memory.status().state;
+            if let Some(problem) = memory::not_ready(state.as_ref()) {
+                return Err(Error::MemoryNotReady(problem));
+            }
+        }
         settings::save(file, &settings, &request.revision)?;
         Ok(self.settings())
     }
@@ -1498,6 +2073,7 @@ impl std::fmt::Debug for Site {
             .field("quotas", &self.quotas)
             .field("sessions", &self.sessions)
             .field("models", &self.models)
+            .field("memory", &self.memory)
             .finish_non_exhaustive()
     }
 }
@@ -1510,10 +2086,14 @@ impl std::fmt::Debug for Site {
 impl Drop for Site {
     fn drop(&mut self) {
         if let Some(project) = self.project.borrow_mut().take() {
+            // The index first, as in `open`: telling it to stop waits for nothing.
+            project.definitions.close();
             project.runner.close();
         }
         // A model probe's agent would otherwise run on until its timeout.
         self.models.close();
+        // The memory server, a process of its own, would otherwise outlive the window.
+        self.memory.close();
     }
 }
 
@@ -1590,8 +2170,13 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 Error::NoteTextChanged { .. }
                 | Error::NoProject
                 | Error::ReviewLocked { .. }
+                | Error::AnalysisLocked { .. }
+                | Error::AnalysisRefused(_)
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
+                | Error::MemoryNotReady(_)
+                | Error::MemorySetupRunning
+                | Error::MemoryBusy
                 | Error::TurnRunning
                 | Error::RunElsewhere
                 | Error::TooManyRuns { .. }
@@ -1601,9 +2186,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::ThreadChanged { .. }
                 | Error::NotAWorktree { .. }
                 | Error::ApplyConflict { .. } => StatusCode::CONFLICT,
-                Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
-                    StatusCode::NOT_FOUND
-                }
+                Error::NoSuchNote { .. }
+                | Error::NoSuchRequest
+                | Error::NoSuchRun { .. }
+                | Error::NoSuchDiagram { .. } => StatusCode::NOT_FOUND,
                 Error::DiskFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
                 // The agent, the server behind this one, failed.
                 Error::AgentNotFound { .. }
@@ -1629,11 +2215,17 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::Window(_)
                 | Error::Webview(_)
                 | Error::SpawnWorker(_)
+                | Error::StartMemory(_)
                 | Error::BenchInterrupted
                 | Error::ReadReview { .. }
                 | Error::ParseReview { .. }
                 | Error::InvalidReview { .. }
                 | Error::WriteReview { .. }
+                | Error::ReadAnalysis { .. }
+                | Error::ParseAnalysis { .. }
+                | Error::InvalidAnalysis { .. }
+                | Error::WriteAnalysis { .. }
+                | Error::TrashAnalysis { .. }
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }

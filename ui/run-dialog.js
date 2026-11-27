@@ -6,6 +6,7 @@
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, agentLogoIcon, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
+import { findingMemories, findingMemoryLink, runMemory } from "./memory-tab.js";
 import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
 import {
@@ -33,6 +34,11 @@ import {
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 
+// The memories a review's findings name, each once; none without a review.
+const citedIds = (review) => [
+  ...new Set((review?.findings ?? []).map((finding) => finding.memory).filter(Boolean)),
+];
+
 // What a Checks row says of each evidence state (`evidence` in run.js). "An edit after it"
 // rather than "stale": a formatter run as a command also changes files, unseen, so the row
 // claims only what the log shows.
@@ -47,7 +53,10 @@ const CHECK_WORDS = {
 // `store` holds the runs (run-store.js); `detailEl` is the `<dialog>`. `noteOf(id)` gives a
 // note by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)`
 // shows a file in the code pane; `reviewers()` names the settings' reviewers, in order;
-// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane.
+// `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
+// `openMemory(id)` opens a team memory's dialog; `changeMapState()` says whether the map can
+// show what they touched: "none" with no analysis, "no-architecture" when it has no
+// Architecture diagram, else "ready"; `showChangeMap(from, to)` shows it.
 export function runDialog({
   store,
   detailEl,
@@ -56,6 +65,9 @@ export function runDialog({
   openFile,
   reviewers,
   showChanges,
+  openMemory,
+  changeMapState,
+  showChangeMap,
   onError,
 }) {
   // What the dialog shows while open: `{ kind: "run", id }` or `{ kind: "step", id, key }`;
@@ -71,7 +83,13 @@ export function runDialog({
   // What the dialog writes in place while the stamp it was drawn from holds: the text the
   // agent streams, and the time. Each writes what is now known of its run.
   let streamed = [];
+  // The thread's Memory section: drawn again when its recall comes in. So are the memories the
+  // review's findings name, once each summary is read.
+  const memory = runMemory({ openMemory, onSettled: () => drawDetail() });
+  const cited = findingMemories({ onSettled: () => drawDetail() });
   detailEl.addEventListener("close", () => {
+    memory.stop();
+    cited.stop();
     detail = null;
     detailDrawn = null;
     asking = null;
@@ -138,19 +156,29 @@ export function runDialog({
       const shown = [notes, reviewKey(review), reviewers(), record ?? null];
       const live = root.review ? (isLive(root) ? root : undefined) : liveOf(root.id);
       const liveKey = `${live?.id}:${live?.status}`;
+      const memoryKey = memory.key((thread.at(-1) ?? root).id);
+      const citedKey = cited.key(citedIds(review));
       stamp = [
         `run:${root.id}`,
         threadKey(thread),
         JSON.stringify(shown),
         liveKey,
         busyThread(root.id),
+        memoryKey,
+        citedKey,
+        // An analysis read since, or deleted, changes the Change map button.
+        changeMapState(),
       ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, store.knownViews());
       const finding = review?.findings.find((item) => item.id === detail.finding);
       if (!finding) return;
-      stamp = [`finding:${view.id}:${finding.id}`, JSON.stringify(finding)];
+      stamp = [
+        `finding:${view.id}:${finding.id}`,
+        JSON.stringify(finding),
+        cited.key(finding.memory ? [finding.memory] : []),
+      ];
       draw = () => findingDetail(view, finding);
     } else {
       const index = steps.findIndex((step) => step.key === detail.key);
@@ -282,7 +310,18 @@ export function runDialog({
       });
       noteCards.append(button);
     }
-    body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    // An analysis carries no notes: its diagrams name it (src/run.rs, `Runner::analyze`).
+    if (!view.analysis) {
+      body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    }
+    // What the team recorded about the thread's prompt and changed paths; left out when
+    // hippius-mem cannot run here.
+    const remembered = memory.view(latest.id);
+    if (remembered) {
+      const cards = el("div", "run-cards");
+      cards.append(...remembered);
+      body.append(section("Memory", cards));
+    }
     const branch = threadPart(view, record, latest);
     if (branch) body.append(branch);
 
@@ -294,11 +333,14 @@ export function runDialog({
     if (reply) body.append(reply);
     const report = reportNotice(view);
     if (report) body.append(el("div", "run-notice", report));
+    if (view.memoryNotice) body.append(el("div", "run-notice", view.memoryNotice));
     if (view.problem) body.append(el("div", "run-notice", view.problem));
     for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
     if (!view.review) {
-      body.append(reviewPart(view, review));
-      body.append(followUpBox(view, latest));
+      // A thread that only reads changed nothing to review (src/run.rs, `Runner::review`).
+      if (!readsOnly(view, record)) body.append(reviewPart(view, review));
+      // An analysis takes no follow-up (`POST api/run/follow` refuses one): analyze again.
+      if (!view.analysis) body.append(followUpBox(view, latest));
     }
 
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], {
@@ -339,6 +381,8 @@ export function runDialog({
         showChanges(view.id, latest.id);
       });
       actions.push(button);
+      const map = changeMapButton(view, latest);
+      if (map) actions.push(map);
     }
     const head = detailHeader(statusIcon(iconKind(latest)), title, status(), actions);
     const where = head.querySelector(".note-dialog-where");
@@ -348,6 +392,30 @@ export function runDialog({
     return [head, body];
   }
 
+  // Change map, beside Changes: what runs `view` to `latest` touched on the map's Architecture
+  // (docs/review-assist.md, "The four kinds"). None without an analysis; disabled, with why,
+  // when it has no Architecture diagram.
+  function changeMapButton(view, latest) {
+    const state = changeMapState();
+    if (state === "none") return null;
+    const button = el("button", "button run-detail-change-map", "Change map");
+    button.type = "button";
+    if (state === "no-architecture") {
+      button.disabled = true;
+      button.title = "The map has no Architecture diagram";
+      return button;
+    }
+    button.title =
+      latest.id === view.id
+        ? `What ${view.id} touched on the map`
+        : `What ${view.id} to ${latest.id} touched on the map`;
+    button.addEventListener("click", () => {
+      detailEl.close();
+      showChangeMap(view.id, latest.id);
+    });
+    return button;
+  }
+
   // The thread's branch, and what ends the thread (docs/design.md, "Ending a thread"): Apply
   // writes its changes into the working tree, uncommitted; Discard, on a second click, drops
   // them. Either frees its worktree. An evicted thread, whose worktree was freed for disk
@@ -355,6 +423,7 @@ export function runDialog({
   // worktrees, and while the record is read.
   function threadPart(root, record, latest) {
     if (!record) return null;
+    if (readsOnly(root, record)) return readThreadPart(root, record, latest);
     const line = el("div", "run-thread");
     line.append(el("code", "run-thread-branch", record.branch));
     if (record.state === "applied" || record.state === "discarded") {
@@ -407,6 +476,37 @@ export function runDialog({
     }
     part.append(pullRequestPart(root, record, busy));
     return part;
+  }
+
+  // The thread of an ask, which only reads (src/thread.rs, `Mode::Read`): nothing to apply,
+  // no branch worth showing and no pull request. Discard, on a second click, ends it and frees
+  // its worktree, as resolving its ask does.
+  function readThreadPart(root, record, latest) {
+    const line = el("div", "run-thread");
+    if (record.state === "open" || record.state === "evicted") {
+      const discard = el("button", "button", "Discard");
+      discard.type = "button";
+      discard.title = "End the thread and free its worktree";
+      discard.disabled = isLive(store.byId(latest.id) ?? latest);
+      actOnSecondClick(discard, {
+        arm: () => {
+          discard.textContent = "Click again to discard";
+        },
+        disarm: () => {
+          discard.textContent = "Discard";
+        },
+        act: () => {
+          discard.disabled = true;
+          store.endThread(root.id, "discard").then((ended) => {
+            discard.disabled = ended;
+          });
+        },
+      });
+      line.append(el("span", "run-thread-state", "Read-only: it changes no file"), discard);
+    } else {
+      line.append(el("span", "run-thread-state", "Ended"));
+    }
+    return section("Thread", line);
   }
 
   // The thread's pull request (docs/design.md, "Ending a thread"): a link to it with its
@@ -488,6 +588,7 @@ export function runDialog({
     if (reply) parts.push(reply);
     const report = reportNotice(turn);
     if (report) parts.push(el("div", "run-notice", report));
+    if (turn.memoryNotice) parts.push(el("div", "run-notice", turn.memoryNotice));
     if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
     return parts;
   }
@@ -566,7 +667,9 @@ export function runDialog({
       const update = (next) => {
         target = next;
         const busy = busyThread(root.id);
-        input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
+        input.placeholder = readsOnly(root, store.thread(root.id))
+          ? `Ask ${next.agent} a follow-up`
+          : `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
         button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
         button.disabled = busy !== "" || sending;
         // The held message wins: it says why the page did not end, which the engineer asked for.
@@ -671,9 +774,23 @@ export function runDialog({
       button.addEventListener("click", () =>
         openDetail({ kind: "finding", id: view.id, finding: finding.id }),
       );
-      cards.append(button);
+      if (!finding.memory) {
+        cards.append(button);
+        continue;
+      }
+      // The memory's button goes beside the card, not in it: a button in a button gets both
+      // clicks.
+      const group = el("div", "run-card-group");
+      const memoryLink = findingMemoryLink(
+        finding.memory,
+        cited.summary(finding.memory),
+        openMemory,
+      );
+      group.append(button, memoryLink);
+      cards.append(group);
     }
     part.append(cards);
+    for (const notice of review.notices) part.append(el("div", "run-notice", notice));
     for (const problem of review.problems)
       part.append(el("div", "run-notice", `A reviewer's findings could not be read: ${problem}`));
     return part;
@@ -697,6 +814,10 @@ export function runDialog({
     body.append(nav, section("Finding", el("div", "run-detail-text", finding.text)));
     if (finding.fix)
       body.append(section("Proposed fix", el("div", "run-detail-text", finding.fix)));
+    if (finding.memory) {
+      const link = findingMemoryLink(finding.memory, cited.summary(finding.memory), openMemory);
+      body.append(section("Team memory", link));
+    }
     const verdict =
       finding.verdict.text ||
       {
@@ -851,6 +972,12 @@ export function runDialog({
   }
 
   return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft, busyThread };
+}
+
+// Whether the thread that starts at run `root` only reads: its header says so (run log
+// version 7) before its record (`store.thread`) is read.
+function readsOnly(root, record) {
+  return Boolean(root.readOnly) || record?.mode === "read";
 }
 
 // The run's steps in order, each with its index among the run's items and its key: every

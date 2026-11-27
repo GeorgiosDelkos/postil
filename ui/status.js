@@ -8,6 +8,7 @@ import {
   diffStats,
   evidence,
   foldRun,
+  isAsk,
   isLive,
   isOpen,
   isResolved,
@@ -64,6 +65,8 @@ export function runStatus(note, run) {
       if (endReason(run) !== "end_turn") {
         return { kind: "stopped", label: `Stopped in ${run.id}`, tone: "idle" };
       }
+      // An answer is the reply itself: it names no note.
+      if (isAsk(note)) return { kind: "answered", label: `Answered in ${run.id}`, tone: "done" };
       return agentSaid(run, note.id) === null
         ? { kind: "silent", label: `No word in ${run.id}`, tone: "idle" }
         : { kind: "addressed", label: `Addressed in ${run.id}`, tone: "done" };
@@ -232,7 +235,9 @@ const runNumber = (view) => Number(view.id.slice(1));
 // (`agentSaid`, the judge answers "F1: accepted - ..."), "answered" for a line that says
 // neither, "judging" while the judge runs, "waiting" before it starts, "no word" when it
 // ended without a line, and "not judged" when a single reviewer only proposed or the review
-// stopped before its judge (a stage failed or was stopped).
+// stopped before its judge (a stage failed or was stopped). A finding keeps the team memory it
+// names (`memory`). `notices` are the stages' memory notices, each once: why a stage's team
+// memory could not be checked, or why its agent got no team memory.
 export function reviewOf(id, views) {
   const stages = views
     .filter((view) => view?.review?.of === id)
@@ -280,7 +285,8 @@ export function reviewOf(id, views) {
       .filter((entry) => entry.kind === "findings" && entry.problem)
       .map((entry) => `${view.id}: ${entry.problem}`),
   );
-  return { stages: chain, reviewers, findings, problems };
+  const notices = [...new Set(chain.map((view) => view.memoryNotice).filter(Boolean))];
+  return { stages: chain, reviewers, findings, problems, notices };
 }
 
 // Why a failed run failed, from its log, or null.
@@ -303,16 +309,18 @@ export function reviewKey(review) {
       stage.status,
       statusLine(stage),
     ]),
-    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [
+    review.findings.map(({ id, note, text, fix, path, line, memory, verdict }) => [
       id,
       note,
       text,
       fix,
       path,
       line,
+      memory ?? null,
       verdict.word,
     ]),
     review.problems,
+    review.notices,
   ];
 }
 
@@ -407,9 +415,13 @@ function turnShown(turn) {
     statusLine(turn),
     turn.startedAt,
     turn.problem ?? null,
+    turn.memoryNotice ?? null,
     turn.review ?? null,
     turn.followUp ?? null,
     turn.followUp ? freshAgent(turn) : null,
+    turn.analysis ?? null,
+    turn.remember ?? null,
+    turn.draft ?? null,
     plan,
     items.map((item) => itemShown(item, live)),
     // Whether the reply shows at all: its text is written in place.
@@ -460,6 +472,7 @@ export function noteDialogKey(note, run, review, shown) {
     run.status,
     run.notes,
     run.problem ?? null,
+    run.memoryNotice ?? null,
     runFailure(run),
     statusLine(run),
     runStatus(note, run),
@@ -473,5 +486,7 @@ export function noteDialogKey(note, run, review, shown) {
     review?.findings
       .filter((finding) => finding.note === note.id)
       .map((finding) => finding.verdict.text) ?? null,
+    // An ask's dialog shows the answer whole, which grows as the agent writes it.
+    isAsk(note) ? replyText(run) : null,
   ]);
 }

@@ -100,6 +100,15 @@ export function selectBox(key, label, options, value, choose, { disabled = false
 // colour are CSS (`.agent-mark.<kind>`). Not installed is a hollow circle, with no glyph.
 const AGENT_MARKS = { installed: "✓", missing: "!", unchecked: "–", absent: "" };
 
+// The mark for `state`, `{ kind, label }` as `agentState` or `memoryState` gives it; the label
+// is what a screen reader says.
+export function stateMark(state) {
+  const mark = el("span", `agent-mark ${state.kind}`, AGENT_MARKS[state.kind]);
+  mark.setAttribute("role", "img");
+  mark.setAttribute("aria-label", state.label);
+  return mark;
+}
+
 // One row in the agent list: a mark for where the agent stands, its logo and name, what it is
 // used for, the command it starts with, and a switch. The state in words is the mark's label
 // and, with the full path of the program, the row's tooltip. A row whose agent is not
@@ -111,9 +120,7 @@ export function agentListRow(
   const state = agentState(agent);
   const node = el("div", `agent-row ${state.kind}`);
   node.title = agent.found ? `${state.label}: ${agent.found}` : state.label;
-  const mark = el("span", `agent-mark ${state.kind}`, AGENT_MARKS[state.kind]);
-  mark.setAttribute("role", "img");
-  mark.setAttribute("aria-label", state.label);
+  const mark = stateMark(state);
 
   const text = el("div", "agent-text");
   const name = el("span", "agent-name");
@@ -225,18 +232,31 @@ function agentCell(agentName, name) {
   return node;
 }
 
-// The agent notes are sent to and its model, as the one row of a slot card: a muted arrow in
-// the lead column, the agent picker, and the model picker to the card's edge (this row has no
-// buttons). `key` names the agent select; the model select is `${key}-model`. `onAgent` gets
-// a name, or null for none.
-export function agentSlotControl(key, settings, models, { disabled = false, onAgent, onModel }) {
+// One slot, the agent notes are sent to by default, and its model, as the one row of a slot
+// card: a muted arrow in the lead column, the agent picker, and the model picker to the card's
+// edge (this row has no buttons). `key` names the agent select; the model select is
+// `${key}-model`. `slot` is the chosen slot or null, `label` the picker's name and
+// `emptyLabel` what no choice says. `onAgent` gets a name, or null for none.
+export function agentSlotControl(
+  key,
+  settings,
+  models,
+  {
+    slot = settings.agent,
+    label = "Send notes to",
+    emptyLabel = "None",
+    disabled = false,
+    onAgent,
+    onModel,
+  },
+) {
   const enabled = settings.enabledAgents;
-  const none = enabled.length ? "None" : "Turn on an agent first";
+  const none = enabled.length ? emptyLabel : "Turn on an agent first";
   const options = [["", none], ...enabled.map((name) => [name, name])];
-  const chosen = settings.agent;
+  const chosen = slot ?? null;
   const agent = selectBox(
     key,
-    "Send notes to",
+    label,
     options,
     chosen?.name ?? "",
     (name) => onAgent(name || null),

@@ -7,12 +7,17 @@ import {
   agentState,
   codeMetrics,
   formatSlot,
+  canSetUp,
+  memoryState,
   moveReviewer,
   removeCustomAgent,
   removeReviewer,
   saveCustomAgent,
   setAgent,
   setAgentModel,
+  setAnalyzer,
+  setAnalyzerModel,
+  setAgentMemory,
   setEnabled,
   setReviewerModel,
 } from "./settings.js";
@@ -31,10 +36,12 @@ function settings() {
     customAgents: [{ name: "Local", command: "local-agent --acp" }],
     enabledAgents: ["Grok", "Local", "Claude"],
     agent: { name: "Local", model: null },
+    analyzer: null,
     reviewers: [
       { name: "Grok", model: "grok-4.7" },
       { name: "Grok", model: null },
     ],
+    agentMemory: false,
   };
 }
 
@@ -95,6 +102,29 @@ test("an agent can be turned off only while nothing uses it", () => {
   ]);
   const same = settings();
   assert.equal(setEnabled(same, "Grok", true).settings, same, "no change, same object");
+});
+
+test("the analyzer is chosen among enabled agents and cannot be turned off or removed", () => {
+  const chosen = setAnalyzer(settings(), "Claude").settings;
+  assert.deepEqual(chosen.analyzer, slot("Claude"));
+  assert.match(setEnabled(chosen, "Claude", false).error, /while it analyzes the repository/);
+  assert.match(setAnalyzer(settings(), "Gemini").error, /Turn Gemini on first/);
+  const fast = setAnalyzerModel(chosen, "fast").settings;
+  assert.deepEqual(fast.analyzer, slot("Claude", "fast"));
+  assert.deepEqual(setAnalyzer(fast, "Claude").settings.analyzer, slot("Claude", "fast"));
+  assert.deepEqual(setAnalyzer(fast, "Grok").settings.analyzer, slot("Grok"));
+  assert.equal(setAnalyzer(fast, null).settings.analyzer, null);
+  assert.match(setAnalyzerModel(settings(), "x").error, /Choose the analyzer/);
+
+  const custom = setAnalyzer(setAgent(settings(), "Claude").settings, "Local").settings;
+  assert.match(removeCustomAgent(custom, "Local").error, /cannot be removed while it analyzes/);
+  const renamed = saveCustomAgent(
+    setAnalyzerModel(custom, "big").settings,
+    { name: "Mine", command: "mine --acp" },
+    "Local",
+    BUILT_IN,
+  ).settings;
+  assert.deepEqual(renamed.analyzer, slot("Mine", "big"), "renamed, its model kept");
 });
 
 test("a new custom agent is trimmed, enabled, and checked as the Rust process checks it", () => {
@@ -234,4 +264,40 @@ test("reviewers are removed by position and moved within the list's ends", () =>
   assert.deepEqual(names(moveReviewer(three, 0, 1).settings.reviewers), ["Grok", "Grok", "Claude"]);
   assert.equal(moveReviewer(three, 0, -1).settings, three, "the first cannot move up");
   assert.equal(moveReviewer(three, 2, 1).settings, three, "the last cannot move down");
+});
+
+test("team memory turns on only when hippius-mem is ready, and off in any state", () => {
+  const ready = { kind: "ready", path: "/bin/hippius-mem" };
+  const unconfigured = { kind: "unconfigured", path: "/bin/hippius-mem", problem: null };
+  assert.equal(setAgentMemory(settings(), true, ready).settings.agentMemory, true);
+  for (const state of [unconfigured, { kind: "missing" }, null]) {
+    assert.match(setAgentMemory(settings(), true, state).error, /Set up hippius-mem/);
+    const on = { ...settings(), agentMemory: true };
+    assert.equal(setAgentMemory(on, false, state).settings.agentMemory, false);
+  }
+});
+
+test("hippius-mem's mark says missing only while team memory is on", () => {
+  const at = (state, on = false) => memoryState({ state }, on).kind;
+  assert.equal(at(null), "unchecked");
+  assert.equal(at({ kind: "ready", path: "/p" }), "installed");
+  assert.equal(at({ kind: "unconfigured", path: "/p", problem: null }), "unchecked");
+  assert.equal(at({ kind: "missing" }), "absent");
+  assert.equal(at({ kind: "missing" }, true), "missing");
+});
+
+test("Set up is offered only when doctor found no configuration, whatever its exit code", () => {
+  const unconfigured = (problem) => ({ kind: "unconfigured", path: "/p", problem });
+  const noConfig =
+    "Error: failed to load configuration; run `hippius-mem quickstart` to set up a trial vault";
+  const probeFailed = "INFO profile: team\nError: live encryption-boundary probe failed";
+  assert.equal(canSetUp(unconfigured(null)), true);
+  assert.equal(canSetUp(unconfigured(noConfig)), true);
+  // A configured vault whose check failed: quickstart would only refuse.
+  assert.equal(canSetUp(unconfigured(probeFailed)), false);
+  assert.equal(canSetUp(unconfigured("hippius-mem doctor did not answer within 10 s")), false);
+  assert.equal(memoryState({ state: unconfigured(probeFailed) }, false).kind, "missing");
+  for (const state of [null, { kind: "missing" }, { kind: "ready", path: "/p" }]) {
+    assert.equal(canSetUp(state), false);
+  }
 });

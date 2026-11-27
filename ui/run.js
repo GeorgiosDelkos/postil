@@ -2,11 +2,24 @@
 // runs them. A run comes from `GET api/run` (src/run/log.rs, `RunView`): its entries are the
 // lines of its log, append-only, and the panel folds them into what it shows.
 
-// The notes ticked when the send step opens: the open ones whose lines are still in their
-// file. A sent note can be sent again, and an outdated one is offered, but both are left
+// The notes ticked when the send step opens: the open change notes whose lines are still in
+// their file. A sent note can be sent again, and an outdated one is offered, but both are left
 // for the engineer to tick.
 export function sendable(notes) {
-  return notes.filter((note) => isOpen(note) && note.anchor === "found").map((note) => note.id);
+  return notes
+    .filter((note) => waitsToSend(note) && note.anchor === "found")
+    .map((note) => note.id);
+}
+
+// Whether a note is a question, answered by an agent that only reads, in a thread of its own
+// (src/notes.rs, "Asks"). An ask is never sent with change notes: the server refuses it.
+export function isAsk(note) {
+  return note.intent === "ask";
+}
+
+// Whether a note is a change still to be sent: what the send step's counts count.
+export function waitsToSend(note) {
+  return isOpen(note) && !isAsk(note);
 }
 
 // Whether a note is still to be sent. `state` is `{ kind: "open" }`,
@@ -540,11 +553,13 @@ export function stopKey(run) {
 // Escape while it has the focus; this is for when the focus is elsewhere.
 // `page` says what is open: `{ focusMode, composer, send, changes, selection, live }`, each a
 // boolean. Returns the action's name, or null.
-export function escapeAction({ focusMode, composer, send, changes, selection, live }) {
+export function escapeAction({ focusMode, composer, send, changes, changeMap, selection, live }) {
   if (focusMode && !composer) return "leave-focus";
   if (composer) return "close-composer";
   if (send) return "close-send";
   if (changes) return "close-changes";
+  // The change map's own esc: back to the repository's map, before a run would be stopped.
+  if (changeMap) return "leave-change-map";
   if (selection) return "clear-selection";
   if (live) return "stop";
   return null;

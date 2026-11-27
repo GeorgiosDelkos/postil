@@ -4,6 +4,8 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::acp::AUTH_REQUIRED;
+
 /// A specialized `Result` for this crate.
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
@@ -137,6 +139,56 @@ pub enum Error {
         /// How long the change waited, in seconds.
         seconds: u64,
     },
+    /// The analysis file exists but could not be read.
+    ReadAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// The analysis file is not JSON of the expected shape.
+    ParseAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// What the JSON parser reported, with the line and column.
+        source: serde_json::Error,
+    },
+    /// The analysis file parses but breaks a rule of the format.
+    InvalidAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// Which rule, and where.
+        problem: String,
+    },
+    /// The analysis file could not be written.
+    WriteAnalysis {
+        /// The analysis file's path, or its lock file's.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+    /// The analysis file could not be moved to the Trash (Start over).
+    TrashAnalysis {
+        /// The analysis file's path.
+        path: PathBuf,
+        /// Foundation's reason, as an I/O error.
+        source: io::Error,
+    },
+    /// Another writer held the analysis file's lock for as long as a change waits for it.
+    AnalysisLocked {
+        /// The lock file's path.
+        path: PathBuf,
+        /// How long the change waited, in seconds.
+        seconds: u64,
+    },
+    /// An analysis run was refused before a thread was made: the analyzer is not installed,
+    /// or an analysis of this window is under way. The text says which.
+    AnalysisRefused(String),
+    /// A diagram was asked for by an id the analysis does not hold.
+    NoSuchDiagram {
+        /// The id asked for, `D3`.
+        id: String,
+    },
     /// The page sent settings that break a rule (`settings.rs`); the text says which.
     InvalidSettings(String),
     /// The settings file on disk cannot be used, so saving over it is refused until it is
@@ -145,6 +197,16 @@ pub enum Error {
     SettingsLocked(String),
     /// The settings file changed after the page read it (another window, or a hand edit).
     SettingsChanged,
+    /// Team memory was turned on while hippius-mem is not ready (`memory.rs`); the text says
+    /// why.
+    MemoryNotReady(String),
+    /// A hippius-mem set up or check was asked for while a set up runs.
+    MemorySetupRunning,
+    /// A memory write was asked for while the memory thread's queue holds nothing it may drop
+    /// (`memory.rs`, `Calls::enqueue`).
+    MemoryBusy,
+    /// The thread that checks or sets up hippius-mem could not start.
+    StartMemory(io::Error),
     /// The settings file could not be written.
     WriteSettings {
         /// The settings file's path.
@@ -429,11 +491,59 @@ impl fmt::Display for Error {
                  again; `lsof` on that file names the process)",
                 path.display()
             ),
+            // As for the review file: a file that cannot be read is never written over, so the
+            // diagrams in it are safe until the engineer fixes or moves it.
+            Self::ReadAnalysis { path, .. } => write!(
+                f,
+                "cannot read {} (fix its permissions or encoding, or move it aside to start over)",
+                path.display()
+            ),
+            Self::ParseAnalysis { path, .. } => write!(
+                f,
+                "cannot parse {} (fix it, or move it aside to start over)",
+                path.display()
+            ),
+            Self::InvalidAnalysis { path, problem } => write!(
+                f,
+                "{}: {problem} (fix it, or move it aside to start over)",
+                path.display()
+            ),
+            Self::TrashAnalysis { path, .. } => write!(
+                f,
+                "cannot move {} to the Trash (move it aside by hand to start over)",
+                path.display()
+            ),
+            Self::WriteAnalysis { path, .. } => write!(
+                f,
+                "cannot write {} (check that its directory is writable; the analysis was not \
+                 saved)",
+                path.display()
+            ),
+            Self::AnalysisLocked { path, seconds } => write!(
+                f,
+                "another writer held {} for {seconds} s, so the analysis was not saved (try \
+                 again; `lsof` on that file names the process)",
+                path.display()
+            ),
+            Self::AnalysisRefused(problem) => write!(f, "cannot analyze: {problem}"),
+            Self::NoSuchDiagram { id } => write!(f, "the analysis has no diagram {id}"),
             Self::InvalidSettings(problem) => write!(f, "cannot save the settings: {problem}"),
             Self::SettingsLocked(problem) => write!(
                 f,
                 "cannot save the settings: {problem} (fix the file, or reset the settings)"
             ),
+            Self::MemoryNotReady(problem) => {
+                write!(f, "cannot turn team memory on: {problem}")
+            }
+            Self::MemorySetupRunning => write!(
+                f,
+                "the hippius-mem set up is still running (wait for it to finish)"
+            ),
+            Self::MemoryBusy => write!(
+                f,
+                "too many team memory writes are queued: wait for them to finish"
+            ),
+            Self::StartMemory(_) => write!(f, "cannot start a thread to run hippius-mem"),
             Self::SettingsChanged => write!(
                 f,
                 "cannot save the settings: the file changed since this window read it (the \
@@ -469,7 +579,7 @@ impl fmt::Display for Error {
             // (docs/design.md, "Agents").
             Self::AgentRefused {
                 step,
-                code: -32000,
+                code: AUTH_REQUIRED,
                 message,
             } => write!(
                 f,
@@ -650,9 +760,13 @@ impl std::error::Error for Error {
         match self {
             Self::SpawnGit(source)
             | Self::SpawnWorker(source)
+            | Self::StartMemory(source)
             | Self::Read { source, .. }
             | Self::ReadReview { source, .. }
             | Self::WriteReview { source, .. }
+            | Self::ReadAnalysis { source, .. }
+            | Self::WriteAnalysis { source, .. }
+            | Self::TrashAnalysis { source, .. }
             | Self::WriteRecent { source, .. }
             | Self::WriteSettings { source, .. }
             | Self::StartAgent { source, .. }
@@ -664,7 +778,7 @@ impl std::error::Error for Error {
             | Self::ReadRun { source, .. }
             | Self::WriteWorktree { source, .. }
             | Self::WriteThreads { source, .. } => Some(source),
-            Self::ParseReview { source, .. } => Some(source),
+            Self::ParseReview { source, .. } | Self::ParseAnalysis { source, .. } => Some(source),
             Self::Highlight { source, .. } => Some(source),
             Self::Window(source) => Some(source),
             Self::Webview(source) => Some(source),
@@ -683,9 +797,16 @@ impl std::error::Error for Error {
             | Self::NoteTextChanged { .. }
             | Self::InvalidReview { .. }
             | Self::ReviewLocked { .. }
+            | Self::InvalidAnalysis { .. }
+            | Self::AnalysisLocked { .. }
+            | Self::AnalysisRefused(_)
+            | Self::NoSuchDiagram { .. }
             | Self::InvalidSettings(_)
             | Self::SettingsLocked(_)
             | Self::SettingsChanged
+            | Self::MemoryNotReady(_)
+            | Self::MemorySetupRunning
+            | Self::MemoryBusy
             | Self::AgentNotFound { .. }
             | Self::AgentSilent { .. }
             | Self::AgentExited { .. }

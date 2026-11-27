@@ -217,3 +217,53 @@ fn every_page_module_is_served() {
         assert_eq!(reply.body().as_ref(), source.as_bytes(), "{name}");
     }
 }
+
+/// The sha256 of `@dagrejs/dagre` 3.1.3's `dist/dagre.min.js`, the release vendored as
+/// `ui/vendor/dagre.min.js` (docs/design.md, "The map's layout").
+const DAGRE_SHA256: &str = "54a503e346f93ca0bb10abe7999587e037262935687aca45eb4e4b0f64bbb578";
+
+#[test]
+fn every_vendor_file_is_served() {
+    // The vendored scripts are loaded by a script element, not imported, so the module tests
+    // above do not see them; a missing row would only show when the map first opens.
+    let site = Site::new(None, None, None, no_agents(), quiet());
+    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/vendor");
+    let mut served = Vec::new();
+    for entry in fs::read_dir(&vendor).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "LICENSE")
+        {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let uri = format!("postil://localhost/vendor/{name}");
+        let reply = site.respond(&Request::builder().uri(uri).body(Vec::new()).unwrap());
+        assert_eq!(reply.status(), StatusCode::OK, "{name}");
+        assert_eq!(reply.headers()[CONTENT_TYPE], "text/javascript", "{name}");
+        assert_eq!(reply.body().as_ref(), fs::read(&path).unwrap(), "{name}");
+        served.push(name);
+    }
+    assert_eq!(served, ["dagre.min.js"]);
+    assert!(
+        include_str!("../../../ui/diagram-view.js").contains("\"vendor/dagre.min.js\""),
+        "the map loads the served path"
+    );
+
+    // The bytes are the release vendored, and the license file records their hash, so an
+    // edited bundle fails here and not in review.
+    let hash = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(vendor.join("dagre.min.js"))
+        .output()
+        .unwrap();
+    let hash = String::from_utf8(hash.stdout).unwrap();
+    let hash = hash.split_whitespace().next().unwrap();
+    let license = fs::read_to_string(vendor.join("dagre.LICENSE")).unwrap();
+    assert_eq!(
+        hash, DAGRE_SHA256,
+        "ui/vendor/dagre.min.js is not the 3.1.3 release"
+    );
+    assert!(license.contains(&format!("sha256: {DAGRE_SHA256}")));
+}

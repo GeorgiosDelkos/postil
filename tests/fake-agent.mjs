@@ -124,8 +124,112 @@ let model = null;
 
 // Prompts this process received, so a test can tell a kept agent from a new one.
 let prompts = 0;
+// The params of each `session/new` this process received, in order: "echo-session" and
+// "refuse-servers" say them in each turn, so a test sees the MCP servers the app gave.
+const sessions = [];
 // A file in the session's working directory, as agents report paths: absolute.
 const file = `${process.cwd()}/src/a.rs`;
+
+// A citation as the analysis prompt asks for one: lines, and the text of the first.
+const cite = (path, start, end, first) => ({ path, lines: [start, end], first });
+
+// The diagrams an Analyzer answers the analysis prompt `text` with, by the kind it asks for.
+// The tests' repository has src/a.rs ("fn a() {", "    one();", "}") and src/b.rs, whose
+// "fn two() {" is on line 3.
+function analysisReply(text) {
+  const node = (key, kind, label, anchors, extra = {}) => ({
+    key,
+    kind,
+    label,
+    summary: `${label} in one line`,
+    detail: `What ${label} does.`,
+    anchors,
+    ...extra,
+  });
+  if (text.startsWith("Analyze this repository")) {
+    return {
+      diagrams: [
+        {
+          kind: "architecture",
+          title: "System",
+          nodes: [
+            // Right where it says.
+            node("page", "component", "Page", [cite("src/a.rs", 2, 2, "one();")], { group: "proc" }),
+            // Shifted: its first line is on line 3, named by the worktree's absolute path. Its
+            // label is over the limit, and its group names no node.
+            node("worker", "component", "W".repeat(70), [cite(`${process.cwd()}/src/b.rs`, 1, 2, "fn two() {")], {
+              group: "nowhere",
+            }),
+            // Wrong: no line reads so.
+            node("store", "store", "Store", [cite("src/a.rs", 1, 1, "no such line")]),
+            // A key used twice.
+            node("page", "component", "Again", []),
+            node("proc", "boundary", "Process", [{ path: "src" }]),
+          ],
+          edges: [
+            { from: "page", to: "worker", label: "calls", anchor: cite("src/a.rs", 2, 2, "one();") },
+            { from: "page", to: "ghost", label: "to no node", anchor: null },
+            { from: "worker", to: "worker", label: "to itself", anchor: null },
+          ],
+        },
+        { kind: "data", title: "Types", nodes: [node("note", "store", "Note", [{ path: "src/a.rs" }])], edges: [] },
+      ],
+    };
+  }
+  if (text.startsWith("Analyze one part")) {
+    return {
+      diagrams: [
+        {
+          kind: "architecture",
+          title: "Inside",
+          nodes: [
+            node("x", "component", "Inner", [cite("src/a.rs", 1, 1, "fn a() {")]),
+            node("y", "component", "Other", [{ path: "src/b.rs" }]),
+          ],
+          edges: [{ from: "x", to: "y", label: "uses", anchor: null }],
+        },
+      ],
+    };
+  }
+  if (text.startsWith("Trace one behavior")) {
+    // In step order, which is neither the keys' order nor the edges': the last step loops back
+    // to the first, as a retry does.
+    const steps = ["send", "check", "apply"].map((key) => node(key, "component", key, [{ path: "src/a.rs" }]));
+    return {
+      diagrams: [
+        {
+          kind: "flow",
+          title: "A flow",
+          nodes: steps,
+          edges: [
+            { from: "send", to: "check", label: "then", anchor: null },
+            { from: "check", to: "apply", label: "then", anchor: null },
+            { from: "apply", to: "send", label: "again", anchor: null },
+          ],
+        },
+      ],
+    };
+  }
+  // An update: replaces the first outdated node and deletes the others, tries to replace and
+  // to delete a healthy one, and adds a node with an edge to the replaced one. The added node's
+  // summary is over the limit and its group names no node, and one more edge goes to no node.
+  const outdated = [...text.matchAll(/^Outdated node (D\d+\.\d+)/gm)].map((match) => match[1]);
+  const healthy = [...text.matchAll(/^- (D\d+\.\d+) "[^"\n]*"$/gm)].map((match) => match[1]);
+  const diagram = text.match(/^Diagram (D\d+)/m)?.[1] ?? null;
+  const [first, ...rest] = outdated;
+  // The added node places the first file not on the map, when the prompt lists any, and
+  // leaves the others where they are.
+  const placed = text.match(/as a new node:\n- (\S+)\n/)?.[1] ?? "src/a.rs";
+  const added = node("added", "component", "Added", [{ path: placed }], { group: "nowhere" });
+  const nodes = [{ ...added, summary: "S".repeat(200) }];
+  const edges = [{ from: "added", to: "ghost", label: "to no node", anchor: null }];
+  if (first) {
+    nodes.push({ ...node(null, "component", "Renewed", [cite("src/a.rs", 1, 1, "fn a() {")]), id: first });
+    edges.push({ from: "added", to: first, label: "new", anchor: null });
+  }
+  if (healthy.length) nodes.push({ ...node(null, "component", "Hijacked", []), id: healthy[0] });
+  return { diagrams: [{ id: diagram, nodes, edges, deleted: [...rest, ...healthy.slice(0, 1)] }] };
+}
 
 async function prompt(id, params) {
   prompts += 1;
@@ -141,6 +245,17 @@ async function prompt(id, params) {
   say(`got ${blocks.join(" | ")}`);
   say(`prompt ${prompts}`);
   switch (scenario) {
+    case "echo-session":
+    case "refuse-servers":
+      // Answers each kind of run well enough to end: an analysis with its diagrams, a
+      // proposer with no findings, and any other run with the sessions alone.
+      say(`sessions ${JSON.stringify(sessions)}`);
+      if (blocks[0].startsWith("Analyze this repository")) {
+        say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]))}\n\`\`\``);
+      } else if (blocks[0].includes("Do not change any file")) {
+        say("Found none.\n\n```json\n[]\n```");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
     case "turn": {
       // Agents send notifications and update kinds the app does not use.
       send({ method: "_x.ai/session/setup", params: { phase: "auth" } });
@@ -293,6 +408,60 @@ async function prompt(id, params) {
       mkdirSync(`${process.cwd()}/outside`, { recursive: true });
       writeFileSync(`${process.cwd()}/outside/new.md`, `prompt ${prompts}\n`);
       return send({ id, result: { stopReason: "end_turn" } });
+    case "asks-to-edit": {
+      // An ask's agent (src/notes.rs, `ask_prompt`) that asks to edit, then to read, says how
+      // each was answered, and ends its answer with a block shaped like an author's report.
+      const options = [
+        { optionId: "once", name: "Allow", kind: "allow_once" },
+        { optionId: "no", name: "Reject", kind: "reject_once" },
+      ];
+      const edit = await ask("session/request_permission", {
+        sessionId: "S1",
+        toolCall: { toolCallId: "e1", title: "Edit a.txt", kind: "edit" },
+        options,
+      });
+      say(`edit ${edit.result.outcome.optionId}`);
+      const read = await ask("session/request_permission", {
+        sessionId: "S1",
+        toolCall: { toolCallId: "r1", title: "Read a.txt", kind: "read" },
+        options,
+      });
+      say(`read ${read.result.outcome.optionId}`);
+      say('It returns early.\n\n```json\n{"checks": [{"command": "cargo test", "result": "passed"}]}\n```');
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "review-memory":
+      // Plays the author and both reviewers of a review with team memory (src/review.rs),
+      // told apart by the prompt; each echoes its prompt as every scenario does ("got"). The
+      // author edits a.txt with a diff it reports and writes b.txt as a command would, with no
+      // diff. The proposer names a memory the fake hippius-mem recalls (mem_01A) and one no
+      // recall gave.
+      if (blocks[0].includes("Do not change any file")) {
+        const finding = (note, path, line, text, fix, memory) =>
+          ({ note, path, line, finding: text, fix, memory });
+        const findings = [
+          finding("N1", "a.txt", 1, "a.txt is read eagerly", "read it lazily", "mem_01A"),
+          finding(null, "b.txt", null, "b.txt is new", null, "mem_01NOTGIVEN"),
+        ];
+        say(`Found two.\n\n\`\`\`json\n${JSON.stringify(findings)}\n\`\`\``);
+      } else if (blocks[0].includes("You are the last reviewer")) {
+        say("F1: accepted - read lazily\nF2: rejected - fine as it is");
+      } else {
+        update({
+          sessionUpdate: "tool_call",
+          toolCallId: "w1",
+          title: "Edit a.txt",
+          kind: "edit",
+          status: "completed",
+          content: [
+            { type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "a\nedited" },
+          ],
+        });
+        writeFileSync(`${process.cwd()}/a.txt`, "a\nedited\n");
+        writeFileSync(`${process.cwd()}/b.txt`, "b\n");
+        say("N1: edited a.txt");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reviewer-silent":
       // A proposer whose reply has no findings block.
       say("Looks fine to me.");
@@ -328,6 +497,23 @@ async function prompt(id, params) {
       renameSync(`${process.cwd()}/c.txt`, `${process.cwd()}/d.txt`);
       writeFileSync(`${process.cwd()}/bin.dat`, Buffer.from([0, 1, 2, 255, 0, 7]));
       return send({ id, result: { stopReason: "end_turn" } });
+    case "report-reviewed": {
+      // Plays the author and a proposing reviewer, told apart by the prompt (src/review.rs).
+      // The author edits a.txt and rates its hunk mechanical; the reviewer finds something on
+      // a.txt's line 2, which must show the hunk unfolded as eyes, and something on no file.
+      if (blocks[0].includes("Do not change any file")) {
+        const findings = [
+          { path: "a.txt", line: 2, finding: "reported is not mechanical" },
+          { finding: "the change has no test" },
+        ];
+        say(`Found two.\n\n\`\`\`json\n${JSON.stringify(findings)}\n\`\`\``);
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      writeFileSync(`${process.cwd()}/a.txt`, "a\nreported\n");
+      const steps = [{ path: "a.txt", lines: [1, 2], why: "the change", risk: "mechanical" }];
+      say(`N1: done\n\n\`\`\`json\n${JSON.stringify({ steps, checks: [] })}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "report": {
       // Edits a.txt and deletes b.txt for real, says what it did, and ends with the author's
       // report (src/report.rs): steps on an edited file, on the deleted one (its lines name
@@ -349,6 +535,29 @@ async function prompt(id, params) {
           { command: "cargo test", result: "passed" },
           { command: "cargo build", result: "maybe" },
         ],
+      };
+      say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "change-map": {
+      // What the change map draws (docs/review-assist-plan.md, 8.6): deletes old.txt, which
+      // the report rates mechanical (folded, first), rewrites every line of big.txt (a long
+      // step in between), changes line 15 of lib.txt alone (last), and adds new.txt.
+      const cwd = process.cwd();
+      rmSync(`${cwd}/old.txt`);
+      const big = Array.from({ length: 150 }, (_, index) => `B${index + 1}\n`).join("");
+      writeFileSync(`${cwd}/big.txt`, big);
+      const lib = Array.from({ length: 20 }, (_, index) => `l${index + 1}\n`).join("");
+      writeFileSync(`${cwd}/lib.txt`, lib.replace("l15\n", "fifteen\n"));
+      writeFileSync(`${cwd}/new.txt`, "new\n");
+      say("N1: done");
+      const report = {
+        steps: [
+          { path: "old.txt", lines: [1, 4], why: "no longer used", risk: "mechanical" },
+          { path: "big.txt", lines: [1, 150], why: "renamed", risk: "routine" },
+          { path: "lib.txt", lines: [15, 15], why: "the change", risk: "routine" },
+        ],
+        checks: [{ command: "cargo test", result: "passed" }],
       };
       say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
       return send({ id, result: { stopReason: "end_turn" } });
@@ -448,6 +657,46 @@ async function prompt(id, params) {
       }
       return send({ id, result: { stopReason: stopped ? "cancelled" : "end_turn" } });
     }
+    case "analysis":
+      // An Analyzer (src/analysis/prompt.rs) that answers each kind of analysis its prompt asks
+      // for, as its last json block.
+      say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]), null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "analysis-empty":
+      say('Nothing to draw.\n\n```json\n{"diagrams": [{"kind": "architecture", "title": "None", "nodes": [], "edges": []}]}\n```');
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "analysis-edits":
+      // An Analyzer that edits without asking, then replies with diagrams that would read.
+      writeFileSync(`${process.cwd()}/a.txt`, "edited\n");
+      say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]), null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "memory-draft":
+    case "memory-draft-writes": {
+      // A thread's agent that answers its notes with a line, and a memory draft (src/run.rs,
+      // `DRAFT_ASK`) with the block it asks for. `memory-draft-writes` breaks the draft's rules
+      // first: it asks to edit, then edits a.txt without asking.
+      if (!blocks[0].includes("as a team memory")) {
+        say("N1: done");
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      if (scenario === "memory-draft-writes") {
+        const edit = await permission("w1");
+        say(`edit ${edit.result.outcome.optionId}`);
+        writeFileSync(`${process.cwd()}/a.txt`, "drafted over\n");
+      }
+      say(
+        'Here is the draft.\n\n```json\n{"summary": "a.txt holds one line on purpose", "body": "The parser reads a.txt whole: keep it to one line."}\n```',
+      );
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "memory-draft-hang":
+      // Answers its notes, and never ends a memory draft's turn: the draft stays under way.
+      if (!blocks[0].includes("as a team memory")) {
+        say("N1: done");
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      say("drafting");
+      return;
     case "hang":
       // Never ends the turn, and ignores the cancel.
       return;
@@ -569,9 +818,21 @@ const handle = (line) => {
       }
       return initialize(message.id);
     case "session/new":
+      sessions.push(message.params);
       if (scenario === "no-session-id") return send({ id: message.id, result: {} });
+      // An agent whose configuration forbids MCP servers from the client refuses a session
+      // that names any, as the schema lets it; "refuse-sessions" refuses every session.
+      if (scenario === "refuse-servers" && message.params.mcpServers.length > 0) {
+        return send({ id: message.id, error: { code: -32602, message: "MCP servers are disabled" } });
+      }
+      if (scenario === "refuse-sessions") {
+        return send({ id: message.id, error: { code: -32602, message: "no sessions today" } });
+      }
       if (scenario === "auth") {
-        return send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
+        // Says how many sessions it was asked for, so a test sees that a sign-in is not asked
+        // again without the MCP servers.
+        const asked = `Authentication required (session/new ${sessions.length})`;
+        return send({ id: message.id, error: { code: -32000, message: asked } });
       }
       if (scenario === "spawns-child") {
         // A grandchild in the agent's process group, as `npx` leaves `node` running. Its pid

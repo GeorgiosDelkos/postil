@@ -315,6 +315,47 @@ const streaming = (id, status, entries, extra = {}) => ({
   ...extra,
 });
 
+test("an ask is answered when its run ends well, with no line naming it", () => {
+  const ask = { ...sent("N1", "R1"), intent: "ask" };
+  const status = (r) => runStatus(ask, r);
+  const answer = [said("It returns early because the list is empty."), ended("end_turn")];
+  assert.deepEqual(status(run("R1", "ended", answer)), {
+    kind: "answered",
+    label: "Answered in R1",
+    tone: "done",
+  });
+  assert.equal(status(run("R1", "ended", [ended("cancelled")])).label, "Stopped in R1");
+  assert.equal(status(run("R1", "failed")).label, "Failed in R1");
+  assert.equal(status(run("R1", "running")).label, "Working");
+  assert.equal(
+    noteStatus({ ...ask, state: { kind: "resolved", run: "R1" } }, run("R1", "ended", answer))
+      .label,
+    "Resolved",
+  );
+  const groups = groupNotes([ask], () => status(run("R1", "ended", answer)));
+  assert.deepEqual(groups.done, [ask], "an answered ask is done");
+});
+
+test("an ask's dialog is drawn again as its answer streams, and on an undone edit", () => {
+  const ask = { ...sent("N1", "R1"), intent: "ask" };
+  const shown = [false, "Claude", [], true];
+  const key = (entries, problem = null) =>
+    noteDialogKey(ask, { ...streaming("R1", "running", entries), problem }, null, shown);
+  const start = [said("It returns")];
+  const drawn = key(start);
+  assert.notEqual(key([...start, said(" early.")]), drawn, "the answer it shows whole");
+  assert.notEqual(
+    key(start, "the agent changed files, though it may only read: its changes were undone"),
+    drawn,
+    "the notice above the answer",
+  );
+  // A change note's dialog shows only the agent's line about it, not the reply.
+  const change = sent("N1", "R1");
+  const changeKey = (entries) =>
+    noteDialogKey(change, streaming("R1", "running", entries), null, shown);
+  assert.equal(changeKey([...start, said(" early.")]), changeKey(start));
+});
+
 test("the note dialog keeps its key while its run streams what the dialog does not show", () => {
   const note = sent("N1", "R1");
   const shown = [true, "Claude", ["Codex"], true];
@@ -357,6 +398,43 @@ test("a judge writing its line changes the verdict's word only for the run dialo
   assert.notEqual(noteKey(more), noteKey(writing), "the note dialog shows the judge's line");
 });
 
+test("a review keeps each finding's team memory and says once why it had none", () => {
+  const finding = (id, memory) => ({
+    id,
+    note: null,
+    path: null,
+    line: null,
+    text: id,
+    fix: null,
+    memory,
+  });
+  const stage = (id, reviewer, memoryNotice, findings) => ({
+    ...streaming(id, "ended", [{ kind: "findings", findings, problem: null }], {
+      review: { of: "R1", reviewer, reviewers: 3 },
+    }),
+    memoryNotice,
+  });
+  const notice = "team memory could not be checked: hippius-mem is not installed on PATH";
+  const review = reviewOf("R1", [
+    stage("R2", 1, notice, [finding("F1", "mem_01A")]),
+    stage("R3", 2, notice, [finding("F2", undefined)]),
+    stage("R4", 3, null, []),
+  ]);
+  assert.deepEqual(
+    review.findings.map((item) => item.memory),
+    ["mem_01A", undefined],
+  );
+  assert.deepEqual(review.notices, [notice], "each notice once");
+  assert.deepEqual(reviewOf("R1", [stage("R2", 1, null, [])]).notices, []);
+
+  // A memory that arrives, or a notice, draws the dialogs again.
+  const without = reviewOf("R1", [stage("R2", 1, null, [finding("F1", undefined)])]);
+  const named = reviewOf("R1", [stage("R2", 1, null, [finding("F1", "mem_01A")])]);
+  const noticed = reviewOf("R1", [stage("R2", 1, notice, [finding("F1", undefined)])]);
+  assert.notDeepEqual(reviewKey(named), reviewKey(without));
+  assert.notDeepEqual(reviewKey(noticed), reviewKey(without));
+});
+
 test("the run dialog keeps its key while the agent streams its reply and thoughts", () => {
   const thought = (text) => ({ kind: "thought", text });
   const edit = tool("t1", "edit", "a.rs", [], "in_progress");
@@ -378,6 +456,54 @@ test("the run dialog keeps its key while the agent streams its reply and thought
     "the reply shows",
   );
   assert.equal(replyText(streaming("R1", "ended", start)), "Done");
+});
+
+test("an undone edit redraws the run dialog with its notice", () => {
+  // The server sets the run's problem from the `undone` entry (src/run/log.rs, `apply`), live
+  // and after a restart; the dialog shows it under the reply.
+  const start = [said("It returns early.")];
+  const text = "the agent changed files, though it may only read: its changes were undone";
+  const drawn = threadKey([streaming("R1", "running", start)]);
+  const undone = threadKey([
+    streaming("R1", "running", [...start, { kind: "undone", text }], { problem: text }),
+  ]);
+  assert.notEqual(undone, drawn);
+});
+
+test("a run that started without team memory redraws its dialogs with the notice", () => {
+  // The server sets `memoryNotice` as the agent starts (src/run.rs, `Runner::start`), with no
+  // entry of its own: only the key shows it changed.
+  const notice = {
+    memoryNotice: "team memory was not given: hippius-mem is not installed on PATH",
+  };
+  const start = [said("Done")];
+  assert.notEqual(
+    threadKey([streaming("R1", "running", start, notice)]),
+    threadKey([streaming("R1", "running", start)]),
+    "the run dialog",
+  );
+  const note = sent("N1", "R1");
+  const shown = [false, "Claude", [], true];
+  assert.notEqual(
+    noteDialogKey(note, streaming("R1", "running", start, notice), null, shown),
+    noteDialogKey(note, streaming("R1", "running", start), null, shown),
+    "the note's dialog",
+  );
+});
+
+test("an analysis run's dialog redraws for what it was asked and for why nothing was stored", () => {
+  // The server sets the problem from the `noAnalysis` entry (src/run/log.rs, `apply`).
+  const asked = { analysis: { kind: "analyze" } };
+  const ended = threadKey([streaming("R1", "ended", [], asked)]);
+  assert.notEqual(ended, threadKey([streaming("R1", "ended", [])]), "the run's kind");
+  const empty = "the analysis was empty";
+  const nothing = threadKey([
+    streaming("R1", "ended", [{ kind: "noAnalysis", problem: empty }], {
+      ...asked,
+      problem: empty,
+    }),
+  ]);
+  assert.notEqual(nothing, ended);
 });
 
 const fenced = (json) => "```json\n" + json + "\n```";

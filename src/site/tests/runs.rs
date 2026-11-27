@@ -821,7 +821,7 @@ fn reviewers_propose_read_only_then_the_last_judges_the_findings() {
 
 /// Saves Fake (`author`) as the agent notes go to and `reviewers`, each a (name,
 /// scenario) pair, as the reviewers in order.
-fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
+pub(super) fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
     let mut custom = vec![serde_json::json!({ "name": "Fake", "command": fake_agent(author) })];
     custom.extend(reviewers.iter().map(
         |(name, scenario)| serde_json::json!({ "name": name, "command": fake_agent(scenario) }),
@@ -1021,6 +1021,38 @@ fn a_send_that_fails_between_two_stages_leaves_the_review_going() {
     assert!(
         kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
         "{judge}"
+    );
+}
+
+#[test]
+fn the_judge_s_edits_are_kept() {
+    let repo = TempRepo::new("run-review-judge-edits");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    // The proposer finds one thing; the judge, which may change files, writes a.txt.
+    set_reviewers(
+        &site,
+        "plain",
+        &[("First", "reviewer"), ("Judge", "writes")],
+    );
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+
+    let judge = wait_for_run(&site, &nudges, "R3");
+
+    assert_eq!(judge["status"], "ended", "{judge}");
+    assert_eq!(judge["problem"], serde_json::Value::Null, "{judge}");
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(worktree.join("a.txt")).unwrap(),
+        "a\nprompt 1\n"
     );
 }
 
@@ -2001,6 +2033,24 @@ fn a_version_5_log_reads_without_a_report() {
 }
 
 #[test]
+fn a_version_7_log_reads_as_no_analysis() {
+    let repo = TempRepo::new("run-version-7");
+    let runs = repo.root.join(".git/postil/runs");
+    fs::create_dir_all(&runs).unwrap();
+    let header = header("R1").replace(r#""version":1"#, r#""version":7"#);
+    fs::write(
+        runs.join("R1.jsonl"),
+        format!("{header}\n{{\"kind\":\"ended\",\"reason\":\"end_turn\"}}\n"),
+    )
+    .unwrap();
+
+    let run = get_json(&repo.site(), RUN);
+    assert_eq!(run["id"], "R1", "{run}");
+    assert_eq!(run["analysis"], serde_json::Value::Null, "{run}");
+    assert_eq!(run["problem"], serde_json::Value::Null, "{run}");
+}
+
+#[test]
 fn an_unreadable_newest_log_is_skipped_and_named() {
     let repo = TempRepo::new("run-skip");
     let runs = repo.root.join(".git/postil/runs");
@@ -2020,8 +2070,8 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         ("\n", "its first line is not a run header"),
         ("not a header\n", "its first line is not a run header"),
         (
-            r#"{"version":7,"id":"R3","newField":1}"#,
-            "it is version 7, and this build of Postil reads versions 1 to 6",
+            r#"{"version":11,"id":"R3","newField":1}"#,
+            "it is version 11, and this build of Postil reads versions 1 to 10",
         ),
         (
             &*header("R3").replace(
@@ -2031,7 +2081,48 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
                     r#""followUp":{"of":"R2","text":"x"}"#,
                 ),
             ),
-            "its header is both a review and a follow-up",
+            "its header is more than one of a review, a follow-up, an analysis and a memory draft",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                concat!(
+                    r#""startedAt":1,"followUp":{"of":"R2","text":"x"},"readOnly":true,"#,
+                    r#""analysis":{"kind":"analyze"}"#,
+                ),
+            ),
+            "its header is more than one of a review, a follow-up, an analysis and a memory draft",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                concat!(
+                    r#""startedAt":1,"readOnly":true,"analysis":{"kind":"analyze"},"#,
+                    r#""remember":{"of":"R2"}"#,
+                ),
+            ),
+            "its header is more than one of a review, a follow-up, an analysis and a memory draft",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                r#""startedAt":1,"remember":{"of":"R2"}"#,
+            ),
+            "its header is a memory draft that may change files",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                r#""startedAt":1,"readOnly":true,"remember":{"of":"R02"}"#,
+            ),
+            r#"its header drafts a memory after "R02", which is not a run id"#,
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                r#""startedAt":1,"analysis":{"kind":"analyze"}"#,
+            ),
+            "its header is an analysis that may change files",
         ),
     ] {
         fs::write(runs.join("R3.jsonl"), newest).unwrap();
@@ -2042,7 +2133,25 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         assert!(problem.contains(why), "{problem}");
     }
 
+    // An analysis run is passed over as no run of notes, and named in no problem.
+    let analysis = header("R3").replace(
+        r#""startedAt":1"#,
+        r#""startedAt":1,"readOnly":true,"analysis":{"kind":"deeper","of":"D1.2"}"#,
+    );
+    fs::write(runs.join("R3.jsonl"), format!("{analysis}\n")).unwrap();
+    let run = get_json(&site, RUN);
+    assert_eq!(
+        (run["id"].as_str(), run["problem"].as_str()),
+        (Some("R2"), None)
+    );
+    let shown = get_json(&site, &format!("{RUN}?id=R3"));
+    assert_eq!(
+        shown["analysis"],
+        serde_json::json!({ "kind": "deeper", "of": "D1.2" })
+    );
+
     fs::remove_file(runs.join("R2.jsonl")).unwrap();
+    fs::remove_file(runs.join("R3.jsonl")).unwrap();
     assert_eq!(get(&site, RUN).1, "null", "nothing readable is no run");
 
     // A runs directory that cannot be listed is an error, not "no runs".
@@ -2051,6 +2160,36 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
     let (status, body) = get(&site, RUN);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("cannot read the run log"), "{body}");
+}
+
+#[test]
+fn a_memory_draft_is_passed_over_as_no_run_of_notes_and_one_unfinished_has_no_draft() {
+    let repo = TempRepo::new("run-draft-log");
+    let runs = repo.root.join(".git/postil/runs");
+    fs::create_dir_all(&runs).unwrap();
+    // A version 8 header reads as no memory draft.
+    let older = header("R2").replace(r#""version":1"#, r#""version":8"#);
+    fs::write(runs.join("R2.jsonl"), format!("{older}\n")).unwrap();
+    let draft = header("R3").replace(
+        r#""startedAt":1"#,
+        r#""startedAt":1,"readOnly":true,"remember":{"of":"R2"}"#,
+    );
+    fs::write(runs.join("R3.jsonl"), format!("{draft}\n")).unwrap();
+    let site = repo.site();
+
+    let run = get_json(&site, RUN);
+    assert_eq!(
+        (run["id"].as_str(), run["problem"].as_str()),
+        (Some("R2"), None)
+    );
+    let shown = get_json(&site, &format!("{RUN}?id=R3"));
+    assert_eq!(shown["remember"], serde_json::json!({ "of": "R2" }));
+    assert_eq!(
+        shown["draft"],
+        serde_json::json!({ "state": "failed", "problem": "the draft run did not finish" })
+    );
+    let plain = get_json(&site, &format!("{RUN}?id=R2"));
+    assert_eq!((plain.get("remember"), plain.get("draft")), (None, None));
 }
 
 #[test]

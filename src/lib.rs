@@ -7,8 +7,10 @@
 
 mod acp;
 mod agents;
+mod analysis;
 mod anchor;
 mod clone;
+mod definitions;
 mod dialog;
 mod disk;
 mod error;
@@ -17,6 +19,7 @@ mod folders;
 mod github;
 mod highlight;
 mod layout;
+mod memory;
 #[cfg(target_os = "macos")]
 mod menu;
 mod models;

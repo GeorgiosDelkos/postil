@@ -17,12 +17,14 @@ export function codeMetrics(fontSize) {
   return { fontSize, lineHeight: Math.round((fontSize * 22) / 13) };
 }
 
-// The agent notes are sent to and each reviewer are slots, `{ name, model }`: an agent and the
-// model it runs, `model` null for the agent's own default (src/settings.rs, AgentSlot).
+// The agent notes are sent to, the analyzer and each reviewer are slots, `{ name, model }`: an
+// agent and the model it runs, `model` null for the agent's own default (src/settings.rs,
+// AgentSlot). The analyzer is null when analyses go to the agent notes are sent to.
 
 // What an agent is used for, in words, or null when it is free to disable or remove.
 export function usage(settings, name) {
   if (settings.agent?.name === name) return "notes are sent to it";
+  if (settings.analyzer?.name === name) return "it analyzes the repository";
   if (settings.reviewers.some((slot) => slot.name === name)) return "it reviews the agent's work";
   return null;
 }
@@ -114,6 +116,7 @@ export function saveCustomAgent(settings, agent, previous, builtInNames) {
       customAgents: settings.customAgents.map((each) => (each.name === previous ? saved : each)),
       enabledAgents: settings.enabledAgents.map(rename),
       agent: settings.agent === null ? null : renameSlot(settings.agent),
+      analyzer: settings.analyzer ? renameSlot(settings.analyzer) : null,
       reviewers: settings.reviewers.map(renameSlot),
     },
   };
@@ -148,6 +151,22 @@ export function setAgentModel(settings, model) {
   return { settings: { ...settings, agent: { ...settings.agent, model } } };
 }
 
+// The agent that analyzes the repository for the map; null for the agent notes are sent to. As
+// for that agent, only an enabled one can be chosen, and another agent starts on its default
+// model.
+export function setAnalyzer(settings, name) {
+  if (name === null) return { settings: { ...settings, analyzer: null } };
+  if (!settings.enabledAgents.includes(name)) return { error: `Turn ${name} on first.` };
+  const model = settings.analyzer?.name === name ? settings.analyzer.model : null;
+  return { settings: { ...settings, analyzer: { name, model } } };
+}
+
+// The analyzer's model; null for the agent's default.
+export function setAnalyzerModel(settings, model) {
+  if (!settings.analyzer) return { error: "Choose the analyzer first." };
+  return { settings: { ...settings, analyzer: { ...settings.analyzer, model } } };
+}
+
 // Adds a reviewer at the end, on its default model. The same agent may review more than once:
 // each entry is one independent review, with a model of its own.
 export function addReviewer(settings, name) {
@@ -175,4 +194,40 @@ export function moveReviewer(settings, index, step) {
   const reviewers = [...settings.reviewers];
   [reviewers[index], reviewers[target]] = [reviewers[target], reviewers[index]];
   return { settings: { ...settings, reviewers } };
+}
+
+// Team memory (hippius-mem) as the mark beside it shows it (`kind`, an `.agent-mark` class in
+// app.css) and says it (`label`), from `memory`, the `memory` of api/settings. Missing while the
+// switch is on is a problem; while it is off, only not installed.
+export function memoryState(memory, agentMemory) {
+  const state = memory.state;
+  if (state === null) return { kind: "unchecked", label: "Checking hippius-mem…" };
+  if (state.kind === "ready") return { kind: "installed", label: "Ready" };
+  if (state.kind === "unconfigured") {
+    if (canSetUp(state)) return { kind: "unchecked", label: "Installed, not set up" };
+    return { kind: "missing", label: "Installed, doctor did not pass" };
+  }
+  if (agentMemory) return { kind: "missing", label: "Not found on PATH" };
+  return { kind: "absent", label: "Not installed" };
+}
+
+// Whether Set up a trial vault is offered for `state`: only when doctor found no
+// configuration. hippius-mem exits 1 for every error, so its message tells this apart from a
+// configured vault whose check failed, where `quickstart` would only refuse ("a config already
+// exists"). The words are doctor's with no configuration (hippius-mem 0.7.1, spike S3), pinned
+// by the test of the real program in src/site/tests/memory.rs. Doctor printing nothing says
+// nothing against it.
+export function canSetUp(state) {
+  if (state?.kind !== "unconfigured") return false;
+  return state.problem === null || state.problem.includes("failed to load configuration");
+}
+
+// Turns team memory on or off. It turns on only once hippius-mem is ready (`state`, the state in
+// api/settings' `memory`); it turns off whatever the state, so a removed hippius-mem can be let
+// go. The Rust process checks the same rule against its own latest check (src/site.rs).
+export function setAgentMemory(settings, enabled, state) {
+  if (enabled && state?.kind !== "ready") {
+    return { error: "Set up hippius-mem before giving agents team memory." };
+  }
+  return { settings: { ...settings, agentMemory: enabled } };
 }

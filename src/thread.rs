@@ -55,9 +55,9 @@ use crate::files::{save_json, version_of};
 use crate::repo::{Checkout, Repo};
 
 /// The format version of `threads.json`. Version 2 added `lastRun` and the evicted state,
-/// version 3 `pullRequest`; versions 1 and 2 are still read, version 1 as threads with no time
-/// of a last run.
-const THREADS_VERSION: u32 = 3;
+/// version 3 `pullRequest`, version 4 `mode`; every older version is still read, version 1 as
+/// threads with no time of a last run, and versions 1 to 3 as threads that work.
+const THREADS_VERSION: u32 = 4;
 
 /// The longest slug a branch name takes from a note, in characters. Arbitrary: long enough to
 /// tell threads apart in `git branch`, short enough for a pull request's head.
@@ -92,6 +92,25 @@ pub(crate) struct Thread {
     /// The pull request opened from the thread's branch, once one is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pull_request: Option<PullRequest>,
+    /// Whether its runs may change files, set before the thread is added to the record and
+    /// never changed. Absent before version 4, where every thread works.
+    #[serde(default)]
+    pub(crate) mode: Mode,
+}
+
+/// Whether a thread's runs may change files (docs/review-assist.md, "Where read-only agents
+/// run").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Mode {
+    /// Its runs work on notes: they edit, and their changes are applied or opened as a pull
+    /// request.
+    #[default]
+    Work,
+    /// Its runs only read, as an ask's do: every tool call but a read is refused, edits made
+    /// without asking are undone, and there is nothing to apply, review or open as a pull
+    /// request.
+    Read,
 }
 
 /// A thread's pull request on GitHub, as Postil last read it.
@@ -135,7 +154,8 @@ struct Threads {
 }
 
 /// A new thread for run `id` of `repo`, its first note's text `title`: its place, its branch
-/// and the commit it starts from, `fork`. Nothing is written or made.
+/// and the commit it starts from, `fork`. It works ([`Mode::Work`]) until the caller sets
+/// another mode, before the thread is added. Nothing is written or made.
 ///
 /// # Errors
 ///
@@ -172,13 +192,14 @@ pub(crate) fn plan(
         state: State::Open,
         skipped: Vec::new(),
         pull_request: None,
+        mode: Mode::Work,
     })
 }
 
 /// Makes `thread`'s worktree, locked in git, on its branch: a new branch at the fork commit for
 /// an open thread, its existing branch for an evicted one. Then checks out its submodules,
-/// and clones the engineer's ignored top-level folders (`target`, `node_modules`) into it.
-/// Returns what was
+/// and, for a thread that works, clones the engineer's ignored top-level folders (`target`,
+/// `node_modules`) into it: a thread that only reads builds nothing. Returns what was
 /// not given to the worktree, each with the reason: a folder that could not be cloned or
 /// copied, a Python virtual environment (it names its own absolute path, so a clone would
 /// install into the engineer's), or submodules that could not be checked out. Takes as long
@@ -221,6 +242,9 @@ pub(crate) fn make(repo: &Repo, thread: &Thread) -> Result<Vec<String>> {
     let mut skipped = Vec::new();
     if let Err(error) = tree.update_submodules() {
         skipped.push(format!("submodules: {}", error_chain(&error)));
+    }
+    if thread.mode == Mode::Read {
+        return Ok(skipped);
     }
     let folders = repo.ignored_folders().unwrap_or_else(|error| {
         skipped.push(format!("ignored folders: {}", error_chain(&error)));
@@ -537,6 +561,7 @@ pub(crate) fn sweep(repo: &Repo, home: &Path) -> Result<()> {
             state: State::Open,
             skipped: Vec::new(),
             pull_request: None,
+            mode: Mode::Work,
         };
         if let Ok(Some(trashed)) = free(repo, &home, &orphan) {
             trashed.delete_later();
@@ -831,15 +856,16 @@ fn read(file: &Path) -> Result<Threads> {
     };
     match version_of(&json) {
         // Version 1 has no `lastRun`, which reads as 0, and no thread evicted; neither 1 nor 2
-        // has a pull request. Both are written back as the current version at the next change.
-        Ok(1 | 2 | THREADS_VERSION) => {
+        // has a pull request, and none before 4 a `mode`, which reads as `Work`. Each is
+        // written back as the current version at the next change.
+        Ok(1..=THREADS_VERSION) => {
             let mut threads: Threads =
                 serde_json::from_slice(&json).map_err(|e| problem(e.to_string()))?;
             threads.version = THREADS_VERSION;
             Ok(threads)
         }
         Ok(version) => Err(problem(format!(
-            "version {version}, and this Postil reads version {THREADS_VERSION}"
+            "version {version}, and this Postil reads versions 1 to {THREADS_VERSION}"
         ))),
         Err(error) => Err(problem(error.to_string())),
     }
@@ -927,6 +953,47 @@ mod tests {
         // One in Postil's home cannot be changed, so no thread is made there.
         let error = plan(&repo, Some(&dir.path().join("ho:me")), "R1", "abc", "t").unwrap_err();
         assert!(matches!(error, Error::ColonInPath { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn the_record_is_pretty_json_ending_in_a_newline_byte_for_byte() {
+        let dir = TempDir::new("thread-bytes");
+        let file = dir.path().join("threads.json");
+        let thread = |id: &str, mode| Thread {
+            id: id.to_owned(),
+            path: PathBuf::from(format!("/home/.postil/worktrees/app-0a1b2c3d/{id}")),
+            branch: format!("postil/{id}-fix"),
+            fork: "f0".to_owned(),
+            base: Some("trunk".to_owned()),
+            tip: "t1".to_owned(),
+            last_run: 7,
+            state: State::Open,
+            skipped: Vec::new(),
+            pull_request: None,
+            mode,
+        };
+        let threads = Threads {
+            version: THREADS_VERSION,
+            threads: vec![thread("r1", Mode::Work), thread("r2", Mode::Read)],
+        };
+
+        save_json(&file, &threads).unwrap();
+
+        let entry = |id: &str, mode: &str| {
+            format!(
+                "    {{\n      \"id\": \"{id}\",\n      \"path\": \
+                 \"/home/.postil/worktrees/app-0a1b2c3d/{id}\",\n      \"branch\": \
+                 \"postil/{id}-fix\",\n      \"fork\": \"f0\",\n      \"base\": \"trunk\",\n      \
+                 \"tip\": \"t1\",\n      \"lastRun\": 7,\n      \"state\": \"open\",\n      \
+                 \"mode\": \"{mode}\"\n    }}"
+            )
+        };
+        let expected = format!(
+            "{{\n  \"version\": 4,\n  \"threads\": [\n{},\n{}\n  ]\n}}\n",
+            entry("r1", "work"),
+            entry("r2", "read")
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
     }
 
     #[test]
