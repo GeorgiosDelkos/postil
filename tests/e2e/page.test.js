@@ -652,6 +652,45 @@ test("the Usage button's warning dot stays a dot beside the label", async (t) =>
   assert.deepEqual([dot.width, dot.height], [6, 6]);
 });
 
+test("the quota strip shows one bar per agent, the bars in one column", async (t) => {
+  const { page } = await openProject(t);
+  // The e2e site has no built-in agents installed, so their quotas are put into its reply.
+  const quota = (...windows) => ({ status: "ok", windows });
+  const agents = [
+    ["Claude", quota({ label: "7-day all models", shortLabel: "wk", usedPercent: 93 })],
+    [
+      "Antigravity",
+      quota(
+        { label: "Gemini models (5h)", shortLabel: "5h", usedPercent: 4.8 },
+        { label: "Gemini models (weekly)", shortLabel: "wk", usedPercent: 58 },
+      ),
+    ],
+    ["Grok", quota({ label: "Weekly window", shortLabel: "wk", usedPercent: 19 })],
+  ].map(([name, report]) => ({ name, builtIn: true, found: `/bin/${name}`, quota: report }));
+  await page.route(/api\/usage\?/, async (route) => {
+    const view = await (await route.fetch()).json();
+    await route.fulfill({ json: { ...view, agents, scanning: false, polling: false } });
+  });
+  await page.reload();
+  const strip = page.locator("#quota-strip");
+  await strip.waitFor();
+
+  assert.deepEqual(await strip.locator(".quota-strip-text").allTextContents(), [
+    "wk 93%",
+    "wk 58%",
+    "wk 19%",
+  ]);
+  const bars = await Promise.all(
+    (await strip.locator(".quota-strip-bar").all()).map((bar) => bar.boundingBox()),
+  );
+  assert.equal(bars.length, 3);
+  for (const bar of bars) assert.deepEqual([bar.x, bar.width], [bars[0].x, bars[0].width]);
+  const cut = await strip
+    .locator(".quota-strip-name")
+    .evaluateAll((names) => names.filter((n) => n.scrollWidth > n.clientWidth).length);
+  assert.equal(cut, 0, "every name shows in full");
+});
+
 test("OpenCode's logo shows wherever the page names it, and a custom agent has none", async (t) => {
   const { page, api } = await openProject(t, null, "new-opencode");
   const logo = 'svg.agent-logo use[href="#agent-opencode"]';

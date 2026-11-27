@@ -172,24 +172,23 @@ function inferShortLabel(label) {
   return "lim";
 }
 
-// Compact inline text for an agent's live quota: `5h 35% · wk 19%`, or credits when no window
-// is present.
-export function inlineQuotaText(quota) {
-  const compact = compactQuotaWindows(quota);
-  if (compact.length > 0) {
-    return compact.map((win) => `${win.label} ${formatPercent(win.usedPercent)}`).join(" · ");
-  }
-  if (quota?.status === "ok" && quota.credits) {
-    return formatCredits(quota.credits);
-  }
-  return "";
-}
-
-// The compact window with the highest utilization, used for single-meter menu badges.
+// The compact window with the highest utilization: the one meter the sidebar strip and the menu
+// badges show. The owner asked on 2026-11-27 for every agent's line to look alike, its bar in
+// the same place; two stacked bars and two values made Antigravity's line wider than the rest
+// and cut its name. The popover lists every window.
 export function tightestQuotaWindow(quota) {
   const compact = compactQuotaWindows(quota);
   if (compact.length === 0) return null;
   return compact.reduce((best, win) => (win.usedPercent > best.usedPercent ? win : best));
+}
+
+// The text beside that meter ("wk 58%"), or the credits when there is no window, or "" when
+// there is nothing to show.
+export function tightestQuotaText(quota) {
+  const tightest = tightestQuotaWindow(quota);
+  if (tightest) return `${tightest.label} ${formatPercent(tightest.usedPercent)}`;
+  if (quota?.status === "ok" && quota.credits) return formatCredits(quota.credits);
+  return "";
 }
 
 // Built-in agents to show in the sidebar quota strip and popover: enabled built-in agents when

@@ -4186,9 +4186,11 @@ body.focus-mode .code {
 
 .quota-strip {
   width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
+  /* One grid for every row, so the bars share a column and the values another. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px auto;
+  align-items: center;
+  gap: 5px 8px;
   margin-bottom: 6px;
   padding: 7px 8px;
   background: var(--card);
@@ -4209,11 +4211,7 @@ body.focus-mode .code {
 }
 
 .quota-strip-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
+  display: contents;
 }
 
 .quota-strip-agent {
@@ -4230,20 +4228,6 @@ body.focus-mode .code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.quota-strip-meters {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-}
-
-.quota-mini-bars {
-  display: inline-flex;
-  flex-direction: column;
-  gap: 2px;
-  width: 20px;
 }
 
 .quota-mini-track {
@@ -4270,7 +4254,16 @@ body.focus-mode .code {
   background: var(--attention);
 }
 
+.quota-strip-bar {
+  display: flex;
+}
+
+.quota-strip-bar .quota-mini-track {
+  width: 100%;
+}
+
 .quota-strip-text {
+  text-align: right;
   font: 500 10.5px var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
