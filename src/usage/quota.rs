@@ -172,7 +172,8 @@ type ProbeFn = Arc<dyn Fn(&str, &OsStr) -> QuotaReport + Send + Sync>;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum QuotaFetch {
     /// Serve cached reports; probe only an entry that is missing, older than
-    /// [`CACHE_TTL`], or in flight past [`LOADING_TIMEOUT`]. `GET /api/usage`.
+    /// [`CACHE_TTL`] (or [`ERROR_CACHE_TTL`] for failed probes), or in flight past
+    /// [`LOADING_TIMEOUT`]. `GET /api/usage`.
     Cached,
     /// Probe every finished entry again, but keep a probe still in flight within
     /// [`LOADING_TIMEOUT`]: its result is the fresh one. `POST /api/usage/refresh`.
@@ -1950,14 +1951,14 @@ mod tests {
         poller.join_probes();
         let ok = claude(&poller, QuotaFetch::Cached);
         assert_eq!(ok.status, QuotaStatus::Ok);
-        assert_eq!(ok.windows[0].used_percent, 42.0);
+        assert!((ok.windows[0].used_percent - 42.0).abs() < 1e-6);
 
         // Refresh starts probe 2 while returning Loading with the previous good snapshot.
         let refreshing = claude(&poller, QuotaFetch::Refresh);
         assert_eq!(refreshing.status, QuotaStatus::Loading);
         assert_eq!(refreshing.plan.as_deref(), Some("Max"));
         assert_eq!(refreshing.windows.len(), 1);
-        assert_eq!(refreshing.windows[0].used_percent, 42.0);
+        assert!((refreshing.windows[0].used_percent - 42.0).abs() < 1e-6);
         assert_eq!(refreshing.fetched_at, Some(1_795_000_000));
 
         // Probe 2 fails transiently (HTTP 429): status is Error with message, but windows survive.
@@ -1970,7 +1971,7 @@ mod tests {
         );
         assert_eq!(failed.plan.as_deref(), Some("Max"));
         assert_eq!(failed.windows.len(), 1);
-        assert_eq!(failed.windows[0].used_percent, 42.0);
+        assert!((failed.windows[0].used_percent - 42.0).abs() < 1e-6);
         assert_eq!(failed.fetched_at, Some(1_795_000_000));
 
         // Probe 3 succeeds and updates the cached snapshot.
@@ -1978,7 +1979,7 @@ mod tests {
         poller.join_probes();
         let updated = claude(&poller, QuotaFetch::Cached);
         assert_eq!(updated.status, QuotaStatus::Ok);
-        assert_eq!(updated.windows[0].used_percent, 55.0);
+        assert!((updated.windows[0].used_percent - 55.0).abs() < 1e-6);
         assert_eq!(updated.message, None);
 
         // Probe 4 returns Unavailable (signed out): clears last_ok windows.

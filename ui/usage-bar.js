@@ -24,6 +24,7 @@ import {
 
 const POLL_MS = 1000;
 const FRESH_MS = 300_000;
+const ERROR_FRESH_MS = 60_000;
 const AUTO_REFRESH_COOLDOWN_MS = 60_000;
 const MAX_POLLS = 45;
 
@@ -71,6 +72,7 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     if (!fromDialog && (merged.scanning || merged.polling) && ui.polls < MAX_POLLS) {
       ui.polls += 1;
       ui.pollTimer = setTimeout(() => {
+        ui.pollTimer = null;
         fetchUsage({ force: false, allowStale: true }).catch(() => {});
       }, POLL_MS);
     } else if (!merged.scanning && !merged.polling) {
@@ -81,13 +83,18 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     if (!popoverEl.hidden) renderPopover();
   }
 
+  function hasErrorQuota() {
+    return (ui.view?.agents ?? []).some((agent) => agent?.quota?.status === "error");
+  }
+
   async function fetchUsage({ force = false, allowStale = false, manual = false } = {}) {
     if (!ui.started) return;
     const now = Date.now();
     const settled = ui.view && !ui.view.scanning && !ui.view.polling;
+    const freshWindow = hasErrorQuota() ? ERROR_FRESH_MS : FRESH_MS;
     if (!force) {
       if (ui.inFlight) return;
-      if (!allowStale && settled && now - ui.fetchedAtMs < FRESH_MS) return;
+      if (!allowStale && settled && now - ui.fetchedAtMs < freshWindow) return;
     } else if (!manual) {
       if (ui.inFlight || ui.pollTimer !== null) return;
       if (now - ui.lastForceAtMs < AUTO_REFRESH_COOLDOWN_MS) return;
@@ -95,6 +102,8 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     const token = ++ui.asked;
     ui.inFlight = true;
     if (force) {
+      clearTimeout(ui.pollTimer);
+      ui.pollTimer = null;
       ui.lastForceAtMs = now;
       ui.refreshing = true;
       ui.polls = 0;
