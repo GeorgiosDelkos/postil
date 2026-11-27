@@ -106,6 +106,7 @@ pub(crate) enum RunOrigin {
     Notes,
     FollowUp,
     Review,
+    Analysis,
 }
 
 /// One finished run recorded in `usage.jsonl`.

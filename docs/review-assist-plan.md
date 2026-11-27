@@ -78,7 +78,7 @@ step named.
   | `threads.json` (`THREADS_VERSION`, `src/thread.rs:60`) | 3 | 7.6 (4) |
   | `settings.json` (`VERSION`, `src/settings.rs:42`) | 2 | 8.2 (3), 9.1 (4) |
   | `layout.json` | 1 | 8.3 (2) |
-  | `analysis.json` | none | 8.1 (1) |
+  | `analysis.json` | none | 8.1 (1), 8.2 (2), 8.7 (3) |
 
   `settings.json` is at version 2 since #60 made the agent and reviewers `{name, model}` slots:
   `settings::parse` (`src/settings.rs:461`) reads version 1 through `upgrade_v1` and refuses

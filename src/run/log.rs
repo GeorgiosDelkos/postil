@@ -37,6 +37,7 @@ use crate::acp::{
     ContentBlock, Event, Location, PermissionKind, PlanEntryStatus, PromptUsage, SessionUpdate,
     StopReason, ToolCallContent, ToolCallStatus, ToolKind, TurnEnd, UsageCost,
 };
+use crate::analysis::AnalysisRun;
 use crate::error::{Error, Result};
 use crate::files::version_of;
 use crate::report::Report;
@@ -82,10 +83,11 @@ pub(super) enum InThread<'a> {
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
 /// on the `tool` and `toolUpdate` entries; version 6 the `report` entry; version 7 `readOnly`
-/// in the header and the `undone` entry. Every older version reads: a log before version 4 has
-/// no snapshots, one before version 5 no commands or exit codes, one before version 6 no
-/// report, and one before version 7 is a run that may change files.
-const LOG_VERSION: u32 = 7;
+/// in the header and the `undone` entry; version 8 an analysis run (`analysis` in the header,
+/// the `noAnalysis` entry). Every older version reads: a log before version 4 has no snapshots,
+/// one before version 5 no commands or exit codes, one before version 6 no report, one before
+/// version 7 is a run that may change files, and one before version 8 is no analysis.
+const LOG_VERSION: u32 = 8;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -149,6 +151,10 @@ impl RunUsage {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a fact of its own, set once by its own caller; no two make one state"
+)]
 pub(super) struct RunState {
     pub(super) header: Header,
     entries: Vec<Entry>,
@@ -167,6 +173,12 @@ pub(super) struct RunState {
     /// reader thread, a forced Stop, a close), so only it commits: two `git commit`s in one
     /// worktree at once would fail on its index lock. Not logged.
     pub(super) after_claimed: bool,
+    /// Set by the first caller that ends the run while it holds the thread's lock for work
+    /// after the agent's turn: an analysis run's merge (`run.rs`, `finish_analysis`), a forced
+    /// Stop, or a close ([`Run::claim_end`]). The others leave the end to it: a forced Stop
+    /// that logged the end during the merge would release the thread's lock, and the thread's
+    /// worktree would be freed under the merge's reads. Not logged.
+    end_claimed: bool,
     /// The notes sent, until the agent shows it took the turn; then they are marked sent.
     pub(super) unmarked: Option<Vec<String>>,
     /// The underlying model id the agent reported for its session, if any.
@@ -214,15 +226,22 @@ pub(super) struct Header {
     /// but a read is refused. Absent, as false, in every log written before version 7.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) read_only: bool,
+    /// Set when the run is an analysis (`analysis.rs`): what it was asked, which says what its
+    /// reply may change. Such a run carries no notes, is read-only, and is not listed with the
+    /// runs of notes. Absent in every log written before version 8. Never set together with
+    /// `review` or `follow_up` ([`Origin`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) analysis: Option<AnalysisRun>,
 }
 
-/// What a new run is: a send of notes, a reviewer's stage, or a follow-up. One value, so a
-/// header never holds both a review and a follow-up.
+/// What a new run is: a send of notes, a reviewer's stage, a follow-up, or an analysis. One
+/// value, so a header never holds two of them.
 #[derive(Debug)]
 pub(super) enum Origin {
     Notes,
     Review(Stage),
     FollowUp(FollowUp),
+    Analysis(AnalysisRun),
 }
 
 /// A follow-up run's link to its thread: `of` is the run it follows, `text` what the engineer
@@ -333,6 +352,11 @@ pub(crate) enum Entry {
     Report { report: Report },
     /// Where a [`Entry::Report`] would be: why no report could be read.
     NoReport { problem: String },
+    /// An analysis run's turn ended well and nothing was stored: `problem` says why (its reply
+    /// was empty, or did not read, or the file could not be written). Logged with the run's
+    /// end, and becomes the run's problem. A run whose analysis was stored logs nothing: its
+    /// diagrams name it.
+    NoAnalysis { problem: String },
     /// The run changed files it may only read, and Postil put the worktree back: `text` says
     /// so, and becomes the run's problem. Logged before the run's end, for a run whose end
     /// logs no findings (a proposer's that ended well says it there).
@@ -449,6 +473,8 @@ pub(crate) struct RunView {
     /// Whether the run's thread only reads ([`Header::read_only`]): the page offers no Apply,
     /// pull request or review for it.
     read_only: bool,
+    /// For an analysis run, what it was asked ([`Header::analysis`]).
+    analysis: Option<AnalysisRun>,
 }
 
 impl Run {
@@ -526,10 +552,11 @@ impl Run {
                 path: file.clone(),
                 source,
             })?;
-        let (review, follow_up) = match origin {
-            Origin::Notes => (None, None),
-            Origin::Review(stage) => (Some(stage), None),
-            Origin::FollowUp(follow_up) => (None, Some(follow_up)),
+        let (review, follow_up, analysis) = match origin {
+            Origin::Notes => (None, None, None),
+            Origin::Review(stage) => (Some(stage), None, None),
+            Origin::FollowUp(follow_up) => (None, Some(follow_up), None),
+            Origin::Analysis(analysis) => (None, None, Some(analysis)),
         };
         let header = Header {
             version: LOG_VERSION,
@@ -543,6 +570,7 @@ impl Run {
             review,
             follow_up,
             read_only,
+            analysis,
         };
         if let Err(source) = log.write_all(&json_line(&header)) {
             // A log without its header would be skipped as unreadable on every restart.
@@ -570,9 +598,9 @@ impl Run {
         })
     }
 
-    /// The newest readable run log in `dir`, read as a run this process does not run; `None`
-    /// when there is none. A newer log that cannot be read is skipped, and the run shown says
-    /// why.
+    /// The newest readable run log of notes in `dir`, read as a run this process does not run;
+    /// `None` when there is none. An analysis run is passed over: the Run tab lists runs of
+    /// notes. A newer log that cannot be read is skipped, and the run shown says why.
     pub(super) fn latest(dir: &Path) -> Result<Option<Self>> {
         let mut numbers = match run_numbers(dir) {
             Ok(numbers) => numbers,
@@ -592,6 +620,7 @@ impl Run {
                 continue;
             }
             match Self::read(&file) {
+                Ok(run) if run.state().header.analysis.is_some() => {}
                 Ok(run) => {
                     if let Some(skipped) = skipped {
                         run.state().problem.get_or_insert(skipped);
@@ -666,6 +695,15 @@ impl Run {
     /// The latest cumulative session cost reported on this run (or its baseline if none).
     pub(super) fn session_cost(&self) -> Option<UsageCost> {
         self.state().usage.session_cost()
+    }
+
+    /// Claims the run's end for the caller: true when the run is live and no one claimed it
+    /// before, under one hold of the state ([`RunState::end_claimed`]).
+    pub(super) fn claim_end(&self) -> bool {
+        let mut state = self.state();
+        let claimed = state.live() && !state.end_claimed;
+        state.end_claimed |= claimed;
+        claimed
     }
 
     /// Adds an entry to the run and its log. A run that ended takes no more entries.
@@ -804,6 +842,8 @@ impl Run {
             RunOrigin::Review
         } else if state.header.follow_up.is_some() {
             RunOrigin::FollowUp
+        } else if state.header.analysis.is_some() {
+            RunOrigin::Analysis
         } else {
             RunOrigin::Notes
         };
@@ -862,6 +902,7 @@ impl Run {
             review: state.header.review.clone(),
             follow_up: state.header.follow_up.clone(),
             read_only: state.header.read_only,
+            analysis: state.header.analysis.clone(),
         }
     }
 }
@@ -890,6 +931,7 @@ impl RunState {
             cancel_requested: false,
             cancel_asked: None,
             after_claimed: false,
+            end_claimed: false,
             unmarked: None,
             model: None,
             usage: RunUsage::default(),
@@ -944,6 +986,7 @@ impl RunState {
                 | Entry::Findings { .. }
                 | Entry::Report { .. }
                 | Entry::NoReport { .. }
+                | Entry::NoAnalysis { .. }
                 | Entry::Undone { .. }
                 | Entry::Snapshot { .. } => {}
             }
@@ -1048,6 +1091,9 @@ impl RunState {
             // (docs/review-assist-plan.md, "Corrections to the design", 3).
             Entry::Undone { text } => {
                 self.problem.get_or_insert_with(|| text.clone());
+            }
+            Entry::NoAnalysis { problem } => {
+                self.problem.get_or_insert_with(|| problem.clone());
             }
             Entry::Tool { id, tool, .. }
             | Entry::ToolUpdate {
@@ -1187,6 +1233,19 @@ pub(super) fn remove_thread_lock(dir: &Path, id: &str) {
     }
 }
 
+/// The ids of the threads whose lock is held now, in any window, this one's included
+/// ([`live_threads`]), counted under `runs/active.lock` as every count is. A thread's id is its
+/// first run's, so an analysis run, whose thread has no other, is live exactly while its id is
+/// here.
+///
+/// # Errors
+///
+/// As [`hold_run_lock`] and [`live_threads`].
+pub(super) fn held_threads(dir: &Path) -> Result<Vec<String>> {
+    let _active = hold_run_lock(dir)?;
+    live_threads(dir, None)
+}
+
 /// The ids of the threads whose lock a run holds now, in any window, `except` the one the
 /// caller holds; sorted. Each lock is only tried, never waited for, so a lock released a moment
 /// ago can read as held ([`Run::create`] counts again). Every count runs under
@@ -1307,9 +1366,20 @@ fn parse_header(first: &[u8]) -> std::result::Result<Header, String> {
     }
     let header: Header = serde_json::from_slice(first)
         .map_err(|error| format!("its first line is not a run header ({error})"))?;
-    // `Origin` makes the two exclusive when Postil writes a header; this holds a hand edit to it.
-    if header.review.is_some() && header.follow_up.is_some() {
-        return Err("its header is both a review and a follow-up".to_owned());
+    // `Origin` makes the three exclusive when Postil writes a header, and an analysis read-only;
+    // this holds a hand edit to it.
+    let origins = [
+        header.review.is_some(),
+        header.follow_up.is_some(),
+        header.analysis.is_some(),
+    ];
+    if origins.into_iter().filter(|set| *set).count() > 1 {
+        return Err(
+            "its header is more than one of a review, a follow-up and an analysis".to_owned(),
+        );
+    }
+    if header.analysis.is_some() && !header.read_only {
+        return Err("its header is an analysis that may change files".to_owned());
     }
     Ok(header)
 }

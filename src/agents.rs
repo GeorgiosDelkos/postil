@@ -306,6 +306,22 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Whether `choice` can start from `search_path`: the program its command starts is there,
+/// and for a built-in agent its own program too (Claude's command starts `npx`, which runs
+/// nothing without `claude`). Looks at the disk; starts nothing.
+pub(crate) fn is_installed(choice: &AgentChoice, search_path: &OsStr) -> bool {
+    let Some(starts) = program_of(&choice.command) else {
+        return false;
+    };
+    let own = BUILT_IN
+        .iter()
+        .find(|agent| agent.name == choice.name)
+        .map(|agent| agent.program);
+    own.into_iter()
+        .chain([starts])
+        .all(|program| find_program(program, search_path).is_some())
+}
+
 /// The program a command starts: its first word. Commands are split on whitespace, without
 /// quoting (`settings.rs` refuses quotes), so a program path with a space cannot be named.
 pub(crate) fn program_of(command: &str) -> Option<&str> {
@@ -354,6 +370,34 @@ mod tests {
             Some(wanted.clone()),
             "a path is taken as it is, whatever the search path"
         );
+    }
+
+    #[test]
+    fn a_built_in_agent_is_installed_only_with_its_own_program_beside_the_one_it_starts() {
+        let dir = TempDir::new("agents-installed");
+        file(&dir, "npx", "", 0o755);
+        file(&dir, "codex", "", 0o755);
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let choice = |name: &str, command: &str| AgentChoice {
+            name: name.to_owned(),
+            command: command.to_owned(),
+            model: None,
+        };
+        let command = |name: &str| {
+            BUILT_IN
+                .iter()
+                .find(|agent| agent.name == name)
+                .unwrap()
+                .command
+        };
+
+        // Both start through npx: Claude's own program is missing, Codex's is there.
+        assert!(!is_installed(&choice("Claude", command("Claude")), &path));
+        assert!(is_installed(&choice("Codex", command("Codex")), &path));
+        // A custom agent needs only the program its command starts.
+        assert!(is_installed(&choice("Mine", "npx mine"), &path));
+        assert!(!is_installed(&choice("Mine", "mine --acp"), &path));
+        assert!(!is_installed(&choice("Mine", "  "), &path));
     }
 
     #[test]

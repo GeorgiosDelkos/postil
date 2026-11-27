@@ -534,6 +534,25 @@ test("q on a line asks about it, read-only, and its answer becomes a note on req
   assert.equal(await detail.getByRole("button", { name: "Discard" }).count(), 0);
 });
 
+test("the Run tab lists the run of notes and leaves an analysis run out", async (t) => {
+  const { page, api } = await openProject(t);
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  const body = JSON.stringify({ kind: "analyze" });
+  const { run } = await api("api/analysis", { method: "POST", body });
+  assert.equal(run, "R2");
+  // The page reads R2, as it reads every run it lists, and draws again once it has.
+  await page.waitForFunction(async () => {
+    const response = await fetch("api/run?id=R2");
+    return response.ok && (await response.json()).status === "running";
+  });
+  await draws(page, 5);
+
+  const cards = page.locator("#run .run-entry");
+  assert.equal(await cards.count(), 1);
+  await cards.filter({ hasText: "R1" }).waitFor();
+  assert.equal(await page.locator("#run .run-label").textContent(), "Run");
+});
+
 test("the run's dialog shows its branch, and Apply ends the thread once the run stops", async (t) => {
   const { page, api } = await openProject(t);
   await startRun(page, api, [await addNote(api, "Rename two.")]);
@@ -719,8 +738,8 @@ test("Settings lists the models the agent reports and saves one per slot", async
 // The longest name a custom agent may have (MAX_NAME in src/settings.rs).
 const LONG_NAME = "An agent whose name runs to forty chars!";
 
-// A project whose agent is OpenCode, reviewed by OpenCode and then by a custom agent named
-// LONG_NAME, both played by the fake agent.
+// A project whose agent and analyzer are OpenCode, reviewed by OpenCode and then by a custom
+// agent named LONG_NAME, both played by the fake agent.
 async function openLongNameProject(t) {
   const opened = await openProject(t, null, "new-opencode");
   const { revision, settings } = await opened.api("api/settings");
@@ -729,6 +748,7 @@ async function openLongNameProject(t) {
     ...settings,
     customAgents: [...settings.customAgents, { name: LONG_NAME, command: fake.command }],
     enabledAgents: [...settings.enabledAgents, LONG_NAME],
+    analyzer: { name: "OpenCode", model: null },
     reviewers: [
       { name: "OpenCode", model: null },
       { name: LONG_NAME, model: null },
@@ -761,15 +781,14 @@ async function settlesAt(dialog, selector, value) {
 }
 
 // Checks that `dialog`'s slot rows share their columns: the agents and the model pickers of
-// the send-to slot (`agentKey`) and of both reviewers start at one x, the reviewers' model
-// cells have one width and their buttons one x, every card fits in the dialog, the long name
-// is cut to its column with a tooltip, and a long model name shows whole.
-async function assertSlotsAligned(dialog, agentKey) {
+// every slot (`keys`, the model pickers' keys, one per slot) start at one x, the reviewers'
+// model cells have one width and their buttons one x, every card fits in the dialog, the long
+// name is cut to its column with a tooltip, and a long model name shows whole.
+async function assertSlotsAligned(dialog, keys) {
   // The dialog comes in with a short animation, which moves every box while it runs.
   await dialog.evaluate((node) =>
     Promise.all(node.getAnimations({ subtree: true }).map((animation) => animation.finished)),
   );
-  const keys = [`${agentKey}-model`, "reviewer-model-0", "reviewer-model-1"];
   const box = (key) => dialog.locator(`[data-key="${key}"]`).boundingBox();
   const models = await Promise.all(keys.map(box));
   for (const [index, model] of models.entries()) {
@@ -778,7 +797,7 @@ async function assertSlotsAligned(dialog, agentKey) {
   const agents = await Promise.all(
     (await dialog.locator(".slot-agent").all()).map((agent) => agent.boundingBox()),
   );
-  assert.equal(agents.length, 3);
+  assert.equal(agents.length, keys.length, "one agent per slot");
   for (const agent of agents) assert.equal(agent.x, agents[0].x, "the agents start at one x");
   const cells = await Promise.all(
     (await dialog.locator("li .model-select").all()).map((cell) => cell.boundingBox()),
@@ -834,13 +853,19 @@ test("the workflow slots line up whatever the agents' names, in Settings and the
   await page.locator("#open-settings").click();
   const settings = page.locator("#settings");
   await settings.locator('[data-key="reviewer-model-1"]').waitFor();
-  await assertSlotsAligned(settings, "agent");
+  // Settings has the Analyzer's row, which the wizard does not.
+  await assertSlotsAligned(settings, [
+    "agent-model",
+    "analyzer-model",
+    "reviewer-model-0",
+    "reviewer-model-1",
+  ]);
 
   await settings.locator('[data-key="run-wizard"]').click();
   const wizard = page.locator("#wizard");
   await wizard.locator('[data-key="step-workflow"]').click();
   await wizard.locator('[data-key="reviewer-model-1"]').waitFor();
-  await assertSlotsAligned(wizard, "wizard-agent");
+  await assertSlotsAligned(wizard, ["wizard-agent-model", "reviewer-model-0", "reviewer-model-1"]);
 });
 
 test("the workflow slots ring a picker only after a key, and Tab reaches every button", async (t) => {

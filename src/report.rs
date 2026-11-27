@@ -210,7 +210,7 @@ fn check(value: &Value) -> Option<Check> {
 /// `src/a.rs`, so a step matches the diff's path); `None` when it is empty or leaves the
 /// repository. A path outside `root` comes back from `strip_prefix` unchanged, so one that is
 /// still absolute, or climbs with `..`, is outside.
-fn repo_path(raw: &str, root: &Path) -> Option<String> {
+pub(crate) fn repo_path(raw: &str, root: &Path) -> Option<String> {
     let path = Path::new(raw).strip_prefix(root).unwrap_or(Path::new(raw));
     let mut parts = Vec::new();
     for part in path.components() {

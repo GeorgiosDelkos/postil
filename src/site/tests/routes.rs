@@ -49,7 +49,16 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         "GET the pane widths or PUT new ones",
     ),
     ("/api/file", &[Method::GET], "GET"),
-    ("/api/analysis", &[Method::GET], "GET"),
+    (
+        "/api/analysis",
+        &[Method::GET, Method::POST, Method::DELETE],
+        "GET, POST {\"kind\": ...}, or DELETE ?diagram=<diagram id>",
+    ),
+    (
+        "/api/analysis/update",
+        &[Method::POST],
+        "POST {\"diagram\": ...}, or with no body for every diagram",
+    ),
     (
         "/api/definitions",
         &[Method::GET],

@@ -3,8 +3,9 @@
 Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
-Ask (7.6), jump to definition (7.7), and the analysis file with its citation checking (8.1).
-This document adds to `docs/design.md`, which stays the reference for everything built so far.
+Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1), and
+analysis runs (8.2), with no page beyond the settings' Analyzer yet. This document adds to
+`docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
 what this document assumes and the owner has not confirmed.
@@ -338,7 +339,8 @@ The owner asked for the link to be visible in the code, as notes are.
 ### Data structures
 
 Built in step 8.1 (`src/analysis.rs`, `GET /api/analysis`): the types below, the file at
-version 1 without `checked`, which comes with the code that reads it in step 8.7 (version 2),
+version 1 (version 2 from step 8.2, which adds each diagram's `dropped`) without `checked`,
+which comes with the code that reads it in step 8.7 (version 3),
 checking a citation, and placing every verified reference on each read. As built, an unverified
 reference has no `target`, only its path and, when its file could not be read, a `reason`:
 its lines may be zero, reversed or past the end of a file that may not exist.
@@ -348,7 +350,7 @@ and edges, on each draw. Changed: whole diagrams, by an analysis run. A reposito
 of diagrams of tens of nodes, so every operation is a scan, as for notes.
 
 ```rust
-/// `<git dir>/postil/analysis.json`, version 1.
+/// `<git dir>/postil/analysis.json`, version 2.
 struct Analysis {
     checked: CommitId,        // The commit the Architecture was last compared with.
     diagrams: Vec<Diagram>,
@@ -417,12 +419,29 @@ enum RefState {
 
 ### An analysis run
 
+Built in step 8.2 (`src/analysis/prompt.rs`, `src/analysis/merge.rs`, `Runner::analyze`,
+`POST /api/analysis`, `POST /api/analysis/update`, `DELETE /api/analysis?diagram=D3`), with
+`analysis.json` at version 2: each diagram keeps what its runs left out (`dropped`), so the
+pane's header can say it.
+
 - **The agent** is the settings' Analyzer, a new choice beside the default agent and the
-  reviewers, which starts as the default agent.
-- **The run** is read-only in a thread of its own. Its header is marked
-  `analysis: {kind, of}` (run log version 8). It counts toward the cap
-  of 3 live runs and is not listed in the Run tab, which lists runs of notes; the diagram
-  pane's header shows its status and Stop, and opens its dialog.
+  reviewers, which starts as the default agent (`settings.json` version 3).
+- **The run** is read-only in a thread of its own, which ends with it: its worktree and branch
+  are freed, and its record kept, with the commit the run started from, which Update compares
+  the files with. Its header is marked `analysis: {kind, of, nodes}` (run log version 8);
+  `nodes` is what an update may change. It counts toward the cap of 3 live runs and is not
+  listed in the Run tab, which lists runs of notes; the diagram pane's header shows its status
+  and Stop, and opens its dialog. One analysis runs at a time in a window; two windows may
+  each run one, and the later merge wins.
+- **The merge** happens as the turn ends well, before the run's end is logged: the citations
+  are checked in the worktree first, then `analysis.lock` is held only to read the file as
+  stored, merge and save. A run that is stopped, fails, or edits files stores nothing, and one
+  whose reply gives nothing says why in its dialog (the `noAnalysis` entry). Ids are Postil's:
+  the agent names nodes with keys of its own.
+- **A diagram's parent** is a node of another diagram, and parents never loop: `analysis.json`
+  refuses a file that breaks this. A replaced or deleted diagram, or a node Update deletes,
+  takes the diagrams below it with it; a node Update replaces in place keeps its id, and the
+  diagrams below it stay.
 - **The reply** ends with one `json` block: diagrams of nodes and edges, where a citation is
   `{path, lines, first}` and `first` is the text of the first cited line.
 - **Checking a citation.** Postil reads the file in the run's worktree. The citation holds

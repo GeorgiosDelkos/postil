@@ -55,6 +55,7 @@ fn diagram(id: u32, kind: DiagramKind, parent: Option<&str>, nodes: Vec<Node>) -
         run: RunId(u64::from(id)),
         nodes,
         edges: Vec::new(),
+        dropped: Dropped::default(),
     }
 }
 
@@ -108,13 +109,21 @@ fn every_kind() -> Analysis {
         ],
     );
     data.edges.push(edge("D2.1", "D2.2", None));
+    let mut flow = diagram(3, DiagramKind::Flow, None, Vec::new());
+    flow.dropped = Dropped {
+        nodes: 1,
+        edges: 2,
+        groups: 3,
+        shortened: 4,
+        reply_cut: true,
+    };
     Analysis {
-        diagrams: vec![top, data, diagram(3, DiagramKind::Flow, None, Vec::new())],
+        diagrams: vec![top, data, flow],
     }
 }
 
 const EVERY_KIND_JSON: &str = r#"{
-  "version": 1,
+  "version": 2,
   "diagrams": [
     {
       "id": "D1",
@@ -218,7 +227,14 @@ const EVERY_KIND_JSON: &str = r#"{
       "title": "secret title",
       "run": "R3",
       "nodes": [],
-      "edges": []
+      "edges": [],
+      "dropped": {
+        "nodes": 1,
+        "edges": 2,
+        "groups": 3,
+        "shortened": 4,
+        "replyCut": true
+      }
     }
   ]
 }
@@ -479,7 +495,8 @@ fn citations_are_checked_against_the_repository() {
     ];
     for (cited, expected) in cases {
         let debug = format!("{cited:?}");
-        let checked = serde_json::to_value(check_in(cited, &repo)).unwrap();
+        let checked =
+            serde_json::to_value(check_in(cited, &repo, &mut ReadFiles::default())).unwrap();
         assert_eq!(checked, expected, "{debug}");
     }
 }
@@ -663,4 +680,588 @@ fn debug_output_hides_code_and_prose_text() {
         cited,
         "Cited { path: \"a.rs\", lines: Some(CitedLines { start: 1, end: 2 }), .. }"
     );
+}
+
+/// A reply holding `reply` as its last json block, after some words.
+fn replied(reply: &serde_json::Value) -> String {
+    format!("Here it is.\n\n```json\n{reply}\n```\n")
+}
+
+fn asked(kind: AnalysisKind, of: Option<&str>, nodes: &[&str]) -> AnalysisRun {
+    AnalysisRun {
+        kind,
+        of: of.map(str::to_owned),
+        nodes: nodes.iter().map(|id| NodeId::parse(id).unwrap()).collect(),
+    }
+}
+
+fn empty() -> Analysis {
+    Analysis {
+        diagrams: Vec::new(),
+    }
+}
+
+fn plain_node(key: &str, group: Option<&str>) -> serde_json::Value {
+    json!({"key": key, "kind": "component", "label": key, "summary": "", "detail": "",
+           "group": group, "anchors": []})
+}
+
+#[test]
+fn merge_keeps_invariants_and_counts_limits() {
+    let dir = TempDir::new("analysis-merge-limits");
+    let worktree = Repo::init(dir.path()).unwrap();
+    // Two bytes each, so a cut that counted bytes would split one.
+    let long = |count: usize| "é".repeat(count);
+    let mut nodes = vec![
+        json!({"key": "a", "kind": "boundary", "label": long(61), "summary": long(161),
+               "detail": long(4_001), "group": "b", "anchors": []}),
+        plain_node("b", Some("a")),
+        plain_node("c", Some("c")),
+        plain_node("d", Some("nobody")),
+        plain_node("a", None),
+        json!({"kind": "component", "label": "no key"}),
+        json!({"key": "e", "kind": "a kind Postil does not know"}),
+    ];
+    nodes.extend((0..194).map(|n| plain_node(&format!("n{n}"), None)));
+    let reply = json!({"diagrams": [{
+        "kind": "architecture", "title": long(61), "nodes": nodes,
+        "edges": [
+            {"from": "a", "to": "b", "label": long(61)},
+            {"from": "a", "to": "ghost", "label": "x"},
+            {"from": "c", "to": "c", "label": "x"},
+            {"from": "e", "to": "a"},
+        ],
+    }]});
+    let mut analysis = empty();
+
+    merge::merge_into(
+        &mut analysis,
+        &replied(&reply),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+
+    check_graph(&analysis.diagrams).unwrap();
+    let [diagram] = analysis.diagrams.as_slice() else {
+        panic!("one diagram: {analysis:?}");
+    };
+    assert_eq!(diagram.nodes.len(), 198, "the limit, less the two that go");
+    assert_eq!(
+        diagram.dropped,
+        Dropped {
+            // 7 + 194 sent: one past the limit, then of the 200 kept a key used twice and one
+            // with no key.
+            nodes: 3,
+            // To no node, and to itself.
+            edges: 2,
+            // c's group is itself, d's names no node, and a and b loop: a is cleared first,
+            // which ends b's walk.
+            groups: 3,
+            // a's label, summary and detail, the title, the edge's label.
+            shortened: 5,
+            reply_cut: false,
+        }
+    );
+    let a = &diagram.nodes[0];
+    assert_eq!(a.label, format!("{}…", long(59)));
+    assert_eq!(a.summary.chars().count(), 160);
+    assert_eq!(a.detail.chars().count(), 4_000);
+    assert!(a.detail.ends_with('…'));
+    assert_eq!(diagram.title.chars().count(), 60);
+    assert_eq!(
+        diagram
+            .nodes
+            .iter()
+            .map(|node| node.group)
+            .take(4)
+            .collect::<Vec<_>>(),
+        [None, NodeId::parse("D1.1"), None, None]
+    );
+    assert!(matches!(diagram.nodes[4].kind, NodeKind::Component));
+    assert_eq!(diagram.edges.len(), 2, "{:?}", diagram.edges);
+}
+
+#[test]
+fn a_reply_over_2_mib_is_read_from_its_end_and_never_split_inside_a_character() {
+    let dir = TempDir::new("analysis-merge-long");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let mut block =
+        replied(&json!({"diagrams": [{"kind": "data", "nodes": [plain_node("a", None)]}]}));
+    // The last 2 MiB start an odd number of bytes into the two-byte characters, so the cut
+    // lands inside one.
+    if block.len().is_multiple_of(2) {
+        block.push(' ');
+    }
+    let words = format!("x{}", "é".repeat(1 << 20));
+    let whole = format!("{words}{block}");
+    assert!(!whole.is_char_boundary(whole.len() - (2 << 20)));
+    let mut analysis = empty();
+    let analyze = asked(AnalysisKind::Analyze, None, &[]);
+
+    merge::merge_into(
+        &mut analysis,
+        &format!("{words}{block}"),
+        &worktree,
+        1,
+        &analyze,
+    )
+    .unwrap();
+
+    assert!(analysis.diagrams[0].dropped.reply_cut);
+    let error = merge::merge_into(
+        &mut empty(),
+        &format!("{block}{words}"),
+        &worktree,
+        1,
+        &analyze,
+    )
+    .unwrap_err();
+    assert!(error.contains("over the 2 MiB limit"), "{error}");
+}
+
+/// A pseudo-random number generator (xorshift64), so the property test below is the same on
+/// every run and a failure can be replayed from its seed.
+struct Draws(u64);
+
+impl Draws {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % u64::try_from(bound).unwrap()).unwrap()
+    }
+
+    fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+        from[self.below(from.len())]
+    }
+}
+
+/// Some node ids of `analysis`, and some that are not in it.
+fn some_ids(analysis: &Analysis, draws: &mut Draws) -> Vec<String> {
+    let mut ids: Vec<String> = analysis
+        .diagrams
+        .iter()
+        .flat_map(|diagram| diagram.nodes.iter().map(|node| node.id.to_string()))
+        .collect();
+    ids.push(format!("D{}.{}", draws.below(9) + 1, draws.below(9) + 1));
+    ids
+}
+
+/// A reply of random diagrams: keys, groups and edge ends drawn from a small pool that holds
+/// keys used twice, ids of nodes there and not there, and nothing.
+fn random_reply(draws: &mut Draws, ids: &[String]) -> serde_json::Value {
+    let mut names = vec!["a", "b", "c", "d", ""];
+    names.extend(ids.iter().map(String::as_str));
+    let kinds = ["architecture", "data", "flow", "other"];
+    let diagrams: Vec<serde_json::Value> = (0..=draws.below(3))
+        .map(|_| {
+            let nodes: Vec<serde_json::Value> = (0..draws.below(7))
+                .map(|_| {
+                    let group = draws.pick(&names);
+                    let mut node =
+                        plain_node(draws.pick(&names), (!group.is_empty()).then_some(group));
+                    if draws.below(3) == 0 {
+                        node["id"] = json!(draws.pick(&names));
+                    }
+                    node
+                })
+                .collect();
+            let edges: Vec<serde_json::Value> = (0..draws.below(9))
+                .map(
+                    |_| json!({"from": draws.pick(&names), "to": draws.pick(&names), "label": "e"}),
+                )
+                .collect();
+            let deleted: Vec<&str> = (0..draws.below(3)).map(|_| draws.pick(&names)).collect();
+            json!({"id": format!("D{}", draws.below(6) + 1), "kind": draws.pick(&kinds),
+                   "title": "t", "nodes": nodes, "edges": edges, "deleted": deleted})
+        })
+        .collect();
+    json!({ "diagrams": diagrams })
+}
+
+#[test]
+fn every_stored_edge_joins_two_stored_nodes_and_parents_never_loop() {
+    let dir = TempDir::new("analysis-merge-property");
+    let worktree = Repo::init(dir.path()).unwrap();
+    for seed in 1..=60_u64 {
+        let mut draws = Draws(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut analysis = empty();
+        for step in 0..30_u64 {
+            let ids = some_ids(&analysis, &mut draws);
+            let reply = replied(&random_reply(&mut draws, &ids));
+            let of = ids[draws.below(ids.len())].clone();
+            let allowed: Vec<&str> = ids
+                .iter()
+                .map(String::as_str)
+                .filter(|_| draws.below(2) == 0)
+                .collect();
+            let asked = match draws.below(5) {
+                0 => asked(AnalysisKind::Analyze, None, &[]),
+                1 => asked(AnalysisKind::Deeper, Some(&of), &[]),
+                2 => asked(AnalysisKind::Flow, None, &[]),
+                3 => asked(AnalysisKind::Update, None, &allowed),
+                _ => {
+                    // A delete, as `delete` does it.
+                    if !analysis.diagrams.is_empty() {
+                        let gone = analysis.diagrams[draws.below(analysis.diagrams.len())].id;
+                        analysis.diagrams.retain(|diagram| diagram.id != gone);
+                        prune_orphans(&mut analysis.diagrams);
+                    }
+                    check_graph(&analysis.diagrams)
+                        .unwrap_or_else(|problem| panic!("seed {seed} step {step}: {problem}"));
+                    continue;
+                }
+            };
+            // A merge that stores nothing leaves the analysis as it was, which holds.
+            drop(merge::merge_into(
+                &mut analysis,
+                &reply,
+                &worktree,
+                step + 1,
+                &asked,
+            ));
+            check_graph(&analysis.diagrams).unwrap_or_else(|problem| {
+                panic!("seed {seed} step {step}: {problem}: {reply} {analysis:?}")
+            });
+        }
+    }
+}
+
+#[test]
+fn a_diagram_whose_first_reply_was_cut_stays_marked_cut_after_an_uncut_update() {
+    let dir = TempDir::new("analysis-merge-cut-update");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let first = replied(&json!({"diagrams": [{"kind": "data", "nodes": [plain_node("a", None)]}]}));
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &format!("{}{first}", "x".repeat(2 << 20)),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+    assert!(analysis.diagrams[0].dropped.reply_cut);
+
+    let update = json!({"diagrams": [{"id": "D1", "nodes": [plain_node("b", None)]}]});
+    merge::merge_into(
+        &mut analysis,
+        &replied(&update),
+        &worktree,
+        2,
+        &asked(AnalysisKind::Update, None, &[]),
+    )
+    .unwrap();
+
+    assert_eq!(analysis.diagrams[0].nodes.len(), 2);
+    assert!(analysis.diagrams[0].dropped.reply_cut, "still cut");
+}
+
+#[test]
+fn nulls_and_malformed_lines_cost_only_their_citation() {
+    let dir = TempDir::new("analysis-merge-lenient");
+    let worktree = Repo::init(dir.path()).unwrap();
+    fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let cite =
+        |lines: serde_json::Value| json!({"path": "a.rs", "lines": lines, "first": "fn a() {}"});
+    let reply = json!({"diagrams": [{"kind": "architecture", "edges": null, "deleted": null,
+    "nodes": [
+        {"key": "a", "anchors": null},
+        {"key": "b", "anchors": [
+            cite(json!([12])),
+            cite(json!([-1, 3])),
+            cite(json!("1-1")),
+            cite(json!([1, 1])),
+            cite(serde_json::Value::Null),
+        ]},
+    ]}]});
+    let mut analysis = empty();
+
+    merge::merge_into(
+        &mut analysis,
+        &replied(&reply),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+
+    let nodes = &analysis.diagrams[0].nodes;
+    assert!(nodes[0].anchors.is_empty());
+    let states: Vec<serde_json::Value> = nodes[1]
+        .anchors
+        .iter()
+        .map(|anchor| serde_json::to_value(anchor).unwrap()["target"].clone())
+        .collect();
+    // Malformed lines are no lines Postil finds, never the whole file; null names none.
+    assert_eq!(
+        states,
+        [
+            json!(null),
+            json!(null),
+            json!(null),
+            json!("lines"),
+            json!("file")
+        ]
+    );
+}
+
+#[test]
+fn an_update_keeps_the_groups_of_nodes_it_does_not_change() {
+    let dir = TempDir::new("analysis-merge-update-kept-group");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let top = json!({"diagrams": [{"kind": "architecture",
+        "nodes": [plain_node("a", Some("b")), plain_node("b", None)]}]});
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &replied(&top),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+    // D1.1, healthy, is grouped in D1.2; D1.2, outdated, comes back grouped in D1.1, twice;
+    // a node with an empty id beside its key is a new node.
+    let mut again = plain_node("ignored", Some("D1.1"));
+    again["id"] = json!("D1.2");
+    let mut twice = plain_node("ignored", None);
+    twice["id"] = json!("D1.2");
+    twice["label"] = json!("second");
+    let mut added = plain_node("c", None);
+    added["id"] = json!("");
+    let update = json!({"diagrams": [{"id": "D1", "nodes": [again, twice, added]}]});
+
+    merge::merge_into(
+        &mut analysis,
+        &replied(&update),
+        &worktree,
+        2,
+        &asked(AnalysisKind::Update, None, &["D1.2"]),
+    )
+    .unwrap();
+
+    check_graph(&analysis.diagrams).unwrap();
+    let diagram = &analysis.diagrams[0];
+    let id = NodeId::parse;
+    assert_eq!(
+        diagram.nodes[0].group,
+        id("D1.2"),
+        "the healthy node's group stays"
+    );
+    assert_eq!(
+        diagram.nodes[1].group, None,
+        "the replacement's would close a loop"
+    );
+    assert_eq!(
+        diagram.nodes[1].label, "ignored",
+        "the first replacement stands"
+    );
+    assert_eq!(diagram.nodes[2].id, id("D1.3").unwrap());
+    assert_eq!(diagram.dropped.groups, 1);
+    assert_eq!(diagram.dropped.nodes, 1, "the second replacement");
+}
+
+#[test]
+fn a_scoped_update_changes_only_its_diagram() {
+    let dir = TempDir::new("analysis-merge-update-scope");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let both = json!({"diagrams": [
+        {"kind": "architecture", "nodes": [plain_node("a", None)]},
+        {"kind": "data", "nodes": [plain_node("d", None)]},
+    ]});
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &replied(&both),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+    let scoped = AnalysisRun {
+        of: Some("D1".to_owned()),
+        ..asked(AnalysisKind::Update, None, &[])
+    };
+    let outside = json!({"diagrams": [{"id": "D2", "nodes": [plain_node("x", None)]}]});
+
+    let error =
+        merge::merge_into(&mut analysis, &replied(&outside), &worktree, 2, &scoped).unwrap_err();
+    assert_eq!(error, "the analysis was empty");
+
+    let mixed = json!({"diagrams": [
+        {"id": "D2", "nodes": [plain_node("x", None)]},
+        {"id": "D1", "nodes": [plain_node("y", None)]},
+    ]});
+    merge::merge_into(&mut analysis, &replied(&mixed), &worktree, 3, &scoped).unwrap();
+    assert_eq!(analysis.diagrams[0].nodes.len(), 2);
+    assert_eq!(
+        analysis.diagrams[1].nodes.len(),
+        1,
+        "D2 is outside the update"
+    );
+    assert_eq!(analysis.diagrams[1].run, RunId(1));
+}
+
+#[test]
+fn an_update_that_deletes_every_node_of_a_diagram_removes_it() {
+    let dir = TempDir::new("analysis-merge-update-empty-diagram");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &replied(
+            &json!({"diagrams": [{"kind": "architecture", "nodes": [plain_node("a", None)]}]}),
+        ),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+
+    let update = json!({"diagrams": [{"id": "D1", "deleted": ["D1.1"]}]});
+    merge::merge_into(
+        &mut analysis,
+        &replied(&update),
+        &worktree,
+        2,
+        &asked(AnalysisKind::Update, None, &["D1.1"]),
+    )
+    .unwrap();
+
+    assert!(analysis.diagrams.is_empty());
+}
+
+#[test]
+fn a_deeper_analysis_of_a_node_gone_meanwhile_stores_nothing() {
+    let dir = TempDir::new("analysis-merge-gone");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let top = json!({"diagrams": [{"kind": "architecture",
+                                   "nodes": [plain_node("a", None), plain_node("b", None)]}]});
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &replied(&top),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+    let inner = json!({"diagrams": [{"kind": "architecture", "nodes": [plain_node("x", None)]}]});
+
+    // D1.3 is not there, though D1.1 and D1.2 are.
+    let error = merge::merge_into(
+        &mut analysis,
+        &replied(&inner),
+        &worktree,
+        2,
+        &asked(AnalysisKind::Deeper, Some("D1.3"), &[]),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("D1.3 it analyzes is gone"), "{error}");
+    assert_eq!(analysis.diagrams.len(), 1);
+}
+
+#[test]
+fn an_update_keeps_a_diagram_at_200_nodes_and_counts_what_it_passes_over() {
+    let dir = TempDir::new("analysis-merge-update-limit");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let full: Vec<serde_json::Value> = (0..200)
+        .map(|n| plain_node(&format!("n{n}"), None))
+        .collect();
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &replied(&json!({"diagrams": [{"kind": "architecture", "nodes": full}]})),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+    let update = json!({"diagrams": [{"id": "D1", "deleted": ["D1.2", "D1.2"], "nodes": [
+        {"kind": "component", "label": "no key, no id"},
+        plain_node("x", None),
+        plain_node("x", None),
+        plain_node("y", None),
+    ]}]});
+
+    merge::merge_into(
+        &mut analysis,
+        &replied(&update),
+        &worktree,
+        2,
+        &asked(AnalysisKind::Update, None, &["D1.2"]),
+    )
+    .unwrap();
+
+    let diagram = &analysis.diagrams[0];
+    // One deleted makes room for x; y would be the 201st.
+    assert_eq!(diagram.nodes.len(), 200);
+    assert_eq!(diagram.nodes[199].id, NodeId::parse("D1.201").unwrap());
+    // D1.2 deleted again, no key, x again, and y past the limit.
+    assert_eq!(diagram.dropped.nodes, 4);
+    assert_eq!(diagram.run, RunId(2));
+}
+
+#[test]
+fn a_flow_question_of_300_characters_is_asked() {
+    let dir = TempDir::new("analysis-flow-question");
+    let repo = Repo::init(dir.path()).unwrap();
+    let flow = |length: usize| {
+        let request = json!({"kind": "flow", "question": "é".repeat(length)});
+        plan(
+            &repo,
+            AnalysisJob::New(serde_json::from_value(request).unwrap()),
+        )
+    };
+
+    // 301 is refused in `analyze_deeper_replaces_only_its_branch`, through the route.
+    let planned = flow(300).unwrap();
+    assert!(planned.prompt.contains(&"é".repeat(300)));
+}
+
+#[test]
+fn an_update_counts_groups_that_name_no_node_or_loop() {
+    let dir = TempDir::new("analysis-merge-update-groups");
+    let worktree = Repo::init(dir.path()).unwrap();
+    let mut analysis = empty();
+    merge::merge_into(
+        &mut analysis,
+        &replied(&json!({"diagrams": [{"kind": "architecture",
+                                       "nodes": [plain_node("a", None)]}]})),
+        &worktree,
+        1,
+        &asked(AnalysisKind::Analyze, None, &[]),
+    )
+    .unwrap();
+    let update = json!({"diagrams": [{"id": "D1", "nodes": [
+        plain_node("p", Some("q")),
+        plain_node("q", Some("p")),
+        plain_node("r", Some("nowhere")),
+        plain_node("s", Some("D1.1")),
+    ]}]});
+
+    merge::merge_into(
+        &mut analysis,
+        &replied(&update),
+        &worktree,
+        2,
+        &asked(AnalysisKind::Update, None, &[]),
+    )
+    .unwrap();
+
+    check_graph(&analysis.diagrams).unwrap();
+    let groups: Vec<Option<NodeId>> = analysis.diagrams[0]
+        .nodes
+        .iter()
+        .map(|node| node.group)
+        .collect();
+    // p is grouped in q; q's group, which would close the loop, is not given. s's group is an
+    // existing node.
+    let id = NodeId::parse;
+    assert_eq!(groups, [None, id("D1.3"), None, None, id("D1.1")]);
+    assert_eq!(analysis.diagrams[0].dropped.groups, 2);
 }

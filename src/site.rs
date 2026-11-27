@@ -17,7 +17,7 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
-use crate::analysis;
+use crate::analysis::{self, AnalysisJob, AnalyzeRequest, UpdateRequest};
 use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
@@ -808,7 +808,7 @@ impl Site {
                 Method::PUT => json_or_error(self.save_layout(body)),
                 _ => not_allowed("GET the pane widths or PUT new ones"),
             },
-            path if path.starts_with("/api/analysis") => self.respond_analysis(path, method),
+            path if path.starts_with("/api/analysis") => self.respond_analysis(request),
             "/api/runs" => match *method {
                 Method::GET => json_or_error(self.runner().and_then(|runner| {
                     let ids = runner.ids()?;
@@ -935,6 +935,40 @@ impl Site {
         Ok(to_json(&analysis))
     }
 
+    /// The reply to `POST /api/analysis` `{"kind": ..., "of": ..., "question": ...}`: starts an
+    /// analysis run of the settings' Analyzer (`Runner::analyze`), and answers `{"run": "R5"}`.
+    /// The page follows that run by its id: it is not the Run tab's latest.
+    fn start_analysis(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: AnalyzeRequest = parse_body(body, Error::BadRequest)?;
+        self.analyze(AnalysisJob::New(request))
+    }
+
+    /// The reply to `POST /api/analysis/update`, with `{"diagram": "D1"}` or no body for every
+    /// diagram: starts an update of the outdated nodes and the files not on the map, as
+    /// [`Site::start_analysis`] starts an analysis.
+    fn update_analysis(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: UpdateRequest = if body.is_empty() {
+            UpdateRequest::default()
+        } else {
+            parse_body(body, Error::BadRequest)?
+        };
+        self.analyze(AnalysisJob::Update(request))
+    }
+
+    fn analyze(&self, job: AnalysisJob) -> Result<Vec<u8>> {
+        let agent = self.current_settings().analyzer()?;
+        let run = self.runner()?.analyze(agent, job)?;
+        Ok(to_json(&serde_json::json!({ "run": run })))
+    }
+
+    /// The reply to `DELETE /api/analysis?diagram=D3`: deletes the diagram, with the diagrams
+    /// below its nodes, and returns the analysis left, placed.
+    fn delete_diagram(&self, query: &str) -> Result<Vec<u8>> {
+        let id = query_value(query, "diagram")
+            .ok_or_else(|| Error::BadRequest("expected ?diagram=<diagram id>".to_owned()))?;
+        Ok(to_json(&analysis::delete(&*self.repo()?, &id)?))
+    }
+
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
     /// notes.
     fn add_note(&self, body: &[u8]) -> Result<Vec<u8>> {
@@ -1016,12 +1050,21 @@ impl Site {
 
     /// The replies to `/api/analysis` and the routes under it. [`Site::respond`] sends every
     /// path that starts with `/api/analysis` here, so a path that is none of these (such as
-    /// `/api/analysisx`) is not found here.
-    fn respond_analysis(&self, path: &str, method: &Method) -> Reply {
-        match path {
+    /// `/api/analysisx`) is not found here. Takes the whole request so that dispatch stays one
+    /// line: `respond` is at clippy's length limit.
+    fn respond_analysis(&self, request: &Request<Vec<u8>>) -> Reply {
+        let (method, body) = (request.method(), request.body());
+        let query = request.uri().query().unwrap_or("");
+        match request.uri().path() {
             "/api/analysis" => match *method {
                 Method::GET => json_or_error(self.analysis()),
-                _ => not_allowed("GET"),
+                Method::POST => json_or_error(self.start_analysis(body)),
+                Method::DELETE => json_or_error(self.delete_diagram(query)),
+                _ => not_allowed("GET, POST {\"kind\": ...}, or DELETE ?diagram=<diagram id>"),
+            },
+            "/api/analysis/update" => match *method {
+                Method::POST => json_or_error(self.update_analysis(body)),
+                _ => not_allowed("POST {\"diagram\": ...}, or with no body for every diagram"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
@@ -1709,6 +1752,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::NoProject
                 | Error::ReviewLocked { .. }
                 | Error::AnalysisLocked { .. }
+                | Error::AnalysisRefused(_)
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
                 | Error::TurnRunning
@@ -1720,9 +1764,10 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::ThreadChanged { .. }
                 | Error::NotAWorktree { .. }
                 | Error::ApplyConflict { .. } => StatusCode::CONFLICT,
-                Error::NoSuchNote { .. } | Error::NoSuchRequest | Error::NoSuchRun { .. } => {
-                    StatusCode::NOT_FOUND
-                }
+                Error::NoSuchNote { .. }
+                | Error::NoSuchRequest
+                | Error::NoSuchRun { .. }
+                | Error::NoSuchDiagram { .. } => StatusCode::NOT_FOUND,
                 Error::DiskFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
                 // The agent, the server behind this one, failed.
                 Error::AgentNotFound { .. }

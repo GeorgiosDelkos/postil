@@ -11,7 +11,9 @@
 //! Format version 2 names the agent notes are sent to, and each reviewer, as a slot: an
 //! agent's name and the model it runs (`{"name": "Claude", "model": "opus"}`, `null` for the
 //! agent's own default). A version 1 file, where they are plain names, is still read: each
-//! name becomes a slot with no model, and the next save writes version 2.
+//! name becomes a slot with no model, and the next save writes version 3. Version 3 adds the
+//! Analyzer, a slot like the others, which draws the map (docs/review-assist.md, "An analysis
+//! run"); a version 2 file has none, and analyses go to the agent notes are sent to.
 //!
 //! The rules, checked when a [`RawSettings`] becomes a [`Settings`] (`TryFrom`), the only way
 //! to make one:
@@ -20,8 +22,8 @@
 //!   whatever the case, built-in ones included, and a command of plain words (no quotes)
 //!   whose program is a name on the search path or an absolute path;
 //! - the enabled agents are known agents, each once;
-//! - the agent notes are sent to, and every reviewer, is an enabled agent. A reviewer may be
-//!   listed more than once: each entry is one independent review;
+//! - the agent notes are sent to, the analyzer, and every reviewer, is an enabled agent. A
+//!   reviewer may be listed more than once: each entry is one independent review;
 //! - a slot's model, when set, is 1 to 200 characters with no space at either end and no
 //!   control character. Whether the agent offers it is checked when a run starts, against
 //!   the list the agent reports then (`acp`, `Starting::open_session`).
@@ -38,8 +40,11 @@ use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
 
-/// The format version this build writes. It also reads [`V1`].
-const VERSION: u32 = 2;
+/// The format version this build writes. It also reads [`V2`] and [`V1`].
+const VERSION: u32 = 3;
+
+/// The format before the analyzer: read as it is, with no analyzer.
+const V2: u32 = 2;
 
 /// The format before slots: the agent and the reviewers as plain names ([`upgrade_v1`]).
 const V1: u32 = 1;
@@ -97,6 +102,9 @@ pub(crate) struct RawSettings {
     enabled_agents: Vec<String>,
     /// The agent notes are sent to, and its model.
     agent: Option<AgentSlot>,
+    /// The agent that analyzes the repository for the map, and its model; `None` for the
+    /// agent notes are sent to, with its model.
+    analyzer: Option<AgentSlot>,
     /// The agents that review the agent's work, in order, each with its model.
     reviewers: Vec<AgentSlot>,
 }
@@ -160,6 +168,19 @@ impl Settings {
             .filter(|slot| slot.name == name)
             .and_then(|slot| slot.model.clone());
         self.choice(name, model)
+    }
+
+    /// The agent that analyzes the repository, with its command and model: the analyzer, or
+    /// the agent notes are sent to when no analyzer is chosen.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when neither is chosen.
+    pub(crate) fn analyzer(&self) -> Result<AgentChoice> {
+        match &self.0.analyzer {
+            Some(slot) => self.choice(&slot.name, slot.model.clone()),
+            None => self.default_agent(),
+        }
     }
 
     /// The reviewers, in order, each with its command and model.
@@ -295,6 +316,15 @@ impl RawSettings {
             }
             check_model(agent)?;
         }
+        if let Some(analyzer) = &self.analyzer {
+            if !enabled(analyzer) {
+                return Err(format!(
+                    "{:?} cannot analyze: it is not an enabled agent",
+                    analyzer.name
+                ));
+            }
+            check_model(analyzer)?;
+        }
         for reviewer in &self.reviewers {
             if !enabled(reviewer) {
                 return Err(format!(
@@ -365,6 +395,7 @@ impl Default for RawSettings {
             custom_agents: Vec::new(),
             enabled_agents: Vec::new(),
             agent: None,
+            analyzer: None,
             reviewers: Vec::new(),
         }
     }
@@ -468,7 +499,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Some(version) if version != VERSION && version != V1 => {
+        Some(version) if ![VERSION, V2, V1].contains(&version) => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
@@ -487,9 +518,10 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
         .map_err(|problem| format!("{shown} breaks a rule: {problem}"))
 }
 
-/// Rewrites a version 1 file, as parsed, into version 2's shape: the agent and each reviewer,
-/// plain names there, become slots with no model. Anything else is left as it is, so a value
-/// of another type still fails the parse that follows, with serde's message.
+/// Rewrites a version 1 file, as parsed, into version 2's shape, which version 3 reads: the
+/// agent and each reviewer, plain names there, become slots with no model. Anything else is
+/// left as it is, so a value of another type still fails the parse that follows, with serde's
+/// message.
 fn upgrade_v1(file: &mut Value) {
     let slot = |value: &mut Value| {
         if let Value::String(name) = value {
@@ -575,6 +607,7 @@ mod tests {
             "customAgents": [{ "name": "Local", "command": "local-agent --acp" }],
             "enabledAgents": ["Claude", "Local"],
             "agent": { "name": "Local" },
+            "analyzer": { "name": "Claude", "model": "sonnet" },
             "reviewers": [
                 { "name": "Claude", "model": "opus" },
                 { "name": "Claude", "model": null },
@@ -586,7 +619,7 @@ mod tests {
         save(&file, &settings, "").unwrap();
 
         let expected = r#"{
-  "version": 2,
+  "version": 3,
   "settings": {
     "theme": "dark",
     "codeFontSize": 14,
@@ -605,6 +638,10 @@ mod tests {
     "agent": {
       "name": "Local",
       "model": null
+    },
+    "analyzer": {
+      "name": "Claude",
+      "model": "sonnet"
     },
     "reviewers": [
       {

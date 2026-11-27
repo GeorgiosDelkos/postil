@@ -127,6 +127,101 @@ let prompts = 0;
 // A file in the session's working directory, as agents report paths: absolute.
 const file = `${process.cwd()}/src/a.rs`;
 
+// A citation as the analysis prompt asks for one: lines, and the text of the first.
+const cite = (path, start, end, first) => ({ path, lines: [start, end], first });
+
+// The diagrams an Analyzer answers the analysis prompt `text` with, by the kind it asks for.
+// The tests' repository has src/a.rs ("fn a() {", "    one();", "}") and src/b.rs, whose
+// "fn two() {" is on line 3.
+function analysisReply(text) {
+  const node = (key, kind, label, anchors, extra = {}) => ({
+    key,
+    kind,
+    label,
+    summary: `${label} in one line`,
+    detail: `What ${label} does.`,
+    anchors,
+    ...extra,
+  });
+  if (text.startsWith("Analyze this repository")) {
+    return {
+      diagrams: [
+        {
+          kind: "architecture",
+          title: "System",
+          nodes: [
+            // Right where it says.
+            node("page", "component", "Page", [cite("src/a.rs", 2, 2, "one();")], { group: "proc" }),
+            // Shifted: its first line is on line 3, named by the worktree's absolute path. Its
+            // label is over the limit, and its group names no node.
+            node("worker", "component", "W".repeat(70), [cite(`${process.cwd()}/src/b.rs`, 1, 2, "fn two() {")], {
+              group: "nowhere",
+            }),
+            // Wrong: no line reads so.
+            node("store", "store", "Store", [cite("src/a.rs", 1, 1, "no such line")]),
+            // A key used twice.
+            node("page", "component", "Again", []),
+            node("proc", "boundary", "Process", [{ path: "src" }]),
+          ],
+          edges: [
+            { from: "page", to: "worker", label: "calls", anchor: cite("src/a.rs", 2, 2, "one();") },
+            { from: "page", to: "ghost", label: "to no node", anchor: null },
+            { from: "worker", to: "worker", label: "to itself", anchor: null },
+          ],
+        },
+        { kind: "data", title: "Types", nodes: [node("note", "store", "Note", [{ path: "src/a.rs" }])], edges: [] },
+      ],
+    };
+  }
+  if (text.startsWith("Analyze one part")) {
+    return {
+      diagrams: [
+        {
+          kind: "architecture",
+          title: "Inside",
+          nodes: [
+            node("x", "component", "Inner", [cite("src/a.rs", 1, 1, "fn a() {")]),
+            node("y", "component", "Other", [{ path: "src/b.rs" }]),
+          ],
+          edges: [{ from: "x", to: "y", label: "uses", anchor: null }],
+        },
+      ],
+    };
+  }
+  if (text.startsWith("Trace one behavior")) {
+    const steps = ["first", "second", "third"].map((key) => node(key, "component", key, [{ path: "src/a.rs" }]));
+    return {
+      diagrams: [
+        {
+          kind: "flow",
+          title: "A flow",
+          nodes: steps,
+          edges: [
+            { from: "first", to: "second", label: "then", anchor: null },
+            { from: "second", to: "third", label: "then", anchor: null },
+          ],
+        },
+      ],
+    };
+  }
+  // An update: replaces the first outdated node and deletes the others, tries to replace and
+  // to delete a healthy one, and adds a node with an edge to the replaced one. The added node's
+  // summary is over the limit and its group names no node, and one more edge goes to no node.
+  const outdated = [...text.matchAll(/^Outdated node (D\d+\.\d+)/gm)].map((match) => match[1]);
+  const healthy = [...text.matchAll(/^- (D\d+\.\d+) "[^"\n]*"$/gm)].map((match) => match[1]);
+  const diagram = text.match(/^Diagram (D\d+)/m)?.[1] ?? null;
+  const [first, ...rest] = outdated;
+  const added = node("added", "component", "Added", [{ path: "src/a.rs" }], { group: "nowhere" });
+  const nodes = [{ ...added, summary: "S".repeat(200) }];
+  const edges = [{ from: "added", to: "ghost", label: "to no node", anchor: null }];
+  if (first) {
+    nodes.push({ ...node(null, "component", "Renewed", [cite("src/a.rs", 1, 1, "fn a() {")]), id: first });
+    edges.push({ from: "added", to: first, label: "new", anchor: null });
+  }
+  if (healthy.length) nodes.push({ ...node(null, "component", "Hijacked", []), id: healthy[0] });
+  return { diagrams: [{ id: diagram, nodes, edges, deleted: [...rest, ...healthy.slice(0, 1)] }] };
+}
+
 async function prompt(id, params) {
   prompts += 1;
   // Refuses its first prompt before doing anything, as an agent at its rate limit does, and
@@ -487,6 +582,19 @@ async function prompt(id, params) {
       }
       return send({ id, result: { stopReason: stopped ? "cancelled" : "end_turn" } });
     }
+    case "analysis":
+      // An Analyzer (src/analysis/prompt.rs) that answers each kind of analysis its prompt asks
+      // for, as its last json block.
+      say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]), null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "analysis-empty":
+      say('Nothing to draw.\n\n```json\n{"diagrams": [{"kind": "architecture", "title": "None", "nodes": [], "edges": []}]}\n```');
+      return send({ id, result: { stopReason: "end_turn" } });
+    case "analysis-edits":
+      // An Analyzer that edits without asking, then replies with diagrams that would read.
+      writeFileSync(`${process.cwd()}/a.txt`, "edited\n");
+      say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]), null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
     case "hang":
       // Never ends the turn, and ignores the cancel.
       return;

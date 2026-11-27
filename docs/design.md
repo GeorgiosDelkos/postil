@@ -459,7 +459,12 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   `readOnly` to the header of every run in a thread that only reads (an ask and its
   follow-ups: no snapshot, no report, every tool call but a read refused), and the `undone`
   entry, logged before the end of a read-only run whose edits Postil put back, which becomes
-  the run's problem after a restart too. Older logs read as runs that may change files.
+  the run's problem after a restart too. Older logs read as runs that may change files. Run
+  log version 8 adds `analysis: {kind, of, nodes}` to the header of an analysis run
+  (docs/review-assist.md, "An analysis run"), which carries no notes and is read-only, and the
+  `noAnalysis` entry, logged with the end of one whose turn ended well and stored nothing,
+  which becomes its problem. An analysis run's log is kept when notes are deleted: its
+  diagrams name it. Older logs read as no analysis.
 - **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
   first update, a permission request, or a stop. A run that fails to start, or whose prompt
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
@@ -944,8 +949,10 @@ view on 2026-11-23.
 
 ### The Run tab
 
-The Run tab (`ui/run-tab.js`) lists the runs, newest first, one card each: the status's
-icon, the run id, the agent, the notes sent, and the status (`GET /api/runs` gives the ids).
+The Run tab (`ui/run-tab.js`) lists the runs of notes, newest first, one card each (an
+analysis run is not one: `GET /api/run` never gives it as the latest, and the tab leaves it
+out): the status's icon, the run id, the agent, the notes sent, and the status
+(`GET /api/runs` gives the ids).
 A card opens the run's dialog, which holds everything about it: the plan, one card per note
 (it opens the note's detail), one card per step (it opens the step whole: its command, diffs
 and output, with the arrow keys or ‹ › to move between steps and the run's id to go back),
@@ -1021,12 +1028,14 @@ settings are the theme (system, light, dark), the code font size (11 to 20 px; t
 height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
 reopens the last project, and the agents above.
 
-The file is format version 2: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
-`null` for the agent's default), and `reviewers` a list of slots. A version 1 file, where both
-are plain names, is read as slots with no model, and the next save writes version 2; an older
-Postil then reads the file as one from a newer Postil and leaves it alone. A model id is 1 to
-200 characters with no space at either end and no control character; whether the agent offers
-it is checked when a run starts (section "Runs").
+The file is format version 3: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
+`null` for the agent's default), `analyzer` a slot or `null` (analyses then go to `agent`, on
+its model), and `reviewers` a list of slots. Each names an enabled agent, so an agent in use
+cannot be turned off or removed. A version 2 file has no `analyzer`; a version 1 file, where the
+agent and reviewers are plain names, is read as slots with no model. The next save writes
+version 3; an older Postil then reads the file as one from a newer Postil and leaves it alone.
+A model id is 1 to 200 characters with no space at either end and no control character;
+whether the agent offers it is checked when a run starts (section "Runs").
 
 The theme is set on the window, and WebKit answers the page's `prefers-color-scheme` from the
 window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:

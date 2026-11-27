@@ -2033,6 +2033,24 @@ fn a_version_5_log_reads_without_a_report() {
 }
 
 #[test]
+fn a_version_7_log_reads_as_no_analysis() {
+    let repo = TempRepo::new("run-version-7");
+    let runs = repo.root.join(".git/postil/runs");
+    fs::create_dir_all(&runs).unwrap();
+    let header = header("R1").replace(r#""version":1"#, r#""version":7"#);
+    fs::write(
+        runs.join("R1.jsonl"),
+        format!("{header}\n{{\"kind\":\"ended\",\"reason\":\"end_turn\"}}\n"),
+    )
+    .unwrap();
+
+    let run = get_json(&repo.site(), RUN);
+    assert_eq!(run["id"], "R1", "{run}");
+    assert_eq!(run["analysis"], serde_json::Value::Null, "{run}");
+    assert_eq!(run["problem"], serde_json::Value::Null, "{run}");
+}
+
+#[test]
 fn an_unreadable_newest_log_is_skipped_and_named() {
     let repo = TempRepo::new("run-skip");
     let runs = repo.root.join(".git/postil/runs");
@@ -2052,8 +2070,8 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         ("\n", "its first line is not a run header"),
         ("not a header\n", "its first line is not a run header"),
         (
-            r#"{"version":8,"id":"R3","newField":1}"#,
-            "it is version 8, and this build of Postil reads versions 1 to 7",
+            r#"{"version":9,"id":"R3","newField":1}"#,
+            "it is version 9, and this build of Postil reads versions 1 to 8",
         ),
         (
             &*header("R3").replace(
@@ -2063,7 +2081,24 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
                     r#""followUp":{"of":"R2","text":"x"}"#,
                 ),
             ),
-            "its header is both a review and a follow-up",
+            "its header is more than one of a review, a follow-up and an analysis",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                concat!(
+                    r#""startedAt":1,"followUp":{"of":"R2","text":"x"},"readOnly":true,"#,
+                    r#""analysis":{"kind":"analyze"}"#,
+                ),
+            ),
+            "its header is more than one of a review, a follow-up and an analysis",
+        ),
+        (
+            &*header("R3").replace(
+                r#""startedAt":1"#,
+                r#""startedAt":1,"analysis":{"kind":"analyze"}"#,
+            ),
+            "its header is an analysis that may change files",
         ),
     ] {
         fs::write(runs.join("R3.jsonl"), newest).unwrap();
@@ -2074,7 +2109,25 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         assert!(problem.contains(why), "{problem}");
     }
 
+    // An analysis run is passed over as no run of notes, and named in no problem.
+    let analysis = header("R3").replace(
+        r#""startedAt":1"#,
+        r#""startedAt":1,"readOnly":true,"analysis":{"kind":"deeper","of":"D1.2"}"#,
+    );
+    fs::write(runs.join("R3.jsonl"), format!("{analysis}\n")).unwrap();
+    let run = get_json(&site, RUN);
+    assert_eq!(
+        (run["id"].as_str(), run["problem"].as_str()),
+        (Some("R2"), None)
+    );
+    let shown = get_json(&site, &format!("{RUN}?id=R3"));
+    assert_eq!(
+        shown["analysis"],
+        serde_json::json!({ "kind": "deeper", "of": "D1.2" })
+    );
+
     fs::remove_file(runs.join("R2.jsonl")).unwrap();
+    fs::remove_file(runs.join("R3.jsonl")).unwrap();
     assert_eq!(get(&site, RUN).1, "null", "nothing readable is no run");
 
     // A runs directory that cannot be listed is an error, not "no runs".

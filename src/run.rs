@@ -49,8 +49,12 @@
 //! every other thread's agent events, wait for those: one lock for all threads keeps the lock
 //! order above, and costs milliseconds.
 //!
-//! `review.lock` (inside `notes.rs`) is the innermost lock: whatever holds it reads and writes
-//! files only, and takes no slots, `runs/active.lock` or thread lock. An ask saves its note
+//! `review.lock` (inside `notes.rs`) and `analysis.lock` (inside `analysis.rs`) are the
+//! innermost locks: whatever holds one reads and writes files only, and takes no slots,
+//! `runs/active.lock` or thread lock. An analysis run's merge takes `analysis.lock` on its
+//! agent's reader thread as its turn ends ([`finish_analysis`]), with no slots held and while
+//! the run still holds its thread's lock, for the read, the merge and the save of the file:
+//! milliseconds, since the reply's citations are checked before it is taken. An ask saves its note
 //! under it inside [`Run::create`], so under the slots and `runs/active.lock`
 //! ([`Runner::ask`]). The save holds it for milliseconds; a lock another process keeps is
 //! waited for up to `files::LOCK_WAIT`, 2 s, before the ask fails. Every page request and
@@ -80,7 +84,8 @@ use crate::acp::{
     Agent, ContentBlock, ElicitationReply, Event, Launch, PermissionKind, PermissionOption,
     PermissionRequest, StopReason, Stopper, ToolKind, TurnEnd,
 };
-use crate::agents::{AgentChoice, Scanner};
+use crate::agents::{self, AgentChoice, Scanner};
+use crate::analysis::{self, AnalysisJob, Planned};
 use crate::error::{Error, Result, error_chain};
 use crate::notes::{self, NewNote, Prompt, Review};
 use crate::repo::Repo;
@@ -88,7 +93,7 @@ use crate::report;
 use crate::review::{self, Diff, Finding, Stage, Work};
 use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
-    hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
+    held_threads, hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
 use crate::thread::{self, Mode, State, Thread};
 use crate::usage::ledger::LedgerSink;
@@ -133,6 +138,11 @@ pub(crate) struct Runner {
     /// or end a thread during it otherwise.
     #[cfg(test)]
     making_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Holds the next analysis merge, once, once it claimed the run's end, until a test lets it
+    /// go ([`Runner::hold_merge`]): a merge takes milliseconds, too short to Stop or close the
+    /// project during it otherwise. The sender says the merge got there.
+    #[cfg(test)]
+    merge_gate: Mutex<Option<MergeGate>>,
     /// The disk bounds a test sets in place of the real ones ([`room::TestDisk`]).
     #[cfg(test)]
     test_disk: Mutex<room::TestDisk>,
@@ -253,13 +263,17 @@ impl Slots {
             })
     }
 
-    /// The live run of this window started most recently, if any: the latest run once the
-    /// one before is gone.
+    /// The live run of notes of this window started most recently, if any: the latest run once
+    /// the one before is gone. An analysis run is never the latest: the Run tab lists runs of
+    /// notes.
     fn newest_live(&self) -> Option<Arc<Run>> {
         self.by_thread
             .values()
             .filter_map(|slot| slot.run.as_ref())
-            .filter(|run| run.state().live())
+            .filter(|run| {
+                let state = run.state();
+                state.live() && state.header.analysis.is_none()
+            })
             .max_by_key(|run| run_number(&run.state().header.id))
             .cloned()
     }
@@ -267,6 +281,16 @@ impl Slots {
     /// Whether any thread of this window is busy ([`Slot::busy`]).
     fn busy(&self) -> bool {
         self.by_thread.values().any(Slot::busy)
+    }
+
+    /// Whether an analysis run of this window is under way, or its worktree is being made.
+    fn analyzing(&self) -> bool {
+        self.by_thread.values().any(|slot| {
+            slot.run.as_ref().is_some_and(|run| {
+                let state = run.state();
+                state.header.analysis.is_some() && (state.live() || slot.making)
+            })
+        })
     }
 
     /// Whether `thread` holds a live ready agent matching `choice`.
@@ -499,6 +523,8 @@ impl Runner {
             #[cfg(test)]
             making_gate: Mutex::new(None),
             #[cfg(test)]
+            merge_gate: Mutex::new(None),
+            #[cfg(test)]
             test_disk: Mutex::default(),
         })
     }
@@ -605,6 +631,66 @@ impl Runner {
         Ok(saved.expect("launch succeeded, so Run::create called the content closure"))
     }
 
+    /// Starts an analysis run of `agent`, read-only in a new thread of its own that ends with
+    /// the run (docs/review-assist.md, "An analysis run"), as `job` asks, and returns the run's
+    /// id. Its reply is merged into the analysis as its turn ends well ([`finish_analysis`]).
+    /// Waits for the agent scan, once per app, and for locks as [`Runner::send`] does. Reads
+    /// the analysis, and for an update the file list and the record ([`analysis::plan`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AnalysisRefused`] when `agent` is not installed, or an analysis of this window
+    /// is under way, both before a thread is made; [`Error::NoCommit`]; [`Error::NoHome`]; as
+    /// [`thread::all`] and [`analysis::plan`]; and as [`Runner::send`]:
+    /// [`Error::TooManyRuns`], [`Error::RunElsewhere`], and the errors that fail the run.
+    pub(crate) fn analyze(
+        self: &Arc<Self>,
+        agent: AgentChoice,
+        job: AnalysisJob,
+    ) -> Result<String> {
+        // Checked here: a missing agent would fail only on the start thread, after the thread
+        // is made.
+        if !agents::is_installed(&agent, &self.agents.wait()) {
+            return Err(Error::AnalysisRefused(format!(
+                "{} is not installed: install it, or choose another Analyzer in Settings",
+                agent.name
+            )));
+        }
+        let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
+        self.home.as_deref().ok_or(Error::NoHome)?;
+        thread::all(&self.repo)?;
+        let Planned { run, title, prompt } = analysis::plan(&self.repo, job)?;
+        let slots = self.slots();
+        if slots.analyzing() {
+            return Err(Error::AnalysisRefused(
+                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
+            ));
+        }
+        let new = NewRun {
+            agent,
+            origin: Origin::Analysis(run),
+            conversation: Conversation::Fresh,
+            review: None,
+            place: Place::New {
+                fork,
+                title,
+                mode: Mode::Read,
+            },
+        };
+        let mut id = None;
+        self.launch(slots, new, |run| {
+            id = Some(run.to_owned());
+            Ok(Content {
+                notes: Vec::new(),
+                prompt: Prompt {
+                    text: prompt,
+                    files: Vec::new(),
+                },
+            })
+        })?;
+        Ok(id.expect("launch succeeded, so Run::create called the content closure"))
+    }
+
     /// The thread `id`, open with its worktree on disk, or evicted, whose run makes it again.
     ///
     /// # Errors
@@ -692,6 +778,12 @@ impl Runner {
             if state.header.review.is_some() {
                 return Err(Error::BadRequest(format!(
                     "{of} is a review: follow up the run it reviews"
+                )));
+            }
+            // Its thread ended with it, and a follow-up would merge nothing.
+            if state.header.analysis.is_some() {
+                return Err(Error::BadRequest(format!(
+                    "{of} is an analysis: analyze again to go on"
                 )));
             }
             state.header.notes.clone()
@@ -1010,6 +1102,7 @@ impl Runner {
         } = new;
         let snapshot = place.mode() == Mode::Work
             && !matches!(&origin, Origin::Review(stage) if !stage.judges());
+        let analysis = matches!(origin, Origin::Analysis(_));
         let Created { run, prompt, marks } =
             self.create_run(&agent.name, origin, &place, content)?;
         let (thread, worktree) = match self.place(&run, place, snapshot) {
@@ -1038,7 +1131,10 @@ impl Runner {
         };
         slots.launches += 1;
         let used = slots.launches;
-        slots.latest = Some(Arc::clone(&run));
+        // The Run tab follows the latest run, and lists runs of notes only.
+        if !analysis {
+            slots.latest = Some(Arc::clone(&run));
+        }
         let slot = slots
             .by_thread
             .entry(id.clone())
@@ -1273,7 +1369,8 @@ impl Runner {
         drop(slots);
         // Dropping the agent kills it and waits for its process to be reaped.
         drop(released);
-        if forced {
+        // An analysis merging its reply ends the run itself, once it is done.
+        if forced && run.claim_end() {
             // Its exit is not reported, so the snapshot after it is taken here, once nothing
             // can write any more. The run stays live until then, so a send is refused
             // (`TurnRunning`) meanwhile.
@@ -1285,6 +1382,7 @@ impl Runner {
         }
         if let Some(thread) = &thread {
             self.forget_deleted_ask(&run, thread);
+            self.end_analysis_thread(&run, thread);
         }
         (self.notify)();
         result
@@ -1620,7 +1718,9 @@ impl Runner {
     fn forget_deleted_ask(&self, run: &Run, thread: &Thread) {
         let notes = {
             let state = run.state();
-            if thread.mode != Mode::Read || state.live() {
+            // An analysis carries no notes, and its thread ends with it
+            // ([`Runner::end_analysis_thread`]).
+            if thread.mode != Mode::Read || state.live() || state.header.analysis.is_some() {
                 return;
             }
             state.header.notes.clone()
@@ -1630,6 +1730,64 @@ impl Runner {
         };
         if notes.iter().all(|note| !left.contains(note)) {
             drop(self.delete_runs_without_notes());
+        }
+    }
+
+    /// When `run`, in `thread`, is an analysis run that has ended, ends its thread
+    /// (docs/review-assist.md, "Where read-only agents run"): lets its agent go, frees the
+    /// worktree and deletes the branch ([`thread::forget`]), marks the thread discarded, and
+    /// removes its lock file, which every count of live runs would try for as long as it
+    /// stays. The record stays, with the commit the run started from, which an update compares
+    /// the files with, until the run's log goes ([`Runner::delete_runs_without_notes`]). The
+    /// slot goes last, once all that is done: a thread that cannot be ended (its lock held
+    /// elsewhere, edits the undo could not put back) keeps its slot, so the run, which says
+    /// why, is still the one this window shows. Called wherever a run ends, beside
+    /// [`Runner::forget_deleted_ask`] and with no slots guard held: takes the thread's lock,
+    /// then the slots, as forgetting a thread does; the thread is not busy once its only run
+    /// ended, since an analysis takes no follow-up.
+    fn end_analysis_thread(&self, run: &Run, thread: &Thread) {
+        {
+            let state = run.state();
+            if state.header.analysis.is_none() || state.live() {
+                return;
+            }
+        }
+        let Some(home) = self.home.as_deref() else {
+            return;
+        };
+        let dir = self.repo.runs_dir();
+        let ended = (|| {
+            let lock = hold_thread_lock(&dir, &thread.id)?;
+            let released = self
+                .slots()
+                .by_thread
+                .get_mut(&thread.id)
+                .map_or(Held::None, Slot::release);
+            // Dropping the agent waits for its process, so after the slots' lock.
+            drop(released);
+            // Read again under the lock, as ending a thread does.
+            let stored = thread::find(&self.repo, &thread.id)?
+                .filter(|stored| matches!(stored.state, State::Open | State::Evicted));
+            if let Some(stored) = stored {
+                thread::forget(&self.repo, home, &stored)?;
+                thread::update(&self.repo, &thread.id, |stored| {
+                    stored.state = State::Discarded;
+                })?;
+            }
+            // Removed while it is held, as a new thread whose worktree failed removes its own.
+            remove_thread_lock(&dir, &thread.id);
+            drop(lock);
+            Ok::<_, Error>(())
+        })();
+        match ended {
+            Ok(()) => drop(self.slots().by_thread.remove(&thread.id)),
+            Err(error) => {
+                run.state().problem.get_or_insert(format!(
+                    "the analysis's thread could not be ended, and its worktree stays: {}",
+                    error_chain(&error)
+                ));
+                (self.notify)();
+            }
         }
     }
 
@@ -1669,6 +1827,11 @@ impl Runner {
     /// saved (`send` reads them for the prompt first), so every listed log's notes are seen:
     /// another window's new note, even one given a freed id, keeps its new run.
     ///
+    /// An analysis run carries no notes: its log goes once the run is over, in every window
+    /// (its thread's lock is free), and no diagram of the analysis names it
+    /// (`analysis::runs_named`): one that stored nothing, or whose diagrams were all replaced
+    /// or deleted. Its thread's record goes with it, below.
+    ///
     /// Then forgets every thread whose first run's log is gone and that is not busy in this
     /// window ([`Runner::forget_threads`]): takes its lock, stops its kept agent, frees its
     /// worktree, and deletes its branch while it is at Postil's last commit.
@@ -1686,6 +1849,14 @@ impl Runner {
             source,
         })?;
         let left = notes::ids(&self.repo)?;
+        // An analysis run under way in any window holds its thread's lock, whose id is the
+        // run's; no diagram names it until its merge. Read before the diagrams: a run not live
+        // here has ended, so its merge is saved and the read below sees it. Either that cannot
+        // be read keeps every analysis log.
+        let running = held_threads(&dir).ok();
+        let named = running
+            .as_ref()
+            .and_then(|_| analysis::runs_named(&self.repo).ok());
         // Read once: the slots are not held while logs are read, so the agents' events, which
         // need them, are never kept waiting on the disk.
         let live = self.live();
@@ -1701,7 +1872,20 @@ impl Runner {
             let Ok(header) = read_header(&file) else {
                 continue;
             };
-            if header.notes.iter().any(|note| left.contains(note)) {
+            // An analysis carries no notes: its log stays while its run is under way, in any
+            // window, and then while a stored diagram names it, as their record.
+            let kept = match &header.analysis {
+                Some(_) => {
+                    running
+                        .as_ref()
+                        .is_some_and(|running| running.contains(&header.id))
+                        || named
+                            .as_ref()
+                            .is_none_or(|named| named.contains(&header.id))
+                }
+                None => header.notes.iter().any(|note| left.contains(note)),
+            };
+            if kept {
                 continue;
             }
             fs::remove_file(&file).map_err(|source| Error::WriteRun { path: file, source })?;
@@ -1847,15 +2031,19 @@ impl Runner {
         // drops their events anyway.
         drop(released);
         for (run, thread) in runs {
-            // As a forced Stop does: the agent's exit is not reported, so the snapshot after
-            // the run is taken here, or its changes view would stay empty. It runs `git add`
-            // on the request thread, quitting included. Both calls do nothing for a run that
-            // already ended.
-            undo_if_live(self, &run, Some(&thread));
-            self.record_end_snapshot(&run, Some(&thread));
-            run.record(Entry::Failed {
-                error: "stopped: Postil closed the project while it ran".to_owned(),
-            });
+            // An analysis merging its reply ends the run itself, as a forced Stop leaves it,
+            // and ends its thread then.
+            if run.claim_end() {
+                // As a forced Stop does: the agent's exit is not reported, so the snapshot
+                // after the run is taken here, or its changes view would stay empty. It runs
+                // `git add` on the request thread, quitting included.
+                undo_if_live(self, &run, Some(&thread));
+                self.record_end_snapshot(&run, Some(&thread));
+                run.record(Entry::Failed {
+                    error: "stopped: Postil closed the project while it ran".to_owned(),
+                });
+            }
+            self.end_analysis_thread(&run, &thread);
         }
     }
 
@@ -1965,6 +2153,7 @@ impl Runner {
             // be made, a Stop came while it was, its agent did not start) ends a deleted ask's
             // thread as an agent's last event does; one that goes on returns at once.
             cleaner.forget_deleted_ask(&run, &thread);
+            cleaner.end_analysis_thread(&run, &thread);
         };
         std::thread::Builder::new()
             .name("agent-start".to_owned())
@@ -2155,6 +2344,14 @@ impl Runner {
     }
 }
 
+/// The gate of [`Runner::hold_merge`]: what releases the merge, and where it says it is held.
+#[cfg(test)]
+#[derive(Debug)]
+struct MergeGate {
+    gate: std::sync::mpsc::Receiver<()>,
+    held: std::sync::mpsc::Sender<()>,
+}
+
 #[cfg(test)]
 impl Runner {
     /// Whether a review is under way: decided as each stage ends, before its end is logged.
@@ -2188,6 +2385,27 @@ impl Runner {
         let (release, gate) = std::sync::mpsc::channel();
         *lock(&self.making_gate) = Some(gate);
         release
+    }
+
+    /// Holds the next analysis merge once it claimed the run's end, until the returned sender
+    /// sends or is dropped; the returned receiver gets a message once the merge is held. Once.
+    pub(crate) fn hold_merge(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+        let (release, gate) = std::sync::mpsc::channel();
+        let (held, reached) = std::sync::mpsc::channel();
+        *lock(&self.merge_gate) = Some(MergeGate { gate, held });
+        (release, reached)
+    }
+
+    /// Waits at the gate [`Runner::hold_merge`] set, if any.
+    fn pass_merge_gate(&self) {
+        let gate = lock(&self.merge_gate).take();
+        if let Some(MergeGate { gate, held }) = gate {
+            // The test may have stopped waiting; the merge goes on as well then.
+            held.send(()).ok();
+            gate.recv().ok();
+        }
     }
 
     /// Waits at the gate [`Runner::hold_making`] set, if any.
@@ -2242,17 +2460,22 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         })
     );
     let ends_turn = matches!(event, Event::TurnEnded(_) | Event::Exited { .. });
-    let (run, thread, released, answer, next) = {
+    let (run, thread, released, answer, next, edited, analyzing) = {
         let mut slots = runner.slots();
         if slots.let_go(id, generation) {
             return;
         }
         let slot = slots.by_thread.get_mut(id).expect("let_go found the slot");
         let thread = Some(slot.thread.clone());
-        let (review, read_only_thread) = slot.run.as_ref().map_or((None, false), |run| {
-            let state = run.state();
-            (state.header.review.clone(), state.header.read_only)
-        });
+        let (review, read_only_thread, analyzing) =
+            slot.run.as_ref().map_or((None, false, false), |run| {
+                let state = run.state();
+                (
+                    state.header.review.clone(),
+                    state.header.read_only,
+                    state.header.analysis.is_some(),
+                )
+            });
         // Answered before the request is logged, and logged with it at once: a page that read
         // the request alone would show the run waiting for the engineer.
         // From the run's header, which never changes: a Stop that ends the chain does not lift
@@ -2278,7 +2501,8 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
             event,
             Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
         );
-        let released = if ends_agent {
+        // An analysis's agent goes with its turn: its thread ends with the run.
+        let released = if ends_agent || (ends_turn && analyzing) {
             slot.release()
         } else {
             Held::None
@@ -2293,6 +2517,8 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
             .as_deref()
             .filter(|run| ends_turn && run.state().live())
             .and_then(|run| undo_read_only(&runner, run, thread.as_ref()));
+        // An analysis that changed files stores nothing: its tree is not the one it was given.
+        let edited = undone.is_some();
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
         // next stage starts once the end is logged.
@@ -2310,9 +2536,9 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
             }
             _ => None,
         };
-        (run, thread, released, answer, next)
+        (run, thread, released, answer, next, edited, analyzing)
     };
-    if let Some(run) = run {
+    if let Some(run) = &run {
         // The agent names files in the worktree it works in.
         let root = thread
             .as_ref()
@@ -2320,22 +2546,27 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         // Before the end is logged, so a reader that sees the end sees what the run changed,
         // and its report.
         if ends_turn {
-            runner.record_end_snapshot(&run, thread.as_ref());
+            runner.record_end_snapshot(run, thread.as_ref());
         }
-        let report = if ended_well {
-            report_entry(&run, root)
-        } else {
-            None
+        // Read before the end is logged, which releases the thread's lock: the worktree is
+        // still the run's.
+        let before_end = match (&thread, ended_well && !edited) {
+            (Some(thread), true) if analyzing => finish_analysis(&runner, run, thread),
+            (_, true) => report_entry(run, root),
+            (_, false) => None,
         };
-        if let Some(ids) = run.record_event(event, report, answer, root) {
-            runner.mark_sent(&run, &ids);
+        if let Some(ids) = run.record_event(event, before_end, answer, root) {
+            runner.mark_sent(run, &ids);
         }
         if ends_turn && let Some(thread) = &thread {
-            runner.forget_deleted_ask(&run, thread);
+            runner.forget_deleted_ask(run, thread);
         }
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
     drop(released);
+    if ends_turn && let (Some(run), Some(thread)) = (&run, &thread) {
+        runner.end_analysis_thread(run, thread);
+    }
     (runner.notify)();
     if let Some(ended) = next {
         #[cfg(test)]
@@ -2585,6 +2816,42 @@ fn report_entry(run: &Run, root: &Path) -> Option<Entry> {
         Ok(report) => Entry::Report { report },
         Err(problem) => Entry::NoReport { problem },
     })
+}
+
+/// Merges the reply of `run`, an analysis whose turn ended well in `thread`'s worktree, into
+/// the analysis ([`analysis::merge`]), and returns the entry that says why nothing was stored,
+/// if nothing was; `None` once stored, and for a run that is not an analysis or whose end a
+/// forced stop or a close claimed first ([`Run::claim_end`]). Its own claim keeps those from
+/// ending the run, and so from freeing the worktree, while it reads there. The caller logs it
+/// with the run's end, while the run still holds its thread's lock, so no window starts a run
+/// in the worktree meanwhile. Reads every
+/// cited file in the worktree and takes `analysis.lock`, so it is never called under the
+/// `Slots` lock.
+fn finish_analysis(runner: &Runner, run: &Run, thread: &Thread) -> Option<Entry> {
+    let (asked, id, reply) = {
+        let state = run.state();
+        (
+            state.header.analysis.clone()?,
+            state.header.id.clone(),
+            state.reply(),
+        )
+    };
+    // A forced Stop or a close that claimed the end first ends the run: nothing is stored.
+    if !run.claim_end() {
+        return None;
+    }
+    #[cfg(test)]
+    runner.pass_merge_gate();
+    // A run has a thread only with a home: `thread::plan` refuses one without.
+    let home = runner.home.as_deref()?;
+    let problem = match thread::open(&runner.repo, home, thread) {
+        Ok(tree) => analysis::merge(&runner.repo, &tree, &id, &asked, &reply).err()?,
+        Err(error) => format!(
+            "its worktree could not be opened, so nothing was stored: {}",
+            error_chain(&error)
+        ),
+    };
+    Some(Entry::NoAnalysis { problem })
 }
 
 /// Says on `run` that no snapshot was taken, and why: the run goes on, without its changes

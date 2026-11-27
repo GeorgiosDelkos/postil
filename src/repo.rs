@@ -228,6 +228,23 @@ impl Repo {
         Ok(files)
     }
 
+    /// The files commit `commit` holds, relative to the root, submodules left out as
+    /// [`Repo::files`] leaves them out. Reads the commit's tree, not the disk.
+    ///
+    /// # Errors
+    ///
+    /// The git error, such as a commit the repository does not have.
+    pub(crate) fn files_at(&self, commit: &str) -> Result<HashSet<String>> {
+        let listed = git(&self.root, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
+        // `<mode> <type> <object>\t<path>`. A submodule is mode 160000, a gitlink.
+        Ok(listed
+            .split_terminator('\0')
+            .filter_map(|entry| entry.split_once('\t'))
+            .filter(|(fields, _)| !fields.starts_with("160000"))
+            .map(|(_, path)| path.to_owned())
+            .collect())
+    }
+
     /// Takes a snapshot of the working tree, every tracked file and every untracked file that
     /// is not ignored, as a git tree, and returns its id. Postil takes one before a run and one
     /// after it, and the changes view shows the diff between them (docs/design.md, "The
