@@ -1639,7 +1639,10 @@ export function diagramView({
       if (view.shown === shown) return;
       view.shown = shown;
       onChange();
-      if (!shown) return;
+      if (!shown) {
+        flowDictation.cancel();
+        return;
+      }
       render();
       ensureDagre();
       load().catch((error) => onError(String(error)));
@@ -1658,6 +1661,8 @@ export function diagramView({
     isShown: () => view.shown,
     // The id of the diagram the map shows, or null while it is hidden.
     openDiagramId: () => (view.shown ? (current()?.id ?? null) : null),
+    // Labels of the nodes in the currently open diagram, for dictation contextualStrings.
+    nodeLabels: () => (view.shown ? (current()?.nodes?.map((node) => node.label) ?? []) : []),
     revealNode,
     followCode,
     focus,

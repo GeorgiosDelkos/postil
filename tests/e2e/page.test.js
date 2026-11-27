@@ -2884,3 +2884,31 @@ test("dictation widget replaces partial text in place and keeps surrounding text
     "false",
   );
 });
+
+test("dictation widget handles dialog close and IME composition cleanly", async (t) => {
+  const { page } = await openProject(t);
+  await page.locator('#files .dir[data-path="src"]').click();
+  await page.locator('#files .file[data-path="src/a.rs"]').click();
+  await page.locator("#code-rows .ln .n").first().click();
+  await page.keyboard.press("c");
+  const textarea = page.locator(".composer textarea");
+  await textarea.waitFor();
+
+  // IME composition defers a final transcript + idle until compositionend.
+  await page.locator(".composer .dictation-btn").click();
+  await page.evaluate(() => {
+    const area = document.querySelector(".composer textarea");
+    window.postil.dictation.emit({ type: "state", state: "listening" });
+    area.dispatchEvent(new Event("compositionstart"));
+    window.postil.dictation.emit({ type: "transcript", text: "after ime", isFinal: true });
+    window.postil.dictation.emit({ type: "state", state: "idle" });
+  });
+  assert.equal(await textarea.inputValue(), "", "deferred while composing");
+  await page.evaluate(() => {
+    const area = document.querySelector(".composer textarea");
+    area.value = "漢 ";
+    area.setSelectionRange(2, 2);
+    area.dispatchEvent(new Event("compositionend"));
+  });
+  assert.equal(await textarea.inputValue(), "漢 after ime");
+});

@@ -31,10 +31,8 @@ test("insertion commits a final result in place", () => {
 });
 
 test("caret moved mid-partial commits the partial and continues at the new caret", () => {
-  // Partial inserted at the start of the box.
   const first = insertion("and more", { start: 0, end: 0 }, "first part ");
   assert.equal(first.text, "first part and more");
-  // User moves caret to the end; sliceDelta keeps only words spoken after "first part".
   const delta = sliceDelta("first part at the end", "first part");
   assert.equal(delta, "at the end");
   const second = insertion(first.text + " ", { start: 20, end: 20 }, delta);
@@ -42,8 +40,10 @@ test("caret moved mid-partial commits the partial and continues at the new caret
   assert.deepEqual(second.range, { start: 20, end: 30 });
 });
 
-test("sliceDelta handles case changes and punctuation revisions at the committed prefix", () => {
+test("sliceDelta handles case changes, punctuation revisions, and word boundaries", () => {
   assert.equal(sliceDelta("Hello world next", "hello world"), "next");
+  assert.equal(sliceDelta("Hello, world. Next sentence", "hello world"), "Next sentence");
+  assert.equal(sliceDelta("testing one two", "test"), "testing one two");
   assert.equal(sliceDelta("fresh words", ""), "fresh words");
   assert.equal(sliceDelta("hello", "hello"), "");
 });

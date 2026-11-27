@@ -789,13 +789,16 @@ function showRepo(repo) {
 //   them, so they share its guards, such as a draft note blocking Quit.
 // - `dictation`, the bridge to native on-device speech recognition (`src/dictation.rs`).
 setDictationContext(() => {
-  const words = [];
+  const words = new Set();
   if (state.file?.path) {
-    words.push(state.file.path);
+    words.add(state.file.path);
     const base = state.file.path.split("/").at(-1);
-    if (base && base !== state.file.path) words.push(base);
+    if (base) words.add(base);
   }
-  return words;
+  for (const label of map.nodeLabels()) {
+    if (label) words.add(label);
+  }
+  return [...words];
 });
 const dictationListeners = new Set();
 window.postil = {
