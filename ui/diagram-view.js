@@ -383,12 +383,12 @@ export function diagramView({
       back.addEventListener("click", leaveChangeMap);
       first.push(back);
       crumbs.append(el("b", "map-change-label", `Change map · ${run}`));
-      if (diagram) crumbs.append(" › ");
+      if (diagram) crumbs.append(el("span", "map-crumb-sep", "›"));
     }
     if (diagram) {
       const trail = breadcrumb(shownAnalysis(), diagram);
       trail.forEach((step, index) => {
-        if (index > 0) crumbs.append(" › ");
+        if (index > 0) crumbs.append(el("span", "map-crumb-sep", "›"));
         if (index === trail.length - 1) crumbs.append(el("b", "", step.title));
         else {
           const up = el("button", "map-crumb", step.title);
@@ -715,10 +715,24 @@ export function diagramView({
   // No analysis yet: who would make one, what it reads, and the one button that starts it.
   // With other diagrams there, the kind shown has none yet: Analyze draws it, and the
   // Architecture's top level again, in place of the one there is.
+  function emptyGlyph() {
+    const svg = svgEl("svg", "map-empty-glyph", { viewBox: "0 0 24 24", "aria-hidden": "true" });
+    svg.append(
+      svgEl("rect", "", { x: "3", y: "3.5", width: "7", height: "5.5", rx: "1.5" }),
+      svgEl("rect", "", { x: "14", y: "3.5", width: "7", height: "5.5", rx: "1.5" }),
+      svgEl("rect", "", { x: "8.5", y: "15", width: "7", height: "5.5", rx: "1.5" }),
+      svgEl("path", "", {
+        d: "M10 6.25h4M6.5 9v2.25c0 1 .8 1.75 1.75 1.75h3.75V15M17.5 9v2.25c0 1-.8 1.75-1.75 1.75H12",
+      }),
+    );
+    return svg;
+  }
+
   function emptyCard() {
     const card = el("div", "map-card map-empty");
     const slot = settings()?.analyzer ?? settings()?.agent;
     const analyzer = slot ? formatSlot(slot) : "the agent";
+    card.append(emptyGlyph());
     if (diagrams().length) {
       const name = KINDS.find(([kind]) => kind === view.kind)[1];
       card.append(
@@ -756,6 +770,7 @@ export function diagramView({
   function noFlowCard() {
     const card = el("div", "map-card map-empty");
     card.append(
+      emptyGlyph(),
       el("h2", "map-empty-title", "No flow yet"),
       el(
         "p",
@@ -841,6 +856,7 @@ export function diagramView({
         view.forced?.run === live.id
           ? `Updating after ${view.forced.commit}…`
           : `Analyzing with ${live.agent}…`;
+      parts.push(el("span", "map-run-dot"));
       parts.push(el("span", "map-run-status", status));
       parts.push(stripButton("Open run", () => runs.openRun(live.id)));
       parts.push(stripButton("Stop", () => runs.stopRun(live.id)));
@@ -1038,12 +1054,13 @@ export function diagramView({
       pane.append(card);
     }
     svg.append(pane);
+    const zoom = zoomControls();
     // A card that had the focus goes with the old SVG, and the focus with it to the page's
     // body: the selected card takes it back, as an analysis read again redraws under the
     // keyboard.
     const focused = body.contains(document.activeElement);
-    body.replaceChildren(svg);
-    drawn = { diagram, positioned, pane, cards };
+    body.replaceChildren(svg, zoom.bar);
+    drawn = { diagram, positioned, svg, pane, cards, zoomReadout: zoom.readout };
     if (focused) (cards.get(view.selected) ?? body).focus({ preventScroll: true });
     if (!view.transforms.has(diagram.id) && viewport().width > 0) {
       view.transforms.set(diagram.id, fitTransform(positioned, viewport()));
@@ -1053,6 +1070,39 @@ export function diagramView({
     view.codeNode = view.code && nodeAtLine(placed, view.code.path, view.code.line);
     syncRings();
     centrePending();
+  }
+
+  // Quiet floating zoom/fit controls in the bottom-right corner of the canvas.
+  function zoomControls() {
+    const bar = el("div", "map-zoom");
+    bar.setAttribute("role", "group");
+    bar.setAttribute("aria-label", "Zoom");
+    const zoomBy = (factor) => {
+      if (!drawn) return;
+      stopGlide();
+      const { width, height } = viewport();
+      setTransform(zoomAt(transform(), factor, { x: width / 2, y: height / 2 }));
+    };
+    const out = el("button", "map-zoom-btn", "−");
+    out.type = "button";
+    out.title = "Zoom out";
+    out.setAttribute("aria-label", "Zoom out");
+    out.addEventListener("click", () => zoomBy(1 / 1.25));
+    const readout = el("button", "map-zoom-btn map-zoom-fit", "100%");
+    readout.type = "button";
+    readout.title = "Fit diagram (0)";
+    readout.setAttribute("aria-label", "Fit diagram");
+    readout.addEventListener("click", () => {
+      if (!drawn) return;
+      glideTo(fitTransform(drawn.positioned, viewport()));
+    });
+    const zoomIn = el("button", "map-zoom-btn", "+");
+    zoomIn.type = "button";
+    zoomIn.title = "Zoom in";
+    zoomIn.setAttribute("aria-label", "Zoom in");
+    zoomIn.addEventListener("click", () => zoomBy(1.25));
+    bar.append(out, readout, zoomIn);
+    return { bar, readout };
   }
 
   // Centres the node `revealNode` asked for, once its diagram is drawn in a pane with a size.
@@ -1082,13 +1132,13 @@ export function diagramView({
     const marker = svgEl("marker", "", {
       id: "map-arrow",
       viewBox: "0 0 8 8",
-      refX: "7",
+      refX: "6.5",
       refY: "4",
-      markerWidth: "8",
-      markerHeight: "8",
+      markerWidth: "7",
+      markerHeight: "7",
       orient: "auto-start-reverse",
     });
-    marker.append(svgEl("path", "map-arrow", { d: "M0 0 L8 4 L0 8 z" }));
+    marker.append(svgEl("path", "map-arrow", { d: "M1 1.5 L7 4 L1 6.5 L2.4 4 z" }));
     defs.append(marker);
     return defs;
   }
@@ -1105,7 +1155,7 @@ export function diagramView({
       "data-node-id": box.id,
       "aria-label": `${box.node.label}, boundary${mark ? `, ${mark}` : ""}`,
     });
-    head.append(svgText("map-group-label", box.x + 12, box.y + 18, box.node.label));
+    head.append(svgText("map-group-label", box.x + 12, box.y + 17, box.node.label));
     head.classList.toggle("selected", box.id === view.selected);
     group.append(
       svgEl("rect", "map-group-box", {
@@ -1120,13 +1170,32 @@ export function diagramView({
     return { box: group, head };
   }
 
+  // Smooths multi-point dagre routes with quadratic curves through segment midpoints;
+  // two-point edges stay straight.
+  function edgePath(points) {
+    if (points.length <= 2) {
+      return points.map((point, index) => `${index ? "L" : "M"}${point.x} ${point.y}`).join(" ");
+    }
+    const parts = [`M${points[0].x} ${points[0].y}`];
+    for (let index = 1; index < points.length - 1; index += 1) {
+      const current = points[index];
+      const next = points[index + 1];
+      const midX = (current.x + next.x) / 2;
+      const midY = (current.y + next.y) / 2;
+      parts.push(`Q${current.x} ${current.y} ${midX} ${midY}`);
+    }
+    const last = points[points.length - 1];
+    parts.push(`L${last.x} ${last.y}`);
+    return parts.join(" ");
+  }
+
   function edgeLine({ edge, points }) {
     const line = svgEl("g", "map-edge");
-    const d = points.map((point, index) => `${index ? "L" : "M"}${point.x} ${point.y}`).join(" ");
+    const d = edgePath(points);
     line.append(svgEl("path", "map-edge-line", { d, "marker-end": "url(#map-arrow)" }));
     if (edge.label) {
       const middle = points[Math.floor(points.length / 2)];
-      line.append(svgText("map-edge-label", middle.x, middle.y - 4, shorten(edge.label, 28)));
+      line.append(svgText("map-edge-label", middle.x, middle.y - 5, shorten(edge.label, 28)));
     }
     return line;
   }
@@ -1157,23 +1226,30 @@ export function diagramView({
       svgEl("rect", "map-node-box", { width: box.width, height: box.height, rx: 8 }),
     );
     if (node.kind === "store")
-      card.append(svgEl("path", "map-node-band", { d: `M0 10 H${box.width}` }));
+      card.append(svgEl("path", "map-node-band", { d: `M0.5 9 H${box.width - 0.5}` }));
     if (node.kind === "external") {
-      const inset = { x: 3, y: 3, width: box.width - 6, height: box.height - 6, rx: 6 };
+      const inset = { x: 3.5, y: 3.5, width: box.width - 7, height: box.height - 7, rx: 5.5 };
       card.append(svgEl("rect", "map-node-inset", inset));
     }
     const outdated = node.summary ? `outdated · ${node.summary}` : "outdated";
     const sub = { unverified: "not found in code", outdated }[state];
-    // The number is an element of its own, so the label stays the node's label alone. A digit
-    // of the 12.5 px label is under 8 px wide, and 6 px part the two: read by eye.
-    if (step) card.append(svgText("map-node-step", 12, 22, String(step)));
-    const left = step ? 12 + 8 * String(step).length + 6 : 12;
+    // The step number sits in a small pill badge before the label.
+    let left = 12;
+    if (step) {
+      const digits = String(step);
+      const badgeW = Math.max(18, digits.length * 7 + 8);
+      card.append(
+        svgEl("rect", "map-node-step-bg", { x: 10, y: 11, width: badgeW, height: 15, rx: 4 }),
+        svgText("map-node-step", 10 + badgeW / 2, 22, digits),
+      );
+      left = 10 + badgeW + 6;
+    }
     card.append(
-      svgText("map-node-label", left, 22, shorten(node.label, step ? 21 : 24)),
-      svgText("map-node-summary", 12, 40, shorten(sub ?? node.summary, 30)),
+      svgText("map-node-label", left, 23, shorten(node.label, step ? 20 : 24)),
+      svgText("map-node-summary", 12, 41, shorten(sub ?? node.summary, 30)),
     );
     if (childDiagram(shownAnalysis(), node.id)) {
-      card.append(svgText("map-node-deeper", box.width - 18, 22, "›"));
+      card.append(svgText("map-node-deeper", box.width - 16, 23, "›"));
     }
     card.classList.toggle("selected", node.id === view.selected);
     return card;
@@ -1187,6 +1263,7 @@ export function diagramView({
   function syncRings() {
     if (!drawn) return;
     const matches = new Set(view.search ? searchNodes(drawn.diagram, view.search) : []);
+    drawn.svg.classList.toggle("map-searching", matches.size > 0);
     for (const [id, card] of drawn.cards) {
       card.classList.toggle("ringed", matches.has(id) || id === view.codeNode);
     }
@@ -1207,6 +1284,7 @@ export function diagramView({
     if (!drawn) return;
     const { x, y, scale } = transform();
     drawn.pane.setAttribute("transform", `translate(${x} ${y}) scale(${scale})`);
+    if (drawn.zoomReadout) drawn.zoomReadout.textContent = `${Math.round(scale * 100)}%`;
   }
 
   function stopGlide() {
@@ -1275,10 +1353,15 @@ export function diagramView({
     pinched = event.scale;
   });
 
-  // A drag on the background pans; one that starts on a card leaves the click to the card.
+  // A drag on the background pans; one that starts on a card or zoom control leaves the click to it.
   let panning = null;
   body.addEventListener("pointerdown", (event) => {
-    if (!drawn || event.button !== 0 || event.target.closest("[data-node-id]")) return;
+    if (
+      !drawn ||
+      event.button !== 0 ||
+      event.target.closest("[data-node-id], .map-zoom")
+    )
+      return;
     stopGlide();
     body.setPointerCapture(event.pointerId);
     panning = { x: event.clientX, y: event.clientY, from: transform() };
