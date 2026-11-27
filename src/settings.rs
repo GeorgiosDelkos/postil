@@ -11,9 +11,11 @@
 //! Format version 2 names the agent notes are sent to, and each reviewer, as a slot: an
 //! agent's name and the model it runs (`{"name": "Claude", "model": "opus"}`, `null` for the
 //! agent's own default). A version 1 file, where they are plain names, is still read: each
-//! name becomes a slot with no model, and the next save writes version 3. Version 3 adds the
+//! name becomes a slot with no model, and the next save writes version 4. Version 3 adds the
 //! Analyzer, a slot like the others, which draws the map (docs/review-assist.md, "An analysis
-//! run"); a version 2 file has none, and analyses go to the agent notes are sent to.
+//! run"); a version 2 file has none, and analyses go to the agent notes are sent to. Version 4
+//! adds `agentMemory`, whether agents get team memory (docs/review-assist.md, "Milestone 9:
+//! team memory"); an older file has it off.
 //!
 //! The rules, checked when a [`RawSettings`] becomes a [`Settings`] (`TryFrom`), the only way
 //! to make one:
@@ -40,8 +42,11 @@ use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
 
-/// The format version this build writes. It also reads [`V2`] and [`V1`].
-const VERSION: u32 = 3;
+/// The format version this build writes. It also reads [`V3`], [`V2`] and [`V1`].
+const VERSION: u32 = 4;
+
+/// The format before team memory: read as it is, with it off.
+const V3: u32 = 3;
 
 /// The format before the analyzer: read as it is, with no analyzer.
 const V2: u32 = 2;
@@ -72,6 +77,13 @@ pub(crate) enum Theme {
     System,
     Light,
     Dark,
+}
+
+/// Whether agents get team memory: the `agentMemory` switch, as runs take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamMemory {
+    Off,
+    On,
 }
 
 /// The settings in effect, each rule in the module docs kept: made only from a
@@ -107,6 +119,10 @@ pub(crate) struct RawSettings {
     analyzer: Option<AgentSlot>,
     /// The agents that review the agent's work, in order, each with its model.
     reviewers: Vec<AgentSlot>,
+
+    /// Whether agents get team memory (hippius-mem). Off by default: it is turned on only
+    /// once hippius-mem is ready (`site.rs`, `save_settings`), which a file does not know.
+    agent_memory: bool,
 }
 
 /// A place in the workflow: the agent notes are sent to, or one reviewer. One type for both,
@@ -130,6 +146,14 @@ impl Settings {
 
     pub(crate) fn reopen_last_project(&self) -> bool {
         self.0.reopen_last_project
+    }
+
+    pub(crate) fn team_memory(&self) -> TeamMemory {
+        if self.0.agent_memory {
+            TeamMemory::On
+        } else {
+            TeamMemory::Off
+        }
     }
 
     pub(crate) fn custom_agents(&self) -> &[CustomAgent] {
@@ -397,6 +421,7 @@ impl Default for RawSettings {
             agent: None,
             analyzer: None,
             reviewers: Vec::new(),
+            agent_memory: false,
         }
     }
 }
@@ -499,7 +524,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Some(version) if ![VERSION, V2, V1].contains(&version) => {
+        Some(version) if ![VERSION, V3, V2, V1].contains(&version) => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
@@ -518,7 +543,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
         .map_err(|problem| format!("{shown} breaks a rule: {problem}"))
 }
 
-/// Rewrites a version 1 file, as parsed, into version 2's shape, which version 3 reads: the
+/// Rewrites a version 1 file, as parsed, into version 2's shape, which version 4 reads: the
 /// agent and each reviewer, plain names there, become slots with no model. Anything else is
 /// left as it is, so a value of another type still fails the parse that follows, with serde's
 /// message.
@@ -612,6 +637,7 @@ mod tests {
                 { "name": "Claude", "model": "opus" },
                 { "name": "Claude", "model": null },
             ],
+            "agentMemory": true,
         }))
         .unwrap();
         let settings = Settings::try_from(raw).unwrap();
@@ -619,7 +645,7 @@ mod tests {
         save(&file, &settings, "").unwrap();
 
         let expected = r#"{
-  "version": 3,
+  "version": 4,
   "settings": {
     "theme": "dark",
     "codeFontSize": 14,
@@ -652,7 +678,8 @@ mod tests {
         "name": "Claude",
         "model": null
       }
-    ]
+    ],
+    "agentMemory": true
   }
 }
 "#;

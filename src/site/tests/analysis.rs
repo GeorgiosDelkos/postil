@@ -1938,7 +1938,13 @@ fn two_checks_at_once_start_one_run() {
     let started = first
         .runner()
         .unwrap()
-        .analyze_checked(agent.clone(), expected.as_ref(), &head, planned)
+        .analyze_checked(
+            agent.clone(),
+            TeamMemory::Off,
+            expected.as_ref(),
+            &head,
+            planned,
+        )
         .unwrap();
     let StartedUpdate::Started { run, .. } = started else {
         panic!("the first claim starts the run: {started:?}");
@@ -1946,7 +1952,13 @@ fn two_checks_at_once_start_one_run() {
     let late = second
         .runner()
         .unwrap()
-        .analyze_checked(agent, late_expected.as_ref(), &late_head, late_planned)
+        .analyze_checked(
+            agent,
+            TeamMemory::Off,
+            late_expected.as_ref(),
+            &late_head,
+            late_planned,
+        )
         .unwrap();
     assert!(matches!(late, StartedUpdate::AlreadyChecked), "{late:?}");
     assert_eq!(run_ids(&first), serde_json::json!([run, "R2", "R1"]));

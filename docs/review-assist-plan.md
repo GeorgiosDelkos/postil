@@ -63,7 +63,7 @@ step named.
 | S4 | `@dagrejs/dagre` at a release at least two weeks old: is there one browser file with a global, its size, and the layout time for 200 nodes in WKWebView? | 8.3 | Over 50 ms or no browser build: a layered layout of our own, limited to 60 nodes. |
 | S5 | `cargo deny check` with `tree-sitter-tags`, `objc2-speech`, `objc2-avf-audio` added. | 7.7, 10.1 | A license outside `deny.toml`'s list: ask the owner before adding an exception. |
 | S6 | Speech: does `supportsOnDeviceRecognition` hold for the development Mac's languages, and what does a denied permission return? | 10.1 | No on-device model for a language: dictation reports it, as designed. |
-| S7 | ACP schema at the commit `src/acp/wire.rs` pins: the stdio form of `mcpServers`, and whether an agent may refuse it. | 9.3 | Refusal is possible: `session/new` is retried once with none, and the run says so. |
+| S7 | ACP schema at the commit `src/acp/wire.rs` pins: the stdio form of `mcpServers`, and whether an agent may refuse it. | 9.3 | Refusal is possible: `session/new` is retried once with none, and the run says so. Done: refusal is possible, so it is retried (design, "Open questions", 12). |
 
 ## Rules for every step
 
@@ -759,10 +759,12 @@ Team memory section, with the rescan poll pattern (`ui/settings-dialog.js:320`).
 - `quickstart` refuses because a configuration exists: its message is shown as it is.
 - Set up is one click on a button that says what it writes, and the paths come from the
   command's own output, not from Postil's guess.
-- The binary is removed while Postil runs: the next call fails, the state turns to Missing,
-  and runs start without memory.
-- The setting is on and the state is not Ready: runs start without memory, and the run's
-  dialog says so once.
+- The binary is removed while Postil runs: the next call fails and the state turns to
+  Missing.
+- `doctor` exits 1 for every error: its message is shown, and Set up is offered only when it
+  says there is no configuration.
+- `doctor` picks its profile by the git origin of its working directory: it runs in the open
+  project's root, and again when another project opens.
 
 **Tests.** With a fake `hippius-mem` on a temporary `PATH` (a shell script: the real one
 cannot be made to hang or be missing): each state; the hang; the switch refused when not
@@ -795,9 +797,9 @@ boolean today and becomes a lookup.
 - Closing the project stops the process.
 
 **Tests.** Against the real binary with a trial vault in a temporary home (skipped with a
-message when not installed): remember three notes through the CLI, recall by path, read one,
-read its history. Against the fake script: a dead process is restarted once; a slow call is
-reported; a missing tool is named. Page: the tab's cards, the weak group, the pending state.
+message when not installed): remember three notes through its server (hippius-mem 0.7.1 has no
+remember command), recall by path, read one, read its history. Against the fake script: a dead
+process is restarted once; a slow call is reported; a missing tool is named. Page: the tab's cards, the weak group, the pending state.
 e2e: the Memory tab opens and the send bar stays hidden there.
 
 ### 9.3 Agents get it
@@ -810,7 +812,9 @@ one line. `tests/fake-agent.mjs`: `echo-session` replies with the `session/new` 
 **Edge cases.** The absolute path has spaces. The agent answers `session/new` with an error
 (S7): one retry with no servers, and the run's dialog says memory was not given. The setting
 is off: the list is empty and the prompt has no line. A reviewer and a read-only run get the
-server too: recall is a read.
+server too: recall is a read. The binary is removed while Postil runs: runs start without
+memory. The setting is on and the state is not Ready: runs start without memory, and the
+run's dialog says so once (moved here from 9.1, where no run uses memory yet).
 
 **Tests.** `a_run_gives_the_agent_team_memory` (site, `echo-session`),
 `the_setting_off_gives_none_and_no_prompt_line`, `a_refused_server_list_is_retried_without`.

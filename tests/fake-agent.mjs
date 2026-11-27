@@ -124,6 +124,9 @@ let model = null;
 
 // Prompts this process received, so a test can tell a kept agent from a new one.
 let prompts = 0;
+// The params of each `session/new` this process received, in order: "echo-session" and
+// "refuse-servers" say them in each turn, so a test sees the MCP servers the app gave.
+const sessions = [];
 // A file in the session's working directory, as agents report paths: absolute.
 const file = `${process.cwd()}/src/a.rs`;
 
@@ -242,6 +245,17 @@ async function prompt(id, params) {
   say(`got ${blocks.join(" | ")}`);
   say(`prompt ${prompts}`);
   switch (scenario) {
+    case "echo-session":
+    case "refuse-servers":
+      // Answers each kind of run well enough to end: an analysis with its diagrams, a
+      // proposer with no findings, and any other run with the sessions alone.
+      say(`sessions ${JSON.stringify(sessions)}`);
+      if (blocks[0].startsWith("Analyze this repository")) {
+        say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]))}\n\`\`\``);
+      } else if (blocks[0].includes("Do not change any file")) {
+        say("Found none.\n\n```json\n[]\n```");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
     case "turn": {
       // Agents send notifications and update kinds the app does not use.
       send({ method: "_x.ai/session/setup", params: { phase: "auth" } });
@@ -416,6 +430,38 @@ async function prompt(id, params) {
       say('It returns early.\n\n```json\n{"checks": [{"command": "cargo test", "result": "passed"}]}\n```');
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "review-memory":
+      // Plays the author and both reviewers of a review with team memory (src/review.rs),
+      // told apart by the prompt; each echoes its prompt as every scenario does ("got"). The
+      // author edits a.txt with a diff it reports and writes b.txt as a command would, with no
+      // diff. The proposer names a memory the fake hippius-mem recalls (mem_01A) and one no
+      // recall gave.
+      if (blocks[0].includes("Do not change any file")) {
+        const finding = (note, path, line, text, fix, memory) =>
+          ({ note, path, line, finding: text, fix, memory });
+        const findings = [
+          finding("N1", "a.txt", 1, "a.txt is read eagerly", "read it lazily", "mem_01A"),
+          finding(null, "b.txt", null, "b.txt is new", null, "mem_01NOTGIVEN"),
+        ];
+        say(`Found two.\n\n\`\`\`json\n${JSON.stringify(findings)}\n\`\`\``);
+      } else if (blocks[0].includes("You are the last reviewer")) {
+        say("F1: accepted - read lazily\nF2: rejected - fine as it is");
+      } else {
+        update({
+          sessionUpdate: "tool_call",
+          toolCallId: "w1",
+          title: "Edit a.txt",
+          kind: "edit",
+          status: "completed",
+          content: [
+            { type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "a\nedited" },
+          ],
+        });
+        writeFileSync(`${process.cwd()}/a.txt`, "a\nedited\n");
+        writeFileSync(`${process.cwd()}/b.txt`, "b\n");
+        say("N1: edited a.txt");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reviewer-silent":
       // A proposer whose reply has no findings block.
       say("Looks fine to me.");
@@ -624,6 +670,33 @@ async function prompt(id, params) {
       writeFileSync(`${process.cwd()}/a.txt`, "edited\n");
       say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]), null, 2)}\n\`\`\``);
       return send({ id, result: { stopReason: "end_turn" } });
+    case "memory-draft":
+    case "memory-draft-writes": {
+      // A thread's agent that answers its notes with a line, and a memory draft (src/run.rs,
+      // `DRAFT_ASK`) with the block it asks for. `memory-draft-writes` breaks the draft's rules
+      // first: it asks to edit, then edits a.txt without asking.
+      if (!blocks[0].includes("as a team memory")) {
+        say("N1: done");
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      if (scenario === "memory-draft-writes") {
+        const edit = await permission("w1");
+        say(`edit ${edit.result.outcome.optionId}`);
+        writeFileSync(`${process.cwd()}/a.txt`, "drafted over\n");
+      }
+      say(
+        'Here is the draft.\n\n```json\n{"summary": "a.txt holds one line on purpose", "body": "The parser reads a.txt whole: keep it to one line."}\n```',
+      );
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "memory-draft-hang":
+      // Answers its notes, and never ends a memory draft's turn: the draft stays under way.
+      if (!blocks[0].includes("as a team memory")) {
+        say("N1: done");
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      say("drafting");
+      return;
     case "hang":
       // Never ends the turn, and ignores the cancel.
       return;
@@ -725,9 +798,21 @@ const handle = (line) => {
       }
       return initialize(message.id);
     case "session/new":
+      sessions.push(message.params);
       if (scenario === "no-session-id") return send({ id: message.id, result: {} });
+      // An agent whose configuration forbids MCP servers from the client refuses a session
+      // that names any, as the schema lets it; "refuse-sessions" refuses every session.
+      if (scenario === "refuse-servers" && message.params.mcpServers.length > 0) {
+        return send({ id: message.id, error: { code: -32602, message: "MCP servers are disabled" } });
+      }
+      if (scenario === "refuse-sessions") {
+        return send({ id: message.id, error: { code: -32602, message: "no sessions today" } });
+      }
       if (scenario === "auth") {
-        return send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
+        // Says how many sessions it was asked for, so a test sees that a sign-in is not asked
+        // again without the MCP servers.
+        const asked = `Authentication required (session/new ${sessions.length})`;
+        return send({ id: message.id, error: { code: -32000, message: asked } });
       }
       if (scenario === "spawns-child") {
         // A grandchild in the agent's process group, as `npx` leaves `node` running. Its pid

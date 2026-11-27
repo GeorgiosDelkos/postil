@@ -11,6 +11,7 @@
 // and a review's findings show beside their lines. Files order is the diff's own.
 
 import { el } from "./dom.js";
+import { findingMemories, findingMemoryLink } from "./memory-tab.js";
 import { findingsByLine, hunkRisk, notesByLine, parsePatch, walkthrough } from "./patch.js";
 import { segmented } from "./settings-controls.js";
 
@@ -23,8 +24,18 @@ const LINES_SHOWN = 400;
 // header, `controls` being elements to show beside the meta; `notes()` gives the notes;
 // `noteCard(note)` builds a note's card, which opens its dialog; `addNote(path, line)` writes a
 // note on 1-based line `line` of `path`; `onError(text)` shows a failure; `onClose()` runs when
-// the view closes, to give the pane back to the file.
-export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onError, onClose }) {
+// the view closes, to give the pane back to the file; `openMemory(id)` opens the team memory a
+// finding names.
+export function changesView({
+  viewEl,
+  setHeader,
+  notes,
+  noteCard,
+  addNote,
+  onError,
+  onClose,
+  openMemory,
+}) {
   // What is shown: `{ from, to, run }`, or null while the view is closed.
   let shown = null;
   let request = 0;
@@ -37,9 +48,22 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
   let opened = new Set();
   // The index of the current step among the drawn `.changes-step` sections.
   let current = 0;
-  // While a draw scrolls to a hunk (`focusOn`): `match(file, hunk)`, which says whether a hunk
-  // is wanted (`hunk` null for a file with none), and the first element drawn for one.
+  // The memories the findings name: drawn again where it was as each summary is read.
+  const cited = findingMemories({
+    onSettled: () => {
+      if (!read) return;
+      const top = viewEl.scrollTop;
+      draw();
+      viewEl.scrollTop = top;
+    },
+  });
+  // The `match(file, hunk)` of the latest `focusOn`, which says whether a hunk is wanted (`hunk`
+  // null for a file with none): kept while these changes show, so every draw of them, a
+  // memory's summary read or another order, draws the wanted hunks whole.
   let focus = null;
+  // While `focusOn`'s draw runs, the first element drawn for a wanted hunk, which it scrolls
+  // to; `aiming` keeps a later draw from scrolling.
+  let aiming = false;
   let target = null;
 
   // Shows what runs `from` to `to` changed. `run` is `{ report, findings }` for a single run:
@@ -58,6 +82,7 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     }
     shown = { from, to, run };
     read = null;
+    focus = null;
     opened = new Set();
     current = 0;
     eyesFirst = false;
@@ -88,7 +113,8 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
 
   // Draws the view and scrolls it to the first hunk `match(file, hunk)` holds, or to the first
   // file with no hunks it holds (`hunk` null), opened if folded and drawn whole wherever it
-  // is, so neither a fold nor the `LINES_SHOWN` limit hides it. With no match, draws only.
+  // is, so neither a fold nor the `LINES_SHOWN` limit hides it, in this draw and the later ones
+  // of these changes. With no match, draws only.
   function focusOn(match) {
     focus = match;
     target = null;
@@ -96,8 +122,9 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
       for (const file of read.files)
         for (const hunk of file.hunks) if (match(file, hunk)) opened.add(hunk);
     }
+    aiming = true;
     draw();
-    focus = null;
+    aiming = false;
     if (!target) return;
     const step = target.closest(".changes-step");
     if (step) {
@@ -115,16 +142,15 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     target = null;
   }
 
-  // Whether the draw under way scrolls to one of `entries` (`{ file, hunk }`): they are then
-  // drawn whole.
+  // Whether `focus` wants one of `entries` (`{ file, hunk }`): they are then drawn whole.
   function holdsFocus(entries) {
     return Boolean(focus) && entries.some(({ file, hunk }) => focus(file, hunk));
   }
 
-  // `element`, drawn for `hunk` of `file`, is what the draw scrolls to when it is the first
-  // that `focus` asks for.
+  // `element`, drawn for `hunk` of `file`, is what `focusOn`'s draw scrolls to when it is the
+  // first that `focus` asks for.
   function aim(element, file, hunk) {
-    if (focus && !target && focus(file, hunk)) target = element;
+    if (aiming && focus && !target && focus(file, hunk)) target = element;
   }
 
   // A file's hunks as entries, or the file alone when it has none.
@@ -486,6 +512,9 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     );
     card.append(head, el("div", "note-body", finding.text));
     if (finding.fix) card.append(el("div", "changes-finding-fix", `Fix: ${finding.fix}`));
+    if (finding.memory) {
+      card.append(findingMemoryLink(finding.memory, cited.summary(finding.memory), openMemory));
+    }
     return card;
   }
 
@@ -542,6 +571,8 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     if (!shown) return;
     shown = null;
     read = null;
+    focus = null;
+    cited.stop();
     request += 1;
     viewEl.hidden = true;
     viewEl.replaceChildren();

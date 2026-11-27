@@ -176,6 +176,15 @@ impl Repo {
         )
     }
 
+    /// The name hippius-mem gives this repository's notes: the last segment of its `origin`
+    /// remote, as [`memory_repo_name`] reads it. `None` with no `origin`, or one it cannot
+    /// read, when hippius-mem binds no repository either. Runs `git` once.
+    pub(crate) fn memory_name(&self) -> Option<String> {
+        // Fails when there is no `origin`: no name then, as for hippius-mem.
+        let url = git(&self.root, &["remote", "get-url", "origin"]).ok()?;
+        memory_repo_name(&url).map(str::to_owned)
+    }
+
     /// The checked-out branch, or an empty string when `HEAD` is detached.
     pub(crate) fn branch(&self) -> Result<String> {
         let branch = git(&self.root, &["branch", "--show-current"])?;
@@ -658,10 +667,11 @@ impl Repo {
         self.ref_commit(commit)
     }
 
-    /// The paths that differ between commits `from` and `to`, each with how it changed, in
-    /// git's order. A rename is a deletion and an addition (`--no-renames`), so a file moved
-    /// into a folder no node covers reads as added. A submodule is left out, as [`Repo::files`]
-    /// leaves it out. Reads the two trees, not the disk.
+    /// The paths that differ between commits `from` and `to` (or two snapshot trees,
+    /// [`Repo::snapshot`]), each with how it changed, in git's order. A rename is a deletion
+    /// and an addition (`--no-renames`), so a file moved into a folder no node covers reads as
+    /// added. A submodule is left out, as [`Repo::files`] leaves it out. Reads the two trees,
+    /// not the disk.
     ///
     /// # Errors
     ///
@@ -1089,6 +1099,16 @@ impl Repo {
         })
     }
 
+    /// Checks that `path` is written as git writes paths, as [`Repo::read`] does, without
+    /// looking at the disk: it need not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutsideRepository`] when it is not.
+    pub(crate) fn check_path(&self, path: &str) -> Result<()> {
+        self.inside(path).map(drop)
+    }
+
     /// `file` on disk, once it is known to name something inside the root.
     ///
     /// The path comes from the page. It must be written as git writes paths: names joined by
@@ -1158,6 +1178,34 @@ fn is_home_or_root(dir: &Path) -> bool {
     };
     let home = std::env::var_os("HOME").and_then(|home| Path::new(&home).canonicalize().ok());
     dir.parent().is_none() || home.is_some_and(|home| home == dir)
+}
+
+/// The repository name in the git remote `url`, read as hippius-mem reads it, so Postil's
+/// recalls name the repository its agents' notes are kept under: `normalize_remote` and
+/// `resolve_profile` in hippius-mem at db9261b
+/// (`hippius-mem/src/resolver.rs`, `hippius-mem/src/main.rs`), which take the last segment of
+/// `host/org/.../repo` once one trailing `.git` and any trailing `/` are gone. Its three
+/// shapes: `https://host/org/repo`, `ssh://user@host:22/org/repo` and the scp-like
+/// `user@host:org/repo`. `None` for a path with fewer than two segments (an org alone), a
+/// local path, or a one-character host (a Windows drive letter).
+fn memory_repo_name(url: &str) -> Option<&str> {
+    let url = url.trim();
+    // `://` first, so the scheme's colon is never read as the scp-like form's.
+    let (authority, path) = match url.split_once("://") {
+        Some((_scheme, after)) => after.split_once('/')?,
+        None => url.split_once(':')?,
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split_once(':').map_or(host, |(bare, _port)| bare);
+    if host.len() < 2 {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    // The org; the name is the last segment after it.
+    segments.next()?;
+    segments.next_back()
 }
 
 /// Checks that `id`, a `kind` of object ("commit", "snapshot") from a run log or a request,
@@ -1340,6 +1388,51 @@ fn output_of(mut command: Command, args: &[&OsStr], input: Option<&[u8]>) -> Res
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[test]
+    fn the_memory_name_is_the_remote_s_last_segment_as_hippius_mem_reads_it() {
+        for (url, name) in [
+            (
+                "https://github.com/GeorgiosDelkos/postil.git",
+                Some("postil"),
+            ),
+            ("https://github.com/GeorgiosDelkos/postil", Some("postil")),
+            ("git@github.com:GeorgiosDelkos/postil.git\n", Some("postil")),
+            ("ssh://git@host.example:22/team/postil", Some("postil")),
+            ("https://github.com/team/postil.git/", Some("postil")),
+            // A nested group: the last segment, and one `.git` only.
+            (
+                "https://gitlab.com/group/sub/tool.git.git",
+                Some("tool.git"),
+            ),
+            // An org alone, a local path and a drive letter name no repository.
+            ("https://github.com/team", None),
+            ("/srv/git/postil.git", None),
+            ("C:/work/postil", None),
+            // A two-character host is a host.
+            ("git@gh:team/postil", Some("postil")),
+            ("", None),
+        ] {
+            assert_eq!(memory_repo_name(url), name, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn the_memory_name_comes_from_origin_and_not_from_the_folder() {
+        let dir = TempDir::new("repo-memory-name");
+        let root = dir.path().join("agent-worktree");
+        fs::create_dir(&root).unwrap();
+        git(&root, &["init", "--quiet"]).unwrap();
+        let repo = Repo::open(&root).unwrap();
+        assert_eq!(repo.memory_name(), None, "no origin: no name");
+
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:Owner/postil.git"],
+        )
+        .unwrap();
+        assert_eq!(repo.memory_name().as_deref(), Some("postil"));
+    }
 
     #[test]
     fn a_working_tree_whose_git_folder_is_gone_fails_instead_of_reaching_the_one_above() {

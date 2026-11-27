@@ -24,12 +24,13 @@ use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{self, Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
+use crate::memory::{self, Memory, MemoryId, RememberRequest};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
 use crate::run::{Ending, Notify, Runner, StartedUpdate};
-use crate::settings::{self, CustomAgent, RawSettings, Settings};
+use crate::settings::{self, CustomAgent, RawSettings, Settings, TeamMemory};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
@@ -201,6 +202,21 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/file-list.js"),
     ),
     (
+        "/memory.js",
+        "text/javascript",
+        include_bytes!("../ui/memory.js"),
+    ),
+    (
+        "/memory-tab.js",
+        "text/javascript",
+        include_bytes!("../ui/memory-tab.js"),
+    ),
+    (
+        "/memory-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/memory-dialog.js"),
+    ),
+    (
         "/notes-tray.js",
         "text/javascript",
         include_bytes!("../ui/notes-tray.js"),
@@ -341,6 +357,8 @@ pub(crate) struct Site {
     quotas: QuotaPoller,
     /// On-demand background probes for the models each agent offers (`models.rs`).
     models: ModelProber,
+    /// Whether hippius-mem is installed and set up, checked in the background (`memory.rs`).
+    memory: Memory,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
 }
@@ -360,6 +378,7 @@ struct Project {
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoInfo<'a> {
     name: String,
     root: String,
@@ -367,6 +386,9 @@ struct RepoInfo<'a> {
     files: Vec<String>,
     bench: Option<&'a str>,
     warning: Option<String>,
+    /// The repository's name in team memory ([`Repo::memory_name`]); `None` without an
+    /// `origin` remote, when the Remember dialog offers only the whole team's memory.
+    memory_repo: Option<String>,
 }
 
 /// An entry of the reply to `/api/recent`.
@@ -394,11 +416,57 @@ struct SettingsView<'a> {
     first_run: bool,
     /// Every agent, built-in ones first; `None` while the agent scan runs.
     agents: Option<Vec<AgentView<'a>>>,
+    /// Team memory: whether hippius-mem is installed and set up.
+    memory: MemoryView,
     /// External tools found on the search path; `None` while the agent scan runs.
     tools: Option<ToolsView>,
     /// The smallest and largest code font size.
     font_sizes: [u8; 2],
     tab_widths: [u8; 3],
+}
+
+/// Team memory as the settings dialog shows it.
+#[derive(Debug, Serialize)]
+struct MemoryView {
+    /// Whether a check or a set up runs, so the page asks again shortly.
+    pending: bool,
+    /// `None` while a check runs.
+    state: Option<MemoryStateView>,
+    /// The last set up; `None` before the first.
+    setup: Option<memory::Setup>,
+}
+
+/// [`memory::State`] with its path as text.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum MemoryStateView {
+    Missing,
+    Unconfigured {
+        path: String,
+        problem: Option<String>,
+    },
+    Ready {
+        path: String,
+    },
+}
+
+impl From<memory::Status> for MemoryView {
+    fn from(status: memory::Status) -> Self {
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        let state = status.state.map(|state| match state {
+            memory::State::Missing => MemoryStateView::Missing,
+            memory::State::Unconfigured { path, problem } => MemoryStateView::Unconfigured {
+                path: text(&path),
+                problem,
+            },
+            memory::State::Ready { path } => MemoryStateView::Ready { path: text(&path) },
+        });
+        Self {
+            pending: state.is_none() || status.setup == Some(memory::Setup::Running),
+            state,
+            setup: status.setup,
+        }
+    }
 }
 
 /// External tools found on the search path, for the startup wizard's readiness check.
@@ -544,6 +612,24 @@ struct EditNote {
     body: String,
 }
 
+/// The body of `POST /api/memory/draft`: the note a memory is drafted from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftRequest {
+    note: String,
+}
+
+/// The reply to `POST /api/memory/draft`. `fallback` is the note's text, which the dialog opens
+/// with when no draft comes.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum DraftReply {
+    /// No draft run: the note was never sent, or its thread ended or has no worktree record.
+    Fallback { body: String },
+    /// The draft run started; its view's `draft` holds the draft once it is over.
+    Run { run: String, fallback: String },
+}
+
 /// The body of `POST /api/run/follow`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -667,6 +753,12 @@ impl Site {
         agents: Scanner,
         notify: Notify,
     ) -> Self {
+        // A test that sets no memory up must not run the machine's hippius-mem, whose `doctor`
+        // writes a probe into the engineer's vault: its memory finds no program.
+        #[cfg(not(test))]
+        let memory = Memory::new(agents.clone());
+        #[cfg(test)]
+        let memory = Memory::new(Scanner::new(OsString::new));
         Self {
             project: RefCell::new(None),
             highlighter: Highlighter::new(),
@@ -677,10 +769,27 @@ impl Site {
             usage_file: config.map(|dir| dir.join("usage.jsonl")),
             home: home.map(Path::to_owned),
             models: ModelProber::live(agents.clone()),
+            memory,
             agents,
             quotas: QuotaPoller::live(),
             notify,
         }
+    }
+
+    /// Replaces the memory; it runs in the open project, when one is open, which is opened
+    /// again so that its runner hands this memory to its runs.
+    #[cfg(test)]
+    pub(crate) fn with_memory(mut self, memory: Memory) -> Self {
+        self.memory = memory;
+        let open = self.project.borrow_mut().take();
+        if let Some(open) = open {
+            let repo = Repo::open(open.repo.root()).expect("the open project opens again");
+            open.definitions.close();
+            open.runner.close();
+            self.open(repo, LiveRun::Stop)
+                .expect("no project is open, so none refuses");
+        }
+        self
     }
 
     #[cfg(test)]
@@ -733,9 +842,17 @@ impl Site {
             return Ok(());
         }
         let repo = Arc::new(repo);
+        self.memory.open_project(&repo);
+        // A run gives its agent team memory only once a check found hippius-mem Ready, and the
+        // first check would otherwise wait for the first send or the settings dialog: the send
+        // step's preview would leave out the line about it that the send then has.
+        if self.current_settings().team_memory() == TeamMemory::On {
+            drop(self.memory.status());
+        }
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
+            self.memory.clone(),
             Arc::clone(&self.notify),
             self.home.clone(),
             self.usage_file.clone(),
@@ -829,6 +946,9 @@ impl Site {
                 _ => not_allowed("POST with no body"),
             },
             path if path.starts_with("/api/agents/") => self.respond_agents(path, method, body),
+            path if path == "/api/memory" || path.starts_with("/api/memory/") => {
+                self.respond_memory(request)
+            }
             "/api/usage" => match *method {
                 Method::GET => json_or_error(self.usage_view(query, QuotaFetch::Cached)),
                 _ => not_allowed("GET"),
@@ -844,15 +964,7 @@ impl Site {
             },
             path if path.starts_with("/api/analysis") => self.respond_analysis(request),
             "/api/runs" => match *method {
-                Method::GET => json_or_error(self.runner().and_then(|runner| {
-                    let ids = runner.ids()?;
-                    let live: Vec<_> = runner
-                        .live()
-                        .into_iter()
-                        .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
-                        .collect();
-                    Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
-                })),
+                Method::GET => json_or_error(self.runs()),
                 _ => not_allowed("GET"),
             },
             path if path == "/api/run" || path.starts_with("/api/run/") => {
@@ -877,6 +989,7 @@ impl Site {
             files: repo.files()?,
             bench: self.bench.as_deref(),
             warning,
+            memory_repo: repo.memory_name(),
         };
         Ok(to_json(&info))
     }
@@ -998,8 +1111,9 @@ impl Site {
     }
 
     fn analyze(&self, job: AnalysisJob) -> Result<Vec<u8>> {
-        let agent = self.current_settings().analyzer()?;
-        let run = self.runner()?.analyze(agent, job)?;
+        let settings = self.current_settings();
+        let agent = settings.analyzer()?;
+        let run = self.runner()?.analyze(agent, job, settings.team_memory())?;
         Ok(to_json(&serde_json::json!({ "run": run })))
     }
 
@@ -1019,20 +1133,27 @@ impl Site {
                 expected,
                 head,
                 planned,
-            } => match self.current_settings().analyzer() {
-                Err(error) => CheckView::Blocked {
-                    reason: error_chain(&error),
-                },
-                Ok(agent) => {
-                    match runner.analyze_checked(agent, expected.as_ref(), &head, planned)? {
+            } => {
+                let settings = self.current_settings();
+                match settings.analyzer() {
+                    Err(error) => CheckView::Blocked {
+                        reason: error_chain(&error),
+                    },
+                    Ok(agent) => match runner.analyze_checked(
+                        agent,
+                        settings.team_memory(),
+                        expected.as_ref(),
+                        &head,
+                        planned,
+                    )? {
                         StartedUpdate::Started { run, commit } => {
                             CheckView::Updated { run, commit }
                         }
                         StartedUpdate::AlreadyChecked => CheckView::Same,
                         StartedUpdate::Blocked(reason) => CheckView::Blocked { reason },
-                    }
+                    },
                 }
-            },
+            }
         };
         Ok(to_json(&view))
     }
@@ -1182,7 +1303,14 @@ impl Site {
                     self.agents.rescan();
                     // An agent found again may be another version, with other models.
                     self.models.rescan();
-                    reply(StatusCode::OK, "application/json", self.settings())
+                    // hippius-mem is looked for on the same path. A set up under way checks
+                    // it again when it ends.
+                    match self.memory.check() {
+                        Ok(()) | Err(Error::MemorySetupRunning) => {
+                            reply(StatusCode::OK, "application/json", self.settings())
+                        }
+                        Err(error) => json_or_error(Err(error)),
+                    }
                 }
                 _ => not_allowed("POST with no body"),
             },
@@ -1192,6 +1320,128 @@ impl Site {
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
+    }
+
+    /// The replies to `/api/memory` and the routes under it, as [`Site::respond`] gives them: a
+    /// memory, a recall, Refresh, a draft and a remember, a new check of hippius-mem and a trial
+    /// vault's set up. Each answers at once with what is known, and the work runs in the
+    /// background (`memory.rs`, and the draft run, `run.rs`).
+    /// Takes the whole request so that dispatch stays one line: `respond` is at clippy's
+    /// length limit.
+    fn respond_memory(&self, request: &Request<Vec<u8>>) -> Reply {
+        let method = request.method();
+        let query = request.uri().query().unwrap_or("");
+        match request.uri().path() {
+            "/api/memory" => match *method {
+                Method::GET => json_or_error(self.memory_detail(query)),
+                _ => not_allowed("GET ?id=mem_..."),
+            },
+            "/api/memory/recall" => match *method {
+                Method::GET => json_or_error(self.memory_recall(query)),
+                _ => not_allowed("GET ?path=<path>&node=<node label>, ?run=R1, or ?text=<query>"),
+            },
+            "/api/memory/draft" => match *method {
+                Method::POST => json_or_error(self.memory_draft(request.body())),
+                _ => not_allowed("POST {\"note\": \"N1\"}"),
+            },
+            "/api/memory/remember" => match *method {
+                Method::POST => json_or_error(self.memory_remember(request.body())),
+                _ => not_allowed(
+                    "POST {\"note\": \"N1\", \"noteType\": ..., \"summary\": ..., \"body\": ..., \
+                     \"scope\": \"repo\" or \"global\"}",
+                ),
+            },
+            "/api/memory/refresh" => match *method {
+                Method::POST => json_or_error(self.memory_refresh()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/memory/check" => match *method {
+                Method::POST => json_or_error(self.memory.check().map(|()| self.settings())),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/memory/setup" => match *method {
+                Method::POST => json_or_error(self.memory.setup().map(|()| self.settings())),
+                _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    /// The recall for the open file (`?path=`, with the selected node's label as `?node=`), for
+    /// the thread that ends with a run (`?run=`): its prompt and changed paths, or for a text
+    /// (`?text=`), a draft's summary, which the Remember dialog checks for duplicates.
+    fn memory_recall(&self, query: &str) -> Result<Vec<u8>> {
+        if let Some(text) = query_value(query, "text") {
+            if text.trim().is_empty() {
+                return Err(Error::BadRequest(
+                    "expected ?text=<a query that is not blank>".to_owned(),
+                ));
+            }
+            self.repo()?;
+            return Ok(to_json(&self.memory.recall_run(text)?));
+        }
+        if let Some(run) = query_value(query, "run") {
+            // The runner holds no lock once this returns: memory is never waited on with a
+            // run's lock held.
+            let text = self.runner()?.recall_query(&run)?;
+            return Ok(to_json(&self.memory.recall_run(text)?));
+        }
+        let path = query_value(query, "path").ok_or_else(|| {
+            Error::BadRequest(
+                "expected ?path=<percent-encoded path>, ?run=<run id> or ?text=<query>".to_owned(),
+            )
+        })?;
+        self.repo()?.check_path(&path)?;
+        let node = query_value(query, "node").filter(|label| !label.is_empty());
+        Ok(to_json(&self.memory.recall_file(&path, node.as_deref())?))
+    }
+
+    /// Memory `?id=` whole, with its history.
+    fn memory_detail(&self, query: &str) -> Result<Vec<u8>> {
+        self.repo()?;
+        let id = query_value(query, "id")
+            .ok_or_else(|| Error::BadRequest("expected ?id=mem_...".to_owned()))?;
+        Ok(to_json(&self.memory.detail(MemoryId::parse(&id)?)?))
+    }
+
+    fn memory_refresh(&self) -> Result<Vec<u8>> {
+        self.repo()?;
+        Ok(to_json(&self.memory.refresh()?))
+    }
+
+    /// The reply to `POST /api/memory/draft` (docs/review-assist.md, "Postil writes memory"):
+    /// starts a draft run in the thread the note was sent in ([`Runner::draft`]), with the
+    /// settings' choice for the agent that ran its latest turn should a fresh one start; or,
+    /// when the note was never sent or its thread ended, the note's text alone, and no run.
+    fn memory_draft(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: DraftRequest = parse_body(body, Error::BadRequest)?;
+        let repo = self.repo()?;
+        let source = notes::draft_source(&repo, &request.note)?;
+        let runner = self.runner()?;
+        let tip = match &source.run {
+            Some(run) => runner.thread_tip(run)?,
+            None => None,
+        };
+        let Some(of) = tip else {
+            return Ok(to_json(&DraftReply::Fallback { body: source.body }));
+        };
+        let agent = self
+            .current_settings()
+            .chosen_agent(&runner.agent_of(&of)?)?;
+        let run = runner.draft(&of, agent, &source.quoted)?;
+        Ok(to_json(&DraftReply::Run {
+            run,
+            fallback: source.body,
+        }))
+    }
+
+    /// The reply to `POST /api/memory/remember`: the write, checked here and then queued for
+    /// the memory thread ([`Memory::remember`]), as far as it is known.
+    fn memory_remember(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: RememberRequest = parse_body(body, Error::BadRequest)?;
+        let repo = self.repo()?;
+        let job = request.into_job(&repo)?;
+        Ok(to_json(&self.memory.remember(job)?))
     }
 
     /// The replies to `/api/thread` and the routes under it, as [`Site::respond`] gives them:
@@ -1322,6 +1572,18 @@ impl Site {
             .ok_or(Error::NoProject)
     }
 
+    /// The reply to `GET /api/runs`: every run's id, and the live ones with their threads.
+    fn runs(&self) -> Result<Vec<u8>> {
+        let runner = self.runner()?;
+        let ids = runner.ids()?;
+        let live: Vec<_> = runner
+            .live()
+            .into_iter()
+            .map(|(id, thread)| serde_json::json!({ "id": id, "thread": thread }))
+            .collect();
+        Ok(to_json(&serde_json::json!({ "runs": ids, "live": live })))
+    }
+
     /// The reply to `GET /api/run`: with `?id=R2`, that run, else the latest run, or `null`
     /// when the project has none; either with its entries from number `?after=` on, without
     /// its notes and prompt unless that is 0.
@@ -1359,7 +1621,8 @@ impl Site {
             Some(name) => settings.chosen_agent(name)?,
             None => settings.default_agent()?,
         };
-        self.runner()?.send(agent, &request.notes)?;
+        self.runner()?
+            .send(agent, &request.notes, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1368,8 +1631,11 @@ impl Site {
     /// ask last (`Runner::ask`). The page fetches the run, as after a send.
     fn ask(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: AskRun = parse_body(body, Error::InvalidNote)?;
-        let agent = self.current_settings().default_agent()?;
-        let review = self.runner()?.ask(agent, request.note)?;
+        let settings = self.current_settings();
+        let agent = settings.default_agent()?;
+        let review = self
+            .runner()?
+            .ask(agent, request.note, settings.team_memory())?;
         Ok(to_json(&review))
     }
 
@@ -1386,7 +1652,8 @@ impl Site {
     /// The reply to `GET /api/run/preview?notes=N1,N2`.
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
-        let prompt = self.runner()?.preview(&ids)?;
+        let memory = self.current_settings().team_memory();
+        let prompt = self.runner()?.preview(&ids, memory)?;
         let uncommitted = self.uncommitted_among(&prompt.files)?;
         Ok(to_json(&PreviewView {
             prompt: prompt.text,
@@ -1444,7 +1711,8 @@ impl Site {
         // Loaded once, so every reviewer is checked against the same revision of the file.
         let settings = self.current_settings();
         let reviewers = settings.reviewer_choices()?;
-        self.runner()?.review(&review.of, reviewers)?;
+        self.runner()?
+            .review(&review.of, reviewers, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1454,10 +1722,9 @@ impl Site {
     fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
         let follow: FollowRun = parse_body(body, Error::BadRequest)?;
         let runner = self.runner()?;
-        let agent = self
-            .current_settings()
-            .chosen_agent(&runner.agent_of(&follow.of)?)?;
-        runner.follow_up(&follow.of, agent, &follow.text)?;
+        let settings = self.current_settings();
+        let agent = settings.chosen_agent(&runner.agent_of(&follow.of)?)?;
+        runner.follow_up(&follow.of, agent, &follow.text, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1531,6 +1798,7 @@ impl Site {
             file,
             first_run: loaded.first_run,
             agents,
+            memory: MemoryView::from(self.memory.status()),
             tools,
             font_sizes: [*settings::FONT_SIZES.start(), *settings::FONT_SIZES.end()],
             tab_widths: settings::TAB_WIDTHS,
@@ -1544,6 +1812,17 @@ impl Site {
         let file = self.settings_file.as_deref().ok_or(Error::NoHome)?;
         // Checked here, not by serde, for the same reason as `save_layout`.
         let settings = Settings::try_from(request.settings).map_err(Error::InvalidSettings)?;
+        // Only turning it on is refused, so a hippius-mem removed later does not block every
+        // other change. The state is the latest check's, never waited for: a check can take
+        // seconds, and the dialog offers the switch only once it is ready.
+        if settings.team_memory() == TeamMemory::On
+            && self.current_settings().team_memory() == TeamMemory::Off
+        {
+            let state = self.memory.status().state;
+            if let Some(problem) = memory::not_ready(state.as_ref()) {
+                return Err(Error::MemoryNotReady(problem));
+            }
+        }
         settings::save(file, &settings, &request.revision)?;
         Ok(self.settings())
     }
@@ -1761,6 +2040,7 @@ impl std::fmt::Debug for Site {
             .field("agents", &self.agents)
             .field("quotas", &self.quotas)
             .field("models", &self.models)
+            .field("memory", &self.memory)
             .finish_non_exhaustive()
     }
 }
@@ -1779,6 +2059,8 @@ impl Drop for Site {
         }
         // A model probe's agent would otherwise run on until its timeout.
         self.models.close();
+        // The memory server, a process of its own, would otherwise outlive the window.
+        self.memory.close();
     }
 }
 
@@ -1859,6 +2141,9 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::AnalysisRefused(_)
                 | Error::SettingsLocked(_)
                 | Error::SettingsChanged
+                | Error::MemoryNotReady(_)
+                | Error::MemorySetupRunning
+                | Error::MemoryBusy
                 | Error::TurnRunning
                 | Error::RunElsewhere
                 | Error::TooManyRuns { .. }
@@ -1897,6 +2182,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::Window(_)
                 | Error::Webview(_)
                 | Error::SpawnWorker(_)
+                | Error::StartMemory(_)
                 | Error::BenchInterrupted
                 | Error::ReadReview { .. }
                 | Error::ParseReview { .. }

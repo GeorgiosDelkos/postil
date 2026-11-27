@@ -744,6 +744,250 @@ test("Settings lists the models the agent reports and saves one per slot", async
   assert.equal(await model("reviewer-model-1").inputValue(), "deep");
 });
 
+test("Set up a trial vault shows what quickstart printed and turns team memory on", async (t) => {
+  const { page, api } = await openProject(t, "plain", "new-memory");
+  await page.locator("#open-settings").click();
+  const dialog = page.locator("#settings");
+
+  await dialog.getByText("Installed, not set up").waitFor();
+  await dialog.locator('[data-key="memory-setup"]').click();
+  // The set up takes half a second; the dialog asks again every 250 ms until it ends.
+  await dialog.locator(".memory-output").filter({ hasText: "Trial vault ready at" }).waitFor();
+  assert.equal(
+    await dialog.locator(".memory-output").textContent(),
+    "Trial vault ready at /tmp/postil-e2e-vault.",
+  );
+  await dialog.getByText("Ready", { exact: true }).waitFor();
+  const toggle = dialog.locator('[data-key="agent-memory"]');
+  await page.waitForFunction(
+    () => document.querySelector('[data-key="agent-memory"]')?.ariaChecked === "true",
+  );
+  assert.equal(await toggle.isDisabled(), false);
+  assert.equal((await api("api/settings")).settings.agentMemory, true);
+});
+
+test("the Memory tab recalls only while it shows, keeps the send bar hidden, and opens a memory", async (t) => {
+  const { page, api } = await openProject(t, "plain", "new-memory-server");
+  const recalls = [];
+  page.on("request", (request) => {
+    if (request.url().includes("api/memory/recall")) recalls.push(request.url());
+  });
+  // An open note puts the send bar on the Review tab.
+  await addNote(api, "check this");
+  await page.reload();
+  await page.locator("#send-bar").waitFor();
+
+  await openFile(page, "src/a.rs");
+  await openFile(page, "src/b.rs");
+  assert.deepEqual(recalls, [], "no recall while the Memory tab is closed");
+
+  await page.locator("#tab-memory").click();
+  assert.equal(await page.locator("#send-bar").isVisible(), false);
+  const cards = page.locator("#memory .memory-card");
+  await cards.first().waitFor();
+  assert.equal(recalls.length >= 1 && recalls[0].endsWith("path=src%2Fb.rs"), true, recalls.join());
+  assert.equal(await page.locator("#memory .memory-weak .memory-card").count(), 1);
+  assert.match(await page.locator("#memory .memory-weak").textContent(), /^Possibly related/);
+
+  // A file opened while the tab shows is recalled for.
+  const recalled = page.waitForRequest((request) => request.url().endsWith("path=src%2Fc.rs"));
+  await openFile(page, "src/c.rs");
+  await recalled;
+
+  await cards.filter({ hasText: "a.rs parses lazily" }).click();
+  const dialog = page.locator("#memory-dialog");
+  await dialog.locator(".run-message").filter({ hasText: "It is lazy." }).waitFor();
+  assert.equal(await dialog.locator(".run-message em").textContent(), "is");
+  await dialog.getByText("Edit · 5CrAuthor · anchored in the vault").waitFor();
+  await page.keyboard.press("Escape");
+
+  await page.locator("#tab-notes").click();
+  await page.locator("#send-bar").waitFor();
+});
+
+test("a run's dialog shows what the team recorded about its notes and changes", async (t) => {
+  const { page, api } = await openProject(t, "plain", "new-memory-server");
+  const note = await addNote(api, "Rename two.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  // Pending first, then the cards, the guess under "Possibly related".
+  const section = detail.locator(".note-dialog-section").filter({ hasText: /^Memory/ });
+  await section.locator(".memory-card").first().waitFor();
+  assert.equal(await section.locator(".memory-weak .memory-card").count(), 1);
+  await section.locator(".memory-card").filter({ hasText: "a.rs parses lazily" }).click();
+  await page.locator("#memory-dialog .run-message").filter({ hasText: "It is lazy." }).waitFor();
+});
+
+test("a finding shows the team memory it names, on its card and in the changes view", async (t) => {
+  // `review-memory` plays the author and both reviewers; the proposer names mem_01A, which the
+  // fake hippius-mem recalls, and mem_01NOTGIVEN, which no recall gave.
+  const { page, api } = await openProject(t, "review-memory", "new-memory-server");
+  // Team memory turns on only once hippius-mem's check found it ready.
+  const checked = Date.now() + WAIT;
+  while ((await api("api/settings")).memory?.state?.kind !== "ready") {
+    assert.ok(Date.now() < checked, "hippius-mem was not found ready");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const current = await api("api/settings");
+  const settings = {
+    ...current.settings,
+    reviewers: [{ name: "Fake" }, { name: "Fake" }],
+    agentMemory: true,
+  };
+  await api("api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ revision: current.revision, settings }),
+  });
+  const note = await addNote(api, "Rename two.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  // Until run `id` exists and has ended.
+  const ended = async (id) => {
+    const deadline = Date.now() + WAIT;
+    for (;;) {
+      const response = await fetch(new URL(`api/run?id=${id}`, page.url()));
+      if (response.ok && (await response.json()).status === "ended") return;
+      assert.ok(Date.now() < deadline, `${id} did not end`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+  await ended("R1");
+  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
+  await ended("R3");
+
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  const cited = detail.locator('.run-card-group [data-memory="mem_01A"]');
+  // The summary comes once the page read the memory.
+  await cited.filter({ hasText: /^mem_01A · a\.rs parses lazily$/ }).waitFor();
+  assert.equal(await detail.locator("[data-memory]").count(), 1, "an id not given is dropped");
+  await cited.click();
+  const memory = page.locator("#memory-dialog");
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+  await page.keyboard.press("Escape");
+  await memory.waitFor({ state: "hidden" });
+
+  await detail.getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  const flagged = changes.locator('.changes-finding [data-memory="mem_01A"]');
+  await flagged.filter({ hasText: /^mem_01A · a\.rs parses lazily$/ }).waitFor();
+  await flagged.click();
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+});
+
+test("a sent note's thread drafts the memory, and is free again once the draft ended", async (t) => {
+  const { page, api } = await openProject(t, "memory-draft", "new-memory-server");
+  const note = await addNote(api, "Keep src/a.rs to three lines.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  for (let tries = 0; (await api("api/run"))?.status !== "ended"; tries += 1) {
+    assert.ok(tries < 200, "the run did not end");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await page.locator("#tab-notes").click();
+  const card = page
+    .locator("#notes .note")
+    .filter({ has: page.locator(".note-id", { hasText: new RegExp(`^${note.id}$`) }) });
+  const noteDialog = page.locator("#note-dialog");
+  await card.click();
+  await noteDialog.locator(".note-dialog-remember:not(:disabled)").click();
+
+  // The agent's draft fills the form once its run ended.
+  const dialog = page.locator("#remember-dialog");
+  const summary = dialog.locator(".remember-summary");
+  await summary.waitFor();
+  assert.equal(await summary.inputValue(), "a.txt holds one line on purpose");
+  assert.equal(
+    await dialog.locator(".remember-body").inputValue(),
+    "The parser reads a.txt whole: keep it to one line.",
+  );
+  await dialog.locator(".remember-save").click();
+  await dialog.waitFor({ state: "hidden" });
+
+  // The draft ended: its thread is free, so Remember is offered again, beside the chip.
+  await card.click();
+  await noteDialog.locator(".remembered-chip").waitFor();
+  const remember = noteDialog.locator(".note-dialog-remember");
+  assert.equal(await remember.isDisabled(), false);
+  assert.notEqual(await remember.getAttribute("title"), "Wait for the run");
+});
+
+test("Remember waits for the thread's run, saves a note's text, and the note opens its memory", async (t) => {
+  // `hang`: the run never ends, so its thread stays busy for the whole test.
+  const { page, api } = await openProject(t, "hang", "new-memory-server");
+  const running = await addNote(api, "In the run.");
+  const unsent = await addNote(api, "Keep src/a.rs to three lines.");
+  // Not startRun: `hang` streams nothing, so waiting for its draws races the run's own status
+  // draws, which a slow machine has already made by the time Stop shows. Stop is enough here.
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [running.id] }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run-header .stop").waitFor();
+  await page.locator("#tab-notes").click();
+  const card = (id) =>
+    page
+      .locator("#notes .note")
+      .filter({ has: page.locator(".note-id", { hasText: new RegExp(`^${id}$`) }) });
+  const noteDialog = page.locator("#note-dialog");
+
+  // The thread's run is under way: its agent would get the draft.
+  await card(running.id).click();
+  const disabled = noteDialog.locator(".note-dialog-remember");
+  await disabled.waitFor();
+  assert.equal(await disabled.isDisabled(), true);
+  assert.equal(await disabled.getAttribute("title"), "Wait for the run");
+  await page.keyboard.press("Escape");
+
+  // Never sent: no draft run, the dialog opens with the note's text.
+  await card(unsent.id).click();
+  await noteDialog.locator(".note-dialog-remember").click();
+  const dialog = page.locator("#remember-dialog");
+  const body = dialog.locator(".remember-body");
+  await body.waitFor();
+  assert.equal(await body.inputValue(), "Keep src/a.rs to three lines.");
+  await dialog.locator(".remember-summary").fill("src/a.rs holds three lines");
+
+  // A duplicate opens over the draft, and Escape closes it back to the draft as it was.
+  const duplicate = dialog
+    .locator(".remember-check .memory-card")
+    .filter({ has: page.locator(".note-body", { hasText: /^a\.rs parses lazily$/ }) });
+  await duplicate.click();
+  const memory = page.locator("#memory-dialog");
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+  await page.keyboard.press("Escape");
+  await memory.waitFor({ state: "hidden" });
+  assert.equal(await dialog.isVisible(), true);
+  assert.equal(
+    await dialog.locator(".remember-summary").inputValue(),
+    "src/a.rs holds three lines",
+  );
+
+  await dialog.locator(".remember-save").click();
+  await dialog.waitFor({ state: "hidden" });
+  const saved = (await api("api/notes")).notes.find((note) => note.id === unsent.id);
+  assert.equal(saved.memory, "mem_01SAVED");
+
+  // The note shows it was remembered, and opens the memory.
+  await card(unsent.id).click();
+  const chip = noteDialog.locator(".remembered-chip");
+  await chip.waitFor();
+  assert.equal(await chip.textContent(), "Remembered");
+  await chip.click();
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+});
+
 // The longest name a custom agent may have (MAX_NAME in src/settings.rs).
 const LONG_NAME = "An agent whose name runs to forty chars!";
 
@@ -794,6 +1038,11 @@ async function settlesAt(dialog, selector, value) {
 // model cells have one width and their buttons one x, every card fits in the dialog, the long
 // name is cut to its column with a tooltip, and a long model name shows whole.
 async function assertSlotsAligned(dialog, keys) {
+  // The agents' model lists arrive after the dialog opens, and each redraws the slots: measured
+  // before the last one, a card can be replaced mid-check or a name not yet cut. The `long`
+  // option comes with that last list.
+  const select = dialog.locator('[data-key="reviewer-model-1"]');
+  await select.locator('option[value="long"]').waitFor({ state: "attached" });
   // The dialog comes in with a short animation, which moves every box while it runs.
   await dialog.evaluate((node) =>
     Promise.all(node.getAnimations({ subtree: true }).map((animation) => animation.finished)),
@@ -829,8 +1078,6 @@ async function assertSlotsAligned(dialog, keys) {
 
   // A model name as long as real ones shows whole, not cut with an ellipsis. The reviewers'
   // model cells are one width, so one stands for both; the send-to row's is wider.
-  const select = dialog.locator('[data-key="reviewer-model-1"]');
-  await select.locator('option[value="long"]').waitFor({ state: "attached" });
   await select.selectOption("long");
   const text = select.locator("xpath=..").locator(".picker-text");
   await text.filter({ hasText: "OpenCode/Nemotron 3.5 Super VL Free" }).waitFor();
@@ -997,6 +1244,26 @@ test("Skip on the first run saves the defaults with the installed agents turned 
   assert.deepEqual(saved.settings.enabledAgents, ["Gemini"]);
   assert.deepEqual(saved.settings.agent, { name: "Gemini", model: null });
   assert.equal(saved.settings.theme, "system");
+});
+
+test("Skip on the first run turns team memory on only when hippius-mem is ready", async (t) => {
+  for (const memory of ["ready", "unconfigured"]) {
+    const body = JSON.stringify({ memory });
+    const created = await fetch(new URL("new-fresh-memory", bridge), { method: "POST", body });
+    const site = new URL((await created.json()).base, bridge);
+    const page = await browser.newPage();
+    t.after(() => page.close());
+    page.setDefaultTimeout(WAIT);
+    await page.addInitScript(init);
+    await page.goto(site.href);
+
+    const wizard = page.locator("#wizard");
+    await wizard.getByRole("button", { name: "Skip" }).click();
+    await wizard.waitFor({ state: "hidden" });
+    const saved = await (await fetch(new URL("api/settings", site))).json();
+    assert.equal(saved.firstRun, false, memory);
+    assert.equal(saved.settings.agentMemory, memory === "ready", memory);
+  }
 });
 
 test("a wizard whose save is refused starts over from the file another window wrote", async (t) => {
@@ -2476,4 +2743,36 @@ test("Change map waits for an Architecture, marks what the run touched at its fo
   await map.locator(".map-change-exit").click();
   await map.locator(".map-change-label").waitFor({ state: "detached" });
   assert.equal(await map.locator(".map-node.touched, .map-node.near").count(), 0);
+});
+
+test("a hunk a change map node opened stays whole when the changes are drawn again", async (t) => {
+  // The run cuts big.txt from 300 lines to its own 150, none in common: one hunk of 450 lines,
+  // past the 400 a step draws before "Show the other lines" (ui/changes-view.js).
+  const files = { ...CHANGE_FILES, "big.txt": numbered("b", 300) };
+  const { page, api } = await openProject(t, "change-map", "new", { files });
+  const request = { path: "lib.txt", lines: { start: 1, end: 1 }, snippet: "l1", body: "Do it." };
+  const review = await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  const notes = review.notes.map((note) => note.id);
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  await detail.locator(".run-check code", { hasText: /^cargo test$/ }).waitFor();
+  await writeAnalysis(api, CHANGE_ANALYSIS);
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await detail.locator(".run-detail-change-map:enabled").click();
+  await page.locator('#map .map-node.touched[data-node-id="D1.4"]').click();
+
+  const changes = page.locator("#changes-view");
+  const big = changes.locator('.changes-hunk-block[data-path="big.txt"]');
+  const whole = async () => {
+    await big.locator(".changes-line").nth(449).waitFor();
+    assert.equal(await changes.locator(".changes-more").count(), 0, "nothing left to show");
+  };
+  await whole();
+
+  // Another order draws the changes again, without the click's scroll: the hunk stays whole.
+  await page.locator('[data-key="changes-risk-eyes"]').click();
+  await page.locator('[data-key="changes-risk-eyes"][aria-checked="true"]').waitFor();
+  await whole();
 });

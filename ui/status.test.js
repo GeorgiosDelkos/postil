@@ -398,6 +398,43 @@ test("a judge writing its line changes the verdict's word only for the run dialo
   assert.notEqual(noteKey(more), noteKey(writing), "the note dialog shows the judge's line");
 });
 
+test("a review keeps each finding's team memory and says once why it had none", () => {
+  const finding = (id, memory) => ({
+    id,
+    note: null,
+    path: null,
+    line: null,
+    text: id,
+    fix: null,
+    memory,
+  });
+  const stage = (id, reviewer, memoryNotice, findings) => ({
+    ...streaming(id, "ended", [{ kind: "findings", findings, problem: null }], {
+      review: { of: "R1", reviewer, reviewers: 3 },
+    }),
+    memoryNotice,
+  });
+  const notice = "team memory could not be checked: hippius-mem is not installed on PATH";
+  const review = reviewOf("R1", [
+    stage("R2", 1, notice, [finding("F1", "mem_01A")]),
+    stage("R3", 2, notice, [finding("F2", undefined)]),
+    stage("R4", 3, null, []),
+  ]);
+  assert.deepEqual(
+    review.findings.map((item) => item.memory),
+    ["mem_01A", undefined],
+  );
+  assert.deepEqual(review.notices, [notice], "each notice once");
+  assert.deepEqual(reviewOf("R1", [stage("R2", 1, null, [])]).notices, []);
+
+  // A memory that arrives, or a notice, draws the dialogs again.
+  const without = reviewOf("R1", [stage("R2", 1, null, [finding("F1", undefined)])]);
+  const named = reviewOf("R1", [stage("R2", 1, null, [finding("F1", "mem_01A")])]);
+  const noticed = reviewOf("R1", [stage("R2", 1, notice, [finding("F1", undefined)])]);
+  assert.notDeepEqual(reviewKey(named), reviewKey(without));
+  assert.notDeepEqual(reviewKey(noticed), reviewKey(without));
+});
+
 test("the run dialog keeps its key while the agent streams its reply and thoughts", () => {
   const thought = (text) => ({ kind: "thought", text });
   const edit = tool("t1", "edit", "a.rs", [], "in_progress");
@@ -431,6 +468,27 @@ test("an undone edit redraws the run dialog with its notice", () => {
     streaming("R1", "running", [...start, { kind: "undone", text }], { problem: text }),
   ]);
   assert.notEqual(undone, drawn);
+});
+
+test("a run that started without team memory redraws its dialogs with the notice", () => {
+  // The server sets `memoryNotice` as the agent starts (src/run.rs, `Runner::start`), with no
+  // entry of its own: only the key shows it changed.
+  const notice = {
+    memoryNotice: "team memory was not given: hippius-mem is not installed on PATH",
+  };
+  const start = [said("Done")];
+  assert.notEqual(
+    threadKey([streaming("R1", "running", start, notice)]),
+    threadKey([streaming("R1", "running", start)]),
+    "the run dialog",
+  );
+  const note = sent("N1", "R1");
+  const shown = [false, "Claude", [], true];
+  assert.notEqual(
+    noteDialogKey(note, streaming("R1", "running", start, notice), null, shown),
+    noteDialogKey(note, streaming("R1", "running", start), null, shown),
+    "the note's dialog",
+  );
 });
 
 test("an analysis run's dialog redraws for what it was asked and for why nothing was stored", () => {

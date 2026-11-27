@@ -309,6 +309,13 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     return post("api/run/cancel", { run: id }).catch((error) => onError(error.message));
   }
 
+  // A run started that never becomes the latest (a memory draft, src/run.rs `Runner::draft`):
+  // the list is read again at once, so its thread shows busy before the run sends a nudge.
+  function started() {
+    listStale = true;
+    return sync();
+  }
+
   // This window's live runs, oldest first.
   function liveRuns() {
     const live = [...liveViews.values()];
@@ -347,6 +354,11 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     track,
     // The thread live run `id` works in, by its first run's id; undefined for a run not live.
     liveThread: (id) => liveThreads.get(id),
+    // Whether a run of the thread that starts at run `root` is under way in this window.
+    // From the live runs followed, as the run dialog's `liveOf` does: `liveThreads` keeps an ended
+    // run until the list is read again, which a run that is never the latest does not cause.
+    threadLive: (root) => liveRuns().some((view) => liveThreads.get(view.id) === root),
+    started,
     startReview,
     thread,
     endThread,

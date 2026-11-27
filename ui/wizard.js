@@ -29,6 +29,16 @@ export function applyDetectedDefaults(draft, agents) {
   };
 }
 
+// A first run's team memory: on when hippius-mem is ready (`memory`, the `memory` of
+// api/settings), off otherwise: on by default once ready. The wizard has no switch for it, so
+// nothing the user chose is undone; the settings dialog turns it off. Applied as the save goes
+// out (wizard-dialog.js, `commit`), so it follows the state of that moment.
+export function applyMemoryDefault(draft, memory) {
+  const agentMemory = memory?.state?.kind === "ready";
+  if (draft.agentMemory === agentMemory) return draft;
+  return { ...draft, agentMemory };
+}
+
 // Turns an agent on or off inside the wizard's draft. Unlike the Settings dialog (which refuses
 // turning off an agent that is chosen as the default or a reviewer), the wizard reconciles the
 // draft automatically: turning off the default moves it to the next enabled agent (or null) and

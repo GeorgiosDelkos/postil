@@ -19,8 +19,8 @@ import { foldRun, isLive, openPermission, permissionKey, permissionKeys } from "
 // by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
 // file in the code pane; `reviewers()` names the settings' reviewers, in order;
 // `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
-// `changeMapState()` and `showChangeMap(from, to)` offer and show what they touched on the map
-// (run-dialog.js).
+// `openMemory(id)` opens a team memory's dialog; `changeMapState()` and `showChangeMap(from,
+// to)` offer and show what they touched on the map (run-dialog.js).
 export function runPanel({
   panelEl,
   headerEl,
@@ -34,6 +34,7 @@ export function runPanel({
   openFile,
   reviewers,
   showChanges,
+  openMemory,
   changeMapState,
   showChangeMap,
 }) {
@@ -47,6 +48,7 @@ export function runPanel({
     openFile,
     reviewers,
     showChanges,
+    openMemory,
     changeMapState,
     showChangeMap,
     onError,
@@ -91,6 +93,11 @@ export function runPanel({
     // Whether this window runs as many as a repository may: a send would be refused.
     full: () => store.liveRuns().length >= MAX_LIVE,
     busyThread: dialog.busyThread,
+    // Whether a run of the thread that starts at run `root` is under way, a memory draft
+    // included, which the Run tab does not list.
+    threadLive: store.threadLive,
+    // A memory draft started: its thread is busy from now on.
+    started: store.started,
     // Opens the dialog of run `id`'s thread.
     openRun: (id) => dialog.open({ kind: "run", id }),
     // Draws the open dialog again when what it shows changed: an analysis read since changes

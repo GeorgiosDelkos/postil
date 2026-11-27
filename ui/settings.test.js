@@ -7,6 +7,8 @@ import {
   agentState,
   codeMetrics,
   formatSlot,
+  canSetUp,
+  memoryState,
   moveReviewer,
   removeCustomAgent,
   removeReviewer,
@@ -15,6 +17,7 @@ import {
   setAgentModel,
   setAnalyzer,
   setAnalyzerModel,
+  setAgentMemory,
   setEnabled,
   setReviewerModel,
 } from "./settings.js";
@@ -38,6 +41,7 @@ function settings() {
       { name: "Grok", model: "grok-4.7" },
       { name: "Grok", model: null },
     ],
+    agentMemory: false,
   };
 }
 
@@ -260,4 +264,40 @@ test("reviewers are removed by position and moved within the list's ends", () =>
   assert.deepEqual(names(moveReviewer(three, 0, 1).settings.reviewers), ["Grok", "Grok", "Claude"]);
   assert.equal(moveReviewer(three, 0, -1).settings, three, "the first cannot move up");
   assert.equal(moveReviewer(three, 2, 1).settings, three, "the last cannot move down");
+});
+
+test("team memory turns on only when hippius-mem is ready, and off in any state", () => {
+  const ready = { kind: "ready", path: "/bin/hippius-mem" };
+  const unconfigured = { kind: "unconfigured", path: "/bin/hippius-mem", problem: null };
+  assert.equal(setAgentMemory(settings(), true, ready).settings.agentMemory, true);
+  for (const state of [unconfigured, { kind: "missing" }, null]) {
+    assert.match(setAgentMemory(settings(), true, state).error, /Set up hippius-mem/);
+    const on = { ...settings(), agentMemory: true };
+    assert.equal(setAgentMemory(on, false, state).settings.agentMemory, false);
+  }
+});
+
+test("hippius-mem's mark says missing only while team memory is on", () => {
+  const at = (state, on = false) => memoryState({ state }, on).kind;
+  assert.equal(at(null), "unchecked");
+  assert.equal(at({ kind: "ready", path: "/p" }), "installed");
+  assert.equal(at({ kind: "unconfigured", path: "/p", problem: null }), "unchecked");
+  assert.equal(at({ kind: "missing" }), "absent");
+  assert.equal(at({ kind: "missing" }, true), "missing");
+});
+
+test("Set up is offered only when doctor found no configuration, whatever its exit code", () => {
+  const unconfigured = (problem) => ({ kind: "unconfigured", path: "/p", problem });
+  const noConfig =
+    "Error: failed to load configuration; run `hippius-mem quickstart` to set up a trial vault";
+  const probeFailed = "INFO profile: team\nError: live encryption-boundary probe failed";
+  assert.equal(canSetUp(unconfigured(null)), true);
+  assert.equal(canSetUp(unconfigured(noConfig)), true);
+  // A configured vault whose check failed: quickstart would only refuse.
+  assert.equal(canSetUp(unconfigured(probeFailed)), false);
+  assert.equal(canSetUp(unconfigured("hippius-mem doctor did not answer within 10 s")), false);
+  assert.equal(memoryState({ state: unconfigured(probeFailed) }, false).kind, "missing");
+  for (const state of [null, { kind: "missing" }, { kind: "ready", path: "/p" }]) {
+    assert.equal(canSetUp(state), false);
+  }
 });

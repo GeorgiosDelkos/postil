@@ -1619,6 +1619,23 @@ button.repo-name:hover {
   opacity: var(--disabled-opacity);
 }
 
+/* What the last hippius-mem set up printed, as it printed it: its lines name the paths. */
+.memory-output {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: 11px var(--font-mono);
+  color: var(--text);
+}
+
+.memory-output.failed {
+  border-color: var(--note);
+}
+
 .agent-command {
   overflow: hidden;
   white-space: nowrap;
@@ -3579,6 +3596,42 @@ body.resizing * {
   color: var(--text-muted);
 }
 
+/* A finding that names a team memory: its card, then the memory's button under it. Two
+   buttons side by side in a group, never one in the other. */
+.run-card-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* The team memory a finding names: its id and summary, which opens the memory. */
+.finding-memory {
+  align-self: flex-start;
+  max-width: 100%;
+  margin-top: 4px;
+  padding: 2px 8px;
+  overflow: hidden;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.finding-memory:hover,
+.finding-memory:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.run-card-group .finding-memory {
+  margin: 0 0 0 10px;
+}
+
 /* A run's follow-up box, at the end of its dialog. */
 .follow-up {
   display: flex;
@@ -4421,6 +4474,98 @@ body.focus-mode .code {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* Team memory: the tray's Memory tab and a memory's dialog (memory-tab.js, memory-dialog.js) */
+
+.memory-header {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.memory-header .button {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.memory-status {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Guesses: shown, dimmed, under their own label. */
+.memory-weak {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  opacity: 0.6;
+}
+
+.memory-group-label {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.memory-history {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 19px;
+  color: var(--text-soft);
+}
+
+/* The Remember dialog (memory-dialog.js, `rememberDialog`): a team memory drafted from a
+   note, edited and saved by the engineer. */
+.remember-check {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remember-fields {
+  display: flex;
+  gap: 16px;
+}
+
+.remember-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.remember-body {
+  min-height: 140px;
+  padding: 8px 10px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.remember-count {
+  font-family: var(--font-mono);
+}
+
+.remember-count.failed {
+  color: var(--removed);
+}
+
+/* On a note remembered: opens the memory. */
+.remembered-chip {
+  height: 22px;
+  margin-left: auto;
+  margin-right: 6px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 /* The map (docs/review-assist.md, "What the engineer sees"; ui/diagram-view.js): the diagrams

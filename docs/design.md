@@ -180,6 +180,8 @@ schedule three tasks.
 | `src/layout.rs`, `ui/panes.js` | The pane widths (the file list, the tray, the map), `~/.config/postil/layout.json`, and the rules for dragging and fitting them. |
 | `src/settings.rs` | The settings, `~/.config/postil/settings.json`, and their rules. |
 | `src/agents.rs` | The agent catalog, the login shell's `PATH`, and finding installed agents. |
+| `src/memory.rs`, `src/memory/client.rs` | Team memory: finding hippius-mem, `doctor` and the trial vault's set up, on threads of their own; the MCP client of its server, which the thread named `memory` alone calls. |
+| `ui/memory.js`, `ui/memory-tab.js`, `ui/memory-dialog.js` | Team memory on the page: its rules and polling, the tray's Memory tab and the run dialog's Memory section, and a memory's dialog. |
 | `src/files.rs` | Atomic file writes and the configuration directory. |
 | `src/dialog.rs` | The native Open Folder dialog (`NSOpenPanel` through objc2, no new crates). |
 | `src/menu.rs` | The macOS menu bar through `muda`; its commands run in the page. |
@@ -217,6 +219,7 @@ struct Note {
     anchor: Anchor,                // Whether the target is still there.
     state: NoteState,              // Where the note is in the loop. From milestone 3 on.
     intent: Intent,                // Change, or Ask: a question answered read-only. Version 5 on.
+    memory: Option<MemoryId>,      // The team memory remembered from it. Version 6 on.
 }
 
 enum Target {
@@ -293,6 +296,10 @@ As built in milestone 2 (`src/notes.rs`):
   reads with every note a change. `POST /api/notes` makes change notes only: an ask is made by
   `POST /api/run/ask`, which saves it only once its run starts, and a send or a preview that
   names one is refused (400). See `docs/review-assist.md`, "Ask without changing".
+- **Version 6** adds `memory`: the id of the team memory remembered from the note
+  (`mem_` and digits or capital letters, checked on every read), written only on a note that
+  has one. An older file reads with none. Deleting the note leaves the memory. See
+  `docs/review-assist.md`, "Postil writes memory".
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
@@ -340,7 +347,7 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 | Direction | Method | Used for |
 |---|---|---|
 | app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false, and form questions (`elicitation.form`). |
-| app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
+| app to agent | `session/new` | `cwd` is the run's worktree. `mcpServers` holds hippius-mem in the stdio form when team memory is on and Ready, else it is empty; an agent that refuses the server is asked once more with none (docs/review-assist.md, "Agents get it"). The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
 | app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn; its `usage` token counts, when sent, go to the usage ledger. |
 | app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`, every open question `cancel`. |
 | agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, and `usage_update` (context fill and the session's cumulative cost, for the usage ledger, never shown in the run panel). Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |
@@ -475,7 +482,13 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   (docs/review-assist.md, "An analysis run"), which carries no notes and is read-only, and the
   `noAnalysis` entry, logged with the end of one whose turn ended well and stored nothing,
   which becomes its problem. An analysis run's log is kept when notes are deleted: its
-  diagrams name it. Older logs read as no analysis.
+  diagrams name it. Older logs read as no analysis. Run log version 9 adds `remember: {of}`
+  to the header of a memory draft (docs/review-assist.md, "Postil writes memory"): a read-only
+  run in the thread whose latest turn is `of`, whatever the thread's mode, never the latest run
+  of the Run tab, whose reply ends with the draft. Older logs read as no draft. Run log version
+  10 adds `memory` to a finding of the `findings` entry: the id of the team memory the finding
+  names, one the review's memory block held (docs/review-assist.md, "Review checks against
+  memory"), and absent otherwise. Older logs read as findings that name no memory.
 - **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
   first update, a permission request, or a stop. A run that fails to start, or whose prompt
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
@@ -546,6 +559,10 @@ owner on 2026-11-23:
   of notes; a run's dialog has a Review section with a card per reviewer (it opens that
   reviewer's run) and a card per finding with its verdict (it opens the finding whole), and a
   note's dialog shows the findings about that note, in full.
+- **With team memory on, every stage checks the work against it.** The first stage's start
+  recalls memories for the reviewed run's prompt and changed paths, and every stage's prompt
+  carries them as reference data written by teammates; a finding may name one, which its card
+  opens (docs/review-assist.md, "Review checks against memory").
 
 ### Follow-ups
 
@@ -1037,16 +1054,18 @@ authentication, the run panel says which command to run in a terminal.
 button at the foot of the sidebar, `Cmd-,`, or Postil > Settings. Every change saves at once. The
 settings are the theme (system, light, dark), the code font size (11 to 20 px; the line
 height keeps the 22:13 proportion), the tab width (2, 4, 8), whether a start without a folder
-reopens the last project, and the agents above.
+reopens the last project, the agents above, and whether agents get team memory
+(`agentMemory`, docs/review-assist.md, "Milestone 9: team memory").
 
-The file is format version 3: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
+The file is format version 4: `agent` is a slot, `{"name": "Claude", "model": "opus"}` (`model`
 `null` for the agent's default), `analyzer` a slot or `null` (analyses then go to `agent`, on
-its model), and `reviewers` a list of slots. Each names an enabled agent, so an agent in use
-cannot be turned off or removed. A version 2 file has no `analyzer`; a version 1 file, where the
-agent and reviewers are plain names, is read as slots with no model. The next save writes
-version 3; an older Postil then reads the file as one from a newer Postil and leaves it alone.
-A model id is 1 to 200 characters with no space at either end and no control character;
-whether the agent offers it is checked when a run starts (section "Runs").
+its model), `reviewers` a list of slots, and `agentMemory` a boolean, off by default. Each slot
+names an enabled agent, so an agent in use cannot be turned off or removed. A version 3 file has
+no `agentMemory` and reads with it off; a version 2 file has no `analyzer` either; a version 1
+file, where the agent and reviewers are plain names, is read as slots with no model. The next
+save writes version 4; an older Postil then reads the file as one from a newer Postil and
+leaves it alone. A model id is 1 to 200 characters with no space at either end and no control
+character; whether the agent offers it is checked when a run starts (section "Runs").
 
 The theme is set on the window, and WebKit answers the page's `prefers-color-scheme` from the
 window, so `app.css` keeps its two palettes and nothing else. The file is the engineer's own:
@@ -1063,7 +1082,7 @@ through installed agents, the default agent and optional reviewers with their mo
 appearance (with a live code preview) and startup behavior, and a readiness summary (`git`,
 `npx`, `gh`). It is drawn as the main window's panes are (section "Look and feel"). Completing or
 skipping the wizard writes `settings.json` in one save (Skip writes the defaults with the
-installed built-in agents turned on); closing it mid-way reverts any preview without writing the
+installed built-in agents turned on, and team memory when hippius-mem is ready); closing it mid-way reverts any preview without writing the
 file. The wizard's save names a revision like the dialog's, and when the file changes under it
 (another window, the settings dialog) its draft starts over from the file as it now is. The wizard can be run again any time from Postil > Setup Wizard… or
 from Settings.
