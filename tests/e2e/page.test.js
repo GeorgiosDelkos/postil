@@ -657,6 +657,13 @@ test("the quota strip shows one bar per agent, the bars in one column", async (t
   // The e2e site has no built-in agents installed, so their quotas are put into its reply.
   const quota = (...windows) => ({ status: "ok", windows });
   const agents = [
+    // Credits only, as Codex can report: no window, so no bar. Its value is three times as
+    // wide as a percentage, so a layout that let it widen the value column would leave a gap
+    // after each bar and squeeze or cut the names.
+    [
+      "Codex",
+      { status: "ok", windows: [], credits: { used: 1234.5, limit: 5000, currency: "USD" } },
+    ],
     ["Claude", quota({ label: "7-day all models", shortLabel: "wk", usedPercent: 93 })],
     [
       "Antigravity",
@@ -676,15 +683,32 @@ test("the quota strip shows one bar per agent, the bars in one column", async (t
   await strip.waitFor();
 
   assert.deepEqual(await strip.locator(".quota-strip-text").allTextContents(), [
+    "$1234.50 / $5000.00",
     "wk 93%",
     "wk 58%",
     "wk 19%",
   ]);
+  const codex = strip.locator(".quota-strip-row").filter({ hasText: "Codex" });
+  assert.equal(await codex.locator(".quota-strip-bar").count(), 0, "a credits row has no bar");
   const bars = await Promise.all(
     (await strip.locator(".quota-strip-bar").all()).map((bar) => bar.boundingBox()),
   );
   assert.equal(bars.length, 3);
   for (const bar of bars) assert.deepEqual([bar.x, bar.width], [bars[0].x, bars[0].width]);
+  // The values beside the bars keep a column as wide as the widest of them: the credits value
+  // does not widen it and leave a gap between each bar and its value.
+  const slack = await strip.evaluate((s) => {
+    const cells = [
+      ...s.querySelectorAll(".quota-strip-row:has(.quota-strip-bar) .quota-strip-text"),
+    ];
+    const range = document.createRange();
+    const widths = cells.map((cell) => {
+      range.selectNodeContents(cell);
+      return range.getBoundingClientRect().width;
+    });
+    return cells[0].getBoundingClientRect().width - Math.max(...widths);
+  });
+  assert.ok(slack < 1, `the values' column is ${slack} px wider than its widest value`);
   const cut = await strip
     .locator(".quota-strip-name")
     .evaluateAll((names) => names.filter((n) => n.scrollWidth > n.clientWidth).length);

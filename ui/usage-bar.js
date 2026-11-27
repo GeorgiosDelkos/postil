@@ -116,19 +116,25 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
       return;
     }
 
-    // Each row's three cells are cells of the strip's grid, so the bars and the values line up
-    // in columns whatever the names; an agent with credits only keeps an empty bar cell.
+    // Each row's cells are cells of the strip's grid, so the bars and the values line up in
+    // columns whatever the names. An agent with credits only has no bar, and its row is a flex
+    // row across the whole grid instead: a value placed in the grid's columns, even one spanning
+    // the bar column, widens the value column for every row and squeezes every name.
     const rows = active.map((agent) => {
-      const row = el("div", "quota-strip-row");
+      const tightest = tightestQuotaWindow(agent.quota);
+      const row = el("div", tightest ? "quota-strip-row" : "quota-strip-row is-credits");
       const left = el("span", "quota-strip-agent");
       const logo = agentLogoIcon(agent.name);
       if (logo) left.append(logo);
       left.append(el("span", "quota-strip-name", agent.name));
+      row.append(left);
 
-      const bar = el("span", "quota-strip-bar");
-      const tightest = tightestQuotaWindow(agent.quota);
-      if (tightest) bar.append(meter(tightest));
-      row.append(left, bar, el("span", "quota-strip-text", tightestQuotaText(agent.quota)));
+      if (tightest) {
+        const bar = el("span", "quota-strip-bar");
+        bar.append(meter(tightest));
+        row.append(bar);
+      }
+      row.append(el("span", "quota-strip-text", tightestQuotaText(agent.quota)));
       return row;
     });
 

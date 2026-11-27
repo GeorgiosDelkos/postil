@@ -4270,6 +4270,16 @@ body.focus-mode .code {
   white-space: nowrap;
 }
 
+/* Crosses the minmax(0, 1fr) name column, so the grid gives its width to no track. */
+.quota-strip-row.is-credits {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
 .quota-popover {
   position: fixed;
   z-index: 12;
