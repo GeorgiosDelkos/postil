@@ -200,8 +200,18 @@ test("mergeUsageView preserves agents across rescans, refreshes, and transient e
     scanning: false,
     polling: true,
     agents: [
-      { name: "Claude", builtIn: true, found: "/bin/claude", quota: { status: "loading", windows: [] } },
-      { name: "Codex", builtIn: true, found: "/bin/codex", quota: { status: "error", message: "timeout", windows: [] } },
+      {
+        name: "Claude",
+        builtIn: true,
+        found: "/bin/claude",
+        quota: { status: "loading", windows: [] },
+      },
+      {
+        name: "Codex",
+        builtIn: true,
+        found: "/bin/codex",
+        quota: { status: "error", message: "timeout", windows: [] },
+      },
     ],
   });
   assert.equal(refreshing.agents[0].quota.status, "loading");
@@ -216,12 +226,22 @@ test("mergeUsageView preserves agents across rescans, refreshes, and transient e
     scanning: false,
     polling: false,
     agents: [
-      { name: "Claude", builtIn: true, found: "/bin/claude", quota: { status: "unavailable", message: "Session expired", windows: [] } },
+      {
+        name: "Claude",
+        builtIn: true,
+        found: "/bin/claude",
+        quota: { status: "unavailable", message: "Session expired", windows: [] },
+      },
       {
         name: "Codex",
         builtIn: true,
         found: "/bin/codex",
-        quota: { status: "ok", plan: "Plus", windows: [{ label: "5-hour window", shortLabel: "5h", usedPercent: 20 }], fetchedAt: 2000 },
+        quota: {
+          status: "ok",
+          plan: "Plus",
+          windows: [{ label: "5-hour window", shortLabel: "5h", usedPercent: 20 }],
+          fetchedAt: 2000,
+        },
       },
     ],
   });

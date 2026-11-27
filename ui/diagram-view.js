@@ -55,8 +55,8 @@ const CHANGE_UNMAPPED_SHOWN = 20;
 // The kinds a diagram is, as the switcher names them.
 const KINDS = [
   ["architecture", "Architecture"],
-  ["flow", "Flows"],
-  ["data", "Data"],
+  ["user_flow", "User Flow"],
+  ["flow", "Traces"],
 ];
 
 // `mapEl` is the map's pane and `dialogEl` the node's `<dialog>`. `runs` is the run panel
@@ -178,7 +178,7 @@ export function diagramView({
   const flowInput = el("input", "field map-flow-question");
   flowInput.type = "text";
   flowInput.placeholder = "Trace: how is a note sent?";
-  flowInput.setAttribute("aria-label", "A flow to trace");
+  flowInput.setAttribute("aria-label", "A behavior to trace");
   const flowTrace = el("button", "button map-flow-trace", "Trace");
   flowTrace.type = "submit";
   const flowDictation = attachDictation(flowInput);
@@ -535,7 +535,7 @@ export function diagramView({
     open.addEventListener("click", () => openDiagram(flow.id));
     const remove = el("button", "map-flow-delete", "×");
     remove.type = "button";
-    remove.setAttribute("aria-label", `Delete the flow ${flow.title}`);
+    remove.setAttribute("aria-label", `Delete the trace ${flow.title}`);
     actOnSecondClick(remove, {
       area: row,
       arm: () => {
@@ -740,7 +740,7 @@ export function diagramView({
         el(
           "p",
           "",
-          `Analyze has ${analyzer} read the last commit (HEAD), read-only, and draw the top-level Architecture and Data diagrams again, in place of those there are.`,
+          `Analyze has ${analyzer} read the last commit (HEAD), read-only, and draw the high-level Architecture and User Flow diagrams again, in place of those there are.`,
         ),
       );
     } else {
@@ -749,7 +749,7 @@ export function diagramView({
         el(
           "p",
           "",
-          `${analyzer} reads the last commit (HEAD), read-only, and draws its parts and how they connect.`,
+          `${analyzer} reads the last commit (HEAD), read-only, and draws its systems architecture and end-to-end user flow.`,
         ),
       );
     }
@@ -766,12 +766,12 @@ export function diagramView({
     return card;
   }
 
-  // Flows, with none yet: the box above asks for one.
+  // Traces, with none yet: the box above asks for one.
   function noFlowCard() {
     const card = el("div", "map-card map-empty");
     card.append(
       emptyGlyph(),
-      el("h2", "map-empty-title", "No flow yet"),
+      el("h2", "map-empty-title", "No trace yet"),
       el(
         "p",
         "",
@@ -1194,7 +1194,10 @@ export function diagramView({
     const d = edgePath(points);
     line.append(svgEl("path", "map-edge-line", { d, "marker-end": "url(#map-arrow)" }));
     if (edge.label) {
-      const middle = points[Math.floor(points.length / 2)];
+      const middle =
+        points.length === 2
+          ? { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 }
+          : points[Math.floor(points.length / 2)];
       line.append(svgText("map-edge-label", middle.x, middle.y - 5, shorten(edge.label, 28)));
     }
     return line;
@@ -1362,12 +1365,7 @@ export function diagramView({
   // A drag on the background pans; one that starts on a card or zoom control leaves the click to it.
   let panning = null;
   body.addEventListener("pointerdown", (event) => {
-    if (
-      !drawn ||
-      event.button !== 0 ||
-      event.target.closest("[data-node-id], .map-zoom")
-    )
-      return;
+    if (!drawn || event.button !== 0 || event.target.closest("[data-node-id], .map-zoom")) return;
     stopGlide();
     body.setPointerCapture(event.pointerId);
     panning = { x: event.clientX, y: event.clientY, from: transform() };

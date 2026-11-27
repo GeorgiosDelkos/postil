@@ -31,11 +31,11 @@ const MAX_NEW_FILES: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum AnalysisKind {
-    /// The Architecture's top level and the Data diagram of the whole repository.
+    /// The Architecture's top level and the User Flow diagram of the whole repository.
     Analyze,
     /// One more Architecture diagram under a node, or for a file or folder.
     Deeper,
-    /// One behavior as ordered steps.
+    /// One behavior traced as ordered steps.
     Flow,
     /// The outdated nodes again, and the files not on the map.
     Update,
@@ -286,7 +286,7 @@ fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Plan> {
 /// The run of a forced update (docs/review-assist-plan.md, 8.7): an Update of the Architecture
 /// diagrams of `analysis`, which is placed where its code is in the commit the run starts from,
 /// whose files are `files`; `added` are the files added since `checked` that no reference
-/// covers. Flow and Data diagrams wait for an Update the engineer asks for. Reads the record
+/// covers. Flow and User Flow diagrams wait for an Update the engineer asks for. Reads the record
 /// of threads.
 ///
 /// # Errors
@@ -343,46 +343,60 @@ fn is_outdated(anchor: &CodeRef) -> bool {
     )
 }
 
-/// How a reply's diagrams are written, for Analyze, a deeper analysis and a flow.
+/// How a reply's diagrams are written, for Analyze, a deeper analysis and a trace.
 const DIAGRAMS: &str = "End your reply with one JSON object in a code block fenced as json, the \
      last thing in your reply. Its field diagrams is a list of diagrams. Each diagram is an \
-     object with kind (architecture, data or flow), title (at most 60 characters), nodes and \
+     object with kind (architecture, user_flow or flow), title (at most 60 characters), nodes and \
      edges. Each node is an object with key (a short name of your own, unique in its \
-     diagram), kind (component for something that runs or a module or symbol below one, store \
-     for something that holds data, external for something the repository talks to and does \
-     not contain, boundary for a process, a machine or a network drawn around other nodes), \
-     label (at most 60 characters), summary (one line, at most 160 characters), detail \
-     (Markdown, at most 4000 characters), group (the key of the boundary node drawn around \
-     it, or null) and anchors, a list of citations of the code it stands for. A citation is \
-     an object with path (relative to the repository root), lines (the first and last line, \
-     as an array of two numbers) and first (the first cited line, exactly as the file has \
-     it); for a whole file or folder give only path. Every node cites code: a component \
-     where it starts or is defined, a store the code that reads and writes it, an external \
-     system the code that calls it. Each edge is an object with from and to (node keys), \
-     label (the mechanism, such as JSON-RPC over stdio, or appends) and anchor, one citation \
-     of the call, send or write that makes it, or null. At most 200 nodes per diagram; \
-     Postil checks every citation against the files, and keeps what it cannot find as not \
-     found in code.\n";
+     diagram), kind (component for a subsystem, user stage or module, store for something that \
+     holds data or user-visible state, external for something the repository talks to and does \
+     not contain, boundary for a major runtime or deployment group drawn around other nodes), \
+     label (short and scannable, 2 to 4 words, at most 60 characters), summary (one plain-English \
+     line saying what it does, at most 160 characters), detail (Markdown explaining key \
+     responsibilities and entry points, at most 4000 characters), group (the key of the boundary \
+     node drawn around it, or null) and anchors, a list of citations of the primary code entry \
+     points it stands for. A citation is an object with path (relative to the repository root), \
+     lines (the first and last line, as an array of two numbers) and first (the first cited line, \
+     exactly as the file has it); for a whole file or folder give only path. Every node cites \
+     code so a reviewer can click it to dig deeper: a subsystem or user stage cites its main \
+     entry point or handler, a store the code that reads and writes it, an external system the \
+     code that calls it. Each edge is an object with from and to (node keys), label (the \
+     high-level interaction, protocol or user action, concise) and anchor, one citation of the \
+     call, handler or transition that makes it, or null. At most 200 nodes per diagram; Postil \
+     checks every citation against the files, and keeps what it cannot find as not found in \
+     code.\n";
 
 fn analyze_prompt() -> String {
     format!(
-        "Analyze this repository for an engineer who reviews changes to it. Draw two \
-         diagrams of 7 to 25 nodes each.\n\nThe first, of kind architecture, is the system as \
-         it runs, not its folder tree: the components (a process, a thread, a service, a \
-         page), the stores (a file, a database, a queue) and the external systems (a \
-         subprocess, a third-party API), with boundary nodes for processes or machines, and \
-         an edge for each way two of them talk, labeled with the mechanism.\n\nThe second, of \
-         kind data, is the main types: what each holds, and how they relate.\n\n{DIAGRAMS}\n\
-         {ASK_RULES}"
+        "Analyze this repository for a reviewer who wants the high-level picture in seconds and \
+         will click into the code to dig deeper. Draw two concise diagrams of 5 to 10 nodes each. \
+         Prefer clarity over completeness: omit internal helper modules, individual worker \
+         threads, utility files, and low-level data types.\n\n\
+         The first, of kind architecture, is the high-level systems architecture (C4 container or \
+         subsystem level), not the folder tree and not individual threads or structs. Group \
+         related internals into major subsystems or layers (for example: UI, API/Server, Core \
+         Engine, Storage, External Services) and include only the key stores and external \
+         dependencies they rely on. Use boundary nodes sparingly (at most one or two major \
+         runtime boundaries if they clarify separation, or none if a flat subsystem graph is \
+         cleaner). Label edges with the high-level purpose or protocol rather than individual \
+         function calls.\n\n\
+         The second, of kind user_flow, is the end-to-end user journey through the application: \
+         what the user actually does, sees, and decides — NOT low-level data structures, structs, \
+         or internal data plumbing. Each node is a high-level user stage, screen, action, or \
+         outcome, connected by edges labeled with user actions, decisions, or key branches (such \
+         as approve vs discard, or error/retry paths when central). If this repository is a \
+         library or CLI with no GUI, show the primary developer or caller workflow from \
+         invocation to output. Anchor each stage to its primary handler, view, or entry point in \
+         code.\n\n{DIAGRAMS}\n{ASK_RULES}"
     )
 }
 
 fn deeper_prompt(subject: &str) -> String {
     format!(
         "Analyze one part of this repository in more depth, for an engineer who reviews \
-         changes to it: {subject}\n\nDraw one diagram of kind architecture of 7 to 25 nodes: \
-         the modules that make it, and below them the symbols that matter, with an edge for \
-         each call, message or shared value between them.\n\n{DIAGRAMS}\n{ASK_RULES}"
+         changes to it: {subject}\n\nDraw one diagram of kind architecture of 5 to 15 nodes: \
+         the modules and key internals that make up this subsystem, with an edge for each main \
+         call, message or shared dependency between them.\n\n{DIAGRAMS}\n{ASK_RULES}"
     )
 }
 

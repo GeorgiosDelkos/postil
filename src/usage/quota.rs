@@ -1987,7 +1987,7 @@ mod tests {
         poller.join_probes();
         let unavail = claude(&poller, QuotaFetch::Cached);
         assert_eq!(unavail.status, QuotaStatus::Unavailable);
-        assert!(unavail.windows.is_empty());
+        assert_eq!(unavail.windows, Vec::new());
     }
 
     #[test]

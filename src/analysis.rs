@@ -19,7 +19,8 @@
 //!
 //! # The file
 //!
-//! The analysis lives in `<git dir>/postil/analysis.json`, version 3. Version 2 is version 3
+//! The analysis lives in `<git dir>/postil/analysis.json`, version 4. Version 3 stored `"data"`
+//! for what is now `user_flow` (read as [`DiagramKind::UserFlow`]); version 2 is version 3
 //! without `checked`, the commit the Architecture was last compared with ([`check`]), which
 //! reads as none; version 1 is version 2 without each diagram's `dropped`, which reads as
 //! nothing dropped. Reading it never writes it:
@@ -87,8 +88,9 @@ pub(crate) use prompt::{
 };
 
 /// The format version this build writes. It reads every version from 1 on; a newer one is
-/// refused, not rewritten. Version 2 added each diagram's `dropped`, version 3 `checked`.
-const VERSION: u32 = 3;
+/// refused, not rewritten. Version 2 added each diagram's `dropped`, version 3 `checked`, and
+/// version 4 renamed the `data` diagram kind to `user_flow`.
+const VERSION: u32 = 4;
 
 /// Reads the analysis and places every found code reference where its code is now, or
 /// returns `None` when there is no analysis file. Does not write.
@@ -951,7 +953,10 @@ impl Dropped {
 #[serde(rename_all = "lowercase")]
 enum DiagramKind {
     Architecture,
-    Data,
+    /// The end-to-end user journey through the application; versions 1 to 3 stored `"data"`.
+    #[serde(rename = "user_flow", alias = "data")]
+    UserFlow,
+    /// One behavior traced through the code on demand.
     Flow,
 }
 

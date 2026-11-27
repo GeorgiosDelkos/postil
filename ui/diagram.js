@@ -18,8 +18,11 @@ export const ZOOM_MIN = 0.25;
 export const ZOOM_MAX = 2;
 
 // dagre's spacing, in CSS px: between nodes of one rank, between ranks, and around the
-// diagram. Arbitrary, read by eye on the fake agent's diagrams.
-const SPACING = { nodesep: 28, ranksep: 52, marginx: 24, marginy: 24 };
+// diagram. Top-to-bottom fits the narrow map pane beside the code without forcing heavy zoom-out.
+const SPACING = { nodesep: 28, ranksep: 48, marginx: 24, marginy: 24 };
+// Padding inside a boundary box around its laid-out children, with room at the top for its label.
+const GROUP_PAD = 16;
+const GROUP_HEADER = 30;
 
 // The layout of `diagram` by `dagre` (the vendored window.dagre, ui/vendor/). The coordinates
 // are kept in `cache` by the diagram's id and the run that made it, while its shape (its
@@ -66,67 +69,147 @@ function boundaries(diagram) {
 
 // `diagram`'s coordinates by dagre: `{ width, height, boxes, points }`, `boxes` each node's
 // `{ x, y, width, height }` by id, `points` each edge's route by its index in
-// `diagram.edges`, or null for one dagre was not given, which is drawn straight.
+// `diagram.edges`, or null for one crossing boundaries, which is drawn straight.
+//
+// Laid out bottom-up with plain (non-compound) dagre graphs, one per boundary and one at the
+// top level:
+// 1. dagre 3.1.3 throws "Not possible to find intersection inside of the rectangle" on compound
+//    graphs with cross-boundary edges. Non-compound graphs never hit that bug.
+// 2. Lifting cross-boundary edges to their boundary ancestors lets dagre rank boundaries and
+//    external nodes/stores properly top-to-bottom instead of piling unranked nodes to one side.
+// 3. Each boundary gets dedicated header padding so its label never collides with its cards.
 function layoutWith(diagram, dagre) {
   const parents = boundaries(diagram);
   const group = new Map(diagram.nodes.map((node) => [node.id, node.group ?? null]));
-  // dagre 3.1.3 throws "Not possible to find intersection inside of the rectangle" on compound
-  // graphs with an edge between cards in two different boundaries: a bend point it makes for
-  // the edge can land on a card's centre. It did on a 200-node diagram in boundaries of ten
-  // with a third of its edges crossing them, after about 290 ms of work. So dagre is given
-  // only the edges inside one boundary, and those between cards in none; an edge it is not
-  // given is drawn straight between its two boxes. The downside accepted (main session,
-  // 2026-11-26): an edge across boundaries does not order them left to right.
-  const keeps = (from, to) => group.get(from) === group.get(to);
+  const childrenOf = new Map([[null, []]]);
+  for (const node of diagram.nodes) {
+    const parent = node.group ?? null;
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent).push(node);
+  }
   const card = (id) => !parents.has(id);
 
-  const graph = new dagre.graphlib.Graph({ compound: true, multigraph: true });
-  graph.setGraph({ rankdir: "LR", ...SPACING });
-  for (const node of diagram.nodes) {
-    // dagre sizes a boundary with children to hold them; one without is a card, or dagre would
-    // give it no size at all.
-    graph.setNode(node.id, card(node.id) ? { width: NODE_WIDTH, height: NODE_HEIGHT } : {});
-  }
-  for (const node of diagram.nodes) {
-    if (node.group) graph.setParent(node.id, node.group);
-  }
-  // dagre lays out edges between cards only: one to or from a boundary with children is drawn
-  // straight between the two boxes, after the layout.
-  const laid = new Map();
-  diagram.edges.forEach((edge, index) => {
-    if (!card(edge.from) || !card(edge.to) || !keeps(edge.from, edge.to)) return;
-    laid.set(index, String(index));
-    graph.setEdge(edge.from, edge.to, {}, String(index));
-  });
-  if (diagram.kind === "flow") {
-    // A flow's nodes are in step order: each step leans right of the one before, by an edge
-    // only the layout sees, so steps the agent did not join still read left to right. Of the
-    // default weight: one of weight 0 beside a real edge between the same two cards made dagre
-    // throw the error above (a card, two boundaries and a nested one, 2026-11-27).
-    const cards = diagram.nodes.filter((node) => card(node.id));
-    for (let index = 1; index < cards.length; index += 1) {
-      const [from, to] = [cards[index - 1].id, cards[index].id];
-      if (keeps(from, to)) graph.setEdge(from, to, {}, `step${index}`);
+  // Returns the direct child of `container` that is `id` or contains `id`, or null if `id` is
+  // outside `container`.
+  const childAt = (id, container) => {
+    let at = id;
+    while (at != null) {
+      const parent = group.get(at) ?? null;
+      if (parent === container) return at;
+      at = parent;
     }
-  }
-  dagre.layout(graph);
+    return null;
+  };
 
-  const boxes = new Map();
-  for (const node of diagram.nodes) {
-    const box = graph.node(node.id);
-    boxes.set(node.id, {
-      x: box.x - box.width / 2,
-      y: box.y - box.height / 2,
-      width: box.width,
-      height: box.height,
+  // Recursively lays out `container` (null for the diagram root) and returns
+  // `{ width, height, boxes, routed }`, where `boxes` maps every descendant node id to its
+  // box relative to `container`'s top-left, and `routed` maps edge indices laid out inside
+  // `container` to their point arrays.
+  function layoutLevel(container) {
+    const members = childrenOf.get(container) ?? [];
+    if (members.length === 0) {
+      return { width: 0, height: 0, boxes: new Map(), routed: new Map() };
+    }
+
+    // First lay out any child boundaries so we know their exact dimensions.
+    const subLayouts = new Map();
+    const graph = new dagre.graphlib.Graph({ compound: false, multigraph: true });
+    const margins = container === null ? SPACING : { ...SPACING, marginx: 0, marginy: 0 };
+    graph.setGraph({ rankdir: "TB", ...margins });
+
+    for (const node of members) {
+      if (parents.has(node.id)) {
+        const sub = layoutLevel(node.id);
+        subLayouts.set(node.id, sub);
+        graph.setNode(node.id, {
+          width: Math.max(NODE_WIDTH, sub.width + GROUP_PAD * 2),
+          height: Math.max(NODE_HEIGHT, sub.height + GROUP_HEADER + GROUP_PAD),
+        });
+      } else {
+        graph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+      }
+    }
+
+    const laid = new Map();
+    const lifted = new Set();
+    diagram.edges.forEach((edge, index) => {
+      const from = childAt(edge.from, container);
+      const to = childAt(edge.to, container);
+      if (!from || !to || from === to) return;
+      if (from === edge.from && to === edge.to && card(from) && card(to)) {
+        laid.set(index, String(index));
+        graph.setEdge(from, to, {}, String(index));
+      } else {
+        // Cross-boundary edge (or edge touching a boundary): add one proxy edge per ordered pair
+        // so dagre ranks the boundaries and external nodes cleanly relative to each other.
+        const key = `${from}\0${to}`;
+        if (!lifted.has(key)) {
+          lifted.add(key);
+          graph.setEdge(from, to, {}, `lift:${key}`);
+        }
+      }
     });
+
+    if (diagram.kind === "flow") {
+      // A trace's steps are in step order: each step sits below the one before, by an edge only
+      // the layout sees, so steps the agent did not join still read top to bottom — including
+      // when consecutive steps sit in different boundaries.
+      const allCards = diagram.nodes.filter((node) => card(node.id));
+      const stepped = new Set();
+      for (let index = 1; index < allCards.length; index += 1) {
+        const from = childAt(allCards[index - 1].id, container);
+        const to = childAt(allCards[index].id, container);
+        if (!from || !to || from === to) continue;
+        const key = `${from}\0${to}`;
+        if (!stepped.has(key)) {
+          stepped.add(key);
+          graph.setEdge(from, to, {}, `step:${key}`);
+        }
+      }
+    }
+
+    dagre.layout(graph);
+
+    const boxes = new Map();
+    const routed = new Map();
+    for (const node of members) {
+      const box = graph.node(node.id);
+      const x = box.x - box.width / 2;
+      const y = box.y - box.height / 2;
+      boxes.set(node.id, { x, y, width: box.width, height: box.height });
+      const sub = subLayouts.get(node.id);
+      if (sub) {
+        const ox = x + GROUP_PAD;
+        const oy = y + GROUP_HEADER;
+        for (const [childId, childBox] of sub.boxes) {
+          boxes.set(childId, {
+            x: childBox.x + ox,
+            y: childBox.y + oy,
+            width: childBox.width,
+            height: childBox.height,
+          });
+        }
+        for (const [edgeIndex, pts] of sub.routed) {
+          routed.set(
+            edgeIndex,
+            pts.map((pt) => ({ x: pt.x + ox, y: pt.y + oy })),
+          );
+        }
+      }
+    }
+
+    for (const [edgeIndex, name] of laid) {
+      const edge = diagram.edges[edgeIndex];
+      routed.set(edgeIndex, graph.edge({ v: edge.from, w: edge.to, name }).points);
+    }
+
+    const { width, height } = graph.graph();
+    return { width, height, boxes, routed };
   }
-  const points = diagram.edges.map((edge, index) => {
-    const name = laid.get(index);
-    return name === undefined ? null : graph.edge({ v: edge.from, w: edge.to, name }).points;
-  });
-  const { width, height } = graph.graph();
-  return { width, height, boxes, points };
+
+  const root = layoutLevel(null);
+  const points = diagram.edges.map((_, index) => root.routed.get(index) ?? null);
+  return { width: root.width, height: root.height, boxes: root.boxes, points };
 }
 
 // The line between the centres of boxes `from` and `to`, cut where it leaves each box.
@@ -175,7 +258,7 @@ export function checkFlowQuestion(text) {
   const length = [...text.trim()].length;
   if (length === 0) return "Ask a question: how does something happen?";
   if (length > MAX_FLOW_QUESTION) {
-    return `A flow's question is at most ${MAX_FLOW_QUESTION} characters, not ${length}.`;
+    return `A trace's question is at most ${MAX_FLOW_QUESTION} characters, not ${length}.`;
   }
   return null;
 }
@@ -358,8 +441,8 @@ function nodeTouchesFile(node, file) {
 // diagrams of `analysis`, placed at the run's fork: `{ nodes, near, unmapped }`, `nodes` the
 // ids of the touched nodes, `near` those one edge from a touched node and not touched
 // themselves, `unmapped` the paths, in the diff's order, that no Architecture node covers (one
-// a file the run added, which no node can have cited). Flows and Data diagrams are left out:
-// the change map is drawn on the Architecture.
+// a file the run added, which no node can have cited). Traces and User Flow diagrams are left
+// out: the change map is drawn on the Architecture.
 export function touched(analysis, files) {
   const diagrams = (analysis?.diagrams ?? []).filter((diagram) => diagram.kind === "architecture");
   const nodes = new Set();

@@ -172,7 +172,7 @@ function analysisReply(text) {
             { from: "worker", to: "worker", label: "to itself", anchor: null },
           ],
         },
-        { kind: "data", title: "Types", nodes: [node("note", "store", "Note", [{ path: "src/a.rs" }])], edges: [] },
+        { kind: "user_flow", title: "User Flow", nodes: [node("note", "component", "Note", [{ path: "src/a.rs" }])], edges: [] },
       ],
     };
   }
