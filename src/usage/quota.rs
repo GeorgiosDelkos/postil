@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
@@ -45,9 +46,9 @@ const ERROR_CACHE_TTL: Duration = Duration::from_secs(60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long an in-flight `Loading` entry stays fresh before a later poll replaces its probe.
-/// Two [`PROBE_TIMEOUT`]s (the longest a probe should take) plus 4 s of margin, so only a
-/// probe that is stuck past its own timeouts is replaced.
-const LOADING_TIMEOUT: Duration = Duration::from_secs(2 * PROBE_TIMEOUT.as_secs() + 4);
+/// Three [`PROBE_TIMEOUT`]s (Claude can run Keychain read, OAuth refresh, and usage fetch in
+/// sequence) plus 4 s of margin, so only a probe stuck past its own timeouts is replaced.
+const LOADING_TIMEOUT: Duration = Duration::from_secs(3 * PROBE_TIMEOUT.as_secs() + 4);
 
 /// State of a live quota probe for one agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -423,33 +424,112 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
     }
 }
 
+/// Claude Code's public OAuth 2.0 client id and token refresh endpoint.
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+/// Refresh proactively if the access token expires within this many seconds.
+const TOKEN_EXPIRY_SKEW_SECS: u64 = 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeCredentialSource {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Keychain {
+        service: &'static str,
+        account: Option<String>,
+    },
+    File(PathBuf),
+    Env,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeCredentials {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_ms: Option<u64>,
+    plan: Option<String>,
+    raw_json: Value,
+    source: ClaudeCredentialSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeTokenRefresh {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_ms: Option<u64>,
+}
+
 fn probe_claude() -> QuotaReport {
-    let creds = match read_claude_credentials() {
-        Ok(creds) => creds,
+    let mut creds = match read_claude_credentials() {
+        Ok(Some(creds)) => creds,
+        Ok(None) => {
+            if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|val| !val.is_empty()) {
+                return QuotaReport::unavailable("API key mode — no subscription quota window");
+            }
+            return QuotaReport::unavailable(
+                "Not signed in — run `claude /login` in a terminal to sign in",
+            );
+        }
         Err(message) => return QuotaReport::error(message),
     };
-    let Some((token, plan)) = creds else {
-        if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|val| !val.is_empty()) {
-            return QuotaReport::unavailable("API key mode — no subscription quota window");
-        }
-        return QuotaReport::unavailable("Not signed in — run `claude` in a terminal to sign in");
-    };
 
-    let headers = [
-        format!("Authorization: Bearer {token}"),
-        "anthropic-beta: oauth-2025-04-20".to_owned(),
-        "Accept: application/json".to_owned(),
-    ];
-    match curl_json(
-        "GET",
-        "https://api.anthropic.com/api/oauth/usage",
-        &headers,
-        None,
-    ) {
-        Ok((200, body)) => parse_claude_quota(&body, plan),
-        Ok((401 | 403, _)) => {
-            QuotaReport::unavailable("Session expired — run `claude` in a terminal to refresh")
+    let mut refreshed = false;
+    if is_token_expired(creds.expires_at_ms, now_secs()) && creds.refresh_token.is_some() {
+        match try_refresh_claude_credentials(&mut creds) {
+            Ok(()) => refreshed = true,
+            Err(RefreshOutcome::ReauthRequired) => {
+                return QuotaReport::unavailable(
+                    "Claude session expired — run `claude /login` in a terminal, then click Refresh",
+                );
+            }
+            Err(RefreshOutcome::Transient(message)) => {
+                // Fall through and try the current token anyway; if it also fails with 401,
+                // surface the transient refresh error rather than falsely claiming reauth.
+                return match fetch_claude_usage(&creds.access_token) {
+                    Ok((200, body)) => parse_claude_quota(&body, creds.plan),
+                    Ok((401, _)) => QuotaReport::error(message),
+                    Ok((403, _)) => QuotaReport::unavailable(
+                        "Claude account cannot read usage (HTTP 403) — run `claude /login` in a terminal to re-authorize",
+                    ),
+                    Ok((status, _)) => {
+                        QuotaReport::error(format!("Claude usage endpoint returned HTTP {status}"))
+                    }
+                    Err(err) => QuotaReport::error(err),
+                };
+            }
         }
+    }
+
+    match fetch_claude_usage(&creds.access_token) {
+        Ok((200, body)) => parse_claude_quota(&body, creds.plan),
+        Ok((401, _)) if !refreshed && creds.refresh_token.is_some() => {
+            match try_refresh_claude_credentials(&mut creds) {
+                Ok(()) => match fetch_claude_usage(&creds.access_token) {
+                    Ok((200, body)) => parse_claude_quota(&body, creds.plan),
+                    Ok((401, _)) => QuotaReport::unavailable(
+                        "Claude session expired — run `claude /login` in a terminal, then click Refresh",
+                    ),
+                    Ok((403, _)) => QuotaReport::unavailable(
+                        "Claude account cannot read usage (HTTP 403) — run `claude /login` in a terminal to re-authorize",
+                    ),
+                    Ok((status, _)) => {
+                        QuotaReport::error(format!("Claude usage endpoint returned HTTP {status}"))
+                    }
+                    Err(message) => QuotaReport::error(message),
+                },
+                Err(RefreshOutcome::ReauthRequired) => QuotaReport::unavailable(
+                    "Claude session expired — run `claude /login` in a terminal, then click Refresh",
+                ),
+                Err(RefreshOutcome::Transient(message)) => QuotaReport::error(message),
+            }
+        }
+        Ok((401, _)) => QuotaReport::unavailable(
+            "Claude session expired — run `claude /login` in a terminal, then click Refresh",
+        ),
+        Ok((403, _)) => QuotaReport::unavailable(
+            "Claude account cannot read usage (HTTP 403) — run `claude /login` in a terminal to re-authorize",
+        ),
         Ok((status, _)) => {
             QuotaReport::error(format!("Claude usage endpoint returned HTTP {status}"))
         }
@@ -457,19 +537,207 @@ fn probe_claude() -> QuotaReport {
     }
 }
 
-/// Claude Code's OAuth token and plan, from the Keychain or else its credentials file.
-/// `Ok(None)` means not signed in; an error means the file exists but cannot be read.
-fn read_claude_credentials() -> Result<Option<(String, Option<String>)>, String> {
-    if let Some(raw) = read_keychain_secret("Claude Code-credentials")
-        && let Some(parsed) = parse_claude_credentials(&raw)
+fn fetch_claude_usage(token: &str) -> Result<(u16, String), String> {
+    let headers = [
+        format!("Authorization: Bearer {token}"),
+        "anthropic-beta: oauth-2025-04-20".to_owned(),
+        "Accept: application/json".to_owned(),
+    ];
+    curl_json("GET", CLAUDE_USAGE_URL, &headers, None)
+}
+
+enum RefreshOutcome {
+    ReauthRequired,
+    Transient(String),
+}
+
+fn is_token_expired(expires_at_ms: Option<u64>, now_secs: u64) -> bool {
+    let Some(expires_ms) = expires_at_ms else {
+        return false;
+    };
+    let cutoff_ms = now_secs
+        .saturating_add(TOKEN_EXPIRY_SKEW_SECS)
+        .saturating_mul(1000);
+    expires_ms <= cutoff_ms
+}
+
+fn try_refresh_claude_credentials(creds: &mut ClaudeCredentials) -> Result<(), RefreshOutcome> {
+    let Some(refresh_token) = creds.refresh_token.as_deref() else {
+        return Err(RefreshOutcome::ReauthRequired);
+    };
+    let payload = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    })
+    .to_string();
+    let headers = [
+        "Content-Type: application/json".to_owned(),
+        "Accept: application/json".to_owned(),
+    ];
+    let (status, body) = curl_json("POST", CLAUDE_OAUTH_TOKEN_URL, &headers, Some(&payload))
+        .map_err(|err| {
+            RefreshOutcome::Transient(format!("Could not refresh Claude session: {err}"))
+        })?;
+    match status {
+        200 => {
+            let refreshed = parse_claude_refresh_response(&body, now_secs()).ok_or_else(|| {
+                RefreshOutcome::Transient(
+                    "Could not refresh Claude session (unreadable OAuth reply)".to_owned(),
+                )
+            })?;
+            apply_claude_refresh(creds, &refreshed);
+            // Best-effort write-back so Claude Code and future Postil probes share the rotated
+            // refresh token and fresh access token.
+            persist_claude_credentials(creds);
+            Ok(())
+        }
+        400 | 401 | 403 => Err(RefreshOutcome::ReauthRequired),
+        other => Err(RefreshOutcome::Transient(format!(
+            "Could not refresh Claude session (HTTP {other}) — click Refresh to try again"
+        ))),
+    }
+}
+
+fn parse_claude_refresh_response(body: &str, now_secs: u64) -> Option<ClaudeTokenRefresh> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let access_token = json
+        .get("access_token")
+        .or_else(|| json.get("accessToken"))
+        .and_then(Value::as_str)?
+        .trim();
+    if access_token.is_empty() {
+        return None;
+    }
+    let refresh_token = json
+        .get("refresh_token")
+        .or_else(|| json.get("refreshToken"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let expires_at_ms = json
+        .get("expires_in")
+        .or_else(|| json.get("expiresIn"))
+        .and_then(Value::as_u64)
+        .map(|secs| now_secs.saturating_add(secs).saturating_mul(1000));
+    Some(ClaudeTokenRefresh {
+        access_token: access_token.to_owned(),
+        refresh_token,
+        expires_at_ms,
+    })
+}
+
+/// Applies `refreshed` tokens to both the in-memory `creds` fields and its `raw_json` object,
+/// preserving all unrelated fields (`scopes`, `subscriptionType`, `rateLimitTier`, etc.).
+fn apply_claude_refresh(creds: &mut ClaudeCredentials, refreshed: &ClaudeTokenRefresh) {
+    creds.access_token.clone_from(&refreshed.access_token);
+    if let Some(refresh) = &refreshed.refresh_token {
+        creds.refresh_token = Some(refresh.clone());
+    }
+    if let Some(expires_at_ms) = refreshed.expires_at_ms {
+        creds.expires_at_ms = Some(expires_at_ms);
+    }
+
+    let target = if let Some(nested) = creds.raw_json.get_mut("claudeAiOauth") {
+        nested
+    } else {
+        &mut creds.raw_json
+    };
+    if let Some(map) = target.as_object_mut() {
+        let use_snake = !map.contains_key("accessToken") && map.contains_key("access_token");
+        let access_key = if use_snake {
+            "access_token"
+        } else {
+            "accessToken"
+        };
+        map.insert(
+            access_key.to_owned(),
+            Value::String(refreshed.access_token.clone()),
+        );
+        if let Some(refresh) = &refreshed.refresh_token {
+            let refresh_key = if use_snake {
+                "refresh_token"
+            } else {
+                "refreshToken"
+            };
+            map.insert(refresh_key.to_owned(), Value::String(refresh.clone()));
+        }
+        if let Some(expires_at_ms) = refreshed.expires_at_ms {
+            let expires_key = if use_snake { "expires_at" } else { "expiresAt" };
+            map.insert(expires_key.to_owned(), Value::from(expires_at_ms));
+        }
+    }
+}
+
+fn persist_claude_credentials(creds: &ClaudeCredentials) {
+    let Ok(serialized) = serde_json::to_string(&creds.raw_json) else {
+        return;
+    };
+    match &creds.source {
+        ClaudeCredentialSource::Keychain { service, account } => {
+            write_keychain_secret(service, account.as_deref(), &serialized);
+        }
+        ClaudeCredentialSource::File(path) => {
+            drop(write_credentials_file_atomic(path, &serialized));
+        }
+        ClaudeCredentialSource::Env => {}
+    }
+}
+
+fn write_credentials_file_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".credentials.json.postil-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path)
+}
+
+/// Claude Code's OAuth token and plan, from the Keychain, its credentials file, or
+/// `CLAUDE_CODE_OAUTH_TOKEN`. `Ok(None)` means not signed in; an error means the file exists
+/// but cannot be read.
+fn read_claude_credentials() -> Result<Option<ClaudeCredentials>, String> {
+    if let Some(raw) = read_keychain_secret(CLAUDE_KEYCHAIN_SERVICE)
+        && let Some(parsed) = parse_claude_credentials(
+            &raw,
+            ClaudeCredentialSource::Keychain {
+                service: CLAUDE_KEYCHAIN_SERVICE,
+                account: read_keychain_account(CLAUDE_KEYCHAIN_SERVICE),
+            },
+        )
     {
         return Ok(Some(parsed));
     }
-    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(home).join(".claude/.credentials.json");
-    Ok(read_credentials_file(&path)?.and_then(|raw| parse_claude_credentials(&raw)))
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        let path = PathBuf::from(home).join(".claude/.credentials.json");
+        if let Some(parsed) = read_credentials_file(&path)?
+            .and_then(|raw| parse_claude_credentials(&raw, ClaudeCredentialSource::File(path)))
+        {
+            return Ok(Some(parsed));
+        }
+    }
+    if let Some(env_token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(ClaudeCredentials {
+            access_token: env_token,
+            refresh_token: None,
+            expires_at_ms: None,
+            plan: None,
+            raw_json: Value::Null,
+            source: ClaudeCredentialSource::Env,
+        }));
+    }
+    Ok(None)
 }
 
 /// Largest credentials file read, in bytes. Arbitrary: the files hold a few tokens as JSON,
@@ -522,7 +790,10 @@ fn read_credentials_file(path: &Path) -> Result<Option<String>, String> {
     Ok(Some(raw))
 }
 
-fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
+fn parse_claude_credentials(
+    raw: &str,
+    source: ClaudeCredentialSource,
+) -> Option<ClaudeCredentials> {
     let trimmed = raw.trim();
     let decoded = if trimmed.starts_with('{') {
         None
@@ -540,13 +811,31 @@ fn parse_claude_credentials(raw: &str) -> Option<(String, Option<String>)> {
     if token.is_empty() {
         return None;
     }
+    let refresh_token = oauth
+        .get("refreshToken")
+        .or_else(|| oauth.get("refresh_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let expires_at_ms = oauth
+        .get("expiresAt")
+        .or_else(|| oauth.get("expires_at"))
+        .and_then(Value::as_u64);
     let plan = oauth
         .get("subscriptionType")
         .or_else(|| oauth.get("subscription_type"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(title_case);
-    Some((token.to_owned(), plan))
+    Some(ClaudeCredentials {
+        access_token: token.to_owned(),
+        refresh_token,
+        expires_at_ms,
+        plan,
+        raw_json: value,
+        source,
+    })
 }
 
 /// Decodes a hex-encoded UTF-8 string, as macOS `security find-generic-password -w` prints
@@ -1430,6 +1719,67 @@ fn read_keychain_secret(_service: &str) -> Option<String> {
     None
 }
 
+/// Reads the account attribute (`"acct"<blob>="..."`) of a generic password item in macOS
+/// Keychain so an update targets the exact existing entry.
+#[cfg(target_os = "macos")]
+fn read_keychain_account(service: &str) -> Option<String> {
+    let output = run_timed(
+        Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", service])
+            .stdin(Stdio::null()),
+        None,
+        PROBE_TIMEOUT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_keychain_account(&stdout)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_keychain_account(_service: &str) -> Option<String> {
+    None
+}
+
+fn parse_keychain_account(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(r#""acct"<blob>=""#) else {
+            continue;
+        };
+        let account = rest.strip_suffix('"')?.trim();
+        if !account.is_empty() {
+            return Some(account.to_owned());
+        }
+    }
+    None
+}
+
+/// Updates a generic password secret in macOS Keychain via `security -i` over stdin so the
+/// token payload never appears in process arguments.
+#[cfg(target_os = "macos")]
+fn write_keychain_secret(service: &str, account: Option<&str>, secret: &str) {
+    let fallback_user = std::env::var("USER").unwrap_or_default();
+    let acct = account.unwrap_or(fallback_user.as_str());
+    let mut cmd = format!("add-generic-password -U -s {}", curl_quote(service));
+    if !acct.is_empty() {
+        cmd.push_str(&format!(" -a {}", curl_quote(acct)));
+    }
+    cmd.push_str(&format!(" -w {}\n", curl_quote(secret)));
+    drop(run_timed(
+        Command::new("/usr/bin/security")
+            .arg("-i")
+            .stdin(Stdio::piped()),
+        Some(cmd.as_bytes()),
+        PROBE_TIMEOUT,
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_keychain_secret(_service: &str, _account: Option<&str>, _secret: &str) {}
+
 /// Calls `/usr/bin/curl` with URL and headers supplied over stdin (`--config -`) so bearer
 /// tokens never appear in process arguments. Returns `(http_status, body)`.
 fn curl_json(
@@ -2039,14 +2389,87 @@ mod tests {
     fn parse_claude_credentials_decodes_hex_keychain_output() {
         use std::fmt::Write as _;
 
-        let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-test","subscriptionType":"max"}}"#;
+        let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-test","refreshToken":"rt-test","expiresAt":1795789999000,"subscriptionType":"max"}}"#;
         let mut hex = String::with_capacity(json.len() * 2);
         for byte in json.bytes() {
             write!(hex, "{byte:02x}").unwrap();
         }
-        let parsed = parse_claude_credentials(&hex).expect("hex-encoded keychain JSON parses");
-        assert_eq!(parsed.0, "sk-ant-test");
-        assert_eq!(parsed.1.as_deref(), Some("Max"));
+        let parsed = parse_claude_credentials(&hex, ClaudeCredentialSource::Env)
+            .expect("hex-encoded keychain JSON parses");
+        assert_eq!(parsed.access_token, "sk-ant-test");
+        assert_eq!(parsed.refresh_token.as_deref(), Some("rt-test"));
+        assert_eq!(parsed.expires_at_ms, Some(1_795_789_999_000));
+        assert_eq!(parsed.plan.as_deref(), Some("Max"));
+    }
+
+    #[test]
+    fn claude_token_expiry_checks_skew_and_missing_timestamp() {
+        assert!(!is_token_expired(None, 1_000));
+        assert!(is_token_expired(Some(1_000_000), 1_000), "at exact expiry");
+        assert!(
+            is_token_expired(Some(1_060_000), 1_000),
+            "within 60 s skew window"
+        );
+        assert!(
+            !is_token_expired(Some(1_061_000), 1_000),
+            "outside 60 s skew window"
+        );
+    }
+
+    #[test]
+    fn claude_refresh_response_parses_and_updates_credentials_preserving_extra_fields() {
+        let initial = r#"{"claudeAiOauth":{"accessToken":"old-at","refreshToken":"old-rt","expiresAt":1000,"subscriptionType":"max","scopes":["user:profile","user:inference"]},"extraFlag":true}"#;
+        let mut creds =
+            parse_claude_credentials(initial, ClaudeCredentialSource::Env).expect("initial parses");
+        let reply = r#"{"access_token":"new-at","refresh_token":"new-rt","expires_in":3600}"#;
+        let refreshed = parse_claude_refresh_response(reply, 10_000).expect("refresh parses");
+        assert_eq!(refreshed.access_token, "new-at");
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("new-rt"));
+        assert_eq!(refreshed.expires_at_ms, Some(13_600_000));
+
+        apply_claude_refresh(&mut creds, &refreshed);
+        assert_eq!(creds.access_token, "new-at");
+        assert_eq!(creds.refresh_token.as_deref(), Some("new-rt"));
+        assert_eq!(creds.expires_at_ms, Some(13_600_000));
+        assert_eq!(creds.raw_json["extraFlag"], Value::Bool(true));
+        assert_eq!(
+            creds.raw_json["claudeAiOauth"]["accessToken"],
+            Value::String("new-at".to_owned())
+        );
+        assert_eq!(
+            creds.raw_json["claudeAiOauth"]["refreshToken"],
+            Value::String("new-rt".to_owned())
+        );
+        assert_eq!(
+            creds.raw_json["claudeAiOauth"]["scopes"],
+            serde_json::json!(["user:profile", "user:inference"])
+        );
+        assert_eq!(
+            parse_claude_refresh_response(r#"{"access_token":""}"#, 0),
+            None
+        );
+        assert_eq!(parse_claude_refresh_response("not json", 0), None);
+    }
+
+    #[test]
+    fn claude_credentials_file_writes_atomically_and_parses_keychain_account() {
+        let dir = crate::testing::TempDir::new("claude-creds-write");
+        let path = dir.path().join(".credentials.json");
+        let contents = r#"{"claudeAiOauth":{"accessToken":"fresh-at","refreshToken":"fresh-rt"}}"#;
+        write_credentials_file_atomic(&path, contents).expect("atomic write succeeds");
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+
+        let keychain_meta = concat!(
+            "keychain: \"/Users/alice/Library/Keychains/login.keychain-db\"\n",
+            "attributes:\n",
+            "    \"acct\"<blob>=\"alice\"\n",
+            "    \"svce\"<blob>=\"Claude Code-credentials\"\n",
+        );
+        assert_eq!(
+            parse_keychain_account(keychain_meta).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(parse_keychain_account("no account line"), None);
     }
 
     #[test]

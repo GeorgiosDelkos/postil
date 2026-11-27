@@ -4716,6 +4716,15 @@ body.focus-mode .code {
   color: var(--text-muted);
 }
 
+.usage-note code {
+  padding: 1px 5px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font: 11.5px var(--font-mono);
+}
+
 .usage-note.is-error {
   color: var(--attention);
 }

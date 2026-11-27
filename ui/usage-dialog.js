@@ -24,6 +24,19 @@ import {
 
 const POLL_MS = 1000;
 
+function noteParagraph(text, isError = false) {
+  const node = el("p", `usage-note${isError ? " is-error" : ""}`);
+  const parts = String(text).split(/(`[^`]+`)/g);
+  for (const part of parts) {
+    if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
+      node.append(el("code", "", part.slice(1, -1)));
+    } else if (part) {
+      node.append(document.createTextNode(part));
+    }
+  }
+  return node;
+}
+
 function button(text, key, onClick, className = "button") {
   const node = el("button", className, text);
   node.type = "button";
@@ -265,12 +278,9 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
         block.append(el("p", "usage-note", "Checking live quota…"));
         return block;
       }
-      const note = el(
-        "p",
-        `usage-note${quota.status === "error" ? " is-error" : ""}`,
-        quota.message ?? "Live quota unavailable",
+      block.append(
+        noteParagraph(quota.message ?? "Live quota unavailable", quota.status === "error"),
       );
-      block.append(note);
       return block;
     }
 
@@ -299,7 +309,7 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
     }
     block.append(list);
     if (quota.status === "error" && quota.message) {
-      block.append(el("p", "usage-note is-error", quota.message));
+      block.append(noteParagraph(quota.message, true));
     }
     return block;
   }
