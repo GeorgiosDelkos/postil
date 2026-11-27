@@ -4551,8 +4551,8 @@ body.focus-mode .code {
   position: absolute;
   top: 6px;
   right: 6px;
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--note);
   box-shadow: 0 0 0 1.5px var(--chrome);
