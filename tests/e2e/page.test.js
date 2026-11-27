@@ -7,6 +7,7 @@
 // the node under the pointer while it drew the run again (docs/review-2026-11-23.md, D4).
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
@@ -1936,4 +1937,233 @@ test("Cmd-C over striped and chipped lines copies their code alone", async (t) =
   await page.waitForFunction(() => window.copyEvents.length > 0);
   assert.deepEqual(await taken("copyEvents"), ["l2\nl3"]);
   assert.deepEqual(await taken("written"), [], "the browser copied the text selection");
+});
+
+// ---- Deeper, flows, data, outdated and Update (docs/review-assist-plan.md, 8.5) ------------
+
+// The repository the fake agent's analysis cites (tests/fake-agent.mjs, `analysisReply`).
+const ANALYZED_FILES = {
+  "src/a.rs": "fn a() {\n    one();\n}\n",
+  "src/b.rs": "x\ny\nfn two() {\n}\n",
+};
+
+// Opens a project on `ANALYZED_FILES` whose Analyzer is the fake agent's `analysis`.
+const openAnalyzed = (t) => openProject(t, "analysis", "new", { files: ANALYZED_FILES });
+
+// The switcher's button for `kind`, by its whole name.
+const kindButton = (page, name) => page.locator(".map-kind", { hasText: new RegExp(`^${name}$`) });
+
+// The context menu's item whose label starts with `label`.
+const menuItem = (page, label) =>
+  page.locator("#context-menu").getByRole("menuitem", { name: new RegExp(`^${label}`) });
+
+test("the menu item on a folder starts a run, and Data and a node's Analyze deeper draw theirs", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator('#files .dir[data-path="src"]').click({ button: "right" });
+  await menuItem(page, "Analyze Deeper").click();
+
+  // No node covers src yet: its diagram is at the top, and the map opens on it.
+  await node(page, "Inner").waitFor();
+  assert.ok(await page.locator("#map").isVisible());
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Inside");
+
+  // Data has none yet: its card offers Analyze, which draws both kinds.
+  await kindButton(page, "Data").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Note").waitFor();
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+
+  // A node's dialog asks for its inside, which opens under it.
+  await kindButton(page, "Architecture").click();
+  await node(page, "Page").dblclick();
+  await page.locator("#node-dialog").getByRole("button", { name: "Analyze deeper" }).click();
+  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  await node(page, "Inner").waitFor();
+
+  // Back up, Enter on Page goes into the diagram it has.
+  await page.locator(".map-crumb", { hasText: /^System$/ }).click();
+  await node(page, "Page").focus();
+  await page.keyboard.press("Enter");
+  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+
+  // A right-click on Store analyzes its inside, which opens under it.
+  await page.locator(".map-crumb", { hasText: /^System$/ }).click();
+  const store = await node(page, "Store").getAttribute("data-node-id");
+  await node(page, "Store").click({ button: "right" });
+  await menuItem(page, "Analyze Deeper").click();
+  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  const { diagrams } = await api("api/analysis");
+  assert.ok(
+    diagrams.some((diagram) => diagram.parent === store),
+    "a diagram under Store",
+  );
+});
+
+test("Trace from here on a node starts at its id, its chip clears, and a flow's draft holds Quit and Send", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  const pageId = await node(page, "Page").getAttribute("data-node-id");
+
+  // From the dialog, then the chip's × clears where it starts.
+  await node(page, "Page").dblclick();
+  await page.locator("#node-dialog").getByRole("button", { name: "Trace from here" }).click();
+  const chip = page.locator(".map-flow-chip");
+  await chip.locator(".map-flow-chip-label", { hasText: /^From Page$/ }).waitFor();
+  await chip.locator(".map-flow-chip-clear").click();
+  await chip.waitFor({ state: "hidden" });
+
+  // From the right-click menu on the node; the flow asked for starts at its id.
+  await kindButton(page, "Architecture").click();
+  await node(page, "Page").click({ button: "right" });
+  await menuItem(page, "Trace from Here").click();
+  await chip.locator(".map-flow-chip-label", { hasText: /^From Page$/ }).waitFor();
+  const question = page.locator(".map-flow-question");
+  await question.fill("How is a page drawn?");
+  await question.press("Enter");
+  await node(page, "send").waitFor();
+  const [id] = (await api("api/runs")).runs;
+  assert.deepEqual((await api(`api/run?id=${id}`)).analysis, { kind: "flow", of: pageId });
+
+  // A question not asked yet holds Quit and Send, as a note's draft does, and goes once cleared.
+  await page.evaluate(() => {
+    window.posted = [];
+    window.ipc.postMessage = (message) => window.posted.push(message);
+  });
+  await question.fill("Half a question");
+  await page.locator("#code").click();
+  await page.evaluate(() => window.postil.menu("quit"));
+  const problem = page.locator(".map-flow-problem");
+  await problem.filter({ hasText: /^Trace or clear this question before quitting\.$/ }).waitFor();
+  await page.waitForFunction(() => document.activeElement?.classList.contains("map-flow-question"));
+  assert.deepEqual(await page.evaluate(() => window.posted), []);
+
+  const note = { path: "src/a.rs", lines: { start: 1, end: 1 }, snippet: "fn a() {" };
+  await api("api/notes", {
+    method: "POST",
+    body: JSON.stringify({ ...note, body: "Rename one." }),
+  });
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator("#notes").getByText("Rename one.").waitFor();
+  await page.locator("#send-button").click();
+  await problem.filter({ hasText: /^Trace or clear this question before sending\.$/ }).waitFor();
+  assert.ok(await page.locator("#prompt-preview").isHidden(), "the send step did not open");
+
+  await question.fill("");
+  await page.evaluate(() => window.postil.menu("quit"));
+  assert.deepEqual(await page.evaluate(() => window.posted), ["quit"]);
+});
+
+test("a flow's question is refused in the page, Trace from Here starts at the file, and Delete takes two clicks", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  // No Architecture yet: Flows is open to choose all the same.
+  await kindButton(page, "Flows").click();
+  const question = page.locator(".map-flow-question");
+  const problem = page.locator(".map-flow-problem");
+  await page.locator(".map-flow-trace").click();
+  await problem.filter({ hasText: /^Ask a question/ }).waitFor();
+  await question.fill("q".repeat(301));
+  await question.press("Enter");
+  await problem.filter({ hasText: /not 301\.$/ }).waitFor();
+  assert.deepEqual((await api("api/runs")).runs, [], "no run started");
+
+  await openFile(page, "src/a.rs");
+  await page.locator('#code-rows .ln[data-line="1"] .c').click({ button: "right" });
+  await menuItem(page, "Trace from Here").click();
+  await page.locator(".map-flow-chip", { hasText: /^From src\/a\.rs/ }).waitFor();
+  assert.ok(await problem.isHidden(), "a fresh question has nothing to say yet");
+  await page.waitForFunction(() => document.activeElement?.classList.contains("map-flow-question"));
+  await question.fill("How is a note sent?");
+  await question.press("Enter");
+
+  // The new flow opens, its steps numbered in the order the Analyzer gave them.
+  await node(page, "send").waitFor();
+  const steps = await page
+    .locator("#map .map-node")
+    .evaluateAll((cards) =>
+      cards.map(
+        (card) =>
+          `${card.querySelector(".map-node-step").textContent} ${card.querySelector(".map-node-label").textContent}`,
+      ),
+    );
+  assert.deepEqual(steps, ["1 send", "2 check", "3 apply"]);
+  const [id] = (await api("api/runs")).runs;
+  const run = await api(`api/run?id=${id}`);
+  assert.deepEqual(run.analysis, { kind: "flow", of: "src/a.rs" });
+
+  // One click arms Delete and the pointer leaving its row disarms it; two delete the flow.
+  // WebKit gives a clicked button no focus, so it is the row's mouseleave that disarms here,
+  // not the button's blur (dom.js, `actOnSecondClick`).
+  const row = page.locator(".map-flow-item", {
+    has: page.locator(".map-flow-open", { hasText: /^A flow$/ }),
+  });
+  const remove = row.locator(".map-flow-delete");
+  await remove.click();
+  await remove.filter({ hasText: /^Delete$/ }).waitFor();
+  await question.hover();
+  await remove.filter({ hasText: /^×$/ }).waitFor();
+  await remove.click();
+  await remove.click();
+  await row.waitFor({ state: "detached" });
+  await page.locator(".map-empty", { hasText: /^No flow yet/ }).waitFor();
+  const left = await api("api/analysis");
+  assert.deepEqual(
+    left.diagrams.filter((diagram) => diagram.kind === "flow"),
+    [],
+  );
+});
+
+test("an outdated node is marked, Not on the map lists 20 files of 205, and Update renews both", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+
+  // Page's line goes, and 205 files no node covers are committed, for the Analyzer to read.
+  const { root } = await api("api/repo");
+  writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
+  mkdirSync(join(root, "extra"));
+  for (let n = 0; n < 205; n += 1) {
+    writeFileSync(join(root, `extra/e${String(n).padStart(3, "0")}.rs`), "fn e() {}\n");
+  }
+  execFileSync("git", ["-C", root, "add", "-A"]);
+  execFileSync("git", ["-C", root, "commit", "-q", "-m", "Add extra"]);
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+
+  await page.waitForFunction(() =>
+    document.querySelector('.map-node[data-node-id="D1.1"]')?.classList.contains("outdated"),
+  );
+  const unmapped = page.locator(".map-unmapped");
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 205$/ }).click();
+  assert.equal(await unmapped.locator(".map-unmapped-file").count(), 20);
+  await unmapped.locator(".map-unmapped-more", { hasText: /^and 185 more$/ }).waitFor();
+  await unmapped
+    .locator(".map-unmapped-note", { hasText: /^Update sends at most 200 paths\.$/ })
+    .waitFor();
+
+  // The fake Analyzer places e000 alone: the other 204 stay listed, the diagram's run being
+  // the one that made it, which did not see them.
+  await page.locator(".map-update").click();
+  await node(page, "Renewed").waitFor();
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 204$/ }).waitFor();
+  assert.equal(
+    await unmapped.locator(".map-unmapped-file", { hasText: /^extra\/e000\.rs$/ }).count(),
+    0,
+  );
+
+  // A file in the list opens in the code.
+  await unmapped.locator(".map-unmapped-file", { hasText: /^extra\/e001\.rs$/ }).click();
+  await page.locator("#crumbs b", { hasText: /^e001\.rs$/ }).waitFor();
+
+  // Analyze deeper of a folder no node covers adds a second Architecture at the top, and the
+  // picker chooses between them.
+  await page.locator('#files .dir[data-path="extra"]').click({ button: "right" });
+  await menuItem(page, "Analyze Deeper").click();
+  await page.locator(".map-crumbs b", { hasText: /^Inside$/ }).waitFor();
+  const picker = page.locator(".map-top");
+  assert.deepEqual(await picker.locator("option").allTextContents(), ["System", "Inside"]);
+  await picker.selectOption({ label: "System" });
+  await page.locator(".map-crumbs b", { hasText: /^System$/ }).waitFor();
 });

@@ -97,6 +97,11 @@ const files = fileList({
   openFile: (path) => code.openFile(path),
   menu,
   writeNote: (path, target, options) => pathNote.open(path, target, options),
+  analyzeDeeper: (path) => {
+    showMap();
+    return map.analyzeDeeper(path);
+  },
+  isAnalyzing: () => map.isAnalyzing(),
 });
 
 const code = codeView({
@@ -109,6 +114,10 @@ const code = codeView({
   indexNotes,
   indexMarks,
   openMapNode: openNodeInMap,
+  traceFromHere: (path) => {
+    showMap();
+    map.traceFrom({ of: path, label: path });
+  },
   onActiveLine: syncCodeToMap,
   deleteNote,
   beforeOpen: () => {
@@ -130,8 +139,12 @@ const runs = runPanel({
   statusEl: $("agent-status"),
   detailEl: $("run-detail"),
   onChange: followRun,
-  // An older run was read: the notes sent in it show its status.
-  onLoaded: () => tray.render(),
+  // An older run was read: the notes sent in it show its status, and the map reads an
+  // analysis run that ended before the list of runs saw it live.
+  onLoaded: () => {
+    tray.render();
+    map.runChanged();
+  },
   onError: showToast,
   noteOf: (id) => state.notes.find((note) => note.id === id) ?? null,
   openNote: (id) => noteDetail.open(id),
@@ -229,6 +242,7 @@ const map = diagramView({
   mapEl: $("map"),
   dialogEl: $("node-dialog"),
   runs,
+  menu,
   settings: () => state.settings,
   notes: () => state.notes,
   noteCard: (note) => tray.noteCard(tray.cardOf(note), () => noteDetail.open(note.id)),
@@ -561,6 +575,15 @@ function guardDraft(action) {
   // A draft in an open dialog (a note's text being edited, a follow-up) keeps its dialog,
   // which says why.
   if ([noteDetail, pathNote, runs].some((dialog) => dialog.holdDraft(action))) return true;
+  // A flow's question in the map's box: the box must be in view to be asked or cleared. It
+  // takes the focus last: `welcome.hide` gives it to the code, which would blur the box.
+  if (map.hasDraft()) {
+    for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
+    welcome.hide();
+    showMap();
+    map.holdDraft(action);
+    return true;
+  }
   if (!state.composer?.text.trim()) return false;
   // The note must be in view to be saved or discarded: a dialog over it would make it inert.
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
@@ -792,15 +815,20 @@ function drawMapMode(narrow = layout.isNarrow()) {
   syncCodeToMap();
 }
 
-// Opens the map at node `nodeId` of diagram `diagramId`, a click on its stripe or chip in the
-// code: out of focus mode, and in a narrow window in place of the code.
-function openNodeInMap(diagramId, nodeId) {
+// Shows the map: out of focus mode, opened, and in a narrow window in place of the code.
+function showMap() {
   leaveFocus();
   if (!mapMode.open) setMapOpen(true);
   else if (layout.isNarrow() && mapMode.shows !== "map") {
     mapMode.shows = "map";
     drawMapMode();
   }
+}
+
+// Opens the map at node `nodeId` of diagram `diagramId`, a click on its stripe or chip in the
+// code.
+function openNodeInMap(diagramId, nodeId) {
+  showMap();
   map.revealNode(diagramId, nodeId);
 }
 

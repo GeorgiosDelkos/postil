@@ -1102,7 +1102,6 @@ fn a_scoped_update_changes_only_its_diagram() {
         1,
         "D2 is outside the update"
     );
-    assert_eq!(analysis.diagrams[1].run, RunId(1));
 }
 
 #[test]
@@ -1203,7 +1202,7 @@ fn an_update_keeps_a_diagram_at_200_nodes_and_counts_what_it_passes_over() {
     assert_eq!(diagram.nodes[199].id, NodeId::parse("D1.201").unwrap());
     // D1.2 deleted again, no key, x again, and y past the limit.
     assert_eq!(diagram.dropped.nodes, 4);
-    assert_eq!(diagram.run, RunId(2));
+    assert_eq!(diagram.run, RunId(1), "still the run that made it");
 }
 
 #[test]

@@ -946,10 +946,11 @@ impl Site {
     }
 
     /// The reply to `GET /api/analysis`: the diagrams, each code reference placed where its
-    /// code is now, or `null` when there is no analysis. Reads the analysis file and never
-    /// writes it.
+    /// code is now, with the files not on the map (`analysis::view`), or `null` when there is
+    /// no analysis. Reads the analysis file and never writes it.
     fn analysis(&self) -> Result<Vec<u8>> {
-        let analysis = analysis::current(&*self.repo()?)?;
+        let repo = self.repo()?;
+        let analysis = analysis::current(&repo)?.map(|analysis| analysis::view(&repo, analysis));
         Ok(to_json(&analysis))
     }
 
@@ -994,11 +995,14 @@ impl Site {
     }
 
     /// The reply to `DELETE /api/analysis?diagram=D3`: deletes the diagram, with the diagrams
-    /// below its nodes, and returns the analysis left, placed.
+    /// below its nodes, and returns the analysis left as `GET /api/analysis` does: placed, with
+    /// the files not on the map.
     fn delete_diagram(&self, query: &str) -> Result<Vec<u8>> {
         let id = query_value(query, "diagram")
             .ok_or_else(|| Error::BadRequest("expected ?diagram=<diagram id>".to_owned()))?;
-        Ok(to_json(&analysis::delete(&*self.repo()?, &id)?))
+        let repo = self.repo()?;
+        let left = analysis::delete(&repo, &id)?;
+        Ok(to_json(&analysis::view(&repo, left)))
     }
 
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all

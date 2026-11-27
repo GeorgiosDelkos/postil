@@ -27,6 +27,7 @@ const DEFINITIONS_POLL_MS = 250;
 // - `indexNotes()` derives `noteByLine` and `noteCountByPath` again after the file or the
 //   notes changed, and `indexMarks()` derives `markByLine` after the file changed;
 // - `openMapNode(diagramId, nodeId)` opens the map at a node, a click on its stripe or chip;
+// - `traceFromHere(path)` opens the map's Flows box, to trace a flow from the file at `path`;
 // - `onActiveLine()` follows a change of the line the map follows (`activeLine`);
 // - `deleteNote(note)` deletes a note, from the right-click menu;
 // - `beforeOpen()` clears what covers the code pane before a file opens there;
@@ -44,6 +45,7 @@ export function codeView({
   indexNotes,
   indexMarks,
   openMapNode,
+  traceFromHere,
   onActiveLine,
   deleteNote,
   beforeOpen,
@@ -673,6 +675,13 @@ export function codeView({
         run: () => copyText(text),
       },
       { label: "Copy Reference", detail: reference, run: () => copyText(reference) },
+      // From the file, not its lines: a flow starts at a node or a path
+      // (src/analysis/prompt.rs, `subject`).
+      {
+        label: "Trace from Here",
+        detail: state.file.path,
+        run: () => traceFromHere(state.file.path),
+      },
     ];
     if (name) {
       actions.push({

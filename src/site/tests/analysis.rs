@@ -800,7 +800,7 @@ fn analyze_deeper_replaces_only_its_branch() {
     assert_eq!(diagram(&analysis, "D7")["parent"], "D1.4");
     let flow = diagram(&analysis, "D8");
     assert_eq!(flow["parent"], serde_json::Value::Null);
-    assert_eq!(labels(flow), ["D8.1 first", "D8.2 second", "D8.3 third"]);
+    assert_eq!(labels(flow), ["D8.1 send", "D8.2 check", "D8.3 apply"]);
 
     // A file goes under the Architecture node with the nearest reference to it: D1.1, D4.1, D6.1
     // and D7.1 cite src/a.rs itself, D1.4 its folder, the flow's nodes (no Architecture) the
@@ -862,12 +862,19 @@ fn deleting_a_diagram_takes_its_children() {
         let id = analyze(&site, &body);
         analyzed(&site, &nudges, &id);
     }
+    repo.write("tools/x.rs", "fn x() {}\n");
+    repo.commit();
 
     let (status, reply) = delete(&site, &format!("{ANALYSIS}?diagram=D3"));
 
     assert_eq!(status, StatusCode::OK, "{reply}");
     let left: serde_json::Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(diagram_ids(&left), ["D1", "D2"]);
+    // As a read gives it, which the page draws without reading again.
+    assert_eq!(
+        left["unmapped"],
+        serde_json::json!({ "D1": { "files": ["tools/x.rs"], "total": 1 } })
+    );
     assert_eq!(diagram_ids(&get_json(&site, ANALYSIS)), ["D1", "D2"]);
     for (query, status) in [
         ("?diagram=D3", StatusCode::NOT_FOUND),
@@ -946,7 +953,7 @@ fn update_replaces_only_outdated_nodes() {
         ["D1.1 Renewed", "D1.3 Store", "D1.4 Process", "D1.5 Added"]
     );
     assert_eq!(edge_ends(top), ["D1.5 -> D1.1"]);
-    assert_eq!(top["run"], id);
+    assert_eq!(top["run"], first, "still the run that made it");
     // The first run's counts, and the update's added to them: two nodes it may not change, an
     // edge to no node, a group that names none, a summary over the limit.
     assert_eq!(
@@ -957,6 +964,10 @@ fn update_replaces_only_outdated_nodes() {
         })
     );
     assert_eq!(top["nodes"][0]["anchors"][0]["state"], "found");
+
+    // The new node placed tools/c.rs, so it is on the map; D1 is still its first run's.
+    assert_eq!(top["nodes"][3]["anchors"][0]["path"], "tools/c.rs");
+    assert_eq!(analysis["unmapped"], serde_json::Value::Null);
 
     // Brought up to date: nothing left to update.
     let (status, body) = post(&site, UPDATE, "");
@@ -974,13 +985,37 @@ fn update_replaces_only_outdated_nodes() {
         serde_json::json!(["D1.1"]),
         "{run}"
     );
+}
 
-    // So are files added alone: the prompt holds the top-level Architecture, which places them,
-    // and not the Data diagram, which has nothing to update. It names 200 of the 201, sorted.
+#[test]
+fn update_caps_the_new_files() {
+    let repo = analyzed_repo("analysis-update-caps");
+    let (site, nudges) = run_site(&repo, "analysis");
+    let first = analyze(&site, &serde_json::json!({ "kind": "analyze" }));
+    analyzed(&site, &nudges, &first);
+    assert_eq!(
+        get_json(&site, ANALYSIS)["unmapped"],
+        serde_json::Value::Null
+    );
+
+    // 201 files no node covers, and one under the folder D1.4 cites; a.txt was there before.
     for n in 0..201 {
         repo.write(&format!("tools/e{n:03}.rs"), "fn e() {}\n");
     }
+    repo.write("src/d.rs", "fn d() {}\n");
     repo.commit();
+
+    // The page lists 20 of them and counts them all, for the top-level Architecture alone.
+    let unmapped = get_json(&site, ANALYSIS)["unmapped"].clone();
+    let listed: Vec<String> = (0..20).map(|n| format!("tools/e{n:03}.rs")).collect();
+    assert_eq!(
+        unmapped,
+        serde_json::json!({ "D1": { "files": listed, "total": 201 } })
+    );
+
+    // Files added alone are enough to update: the prompt holds the top-level Architecture,
+    // which places them, and not the Data diagram, which has nothing to update. It names 200 of
+    // the 201, sorted.
     let placing = analyze_update(&site, "");
     let run = analyzed(&site, &nudges, &placing);
     assert_eq!(
@@ -996,6 +1031,105 @@ fn update_replaces_only_outdated_nodes() {
     assert!(!prompt.contains("tools/e200.rs"), "{prompt}");
     assert!(prompt.contains("\nDiagram D1 "), "{prompt}");
     assert!(!prompt.contains("Diagram D2"), "{prompt}");
+    // The update placed e000 in its one new node. D1 is still its first run's, which did not
+    // see the others: the 200 left stay listed, e200 among them, though the update saw them
+    // all, and a second update is sent them.
+    let after = get_json(&site, ANALYSIS);
+    assert_eq!(diagram(&after, "D1")["run"], first);
+    let listed: Vec<String> = (1..21).map(|n| format!("tools/e{n:03}.rs")).collect();
+    assert_eq!(
+        after["unmapped"],
+        serde_json::json!({ "D1": { "files": listed, "total": 200 } })
+    );
+    let again = analyze_update(&site, "");
+    let run = analyzed(&site, &nudges, &again);
+    let prompt = prompt_of(&run);
+    assert!(prompt.contains("- tools/e200.rs\n"), "{prompt}");
+    assert!(!prompt.contains("- tools/e000.rs"), "placed: {prompt}");
+}
+
+#[test]
+fn a_flow_keeps_its_step_order() {
+    let repo = analyzed_repo("analysis-flow-order");
+    let (site, nudges) = run_site(&repo, "analysis");
+    let first = analyze(&site, &serde_json::json!({ "kind": "analyze" }));
+    analyzed(&site, &nudges, &first);
+
+    // From a node: the fake Analyzer's steps are send, check and apply, in neither the keys'
+    // order nor the edges', which loop back from apply to send.
+    let body = serde_json::json!({ "kind": "flow", "of": "D1.1", "question": "How?" });
+    let id = analyze(&site, &body);
+    let run = analyzed(&site, &nudges, &id);
+
+    assert_eq!(
+        run["analysis"],
+        serde_json::json!({ "kind": "flow", "of": "D1.1" })
+    );
+    assert!(
+        prompt_of(&run).contains("How?\n\nStart from the node D1.1 of the analysis, \"Page\""),
+        "{run}"
+    );
+    let analysis = get_json(&site, ANALYSIS);
+    let flow = diagram(&analysis, "D3");
+    assert_eq!(flow["kind"], "flow");
+    assert_eq!(labels(flow), ["D3.1 send", "D3.2 check", "D3.3 apply"]);
+    assert_eq!(
+        edge_ends(flow),
+        ["D3.1 -> D3.2", "D3.2 -> D3.3", "D3.3 -> D3.1"]
+    );
+}
+
+#[test]
+fn deeper_on_a_folder_finds_its_parent() {
+    let repo = analyzed_repo("analysis-deeper-folder");
+    repo.write("src/sub/leaf/x.rs", "fn x() {}\n");
+    repo.write("tools/t.rs", "fn t() {}\n");
+    let (site, nudges) = run_site(&repo, "analysis");
+    // Two nested Architecture folders above src/sub/leaf, the outer one first; a node of
+    // another kind on the folder itself, and an Architecture node whose citation of it never
+    // matched.
+    let folder = |path: &str| format!(r#"{{"path": "{path}", "target": "folder"}}"#);
+    let node = |id: &str, anchor: &str| {
+        format!(
+            r#"{{"id": "{id}", "kind": "component", "label": "l", "summary": "s", "detail": "d",
+                "anchors": [{anchor}]}}"#
+        )
+    };
+    let analysis = format!(
+        r#"{{"version": 2, "diagrams": [
+          {{"id": "D1", "kind": "architecture", "title": "Top", "run": "R90",
+            "nodes": [{}, {}, {}], "edges": []}},
+          {{"id": "D2", "kind": "data", "title": "Types", "run": "R90",
+            "nodes": [{}], "edges": []}}]}}"#,
+        node("D1.1", &folder("src")),
+        node("D1.2", &folder("src/sub")),
+        node("D1.3", r#"{"path": "src/sub/leaf", "state": "unverified"}"#),
+        node("D2.1", &folder("src/sub/leaf")),
+    );
+    let file = site.repo().unwrap().analysis_file();
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, analysis).unwrap();
+
+    let parent_of_run = |of: &str| {
+        let id = analyze(&site, &serde_json::json!({ "kind": "deeper", "of": of }));
+        let run = analyzed(&site, &nudges, &id);
+        assert_eq!(run["problem"], serde_json::Value::Null, "{of}: {run}");
+        let analysis = get_json(&site, ANALYSIS);
+        let made = analysis["diagrams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagram| diagram["run"] == id)
+            .unwrap_or_else(|| panic!("{of}: no diagram of {id} in {analysis}"))
+            .clone();
+        made["parent"].clone()
+    };
+
+    // Under the node of the nearest Architecture folder above it: the Data node on the folder
+    // itself and the citation that never matched it do not count.
+    assert_eq!(parent_of_run("src/sub/leaf"), "D1.2");
+    // A folder no node covers is allowed, at the top level.
+    assert_eq!(parent_of_run("tools"), serde_json::Value::Null);
 }
 
 /// What the fake agent of `run` says it got: its prompt.
@@ -1031,6 +1165,10 @@ fn concurrent_and_refused_analysis_runs() {
     let (status, body) = post(&site, ANALYSIS, r#"{"kind": "analyze"}"#);
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("under way"), "{body}");
+    // An update too, though there is no analysis to update yet: refused for the run under way,
+    // not for the analysis it has not written.
+    let (status, body) = post(&site, UPDATE, "");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     under_way(&site, &nudges, &id);
     let (status, body) = post(&site, ANALYSIS, r#"{"kind": "deeper", "of": "src"}"#);
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -1053,6 +1191,21 @@ fn concurrent_and_refused_analysis_runs() {
     let mut ids = diagram_ids(&analysis);
     ids.sort();
     assert_eq!(ids, ["D3", "D4"], "{analysis}");
+
+    // An update while an update runs: refused, and no run starts.
+    repo.write("src/a.rs", "fn a() {\n}\n");
+    set_agents(&site, &[("Fake", &fake_agent("hang"))], "Fake");
+    let updating = analyze_update(&site, "");
+    under_way(&site, &nudges, &updating);
+    let runs = get_json(&site, RUNS)["runs"].clone();
+    let (status, body) = post(&site, UPDATE, "");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("under way"), "{body}");
+    assert_eq!(get_json(&site, RUNS)["runs"], runs, "no run");
+    stop_run(&site, &updating);
+    site.runner().unwrap().backdate_stop();
+    stop_run(&site, &updating);
+    analyzed(&site, &nudges, &updating);
 
     // An analyzer that is not installed is refused before a thread is made.
     set_agents(&site, &[("Fake", "/nonexistent/agent-bin")], "Fake");

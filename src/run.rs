@@ -662,15 +662,24 @@ impl Runner {
                 agent.name
             )));
         }
+        let under_way = || {
+            Error::AnalysisRefused(
+                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
+            )
+        };
+        // Checked before the plan too, which reads the analysis the run under way has not
+        // written yet (an update would be refused as having nothing to update) and runs git for
+        // an update; and again under the slots' lock below, which a run may have taken since.
+        if self.analyzing() {
+            return Err(under_way());
+        }
         let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
         self.home.as_deref().ok_or(Error::NoHome)?;
         thread::all(&self.repo)?;
         let Planned { run, title, prompt } = analysis::plan(&self.repo, job)?;
         let slots = self.slots();
         if slots.analyzing() {
-            return Err(Error::AnalysisRefused(
-                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
-            ));
+            return Err(under_way());
         }
         let new = NewRun {
             agent,

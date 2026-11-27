@@ -53,7 +53,7 @@
 //! reads that block as the run's turn ends well, checks every citation against the run's
 //! worktree, applies the limits, and only then takes [`lock`], loads, merges and saves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io;
@@ -66,6 +66,7 @@ use crate::anchor::{LineRange, Target, TargetKind, locate_lines};
 use crate::error::{Error, Result};
 use crate::files::{self, save_json, version_of};
 use crate::repo::{MAX_READ, PathKind, Repo};
+use crate::thread;
 
 mod merge;
 mod prompt;
@@ -520,6 +521,145 @@ pub(crate) fn delete(repo: &Repo, id: &str) -> Result<Analysis> {
     Ok(analysis)
 }
 
+/// The most paths not on the map that [`view`] lists for a diagram; it counts them all.
+/// Arbitrary, from the plan (docs/review-assist-plan.md, 8.5): a repository of generated files
+/// can add thousands, which nobody reads in a list, and the page reads the analysis on every
+/// focus of its window.
+const MAX_UNMAPPED_SHOWN: usize = 20;
+
+/// `analysis` as `GET /api/analysis` and `DELETE /api/analysis` return it: with the files not
+/// on each of its top-level Architecture diagrams ([`unmapped`]), 20 of them and their count.
+/// Runs no git command when no such diagram's run is in the record of threads (an analysis
+/// written by hand).
+///
+/// What cannot be worked out lists nothing rather than fail the read: a failed read offers
+/// Start over, which would move an analysis that is fine to the Trash. So the record of
+/// threads that cannot be read, a diagram's commit gone from the repository (a history
+/// rewritten since), or a file list git fails to give leave the diagrams without the list.
+pub(crate) fn view(repo: &Repo, analysis: Analysis) -> AnalysisView {
+    let unmapped = unmapped(repo, &analysis).unwrap_or_default();
+    AnalysisView { analysis, unmapped }
+}
+
+/// The files not on each top-level Architecture diagram whose run is in the record, by diagram:
+/// those with any.
+fn unmapped(repo: &Repo, analysis: &Analysis) -> Result<BTreeMap<DiagramId, Unmapped>> {
+    let seen = seen_by(repo, analysis, None)?;
+    if seen.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let uncovered = uncovered(repo, analysis)?;
+    Ok(seen
+        .into_iter()
+        .filter_map(|Seen { diagram, files }| {
+            let new: Vec<&String> = uncovered.iter().filter(|f| !files.contains(*f)).collect();
+            let unmapped = Unmapped {
+                total: new.len(),
+                files: new.into_iter().take(MAX_UNMAPPED_SHOWN).cloned().collect(),
+            };
+            (unmapped.total > 0).then_some((diagram, unmapped))
+        })
+        .collect())
+}
+
+/// The files in the file list that no verified reference of the analysis covers and that
+/// were added since the run of a top-level Architecture diagram in scope (every diagram for
+/// `None`): what an update asks to place. A diagram whose run has no thread in the record (an
+/// analysis written by hand) adds nothing: every file would read as new. Sorted, as
+/// [`Repo::files`] lists them.
+///
+/// # Errors
+///
+/// As [`thread::all`] and [`Repo::files`].
+fn off_the_map(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result<Vec<String>> {
+    let mut seen = seen_by(repo, analysis, scope)?
+        .into_iter()
+        .map(|seen| seen.files);
+    let Some(first) = seen.next() else {
+        return Ok(Vec::new());
+    };
+    // A file is new when some diagram's run did not see it: known are the files all saw.
+    let known = seen.fold(first, |known, files| {
+        known.intersection(&files).cloned().collect()
+    });
+    Ok(uncovered(repo, analysis)?
+        .into_iter()
+        .filter(|file| !known.contains(file))
+        .collect())
+}
+
+/// The files a top-level Architecture diagram's run saw: those of the commit its thread
+/// started from.
+struct Seen {
+    diagram: DiagramId,
+    files: HashSet<String>,
+}
+
+/// What each top-level Architecture diagram in scope (every one for `None`) saw, for those
+/// whose run is in the record of threads. Reads the record once, and lists one commit per
+/// diagram; none of either when no diagram is in scope.
+fn seen_by(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result<Vec<Seen>> {
+    let roots: Vec<&Diagram> = analysis
+        .diagrams
+        .iter()
+        .filter(|diagram| scope.is_none_or(|id| diagram.id == id))
+        .filter(|diagram| diagram.kind == DiagramKind::Architecture && diagram.parent.is_none())
+        .collect();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = thread::all(repo)?;
+    let mut seen = Vec::new();
+    for diagram in roots {
+        let run = diagram.run.to_string();
+        let Some(thread) = threads.iter().find(|thread| thread.id == run) else {
+            continue;
+        };
+        // A commit gone from the repository (a history rewritten since) gives no list, so
+        // nothing reads as new.
+        let Ok(files) = repo.files_at(&thread.fork) else {
+            continue;
+        };
+        seen.push(Seen {
+            diagram: diagram.id,
+            files,
+        });
+    }
+    Ok(seen)
+}
+
+/// The files in the file list that no verified reference of `analysis` covers, one to the file
+/// or to a folder above it. Sorted, as [`Repo::files`] lists them. Looks each file and the
+/// folders above it up in a set of the cited paths, so it costs the files times their depth,
+/// not the files times the references.
+///
+/// # Errors
+///
+/// As [`Repo::files`].
+fn uncovered(repo: &Repo, analysis: &Analysis) -> Result<Vec<String>> {
+    let cited: HashSet<&str> = analysis
+        .diagrams
+        .iter()
+        .flat_map(|diagram| {
+            let nodes = diagram.nodes.iter().flat_map(|node| &node.anchors);
+            nodes.chain(diagram.edges.iter().filter_map(|edge| edge.anchor.as_ref()))
+        })
+        .filter(|anchor| matches!(anchor.detail, RefDetail::Verified { .. }))
+        .map(|anchor| anchor.path.as_str())
+        .collect();
+    let covered = |file: &str| {
+        cited.contains(file)
+            || file
+                .match_indices('/')
+                .any(|(slash, _)| cited.contains(&file[..slash]))
+    };
+    Ok(repo
+        .files()?
+        .into_iter()
+        .filter(|file| !covered(file))
+        .collect())
+}
+
 /// Follows the groups from `node` up: each must be a node of `diagram`, and the walk must end
 /// within as many steps as there are nodes, or it loops.
 fn check_group(
@@ -563,6 +703,34 @@ impl Analysis {
                 .filter_map(|edge| edge.anchor.as_mut());
             nodes.chain(edges)
         })
+    }
+}
+
+/// The analysis as `GET /api/analysis` returns it ([`view`]): the diagrams, and the files not
+/// on them by diagram, worked out on each read and never stored, so `analysis.json` does not
+/// change.
+#[derive(Debug, Serialize)]
+pub(crate) struct AnalysisView {
+    #[serde(flatten)]
+    analysis: Analysis,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    unmapped: BTreeMap<DiagramId, Unmapped>,
+}
+
+/// The files not on a diagram (docs/review-assist.md, "Outdated nodes and Update"): the first
+/// [`MAX_UNMAPPED_SHOWN`] of them, sorted, and how many there are. Its `Debug` counts them.
+#[derive(Serialize)]
+struct Unmapped {
+    files: Vec<String>,
+    total: usize,
+}
+
+impl fmt::Debug for Unmapped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Unmapped")
+            .field("shown", &self.files.len())
+            .field("total", &self.total)
+            .finish_non_exhaustive()
     }
 }
 
@@ -790,8 +958,9 @@ pub(crate) struct CitedLines {
     end: usize,
 }
 
-/// A diagram's id, written `D1`: stable, shown in the page and sent to the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A diagram's id, written `D1`: stable, shown in the page and sent to the agent. Ordered by
+/// number, so the files not on the map list by diagram in one order (`AnalysisView`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) struct DiagramId(u32);
 

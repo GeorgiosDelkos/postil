@@ -433,7 +433,7 @@ fn apply(
             let made = first_built(checked, DiagramId(next), DiagramKind::Flow, None, run)?;
             analysis.diagrams.push(made);
         }
-        AnalysisKind::Update => update(analysis, checked, run, asked)?,
+        AnalysisKind::Update => update(analysis, checked, asked)?,
     }
     // An update may delete every node of a diagram: one with none is no diagram.
     analysis
@@ -648,12 +648,7 @@ fn break_group_loops(nodes: &mut [Node]) -> usize {
 /// # Errors
 ///
 /// [`EMPTY`] when no diagram changed.
-fn update(
-    analysis: &mut Analysis,
-    checked: Checked,
-    run: RunId,
-    asked: &AnalysisRun,
-) -> Result<(), String> {
+fn update(analysis: &mut Analysis, checked: Checked, asked: &AnalysisRun) -> Result<(), String> {
     let scope = asked.of.as_deref().and_then(DiagramId::parse);
     let mut changed = false;
     for raw in checked.diagrams {
@@ -670,7 +665,7 @@ fn update(
         else {
             continue;
         };
-        changed |= update_one(diagram, raw, run, &asked.nodes);
+        changed |= update_one(diagram, raw, &asked.nodes);
     }
     if !changed {
         return Err(EMPTY.to_owned());
@@ -680,8 +675,15 @@ fn update(
 
 /// Applies an update's changes to `diagram`: deletes and replaces only the nodes in
 /// `outdated`, adds nodes and edges, and counts what it passed over. Returns whether it changed
-/// anything; then the diagram is run `run`'s.
-fn update_one(diagram: &mut Diagram, raw: CheckedDiagram, run: RunId, outdated: &[NodeId]) -> bool {
+/// anything.
+///
+/// The diagram's `run` stays the run that made it (main session, 2026-11-27): "Not on the map"
+/// counts the files added since that run's commit (`analysis::off_the_map`), so a file an
+/// update did not place stays listed until one places it, where moving `run` to the update's
+/// would drop every file the update saw from the list for good. The downside accepted: the
+/// update's own log is kept only while a run names it, so it goes at the next delete of a note
+/// (`analysis::runs_named`).
+fn update_one(diagram: &mut Diagram, raw: CheckedDiagram, outdated: &[NodeId]) -> bool {
     let mut dropped = raw.dropped;
     // Before the deletions: a deleted node's id is never given again, or a diagram below it and
     // an edge the reply names it in would land on the new node.
@@ -734,9 +736,6 @@ fn update_one(diagram: &mut Diagram, raw: CheckedDiagram, run: RunId, outdated: 
         changed = true;
     }
     changed |= join(diagram, &by_key, groups, raw.edges, &mut dropped);
-    if changed {
-        diagram.run = run;
-    }
     diagram.dropped.add(dropped);
     changed
 }

@@ -4542,11 +4542,6 @@ body.focus-mode .code {
   color: var(--text-strong);
 }
 
-.map-kind:disabled {
-  opacity: var(--disabled-opacity);
-  cursor: default;
-}
-
 .map-search {
   flex: 1;
   min-width: 120px;
@@ -4554,12 +4549,181 @@ body.focus-mode .code {
   padding: 0 8px;
 }
 
-.map-flow {
+.map-top {
   height: 26px;
 }
 
 .map-update {
   height: 26px;
+}
+
+/* The Flows list: the box that asks for a flow, then a row per flow. */
+.map-flows {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.map-flow-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.map-flow-question {
+  flex: 1;
+  min-width: 120px;
+  height: 26px;
+  padding: 0 8px;
+}
+
+.map-flow-trace {
+  height: 26px;
+}
+
+.map-flow-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 40%;
+  padding: 0 4px 0 8px;
+  height: 22px;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--map);
+  border-radius: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* The label gives way to the ×, which stays whole. */
+.map-flow-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-flow-chip-clear {
+  flex: none;
+}
+
+.map-flow-chip-clear,
+.map-flow-delete {
+  padding: 0 4px;
+  background: none;
+  border: 0;
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.map-flow-chip-clear:hover,
+.map-flow-delete:hover {
+  color: var(--text-strong);
+}
+
+.map-flow-problem {
+  margin: 0;
+  color: var(--attention);
+  font-size: 12px;
+}
+
+.map-flow-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.map-flow-list:empty {
+  display: none;
+}
+
+.map-flow-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+}
+
+.map-flow-item:hover {
+  background: var(--hover);
+}
+
+.map-flow-open {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  background: none;
+  border: 0;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.map-flow-open[aria-current="true"] {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+/* The first click of Delete arms it, as a note card's does. */
+.map-flow-item.confirming .map-flow-delete {
+  color: var(--attention);
+}
+
+/* Not on the map: the files added since the diagram's run that no node covers. */
+.map-unmapped {
+  flex: none;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.map-unmapped-title {
+  color: var(--note);
+  cursor: pointer;
+}
+
+.map-unmapped-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 160px;
+  margin-top: 4px;
+  overflow-y: auto;
+}
+
+.map-unmapped-file {
+  padding: 2px 6px;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-soft);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.map-unmapped-file:hover {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+.map-unmapped-more,
+.map-unmapped-note {
+  margin: 4px 0 0;
+  color: var(--text-muted);
 }
 
 .map-run {
@@ -4738,6 +4902,25 @@ body.focus-mode .code {
   fill: var(--note);
 }
 
+/* Its code moved or went since the analysis: dashed in the note color, which Update fixes. A
+   boundary is marked as a card is. */
+.map-node.outdated .map-node-box,
+.map-group.outdated .map-group-box {
+  stroke: var(--note);
+  stroke-dasharray: 4 3;
+}
+
+.map-group.unverified .map-group-box {
+  stroke-dasharray: 4 3;
+}
+
+/* A flow's step number, before the label. */
+.map-node-step {
+  fill: var(--map);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
 /* A search match, or the node of the code pane's line. */
 .map-node.ringed .map-node-box {
   stroke: var(--accent);
@@ -4754,6 +4937,13 @@ body.focus-mode .code {
 body.keyboard-input .map-node:focus .map-node-box {
   stroke: var(--map);
   stroke-width: 2.5;
+}
+
+/* Analyze deeper and Trace from here, in a node's dialog. */
+.node-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .node-show,

@@ -22,22 +22,24 @@ export const ZOOM_MAX = 2;
 const SPACING = { nodesep: 28, ranksep: 52, marginx: 24, marginy: 24 };
 
 // The layout of `diagram` by `dagre` (the vendored window.dagre, ui/vendor/). The coordinates
-// are kept in `cache` by the diagram's id and the run that made it: only a run writes a
-// diagram's nodes and edges (src/analysis/merge.rs), and a node's box has a fixed size. The
-// nodes and edges themselves are this call's: every read of `api/analysis` places their code
-// references again, so a reference that moved has new lines under the same run.
+// are kept in `cache` by the diagram's id and the run that made it, while its shape (its
+// nodes, their groups, and its edges in order) stays as it was laid out: an Update keeps the
+// diagram's run (src/analysis/merge.rs, `update_one`) and may add, delete or regroup nodes and
+// edges, and a node's box has a fixed size. The nodes and edges themselves are this call's:
+// every read of `api/analysis` places their code references again, so a reference that moved
+// has new lines in the same shape.
 // Returns `{ width, height, nodes, groups, edges, byId }`: `nodes` the cards and `groups` the
 // boundaries with children, each `{ id, node, x, y, width, height }` with (x, y) its top left;
 // `edges` each `{ edge, points }`; `byId` every node and group by id.
 export function layoutDiagram(diagram, dagre, cache) {
   const key = `${diagram.id}:${diagram.run}`;
+  const shape = JSON.stringify([
+    diagram.nodes.map((node) => [node.id, node.group ?? null]),
+    diagram.edges.map((edge) => [edge.from, edge.to]),
+  ]);
   let geometry = cache.get(key);
-  const fits =
-    geometry &&
-    geometry.points.length === diagram.edges.length &&
-    diagram.nodes.every((node) => geometry.boxes.has(node.id));
-  if (!fits) {
-    geometry = layoutWith(diagram, dagre);
+  if (geometry?.shape !== shape) {
+    geometry = { ...layoutWith(diagram, dagre), shape };
     cache.set(key, geometry);
   }
 
@@ -159,6 +161,23 @@ export function nodeState(node) {
 // it has none.
 export function firstFound(node) {
   return node.anchors.find((anchor) => anchor.state === "found") ?? null;
+}
+
+// The longest question a flow takes, in characters (src/analysis/prompt.rs, `MAX_QUESTION`),
+// and the most files not on the map an update sends (`MAX_NEW_FILES` there).
+export const MAX_FLOW_QUESTION = 300;
+export const MAX_UPDATE_FILES = 200;
+
+// Why `text` is no flow's question, in words, or null when it is one: 1 to 300 characters once
+// trimmed, counted as the route counts them (`chars`, Unicode scalar values), so an emoji is one
+// character where `length` would count two.
+export function checkFlowQuestion(text) {
+  const length = [...text.trim()].length;
+  if (length === 0) return "Ask a question: how does something happen?";
+  if (length > MAX_FLOW_QUESTION) {
+    return `A flow's question is at most ${MAX_FLOW_QUESTION} characters, not ${length}.`;
+  }
+  return null;
 }
 
 // What the map's header says of `diagram`: its node count, how many are unverified and
