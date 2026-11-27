@@ -20,12 +20,13 @@ pub(crate) enum Command {
     SetupWizard,
     Quit,
     FocusMode,
+    Files,
     Map,
     MapMarkers,
 }
 
 impl Command {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
@@ -35,6 +36,7 @@ impl Command {
         Self::SetupWizard,
         Self::Quit,
         Self::FocusMode,
+        Self::Files,
         Self::Map,
         Self::MapMarkers,
     ];
@@ -51,6 +53,7 @@ impl Command {
             Self::SetupWizard => "setup-wizard",
             Self::Quit => "quit",
             Self::FocusMode => "focus-mode",
+            Self::Files => "files",
             Self::Map => "map",
             Self::MapMarkers => "map-markers",
         }
@@ -141,8 +144,9 @@ fn build() -> muda::Result<Menu> {
         "View",
         true,
         &[
-            &Command::Usage.item("Usage…", shift_command(Code::KeyU)),
+            &Command::Files.item("Files", command(Code::KeyB)),
             &Command::Map.item("Map", shift_command(Code::KeyM)),
+            &Command::Usage.item("Usage…", shift_command(Code::KeyU)),
             // A plain item, not a check item: muda ticks a check item before the page hears of
             // the click, and the page's session flag resets with every reload, so a tick would
             // drift from what the code shows.

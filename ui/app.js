@@ -268,8 +268,14 @@ const noteDetail = noteDialog($("note-dialog"), {
   canSend: (note) =>
     tray.canSendAlone() && !isResolved(note) && !isAsk(note) && !tray.inLiveRun(note),
   agent: () => state.settings?.agent?.name ?? null,
-  showInCode: (note) =>
-    note.target === "folder" ? files.showFolder(note.path) : code.showNote(note),
+  showInCode: (note) => {
+    if (note.target === "folder") {
+      showFiles();
+      files.showFolder(note.path);
+    } else {
+      code.showNote(note);
+    }
+  },
   send: (note, options) => tray.sendAlone(note, options),
   remove: deleteNote,
   resolve: (note) => changeNote("resolve", note),
@@ -309,6 +315,9 @@ const pathNote = pathNoteDialog($("path-note-dialog"), {
 // the map and the code a window too narrow for both shows (ui/panes.js, `fit`).
 const mapMode = { open: false, shows: "map" };
 
+// Whether the file list drawer shows beside the activity bar (View > Files, Cmd-B).
+let filesOpen = true;
+
 const layout = dividers({ onNarrow: drawMapMode });
 
 const map = diagramView({
@@ -321,8 +330,12 @@ const map = diagramView({
   noteCard: (note) => tray.noteCard(tray.cardOf(note), () => noteDetail.open(note.id)),
   showAnchor: (anchor) => {
     showCode();
-    if (anchor.target === "folder") files.showFolder(anchor.path);
-    else code.showAnchor(anchor);
+    if (anchor.target === "folder") {
+      showFiles();
+      files.showFolder(anchor.path);
+    } else {
+      code.showAnchor(anchor);
+    }
   },
   writeNote: writeOnAnchor,
   showChangesAt,
@@ -752,6 +765,7 @@ async function runVoiceCommand(transcript) {
         await code.openFile(matches[0].path);
       } else {
         leaveFocus();
+        showFiles();
         filterEl.value = cmd.query;
         filterEl.dispatchEvent(new Event("input"));
         filterEl.focus();
@@ -1084,6 +1098,7 @@ window.postil = {
       wizard.open();
     } else if (command === "usage") usage.open();
     else if (command === "focus-mode") toggleFocus();
+    else if (command === "files") toggleFiles();
     else if (command === "map") toggleMap();
     else if (command === "map-markers") toggleMapMarkers();
     else if (command === "close-window" || command === "quit") quit();
@@ -1160,6 +1175,37 @@ function movePanes(change) {
 function inFocus() {
   return document.body.classList.contains("focus-mode");
 }
+
+// ---- Files drawer -------------------------------------------------------------------------
+
+function setFilesOpen(open, { animate = true } = {}) {
+  if (filesOpen === open) return;
+  filesOpen = open;
+  if (!open) liveQuotas.closePopover();
+  const apply = () => {
+    document.body.classList.toggle("files-collapsed", !open);
+    $("toggle-files").setAttribute("aria-pressed", String(open));
+    layout.setFilesOpen(open);
+  };
+  if (animate) movePanes(apply);
+  else apply();
+  if (!open && $("sidebar").contains(document.activeElement)) codeEl.focus();
+}
+
+function showFiles() {
+  leaveFocus();
+  setFilesOpen(true, { animate: false });
+}
+
+function toggleFiles() {
+  if (welcome.isShown()) return;
+  const hidden = inFocus();
+  leaveFocus();
+  if (hidden) setFilesOpen(true);
+  else setFilesOpen(!filesOpen);
+}
+
+$("toggle-files").addEventListener("click", toggleFiles);
 
 // ---- The map ------------------------------------------------------------------------------
 
@@ -1261,8 +1307,8 @@ async function writeOnAnchor(anchor, intent) {
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
 function goToFile() {
   if (welcome.isShown()) return;
-  // The filter is in the file list, which focus mode hides.
-  leaveFocus();
+  // The filter is in the file list, which focus mode or a collapsed drawer hides.
+  showFiles();
   filterEl.focus();
   filterEl.select();
 }

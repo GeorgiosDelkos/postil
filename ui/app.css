@@ -179,10 +179,17 @@ body {
 body {
   margin: 0;
   display: grid;
-  /* The side panes' widths are set by ui/app.js from the kept layout (ui/panes.js); these
-     are the defaults, as in src/layout.rs. */
-  grid-template-columns: var(--sidebar-width, 248px) minmax(0, 1fr) var(--tray-width, 320px);
-  gap: 8px;
+  /* Row 1 is the slim window titlebar (holds macOS traffic lights); row 2 holds the left
+     activity rail + collapsible file list, the code/map pane, and the tray. The side panes'
+     widths are set by ui/app.js from the kept layout (ui/panes.js); these are the defaults,
+     as in src/layout.rs. */
+  grid-template-rows: 38px minmax(0, 1fr);
+  grid-template-columns:
+    calc(var(--rail-width, 48px) + var(--sidebar-drawn-width, 248px))
+    minmax(0, 1fr)
+    var(--tray-width, 320px);
+  column-gap: 8px;
+  row-gap: 0;
   padding: 0 8px 0 0;
   overflow: hidden;
   background: var(--canvas);
@@ -231,24 +238,144 @@ kbd {
   border-color: var(--accent);
 }
 
-/* Sidebar */
+/* Titlebar, Activity Bar & Sidebar */
 
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
+/* The window buttons sit over this strip; src/shell.rs places them. Negative right margin
+   cancels body's 8 px right padding so the bar runs edge to edge. */
+.titlebar {
+  grid-column: 1 / -1;
+  height: 38px;
+  margin-right: -8px;
   background: var(--chrome);
-  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
-/* The window buttons sit over this strip; src/shell.rs places them. */
+/* Kept for the welcome screen, which covers the whole window. */
 .drag-strip {
-  height: 44px;
+  height: 38px;
   flex: none;
 }
 
+.left-rail {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  background: var(--chrome);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.activity-bar {
+  flex: none;
+  width: var(--rail-width, 48px);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+}
+
+.activity-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.activity-btn {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background-color 80ms linear,
+    color 80ms linear;
+}
+
+.activity-btn:hover {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+.activity-btn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.activity-btn[aria-pressed="true"] {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+.activity-btn[aria-pressed="true"]::before {
+  content: "";
+  position: absolute;
+  left: -6px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+.activity-btn-map[aria-pressed="true"] {
+  background: var(--map-wash);
+  color: var(--map);
+}
+
+.activity-btn-map[aria-pressed="true"]::before {
+  background: var(--map);
+}
+
+.activity-btn-map[aria-pressed="true"]:hover {
+  background: color-mix(in srgb, var(--map) 16%, var(--chrome));
+}
+
+.activity-glyph {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.activity-glyph-sliders {
+  fill: var(--chrome);
+}
+
+.activity-btn:hover .activity-glyph-sliders {
+  fill: var(--hover);
+}
+
+.sidebar {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+}
+
+body.files-collapsed .sidebar {
+  visibility: hidden;
+  opacity: 0;
+  border-left-color: transparent;
+  overflow: hidden;
+}
+
 .repo {
-  padding: 4px 16px 12px;
+  padding: 12px 16px;
 }
 
 .repo-branch {
@@ -1033,11 +1160,13 @@ kbd {
    body's three columns give way to one, holding only this screen. */
 
 body.welcome-mode {
+  grid-template-rows: minmax(0, 1fr);
   grid-template-columns: minmax(0, 1fr);
   padding: 0;
 }
 
-body.welcome-mode > .sidebar,
+body.welcome-mode > .titlebar,
+body.welcome-mode > .left-rail,
 body.welcome-mode > .pane {
   display: none;
 }
@@ -1255,7 +1384,7 @@ button.repo-name:hover {
   color: var(--text-strong);
 }
 
-/* Settings: the button at the foot of the sidebar, and the dialog it opens. */
+/* Footer of the file list (agent status and live quota strip), and the Settings dialog. */
 
 .sidebar-footer {
   flex: none;
@@ -1263,51 +1392,8 @@ button.repo-name:hover {
   border-top: 1px solid var(--border);
 }
 
-.settings-button {
-  width: 100%;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 8px;
-  background: none;
-  border: 0;
-  border-radius: 6px;
-  color: var(--text-soft);
-  font: inherit;
-  font-size: 12.5px;
-  text-align: left;
-}
-
-.settings-button:hover,
-.settings-button:focus-visible {
-  background: var(--hover);
-  color: var(--text-strong);
-  outline: none;
-}
-
-/* Only the label grows: a later span, the Usage button's warning dot, keeps its size. */
-.settings-button > span:first-of-type {
-  flex: 1;
-}
-
-.settings-button kbd {
-  color: var(--text-muted);
-  border-color: var(--border);
-}
-
-.settings-glyph {
-  width: 16px;
-  height: 16px;
-  flex: none;
-  fill: var(--chrome);
-  stroke: currentColor;
-  stroke-width: 1.3;
-  stroke-linecap: round;
-}
-
-.settings-button:hover .settings-glyph {
-  fill: var(--hover);
+.sidebar-footer:not(:has(> :not([hidden]))) {
+  display: none;
 }
 
 .settings {
@@ -3072,7 +3158,7 @@ body.keyboard-input .slot-add:focus-visible {
 
 .divider {
   position: fixed;
-  top: 0;
+  top: 38px;
   bottom: 0;
   z-index: 3;
   width: 8px;
@@ -3081,16 +3167,18 @@ body.keyboard-input .slot-add:focus-visible {
 }
 
 #divider-files {
-  left: var(--sidebar-width, 248px);
+  left: calc(var(--rail-width, 48px) + var(--sidebar-drawn-width, 248px));
 }
 
 #divider-tray {
   right: calc(var(--tray-width, 320px) + 8px);
 }
 
-/* On the map's right border: the map starts a gap right of the file list (ui/panes.js). */
+/* On the map's right border: the map starts a gap right of the left rail (ui/panes.js). */
 #divider-map {
-  left: calc(var(--sidebar-width, 248px) + var(--map-width, 400px) + 4px);
+  left: calc(
+    var(--rail-width, 48px) + var(--sidebar-drawn-width, 248px) + var(--map-width, 400px) + 4px
+  );
 }
 
 .divider::after {
@@ -4093,7 +4181,11 @@ body.focus-mode {
   padding: 0;
 }
 
-body.focus-mode > .sidebar,
+body.focus-mode > .titlebar {
+  margin-right: 0;
+}
+
+body.focus-mode > .left-rail,
 body.focus-mode > .tray {
   visibility: hidden;
   opacity: 0;
@@ -4105,25 +4197,27 @@ body.focus-mode .map-pane {
   display: none;
 }
 
-/* Side panes open and close in 160 ms (docs/design.md, "Motion"). Only while focus mode
-   changes: a divider dragged by hand must follow the pointer at once. */
+/* Side panes open and close in 160 ms (docs/design.md, "Motion"). Only while focus mode or
+   the file list changes: a divider dragged by hand must follow the pointer at once. */
 body.panes-moving {
   transition:
     grid-template-columns 160ms ease-out,
     padding 160ms ease-out;
 }
 
-body.panes-moving > .sidebar,
-body.panes-moving > .tray {
+body.panes-moving > .left-rail,
+body.panes-moving > .tray,
+body.panes-moving .sidebar {
   overflow: hidden;
   transition: opacity 160ms ease-out;
 }
 
 /* Visibility is eased only on the way out, so the panes stay seen while they fade. On the way
    in it turns at once: WebKit keeps an element unfocusable while its visibility eases from
-   hidden, and Cmd-P focuses the filter as focus mode ends. */
-body.panes-moving.focus-mode > .sidebar,
-body.panes-moving.focus-mode > .tray {
+   hidden, and Cmd-P focuses the filter as focus mode or collapsed files ends. */
+body.panes-moving.focus-mode > .left-rail,
+body.panes-moving.focus-mode > .tray,
+body.panes-moving.files-collapsed .sidebar {
   transition:
     opacity 160ms ease-out,
     visibility 160ms;
@@ -4224,8 +4318,9 @@ body.focus-mode .code {
   }
 
   body.panes-moving,
-  body.panes-moving > .sidebar,
-  body.panes-moving > .tray {
+  body.panes-moving > .left-rail,
+  body.panes-moving > .tray,
+  body.panes-moving .sidebar {
     transition: none;
   }
 }
@@ -4452,16 +4547,15 @@ body.focus-mode .code {
   color: var(--text-muted);
 }
 
-.usage-button {
-  margin-bottom: 2px;
-}
-
 .usage-warn-dot {
-  flex: none;
+  position: absolute;
+  top: 6px;
+  right: 6px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--note);
+  box-shadow: 0 0 0 1.5px var(--chrome);
 }
 
 .usage-warn-dot.is-critical {
@@ -4877,60 +4971,6 @@ body.focus-mode .code {
 .repo-row .repo-name {
   flex: 1;
   min-width: 0;
-}
-
-.map-toggle {
-  flex: none;
-  height: 24px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 0 8px 0 6px;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-soft);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition:
-    background-color 80ms linear,
-    border-color 80ms linear,
-    color 80ms linear;
-}
-
-.map-toggle-glyph {
-  width: 14px;
-  height: 14px;
-  flex: none;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.3;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.map-toggle:hover {
-  background: var(--hover);
-  border-color: var(--border-strong);
-  color: var(--text-strong);
-}
-
-.map-toggle:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.map-toggle[aria-pressed="true"] {
-  background: var(--map-wash);
-  border-color: color-mix(in srgb, var(--map) 55%, var(--border));
-  color: var(--map);
-}
-
-.map-toggle[aria-pressed="true"]:hover {
-  background: color-mix(in srgb, var(--map) 16%, var(--chrome));
-  border-color: var(--map);
 }
 
 .map-pane {

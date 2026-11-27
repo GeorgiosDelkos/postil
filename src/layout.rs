@@ -22,10 +22,11 @@ use crate::files::{Stored, load_versioned, save_json};
 /// file still reads, with the map at its default width.
 const VERSION: u32 = 2;
 
-/// The file list's width in CSS px. At 200 px its foot still shows "Settings ⌘," whole (about
-/// 140 px with its icon and padding) and the filter a short path; the owner asked on 2026-11-23
-/// for no narrower list. Past 480 px it takes room the code needs. The maximum is arbitrary.
-pub(crate) const SIDEBAR: RangeInclusive<u32> = 200..=480;
+/// The file list's width in CSS px. Usage and Settings live on the 48 px activity bar beside
+/// it, so 180 px still fits the filter, file tree, and quota strip while keeping Files, Map,
+/// Code, and Tray side by side in a 1280 px window (48 + 180 + 320 + 420 + 280 + 24 = 1272).
+/// Past 480 px it takes room the code needs. The maximum is arbitrary.
+pub(crate) const SIDEBAR: RangeInclusive<u32> = 180..=480;
 
 /// The tray's width in CSS px. 280 px fits a note card's header; 720 px is half a 1440 px
 /// window.
@@ -196,16 +197,16 @@ mod tests {
         let file = dir.path().join("layout.json");
         for (sidebar, tray, map, expected) in [
             (
-                199,
+                179,
                 320,
                 400,
-                "the file list is 199 px wide, outside 200 to 480 px",
+                "the file list is 179 px wide, outside 180 to 480 px",
             ),
             (
                 481,
                 320,
                 400,
-                "the file list is 481 px wide, outside 200 to 480 px",
+                "the file list is 481 px wide, outside 180 to 480 px",
             ),
             (
                 248,
@@ -234,8 +235,8 @@ mod tests {
         ] {
             assert_eq!(layout(sidebar, tray, map), Err(expected.to_owned()));
         }
-        save(&file, &layout(200, 280, 320).unwrap()).unwrap();
-        assert_eq!(load(&file), layout(200, 280, 320).unwrap());
+        save(&file, &layout(180, 280, 320).unwrap()).unwrap();
+        assert_eq!(load(&file), layout(180, 280, 320).unwrap());
         save(&file, &layout(480, 720, 960).unwrap()).unwrap();
         assert_eq!(load(&file), layout(480, 720, 960).unwrap());
     }

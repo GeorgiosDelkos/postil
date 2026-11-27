@@ -332,6 +332,7 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
                 | Command::Usage
                 | Command::SetupWizard
                 | Command::FocusMode
+                | Command::Files
                 | Command::Map
                 | Command::MapMarkers => Unanswered::Ignore,
             };
@@ -734,14 +735,14 @@ fn build_window(
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_maximized(maximized);
 
-    // No title bar: the page draws up to the top edge and the window buttons sit over the
-    // sidebar, 14 px in and 16 px down to line up with the sidebar's 44 px top strip.
+    // No title bar: the page draws up to the top edge and the window buttons sit in the
+    // page's 38 px top titlebar strip, 14 px in and 12 px down.
     #[cfg(target_os = "macos")]
     let builder = builder
         .with_titlebar_transparent(true)
         .with_fullsize_content_view(true)
         .with_title_hidden(true)
-        .with_traffic_light_inset(LogicalPosition::new(14.0, 16.0));
+        .with_traffic_light_inset(LogicalPosition::new(14.0, 12.0));
 
     builder.build(event_loop).map_err(Error::Window)
 }

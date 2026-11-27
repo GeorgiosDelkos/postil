@@ -24,6 +24,8 @@ export function dividers({ onNarrow }) {
     limits: null,
     // Whether the map shows; kept for the window's session only, not in layout.json.
     mapOpen: false,
+    // Whether the file list drawer shows beside the activity bar; session-scoped.
+    filesOpen: true,
     // Whether the last draw found the window too narrow for the map beside the code.
     narrow: false,
     // The divider being dragged: a key of DIVIDERS.
@@ -56,19 +58,25 @@ export function dividers({ onNarrow }) {
   }
 
   function options() {
-    return { mapOpen: panes.mapOpen };
+    return { mapOpen: panes.mapOpen, filesOpen: panes.filesOpen };
   }
 
   function drawLayout() {
+    const root = document.documentElement.style;
     if (panes.layout) {
       const drawn = fit(panes.layout, panes.limits, innerWidth, options());
-      const root = document.documentElement.style;
       for (const { id, key, prop } of Object.values(DIVIDERS)) {
         root.setProperty(prop, `${drawn[key]}px`);
         $(id).setAttribute("aria-valuenow", String(drawn[key]));
       }
+      root.setProperty("--sidebar-drawn-width", panes.filesOpen ? `${drawn.sidebar}px` : "0px");
       panes.narrow = drawn.narrow;
+    } else if (!panes.filesOpen) {
+      root.setProperty("--sidebar-drawn-width", "0px");
+    } else {
+      root.removeProperty("--sidebar-drawn-width");
     }
+    $("divider-files").hidden = !panes.filesOpen;
     // The map's divider shows only beside the map; a narrow window shows the map alone.
     $("divider-map").hidden = !panes.mapOpen || panes.narrow;
     onNarrow(panes.narrow);
@@ -130,10 +138,14 @@ export function dividers({ onNarrow }) {
 
   return {
     load: loadLayout,
-    // Opening or closing the map changes what the other panes must leave room for, so the
-    // panes are fitted again; nothing is saved.
+    // Opening or closing the map or file list changes what the other panes must leave room for,
+    // so the panes are fitted again; nothing is saved.
     setMapOpen: (open) => {
       panes.mapOpen = open;
+      drawLayout();
+    },
+    setFilesOpen: (open) => {
+      panes.filesOpen = open;
       drawLayout();
     },
     isNarrow: () => panes.narrow,

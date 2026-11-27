@@ -868,7 +868,7 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         serde_json::json!({
             "sidebar": 248, "tray": 320, "map": 400,
             "defaults": defaults,
-            "limits": { "sidebar": [200, 480], "tray": [280, 720], "map": [320, 960] },
+            "limits": { "sidebar": [180, 480], "tray": [280, 720], "map": [320, 960] },
         })
     );
 
@@ -906,7 +906,7 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
     for (body, words) in [
         (
             r#"{"sidebar": 100, "tray": 320, "map": 400}"#,
-            "outside 200 to 480",
+            "outside 180 to 480",
         ),
         (r#"{"sidebar": 248}"#, "unreadable layout"),
         (
