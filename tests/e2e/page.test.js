@@ -924,7 +924,11 @@ test("Remember waits for the thread's run, saves a note's text, and the note ope
   const { page, api } = await openProject(t, "hang", "new-memory-server");
   const running = await addNote(api, "In the run.");
   const unsent = await addNote(api, "Keep src/a.rs to three lines.");
-  await startRun(page, api, [running]);
+  // Not startRun: `hang` streams nothing, so waiting for its draws races the run's own status
+  // draws, which a slow machine has already made by the time Stop shows. Stop is enough here.
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [running.id] }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run-header .stop").waitFor();
   await page.locator("#tab-notes").click();
   const card = (id) =>
     page
@@ -1034,6 +1038,11 @@ async function settlesAt(dialog, selector, value) {
 // model cells have one width and their buttons one x, every card fits in the dialog, the long
 // name is cut to its column with a tooltip, and a long model name shows whole.
 async function assertSlotsAligned(dialog, keys) {
+  // The agents' model lists arrive after the dialog opens, and each redraws the slots: measured
+  // before the last one, a card can be replaced mid-check or a name not yet cut. The `long`
+  // option comes with that last list.
+  const select = dialog.locator('[data-key="reviewer-model-1"]');
+  await select.locator('option[value="long"]').waitFor({ state: "attached" });
   // The dialog comes in with a short animation, which moves every box while it runs.
   await dialog.evaluate((node) =>
     Promise.all(node.getAnimations({ subtree: true }).map((animation) => animation.finished)),
@@ -1069,8 +1078,6 @@ async function assertSlotsAligned(dialog, keys) {
 
   // A model name as long as real ones shows whole, not cut with an ellipsis. The reviewers'
   // model cells are one width, so one stands for both; the send-to row's is wider.
-  const select = dialog.locator('[data-key="reviewer-model-1"]');
-  await select.locator('option[value="long"]').waitFor({ state: "attached" });
   await select.selectOption("long");
   const text = select.locator("xpath=..").locator(".picker-text");
   await text.filter({ hasText: "OpenCode/Nemotron 3.5 Super VL Free" }).waitFor();
