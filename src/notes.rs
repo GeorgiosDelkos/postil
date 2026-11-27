@@ -42,9 +42,19 @@
 //! reads every older version. Version 2 added each note's `state`; a version 1 file reads
 //! with every note open. Version 3 added the resolved state. Version 4 added each note's
 //! `target` (`lines`, `file` or `folder`); an older file reads with every note on lines, and
-//! a file or folder note has no `lines` or `snippet`. The next write makes an older file
-//! version 4. A path in the file must be written as git writes paths (`Repo::kind`): one
-//! written another way (`./a.rs`, `src//a.rs`), which the page never sent, reads as lost.
+//! a file or folder note has no `lines` or `snippet`. Version 5 added each note's `intent`
+//! (`change` or `ask`); an older file reads with every note a change. The next write makes an
+//! older file version 5. A path in the file must be written as git writes paths
+//! (`Repo::kind`): one written another way (`./a.rs`, `src//a.rs`), which the page never sent,
+//! reads as lost.
+//!
+//! # Asks
+//!
+//! A note with intent [`Intent::Ask`] is a question about its target, answered by an agent
+//! that only reads, in a thread of its own (docs/review-assist.md, "Ask without changing"). It
+//! is saved only when its run starts ([`check_new`], then [`save_ask`] inside `Run::create`),
+//! already sent in that run, which it belongs to whatever becomes of it. It is never sent with
+//! change notes: [`prompt`] refuses it, and [`save_ask`] gives its own prompt.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -64,7 +74,7 @@ use crate::report;
 
 /// The format version this build writes. It reads this one and every older one; a file with
 /// a newer version is refused, not rewritten.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Reads the review file and places every note: a line note where its snippet is now, a file
 /// or folder note by whether its path is still there. Does not write.
@@ -95,8 +105,34 @@ pub(crate) fn ids(repo: &Repo) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Adds a note and saves the review file with every note at its current place, then returns
-/// all notes.
+/// Whether note `id` is an ask, read from the review file as it is, as [`ids`] reads it: no
+/// source file is read. False for an id no note has; the change asked for then says so.
+///
+/// # Errors
+///
+/// As [`current`] for reading the review file.
+pub(crate) fn is_ask(repo: &Repo, id: &str) -> Result<bool> {
+    let wanted = parse_ids(&[id.to_owned()])?;
+    let review = Review::load(&repo.review_file())?;
+    Ok(review
+        .notes
+        .iter()
+        .any(|note| note.id == wanted[0] && note.intent == Intent::Ask))
+}
+
+/// Adds a change note and saves the review file with every note at its current place, then
+/// returns all notes: [`check_new`], then [`save`].
+///
+/// # Errors
+///
+/// As [`check_new`] and [`save`].
+pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
+    save(repo, check_new(repo, new)?)
+}
+
+/// Checks the new note `new` against the files as they are now, and places it, without
+/// reading or writing the review file. [`save`] then saves it as a change, or [`save_ask`]
+/// as an ask.
 ///
 /// For a line note, the snippet is the text the page showed on its lines. When the file
 /// changed since, the note goes where that text is now, by the same rule as [`current`]. A
@@ -104,14 +140,11 @@ pub(crate) fn ids(repo: &Repo) -> Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// As [`current`]; the error of reading the note's file; [`Error::InvalidNote`] for a blank
-/// body, a snippet that does not span its lines, or a path that is not a file or a folder as
-/// the note says; [`Error::OutsideRepository`] for a path that leaves the root;
-/// [`Error::NoteTextChanged`] when the shown text cannot be placed in the file any more;
-/// [`Error::WriteReview`] when the lock or the file cannot be written; [`Error::ReviewLocked`]
-/// when another process holds the lock.
-pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
-    let file = repo.review_file();
+/// The error of reading the note's file; [`Error::InvalidNote`] for a blank body, a snippet
+/// that does not span its lines, or a path that is not a file or a folder as the note says;
+/// [`Error::OutsideRepository`] for a path that leaves the root; [`Error::NoteTextChanged`]
+/// when the shown text cannot be placed in the file any more.
+pub(crate) fn check_new(repo: &Repo, new: NewNote) -> Result<CheckedNote> {
     let body = new.body.trim();
     if body.is_empty() {
         return Err(Error::InvalidNote("the note has no text".to_owned()));
@@ -125,16 +158,12 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
         }
     }
 
-    let _lock = lock(&file)?;
-    // The files read to place the note, which place the other notes in them too.
-    let mut read = HashMap::new();
     let target = match new.target {
         Target::Lines { lines, snippet } => {
             let text = repo.read(&new.path)?;
             let lines = locate(&text, &snippet, lines).ok_or_else(|| Error::NoteTextChanged {
                 path: new.path.clone(),
             })?;
-            read.insert(new.path.clone(), Some(text));
             Target::Lines { lines, snippet }
         }
         Target::Path(kind) => {
@@ -147,10 +176,66 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
             Target::Path(kind)
         }
     };
+    Ok(CheckedNote {
+        path: new.path,
+        target,
+        body: body.to_owned(),
+    })
+}
 
-    // As `current`, with the files read above read only once.
+/// Saves the note `checked` as an open change note with the next free id, and every other
+/// note at its current place, then returns all notes, the new one last.
+///
+/// # Errors
+///
+/// As [`current`]; [`Error::InvalidReview`] when no note id is left; [`Error::WriteReview`]
+/// when the lock or the file cannot be written; [`Error::ReviewLocked`] when another process
+/// holds the lock.
+pub(crate) fn save(repo: &Repo, checked: CheckedNote) -> Result<Review> {
+    save_note(repo, checked, Intent::Change, NoteState::Open {})
+}
+
+/// Saves the note `checked` as an ask, sent in `run` (`R4`), the run made for it (module docs,
+/// "Asks"), as [`save`] saves a change, and returns all notes, the ask's id and its prompt.
+/// Sent from the start: whatever becomes of the run, the ask's status is that run's.
+///
+/// # Errors
+///
+/// As [`save`].
+pub(crate) fn save_ask(repo: &Repo, checked: CheckedNote, run: &str) -> Result<SavedAsk> {
+    let state = NoteState::Sent {
+        run: run.to_owned(),
+    };
+    let review = save_note(repo, checked, Intent::Ask, state)?;
+    let ask = review.notes.last().expect("save_note pushed the ask last");
+    Ok(SavedAsk {
+        id: ask.id.to_string(),
+        prompt: ask.ask_prompt(),
+        review,
+    })
+}
+
+/// An ask [`save_ask`] saved: every note, the ask's id, and the prompt that asks it.
+#[derive(Debug)]
+pub(crate) struct SavedAsk {
+    pub(crate) review: Review,
+    pub(crate) id: String,
+    pub(crate) prompt: Prompt,
+}
+
+/// Saves `checked` as a note of `intent` in `state` with the next free id, under the lock.
+/// Every note is placed in its file as it is now, the new one too: the file `check_new` read
+/// may have changed since, and a read from before the lock would write another note back to
+/// where it was then.
+fn save_note(
+    repo: &Repo,
+    checked: CheckedNote,
+    intent: Intent,
+    state: NoteState,
+) -> Result<Review> {
+    let file = repo.review_file();
+    let _lock = lock(&file)?;
     let mut review = Review::load(&file)?;
-    review.relocate(repo, read);
     // The highest id plus one, not the count plus one: ids stay unique when someone removes
     // a note by editing the file.
     let highest = review.notes.iter().map(|note| note.id.0).max().unwrap_or(0);
@@ -162,14 +247,33 @@ pub(crate) fn add(repo: &Repo, new: NewNote) -> Result<Review> {
     // Pushed last: the page finds the note it just added as the last of the reply's notes.
     review.notes.push(Note {
         id: NoteId(id),
-        path: new.path,
-        target,
-        body: body.to_owned(),
+        path: checked.path,
+        target: checked.target,
+        body: checked.body,
         anchor: Anchor::Found,
-        state: NoteState::Open {},
+        state,
+        intent,
     });
+    review.relocate(repo, HashMap::new());
     review.save(&file)?;
     Ok(review)
+}
+
+/// A new note [`check_new`] accepted, for [`save`] or [`save_ask`]. Its `Debug` output leaves
+/// out the text, as for [`Note`].
+pub(crate) struct CheckedNote {
+    path: String,
+    /// Placed in the file as it was when checked.
+    target: Target,
+    /// Trimmed, never blank.
+    body: String,
+}
+
+impl CheckedNote {
+    /// The note's text: a thread's branch is named from it.
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
 }
 
 /// Deletes the note whose id is `id` (written `N1`), saves, and returns the other notes.
@@ -275,8 +379,8 @@ fn change_notes(
 /// # Errors
 ///
 /// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, holds
-/// something that is not a note id, or names a resolved note (reopen it first);
-/// [`Error::NoSuchNote`] when no note has one of them.
+/// something that is not a note id, or names a resolved note (reopen it first) or an ask
+/// (module docs, "Asks"); [`Error::NoSuchNote`] when no note has one of them.
 pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
     let wanted = parse_ids(ids)?;
     let review = current(repo)?;
@@ -298,35 +402,22 @@ pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
                 "note {id} is resolved: reopen it to send it"
             )));
         }
-        let lost = note.anchor == Anchor::Lost;
-        text.push_str(&format!("\n[{}] {}\n", note.id, note.place()));
-        match &note.target {
-            Target::Lines { snippet, .. } => {
-                if lost {
-                    text.push_str("(These lines are no longer in the file; they were:)\n");
-                }
-                for line in snippet.split('\n') {
-                    text.push_str(&format!("> {line}\n"));
-                }
-            }
-            Target::Path(kind) => {
-                if lost {
-                    text.push_str(&format!("(This {kind} is no longer in the repository.)\n"));
-                }
-            }
+        // A stale page could tick one: its question would read as a change to make.
+        if note.intent == Intent::Ask {
+            return Err(Error::BadRequest(format!(
+                "note {id} is a question, answered in a thread of its own: it is never sent"
+            )));
         }
-        text.push_str(note.body.trim_end());
-        text.push('\n');
-        // A folder gets no link: agents read a `resource_link` as a file, and the path in the
-        // text already names the folder. A symlink to a folder is linked all the same: git and
-        // the file list treat it as a file (`Repo::kind`), and its note is a file note.
-        let linked = !matches!(note.target, Target::Path(PathKind::Folder));
-        if linked && !files.contains(&note.path) {
-            files.push(note.path.clone());
-        }
+        note.quote(&mut text, &mut files);
     }
     Ok(Prompt { text, files })
 }
+
+/// What an ask asks for, in place of the change notes' introduction and report: an answer,
+/// and no change. Kept by a fresh agent's follow-up of an ask too (`run.rs`).
+pub(crate) const ASK_RULES: &str = "Answer from the files in this repository as they are. Do \
+     not edit, create or delete any file, do not run a command that changes one, and do not \
+     commit.\n";
 
 /// The notes `ids` that are still there, as Markdown for a pull request's description: each
 /// note's id, its place and its text, with no snippet of the code it is on. A snippet can hold
@@ -441,8 +532,8 @@ pub(crate) struct Review {
 /// A note the engineer wrote on lines, a file or a folder.
 ///
 /// Stored as one flat object: `id`, `path`, `target`, then `lines` and `snippet` for a line
-/// note only, `body`, `anchor`, `state`. A script reads every note the same way, and a line
-/// note keeps the fields it had before version 4. Read through [`StoredNote`].
+/// note only, `body`, `anchor`, `state`, `intent`. A script reads every note the same way, and
+/// a line note keeps the fields it had before version 4. Read through [`StoredNote`].
 #[derive(Deserialize)]
 #[serde(try_from = "StoredNote")]
 struct Note {
@@ -454,9 +545,66 @@ struct Note {
     /// Recomputed on every read.
     anchor: Anchor,
     state: NoteState,
+    intent: Intent,
+}
+
+/// What a note asks of an agent (module docs, "Asks").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Intent {
+    /// A change to make: sent with other notes to an agent that works.
+    #[default]
+    Change,
+    /// A question to answer, by an agent that only reads.
+    Ask,
 }
 
 impl Note {
+    /// The prompt that asks this note as a question (module docs, "Asks"): the engineer's
+    /// question about its target, quoted as [`prompt`] quotes a note, after the rule that
+    /// nothing is changed. It asks for no report: there is no change to report on.
+    fn ask_prompt(&self) -> Prompt {
+        let mut text = format!(
+            "An engineer reading this repository asks a question about the place named below.\n\
+             {ASK_RULES}"
+        );
+        let mut files = Vec::new();
+        self.quote(&mut text, &mut files);
+        Prompt { text, files }
+    }
+
+    /// Appends the note to a prompt's `text`, as [`prompt`] quotes each note: its heading, a
+    /// line note's quoted snippet, and its body; and its file to `files`, the prompt's links,
+    /// unless it is there already.
+    fn quote(&self, text: &mut String, files: &mut Vec<String>) {
+        let lost = self.anchor == Anchor::Lost;
+        text.push_str(&format!("\n[{}] {}\n", self.id, self.place()));
+        match &self.target {
+            Target::Lines { snippet, .. } => {
+                if lost {
+                    text.push_str("(These lines are no longer in the file; they were:)\n");
+                }
+                for line in snippet.split('\n') {
+                    text.push_str(&format!("> {line}\n"));
+                }
+            }
+            Target::Path(kind) => {
+                if lost {
+                    text.push_str(&format!("(This {kind} is no longer in the repository.)\n"));
+                }
+            }
+        }
+        text.push_str(self.body.trim_end());
+        text.push('\n');
+        // A folder gets no link: agents read a `resource_link` as a file, and the path in the
+        // text already names the folder. A symlink to a folder is linked all the same: git and
+        // the file list treat it as a file (`Repo::kind`), and its note is a file note.
+        let linked = !matches!(self.target, Target::Path(PathKind::Folder));
+        if linked && !files.contains(&self.path) {
+            files.push(self.path.clone());
+        }
+    }
+
     /// Where the note is, as a prompt names it: `src/a.rs:3-5`, `src/a.rs:3`, `src/ (folder)`
     /// or `a.rs (file)`.
     fn place(&self) -> String {
@@ -561,6 +709,9 @@ struct StoredNote {
     /// out too.
     #[serde(default)]
     state: NoteState,
+    /// Absent before version 5, where every note is a change.
+    #[serde(default)]
+    intent: Intent,
 }
 
 /// What the page sends to create a note: `{path, lines, snippet, body}` for lines, as before
@@ -746,6 +897,16 @@ impl fmt::Debug for Note {
             .field("target", &self.target)
             .field("anchor", &self.anchor)
             .field("state", &self.state)
+            .field("intent", &self.intent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for CheckedNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckedNote")
+            .field("path", &self.path)
+            .field("target", &self.target)
             .finish_non_exhaustive()
     }
 }
@@ -788,7 +949,7 @@ impl Serialize for Note {
             Target::Path(PathKind::File) => (TargetKind::File, None),
             Target::Path(PathKind::Folder) => (TargetKind::Folder, None),
         };
-        let mut note = serializer.serialize_struct("Note", 8)?;
+        let mut note = serializer.serialize_struct("Note", 9)?;
         note.serialize_field("id", &self.id)?;
         note.serialize_field("path", &self.path)?;
         note.serialize_field("target", &kind)?;
@@ -802,6 +963,7 @@ impl Serialize for Note {
         note.serialize_field("body", &self.body)?;
         note.serialize_field("anchor", &self.anchor)?;
         note.serialize_field("state", &self.state)?;
+        note.serialize_field("intent", &self.intent)?;
         note.end()
     }
 }
@@ -819,6 +981,7 @@ impl TryFrom<StoredNote> for Note {
             body,
             anchor,
             state,
+            intent,
         } = stored;
         let target =
             Target::read(target, lines, snippet).map_err(|problem| format!("{id}: {problem}"))?;
@@ -829,6 +992,7 @@ impl TryFrom<StoredNote> for Note {
             body,
             anchor,
             state,
+            intent,
         })
     }
 }
@@ -918,11 +1082,23 @@ mod tests {
             state: NoteState::Sent {
                 run: "R1".to_owned(),
             },
+            intent: Intent::Ask,
         };
         let review = Review {
             version: VERSION,
             notes: vec![note],
         };
+        let checked = CheckedNote {
+            path: "src/a.rs".to_owned(),
+            target: lines(),
+            body: "secret body".to_owned(),
+        };
+        let shown = format!("{checked:?}");
+        assert!(
+            shown.contains("src/a.rs") && shown.contains("start: 1"),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret"), "{shown}");
 
         for debug in [format!("{review:?}"), format!("{new:?}")] {
             assert!(debug.contains("src/a.rs"), "{debug}");
@@ -951,6 +1127,11 @@ mod tests {
             body: "Why?".to_owned(),
             anchor: Anchor::Found,
             state,
+            intent: Intent::Change,
+        };
+        let ask = Note {
+            intent: Intent::Ask,
+            ..note(6, "b.rs", Target::Path(PathKind::File), NoteState::Open {})
         };
         let review = Review {
             version: VERSION,
@@ -967,13 +1148,14 @@ mod tests {
                 note(3, "src/a.rs", lines(), NoteState::Resolved { run: None }),
                 note(4, "src", Target::Path(PathKind::Folder), NoteState::Open {}),
                 note(5, "b.rs", Target::Path(PathKind::File), NoteState::Open {}),
+                ask,
             ],
         };
 
         review.save(&file).unwrap();
 
         let open = "        \"kind\": \"open\"";
-        let note_json = |id: u32, path: &str, target: &str, state: &str| {
+        let note_json = |id: u32, path: &str, target: &str, state: &str, intent: &str| {
             let lines = if target == "lines" {
                 "      \"lines\": {\n        \"start\": 2,\n        \"end\": 3\n      },\n      \
                  \"snippet\": \"b\\nc\",\n"
@@ -983,21 +1165,30 @@ mod tests {
             format!(
                 "    {{\n      \"id\": \"N{id}\",\n      \"path\": \"{path}\",\n      \
                  \"target\": \"{target}\",\n{lines}      \"body\": \"Why?\",\n      \
-                 \"anchor\": \"found\",\n      \"state\": {{\n{state}\n      }}\n    }}"
+                 \"anchor\": \"found\",\n      \"state\": {{\n{state}\n      }},\n      \
+                 \"intent\": \"{intent}\"\n    }}"
             )
         };
         let expected = format!(
-            "{{\n  \"version\": 4,\n  \"notes\": [\n{},\n{},\n{},\n{},\n{}\n  ]\n}}\n",
-            note_json(1, "src/a.rs", "lines", open),
+            "{{\n  \"version\": 5,\n  \"notes\": [\n{},\n{},\n{},\n{},\n{},\n{}\n  ]\n}}\n",
+            note_json(1, "src/a.rs", "lines", open, "change"),
             note_json(
                 2,
                 "src/a.rs",
                 "lines",
-                "        \"kind\": \"sent\",\n        \"run\": \"R1\""
+                "        \"kind\": \"sent\",\n        \"run\": \"R1\"",
+                "change"
             ),
-            note_json(3, "src/a.rs", "lines", "        \"kind\": \"resolved\""),
-            note_json(4, "src", "folder", open),
-            note_json(5, "b.rs", "file", open),
+            note_json(
+                3,
+                "src/a.rs",
+                "lines",
+                "        \"kind\": \"resolved\"",
+                "change"
+            ),
+            note_json(4, "src", "folder", open, "change"),
+            note_json(5, "b.rs", "file", open, "change"),
+            note_json(6, "b.rs", "file", open, "ask"),
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), expected);
         drop(fs::remove_dir_all(&dir));

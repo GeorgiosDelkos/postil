@@ -84,5 +84,7 @@ export function runPanel({
     // Whether this window runs as many as a repository may: a send would be refused.
     full: () => store.liveRuns().length >= MAX_LIVE,
     busyThread: dialog.busyThread,
+    // Opens the dialog of run `id`'s thread.
+    openRun: (id) => dialog.open({ kind: "run", id }),
   };
 }

@@ -2,11 +2,11 @@
 // a card's click (docs/design.md, "Notes and their status"). It is drawn from the note and its
 // run (status.js), and drawn again when either changes while it is open.
 
-import { diffView, reviewSection } from "./dialog-parts.js";
+import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { fullPlace, onLines } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
-import { foldRun, isLive, isResolved, openQuestion, statusLine } from "./run.js";
+import { foldRun, isAsk, isLive, isResolved, openQuestion, statusLine } from "./run.js";
 import {
   agentSaid,
   changedFiles,
@@ -15,6 +15,7 @@ import {
   noteDialogKey,
   noteHistory,
   noteStatus,
+  replyText,
   runFailure,
   runStatus,
 } from "./status.js";
@@ -27,7 +28,10 @@ import {
 // content)` for the run's open question (`content` null to skip). `agent()` names the agent Send sends to, the
 // default one, or null when none is set. `reviewOf(runId)` gives a run's latest review
 // (status.js), `reviewers()` the settings' reviewers, `startReview(runId)` starts them, and
-// `busy(runId)` says why a review of run `runId` cannot start now, or "" when it can.
+// `busy(runId)` says why a review of run `runId` cannot start now, or "" when it can. An ask
+// (run.js, `isAsk`) shows its answer instead: `makeNote(note)` makes a change note of it and
+// resolves to null, or the reason it was refused, and `openRun(runId)` opens its run's dialog,
+// where its follow-ups go.
 export function noteDialog(
   dialogEl,
   {
@@ -46,6 +50,8 @@ export function noteDialog(
     reviewers,
     startReview,
     busy,
+    makeNote,
+    openRun,
   },
 ) {
   let shownId = null;
@@ -176,7 +182,9 @@ export function noteDialog(
       main.append(section(gone, el("div", "note-dialog-note", note.path)));
     }
 
-    if (run) {
+    if (run && isAsk(note)) {
+      main.append(answerPart(note, run));
+    } else if (run) {
       main.append(section(`What ${run.agent} said about ${note.id}`, said(note, run)));
       // What the run did to the note's file, whole: the card only says the note's status.
       // A folder note lists the files instead (status.js, `changedFiles`).
@@ -197,10 +205,60 @@ export function noteDialog(
     return main;
   }
 
+  // An ask's answer, whole: the agent's reply, under the notice that its edits were undone
+  // when it made any (docs/review-assist-plan.md, "Corrections to the design", 3). With Make
+  // it a note, and the run, where the follow-ups go.
+  function answerPart(note, run) {
+    const answer = el("div", "note-dialog-answer");
+    const title = isLive(run) ? `${run.agent} is answering` : `${run.agent}'s answer`;
+    const part = section(title, answer);
+    const label = part.firstChild;
+    const open = el("button", "button note-dialog-run", `Open ${run.id}`);
+    open.type = "button";
+    open.title = "Its steps, and a follow-up question";
+    open.addEventListener("click", () => {
+      dialogEl.close();
+      openRun(run.id);
+    });
+    const make = el("button", "button note-dialog-make", "Make it a note");
+    make.type = "button";
+    make.title = "A note asking for a change, on what this asks about, with your text";
+    const made = el("span", "note-dialog-why");
+    make.addEventListener("click", async () => {
+      make.disabled = true;
+      const failure = await makeNote(note);
+      made.textContent = failure ?? "Made a note: it is in the tray, to send when you choose.";
+      made.classList.toggle("failed", failure !== null);
+      make.disabled = false;
+    });
+    const actions = el("span", "note-dialog-actions");
+    actions.append(open, make);
+    label.append(actions);
+    if (run.problem) answer.append(el("div", "run-notice", run.problem));
+    const text = replyText(run);
+    if (text) {
+      const view = el("div", "run-message");
+      fillMarkdown(view, text);
+      answer.append(view);
+    } else {
+      const words = {
+        starting: `${run.agent} is starting.`,
+        working: `${run.agent} is reading. The answer shows here as it writes it.`,
+        needs: `${run.agent} is waiting for you in the run.`,
+        stopped: "Nothing: the run was stopped before the agent answered.",
+        failed: runFailure(run) ?? "The run failed.",
+      }[runStatus(note, run).kind];
+      answer.append(el("div", "note-dialog-said muted", words ?? "No answer."));
+    }
+    answer.append(made);
+    return part;
+  }
+
   // The note's text, with Edit; or, while it is edited, the editor.
   function noteSection(note) {
-    if (editing?.id === note.id) return section("Your note", editing.form);
-    const part = section("Your note", el("div", "note-dialog-note", note.body));
+    const label = isAsk(note) ? "Your question" : "Your note";
+    if (editing?.id === note.id) return section(label, editing.form);
+    const part = section(label, el("div", "note-dialog-note", note.body));
     const button = el("button", "button note-dialog-edit", "Edit");
     button.type = "button";
     button.addEventListener("click", () => startEditing(note));
@@ -357,6 +415,16 @@ export function noteDialog(
   function footer(note, run) {
     const foot = el("footer", "note-dialog-footer");
     const remove = deleteButton(note);
+    // An ask is never sent: it was asked once, and goes on as follow-ups of its run. Resolving
+    // ends its thread, which the server refuses while it runs.
+    if (isAsk(note)) {
+      const resolve = resolveButton(note);
+      const answering = isLive(run) && !isResolved(note);
+      resolve.disabled = answering;
+      const why = answering ? "Wait for the answer, or stop the run." : "";
+      foot.append(remove, el("span", "spacer"), el("span", "note-dialog-why", why), resolve);
+      return foot;
+    }
     const sendable = canSend(note);
     // The default agent, which Send uses, whichever agent ran the note before.
     const to = agent();

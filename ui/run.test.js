@@ -11,6 +11,7 @@ import {
   foldRun,
   isLive,
   inline,
+  isAsk,
   keyFor,
   permissionKey,
   markdownBlocks,
@@ -22,6 +23,7 @@ import {
   statusLine,
   stopKey,
   toolRow,
+  waitsToSend,
   worstEvidence,
 } from "./run.js";
 
@@ -42,6 +44,24 @@ test("the send step ticks the open notes whose lines are still there", () => {
   assert.equal(sentIn(notes[0]), null);
   assert.equal(sentIn(notes[4]), "R2", "a resolved note keeps its run");
   assert.equal(sentIn(notes[5]), null, "resolved without being sent");
+});
+
+test("the send step never ticks an ask, open or sent", () => {
+  const ask = (id, state) => ({ ...note(id, state), intent: "ask" });
+  const notes = [
+    ask("N1", OPEN),
+    { ...note("N2", OPEN), intent: "change" },
+    ask("N3", { kind: "sent", run: "R1" }),
+    note("N4", OPEN),
+  ];
+  assert.deepEqual(sendable(notes), ["N2", "N4"], "a note from before intents is a change");
+  assert.deepEqual(
+    notes.filter(waitsToSend).map((each) => each.id),
+    ["N2", "N4"],
+    "nor counts one as waiting to be sent",
+  );
+  assert.equal(isAsk(notes[2]), true);
+  assert.equal(isAsk(notes[3]), false);
 });
 
 test("message and thought parts join until something else comes between them", () => {

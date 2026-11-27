@@ -8,6 +8,7 @@ import {
   diffStats,
   evidence,
   foldRun,
+  isAsk,
   isLive,
   isOpen,
   isResolved,
@@ -64,6 +65,8 @@ export function runStatus(note, run) {
       if (endReason(run) !== "end_turn") {
         return { kind: "stopped", label: `Stopped in ${run.id}`, tone: "idle" };
       }
+      // An answer is the reply itself: it names no note.
+      if (isAsk(note)) return { kind: "answered", label: `Answered in ${run.id}`, tone: "done" };
       return agentSaid(run, note.id) === null
         ? { kind: "silent", label: `No word in ${run.id}`, tone: "idle" }
         : { kind: "addressed", label: `Addressed in ${run.id}`, tone: "done" };
@@ -473,5 +476,7 @@ export function noteDialogKey(note, run, review, shown) {
     review?.findings
       .filter((finding) => finding.note === note.id)
       .map((finding) => finding.verdict.text) ?? null,
+    // An ask's dialog shows the answer whole, which grows as the agent writes it.
+    isAsk(note) ? replyText(run) : null,
   ]);
 }

@@ -201,6 +201,7 @@ struct Note {
     body: String,
     anchor: Anchor,                // Whether the target is still there.
     state: NoteState,              // Where the note is in the loop. From milestone 3 on.
+    intent: Intent,                // Change, or Ask: a question answered read-only. Version 5 on.
 }
 
 enum Target {
@@ -273,6 +274,10 @@ As built in milestone 2 (`src/notes.rs`):
   tracks it and the file list shows it. A folder note's dialog lists the files the run changed
   below the folder, each with its counts, rather than their diffs, which the run's Changes
   view shows.
+- **Version 5** adds `intent`: `"change"` or `"ask"`, written for every note. An older file
+  reads with every note a change. `POST /api/notes` makes change notes only: an ask is made by
+  `POST /api/run/ask`, which saves it only once its run starts, and a send or a preview that
+  names one is refused (400). See `docs/review-assist.md`, "Ask without changing".
 - **Resolving a note** (`POST /api/notes/resolve?id=N1`) keeps the run it was sent in, so its
   dialog still shows what that run did; `POST /api/notes/reopen?id=N1` puts it back to sent in
   that run, or open when it was never sent. Only Reopen takes a note out of Resolved: a send
@@ -397,6 +402,8 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
 | `POST /api/run/permission` `{run, request, option}` | Answers run `run`'s permission request with an option the agent offered (one with no allow option, which Postil does not answer itself). |
 | `POST /api/run/question` `{run, request, content}` | Answers run `run`'s question with the form's values, or skips it (`content` `null`). |
 | `POST /api/run/cancel` `{run}` | Cancels run `run`; open permission requests are answered `cancelled`. |
+| `POST /api/run/ask` `{note}` | Asks the question `note` (a new note, as `POST /api/notes` takes one) of the settings' agent, read-only, in a new thread that only reads; saves it as an ask, sent in that run, only once the run has its place, and answers every note. |
+| `GET /api/run/uncommitted?file=<path>` | The engineer's changes since the last commit, which a new thread does not see, and whether the file is among them, as the preview says for its notes. |
 
 - **Each thread keeps its agent between its runs**, with its session, so a follow-up
   reaches the same conversation: the owner chose this on 2026-11-23 over a fresh agent per
@@ -444,7 +451,11 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   a restart the newest readable log is shown; one without an end reads as unfinished (the
   app quit during it, or another window runs it). Lines are decoded one by one, so a torn
   write spoils only its line, which is reported; an unreadable newer log is skipped and
-  named. Nothing is synced: a crash costs at most the last lines.
+  named. Nothing is synced: a crash costs at most the last lines. Run log version 7 adds
+  `readOnly` to the header of every run in a thread that only reads (an ask and its
+  follow-ups: no snapshot, no report, every tool call but a read refused), and the `undone`
+  entry, logged before the end of a read-only run whose edits Postil put back, which becomes
+  the run's problem after a restart too. Older logs read as runs that may change files.
 - **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
   first update, a permission request, or a stop. A run that fails to start, or whose prompt
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
@@ -641,9 +652,12 @@ patterns.
   before or after a run; `lastRun`, when its latest run started, in milliseconds since the
   Unix epoch; `skipped`, what the worktree was not given; and `state`: `open`, `evicted`,
   `applied` or `discarded`; and `pullRequest`, once one is opened, with its `url` and `state`
-  (`open`, `merged` or `closed`) as last read. This is version 3. Version 1 had no `lastRun`
-  and no evicted state, and neither 1 nor 2 a pull request; both are still read, version 1's
-  threads as having run at time 0, and written back as version 3. A change reads the file,
+  (`open`, `merged` or `closed`) as last read; and `mode`, `work` or `read` (an ask's thread,
+  which clones no build folders and cannot be applied, reviewed or opened as a pull request).
+  This is version 4. Version 1 had no `lastRun` and no evicted state, neither 1 nor 2 a pull
+  request, and none before 4 a mode; all are still read, version 1's threads as having run at
+  time 0, every older thread as one that works, and written back as version 4. A change reads
+  the file,
   changes one thread and writes it whole, under `threads.lock`; a new thread is written
   before `git worktree add`, so a crash leaves a
   record pointing at whatever was made. Run logs stay append-only, so this file holds what

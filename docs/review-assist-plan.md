@@ -958,13 +958,13 @@ its e2e test needs the bridge to write files with definitions
 
 The owner has not confirmed these; each is the design's assumption carried into a step.
 
-1. An ask is a note with an intent (7.6).
+1. An ask is a note with an intent (7.6). Settled by the owner on 2026-11-26, and built.
 2. The keys: `q`, `n`, `p`, `/`, `0`, `Cmd-Shift-M`, `Cmd-[`, `Cmd-]`, and the key held to
    talk (10.3).
 3. The map's color (8.3).
 4. Postil does not offer `hippius-mem init`, and setup makes a trial vault only (9.1).
 5. Read-only runs in threads of their own, correction 1 above, which replaces the shared
-   reading worktree the design proposed.
+   reading worktree the design proposed. Built in 7.6; not yet confirmed.
 6. The forced update only when history moved forward, correction 5 above.
 
 Found when the plan's review was checked against the code on 2026-11-25 (#51), each with its
@@ -976,7 +976,7 @@ options, and settled since.
     live ask succeeds and the thread ends when the run does, and resolving one is refused with
     409 while it runs (7.6); the undo notice is a new run log entry, `Entry::Undone { text }`
     (7.6, run log 7); `POST /api/run/ask` takes the new note and saves it only when the run
-    starts, so a 409 at the cap leaves nothing (7.6).
+    starts, so a 409 at the cap leaves nothing (7.6). Items 9 to 11 are built in 7.6.
 12. to 15. Settled by the owner on 2026-11-25, each as (a): a deleted file's `lines` stay
     required and are ignored (7.3); lines past the end are not checked in Rust (7.3); a check
     that failed and was edited after shows failed, and the card ranks failed, not seen,

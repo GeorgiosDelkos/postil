@@ -297,7 +297,8 @@ export function runDialog({
     if (view.problem) body.append(el("div", "run-notice", view.problem));
     for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
     if (!view.review) {
-      body.append(reviewPart(view, review));
+      // A thread that only reads changed nothing to review (src/run.rs, `Runner::review`).
+      if (!readsOnly(view, record)) body.append(reviewPart(view, review));
       body.append(followUpBox(view, latest));
     }
 
@@ -355,6 +356,7 @@ export function runDialog({
   // worktrees, and while the record is read.
   function threadPart(root, record, latest) {
     if (!record) return null;
+    if (readsOnly(root, record)) return readThreadPart(root, record, latest);
     const line = el("div", "run-thread");
     line.append(el("code", "run-thread-branch", record.branch));
     if (record.state === "applied" || record.state === "discarded") {
@@ -407,6 +409,37 @@ export function runDialog({
     }
     part.append(pullRequestPart(root, record, busy));
     return part;
+  }
+
+  // The thread of an ask, which only reads (src/thread.rs, `Mode::Read`): nothing to apply,
+  // no branch worth showing and no pull request. Discard, on a second click, ends it and frees
+  // its worktree, as resolving its ask does.
+  function readThreadPart(root, record, latest) {
+    const line = el("div", "run-thread");
+    if (record.state === "open" || record.state === "evicted") {
+      const discard = el("button", "button", "Discard");
+      discard.type = "button";
+      discard.title = "End the thread and free its worktree";
+      discard.disabled = isLive(store.byId(latest.id) ?? latest);
+      actOnSecondClick(discard, {
+        arm: () => {
+          discard.textContent = "Click again to discard";
+        },
+        disarm: () => {
+          discard.textContent = "Discard";
+        },
+        act: () => {
+          discard.disabled = true;
+          store.endThread(root.id, "discard").then((ended) => {
+            discard.disabled = ended;
+          });
+        },
+      });
+      line.append(el("span", "run-thread-state", "Read-only: it changes no file"), discard);
+    } else {
+      line.append(el("span", "run-thread-state", "Ended"));
+    }
+    return section("Thread", line);
   }
 
   // The thread's pull request (docs/design.md, "Ending a thread"): a link to it with its
@@ -566,7 +599,9 @@ export function runDialog({
       const update = (next) => {
         target = next;
         const busy = busyThread(root.id);
-        input.placeholder = `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
+        input.placeholder = readsOnly(root, store.thread(root.id))
+          ? `Ask ${next.agent} a follow-up`
+          : `Ask ${next.agent} for more, or to change what it did in ${next.id}`;
         button.replaceChildren(`Send to ${next.agent}`, el("kbd", "", "⌘↵"));
         button.disabled = busy !== "" || sending;
         // The held message wins: it says why the page did not end, which the engineer asked for.
@@ -851,6 +886,12 @@ export function runDialog({
   }
 
   return { open: openDetail, draw: drawDetail, closeIfGone, holdDraft, busyThread };
+}
+
+// Whether the thread that starts at run `root` only reads: its header says so (run log
+// version 7) before its record (`store.thread`) is read.
+function readsOnly(root, record) {
+  return Boolean(root.readOnly) || record?.mode === "read";
 }
 
 // The run's steps in order, each with its index among the run's items and its key: every

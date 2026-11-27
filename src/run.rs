@@ -43,11 +43,21 @@
 //! under a run's state. The slots are held around the agent's calls that answer, cancel and
 //! prompt (`auto_answer`, [`Runner::cancel`], `begin`), and around git in a thread's
 //! worktree: the commit before a run (`add`, `diff --cached`, `commit`, `rev-parse`, tens of
-//! milliseconds on a medium repository, as a snapshot is), and a proposer's check and undo as
-//! its stage ends (`status`, `branch`, `rev-parse`, `checkout -B`, `clean`), each after the
-//! few `rev-parse` calls that open the worktree ([`thread::open`]). Every page request, and
+//! milliseconds on a medium repository, as a snapshot is), and a read-only run's check and
+//! undo as its turn ends (`status`, `branch`, `rev-parse`, `checkout -B`, `clean`), each after
+//! the few `rev-parse` calls that open the worktree ([`thread::open`]). Every page request, and
 //! every other thread's agent events, wait for those: one lock for all threads keeps the lock
 //! order above, and costs milliseconds.
+//!
+//! `review.lock` (inside `notes.rs`) is the innermost lock: whatever holds it reads and writes
+//! files only, and takes no slots, `runs/active.lock` or thread lock. An ask saves its note
+//! under it inside [`Run::create`], so under the slots and `runs/active.lock`
+//! ([`Runner::ask`]). The save holds it for milliseconds; a lock another process keeps is
+//! waited for up to `files::LOCK_WAIT`, 2 s, before the ask fails. Every page request and
+//! agent event waits that long then, and another window's send gives up on
+//! `runs/active.lock` after its 200 ms (`RunElsewhere`). Accepted over trying the lock for
+//! that same moment: only a script holding `review.lock` costs it, and a second way of
+//! taking the lock would serve this one caller.
 //! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
@@ -72,7 +82,7 @@ use crate::acp::{
 };
 use crate::agents::{AgentChoice, Scanner};
 use crate::error::{Error, Result, error_chain};
-use crate::notes::{self, Prompt};
+use crate::notes::{self, NewNote, Prompt, Review};
 use crate::repo::Repo;
 use crate::report;
 use crate::review::{self, Diff, Finding, Stage, Work};
@@ -80,7 +90,7 @@ use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
     hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
-use crate::thread::{self, State, Thread};
+use crate::thread::{self, Mode, State, Thread};
 use crate::usage::ledger::LedgerSink;
 
 /// How long an agent may take to start, and then to open a session. Claude's adapter took
@@ -357,23 +367,24 @@ struct Pending {
 #[derive(Debug)]
 enum Worktree {
     /// A new thread's, on a new branch: a worktree that cannot be made takes the thread out
-    /// of the record.
-    Make,
+    /// of the record. The run records the fork commit as its snapshot before when `snapshot`
+    /// (its thread works).
+    Make {
+        snapshot: bool,
+    },
     /// An evicted thread's, again from its branch. The run records the commit it starts from
-    /// as its snapshot before when `snapshot` (it is not a proposer).
+    /// as its snapshot before when `snapshot` (it may change files).
     Remake {
         snapshot: bool,
     },
     Made,
 }
 
-/// A run for [`Runner::launch`] to start.
+/// A run for [`Runner::launch`] to start. What it carries and sends, its [`Content`], is
+/// passed beside it: an ask's exists only once the run has its place.
 #[derive(Debug)]
 struct NewRun {
     agent: AgentChoice,
-    /// The notes in the run's header: it goes with the last of them.
-    notes: Vec<String>,
-    prompt: Prompt,
     origin: Origin,
     conversation: Conversation,
     /// The review the run is a stage of, which becomes the one under way; `None` ends the
@@ -382,15 +393,56 @@ struct NewRun {
     place: Place,
 }
 
+/// The notes a launched run carries, in its header (it goes with the last of them), and the
+/// prompt it sends.
+#[derive(Debug)]
+struct Content {
+    notes: Vec<String>,
+    prompt: Prompt,
+}
+
+/// A run whose log [`Runner::create_run`] made: the prompt it sends, and the notes it marks
+/// sent once its agent takes the turn.
+#[derive(Debug)]
+struct Created {
+    run: Arc<Run>,
+    prompt: Prompt,
+    marks: Vec<String>,
+}
+
 /// Which thread a launched run works in.
 #[derive(Debug)]
 enum Place {
-    /// A new thread, started at commit `fork` and named from `title`, its first note's text.
-    New { fork: String, title: String },
-    /// The open thread of this id, whose worktree is on disk: read again by `launch` once it
-    /// holds the thread's lock, as ending a thread does, so another window cannot end or forget
-    /// it in between.
-    Open(String),
+    /// A new thread in `mode`, started at commit `fork` and named from `title`, its first
+    /// note's text.
+    New {
+        fork: String,
+        title: String,
+        mode: Mode,
+    },
+    /// The open thread with this record's id, whose worktree is on disk: read again by
+    /// `launch` once it holds the thread's lock, as ending a thread does, so another window
+    /// cannot end or forget it in between. Only its mode, which never changes, is taken from
+    /// this record.
+    Open(Thread),
+}
+
+impl Place {
+    /// The mode of the thread the run works in.
+    fn mode(&self) -> Mode {
+        match self {
+            Self::New { mode, .. } => *mode,
+            Self::Open(thread) => thread.mode,
+        }
+    }
+
+    /// The thread whose lock the run takes ([`Run::create`]).
+    fn in_thread(&self) -> InThread<'_> {
+        match self {
+            Self::New { .. } => InThread::New,
+            Self::Open(thread) => InThread::Open(&thread.id),
+        }
+    }
 }
 
 /// How the engineer ends a thread (docs/design.md, "Ending a thread").
@@ -490,15 +542,67 @@ impl Runner {
         let title = notes::body(&self.repo, &ids[0])?;
         let new = NewRun {
             agent,
-            notes: ids.to_vec(),
-            prompt,
             origin: Origin::Notes,
             // A new thread works in a new worktree, which a kept agent's session is not in.
             conversation: Conversation::Fresh,
             review: None,
-            place: Place::New { fork, title },
+            place: Place::New {
+                fork,
+                title,
+                mode: Mode::Work,
+            },
         };
-        self.launch(slots, new)
+        let content = Content {
+            notes: ids.to_vec(),
+            prompt,
+        };
+        self.launch(slots, new, |_| Ok(content))
+    }
+
+    /// Asks the question `new` of a fresh `agent`, read-only, in a new thread of its own that
+    /// only reads (docs/review-assist.md, "Ask without changing"), and returns every note, the
+    /// ask last. The ask is saved as a note, sent in the run made for it, only once that run has
+    /// its place, under the lock that counts the live runs (`Run::create`), so a refused ask
+    /// leaves nothing behind (decided 2026-11-26), and an ask whose run fails before its agent
+    /// takes the turn shows that run's failure. Waits for locks as [`Runner::send`] does, and
+    /// for `review.lock` under them (module docs, "Threads and locks").
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoCommit`] in a repository with no commit; [`Error::NoHome`]; as
+    /// [`thread::all`] for a record that cannot be read; as [`notes::check_new`] for the
+    /// question; and as [`Runner::send`]: [`Error::TooManyRuns`], [`Error::RunElsewhere`], and
+    /// the errors that fail the run. Only those after the note is saved leave it, with its
+    /// failed run.
+    pub(crate) fn ask(self: &Arc<Self>, agent: AgentChoice, new: NewNote) -> Result<Review> {
+        let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
+        // Checked before the note is saved, where `thread::plan` and `thread::add` would fail
+        // the run only after it.
+        self.home.as_deref().ok_or(Error::NoHome)?;
+        thread::all(&self.repo)?;
+        let checked = notes::check_new(&self.repo, new)?;
+        let title = checked.body().to_owned();
+        let new = NewRun {
+            agent,
+            origin: Origin::Notes,
+            conversation: Conversation::Fresh,
+            review: None,
+            place: Place::New {
+                fork,
+                title,
+                mode: Mode::Read,
+            },
+        };
+        let mut saved = None;
+        self.launch(self.slots(), new, |run| {
+            let ask = notes::save_ask(&self.repo, checked, run)?;
+            saved = Some(ask.review);
+            Ok(Content {
+                notes: vec![ask.id],
+                prompt: ask.prompt,
+            })
+        })?;
+        Ok(saved.expect("launch succeeded, so Run::create called the content closure"))
     }
 
     /// The thread `id`, open with its worktree on disk, or evicted, whose run makes it again.
@@ -529,17 +633,26 @@ impl Runner {
                 return Ok(thread);
             }
             State::Open => {
+                let again = match thread.mode {
+                    Mode::Work => "send its notes again",
+                    Mode::Read => "ask the question again",
+                };
                 return Err(Error::BadRequest(format!(
-                    "the worktree of {id}'s thread is gone ({}): discard the thread, and send \
-                     its notes again",
+                    "the worktree of {id}'s thread is gone ({}): discard the thread, and \
+                     {again}",
                     thread.path.display()
                 )));
             }
             State::Applied => "applied",
             State::Discarded => "discarded",
         };
+        // An ask's thread ends when its note is resolved: a new question is a new ask.
+        let again = match thread.mode {
+            Mode::Work => "send its notes again to work on them",
+            Mode::Read => "ask again to go on",
+        };
         Err(Error::BadRequest(format!(
-            "{id}'s thread was {ended}: send its notes again to work on them"
+            "{id}'s thread was {ended}: {again}"
         )))
     }
 
@@ -592,7 +705,8 @@ impl Runner {
         let first = thread[0].state().header.id.clone();
         // Refused here, before a run log is made, when the thread is not open; `launch` reads
         // it again under the thread's lock.
-        let evicted = self.open_thread(&first)?.state == State::Evicted;
+        let record = self.open_thread(&first)?;
+        let evicted = record.state == State::Evicted;
         let slots = self.slots();
         // The thread's kept agent ran `followed`, the slot's run. An evicted thread's agent,
         // kept in another window, worked in a worktree that is gone. The kept agent goes on
@@ -616,27 +730,38 @@ impl Runner {
             });
         let same_conversation = kept.is_some();
         let agent = kept.unwrap_or(agent);
-        let prompt = if same_conversation {
+        let prompt = match (same_conversation, record.mode) {
             // After the words, so the page tells this prompt from a fresh agent's by its start
             // (`ui/status.js`, `freshAgent`).
-            Prompt {
+            (true, Mode::Work) => Prompt {
                 text: format!("{text}\n\n{}", report::ASK_AGAIN),
                 files: Vec::new(),
-            }
-        } else {
-            let diffs: Vec<Diff> = thread
-                .iter()
-                .flat_map(|run| run.state().work().diffs)
-                .collect();
-            Prompt {
-                text: fresh_follow_up(&thread, text),
-                files: edited_files(&diffs),
+            },
+            // A thread that only reads asks for no report, and its agent was told the rules.
+            (true, Mode::Read) => Prompt {
+                text: text.to_owned(),
+                files: Vec::new(),
+            },
+            (false, mode) => {
+                // Edits a read-only run made were undone: there is no file to link for them.
+                let files = match mode {
+                    Mode::Work => {
+                        let diffs: Vec<Diff> = thread
+                            .iter()
+                            .flat_map(|run| run.state().work().diffs)
+                            .collect();
+                        edited_files(&diffs)
+                    }
+                    Mode::Read => Vec::new(),
+                };
+                Prompt {
+                    text: fresh_follow_up(&thread, text, mode),
+                    files,
+                }
             }
         };
         let new = NewRun {
             agent,
-            notes,
-            prompt,
             origin: Origin::FollowUp(FollowUp {
                 of: of.to_owned(),
                 text: text.to_owned(),
@@ -647,9 +772,9 @@ impl Runner {
                 Conversation::Fresh
             },
             review: None,
-            place: Place::Open(first),
+            place: Place::Open(record),
         };
-        self.launch(slots, new)
+        self.launch(slots, new, |_| Ok(Content { notes, prompt }))
     }
 
     /// The runs of the thread that ends with run `of`: the run of notes it started from, then
@@ -709,7 +834,7 @@ impl Runner {
     ///
     /// [`Error::TurnRunning`] while a run of the thread is under way in this window, and
     /// [`Error::RunElsewhere`] while another window's is; [`Error::BadRequest`] with no
-    /// reviewers, for a run that is itself a review, or for a follow-up; as
+    /// reviewers, for a run that is itself a review, a follow-up, or a run that only read; as
     /// [`Runner::view_of`] for the reviewed run; [`Error::WriteRun`] when the first stage's
     /// log cannot be created; and as [`Runner::open_thread`] for the thread, and
     /// [`Runner::launch`].
@@ -724,6 +849,11 @@ impl Runner {
             let state = reviewed.state();
             if state.header.review.is_some() {
                 return Err(Error::BadRequest(format!("{of} is itself a review")));
+            }
+            if state.header.read_only {
+                return Err(Error::BadRequest(format!(
+                    "{of} only read: there are no changes to review"
+                )));
             }
             // A review reviews the run of notes a thread started from (docs/design.md,
             // "Follow-ups"); the page shows it there.
@@ -787,25 +917,27 @@ impl Runner {
     fn start_stage(self: &Arc<Self>, slots: MutexGuard<'_, Slots>, chain: Chain) -> Result<()> {
         // Refused here, before a run log is made; `launch` reads it again under the thread's
         // lock.
-        self.open_thread(&chain.stage.of)?;
+        let record = self.open_thread(&chain.stage.of)?;
         let text = if chain.stage.judges() {
             review::judge_prompt(&chain.work, &chain.findings)
         } else {
             review::propose_prompt(&chain.work)
         };
-        let new = NewRun {
-            agent: chain.reviewers[chain.stage.reviewer - 1].clone(),
+        let content = Content {
             notes: chain.notes.clone(),
             prompt: Prompt {
                 text,
                 files: chain.files.clone(),
             },
+        };
+        let new = NewRun {
+            agent: chain.reviewers[chain.stage.reviewer - 1].clone(),
             origin: Origin::Review(chain.stage.clone()),
             conversation: Conversation::Fresh,
-            place: Place::Open(chain.stage.of.clone()),
+            place: Place::Open(record),
             review: Some(chain),
         };
-        self.launch(slots, new)
+        self.launch(slots, new, |_| Ok(content))
     }
 
     /// Starts the review's next stage, once `goes_on` moved the chain to it as stage `ended`
@@ -838,58 +970,48 @@ impl Runner {
     }
 
     /// Makes `new` its thread's run and its review the one under way there, and this window's
-    /// latest run, sends the run to its agent, then tells the page. The thread is placed as
-    /// [`Runner::place`] says. A new thread's snapshot before, the commit it starts from, is
-    /// recorded on the start thread once its worktree is made ([`Runner::start`]). The slot
-    /// changes only once the run's log exists, so a launch that fails leaves the review and the
-    /// kept agent as they were. The agents it replaces or lets go are dropped after `slots` is
-    /// released.
+    /// latest run, sends the run to its agent, then tells the page. What the run carries and
+    /// sends comes from `content`, called once the run has its place ([`Run::create`]). The
+    /// thread is placed as [`Runner::place`] says. A new thread's snapshot before, the commit
+    /// it starts from, is recorded on the start thread once its worktree is made
+    /// ([`Runner::start`]). The slot changes only once the run's log exists, so a launch that
+    /// fails leaves the review and the kept agent as they were. The agents it replaces or lets
+    /// go are dropped after `slots` is released.
+    ///
+    /// A run in a thread that only reads ([`Mode::Read`]) is read-only in its header, so every
+    /// run of the thread is, follow-ups included, whatever started them; it takes no snapshot.
+    /// A proposing reviewer takes none either.
     ///
     /// # Errors
     ///
     /// [`Error::TurnRunning`] while a run of the thread is under way in this window, as
-    /// [`Run::create`]; and as [`Runner::place`], which fails the run too.
-    fn launch(self: &Arc<Self>, mut slots: MutexGuard<'_, Slots>, new: NewRun) -> Result<()> {
+    /// [`Run::create`]; the error of `content`; and as [`Runner::place`], which fails the run
+    /// too.
+    fn launch(
+        self: &Arc<Self>,
+        mut slots: MutexGuard<'_, Slots>,
+        new: NewRun,
+        content: impl FnOnce(&str) -> Result<Content>,
+    ) -> Result<()> {
         // A worktree still being made counts as a run under way: its agent has not started.
         // Between two review stages the chain has been taken by `advance`, which launches the
         // next one, so the thread is not busy for it.
-        if let Place::Open(id) = &new.place
-            && slots.by_thread.get(id).is_some_and(Slot::busy)
+        if let Place::Open(thread) = &new.place
+            && slots.by_thread.get(&thread.id).is_some_and(Slot::busy)
         {
             return Err(Error::TurnRunning);
         }
         let NewRun {
             agent,
-            notes,
-            prompt,
             origin,
             conversation,
             review,
             place,
         } = new;
-        let snapshot = !matches!(&origin, Origin::Review(stage) if !stage.judges());
-        // A follow-up and a review mark no note sent: the notes went to the run they follow or
-        // review.
-        let marks = match origin {
-            Origin::Notes => notes.clone(),
-            Origin::Review(_) | Origin::FollowUp(_) => Vec::new(),
-        };
-        let in_thread = match &place {
-            Place::New { .. } => InThread::New,
-            Place::Open(id) => InThread::Open(id),
-        };
-        let opening = Opening {
-            agent: &agent.name,
-            notes: &notes,
-            prompt: &prompt.text,
-            origin,
-        };
-        let run = Arc::new(Run::create(
-            &self.repo.runs_dir(),
-            opening,
-            in_thread,
-            self.usage_sink(),
-        )?);
+        let snapshot = place.mode() == Mode::Work
+            && !matches!(&origin, Origin::Review(stage) if !stage.judges());
+        let Created { run, prompt, marks } =
+            self.create_run(&agent.name, origin, &place, content)?;
         let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
@@ -922,7 +1044,7 @@ impl Runner {
             .entry(id.clone())
             .or_insert_with(|| Slot::new(thread.clone()));
         slot.chain = review;
-        let new_thread = matches!(worktree, Worktree::Make);
+        let new_thread = matches!(worktree, Worktree::Make { .. });
         slot.making = !matches!(worktree, Worktree::Made);
         let prev_session_cost = reuse.then(|| slot.run.as_deref()?.session_cost()).flatten();
         slot.run = Some(Arc::clone(&run));
@@ -967,6 +1089,52 @@ impl Runner {
         Ok(())
     }
 
+    /// Creates the log of a run of `agent` in `place`, started as `origin` says
+    /// ([`Run::create`]), with the notes and prompt `content` gives once the run has its place.
+    /// Its header is read-only when its thread only reads.
+    ///
+    /// # Errors
+    ///
+    /// As [`Run::create`], and the error of `content`.
+    fn create_run(
+        &self,
+        agent: &str,
+        origin: Origin,
+        place: &Place,
+        content: impl FnOnce(&str) -> Result<Content>,
+    ) -> Result<Created> {
+        let read_only = place.mode() == Mode::Read;
+        // A follow-up and a review mark no note sent: the notes went to the run they follow or
+        // review. An ask, the run of notes in a thread that only reads, is saved sent in its
+        // run already (`notes::save_ask`).
+        let marks_sent = matches!(origin, Origin::Notes) && !read_only;
+        let mut sent = None;
+        let opening = |id: &str| {
+            let Content { notes, prompt } = content(id)?;
+            let text = prompt.text.clone();
+            sent = Some(prompt);
+            Ok(Opening {
+                agent,
+                notes,
+                prompt: text,
+                origin,
+                read_only,
+            })
+        };
+        let dir = self.repo.runs_dir();
+        let run = Run::create(&dir, place.in_thread(), self.usage_sink(), opening)?;
+        let marks = if marks_sent {
+            run.state().header.notes.clone()
+        } else {
+            Vec::new()
+        };
+        Ok(Created {
+            run: Arc::new(run),
+            prompt: sent.expect("Run::create succeeded, so it called the opening closure"),
+            marks,
+        })
+    }
+
     /// The thread `run` works in, as `place` says, and whether its worktree is still to be
     /// made. Called while `run` holds the thread's lock, so the thread is read under it. In an
     /// open thread, first commits what was left in the worktree and takes that commit as the
@@ -976,11 +1144,11 @@ impl Runner {
     ///
     /// For a new thread as [`thread::plan`] and [`thread::add`], the thread's lock file then
     /// removed; for an open one as [`Runner::open_thread`]; and without `snapshot` (a
-    /// proposer), as [`Runner::commit_worktree`].
+    /// proposer, or a thread that only reads), as [`Runner::commit_worktree`].
     fn place(&self, run: &Run, place: Place, snapshot: bool) -> Result<(Thread, Worktree)> {
         let (mut thread, worktree) = match place {
-            Place::New { fork, title } => match self.new_thread(run, &fork, &title) {
-                Ok(thread) => (thread, Worktree::Make),
+            Place::New { fork, title, mode } => match self.new_thread(run, &fork, &title, mode) {
+                Ok(thread) => (thread, Worktree::Make { snapshot }),
                 Err(error) => {
                     // No record names the thread, so nothing would ever forget its lock file.
                     // Removed while the run still holds the lock (its failure is recorded
@@ -991,7 +1159,8 @@ impl Runner {
                     return Err(error);
                 }
             },
-            Place::Open(id) => {
+            Place::Open(record) => {
+                let id = record.id;
                 let thread = self.open_thread(&id)?;
                 let worktree = match thread.state {
                     State::Evicted => Worktree::Remake { snapshot },
@@ -1010,9 +1179,9 @@ impl Runner {
             // thread, recorded on the start thread once the worktree is made: a run whose
             // worktree could not be made has no changes view, which would compare the
             // engineer's own files with that commit.
-            Worktree::Make | Worktree::Remake { .. } => {}
+            Worktree::Make { .. } | Worktree::Remake { .. } => {}
             // Every run of an open thread starts from a commit of what was left there, a
-            // proposer's too: undoing a proposer's edits goes back to that commit, which must
+            // read-only one's too: undoing its edits goes back to that commit, which must
             // hold the engineer's own commits and edits.
             Worktree::Made => match self.commit_worktree(run, &thread, Point::Before) {
                 Ok(commit) => {
@@ -1021,8 +1190,8 @@ impl Runner {
                         run.record_snapshot(Point::Before, commit);
                     }
                 }
-                // A proposer whose start could not be marked would be blamed, and undone, for
-                // what was left: it does not start.
+                // A read-only run whose start could not be marked would be blamed, and undone,
+                // for what was left: it does not start.
                 Err(error) if !snapshot => return Err(error),
                 Err(error) => no_snapshot(run, &error),
             },
@@ -1113,6 +1282,9 @@ impl Runner {
             run.record(Entry::Failed {
                 error: "stopped: the agent did not stop when asked, so Postil ended it".to_owned(),
             });
+        }
+        if let Some(thread) = &thread {
+            self.forget_deleted_ask(&run, thread);
         }
         (self.notify)();
         result
@@ -1340,10 +1512,10 @@ impl Runner {
     /// [`Error::NoHome`] without Postil's home; [`Error::TurnRunning`] while one of its runs
     /// is under way in this window, its review is between two stages, or its worktree is
     /// being made, and [`Error::RunElsewhere`] while another window runs one;
-    /// [`Error::BadRequest`] when there is no open thread `id`; [`Error::ThreadChanged`] when
-    /// the check fails; [`Error::ApplyConflict`] when the changes do not fit the working tree,
-    /// which then stays as it was; as [`thread::update`]; and as [`thread::free`], once the
-    /// thread is marked ended.
+    /// [`Error::BadRequest`] when there is no open thread `id`, or for Apply on a thread that
+    /// only reads; [`Error::ThreadChanged`] when the check fails; [`Error::ApplyConflict`] when
+    /// the changes do not fit the working tree, which then stays as it was; as
+    /// [`thread::update`]; and as [`thread::free`], once the thread is marked ended.
     pub(crate) fn end_thread(&self, id: &str, ending: Ending) -> Result<()> {
         let home = self.home.as_deref().ok_or(Error::NoHome)?;
         // While the thread is busy in this window, its run holds the thread's lock, or a
@@ -1361,6 +1533,11 @@ impl Runner {
             Some(_) => return Err(Error::BadRequest(format!("thread {id} already ended"))),
             None => return Err(Error::BadRequest(format!("there is no thread {id}"))),
         };
+        if ending == Ending::Apply && thread.mode == Mode::Read {
+            return Err(Error::BadRequest(format!(
+                "thread {id} only reads: it has no changes to apply"
+            )));
+        }
         thread::check_place(&self.repo, home, &thread)?;
         let tip = thread::check(&self.repo, home, &thread)?;
         if ending == Ending::Apply {
@@ -1397,6 +1574,63 @@ impl Runner {
         });
         (self.notify)();
         ended
+    }
+
+    /// Ends, with nothing applied, every open or evicted thread that only reads and started
+    /// from a run carrying note `id`: what resolving an ask does before the note is marked
+    /// resolved, so its worktree is freed (docs/review-assist.md, "Where read-only agents run").
+    /// A change note has no such thread, and nothing is done. Reads the record, and the header
+    /// of each such thread's first run.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::end_thread`]: [`Error::TurnRunning`] while a run of the thread is under
+    /// way in this window and [`Error::RunElsewhere`] while another window's is, which keeps a
+    /// live ask from being resolved (decided 2026-11-26); and as [`thread::all`].
+    pub(crate) fn end_ask(&self, id: &str) -> Result<()> {
+        let dir = self.repo.runs_dir();
+        for thread in thread::all(&self.repo)? {
+            let ends = thread.mode == Mode::Read
+                && matches!(thread.state, State::Open | State::Evicted)
+                && read_header(&dir.join(format!("{}.jsonl", thread.id)))
+                    .is_ok_and(|header| header.notes.iter().any(|note| note == id));
+            if ends {
+                self.end_thread(&thread.id, Ending::Discard)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// When `run`, in `thread`, has ended in a thread that only reads and none of its notes is
+    /// left (an ask deleted while it ran), deletes its log and forgets the thread now, as the
+    /// delete would have had the run been over: the thread ends when the run does (decided
+    /// 2026-11-26). Called wherever a run ends, once no slots guard is held: after an agent's
+    /// event, after a Stop, and at the end of the start thread (a worktree that could not be
+    /// made, a Stop while it was, an agent that did not start). A run that ends inside
+    /// [`Runner::launch`] (its thread could not be placed, or no start thread could be
+    /// spawned) goes at the next delete instead, as any run does.
+    ///
+    /// It runs on the agent's reader thread and the start thread too, where no request waits:
+    /// forgetting takes the thread's lock and then the slots, as eviction does on a start
+    /// thread (module docs, "Threads and locks"). Between the end being logged, which releases
+    /// the thread's lock, and this cleanup, a request may start a follow-up in the thread: the
+    /// thread is then busy, so forgetting leaves it, and that follow-up's own end comes back
+    /// here. A follow-up asked for once forgetting holds the lock is refused, as during an
+    /// ending. An error is left for the next delete, which tries again and reports it.
+    fn forget_deleted_ask(&self, run: &Run, thread: &Thread) {
+        let notes = {
+            let state = run.state();
+            if thread.mode != Mode::Read || state.live() {
+                return;
+            }
+            state.header.notes.clone()
+        };
+        let Ok(left) = notes::ids(&self.repo) else {
+            return;
+        };
+        if notes.iter().all(|note| !left.contains(note)) {
+            drop(self.delete_runs_without_notes());
+        }
     }
 
     /// The name of the agent that ran run `id`: a follow-up goes to it.
@@ -1646,7 +1880,12 @@ impl Runner {
     /// run.
     fn start(self: &Arc<Self>, pending: Pending) -> std::io::Result<()> {
         let runner = Arc::clone(self);
-        let start = move || {
+        let (cleaner, run, thread) = (
+            Arc::clone(self),
+            Arc::clone(&pending.run),
+            pending.thread.clone(),
+        );
+        let start_agent = move || {
             let generation = pending.generation;
             let id = pending.thread.id.clone();
             let failed = |error: &Error| {
@@ -1720,6 +1959,13 @@ impl Runner {
             drop(slots);
             (runner.notify)();
         };
+        let start = move || {
+            start_agent();
+            // Every slots guard is dropped by now. A run that ended here (its worktree could not
+            // be made, a Stop came while it was, its agent did not start) ends a deleted ask's
+            // thread as an agent's last event does; one that goes on returns at once.
+            cleaner.forget_deleted_ask(&run, &thread);
+        };
         std::thread::Builder::new()
             .name("agent-start".to_owned())
             .spawn(start)
@@ -1770,9 +2016,9 @@ impl Runner {
             }
         };
         let before = match (&pending.worktree, tip) {
-            // A new thread's run is a run of notes, which takes snapshots: the one before is
-            // the commit the worktree was made at.
-            (Worktree::Make, _) => Some(pending.thread.fork.clone()),
+            // A new thread's run is a run of notes, which takes snapshots unless its thread
+            // only reads: the one before is the commit the worktree was made at.
+            (Worktree::Make { snapshot }, _) => snapshot.then(|| pending.thread.fork.clone()),
             (Worktree::Remake { snapshot }, tip) => tip.filter(|_| *snapshot),
             (Worktree::Made, _) => None,
         };
@@ -1886,11 +2132,12 @@ impl Runner {
         }
     }
 
-    /// Writes a new thread for run `run`'s record, starting at commit `fork` and named from
-    /// `title`.
-    fn new_thread(&self, run: &Run, fork: &str, title: &str) -> Result<Thread> {
+    /// Writes a new thread in `mode` for run `run`'s record, starting at commit `fork` and named
+    /// from `title`.
+    fn new_thread(&self, run: &Run, fork: &str, title: &str, mode: Mode) -> Result<Thread> {
         let id = run.state().header.id.clone();
-        let thread = thread::plan(&self.repo, self.home.as_deref(), &id, fork, title)?;
+        let mut thread = thread::plan(&self.repo, self.home.as_deref(), &id, fork, title)?;
+        thread.mode = mode;
         thread::add(&self.repo, &thread)?;
         Ok(thread)
     }
@@ -2002,15 +2249,15 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         }
         let slot = slots.by_thread.get_mut(id).expect("let_go found the slot");
         let thread = Some(slot.thread.clone());
-        let review = slot
-            .run
-            .as_ref()
-            .and_then(|run| run.state().header.review.clone());
+        let (review, read_only_thread) = slot.run.as_ref().map_or((None, false), |run| {
+            let state = run.state();
+            (state.header.review.clone(), state.header.read_only)
+        });
         // Answered before the request is logged, and logged with it at once: a page that read
         // the request alone would show the run waiting for the engineer.
         // From the run's header, which never changes: a Stop that ends the chain does not lift
         // it for the rest of the proposer's turn.
-        let read_only = review.as_ref().is_some_and(|stage| !stage.judges());
+        let read_only = read_only_thread || review.as_ref().is_some_and(|stage| !stage.judges());
         // The review stage this run is, while its review goes on.
         let stage = review.filter(|stage| {
             slot.chain
@@ -2037,15 +2284,15 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
             Held::None
         };
         let run = slot.run.clone();
-        // However a proposer's turn ends, what it changed is put back before the end is
+        // However a read-only run's turn ends, what it changed is put back before the end is
         // logged, under the lock, so no run starts in the worktree first.
-        // Only for a live run: a kept proposer's agent that exits after its run ended (the
-        // review found nothing, and the agent stayed) must not reset what the engineer has
-        // committed or edited in the worktree since.
+        // Only for a live run: a kept agent that exits after its run ended (a proposer whose
+        // review found nothing, an ask's) must not reset what the engineer has committed or
+        // edited in the worktree since.
         let undone = run
             .as_deref()
             .filter(|run| ends_turn && run.state().live())
-            .and_then(|run| undo_proposer(&runner, run, thread.as_ref()));
+            .and_then(|run| undo_read_only(&runner, run, thread.as_ref()));
         // Decided under the lock, before the stage's end is logged: a reader that sees the end
         // sees the decision, and no Stop or new review can replace the chain meanwhile. The
         // next stage starts once the end is logged.
@@ -2054,9 +2301,10 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
                 decide(slot, run, stage, undone).then(|| Arc::clone(run))
             }
             (_, Some(run)) => {
-                // No findings are logged for a turn that did not end well: the run says it.
-                if let Some(undone) = undone {
-                    run.state().problem.get_or_insert(undone);
+                // No findings are logged for this end: the run says it, in its log, before the
+                // end.
+                if let Some(text) = undone {
+                    run.record(Entry::Undone { text });
                 }
                 None
             }
@@ -2081,6 +2329,9 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         };
         if let Some(ids) = run.record_event(event, report, answer, root) {
             runner.mark_sent(&run, &ids);
+        }
+        if ends_turn && let Some(thread) = &thread {
+            runner.forget_deleted_ask(&run, thread);
         }
     }
     // Dropped outside the lock: dropping an agent waits for its process to be reaped.
@@ -2112,10 +2363,11 @@ fn decide(slot: &mut Slot, run: &Run, stage: &Stage, undone: Option<String>) -> 
 
 /// Answers a permission request as Postil does on the engineer's behalf (docs/design.md,
 /// "Runs", decided with the owner on 2026-11-23: only a question stops for the engineer), and
-/// returns the entry that logs the answer. A proposing reviewer is kept read-only: only its
-/// reads, searches, fetches and thinking are allowed. `None` when no option fits, or when a
-/// Stop already answered the request (and logged that) or the agent is gone; the run then
-/// shows the request open until it ends.
+/// returns the entry that logs the answer. A run that may only read (a proposing reviewer's,
+/// or one in a thread that only reads) is kept so: only its reads, searches, fetches and
+/// thinking are allowed. `None` when no option fits, or when a Stop already answered the
+/// request (and logged that) or the agent is gone; the run then shows the request open until
+/// it ends.
 fn auto_answer(agent: &Agent, request: &PermissionRequest, read_only: bool) -> Option<Entry> {
     let reads = matches!(
         request.tool_call.kind,
@@ -2147,7 +2399,7 @@ fn goes_on(chain: &mut Chain, findings: Vec<Finding>) -> bool {
 
 /// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
 /// proposer's findings are read from its reply (numbered after the `found` before it) and
-/// logged. `undone` says why the proposer's edits were put back ([`undo_proposer`]), if it
+/// logged. `undone` says why the proposer's edits were put back ([`undo_read_only`]), if it
 /// made any. Returns the findings for the next stage; `None` when the review ends here: this
 /// was the judge, or a proposer changed files.
 fn end_stage(
@@ -2173,46 +2425,51 @@ fn end_stage(
     (!edited).then_some(findings)
 }
 
-/// [`undo_proposer`] for a run a forced Stop or a close ends, whose end the agent does not
-/// report: only while it is live, and the run says what was undone.
+/// [`undo_read_only`] for a run a forced Stop or a close ends, whose end the agent does not
+/// report: only while it is live, and the run logs what was undone.
 fn undo_if_live(runner: &Runner, run: &Run, thread: Option<&Thread>) {
     if !run.state().live() {
         return;
     }
-    if let Some(undone) = undo_proposer(runner, run, thread) {
-        run.state().problem.get_or_insert(undone);
+    if let Some(text) = undo_read_only(runner, run, thread) {
+        run.record(Entry::Undone { text });
     }
 }
 
-/// When `run` is a proposing reviewer's and changed `thread`'s worktree, puts the worktree
-/// back to the thread's branch at its tip ([`Repo::reset_to`], ignored files kept) and returns
-/// what the run says about it; `None` for any other run, or a proposer that changed nothing.
-/// Called however the stage's turn ends, a Stop and a close included: edits left there would
-/// be taken in by the next run's commit, and by Apply with it.
+/// When `run` may only read (a proposing reviewer's, or any run of a thread that only reads)
+/// and changed `thread`'s worktree, puts the worktree back to the thread's branch at its tip
+/// ([`Repo::reset_to`], ignored files kept) and returns what the run says about it; `None`
+/// for any other run, or one that changed nothing. Called however the turn ends, a Stop and a
+/// close included: edits left there would be taken in by the next run's commit, and by Apply
+/// with it.
 ///
-/// A proposer may only read, but an agent that edits without asking is not stopped by the
+/// Such a run may only read, but an agent that edits without asking is not stopped by the
 /// permission rule. An edit made through a command reports no diff, one it committed leaves
 /// no change, and one on another branch leaves `HEAD` anywhere, so the worktree is asked for
 /// all three: a change, another branch checked out, or the branch moved. A worktree that
 /// cannot be asked counts as changed. Runs git in the worktree, opened by [`thread::open`]:
 /// `status`, `branch`, `rev-parse`, and the reset when needed.
-fn undo_proposer(runner: &Runner, run: &Run, thread: Option<&Thread>) -> Option<String> {
+fn undo_read_only(runner: &Runner, run: &Run, thread: Option<&Thread>) -> Option<String> {
+    // Who changed files: a proposing reviewer, by its place in the review, or the agent of a
+    // thread that only reads.
     let reviewer = {
         let state = run.state();
-        state
-            .header
-            .review
-            .as_ref()
-            .filter(|stage| !stage.judges())?
-            .reviewer
+        match &state.header.review {
+            Some(stage) if !stage.judges() => Some(stage.reviewer),
+            _ if state.header.read_only => None,
+            _ => return None,
+        }
     };
     let thread = thread?;
     let home = runner.home.as_deref()?;
     let said = |undone: String| {
-        Some(format!(
-            "reviewer {reviewer} changed files, though it may only read: {undone}, and the \
-             review stops here"
-        ))
+        Some(match reviewer {
+            Some(reviewer) => format!(
+                "reviewer {reviewer} changed files, though it may only read: {undone}, and \
+                 the review stops here"
+            ),
+            None => format!("the agent changed files, though it may only read: {undone}"),
+        })
     };
     let tree = match thread::open(&runner.repo, home, thread) {
         Ok(tree) => tree,
@@ -2252,15 +2509,26 @@ fn first_option(options: &[PermissionOption], kinds: [PermissionKind; 2]) -> Opt
         .map(|option| option.option_id.clone())
 }
 
-/// The prompt of a follow-up that goes to a fresh agent: the thread so far, each run's prompt
-/// and reply in order, then the engineer's `text`, then the ask for a report ([`report_ask`]).
-/// The diffs stay out: the agent reads the files as they are now, linked after the text.
-fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
-    let mut prompt = String::from(
-        "You are continuing work another coding agent did in this repository; its \
-         conversation is gone. Here is what it was asked and what it answered, oldest first. \
-         Read the files for their current state.\n",
-    );
+/// The prompt of a follow-up that goes to a fresh agent in a thread in `mode`: the thread so
+/// far, each run's prompt and reply in order, then the engineer's `text`, then the ask for a
+/// report ([`report_ask`]), or, in a thread that only reads, the rule that nothing is changed
+/// ([`notes::ASK_RULES`]). The diffs stay out: the agent reads the files as they are now,
+/// linked after the text.
+fn fresh_follow_up(thread: &[Arc<Run>], text: &str, mode: Mode) -> String {
+    // The page tells this prompt from a kept agent's by its start (`ui/status.js`,
+    // `freshAgent`), whatever the sentence.
+    let mut prompt = String::from(match mode {
+        Mode::Work => {
+            "You are continuing work another coding agent did in this repository; its \
+             conversation is gone. Here is what it was asked and what it answered, oldest \
+             first. Read the files for their current state.\n"
+        }
+        Mode::Read => {
+            "You are continuing a conversation another coding agent had about this \
+             repository; it is gone. Here is what it was asked and what it answered, oldest \
+             first. Read the files for their current state.\n"
+        }
+    });
     for run in thread {
         let state = run.state();
         let asked = state
@@ -2277,12 +2545,12 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str) -> String {
         )
         .expect("writing to a String cannot fail");
     }
-    write!(
-        prompt,
-        "\nThe engineer now asks:\n\n{text}\n\n{}",
-        report_ask(&thread[0].state().header.prompt)
-    )
-    .expect("writing to a String cannot fail");
+    let ending = match mode {
+        Mode::Work => report_ask(&thread[0].state().header.prompt),
+        Mode::Read => notes::ASK_RULES,
+    };
+    write!(prompt, "\nThe engineer now asks:\n\n{text}\n\n{ending}")
+        .expect("writing to a String cannot fail");
     prompt
 }
 
@@ -2299,15 +2567,16 @@ fn report_ask(first_prompt: &str) -> &'static str {
 }
 
 /// The entry that logs the author's report of `run`, a turn that ended well, read from its
-/// reply in `root` (`report::read`); `None` for a review stage, which logs findings instead.
-/// The caller logs it with the run's end, under one hold of the run: a forced stop or a close
-/// that ends the run first takes neither. Asks the file system whether each step's path
-/// exists, so it is never called under the `Slots` lock.
+/// reply in `root` (`report::read`); `None` for a review stage, which logs findings instead,
+/// and for a run that only reads, which was asked for none. The caller logs it with the run's
+/// end, under one hold of the run: a forced stop or a close that ends the run first takes
+/// neither. Asks the file system whether each step's path exists, so it is never called under
+/// the `Slots` lock.
 fn report_entry(run: &Run, root: &Path) -> Option<Entry> {
     let reply = {
         let state = run.state();
         // A run that a forced stop or a close ended takes no entry: no file is read for it.
-        if state.header.review.is_some() || !state.live() {
+        if state.header.review.is_some() || state.header.read_only || !state.live() {
             return None;
         }
         state.reply()

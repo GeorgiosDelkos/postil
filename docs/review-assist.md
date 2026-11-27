@@ -1,12 +1,12 @@
 # Postil: review assist
 
 Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
-7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), and the
-walkthrough with its ratings and findings in the changes view (7.5). This document adds to
-`docs/design.md`, which stays the reference for everything built so far.
-`docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
-Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
-what this document assumes and the owner has not confirmed.
+7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
+walkthrough with its ratings and findings in the changes view (7.5), and read-only threads
+with Ask (7.6). This document adds to `docs/design.md`, which stays the reference for
+everything built so far. `docs/review-assist-plan.md` turns it into pull requests, with the
+edge cases and tests of each. Section "Decisions" lists what the owner settled on 2026-11-25;
+section "Open questions" lists what this document assumes and the owner has not confirmed.
 
 Mockups: https://claude.ai/code/artifact/61c79ac1-1498-4f37-9ec0-f2824cf3f92f (private to the owner until shared).
 
@@ -191,6 +191,12 @@ edited.
   shows Answered.
 - **From an answer:** Make it a note (a `Change` note on the same lines, with the engineer's
   text), or Remember (milestone 9).
+
+Built in step 7.6, as the owner settled it on 2026-11-26: `POST /api/run/ask` takes the new
+note and saves it only once its run has a place, so an ask refused at the cap of 3 live runs
+leaves nothing; Delete of a live ask succeeds, and its thread goes when its run ends; Resolve
+of a live ask is refused (409), and of an idle one ends its thread and frees its worktree; an
+undo notice is logged (`undone`, run log version 7), so it survives a restart.
 
 ### Jump to definition
 
@@ -643,7 +649,8 @@ Postil writes outside itself.
 
 1. **Read-only threads.** Read-only agents run in a thread of their own at `HEAD`, not in
    the engineer's working tree, so they do not see uncommitted edits.
-2. **An ask is a note** with `intent: Ask`, not a record of its own.
+2. **An ask is a note: settled by the owner on 2026-11-26** (built in step 7.6), with
+   `intent: Ask`, not a record of its own.
 3. **Keys.** `q` to ask, `Cmd`-click to jump, `Cmd-Shift-M` for the map, `n` and `p` for
    steps. The key held to talk is not chosen: Right Option is the proposal, since Fn
    belongs to macOS dictation.

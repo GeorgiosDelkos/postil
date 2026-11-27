@@ -46,9 +46,19 @@ export function actOnSecondClick(button, { area = null, arm, disarm, act }) {
   area?.addEventListener("mouseleave", reset);
 }
 
+// The glyph inside each kind of status icon that has one.
+const STATUS_GLYPHS = {
+  needs: "!",
+  addressed: "✓",
+  answered: "✓",
+  resolved: "✓",
+  silent: "–",
+  failed: "×",
+};
+
 // The status icon of a card or a dialog: its shape is CSS (`.status-icon.<kind>`).
 export function statusIcon(kind) {
-  const glyph = { needs: "!", addressed: "✓", resolved: "✓", silent: "–", failed: "×" }[kind] ?? "";
+  const glyph = STATUS_GLYPHS[kind] ?? "";
   const icon = el("span", `status-icon ${kind}`, glyph);
   icon.setAttribute("aria-hidden", "true");
   return icon;

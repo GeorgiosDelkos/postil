@@ -821,7 +821,7 @@ fn reviewers_propose_read_only_then_the_last_judges_the_findings() {
 
 /// Saves Fake (`author`) as the agent notes go to and `reviewers`, each a (name,
 /// scenario) pair, as the reviewers in order.
-fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
+pub(super) fn set_reviewers(site: &Site, author: &str, reviewers: &[(&str, &str)]) {
     let mut custom = vec![serde_json::json!({ "name": "Fake", "command": fake_agent(author) })];
     custom.extend(reviewers.iter().map(
         |(name, scenario)| serde_json::json!({ "name": name, "command": fake_agent(scenario) }),
@@ -1021,6 +1021,38 @@ fn a_send_that_fails_between_two_stages_leaves_the_review_going() {
     assert!(
         kinds(&judge).contains(&"message:judged: saw F1".to_owned()),
         "{judge}"
+    );
+}
+
+#[test]
+fn the_judge_s_edits_are_kept() {
+    let repo = TempRepo::new("run-review-judge-edits");
+    repo.write("a.txt", "a\n");
+    let (site, nudges) = run_site(&repo, "plain");
+    post_note(&site, "a.txt", 1, 1, "one");
+    send(&site, &["N1"]);
+    wait_for(&site, &nudges, "ended");
+    // The proposer finds one thing; the judge, which may change files, writes a.txt.
+    set_reviewers(
+        &site,
+        "plain",
+        &[("First", "reviewer"), ("Judge", "writes")],
+    );
+    let body = serde_json::json!({ "of": "R1" }).to_string();
+    assert_eq!(
+        post(&site, &format!("{RUN}/review"), &body).0,
+        StatusCode::OK
+    );
+
+    let judge = wait_for_run(&site, &nudges, "R3");
+
+    assert_eq!(judge["status"], "ended", "{judge}");
+    assert_eq!(judge["problem"], serde_json::Value::Null, "{judge}");
+    let thread = get_json(&site, "postil://localhost/api/thread?id=R1");
+    let worktree = PathBuf::from(thread["path"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(worktree.join("a.txt")).unwrap(),
+        "a\nprompt 1\n"
     );
 }
 
@@ -2020,8 +2052,8 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         ("\n", "its first line is not a run header"),
         ("not a header\n", "its first line is not a run header"),
         (
-            r#"{"version":7,"id":"R3","newField":1}"#,
-            "it is version 7, and this build of Postil reads versions 1 to 6",
+            r#"{"version":8,"id":"R3","newField":1}"#,
+            "it is version 8, and this build of Postil reads versions 1 to 7",
         ),
         (
             &*header("R3").replace(

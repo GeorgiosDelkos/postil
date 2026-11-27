@@ -18,7 +18,7 @@ import { onLines } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
 import { pathNoteDialog } from "./path-note-dialog.js";
 import { runPanel } from "./run-panel.js";
-import { escapeAction, foldRun, isOpen, isResolved } from "./run.js";
+import { escapeAction, foldRun, isAsk, isOpen, isResolved } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics, formatSlot } from "./settings.js";
 import { reportOf, reviewOf } from "./status.js";
@@ -42,14 +42,16 @@ const state = {
   wanted: null,
   // Selected lines as 0-based indexes, both inclusive: { anchor, head }.
   selection: null,
-  // The open note composer: { start, end, text, saving, node }, lines 0-based and inclusive.
+  // The open note composer: { start, end, intent, text, saving, node }, lines 0-based and
+  // inclusive; `intent` "ask" when it asks a question instead (code-view.js, `openComposer`).
   // `node` is built once and moved, never rebuilt, when the rows re-render: a rebuilt
   // textarea would lose its focus, caret, and grown height while the engineer types.
   composer: null,
   // As `api/notes` returns them: { id, path, target, lines: { start, end }, snippet, body,
-  // anchor, state }, lines 1-based and inclusive, anchor "found" or "lost". `target` is
-  // "lines", "file" or "folder", and only a note on lines has `lines` and `snippet`
-  // (note-place.js). A lost note is shown as outdated.
+  // anchor, state, intent }, lines 1-based and inclusive, anchor "found" or "lost". `target`
+  // is "lines", "file" or "folder", and only a note on lines has `lines` and `snippet`
+  // (note-place.js). A lost note is shown as outdated. `intent` is "change", or "ask" for a
+  // question, which is never sent with the notes (run.js, `isAsk`).
   notes: [],
   // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
   // file, and the number of notes on each file or folder path.
@@ -86,7 +88,7 @@ const files = fileList({
   codeEl,
   openFile: (path) => code.openFile(path),
   menu,
-  writeNote: (path, target) => pathNote.open(path, target),
+  writeNote: (path, target, options) => pathNote.open(path, target, options),
 });
 
 const code = codeView({
@@ -107,6 +109,8 @@ const code = codeView({
     tray.render();
     files.render();
   },
+  // The ask's card shows its run, as a note sent alone does.
+  onAsked: () => runs.sync(),
 });
 
 const runs = runPanel({
@@ -172,7 +176,8 @@ const noteDetail = noteDialog($("note-dialog"), {
     const note = state.notes.find((candidate) => candidate.id === id);
     return note ? { note, run: tray.runFor(note) } : null;
   },
-  canSend: (note) => tray.canSendAlone() && !isResolved(note) && !tray.inLiveRun(note),
+  canSend: (note) =>
+    tray.canSendAlone() && !isResolved(note) && !isAsk(note) && !tray.inLiveRun(note),
   agent: () => state.settings?.agent?.name ?? null,
   showInCode: (note) =>
     note.target === "folder" ? files.showFolder(note.path) : code.showNote(note),
@@ -187,11 +192,19 @@ const noteDetail = noteDialog($("note-dialog"), {
   reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
   startReview: (id) => runs.startReview(id),
   busy: (id) => runs.busyThread(id),
+  makeNote,
+  openRun: (id) => runs.openRun(id),
 });
 
-// A note on a whole file or folder, from the file list.
+// A note on a whole file or folder, or a question about one, from the file list.
 const pathNote = pathNoteDialog($("path-note-dialog"), {
   add: addPathNote,
+  ask: askAboutPath,
+  uncommitted: async (path, target) => {
+    const query = target === "file" ? `?file=${encodeURIComponent(path)}` : "";
+    const response = await fetch(`api/run/uncommitted${query}`);
+    return response.ok ? await response.json() : null;
+  },
   openSend: () => state.projectOpen && tray.openSend(),
 });
 
@@ -275,6 +288,39 @@ async function addPathNote(path, target, body) {
   return null;
 }
 
+// Asks `body` about the whole file or folder at `path` (`target` "file" or "folder") of the
+// default agent (src/run.rs, `Runner::ask`), and draws the notes the reply holds, the ask
+// among them. Resolves to null when asked, or the reason it was refused: nothing is saved then.
+async function askAboutPath(path, target, body) {
+  const number = ++notesAsked;
+  const response = await fetch("api/run/ask", {
+    method: "POST",
+    body: JSON.stringify({ note: { path, target, body } }),
+  });
+  if (!response.ok) return await response.text();
+  const { notes } = await response.json();
+  if (applyNotes({ ok: true, body: notes, number })) redrawNotes();
+  await runs.sync();
+  return null;
+}
+
+// Makes a change note of the ask `ask`, on what it asks about, with its text, from its
+// answer's dialog: the ask stays as it is (docs/review-assist.md, "Ask without changing").
+// Lines no longer in the file make a note on the whole file. Resolves to null when made, or the
+// reason it was refused.
+async function makeNote(ask) {
+  const onLines = ask.target === "lines" && ask.anchor === "found";
+  const note = onLines
+    ? { path: ask.path, lines: ask.lines, snippet: ask.snippet, body: ask.body }
+    : { path: ask.path, target: ask.target === "folder" ? "folder" : "file", body: ask.body };
+  const number = ++notesAsked;
+  const response = await fetch("api/notes", { method: "POST", body: JSON.stringify(note) });
+  if (!response.ok) return await response.text();
+  const { notes } = await response.json();
+  if (applyNotes({ ok: true, body: notes, number })) redrawNotes();
+  return null;
+}
+
 // Deletes the note, and with it every run none of whose notes is left (src/run.rs,
 // `delete_runs_without_notes`): the runs read before are dropped and the latest is fetched again.
 async function deleteNote(note) {
@@ -325,6 +371,12 @@ async function changeNote(action, note) {
   }
   state.notes = (await response.json()).notes;
   redrawNotes();
+  // Resolving an ask ended its thread (src/run.rs, `Runner::end_ask`): the thread the run
+  // dialog holds is read again, or it would offer Discard on a thread already ended.
+  if (action === "resolve" && isAsk(note)) {
+    runs.forget();
+    await runs.sync();
+  }
 }
 
 // ---- Send and run -------------------------------------------------------------------------
@@ -438,6 +490,12 @@ window.addEventListener("keydown", (event) => {
     const row = files.focusedRow();
     if (row) pathNote.open(row.path, row.target);
     else code.openComposer();
+  } else if (event.key === "q" && !typing && !event.metaKey && !event.ctrlKey) {
+    event.preventDefault();
+    // A question about the selected lines, or the file or folder of a row of the file list.
+    const row = files.focusedRow();
+    if (row) pathNote.open(row.path, row.target, { intent: "ask" });
+    else code.askOnSelection();
   }
 });
 
@@ -452,7 +510,9 @@ function guardDraft(action) {
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   welcome.hide();
   const label = state.composer.node.querySelector(".composer-label");
-  label.textContent = `Save or discard this note before ${action}.`;
+  const draft =
+    state.composer.intent === "ask" ? "Ask or discard this question" : "Save or discard this note";
+  label.textContent = `${draft} before ${action}.`;
   label.classList.add("failed");
   state.composer.node.querySelector("textarea").focus();
   return true;

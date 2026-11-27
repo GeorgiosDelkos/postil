@@ -61,10 +61,12 @@ pub(super) struct Opening<'a> {
     /// The agent's name, as the settings give it.
     pub(super) agent: &'a str,
     /// The notes the run carries: it goes with the last of them.
-    pub(super) notes: &'a [String],
+    pub(super) notes: Vec<String>,
     /// The prompt's text, as the agent receives it.
-    pub(super) prompt: &'a str,
+    pub(super) prompt: String,
     pub(super) origin: Origin,
+    /// Whether the run's thread only reads ([`Header::read_only`]).
+    pub(super) read_only: bool,
 }
 
 /// The thread a new run works in, whose lock it holds while live.
@@ -79,10 +81,11 @@ pub(super) enum InThread<'a> {
 /// The run log's format version, in its header line. Version 2 added a reviewer's run
 /// (`review` in the header, the `findings` entry); version 3 a follow-up (`followUp` in the
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
-/// on the `tool` and `toolUpdate` entries; version 6 the `report` entry. Every older version
-/// reads: a log before version 4 has no snapshots, one before version 5 no commands or exit
-/// codes, and one before version 6 no report.
-const LOG_VERSION: u32 = 6;
+/// on the `tool` and `toolUpdate` entries; version 6 the `report` entry; version 7 `readOnly`
+/// in the header and the `undone` entry. Every older version reads: a log before version 4 has
+/// no snapshots, one before version 5 no commands or exit codes, one before version 6 no
+/// report, and one before version 7 is a run that may change files.
+const LOG_VERSION: u32 = 7;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -206,6 +209,11 @@ pub(super) struct Header {
     /// ([`Origin`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) follow_up: Option<FollowUp>,
+    /// Set when the run's thread only reads (`thread::Mode::Read`): an ask, or a follow-up of
+    /// one. Such a run takes no snapshot and reads no report, and every tool call it asks for
+    /// but a read is refused. Absent, as false, in every log written before version 7.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) read_only: bool,
 }
 
 /// What a new run is: a send of notes, a reviewer's stage, or a follow-up. One value, so a
@@ -325,6 +333,10 @@ pub(crate) enum Entry {
     Report { report: Report },
     /// Where a [`Entry::Report`] would be: why no report could be read.
     NoReport { problem: String },
+    /// The run changed files it may only read, and Postil put the worktree back: `text` says
+    /// so, and becomes the run's problem. Logged before the run's end, for a run whose end
+    /// logs no findings (a proposer's that ended well says it there).
+    Undone { text: String },
     /// A snapshot of the working tree, a git tree id ([`Repo::snapshot`]), taken before the
     /// agent gets the prompt or as its turn ends.
     ///
@@ -434,13 +446,22 @@ pub(crate) struct RunView {
     review: Option<Stage>,
     /// For a follow-up, the run it follows and the engineer's words.
     follow_up: Option<FollowUp>,
+    /// Whether the run's thread only reads ([`Header::read_only`]): the page offers no Apply,
+    /// pull request or review for it.
+    read_only: bool,
 }
 
 impl Run {
     /// Creates the log for a new run in `dir`, with the next free id, takes the lock of the
-    /// run's thread, `thread`, and writes the header. `runs/active.lock` is held only for
-    /// this: it makes taking a number, counting the live runs and taking a thread's lock one
-    /// step across windows, so no two windows both see a place under [`MAX_LIVE`].
+    /// run's thread, `thread`, and writes the header, which `opening` gives. `runs/active.lock`
+    /// is held only for this: it makes taking a number, counting the live runs and taking a
+    /// thread's lock one step across windows, so no two windows both see a place under
+    /// [`MAX_LIVE`].
+    ///
+    /// `opening` is called with the run's id once the run has its place, under
+    /// `runs/active.lock`, before the log exists: an ask saves its note there, sent in this run,
+    /// so an ask refused at the cap saves nothing, and every log on disk names notes saved
+    /// before it (`Runner::delete_runs_without_notes`).
     ///
     /// # Errors
     ///
@@ -448,19 +469,13 @@ impl Run {
     /// window holds a lock this takes past [`LOCK_PATIENCE`]; [`Error::TooManyRuns`] when
     /// [`MAX_LIVE`] runs are live in the repository; [`Error::BadRequest`] for a thread id
     /// that is not a run's; [`Error::ReadRun`] when the thread locks cannot be listed or
-    /// opened; and [`Error::WriteRun`] when a file cannot be written.
-    pub(super) fn create(
+    /// opened; the error of `opening`; and [`Error::WriteRun`] when a file cannot be written.
+    pub(super) fn create<'a>(
         dir: &Path,
-        opening: Opening<'_>,
         thread: InThread<'_>,
         usage: Option<LedgerSink>,
+        opening: impl FnOnce(&str) -> Result<Opening<'a>>,
     ) -> Result<Self> {
-        let Opening {
-            agent,
-            notes,
-            prompt,
-            origin,
-        } = opening;
         let error = |path: &Path| {
             let path = path.to_owned();
             move |source| Error::WriteRun { path, source }
@@ -486,20 +501,31 @@ impl Run {
         if live.len() >= MAX_LIVE {
             return Err(Error::TooManyRuns { live });
         }
-
         // A deleted run's number is not given again (`last_run`): a page that read the old R5
-        // would show a new R5 as the old one.
+        // would show a new R5 as the old one. Every window takes a number under
+        // `runs/active.lock`, held here, and the highest log on disk counts, so the number is
+        // free until the file below claims it.
         let used = last_run(&mut active).map_err(error(&active_path))?;
-        let mut number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
-        // Creating the file claims the id; another window may have claimed it first.
-        let (file, mut log) = loop {
-            let file = dir.join(format!("R{number}.jsonl"));
-            match File::options().append(true).create_new(true).open(&file) {
-                Ok(log) => break (file, log),
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => number += 1,
-                Err(source) => return Err(Error::WriteRun { path: file, source }),
-            }
-        };
+        let number = highest_run(dir).map_err(error(dir))?.max(used) + 1;
+        let id = format!("R{number}");
+        let Opening {
+            agent,
+            notes,
+            prompt,
+            origin,
+            read_only,
+        } = opening(&id)?;
+        // `create_new` all the same: a file something other than Postil made meanwhile is
+        // refused, never written over.
+        let file = dir.join(format!("{id}.jsonl"));
+        let mut log = File::options()
+            .append(true)
+            .create_new(true)
+            .open(&file)
+            .map_err(|source| Error::WriteRun {
+                path: file.clone(),
+                source,
+            })?;
         let (review, follow_up) = match origin {
             Origin::Notes => (None, None),
             Origin::Review(stage) => (Some(stage), None),
@@ -507,15 +533,16 @@ impl Run {
         };
         let header = Header {
             version: LOG_VERSION,
-            id: format!("R{number}"),
+            id,
             agent: agent.to_owned(),
-            notes: notes.to_vec(),
-            prompt: prompt.to_owned(),
+            notes,
+            prompt,
             started_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
             review,
             follow_up,
+            read_only,
         };
         if let Err(source) = log.write_all(&json_line(&header)) {
             // A log without its header would be skipped as unreadable on every restart.
@@ -834,6 +861,7 @@ impl Run {
             }),
             review: state.header.review.clone(),
             follow_up: state.header.follow_up.clone(),
+            read_only: state.header.read_only,
         }
     }
 }
@@ -916,6 +944,7 @@ impl RunState {
                 | Entry::Findings { .. }
                 | Entry::Report { .. }
                 | Entry::NoReport { .. }
+                | Entry::Undone { .. }
                 | Entry::Snapshot { .. } => {}
             }
         }
@@ -1014,6 +1043,11 @@ impl RunState {
             Entry::Failed { .. } => {
                 self.finish(Status::Failed);
                 return Some(RunOutcome::Failed);
+            }
+            // The run is not failed: the worktree was put back, and what the agent said stands
+            // (docs/review-assist-plan.md, "Corrections to the design", 3).
+            Entry::Undone { text } => {
+                self.problem.get_or_insert_with(|| text.clone());
             }
             Entry::Tool { id, tool, .. }
             | Entry::ToolUpdate {
@@ -1505,15 +1539,20 @@ fn json_line<T: Serialize>(value: &T) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// What a run of note N1 by agent "Fake" opens with.
+    fn opening(prompt: &str) -> Opening<'static> {
+        Opening {
+            agent: "Fake",
+            notes: vec!["N1".to_owned()],
+            prompt: prompt.to_owned(),
+            origin: Origin::Notes,
+            read_only: false,
+        }
+    }
+
     /// A run of note N1 by agent "Fake", in a new thread, in the runs directory `dir`.
     fn create(dir: &Path, prompt: &str) -> Run {
-        let opening = Opening {
-            agent: "Fake",
-            notes: &["N1".to_owned()],
-            prompt,
-            origin: Origin::Notes,
-        };
-        Run::create(dir, opening, InThread::New, None).unwrap()
+        Run::create(dir, InThread::New, None, |_| Ok(opening(prompt))).unwrap()
     }
 
     #[test]
@@ -1573,17 +1612,11 @@ mod tests {
 
     /// A run like [`create`]'s whose usage record goes to `ledger`.
     fn create_with_ledger(dir: &Path, ledger: &Path) -> Run {
-        let opening = Opening {
-            agent: "Fake",
-            notes: &["N1".to_owned()],
-            prompt: "p",
-            origin: Origin::Notes,
-        };
         let sink = LedgerSink {
             file: ledger.to_owned(),
             repo: "/repo".to_owned(),
         };
-        Run::create(dir, opening, InThread::New, Some(sink)).unwrap()
+        Run::create(dir, InThread::New, Some(sink), |_| Ok(opening("p"))).unwrap()
     }
 
     #[test]

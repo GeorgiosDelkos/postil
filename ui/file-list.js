@@ -22,8 +22,9 @@ const rowTarget = (row) => (row.classList.contains("dir") ? "folder" : "file");
 // `state` is the page's state: the list reads `repo.files`, `tree`, `expanded`,
 // `noteCountByPath` and `file`, and keeps `expanded`. `openFile(path)` opens a file in the code
 // pane and resolves to whether it was shown; `codeEl` takes the focus when the filter is left.
-// `menu` is the context menu (context-menu.js), and `writeNote(path, target)` opens the dialog
-// for a note on the whole file or folder (`target` "file" or "folder").
+// `menu` is the context menu (context-menu.js), and `writeNote(path, target, { intent })` opens
+// the dialog for a note on the whole file or folder (`target` "file" or "folder"), or for a
+// question about it (`intent` "ask").
 export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, writeNote }) {
   // The index of the highlighted row while the file filter has text.
   let activeMatch = 0;
@@ -208,6 +209,13 @@ export function fileList({ state, filesEl, filterEl, codeEl, openFile, menu, wri
         key: "C",
         matches: (key) => key.key === "c" && !key.metaKey,
         run: () => writeNote(row.dataset.path, target),
+      },
+      {
+        label: "Ask…",
+        detail: `about this ${target}`,
+        key: "Q",
+        matches: (key) => key.key === "q" && !key.metaKey,
+        run: () => writeNote(row.dataset.path, target, { intent: "ask" }),
       },
     ]);
   });

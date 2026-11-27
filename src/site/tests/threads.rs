@@ -420,6 +420,17 @@ fn an_unreadable_thread_record_fails_the_send_and_is_never_written_over() {
     // No record names R1's thread, so its lock file goes with the failed run.
     assert!(!repo.root.join(".git/postil/threads/R1.lock").exists());
 
+    // A newer record is refused, not read as this version, and kept.
+    let newer = r#"{"version": 5, "threads": []}"#;
+    fs::write(&record, newer).unwrap();
+    let (status, body) = send(&site, &["N1"]);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.contains("version 5, and this Postil reads versions 1 to 4"),
+        "{body}"
+    );
+    assert_eq!(fs::read_to_string(&record).unwrap(), newer);
+
     // A record that cannot be read at all is not an empty one.
     fs::remove_file(&record).unwrap();
     fs::create_dir(&record).unwrap();
