@@ -21,7 +21,7 @@ import { runPanel } from "./run-panel.js";
 import { escapeAction, foldRun, isOpen, isResolved } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics, formatSlot } from "./settings.js";
-import { reviewOf } from "./status.js";
+import { reportOf, reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
 import { usageDialog } from "./usage-dialog.js";
 import { welcomeScreen } from "./welcome.js";
@@ -124,7 +124,13 @@ const runs = runPanel({
   reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
   showChanges: (from, to) => {
     tray.closeSend();
-    changes.show(from, to);
+    // A walkthrough belongs to one run (docs/review-assist.md, "Guided walkthrough and risk").
+    const run = from === to ? runs.byId(from) : null;
+    const walk = run && {
+      report: reportOf(run)?.report ?? null,
+      findings: reviewOf(run.id, runs.knownViews())?.findings ?? [],
+    };
+    changes.show(from, to, walk);
   },
 });
 
@@ -144,13 +150,13 @@ const tray = notesTray({
 // What a run changed, over the open file; Esc, or opening a file, gives the pane back.
 const changes = changesView({
   viewEl: $("changes-view"),
-  setHeader: (title, meta) => {
+  setHeader: (title, meta, controls) => {
     const close = el("button", "button changes-close", "esc");
     close.type = "button";
     close.title = "Back to the file";
     close.addEventListener("click", () => changes.close());
     $("crumbs").replaceChildren(el("b", "", title), close);
-    $("file-meta").textContent = meta;
+    $("file-meta").replaceChildren(...controls, meta);
   },
   notes: () => state.notes,
   noteCard: (note) => tray.noteCard(tray.cardOf(note), () => noteDetail.open(note.id)),

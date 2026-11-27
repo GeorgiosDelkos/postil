@@ -3622,6 +3622,129 @@ button.changes-number:focus-visible {
   margin: 8px 12px 10px;
 }
 
+/* The changes view's order and rating controls, in the pane's header beside the counts. */
+.meta:has(.segmented) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.meta .segmented {
+  padding: 1px;
+  border-radius: 6px;
+}
+
+.meta .segment {
+  min-width: 0;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 4px;
+  font-size: 11.5px;
+}
+
+/* One step of the walkthrough: what the author says, then the hunks its lines overlap. */
+.changes-step {
+  margin-bottom: 22px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+
+.changes-step[aria-current="step"] {
+  border-left-color: var(--accent);
+}
+
+.changes-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 12.5px;
+}
+
+.changes-step-number {
+  flex: none;
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.changes-step-head .changes-path {
+  color: var(--text-muted);
+}
+
+.changes-why {
+  margin-bottom: 8px;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.changes-step .changes-file {
+  margin-bottom: 10px;
+}
+
+.changes-hunk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.changes-hunk-header {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A folded `mechanical` hunk: one line with its counts, opened by a click. */
+button.changes-fold {
+  width: 100%;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.changes-fold:hover,
+button.changes-fold:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.changes-risk {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font: 11px/1.5 var(--font-mono);
+}
+
+.changes-risk.eyes {
+  border-color: var(--attention-border);
+  color: var(--attention);
+}
+
+.changes-loose {
+  padding-left: 0;
+  margin-bottom: 10px;
+}
+
+.changes-finding {
+  border-color: var(--attention-border);
+}
+
+.changes-finding-verdict {
+  flex: 1;
+  color: var(--attention);
+}
+
+.changes-finding-fix {
+  color: var(--text-soft);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Editing a note's text in its dialog. */
 .note-dialog-label .note-dialog-edit {
   margin-left: auto;

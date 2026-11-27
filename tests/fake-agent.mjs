@@ -328,6 +328,23 @@ async function prompt(id, params) {
       renameSync(`${process.cwd()}/c.txt`, `${process.cwd()}/d.txt`);
       writeFileSync(`${process.cwd()}/bin.dat`, Buffer.from([0, 1, 2, 255, 0, 7]));
       return send({ id, result: { stopReason: "end_turn" } });
+    case "report-reviewed": {
+      // Plays the author and a proposing reviewer, told apart by the prompt (src/review.rs).
+      // The author edits a.txt and rates its hunk mechanical; the reviewer finds something on
+      // a.txt's line 2, which must show the hunk unfolded as eyes, and something on no file.
+      if (blocks[0].includes("Do not change any file")) {
+        const findings = [
+          { path: "a.txt", line: 2, finding: "reported is not mechanical" },
+          { finding: "the change has no test" },
+        ];
+        say(`Found two.\n\n\`\`\`json\n${JSON.stringify(findings)}\n\`\`\``);
+        return send({ id, result: { stopReason: "end_turn" } });
+      }
+      writeFileSync(`${process.cwd()}/a.txt`, "a\nreported\n");
+      const steps = [{ path: "a.txt", lines: [1, 2], why: "the change", risk: "mechanical" }];
+      say(`N1: done\n\n\`\`\`json\n${JSON.stringify({ steps, checks: [] })}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "report": {
       // Edits a.txt and deletes b.txt for real, says what it did, and ends with the author's
       // report (src/report.rs): steps on an edited file, on the deleted one (its lines name

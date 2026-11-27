@@ -1,12 +1,12 @@
 # Postil: review assist
 
-Status: 2026-11-25. Designed. Built so far: an execute call's command and exit code (step
-7.2), the author's report (7.3), read and logged, and the evidence on the run (7.4); the
-walkthrough is not. This document adds to `docs/design.md`, which stays
-the reference for everything built so far. `docs/review-assist-plan.md` turns it into pull
-requests, with the edge cases and tests of each. Section "Decisions" lists what the owner settled on
-2026-11-25; section "Open questions" lists what this document assumes and the owner has not
-confirmed.
+Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
+7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), and the
+walkthrough with its ratings and findings in the changes view (7.5). This document adds to
+`docs/design.md`, which stays the reference for everything built so far.
+`docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
+Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
+what this document assumes and the owner has not confirmed.
 
 Mockups: https://claude.ai/code/artifact/61c79ac1-1498-4f37-9ec0-f2824cf3f92f (private to the owner until shared).
 
@@ -133,8 +133,10 @@ struct Check {
 
 ### Guided walkthrough and risk
 
-The changes view gains an order: Walkthrough (the default when the run has a report) or Files
-(today's order).
+Built in step 7.5 (`ui/changes-view.js`, `walkthrough` in `ui/patch.js`). The changes view has
+an order: Walkthrough (the default when the run's report names a step) or Files (the diff's
+order). A hunk two steps overlap belongs to the first, and the later one says "shown in step
+N"; a step that names no changed line is listed last.
 
 - **A step covers the hunks its lines overlap.** `n` and `p` move between steps; the step's
   `why` shows above its hunks.

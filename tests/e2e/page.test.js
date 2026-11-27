@@ -48,11 +48,12 @@ before(async () => {
 });
 after(() => browser?.close());
 
-// A new project on the bridge, `src/a.rs`, `b.rs` and `c.rs` in a fresh repository, open in a
-// new page, its agent in the fake agent's `scenario`. `api` calls its routes from the test, as
-// the page does. `route` is the bridge's route that makes the site (src/site/tests/page_e2e.rs).
-async function openProject(t, scenario = "flood", route = "new") {
-  const body = JSON.stringify({ scenario });
+// A new project on the bridge, `src/a.rs`, `b.rs` and `c.rs` in a fresh repository (or `files`,
+// a map of path to text, instead), open in a new page, its agent in the fake agent's
+// `scenario`. `api` calls its routes from the test, as the page does. `route` is the bridge's
+// route that makes the site (src/site/tests/page_e2e.rs).
+async function openProject(t, scenario = "flood", route = "new", { files } = {}) {
+  const body = JSON.stringify({ scenario, files });
   const created = await fetch(new URL(route, bridge), { method: "POST", body });
   const site = new URL((await created.json()).base, bridge);
   const page = await browser.newPage();
@@ -178,6 +179,108 @@ test("a click on a line number in Changes opens the composer on that line (JS19)
   await page.locator("#changes-view").getByRole("button", { name: "2", exact: true }).click();
   await page.locator("#changes-view").waitFor({ state: "hidden" });
   await page.locator("#code-rows label").filter({ hasText: "Note on line 2" }).waitFor();
+});
+
+// The fake agent's `report` run, ended, with its changes open in Walkthrough order: it edits
+// a.txt (step 1, routine), deletes b.txt (step 2, mechanical, so folded), and names a.txt's
+// line 2 again (step 3, shown in step 1).
+async function openWalkthrough(t) {
+  const files = { "a.txt": "a\n", "b.txt": "1\n2\n3\n4\n" };
+  const { page, api } = await openProject(t, "report", "new", { files });
+  const request = { path: "a.txt", lines: { start: 1, end: 1 }, snippet: "a", body: "Change a." };
+  const review = await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  const notes = review.notes.map((note) => note.id);
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  // The report's check is listed once the page holds the run's report.
+  await detail.locator(".run-check").filter({ hasText: "cargo test" }).waitFor();
+  await detail.getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  await changes.locator(".changes-step").first().waitFor();
+  return { page, changes };
+}
+
+test("n moves to the walkthrough's next step, and still does after a click on Walkthrough", async (t) => {
+  const { page, changes } = await openWalkthrough(t);
+  const current = changes.locator('.changes-step[aria-current="step"] .changes-step-number');
+  await current.filter({ hasText: "Step 1 of 3" }).waitFor();
+  await page.keyboard.press("n");
+  await current.filter({ hasText: "Step 2 of 3" }).waitFor();
+  await page.keyboard.press("p");
+  await current.filter({ hasText: "Step 1 of 3" }).waitFor();
+  // p at the first step, and n with a modifier held, do nothing.
+  await page.keyboard.press("p");
+  await page.keyboard.press("Control+n");
+  assert.equal(await current.textContent(), "Step 1 of 3");
+
+  // The control is in the pane's header, outside the view: it gives the keys back to it.
+  await page.locator("#file-meta").getByRole("radio", { name: "Walkthrough" }).click();
+  await current.filter({ hasText: "Step 1 of 3" }).waitFor();
+  await page.keyboard.press("n");
+  await current.filter({ hasText: "Step 2 of 3" }).waitFor();
+});
+
+test("a mechanical hunk starts folded and opens on a click", async (t) => {
+  const { changes } = await openWalkthrough(t);
+  const deleted = changes.locator(".changes-step").filter({ hasText: "Step 2 of 3" });
+  assert.equal(await deleted.locator(".changes-line").count(), 0, "folded");
+  await deleted.locator(".changes-fold").click();
+  await deleted.locator(".changes-line.del").nth(3).waitFor();
+  assert.equal(await deleted.locator(".changes-fold").count(), 0);
+});
+
+test("a click on a line number in a walkthrough's hunk opens the composer on that line", async (t) => {
+  const { page, changes } = await openWalkthrough(t);
+  const first = changes.locator(".changes-step").filter({ hasText: "Step 1 of 3" });
+  await first.getByRole("button", { name: "1", exact: true }).click();
+  await changes.waitFor({ state: "hidden" });
+  await page.locator("#code-rows label").filter({ hasText: "Note on line 1" }).waitFor();
+});
+
+test("a review's finding shows beside its line, unfolds its hunk as eyes, and one on no file tops the view", async (t) => {
+  const { page, api } = await openProject(t, "report-reviewed", "new", {
+    files: { "a.txt": "a\n" },
+  });
+  // The same fake agent proposes as the one reviewer: the scenario tells the prompts apart.
+  const current = await api("api/settings");
+  const settings = { ...current.settings, reviewers: [{ name: "Fake" }] };
+  const body = JSON.stringify({ revision: current.revision, settings });
+  await api("api/settings", { method: "PUT", body });
+  const request = { path: "a.txt", lines: { start: 1, end: 1 }, snippet: "a", body: "Change a." };
+  const review = await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  const notes = review.notes.map((note) => note.id);
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes }) });
+  const deadline = Date.now() + WAIT;
+  for (;;) {
+    const { status } = await api("api/run?id=R1");
+    if (status === "ended") break;
+    assert.ok(Date.now() < deadline, `R1 is ${status}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
+
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  // The run's dialog lists the findings once the page holds the review.
+  await detail.locator(".run-card.finding").filter({ hasText: "no test" }).waitFor();
+  await detail.getByRole("button", { name: "Changes" }).click();
+
+  const changes = page.locator("#changes-view");
+  await changes
+    .locator(":scope > .changes-loose .changes-finding", { hasText: "no test" })
+    .waitFor();
+  const step = changes.locator(".changes-step").filter({ hasText: "Step 1 of 1" });
+  // Rated mechanical by its author, the hunk a finding is on is drawn whole, as eyes.
+  const hunk = step.locator('.changes-hunk-block[data-risk="eyes"]');
+  await hunk.locator(".changes-risk.eyes").waitFor();
+  assert.equal(await step.locator(".changes-fold").count(), 0, "not folded");
+  const beside = hunk.locator(
+    '.changes-line:has(button.changes-number.new:text-is("2")) + .changes-notes .changes-finding',
+  );
+  await beside.filter({ hasText: "reported is not mechanical" }).waitFor();
 });
 
 test("a note's remark on the code follows an edit and a delete of the note (JS18)", async (t) => {
