@@ -1,8 +1,7 @@
 # Postil: review assist, implementation plan
 
-Status: 2026-11-27. Milestones 7, 8 and 9 are built and merged (PRs #53 to #79), and steps
-10.1 (native dictation) and 10.2 (the dictation widget) are built. Step 10.3 (voice commands)
-remains. This plan turns `docs/review-assist.md` (the
+Status: 2026-11-27. Milestones 7, 8, 9 and 10 are built (PRs #53 to #79 merged; milestone 10
+in stacked PRs for 10.1, 10.2 and 10.3). This plan turns `docs/review-assist.md` (the
 design) into pull requests. It was written against the code at `53442a6`; every function and
 line it names was read there. `b7286bc` (#50, Open pull request) landed after it: line numbers
 in `src/notes.rs`, `src/run.rs`, `src/site.rs`, `src/thread.rs` and `ui/run-dialog.js` moved,
@@ -966,7 +965,8 @@ The owner has not confirmed these; each is the design's assumption carried into 
 
 1. An ask is a note with an intent (7.6). Settled by the owner on 2026-11-26, and built.
 2. The keys: `q`, `n`, `p`, `/`, `0`, `Cmd-Shift-M`, `Cmd-[`, `Cmd-]`, and the key held to
-   talk (10.3).
+   talk (10.3). Settled by the owner on 2026-11-27: Right Option (`AltRight`) held to talk,
+   and all existing keys kept as built.
 3. The map's color (8.3).
 4. Postil does not offer `hippius-mem init`, and setup makes a trial vault only (9.1).
 5. Read-only runs in threads of their own, correction 1 above, which replaces the shared

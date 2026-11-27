@@ -71,6 +71,11 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         include_bytes!("../ui/dictation.js"),
     ),
     (
+        "/voice.js",
+        "text/javascript",
+        include_bytes!("../ui/voice.js"),
+    ),
+    (
         "/icons.js",
         "text/javascript",
         include_bytes!("../ui/icons.js"),

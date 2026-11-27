@@ -2912,3 +2912,56 @@ test("dictation widget handles dialog close and IME composition cleanly", async 
   });
   assert.equal(await textarea.inputValue(), "漢 after ime");
 });
+
+test("voice commands: 'next' moves the walkthrough and 'send' twice sends", async (t) => {
+  const files = { "a.txt": "a\n", "b.txt": "1\n2\n3\n4\n" };
+  const { page, api } = await openProject(t, "report", "new", { files });
+  const request = { path: "a.txt", lines: { start: 1, end: 1 }, snippet: "a", body: "Change a." };
+  await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator("#notes .note").first().waitFor();
+
+  // Hold Right Option for >200 ms, say "send" -> opens the send step, does not send yet.
+  await page.keyboard.down("AltRight");
+  await page.waitForTimeout(250);
+  await page.evaluate(() => {
+    window.postil.dictation.emit({ type: "state", state: "listening" });
+    window.postil.dictation.emit({ type: "transcript", text: "send", isFinal: true });
+    window.postil.dictation.emit({ type: "state", state: "idle" });
+  });
+  await page.keyboard.up("AltRight");
+  await page.locator("#prompt-preview").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#tab-run").isHidden(), true, "first send only opens send step");
+
+  // Second "send" while in the send step sends the run.
+  await page.keyboard.down("AltRight");
+  await page.waitForTimeout(250);
+  await page.evaluate(() => {
+    window.postil.dictation.emit({ type: "state", state: "listening" });
+    window.postil.dictation.emit({ type: "transcript", text: "send", isFinal: true });
+    window.postil.dictation.emit({ type: "state", state: "idle" });
+  });
+  await page.keyboard.up("AltRight");
+  await page.locator("#tab-run").waitFor({ state: "visible" });
+  await page.locator("#run .run-entry").first().waitFor();
+
+  // Open the run's Changes walkthrough, then say "next" to move from step 1 to step 2.
+  await page.locator("#run .run-entry").first().click();
+  const detail = page.locator("#run-detail");
+  await detail.locator(".run-check").filter({ hasText: "cargo test" }).waitFor();
+  await detail.getByRole("button", { name: "Changes" }).click();
+  const current = page.locator(
+    '#changes-view .changes-step[aria-current="step"] .changes-step-number',
+  );
+  await current.filter({ hasText: "Step 1 of 3" }).waitFor();
+
+  await page.keyboard.down("AltRight");
+  await page.waitForTimeout(250);
+  await page.evaluate(() => {
+    window.postil.dictation.emit({ type: "state", state: "listening" });
+    window.postil.dictation.emit({ type: "transcript", text: "next", isFinal: true });
+    window.postil.dictation.emit({ type: "state", state: "idle" });
+  });
+  await page.keyboard.up("AltRight");
+  await current.filter({ hasText: "Step 2 of 3" }).waitFor();
+});

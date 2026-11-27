@@ -766,11 +766,17 @@ export function codeView({
     await askDefinitions(jumpAsked, name, state.file.path, line);
   }
 
+  // Jumps to definition by spoken or typed `name`, opening the picker when several match.
+  async function jumpToName(name) {
+    cancelJump();
+    await askDefinitions(jumpAsked, name, state.file?.path ?? "", -1);
+  }
+
   async function askDefinitions(asked, name, from, line) {
     const query = `name=${encodeURIComponent(name)}&from=${encodeURIComponent(from)}`;
     const response = await fetch(`api/definitions?${query}`);
     // A newer jump, Escape, or another file opened meanwhile: the answer is not wanted.
-    if (asked !== jumpAsked || state.file?.path !== from) return;
+    if (asked !== jumpAsked || (state.file?.path ?? "") !== from) return;
     if (!response.ok) {
       showToast(await response.text());
       return;
@@ -783,13 +789,14 @@ export function codeView({
       return;
     }
     const { definitions, total } = reply;
-    const here = (definition) => definition.path === from && definition.line === line + 1;
+    const here = (definition) =>
+      line >= 0 && definition.path === from && definition.line === line + 1;
     if (definitions.length === 0) {
       showToast(`No definition found for ${name}.`);
       return;
     }
     // Taken before the list opens: a refresh while it is open may change the open file.
-    const left = currentPlace();
+    const left = state.file ? currentPlace() : null;
     const target =
       definitions.length === 1 ? definitions[0] : await picker.open(name, definitions, total);
     if (!target || asked !== jumpAsked) return;
@@ -799,7 +806,7 @@ export function codeView({
     }
     const landed = { path: target.path, line: target.line, scrollTop: null, selection: null };
     const shown = await showPlace(landed);
-    if (shown === "shown") history.jump(left, landed);
+    if (shown === "shown" && left) history.jump(left, landed);
     // The index has not seen the file go yet: it looks again on the next focus.
     else if (shown === "missing") showToast(`${target.path} is no longer there.`);
   }
@@ -862,7 +869,7 @@ export function codeView({
   // to the selection between the right-click and the click. With `intent` "ask" it asks a
   // question about the lines instead (docs/review-assist.md, "Ask without changing"): saving
   // sends it at once to the default agent, which only reads.
-  function openComposer(range = selectedRange(), { intent = "change" } = {}) {
+  function openComposer(range = selectedRange(), { intent = "change", text = "" } = {}) {
     if (!range || state.composer) return;
     state.selection = { anchor: range.start, head: range.end };
 
@@ -873,12 +880,19 @@ export function codeView({
       codeEl.scrollTop = top - codeEl.clientHeight / 3;
     }
 
-    const composer = { ...range, intent, text: "", saving: false, node: null };
+    const composer = { ...range, intent, text, saving: false, node: null };
     composer.node = buildComposer(composer);
     state.composer = composer;
     renderCode({ force: true });
     onActiveLine();
-    composer.node.querySelector("textarea").focus();
+    const textarea = composer.node.querySelector("textarea");
+    if (text) {
+      textarea.value = text;
+      textarea.style.height = "auto";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+      requestAnimationFrame(() => measureComposer(composer.node));
+    }
+    textarea.focus();
     if (intent === "ask") showAskWarning(composer);
   }
 
@@ -1053,6 +1067,7 @@ export function codeView({
     askOnSelection,
     closeComposer,
     cancelJump,
+    jumpToName,
     stepHistory,
   };
 }
