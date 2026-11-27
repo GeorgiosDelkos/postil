@@ -1348,7 +1348,10 @@ export function diagramView({
       const t = Math.min(1, (now - started) / GLIDE_MS);
       const eased = 1 - (1 - t) ** 3;
       const at = (a, b) => a + (b - a) * eased;
-      setTransform({ x: at(from.x, target.x), y: at(from.y, target.y), scale: target.scale });
+      setTransform(
+        { x: at(from.x, target.x), y: at(from.y, target.y), scale: target.scale },
+        { immediate: true },
+      );
       glide = t < 1 ? requestAnimationFrame(frame) : null;
     };
     glide = requestAnimationFrame(frame);
@@ -1431,7 +1434,7 @@ export function diagramView({
     if (!view.transforms.has(drawn.diagram.id)) {
       view.transforms.set(drawn.diagram.id, fitTransform(drawn.positioned, viewport()));
     }
-    setTransform(transform());
+    setTransform(transform(), { immediate: true });
     centrePending();
   }).observe(body);
 

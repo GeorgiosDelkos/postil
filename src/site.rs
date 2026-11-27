@@ -974,17 +974,19 @@ impl Site {
             }
             "/api/notes" => self.respond_notes(method, query, body),
             "/api/notes/resolve" => match *method {
-                Method::POST => self.change_note(query, |site, repo, id| {
+                Method::POST => self.change_note(query, |project, id| {
                     // An ask's thread ends first, freeing its worktree; refused while it runs.
-                    if notes::is_ask(repo, id)? {
-                        site.runner()?.end_ask(id)?;
+                    if notes::is_ask(&project.repo, id)? {
+                        project.runner.end_ask(id)?;
                     }
-                    notes::resolve(repo, id)
+                    notes::resolve(&project.repo, id)
                 }),
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/notes/reopen" => match *method {
-                Method::POST => self.change_note(query, |_, repo, id| notes::reopen(repo, id)),
+                Method::POST => {
+                    self.change_note(query, |project, id| notes::reopen(&project.repo, id))
+                }
                 _ => not_allowed("POST ?id=<note id> with no body"),
             },
             "/api/folders" => match *method {
@@ -1240,12 +1242,16 @@ impl Site {
     /// `{"trashed": null}` when there was no file. Refused while an analysis of this window is
     /// under way: its merge would write a new file as this one goes.
     fn start_analysis_over(&self) -> Result<Vec<u8>> {
-        if self.runner()?.analyzing() {
+        // Hold the read lock across the check and trash so `open` cannot switch projects between
+        // checking `runner.analyzing()` and trashing `repo`'s analysis file.
+        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+        let project = guard.as_ref().ok_or(Error::NoProject)?;
+        if project.runner.analyzing() {
             return Err(Error::AnalysisRefused(
                 "an analysis of this window is under way: wait for it, or stop it".to_owned(),
             ));
         }
-        let trashed = analysis::start_over(&*self.repo()?)?;
+        let trashed = analysis::start_over(&project.repo)?;
         Ok(to_json(&serde_json::json!({ "trashed": trashed })))
     }
 
@@ -1287,23 +1293,29 @@ impl Site {
     /// The reply to `DELETE /api/notes?id=N1`: removes the note, saves, and returns the
     /// other notes.
     fn delete_note(&self, id: &str) -> Result<Vec<u8>> {
-        let review = notes::delete(&*self.repo()?, id)?;
+        // Hold the read lock so both operations target the same open project.
+        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+        let project = guard.as_ref().ok_or(Error::NoProject)?;
+        let review = notes::delete(&project.repo, id)?;
         // A run goes with its last note (docs/design.md, "Runs"). The note is deleted by now:
         // a log that cannot be removed is reported, and tried again at the next delete.
-        self.runner()?.delete_runs_without_notes()?;
+        project.runner.delete_runs_without_notes()?;
         Ok(to_json(&review))
     }
 
     /// The reply to `POST /api/notes/resolve?id=N1` and `POST /api/notes/reopen?id=N1`:
     /// changes the note's state with `change` (around `notes::resolve` or `notes::reopen`),
     /// and returns all notes.
-    fn change_note(&self, query: &str, change: fn(&Self, &Repo, &str) -> Result<Review>) -> Reply {
+    fn change_note(&self, query: &str, change: fn(&Project, &str) -> Result<Review>) -> Reply {
         let Some(id) = query_value(query, "id") else {
             return bad_request("expected ?id=<note id>");
         };
+        let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
         json_or_error(
-            self.repo()
-                .and_then(|repo| change(self, &repo, &id))
+            guard
+                .as_ref()
+                .ok_or(Error::NoProject)
+                .and_then(|project| change(project, &id))
                 .map(|review| to_json(&review)),
         )
     }

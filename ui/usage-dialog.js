@@ -67,18 +67,10 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
   const MAX_POLLS = 45;
   let polls = 0;
 
-  function viewSignature(view) {
-    if (!view) return null;
-    const agents = (view.agents ?? [])
-      .map((a) => `${a.name}:${a.quota?.status ?? ""}:${a.quota?.fetchedAt ?? ""}:${a.runs ?? 0}`)
-      .join("|");
-    return `${view.scope}|${view.range}|${view.scanning}|${view.polling}|${view.totals?.runs ?? 0}|${agents}`;
-  }
-
   function show(view) {
     const merged = mergeUsageView(ui.view, view);
     const unchanged =
-      !ui.refreshing && ui.error === null && viewSignature(merged) === viewSignature(ui.view);
+      !ui.refreshing && ui.error === null && JSON.stringify(merged) === JSON.stringify(ui.view);
     ui.view = merged;
     ui.scope = merged.scope;
     ui.range = merged.range;
@@ -104,6 +96,18 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
     }
     if (!unchanged) render();
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (
+      !document.hidden &&
+      dialogEl.open &&
+      ui.pollTimer === null &&
+      polls < MAX_POLLS &&
+      (ui.view?.scanning || ui.view?.polling)
+    ) {
+      fetchView().catch(fail);
+    }
+  });
 
   function fail(error) {
     ui.error = String(error.message ?? error);

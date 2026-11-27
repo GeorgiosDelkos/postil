@@ -1434,7 +1434,7 @@ async function start() {
   if (notes) applyNotes(notes);
   files.render();
   tray.render();
-  if (analysis !== undefined) {
+  if (analysis) {
     await map.applyAnalysis(analysis).catch((error) => showToast(String(error)));
   }
   // The latest run, this session's or one from before a restart.

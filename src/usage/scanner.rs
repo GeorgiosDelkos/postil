@@ -119,6 +119,8 @@ impl SessionScanner {
 
     fn spawn_scan(&self, home: PathBuf, cache: HashMap<PathBuf, FileStamp>) {
         let shared = Arc::clone(&self.state);
+        // `FileStamp::records` is an `Arc<[LedgerRecord]>`, so cloning the map is shallow.
+        let fallback_cache = cache.clone();
         let spawned = std::thread::Builder::new()
             .name("usage-session-scan".to_owned())
             .spawn(move || {
@@ -137,6 +139,7 @@ impl SessionScanner {
             drop(handle);
         } else {
             let mut state = lock(&self.state);
+            state.cache = fallback_cache;
             state.updated = Some(Instant::now());
             state.in_flight = false;
         }

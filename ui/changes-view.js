@@ -432,7 +432,11 @@ export function changesView({
   }
 
   function moreButton(count, more) {
-    const button = el("button", "button changes-more", `Show the other ${count} lines`);
+    const label =
+      count > LINES_SHOWN
+        ? `Show ${LINES_SHOWN} more of ${count} lines`
+        : `Show the other ${count} lines`;
+    const button = el("button", "button changes-more", label);
     button.type = "button";
     button.addEventListener("click", more);
     return button;

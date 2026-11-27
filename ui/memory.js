@@ -120,20 +120,32 @@ const MEMORY_POLL_TIMEOUT_MS = 60_000;
 
 export function pollMemory(url, { method = "GET", body, onReply }) {
   let stopped = false;
+  let inFlight = false;
   let timer = null;
   let delay = MEMORY_POLL_MS;
   const startedAt = Date.now();
   const hasVisibility =
     typeof document !== "undefined" && typeof document.addEventListener === "function";
+  const detachVisibility = () => {
+    if (hasVisibility) document.removeEventListener("visibilitychange", onVisible);
+  };
+  const timedOut = () => Date.now() - startedAt >= MEMORY_POLL_TIMEOUT_MS;
   const schedule = () => {
     if (stopped) return;
-    if (Date.now() - startedAt >= MEMORY_POLL_TIMEOUT_MS) return;
+    if (timedOut()) {
+      detachVisibility();
+      return;
+    }
     if (hasVisibility && document.hidden) return;
     timer = setTimeout(ask, delay);
     delay = Math.min(delay * 2, MEMORY_POLL_MAX_MS);
   };
   const onVisible = () => {
-    if (!stopped && hasVisibility && !document.hidden && timer === null) {
+    if (stopped || timedOut()) {
+      detachVisibility();
+      return;
+    }
+    if (hasVisibility && !document.hidden && !inFlight && timer === null) {
       delay = MEMORY_POLL_MS;
       void ask();
     }
@@ -143,6 +155,7 @@ export function pollMemory(url, { method = "GET", body, onReply }) {
   }
   async function ask() {
     timer = null;
+    inFlight = true;
     let reply;
     try {
       const response = await fetch(url, body === undefined ? { method } : { method, body });
@@ -152,20 +165,17 @@ export function pollMemory(url, { method = "GET", body, onReply }) {
     } catch (error) {
       reply = { state: "failed", error: String(error) };
     }
+    inFlight = false;
     if (stopped) return;
     onReply(reply);
     if (reply.state === "pending") schedule();
-    else if (hasVisibility) {
-      document.removeEventListener("visibilitychange", onVisible);
-    }
+    else detachVisibility();
   }
   void ask();
   return () => {
     stopped = true;
     clearTimeout(timer);
     timer = null;
-    if (hasVisibility) {
-      document.removeEventListener("visibilitychange", onVisible);
-    }
+    detachVisibility();
   };
 }

@@ -101,6 +101,19 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     if (!popoverEl.hidden) renderPopover();
   }
 
+  document.addEventListener("visibilitychange", () => {
+    if (
+      !document.hidden &&
+      ui.started &&
+      ui.pollTimer === null &&
+      !ui.inFlight &&
+      ui.polls < MAX_POLLS &&
+      (ui.view?.scanning || ui.view?.polling)
+    ) {
+      fetchUsage({ force: false, allowStale: true }).catch(() => {});
+    }
+  });
+
   function hasErrorQuota() {
     return (ui.view?.agents ?? []).some((agent) => agent?.quota?.status === "error");
   }

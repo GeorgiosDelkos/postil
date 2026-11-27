@@ -315,12 +315,12 @@ export function attachDictation(input, { onError = showToast } = {}) {
       dialogCleanup = () => dialog.removeEventListener("close", onClose);
     }
 
-    const observeRoot = dialog ?? input.parentElement ?? document.body;
+    const observeRoot = dialog ?? input.closest(".composer")?.parentElement ?? document.body;
     if (typeof MutationObserver !== "undefined" && observeRoot) {
       observer = new MutationObserver(() => {
         if (!input.isConnected) cancel();
       });
-      observer.observe(observeRoot, { childList: true, subtree: observeRoot !== document.body });
+      observer.observe(observeRoot, { childList: true, subtree: true });
     }
 
     const context = contextProvider();

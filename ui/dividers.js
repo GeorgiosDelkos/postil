@@ -71,7 +71,7 @@ export function dividers({ onNarrow }) {
     else root.setProperty(prop, value);
   }
 
-  function drawLayout() {
+  function drawLayout({ forceNotify = false } = {}) {
     const root = document.documentElement.style;
     if (panes.layout) {
       const drawn = fit(panes.layout, panes.limits, innerWidth, options());
@@ -92,7 +92,7 @@ export function dividers({ onNarrow }) {
     $("divider-files").hidden = !panes.filesOpen;
     // The map's divider shows only beside the map; a narrow window shows the map alone.
     $("divider-map").hidden = !panes.mapOpen || panes.narrow;
-    if (panes.narrow !== lastNarrow) {
+    if (forceNotify || panes.narrow !== lastNarrow) {
       lastNarrow = panes.narrow;
       onNarrow(panes.narrow);
     }
@@ -114,6 +114,8 @@ export function dividers({ onNarrow }) {
       if (dragRaf !== null) {
         cancelAnimationFrame(dragRaf);
         dragRaf = null;
+        const { layout, limits } = panes;
+        panes.layout = drag(layout, limits, divider, dragX, innerWidth, options());
       }
       panes.dragging = null;
       el.classList.remove("active");
@@ -177,7 +179,7 @@ export function dividers({ onNarrow }) {
     // so the panes are fitted again; nothing is saved.
     setMapOpen: (open) => {
       panes.mapOpen = open;
-      drawLayout();
+      drawLayout({ forceNotify: true });
     },
     setFilesOpen: (open) => {
       panes.filesOpen = open;

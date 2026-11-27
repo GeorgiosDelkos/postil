@@ -713,34 +713,67 @@ pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<(
 
 /// Deletes everything in the trash folder `trash` ([`empty`]) on a background thread: freed
 /// worktrees can hold hundreds of thousands of files. A delete cut short by a quit is
-/// finished by the next call. At most one thread empties a given `trash` directory at a time.
+/// finished by the next call. At most one thread empties a given `trash` directory at a time;
+/// calls arriving while a sweep is running set a rerun flag so newly trashed folders are not
+/// stranded.
 pub(crate) fn empty_trash(trash: &Path) {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
+    struct ActiveGuard {
+        active: &'static Mutex<HashMap<PathBuf, bool>>,
+        dir: PathBuf,
+        armed: bool,
+    }
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let mut guard = self
+                    .active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.remove(&self.dir);
+            }
+        }
+    }
+
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let active = ACTIVE.get_or_init(|| Mutex::new(HashMap::new()));
     let trash = trash.to_owned();
     {
         let mut guard = active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !guard.insert(trash.clone()) {
+        if let Some(rerun) = guard.get_mut(&trash) {
+            *rerun = true;
             return;
         }
+        guard.insert(trash.clone(), false);
     }
     let dir = trash.clone();
     let spawned = std::thread::Builder::new()
         .name("empty-trash".to_owned())
         .spawn(move || {
-            empty(&dir);
-            let mut guard = active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(&dir);
+            let mut active_guard = ActiveGuard {
+                active,
+                dir: dir.clone(),
+                armed: true,
+            };
+            loop {
+                empty(&dir);
+                let mut guard = active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.get(&dir).copied().unwrap_or(false) {
+                    guard.insert(dir.clone(), false);
+                } else {
+                    guard.remove(&dir);
+                    active_guard.armed = false;
+                    break;
+                }
+            }
         });
     if spawned.is_err() {
-        // No thread: release the slot so the next call retries.
         let mut guard = active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
