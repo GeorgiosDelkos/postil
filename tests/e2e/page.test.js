@@ -2068,23 +2068,23 @@ test("a click on a stripe keeps the line selection, and the map follows the code
   const body = await page.locator("#map .map-body").boundingBox();
   const far = await card(page, "D1.4").boundingBox();
   await page.mouse.move(body.x + body.width / 2, body.y + body.height / 2);
-  await page.mouse.wheel(0, -(body.y + body.height - far.y + 20));
+  await page.mouse.wheel(-(body.x + body.width - far.x + 20), 0);
   await page.waitForFunction(
-    (bottom) =>
-      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().top >
-      bottom,
-    body.y + body.height,
+    (right) =>
+      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().left >
+      right,
+    body.x + body.width,
   );
   await scrollTo(150);
   await onlyNode(page, "ringed", "D1.4");
   await page.waitForFunction(
-    ({ top, bottom }) => {
+    ({ left, right }) => {
       const box = document
         .querySelector('#map .map-node[data-node-id="D1.4"]')
         .getBoundingClientRect();
-      return box.top >= top && box.bottom <= bottom;
+      return box.left >= left && box.right <= right;
     },
-    { top: body.y, bottom: body.y + body.height },
+    { left: body.x, right: body.x + body.width },
   );
   assert.equal(await page.locator(".map-crumbs b").textContent(), "System");
 
@@ -2146,12 +2146,12 @@ test("a pan towards the code's node stops when another diagram opens", async (t)
   const body = await page.locator("#map .map-body").boundingBox();
   const far = await card(page, "D1.4").boundingBox();
   await page.mouse.move(body.x + body.width / 2, body.y + body.height / 2);
-  await page.mouse.wheel(0, -(body.y + body.height - far.y + 20));
+  await page.mouse.wheel(-(body.x + body.width - far.x + 20), 0);
   await page.waitForFunction(
-    (bottom) =>
-      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().top >
-      bottom,
-    body.y + body.height,
+    (right) =>
+      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().left >
+      right,
+    body.x + body.width,
   );
   // Line 150 starts a 160 ms glide to Far; User Flow opens two frames in, and Types must stay
   // where it is drawn.
@@ -2324,21 +2324,21 @@ test("the menu item on a folder starts a run, and Data and a node's Analyze deep
   await kindButton(page, "Architecture").click();
   await node(page, "Page").dblclick();
   await page.locator("#node-dialog").getByRole("button", { name: "Analyze deeper" }).click();
-  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  await page.locator(".map-crumbs", { hasText: /^System\s*›\s*Inside$/ }).waitFor();
   await node(page, "Inner").waitFor();
 
   // Back up, Enter on Page goes into the diagram it has.
   await page.locator(".map-crumb", { hasText: /^System$/ }).click();
   await node(page, "Page").focus();
   await page.keyboard.press("Enter");
-  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  await page.locator(".map-crumbs", { hasText: /^System\s*›\s*Inside$/ }).waitFor();
 
   // A right-click on Store analyzes its inside, which opens under it.
   await page.locator(".map-crumb", { hasText: /^System$/ }).click();
   const store = await node(page, "Store").getAttribute("data-node-id");
   await node(page, "Store").click({ button: "right" });
   await menuItem(page, "Analyze Deeper").click();
-  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  await page.locator(".map-crumbs", { hasText: /^System\s*›\s*Inside$/ }).waitFor();
   const { diagrams } = await api("api/analysis");
   assert.ok(
     diagrams.some((diagram) => diagram.parent === store),
@@ -2454,7 +2454,7 @@ test("a flow's question is refused in the page, Trace from Here starts at the fi
   await remove.click();
   await remove.click();
   await row.waitFor({ state: "detached" });
-  await page.locator(".map-empty", { hasText: /^No flow yet/ }).waitFor();
+  await page.locator(".map-empty", { hasText: /^No trace yet/ }).waitFor();
   const left = await api("api/analysis");
   assert.deepEqual(
     left.diagrams.filter((diagram) => diagram.kind === "flow"),
