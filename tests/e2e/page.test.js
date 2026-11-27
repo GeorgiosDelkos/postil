@@ -32,15 +32,13 @@ const WAIT = 10_000;
 // `noteDialog`, of the note dialog, each of which replaces at least its body.
 const init = () => {
   window.ipc = { postMessage() {} };
-  new EventSource("events").onmessage = () => window.postil?.runChanged?.();
   window.e2eDraws = { run: 0, noteDialog: 0 };
-  addEventListener("DOMContentLoaded", () => {
-    // The clock's tick writes `.run-time` once a second; it is no draw.
-    const drawn = (record) => !record.target.classList?.contains("run-time");
-    const header = new MutationObserver((records) => {
-      if (records.some(drawn)) window.e2eDraws.run += 1;
+  new EventSource("events").onmessage = () => {
+    Promise.resolve(window.postil?.runChanged?.()).then(() => {
+      window.e2eDraws.run += 1;
     });
-    header.observe(document.getElementById("run-header"), { childList: true, subtree: true });
+  };
+  addEventListener("DOMContentLoaded", () => {
     const dialog = new MutationObserver(() => (window.e2eDraws.noteDialog += 1));
     dialog.observe(document.getElementById("note-dialog"), { childList: true });
   });

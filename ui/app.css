@@ -3854,8 +3854,6 @@ body.keyboard-input .changes-view:focus-visible {
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 300px;
 }
 
 .changes-file-head {
@@ -3992,8 +3990,6 @@ button.changes-number:focus-visible {
   margin-bottom: 22px;
   padding-left: 10px;
   border-left: 2px solid var(--border);
-  content-visibility: auto;
-  contain-intrinsic-size: auto 300px;
 }
 
 .changes-step[aria-current="step"] {
