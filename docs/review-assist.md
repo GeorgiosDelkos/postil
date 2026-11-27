@@ -8,8 +8,9 @@ analysis runs (8.2), the split pane with the diagram view (8.3), the link shown 
 code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated nodes,
 "Not on the map" and Update in the page (8.5), the change map (8.6), the forced update
 (8.7), finding and setting up hippius-mem (9.1), the memory client with the Memory tab and
-the run's Memory section (9.2), team memory given to agents (9.3), Remember (9.4), and
-reviews checked against memory (9.5). Milestone 10 (voice) is not built. This document adds
+the run's Memory section (9.2), team memory given to agents (9.3), Remember (9.4),
+reviews checked against memory (9.5), and native dictation (10.1). Steps 10.2 (the
+dictation widget) and 10.3 (voice commands) are not built. This document adds
 to `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -719,6 +720,9 @@ The owner chose a reviewer stage that judges over listing raw recall hits beside
 
 ### Dictation
 
+Built (native layer, step 10.1): `src/dictation.rs`, `AppEvent` variants and
+`window.postil.dictation` in `src/shell.rs` and `ui/app.js`, usage descriptions in
+`scripts/bundle.sh`, and `com.apple.security.device.audio-input` in `assets/Postil.entitlements`.
 Designed in another session; this section records its decisions. Apple's Speech and AVFAudio
 frameworks (`SFSpeechRecognizer`, `AVAudioEngine`), called from Rust through objc2, with
 on-device recognition required: no model in the binary, no daemon, no network call.

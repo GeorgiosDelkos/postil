@@ -786,6 +786,8 @@ function showRepo(repo) {
 // - `openFolder`, with the folder from the Open Folder dialog, or one dropped on the window;
 // - `menu`, with the id of a menu bar command (src/menu.rs, `Command::id`). The page runs
 //   them, so they share its guards, such as a draft note blocking Quit.
+// - `dictation`, the bridge to native on-device speech recognition (`src/dictation.rs`).
+const dictationListeners = new Set();
 window.postil = {
   openFolder: (path) => {
     menu.close();
@@ -814,6 +816,31 @@ window.postil = {
   },
   // The run changed (src/run.rs); fetch what is new.
   runChanged: () => runs.sync(),
+  dictation: {
+    start(options) {
+      const payload = options ? JSON.stringify(options) : "";
+      window.ipc?.postMessage(payload ? `dictation:start:${payload}` : "dictation:start");
+    },
+    stop() {
+      window.ipc?.postMessage("dictation:stop");
+    },
+    cancel() {
+      window.ipc?.postMessage("dictation:cancel");
+    },
+    subscribe(listener) {
+      dictationListeners.add(listener);
+      return () => dictationListeners.delete(listener);
+    },
+    emit(event) {
+      for (const listener of Array.from(dictationListeners)) {
+        try {
+          listener(event);
+        } catch (error) {
+          console.error(error);
+        }
+      }
+    },
+  },
 };
 
 // Focus mode (docs/design.md, "Look and feel"): Cmd-\ hides the file list and the tray, and
