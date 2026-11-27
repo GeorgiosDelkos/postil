@@ -4,6 +4,7 @@
 // which ends with the box that sends the next one.
 
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import { actOnSecondClick, agentLogoIcon, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
 import { findingMemories, findingMemoryLink, runMemory } from "./memory-tab.js";
@@ -657,8 +658,9 @@ export function runDialog({
       const why = el("span", "note-dialog-why");
       const button = el("button", "button primary");
       button.type = "submit";
+      const dictation = attachDictation(input);
       const actions = el("div", "follow-up-actions");
-      actions.append(why, button);
+      actions.append(why, dictation.button, button);
       form.append(input, actions);
       let target = latest;
       let sending = false;

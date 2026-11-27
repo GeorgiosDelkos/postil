@@ -3,6 +3,7 @@
 // run (status.js), and drawn again when either changes while it is open.
 
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { isMemoryId } from "./memory.js";
 import { findingMemoryLink } from "./memory-tab.js";
@@ -302,8 +303,9 @@ export function noteDialog(
     save.type = "submit";
     save.append("Save", el("kbd", "", "⌘↵"));
     const why = el("span", "note-dialog-why");
+    const dictation = attachDictation(input);
     const actions = el("div", "note-edit-actions");
-    actions.append(why, cancel, save);
+    actions.append(why, dictation.button, cancel, save);
     form.append(input, actions);
     const stop = () => {
       editing = null;

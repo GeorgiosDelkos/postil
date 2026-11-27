@@ -8,6 +8,7 @@
 // (dialog-parts.js, `fillMarkdown`), never as HTML.
 
 import { fillMarkdown } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import {
   anchorPlace,
   arrowTarget,
@@ -180,7 +181,8 @@ export function diagramView({
   flowInput.setAttribute("aria-label", "A flow to trace");
   const flowTrace = el("button", "button map-flow-trace", "Trace");
   flowTrace.type = "submit";
-  flowForm.append(flowFrom, flowInput, flowTrace);
+  const flowDictation = attachDictation(flowInput);
+  flowForm.append(flowFrom, flowInput, flowDictation.button, flowTrace);
   const flowProblem = el("p", "map-flow-problem");
   const flowList = el("div", "map-flow-list");
   flows.append(flowForm, flowProblem, flowList);

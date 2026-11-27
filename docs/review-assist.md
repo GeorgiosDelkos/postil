@@ -9,8 +9,8 @@ code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated 
 "Not on the map" and Update in the page (8.5), the change map (8.6), the forced update
 (8.7), finding and setting up hippius-mem (9.1), the memory client with the Memory tab and
 the run's Memory section (9.2), team memory given to agents (9.3), Remember (9.4),
-reviews checked against memory (9.5), and native dictation (10.1). Steps 10.2 (the
-dictation widget) and 10.3 (voice commands) are not built. This document adds
+reviews checked against memory (9.5), native dictation (10.1), and the dictation widget
+(10.2). Step 10.3 (voice commands) is not built. This document adds
 to `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists

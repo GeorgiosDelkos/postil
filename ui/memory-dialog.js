@@ -8,6 +8,7 @@
 // so a memory opened from "Already recorded?" shows over it and closes back to the draft.
 
 import { fillMarkdown } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import { el } from "./dom.js";
 import {
   MEMORY_BODY_LIMIT,
@@ -247,14 +248,16 @@ export function rememberDialog(dialogEl, { memoryRepo, openMemory, onDraftStarte
     const main = bodyPart();
     const check = section("Already recorded?", form.checkEl);
     if (notice) main.append(el("div", "run-notice", notice));
+    const summaryRow = el("div", "dictation-field");
+    summaryRow.append(form.summaryEl, attachDictation(form.summaryEl).button);
     const bodyLabel = el("div", "note-dialog-label");
-    bodyLabel.append(el("span", "", "Memory"), form.countEl);
+    bodyLabel.append(el("span", "", "Memory"), attachDictation(form.bodyEl).button, form.countEl);
     const fields = el("div", "remember-fields");
     fields.append(form.typeEl.label, form.scopeEl.label);
     main.append(
       check,
       fields,
-      section("Summary", form.summaryEl),
+      section("Summary", summaryRow),
       bodyLabel,
       form.bodyEl,
       el("div", "note-dialog-said muted", "Sent as shown above."),
