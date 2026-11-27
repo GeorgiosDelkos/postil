@@ -188,11 +188,19 @@ fn broken_shapes() -> Vec<(String, &'static str)> {
         (r#"{"diagrams": []}"#.to_owned(), "missing field `version`"),
         (
             r#"{"version": 0, "diagrams": []}"#.to_owned(),
-            "version 0, but this build of Postil reads versions 1 to 2",
+            "version 0, but this build of Postil reads versions 1 to 3",
         ),
         (
-            r#"{"version": 1, "diagrams": [], "checked": "abc"}"#.to_owned(),
-            "unknown field `checked`",
+            r#"{"version": 3, "checked": "abc", "diagrams": []}"#.to_owned(),
+            "commit id \"abc\": expected 4 to 64 lowercase hexadecimal digits",
+        ),
+        (
+            r#"{"version": 3, "checked": "HEAD", "diagrams": []}"#.to_owned(),
+            "commit id \"HEAD\"",
+        ),
+        (
+            r#"{"version": 3, "checked": "ABCDEF1", "diagrams": []}"#.to_owned(),
+            "commit id \"ABCDEF1\"",
         ),
         (
             with("", "").replace(r#""run": "R1""#, r#""run": "R1", "x": 1"#),
@@ -401,18 +409,18 @@ fn a_newer_analysis_is_refused() {
     fs::write(&good, with("", "")).unwrap();
     let analysis = crate::analysis::load(&good).unwrap().unwrap();
     let _lock = crate::analysis::lock(&file).unwrap();
-    // Version 3 adds `checked`: the version is the reason given, not the field.
-    let newer = r#"{"version": 3, "checked": "abc1234", "diagrams": []}"#;
+    // A version 4 would add a field: the version is the reason given, not the field.
+    let newer = r#"{"version": 4, "later": "abc1234", "diagrams": []}"#;
     fs::write(&file, newer).unwrap();
 
     let (status, reply) = get(&site, ANALYSIS);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
-        reply.contains("version 3, but this build of Postil reads versions 1 to 2"),
+        reply.contains("version 4, but this build of Postil reads versions 1 to 3"),
         "{reply}"
     );
     let error = crate::analysis::save(&file, &analysis).unwrap_err();
-    assert!(error.to_string().contains("version 3"), "{error}");
+    assert!(error.to_string().contains("version 4"), "{error}");
     assert_eq!(fs::read_to_string(&file).unwrap(), newer);
 }
 
@@ -424,7 +432,7 @@ fn start_over_moves_an_unreadable_analysis_to_the_trash() {
     let site = repo.site();
     let file = site.repo().unwrap().analysis_file();
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let newer = r#"{"version": 3, "checked": "abc1234", "diagrams": []}"#;
+    let newer = r#"{"version": 4, "later": "abc1234", "diagrams": []}"#;
     fs::write(&file, newer).unwrap();
     assert_eq!(get(&site, ANALYSIS).0, StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -969,7 +977,10 @@ fn update_replaces_only_outdated_nodes() {
     assert_eq!(top["nodes"][3]["anchors"][0]["path"], "tools/c.rs");
     assert_eq!(analysis["unmapped"], serde_json::Value::Null);
 
-    // Brought up to date: nothing left to update.
+    // Brought up to date: nothing left to update. The update of D1 alone left `checked` at the
+    // commit before, which an update of every diagram moves, with no run; then it is refused.
+    let (status, body) = post(&site, UPDATE, "");
+    assert_eq!((status, body.as_str()), (StatusCode::OK, r#"{"run":null}"#));
     let (status, body) = post(&site, UPDATE, "");
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (status, body) = post(&site, UPDATE, "{\"diagram\": \"D9\"}");
@@ -1483,4 +1494,608 @@ fn an_analysis_is_placed_at_a_commit() {
         AT_COMMIT,
         "a read never writes"
     );
+}
+// The forced update (docs/review-assist-plan.md, 8.7), with real `git` and the fake agent.
+
+const CHECK: &str = "postil://localhost/api/analysis/check";
+
+/// Checks the analysis against `HEAD`, as the page's refresh does, and returns the answer.
+fn check(site: &Site) -> serde_json::Value {
+    let (status, reply) = post(site, CHECK, "");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    serde_json::from_str(&reply).unwrap()
+}
+
+/// The `checked` commit `repo`'s analysis file stores, or null.
+fn checked(repo: &TempRepo) -> serde_json::Value {
+    let text = stored(repo).expect("an analysis file");
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["checked"].clone()
+}
+
+/// The commit `HEAD` names.
+fn head(repo: &TempRepo) -> String {
+    git_out(&repo.root, &["rev-parse", "HEAD"])
+}
+
+/// The ids of every run, newest first.
+fn run_ids(site: &Site) -> serde_json::Value {
+    get_json(site, RUNS)["runs"].clone()
+}
+
+/// A repository analyzed by the fake Analyzer at its first commit, with a site on it.
+fn analyzed_site(name: &str) -> (TempRepo, Site, mpsc::Receiver<()>) {
+    let repo = analyzed_repo(name);
+    let (site, nudges) = run_site(&repo, "analysis");
+    let first = analyze(&site, &serde_json::json!({ "kind": "analyze" }));
+    analyzed(&site, &nudges, &first);
+    (repo, site, nudges)
+}
+
+/// The update `answer` started, which must have, at commit `head`.
+fn updated(answer: &serde_json::Value, head: &str) -> String {
+    assert_eq!(answer["state"], "updated", "{answer}");
+    assert_eq!(answer["commit"], head[..7], "{answer}");
+    answer["run"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_commit_that_changes_cited_lines_starts_an_update() {
+    let (repo, site, nudges) = analyzed_site("forced-cited-lines");
+    let base = head(&repo);
+    assert_eq!(
+        checked(&repo),
+        base,
+        "set by the first analysis, to its fork"
+    );
+    let before = stored(&repo);
+    // Another process holds `analysis.lock` (`flock` locks belong to the open file, so this
+    // one conflicts with the site's): the check takes no lock, and does not wait on it.
+    let held = fs::File::create(repo.root.join(".git/postil/analysis.lock")).unwrap();
+    held.lock().unwrap();
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+    drop(held);
+    assert_eq!(stored(&repo), before, "the same commit writes nothing");
+
+    // Edits that break every citation, and a file no node covers, all uncommitted: the
+    // Analyzer's worktree would not see them.
+    repo.write("src/a.rs", "fn gone() {}\n");
+    repo.write("src/b.rs", "\n");
+    repo.write("tools/new.rs", "fn new() {}\n");
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+    assert_eq!(run_ids(&site), serde_json::json!(["R1"]));
+
+    // Committed, Page's line changes; the Analyzer is another agent by now.
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.write("src/b.rs", "// b\n\nfn two() {\n}\n");
+    fs::remove_dir_all(repo.root.join("tools")).unwrap();
+    repo.commit();
+    let mut settings = get_json(&site, SETTINGS)["settings"].clone();
+    settings["customAgents"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "name": "Analyst", "command": fake_agent("analysis") }));
+    settings["enabledAgents"]
+        .as_array_mut()
+        .unwrap()
+        .push("Analyst".into());
+    settings["analyzer"] = serde_json::json!({ "name": "Analyst", "model": null });
+    let (status, body) = save(&site, &settings.to_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let now = head(&repo);
+    let id = updated(&check(&site), &now);
+    assert_eq!(checked(&repo), now, "moved as the update started");
+    let run = analyzed(&site, &nudges, &id);
+
+    assert_eq!(run["agent"], "Analyst", "the Analyzer of now: {run}");
+    assert_eq!(
+        run["analysis"],
+        serde_json::json!({ "kind": "update", "nodes": ["D1.1"] }),
+        "{run}"
+    );
+    let prompt = prompt_of(&run);
+    assert!(
+        prompt.contains("It cited src/a.rs lines 2 to 2, which read:\n        one();\n"),
+        "{prompt}"
+    );
+    assert_eq!(
+        labels(diagram(&get_json(&site, ANALYSIS), "D1"))[0],
+        "D1.1 Renewed"
+    );
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+    assert_eq!(run_ids(&site), serde_json::json!([id, "R1"]));
+}
+
+#[test]
+fn a_commit_that_touches_nothing_cited_moves_checked_with_no_run() {
+    let (repo, site, _nudges) = analyzed_site("forced-untouched");
+    repo.git(&["checkout", "--quiet", "--detach"]);
+
+    // Two lines above Page's, which is found where it moved; a file in src, which Process
+    // cites whole; and a.txt, which nothing cites, edited.
+    repo.write("src/a.rs", "// zero\n// one\nfn a() {\n    one();\n}\n");
+    repo.write("src/new.rs", "fn new() {}\n");
+    repo.write("a.txt", "edited\n");
+    repo.commit();
+    // Uncommitted, Page's line goes: the check reads the commit.
+    repo.write("src/a.rs", "fn a() {\n}\n");
+    let before = run_ids(&site);
+
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+    assert_eq!(checked(&repo), head(&repo));
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+
+    // a.txt, which nothing cites, deleted.
+    fs::remove_file(repo.root.join("a.txt")).unwrap();
+    repo.git(&["rm", "--quiet", "--cached", "a.txt"]);
+    repo.git(&[
+        "commit",
+        "--quiet",
+        "--message",
+        "Delete a.txt",
+        "--",
+        "a.txt",
+    ]);
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+    assert_eq!(checked(&repo), head(&repo));
+    assert_eq!(run_ids(&site), before, "no run");
+}
+
+#[test]
+fn a_new_file_starts_an_update() {
+    let (repo, site, nudges) = analyzed_site("forced-new-file");
+    fs::create_dir(repo.root.join("tools")).unwrap();
+    repo.write("tools/new.rs", "fn new() {}\n");
+    repo.commit();
+
+    let id = updated(&check(&site), &head(&repo));
+    let run = analyzed(&site, &nudges, &id);
+
+    assert_eq!(
+        run["analysis"],
+        serde_json::json!({ "kind": "update" }),
+        "{run}"
+    );
+    let prompt = prompt_of(&run);
+    assert!(
+        prompt.contains("as a new node:\n- tools/new.rs\n"),
+        "{prompt}"
+    );
+    let analysis = get_json(&site, ANALYSIS);
+    let top = diagram(&analysis, "D1");
+    assert_eq!(labels(top).last().unwrap(), "D1.5 Added");
+    assert_eq!(top["nodes"][4]["anchors"][0]["path"], "tools/new.rs");
+}
+
+#[test]
+fn a_deleted_cited_file_starts_an_update() {
+    let (repo, site, nudges) = analyzed_site("forced-deleted-file");
+    // Page cites a line of src/a.rs, Worker one of src/b.rs, Process the folder src, which
+    // goes with them; the Data diagram's Note cites src/a.rs whole.
+    git_out(&repo.root, &["rm", "--quiet", "src/a.rs", "src/b.rs"]);
+    repo.commit();
+
+    let id = updated(&check(&site), &head(&repo));
+    let run = analyzed(&site, &nudges, &id);
+
+    assert_eq!(
+        run["analysis"]["nodes"],
+        serde_json::json!(["D1.1", "D1.2", "D1.4"]),
+        "{run}"
+    );
+    let prompt = prompt_of(&run);
+    assert!(prompt.contains("It cited src, which is gone."), "{prompt}");
+    assert!(prompt.contains("\nDiagram D1 "), "{prompt}");
+    // A Flow or Data diagram waits for an Update the engineer asks for.
+    assert!(!prompt.contains("Diagram D2"), "{prompt}");
+}
+
+#[test]
+fn a_branch_switch_starts_no_update() {
+    let (repo, site, nudges) = analyzed_site("forced-branch-switch");
+    let base = head(&repo);
+    repo.git(&["checkout", "--quiet", "-b", "doomed"]);
+    repo.write("a.txt", "doomed\n");
+    repo.commit();
+    let doomed = head(&repo);
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+
+    // Back on trunk, `checked` is no ancestor of HEAD; then its commit is pruned.
+    repo.git(&["checkout", "--quiet", "trunk"]);
+    let before = stored(&repo);
+    assert_eq!(check(&site), serde_json::json!({ "state": "diverged" }));
+    repo.git(&["branch", "--quiet", "-D", "doomed"]);
+    repo.git(&["reflog", "expire", "--expire=now", "--all"]);
+    repo.git(&["gc", "--quiet", "--prune=now"]);
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["cat-file", "-e", &doomed])
+            .status()
+            .unwrap()
+            .code()
+            == Some(1),
+        "pruned"
+    );
+    assert_eq!(check(&site), serde_json::json!({ "state": "diverged" }));
+    assert_eq!(stored(&repo), before, "nothing written");
+    assert_eq!(run_ids(&site), serde_json::json!(["R1"]));
+
+    // Update moves `checked`, with no run when nothing is outdated here.
+    let (status, reply) = post(&site, UPDATE, "");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, r#"{"run":null}"#);
+    assert_eq!(checked(&repo), base);
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+
+    // Diverged again, now with Page's line gone on trunk: Update runs, and moves `checked`.
+    repo.git(&["checkout", "--quiet", "-b", "other"]);
+    repo.write("a.txt", "other\n");
+    repo.commit();
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+    repo.git(&["checkout", "--quiet", "trunk"]);
+    repo.write("src/a.rs", "fn a() {\n}\n");
+    repo.commit();
+    assert_eq!(check(&site), serde_json::json!({ "state": "diverged" }));
+    let id = analyze_update(&site, "");
+    assert_eq!(checked(&repo), head(&repo), "moved as the update started");
+    analyzed(&site, &nudges, &id);
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+}
+
+#[test]
+fn a_failed_update_is_not_started_twice_for_one_commit() {
+    let (repo, site, nudges) = analyzed_site("forced-failed");
+    set_agents(&site, &[("Fake", &fake_agent("exit-mid-turn"))], "Fake");
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.commit();
+    let failing = head(&repo);
+
+    let id = updated(&check(&site), &failing);
+    let run = analyzed(&site, &nudges, &id);
+    assert_eq!(run["status"], "failed", "{run}");
+    assert_eq!(checked(&repo), failing);
+
+    // An Analyzer that works now is not sent the same commit again, nor the node the failed run
+    // left outdated when a later commit changes a file other nodes cite and leaves them found.
+    set_agents(&site, &[("Fake", &fake_agent("analysis"))], "Fake");
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+    repo.write("src/b.rs", "// b\n\nfn two() {\n}\n// more\n");
+    repo.commit();
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+    assert_eq!(checked(&repo), head(&repo));
+    assert_eq!(run_ids(&site), serde_json::json!([id, "R1"]));
+}
+
+/// Waits, nudge by nudge, until run `id` is live no more.
+fn not_live(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) {
+    loop {
+        let live = get_json(site, RUNS)["live"].clone();
+        if !live.as_array().unwrap().iter().any(|run| run["id"] == id) {
+            return;
+        }
+        nudges
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|_| panic!("no change while waiting for {id} to end: {live}"));
+    }
+}
+
+/// Stops run `id`, whose agent ignores the first Stop, and waits until it is live no more.
+fn force_stop(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) {
+    stop_run(site, id);
+    site.runner().unwrap().backdate_stop();
+    stop_run(site, id);
+    not_live(site, nudges, id);
+}
+
+#[test]
+fn an_update_refused_at_the_cap_starts_on_the_next_check() {
+    let (repo, site, nudges) = analyzed_site("forced-refused");
+    let base = head(&repo);
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.commit();
+    let first = head(&repo);
+
+    // An Analyzer that is not installed.
+    set_agents(&site, &[("Fake", "/nonexistent/agent-bin")], "Fake");
+    let answer = check(&site);
+    assert_eq!(answer["state"], "blocked", "{answer}");
+    assert!(
+        answer["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Fake is not installed"),
+        "{answer}"
+    );
+    assert_eq!(checked(&repo), base);
+
+    // Three runs of notes live: the cap.
+    set_agents(&site, &[("Fake", &fake_agent("hang"))], "Fake");
+    for (text, note) in [("one", "N1"), ("two", "N2"), ("three", "N3")] {
+        post_note(&site, "a.txt", 1, 1, text);
+        send(&site, &[note]);
+    }
+    for id in ["R2", "R3", "R4"] {
+        under_way(&site, &nudges, id);
+    }
+    let answer = check(&site);
+    assert_eq!(answer["state"], "blocked", "{answer}");
+    assert!(
+        answer["reason"]
+            .as_str()
+            .unwrap()
+            .contains("3 agents already work in this repository"),
+        "{answer}"
+    );
+    assert_eq!(checked(&repo), base);
+    assert_eq!(
+        run_ids(&site),
+        serde_json::json!(["R4", "R3", "R2", "R1"]),
+        "no run, and no run number taken"
+    );
+
+    // One ends: the next check starts the update, which runs on.
+    force_stop(&site, &nudges, "R3");
+    let updating = updated(&check(&site), &first);
+    assert_eq!(checked(&repo), first);
+    under_way(&site, &nudges, &updating);
+
+    // A commit lands meanwhile: refused while the update runs, and compared from the commit
+    // the update started at once it ended.
+    repo.write("src/b.rs", "// b\n");
+    git_out(
+        &repo.root,
+        &["commit", "--quiet", "--message", "b", "--", "src/b.rs"],
+    );
+    let second = head(&repo);
+    let answer = check(&site);
+    assert_eq!(answer["state"], "blocked", "{answer}");
+    assert!(
+        answer["reason"].as_str().unwrap().contains("under way"),
+        "{answer}"
+    );
+    assert_eq!(checked(&repo), first);
+    force_stop(&site, &nudges, &updating);
+    analyzed(&site, &nudges, &updating);
+    set_agents(&site, &[("Fake", &fake_agent("analysis"))], "Fake");
+    let id = updated(&check(&site), &second);
+    let run = analyzed(&site, &nudges, &id);
+    let prompt = prompt_of(&run);
+    assert!(
+        prompt.contains("Outdated node D1.2"),
+        "src/b.rs changed since: {prompt}"
+    );
+    for id in ["R2", "R4"] {
+        force_stop(&site, &nudges, id);
+    }
+}
+
+#[test]
+fn two_checks_at_once_start_one_run() {
+    let repo = analyzed_repo("forced-two-windows");
+    let (first, first_nudges) = run_site(&repo, "analysis");
+    let analysis = analyze(&first, &serde_json::json!({ "kind": "analyze" }));
+    analyzed(&first, &first_nudges, &analysis);
+    let (second, second_nudges) = run_site(&repo, "analysis");
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.commit();
+
+    // Each window on a thread of its own, as two processes would be: a site is not shared
+    // between threads, so each goes to its thread and comes back.
+    let barrier = std::sync::Barrier::new(2);
+    let [(one, first), (two, second)] = std::thread::scope(|scope| {
+        let at_once = |site: Site| {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                (check(&site), site)
+            })
+        };
+        [at_once(first), at_once(second)].map(|thread| thread.join().unwrap())
+    });
+
+    let answers = [&one, &two];
+    let started: Vec<_> = answers
+        .iter()
+        .filter(|answer| answer["state"] == "updated")
+        .collect();
+    assert_eq!(started.len(), 1, "{answers:?}");
+    assert!(
+        answers.iter().any(|answer| answer["state"] == "same"),
+        "{answers:?}"
+    );
+    assert_eq!(started[0]["run"], "R2", "{answers:?}");
+    assert_eq!(run_ids(&first), serde_json::json!(["R2", "R1"]));
+    let (site, nudges) = if one["state"] == "updated" {
+        (&first, &first_nudges)
+    } else {
+        (&second, &second_nudges)
+    };
+    analyzed(site, nudges, "R2");
+
+    // The update renewed Page on line 1, which goes now. Both read `checked` before either
+    // starts its run, the order threads may take: the second's claim finds it moved, and it
+    // starts nothing and takes no run number.
+    repo.write("src/a.rs", "fn b() {\n    three();\n}\n");
+    repo.commit();
+    let verdict = |site: &Site| {
+        let Verdict::Update {
+            expected,
+            head,
+            planned,
+        } = crate::analysis::check_head(&site.repo().unwrap()).unwrap()
+        else {
+            panic!("an update is due");
+        };
+        (expected, head, planned)
+    };
+    let [
+        (expected, head, planned),
+        (late_expected, late_head, late_planned),
+    ] = [&first, &second].map(verdict);
+    let agent = first.current_settings().analyzer().unwrap();
+    let started = first
+        .runner()
+        .unwrap()
+        .analyze_checked(agent.clone(), expected.as_ref(), &head, planned)
+        .unwrap();
+    let StartedUpdate::Started { run, .. } = started else {
+        panic!("the first claim starts the run: {started:?}");
+    };
+    let late = second
+        .runner()
+        .unwrap()
+        .analyze_checked(agent, late_expected.as_ref(), &late_head, late_planned)
+        .unwrap();
+    assert!(matches!(late, StartedUpdate::AlreadyChecked), "{late:?}");
+    assert_eq!(run_ids(&first), serde_json::json!([run, "R2", "R1"]));
+    analyzed(&first, &first_nudges, &run);
+}
+
+#[test]
+fn an_outdated_edge_starts_an_update_of_the_node_it_leaves() {
+    let repo = analyzed_repo("forced-edge");
+    let (site, nudges) = run_site(&repo, "analysis");
+    // Written by hand at HEAD: the nodes cite whole files, the edge a line of src/a.rs.
+    let analysis = format!(
+        r#"{{"version": 3, "checked": "{}", "diagrams": [{{
+            "id": "D1", "kind": "architecture", "title": "Top", "run": "R90",
+            "nodes": [
+                {{"id": "D1.1", "kind": "component", "label": "A", "summary": "s",
+                  "detail": "d", "anchors": [{{"path": "src/b.rs", "target": "file"}}]}},
+                {{"id": "D1.2", "kind": "component", "label": "B", "summary": "s",
+                  "detail": "d", "anchors": [{{"path": "a.txt", "target": "file"}}]}}
+            ],
+            "edges": [{{"from": "D1.1", "to": "D1.2", "label": "calls",
+                "anchor": {{"path": "src/a.rs", "target": "lines",
+                            "lines": {{"start": 2, "end": 2}}, "snippet": "    one();"}}}}]
+        }}]}}"#,
+        head(&repo)
+    );
+    let file = site.repo().unwrap().analysis_file();
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, analysis).unwrap();
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.commit();
+
+    let id = updated(&check(&site), &head(&repo));
+    let run = analyzed(&site, &nudges, &id);
+
+    assert_eq!(
+        run["analysis"]["nodes"],
+        serde_json::json!(["D1.1"]),
+        "{run}"
+    );
+    let prompt = prompt_of(&run);
+    assert!(
+        prompt.contains(
+            "Outdated node D1.1, \"A\": s\nIts edges out go with it when it is replaced; give \
+             back in edges those that still hold, citing the code as it is now:\n- to D1.2, \
+             \"calls\": it cited src/a.rs lines 2 to 2, which read:\n        one();\n"
+        ),
+        "{prompt}"
+    );
+
+    // The fake Analyzer renewed D1.1 and gave no edge back: the broken one went with the old
+    // node, so a later commit to its file that breaks nothing starts no update.
+    let top = diagram(&get_json(&site, ANALYSIS), "D1").clone();
+    assert!(
+        !edge_ends(&top)
+            .iter()
+            .any(|ends| ends.starts_with("D1.1 ->")),
+        "{top}"
+    );
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n// more\n");
+    repo.commit();
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+}
+
+#[test]
+fn a_version_2_analysis_is_compared_from_its_run_s_fork_or_else_from_head() {
+    let (repo, site, nudges) = analyzed_site("forced-version-2");
+    // As a build before `checked` left it.
+    let file = site.repo().unwrap().analysis_file();
+    let mut old: serde_json::Value = serde_json::from_str(&stored(&repo).unwrap()).unwrap();
+    old["version"] = 2.into();
+    old.as_object_mut().unwrap().remove("checked");
+    fs::write(&file, old.to_string()).unwrap();
+    repo.write("src/a.rs", "fn a() {\n    two();\n}\n");
+    repo.commit();
+
+    // From the fork of the Architecture's run: the commit broke Page.
+    let id = updated(&check(&site), &head(&repo));
+    analyzed(&site, &nudges, &id);
+    assert_eq!(checked(&repo), head(&repo));
+
+    // Written by hand, with no run in the record: from HEAD, with no run.
+    let by_hand = BY_HAND
+        .replace("\"version\": 1", "\"version\": 2")
+        .replace("\"run\": \"R1\"", "\"run\": \"R90\"");
+    fs::write(&file, &by_hand).unwrap();
+    repo.write("src/a.rs", "fn a() {\n    three();\n}\n");
+    repo.commit();
+    assert_eq!(check(&site), serde_json::json!({ "state": "untouched" }));
+    assert_eq!(checked(&repo), head(&repo));
+    assert_eq!(run_ids(&site), serde_json::json!([id, "R1"]));
+}
+#[test]
+fn checked_is_set_by_the_run_that_stores_the_first_architecture() {
+    let repo = analyzed_repo("forced-flow-first");
+    let (site, nudges) = run_site(&repo, "analysis");
+    // A flow alone: no Architecture, so nothing to compare with.
+    let flow = analyze(
+        &site,
+        &serde_json::json!({ "kind": "flow", "question": "How?" }),
+    );
+    analyzed(&site, &nudges, &flow);
+    assert_eq!(checked(&repo), serde_json::Value::Null);
+
+    // A file lands, then a deeper analysis of src draws the first Architecture, which saw it.
+    fs::create_dir(repo.root.join("tools")).unwrap();
+    repo.write("tools/new.rs", "fn new() {}\n");
+    repo.commit();
+    let deeper = analyze(&site, &serde_json::json!({ "kind": "deeper", "of": "src" }));
+    analyzed(&site, &nudges, &deeper);
+    assert_eq!(checked(&repo), head(&repo), "the Architecture's fork");
+    assert_eq!(check(&site), serde_json::json!({ "state": "same" }));
+    assert_eq!(run_ids(&site), serde_json::json!([deeper, flow]));
+
+    // A later flow says nothing of the Architecture: `checked` stays where it was.
+    repo.write("a.txt", "later\n");
+    repo.commit();
+    let again = analyze(
+        &site,
+        &serde_json::json!({ "kind": "flow", "question": "Why?" }),
+    );
+    analyzed(&site, &nudges, &again);
+    assert_ne!(checked(&repo), head(&repo));
+}
+
+#[test]
+fn an_update_of_one_diagram_leaves_the_forced_update_of_the_others() {
+    let (repo, site, nudges) = analyzed_site("forced-one-diagram");
+    // D3 deepens D1.1; both cite src/a.rs, D3.1 its line 1, D1.1 its line 2.
+    let deeper = analyze(
+        &site,
+        &serde_json::json!({ "kind": "deeper", "of": "D1.1" }),
+    );
+    analyzed(&site, &nudges, &deeper);
+    let base = head(&repo);
+    assert_eq!(checked(&repo), base, "a deeper diagram leaves `checked`");
+
+    repo.write("src/a.rs", "fn z() {\n    two();\n}\n");
+    repo.commit();
+    let id = analyze_update(&site, "{\"diagram\": \"D3\"}");
+    let run = analyzed(&site, &nudges, &id);
+    assert_eq!(run["analysis"]["of"], "D3", "{run}");
+    assert_eq!(
+        checked(&repo),
+        base,
+        "D1 is not brought up to date by D3's update"
+    );
+
+    let forced = updated(&check(&site), &head(&repo));
+    let run = analyzed(&site, &nudges, &forced);
+    assert!(prompt_of(&run).contains("Outdated node D1.1"), "{run}");
 }

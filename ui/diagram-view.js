@@ -108,6 +108,12 @@ export function diagramView({
     settled: null,
     // What started that run, `{ route, request }`, for Retry.
     retry: null,
+    // What the last check of HEAD found that the strip says (`check`): null, `{ state:
+    // "diverged" }`, or `{ state: "blocked", reason }`. And the forced update the page was told
+    // of, `{ run, commit }` with `commit` the short id it started at, or null: kept apart, so a
+    // later check that finds nothing to do leaves "Updating after" on the strip while it runs.
+    check: null,
+    forced: null,
     // Uncommitted changes, for the empty state (`GET api/run/uncommitted`).
     uncommitted: null,
     // The code pane's line the map follows, `{ path, line }` with `line` 1-based, or null, and
@@ -138,6 +144,9 @@ export function diagramView({
   // already applied is dropped, as the notes are (app.js, `fetchNotes`).
   let analysisAsked = 0;
   let analysisShown = 0;
+  // Every check of HEAD is numbered too, and a reply older than one applied is dropped.
+  let checkAsked = 0;
+  let checkShown = 0;
   // Layouts by diagram id and run, for the session (diagram.js, `layoutDiagram`).
   const layouts = new Map();
   // The drawn diagram: its layout, the SVG's viewport group, and the node elements by id.
@@ -239,6 +248,41 @@ export function diagramView({
     onChange();
     if (!view.shown) return;
     if (view.analysis.status !== "ready") await loadUncommitted();
+    render();
+  }
+
+  // Compares the analysis with HEAD (`POST api/analysis/check`, src/analysis/check.rs), which
+  // starts the forced update when commits broke the Architecture or added a file no node
+  // covers: on start, on each refresh, when a run ends, and when the settings change. Only
+  // with an analysis that reads.
+  async function check() {
+    if (view.analysis.status !== "ready") {
+      view.check = null;
+      return;
+    }
+    const number = ++checkAsked;
+    const response = await fetch("api/analysis/check", { method: "POST" });
+    if (!response.ok) {
+      const problem = await response.text();
+      // An analysis that cannot be read says so in the pane already.
+      if (view.analysis.status !== "error") onError(problem);
+      return;
+    }
+    const reply = await response.json();
+    // A run that started is followed whatever the order of the replies: no later reply names it.
+    if (reply.state === "updated") {
+      checkShown = Math.max(checkShown, number);
+      view.forced = { run: reply.run, commit: reply.commit };
+      view.runId = reply.run;
+      view.retry = { route: "api/analysis/update", request: {} };
+      view.check = null;
+      await runs.track();
+      render();
+      return;
+    }
+    if (number < checkShown) return;
+    checkShown = number;
+    view.check = reply.state === "diverged" || reply.state === "blocked" ? reply : null;
     render();
   }
 
@@ -427,9 +471,10 @@ export function diagramView({
     });
     parts.push(search);
 
-    // Update changes the repository's map, which a change map is not.
+    // Update changes the repository's map, which a change map is not. While the strip offers
+    // the Update of a checkout on another history, it is the one Update.
     const stale = diagramCounts(diagram).outdated > 0 || unmappedOf(diagram);
-    if (!view.change && stale) {
+    if (!view.change && stale && !divergedShown()) {
       const update = el("button", "button map-update", "Update");
       update.type = "button";
       update.title =
@@ -739,14 +784,38 @@ export function diagramView({
     return runs.liveRuns().find((run) => run.analysis) ?? null;
   }
 
+  // Whether the strip offers the Update of a checkout on another history: the last check found
+  // `checked` gone or no ancestor of HEAD, no change map is shown, no analysis runs, and there
+  // is an Architecture.
+  function divergedShown() {
+    return (
+      !view.change &&
+      !liveRun() &&
+      view.check?.state === "diverged" &&
+      diagrams().some((diagram) => diagram.kind === "architecture")
+    );
+  }
+
   // Starts an analysis run as `request` asks at `route`, and resolves to whether it started.
+  // An Update with nothing to send on another history starts none: it moved `checked` (src/
+  // run.rs, `Runner::analyze`), and the analysis is read again.
   async function startRun(route, request) {
     const response = await fetch(route, { method: "POST", body: JSON.stringify(request) });
     if (!response.ok) {
       onError(await response.text());
       return false;
     }
-    view.runId = (await response.json()).run;
+    const { run } = await response.json();
+    // A check sent before the start answers for the commit before: its reply is dropped.
+    checkShown = ++checkAsked;
+    view.check = null;
+    view.forced = null;
+    if (run === null) {
+      await load();
+      render();
+      return true;
+    }
+    view.runId = run;
     view.retry = { route, request };
     await runs.track();
     render();
@@ -758,16 +827,29 @@ export function diagramView({
     return startRun("api/analysis", { kind: "deeper", of });
   }
 
-  // The strip under the tools: the run under way, with Open run and Stop, or why the last one
+  // The strip under the tools: the run under way, with Open run and Stop; the checkout on
+  // another history, with Update; why the forced update could not start; or why the last run
   // stored nothing, with Open run and Retry.
   function renderStrip() {
     const live = liveRun();
     const ended = !live && view.runId ? runs.byId(view.runId) : null;
     const parts = [];
     if (live) {
-      parts.push(el("span", "map-run-status", `Analyzing with ${live.agent}…`));
+      const status =
+        view.forced?.run === live.id
+          ? `Updating after ${view.forced.commit}…`
+          : `Analyzing with ${live.agent}…`;
+      parts.push(el("span", "map-run-status", status));
       parts.push(stripButton("Open run", () => runs.openRun(live.id)));
       parts.push(stripButton("Stop", () => runs.stopRun(live.id)));
+    } else if (divergedShown()) {
+      parts.push(el("span", "map-run-status", "The checkout moved to another history."));
+      const update = stripButton("Update", () => startRun("api/analysis/update", {}));
+      update.classList.add("map-update");
+      update.title = "Asks the Analyzer again for what is outdated here, and compares from here on";
+      parts.push(update);
+    } else if (view.check?.state === "blocked") {
+      parts.push(el("span", "map-run-status map-run-problem", view.check.reason));
     } else if (ended && runProblem(ended)) {
       parts.push(el("span", "map-run-status map-run-problem", runProblem(ended)));
       parts.push(stripButton("Open run", () => runs.openRun(ended.id)));
@@ -789,13 +871,16 @@ export function diagramView({
 
   // Called after every change of the runs: the strip follows the run, and a run that ended
   // well wrote the analysis, which is read again: also with the map closed since, for the code's
-  // stripes and chips.
+  // stripes and chips. Then HEAD is checked again: commits may have landed while it ran.
   function runChanged() {
     const tracked = view.runId && runs.byId(view.runId);
     if (tracked && !isLive(tracked) && view.settled !== tracked.id) {
       view.settled = tracked.id;
       load()
-        .then(() => openMade(tracked))
+        .then(() => {
+          openMade(tracked);
+          return check();
+        })
         .catch((error) => onError(String(error)));
       return;
     }
@@ -1564,6 +1649,8 @@ export function diagramView({
     load,
     fetchAnalysis,
     applyAnalysis,
+    // Compares the analysis with HEAD, which may start the forced update (`check`).
+    check,
     // The analysis read last, or null when there is none or it cannot be used.
     analysis: () => view.analysis.data,
     isShown: () => view.shown,

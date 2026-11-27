@@ -64,6 +64,7 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
         &[Method::POST],
         "POST with no body",
     ),
+    ("/api/analysis/check", &[Method::POST], "POST with no body"),
     (
         "/api/definitions",
         &[Method::GET],

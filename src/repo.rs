@@ -645,6 +645,73 @@ impl Repo {
         }
     }
 
+    /// The full id of the commit `commit` (a hexadecimal id, full or short) names, or `None`
+    /// when the repository has no such commit: one `git gc` pruned after a rebase, say.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when `commit` is not a hexadecimal object id, and the other git
+    /// errors, such as an id of an object that is not a commit, or a short id that names more
+    /// than one object.
+    pub(crate) fn resolve_commit(&self, commit: &str) -> Result<Option<String>> {
+        check_object_id("commit", commit)?;
+        self.ref_commit(commit)
+    }
+
+    /// The paths that differ between commits `from` and `to`, each with how it changed, in
+    /// git's order. A rename is a deletion and an addition (`--no-renames`), so a file moved
+    /// into a folder no node covers reads as added. A submodule is left out, as [`Repo::files`]
+    /// leaves it out. Reads the two trees, not the disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when an id is not a hexadecimal object id, and the git error,
+    /// such as a commit the repository does not have.
+    pub(crate) fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<ChangedPath>> {
+        check_object_id("commit", from)?;
+        check_object_id("commit", to)?;
+        let args = [
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            "--ignore-submodules=all",
+            "--no-ext-diff",
+            from,
+            to,
+        ];
+        let listed = git(&self.root, &args)?;
+        // `<status>\0<path>\0` for each path: with `-z` the path is written as it is, unquoted.
+        let mut fields = listed.split_terminator('\0');
+        let mut changed = Vec::new();
+        while let Some(status) = fields.next() {
+            let change = match status {
+                "A" => Change::Added,
+                "D" => Change::Deleted,
+                "M" => Change::Modified,
+                "T" => Change::TypeChanged,
+                // Unmerged (`U`) and unknown (`X`) entries are in no diff of two commits.
+                other => {
+                    return Err(Error::Git {
+                        command: args.join(" "),
+                        stderr: format!("(no error output, and an unexpected status {other:?})"),
+                    });
+                }
+            };
+            let Some(path) = fields.next() else {
+                return Err(Error::Git {
+                    command: args.join(" "),
+                    stderr: format!("(no error output, and status {status} has no path)"),
+                });
+            };
+            changed.push(ChangedPath {
+                change,
+                path: path.to_owned(),
+            });
+        }
+        Ok(changed)
+    }
+
     /// Whether git ignores `path` (relative to the root) in this working tree, by its own
     /// `.gitignore` files and the repository's exclude rules. A path git cannot judge counts
     /// as not ignored: its one caller then leaves the folder out, the safe side.
@@ -1042,6 +1109,24 @@ impl Repo {
     }
 }
 
+/// A path that differs between two commits, and how ([`Repo::changed_paths`]).
+#[derive(Debug)]
+pub(crate) struct ChangedPath {
+    pub(crate) change: Change,
+    /// Relative to the root, as git writes it.
+    pub(crate) path: String,
+}
+
+/// How a path changed between two commits: git's `--name-status` letters `A`, `D`, `M`, `T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Change {
+    Added,
+    Deleted,
+    Modified,
+    /// A file became a symlink or a submodule, or the other way round.
+    TypeChanged,
+}
+
 /// What a path in the working tree is, as [`Repo::kind`] finds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathKind {
@@ -1306,6 +1391,96 @@ mod tests {
             "{outside:?}"
         );
         let named = repo.read_at("HEAD", "a.txt").unwrap_err();
+        assert!(matches!(named, Error::BadRequest(_)), "{named:?}");
+    }
+
+    #[test]
+    fn changed_paths_lists_added_deleted_modified_and_type_changed_files() {
+        let dir = TempDir::new("repo-changed-paths");
+        let root = dir.path();
+        git(root, &["init", "--quiet"]).unwrap();
+        git(root, &["config", "user.name", "Postil Test"]).unwrap();
+        git(
+            root,
+            &["config", "user.email", "postil-test@example.invalid"],
+        )
+        .unwrap();
+        let commit = || {
+            git(root, &["add", "--all"]).unwrap();
+            git(root, &["commit", "--quiet", "--message", "c"]).unwrap();
+            Repo::open(root).unwrap().head().unwrap().unwrap()
+        };
+        fs::write(root.join("old.txt"), "the same text\n").unwrap();
+        fs::write(root.join("edited.txt"), "before\n").unwrap();
+        fs::write(root.join("link"), "a file\n").unwrap();
+        let from = commit();
+
+        // The moved file keeps its text, which git would call a rename; the new name has a
+        // space and a letter that is not ASCII, which git quotes without `-z`.
+        fs::remove_file(root.join("old.txt")).unwrap();
+        fs::write(root.join("new é.txt"), "the same text\n").unwrap();
+        fs::write(root.join("edited.txt"), "after\n").unwrap();
+        fs::remove_file(root.join("link")).unwrap();
+        std::os::unix::fs::symlink("edited.txt", root.join("link")).unwrap();
+        let to = commit();
+
+        let repo = Repo::open(root).unwrap();
+        let changed: Vec<(Change, String)> = repo
+            .changed_paths(&from, &to)
+            .unwrap()
+            .into_iter()
+            .map(|changed| (changed.change, changed.path))
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                (Change::Modified, "edited.txt".to_owned()),
+                (Change::TypeChanged, "link".to_owned()),
+                (Change::Added, "new é.txt".to_owned()),
+                (Change::Deleted, "old.txt".to_owned()),
+            ]
+        );
+        assert!(repo.changed_paths(&to, &to).unwrap().is_empty());
+
+        // A submodule added: a gitlink, which no file list holds.
+        let gitlink = format!("160000,{to},vendor/sub");
+        git(root, &["update-index", "--add", "--cacheinfo", &gitlink]).unwrap();
+        git(root, &["commit", "--quiet", "--message", "sub"]).unwrap();
+        let with_sub = repo.head().unwrap().unwrap();
+        assert!(
+            repo.changed_paths(&to, &with_sub).unwrap().is_empty(),
+            "a submodule is left out"
+        );
+        let named = repo.changed_paths("HEAD~1", &to).unwrap_err();
+        assert!(matches!(named, Error::BadRequest(_)), "{named:?}");
+    }
+
+    #[test]
+    fn resolve_commit_gives_the_full_id_or_none_for_a_commit_the_repository_lacks() {
+        let dir = TempDir::new("repo-resolve-commit");
+        let root = dir.path();
+        git(root, &["init", "--quiet"]).unwrap();
+        git(root, &["config", "user.name", "Postil Test"]).unwrap();
+        git(
+            root,
+            &["config", "user.email", "postil-test@example.invalid"],
+        )
+        .unwrap();
+        git(
+            root,
+            &["commit", "--quiet", "--allow-empty", "--message", "c"],
+        )
+        .unwrap();
+        let repo = Repo::open(root).unwrap();
+        let head = repo.head().unwrap().unwrap();
+
+        assert_eq!(repo.resolve_commit(&head[..7]).unwrap(), Some(head.clone()));
+        let missing = "0".repeat(head.len());
+        assert_eq!(repo.resolve_commit(&missing).unwrap(), None);
+        let tree = git(root, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let tree = repo.resolve_commit(tree.trim_end()).unwrap_err();
+        assert!(matches!(tree, Error::Git { .. }), "not a commit: {tree:?}");
+        let named = repo.resolve_commit("--all").unwrap_err();
         assert!(matches!(named, Error::BadRequest(_)), "{named:?}");
     }
 }
