@@ -2968,3 +2968,33 @@ test("voice commands: 'next' moves the walkthrough and 'send' twice sends", asyn
   await page.keyboard.up("AltRight");
   await current.filter({ hasText: "Step 2 of 3" }).waitFor();
 });
+
+test("activity bar toggles the collapsible Files drawer and Go to File reopens it", async (t) => {
+  const { page } = await openProject(t);
+  const toggleFiles = page.locator("#toggle-files");
+  const sidebar = page.locator("#sidebar");
+  const divider = page.locator("#divider-files");
+
+  assert.equal(await toggleFiles.getAttribute("aria-pressed"), "true");
+  assert.ok(await sidebar.isVisible());
+  assert.ok(await divider.isVisible());
+
+  await toggleFiles.click();
+  assert.equal(await toggleFiles.getAttribute("aria-pressed"), "false");
+  await sidebar.waitFor({ state: "hidden" });
+  assert.ok(!(await divider.isVisible()), "files divider hides while drawer is collapsed");
+  assert.ok(await page.locator("#toggle-map").isVisible());
+  assert.ok(await page.locator("#open-usage").isVisible());
+  assert.ok(await page.locator("#open-settings").isVisible());
+
+  // Go to File (Cmd-P) automatically reopens the collapsed Files drawer and focuses the filter.
+  await page.evaluate(() => window.postil.menu("go-to-file"));
+  assert.equal(await toggleFiles.getAttribute("aria-pressed"), "true");
+  await sidebar.waitFor({ state: "visible" });
+  assert.ok(await divider.isVisible());
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.id),
+    "filter",
+    "filter is focused after reopening",
+  );
+});

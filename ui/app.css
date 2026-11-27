@@ -240,10 +240,12 @@ kbd {
 
 /* Titlebar, Activity Bar & Sidebar */
 
-/* The window buttons sit over this strip; src/shell.rs places them. */
+/* The window buttons sit over this strip; src/shell.rs places them. Negative right margin
+   cancels body's 8 px right padding so the bar runs edge to edge. */
 .titlebar {
   grid-column: 1 / -1;
   height: 38px;
+  margin-right: -8px;
   background: var(--chrome);
   border-bottom: 1px solid var(--border);
 }
@@ -4177,6 +4179,10 @@ body.focus-mode {
     minmax(0, 1fr)
     max(0px, (100% - 1116px) / 2);
   padding: 0;
+}
+
+body.focus-mode > .titlebar {
+  margin-right: 0;
 }
 
 body.focus-mode > .left-rail,

@@ -46,8 +46,7 @@ export function fit(layout, limits, width, { mapOpen = false, filesOpen = true }
   let tray = clamp(layout.tray, limits.tray);
   let map = clamp(layout.map, limits.map);
   const sidebarUsed = filesOpen ? sidebar : 0;
-  let excess =
-    RAIL_WIDTH + sidebarUsed + tray + (sideBySide ? map : 0) + CODE_MIN + GAPS - width;
+  let excess = RAIL_WIDTH + sidebarUsed + tray + (sideBySide ? map : 0) + CODE_MIN + GAPS - width;
   const give = (current, min) => {
     const given = Math.max(0, Math.min(excess, current - min));
     excess -= given;
