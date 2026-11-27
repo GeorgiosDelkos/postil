@@ -2090,7 +2090,7 @@ test("a click on a stripe keeps the line selection, and the map follows the code
 
   // The code never switches the diagram: with Types open, line 150, which only System's Far
   // covers, rings nothing, and line 3 rings Types' Token.
-  await page.locator(".map-kind").filter({ hasText: "Data" }).click();
+  await page.locator(".map-kind").filter({ hasText: "User Flow" }).click();
   await page.locator(".map-crumbs b").filter({ hasText: "Types" }).waitFor();
   await scrollTo(150);
   await page.evaluate(
@@ -2118,7 +2118,7 @@ test("a flow's step numbers show in the gutter only while the map shows that flo
   assert.deepEqual(await steps(), [], "none while the Architecture shows");
 
   const kind = (name) => page.locator(".map-kind").filter({ hasText: name }).click();
-  await kind("Flows");
+  await kind("Traces");
   await node(page, "Read").waitFor();
   // Each step on the first line of its reference: lines 20 and 25.
   assert.deepEqual(await steps(), [
@@ -2128,7 +2128,7 @@ test("a flow's step numbers show in the gutter only while the map shows that flo
   await kind("Architecture");
   await node(page, "Server").waitFor();
   assert.deepEqual(await steps(), []);
-  await kind("Flows");
+  await kind("Traces");
   await node(page, "Read").waitFor();
   assert.equal((await steps()).length, 2, "back with the flow");
 
@@ -2153,7 +2153,7 @@ test("a pan towards the code's node stops when another diagram opens", async (t)
       bottom,
     body.y + body.height,
   );
-  // Line 150 starts a 160 ms glide to Far; Data opens two frames in, and Types must stay
+  // Line 150 starts a 160 ms glide to Far; User Flow opens two frames in, and Types must stay
   // where it is drawn.
   const moved = await page.evaluate(async () => {
     const code = document.getElementById("code");
@@ -2163,7 +2163,9 @@ test("a pan towards the code's node stops when another diagram opens", async (t)
     await frame();
     await frame();
     const ringed = document.querySelector(".map-node.ringed")?.dataset.nodeId;
-    [...document.querySelectorAll(".map-kind")].find((each) => each.textContent === "Data").click();
+    [...document.querySelectorAll(".map-kind")]
+      .find((each) => each.textContent === "User Flow")
+      .click();
     const pane = () => document.querySelector("#map .map-viewport").getAttribute("transform");
     const drawn = pane();
     await new Promise((resolve) => setTimeout(resolve, 400));
@@ -2312,11 +2314,11 @@ test("the menu item on a folder starts a run, and Data and a node's Analyze deep
   assert.ok(await page.locator("#map").isVisible());
   assert.equal(await page.locator(".map-crumbs b").textContent(), "Inside");
 
-  // Data has none yet: its card offers Analyze, which draws both kinds.
-  await kindButton(page, "Data").click();
+  // User Flow has none yet: its card offers Analyze, which draws both kinds.
+  await kindButton(page, "User Flow").click();
   await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
   await node(page, "Note").waitFor();
-  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "User Flow");
 
   // A node's dialog asks for its inside, which opens under it.
   await kindButton(page, "Architecture").click();
@@ -2403,8 +2405,8 @@ test("Trace from here on a node starts at its id, its chip clears, and a flow's 
 test("a flow's question is refused in the page, Trace from Here starts at the file, and Delete takes two clicks", async (t) => {
   const { page, api } = await openAnalyzed(t);
   await page.locator("#toggle-map").click();
-  // No Architecture yet: Flows is open to choose all the same.
-  await kindButton(page, "Flows").click();
+  // No Architecture yet: Traces is open to choose all the same.
+  await kindButton(page, "Traces").click();
   const question = page.locator(".map-flow-question");
   const problem = page.locator(".map-flow-problem");
   await page.locator(".map-flow-trace").click();

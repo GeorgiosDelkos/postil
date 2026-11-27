@@ -94,9 +94,9 @@ fn every_kind() -> Analysis {
             Target::Path(PathKind::Folder),
         ))),
     ));
-    let mut data = diagram(
+    let mut user_flow = diagram(
         2,
-        DiagramKind::Data,
+        DiagramKind::UserFlow,
         Some("D1.1"),
         vec![
             node(
@@ -108,7 +108,7 @@ fn every_kind() -> Analysis {
             node("D2.2", NodeKind::External, None, Vec::new()),
         ],
     );
-    data.edges.push(edge("D2.1", "D2.2", None));
+    user_flow.edges.push(edge("D2.1", "D2.2", None));
     let mut flow = diagram(3, DiagramKind::Flow, None, Vec::new());
     flow.dropped = Dropped {
         nodes: 1,
@@ -121,12 +121,12 @@ fn every_kind() -> Analysis {
         checked: Some(CommitId(
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
         )),
-        diagrams: vec![top, data, flow],
+        diagrams: vec![top, user_flow, flow],
     }
 }
 
 const EVERY_KIND_JSON: &str = r#"{
-  "version": 3,
+  "version": 4,
   "checked": "0123456789abcdef0123456789abcdef01234567",
   "diagrams": [
     {
@@ -190,7 +190,7 @@ const EVERY_KIND_JSON: &str = r#"{
     },
     {
       "id": "D2",
-      "kind": "data",
+      "kind": "user_flow",
       "title": "secret title",
       "parent": "D1.1",
       "run": "R2",
@@ -260,23 +260,28 @@ fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
 }
 
 #[test]
-fn a_version_2_analysis_reads_without_checked_and_is_written_as_version_3() {
+fn a_version_2_analysis_reads_without_checked_and_legacy_data_kind_upgrades_to_version_4() {
     let dir = TempDir::new("analysis-version-2");
     let file = dir.path().join("postil/analysis.json");
     let _lock = lock(&file).unwrap();
-    let version_2 = EVERY_KIND_JSON.replace(
-        "  \"version\": 3,\n  \"checked\": \"0123456789abcdef0123456789abcdef01234567\",\n",
-        "  \"version\": 2,\n",
-    );
+    let version_2 = EVERY_KIND_JSON
+        .replace(
+            "  \"version\": 4,\n  \"checked\": \"0123456789abcdef0123456789abcdef01234567\",\n",
+            "  \"version\": 2,\n",
+        )
+        .replace("\"kind\": \"user_flow\"", "\"kind\": \"data\"");
     fs::write(&file, &version_2).unwrap();
 
     let loaded = load(&file).unwrap().unwrap();
     assert_eq!(loaded.checked, None);
+    assert_eq!(loaded.diagrams[1].kind, DiagramKind::UserFlow);
     save(&file, &loaded).unwrap();
     let written = fs::read_to_string(&file).unwrap();
     assert_eq!(
         written,
-        version_2.replace("\"version\": 2", "\"version\": 3")
+        version_2
+            .replace("\"version\": 2", "\"version\": 4")
+            .replace("\"kind\": \"data\"", "\"kind\": \"user_flow\"")
     );
 }
 
@@ -881,7 +886,7 @@ fn some_ids(analysis: &Analysis, draws: &mut Draws) -> Vec<String> {
 fn random_reply(draws: &mut Draws, ids: &[String]) -> serde_json::Value {
     let mut names = vec!["a", "b", "c", "d", ""];
     names.extend(ids.iter().map(String::as_str));
-    let kinds = ["architecture", "data", "flow", "other"];
+    let kinds = ["architecture", "user_flow", "data", "flow", "other"];
     let diagrams: Vec<serde_json::Value> = (0..=draws.below(3))
         .map(|_| {
             let nodes: Vec<serde_json::Value> = (0..draws.below(7))

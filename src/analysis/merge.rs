@@ -413,7 +413,7 @@ fn apply(
             for diagram in checked.diagrams {
                 let kind = match diagram.kind.as_deref() {
                     Some("architecture") => DiagramKind::Architecture,
-                    Some("data") => DiagramKind::Data,
+                    Some("user_flow" | "userflow" | "data") => DiagramKind::UserFlow,
                     // The prompt asks for these two kinds only.
                     _ => continue,
                 };

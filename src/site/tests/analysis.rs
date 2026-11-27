@@ -188,7 +188,7 @@ fn broken_shapes() -> Vec<(String, &'static str)> {
         (r#"{"diagrams": []}"#.to_owned(), "missing field `version`"),
         (
             r#"{"version": 0, "diagrams": []}"#.to_owned(),
-            "version 0, but this build of Postil reads versions 1 to 3",
+            "version 0, but this build of Postil reads versions 1 to 4",
         ),
         (
             r#"{"version": 3, "checked": "abc", "diagrams": []}"#.to_owned(),
@@ -409,18 +409,18 @@ fn a_newer_analysis_is_refused() {
     fs::write(&good, with("", "")).unwrap();
     let analysis = crate::analysis::load(&good).unwrap().unwrap();
     let _lock = crate::analysis::lock(&file).unwrap();
-    // A version 4 would add a field: the version is the reason given, not the field.
-    let newer = r#"{"version": 4, "later": "abc1234", "diagrams": []}"#;
+    // A version 5 would add a field: the version is the reason given, not the field.
+    let newer = r#"{"version": 5, "later": "abc1234", "diagrams": []}"#;
     fs::write(&file, newer).unwrap();
 
     let (status, reply) = get(&site, ANALYSIS);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
-        reply.contains("version 4, but this build of Postil reads versions 1 to 3"),
+        reply.contains("version 5, but this build of Postil reads versions 1 to 4"),
         "{reply}"
     );
     let error = crate::analysis::save(&file, &analysis).unwrap_err();
-    assert!(error.to_string().contains("version 4"), "{error}");
+    assert!(error.to_string().contains("version 5"), "{error}");
     assert_eq!(fs::read_to_string(&file).unwrap(), newer);
 }
 
@@ -432,7 +432,7 @@ fn start_over_moves_an_unreadable_analysis_to_the_trash() {
     let site = repo.site();
     let file = site.repo().unwrap().analysis_file();
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let newer = r#"{"version": 4, "later": "abc1234", "diagrams": []}"#;
+    let newer = r#"{"version": 5, "later": "abc1234", "diagrams": []}"#;
     fs::write(&file, newer).unwrap();
     assert_eq!(get(&site, ANALYSIS).0, StatusCode::INTERNAL_SERVER_ERROR);
 

@@ -132,12 +132,27 @@ test("200 nodes and 260 edges lay out, with edges across boundaries drawn straig
   assert.ok(inside.every(({ points }) => points.length > 2));
 });
 
-test("a flow's steps read left to right even where no edge joins them", () => {
+test("a flow's steps read top to bottom even where no edge joins them", () => {
   const steps = ["D1.1", "D1.2", "D1.3"].map((id) => node(id));
   const laid = layoutDiagram(diagram(steps, [], { kind: "flow" }), dagre, new Map());
-  const xs = steps.map(({ id }) => laid.byId.get(id).x);
-  assert.ok(xs[0] < xs[1] && xs[1] < xs[2], `${xs}`);
+  const ys = steps.map(({ id }) => laid.byId.get(id).y);
+  assert.ok(ys[0] < ys[1] && ys[1] < ys[2], `${ys}`);
   assert.equal(laid.edges.length, 0, "the layout's own edges are not drawn");
+});
+
+test("cross-boundary edges rank external nodes below their source boundary", () => {
+  const nodes = [
+    node("D1.1", { kind: "boundary" }),
+    node("D1.2", { group: "D1.1" }),
+    node("D1.3", { kind: "external" }),
+  ];
+  const laid = layoutDiagram(diagram(nodes, [edge("D1.2", "D1.3")]), dagre, new Map());
+  const group = laid.byId.get("D1.1");
+  const inner = laid.byId.get("D1.2");
+  const ext = laid.byId.get("D1.3");
+  assert.ok(inside(inner, group), "inner card stays inside its boundary");
+  assert.ok(inner.y >= group.y + 24, "boundary reserves header space above its cards");
+  assert.ok(group.y + group.height < ext.y, "external target is ranked below the boundary");
 });
 
 test("search ranks a label that starts with the words, then one that holds them, then a summary", () => {
@@ -333,7 +348,7 @@ test("a flow with nested boundaries and an edge beside a step lays out", () => {
   const edges = [edge("D1.7", "D1.4"), edge("D1.3", "D1.4")];
   const laid = layoutDiagram(diagram(nodes, edges, { kind: "flow" }), dagre, new Map());
   assert.ok([...laid.nodes, ...laid.groups].every(finite));
-  assert.ok(laid.byId.get("D1.3").x < laid.byId.get("D1.4").x, "the steps in order");
+  assert.ok(laid.byId.get("D1.3").y < laid.byId.get("D1.4").y, "the steps in order");
 });
 
 test("an arrow from a boundary goes to what lies that way of it, not to the first card", () => {
@@ -401,11 +416,11 @@ function markedAnalysis() {
     node("D1.4", { label: "Old", anchors: [cite(9, 12, "outdated")] }),
     node("D1.5", { label: "Elsewhere", anchors: [cite(1, 20, "found", "src/b.rs")] }),
   ]);
-  const data = {
+  const userFlow = {
     ...diagram([node("D2.1", { label: "Token", anchors: [cite(2, 3), cite(2, 2)] })]),
     id: "D2",
-    kind: "data",
-    title: "Types",
+    kind: "user_flow",
+    title: "User Flow",
   };
   const flow = {
     ...diagram([
@@ -416,7 +431,7 @@ function markedAnalysis() {
     kind: "flow",
     title: "Load",
   };
-  return { diagrams: [arch, data, flow] };
+  return { diagrams: [arch, userFlow, flow] };
 }
 
 test("a file's marks: the innermost Architecture node per line, its chip on its first line", () => {
@@ -614,7 +629,7 @@ test("only Architecture diagrams are touched, at the top level and below", () =>
     diagram([cites("D1.1")]),
     diagram([cites("D2.1"), bare("D2.2")], [edge("D2.1", "D2.2")], { id: "D2", parent: "D1.1" }),
     diagram([cites("D3.1"), bare("D3.2")], [edge("D3.1", "D3.2")], { id: "D3", kind: "flow" }),
-    diagram([cites("D4.1")], [], { id: "D4", kind: "data" }),
+    diagram([cites("D4.1")], [], { id: "D4", kind: "user_flow" }),
   );
   const result = touched(analysis, [changed("src/a.rs", "modified", [[1, 1]])]);
   assert.deepEqual([...result.nodes], ["D1.1", "D2.1"]);
