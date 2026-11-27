@@ -13,7 +13,7 @@ import {
   replyProblem,
 } from "./memory.js";
 import { memoryDialog, rememberDialog } from "./memory-dialog.js";
-import { memoryTab, runMemory } from "./memory-tab.js";
+import { findingMemories, findingMemoryLink, memoryTab, runMemory } from "./memory-tab.js";
 
 const strong = {
   id: "mem_01A",
@@ -419,6 +419,51 @@ test("the run dialog's Memory section is left out when hippius-mem cannot run", 
       assert.equal(asked.length, 2, "answers are kept while the dialog is open");
     },
   ));
+
+test("a finding's memory shows its id, then its summary once read, and opens it", () => {
+  let polls = 0;
+  return withPage(
+    (url) => {
+      if (url.endsWith("mem_01GONE"))
+        return { state: "failed", error: "note mem_01GONE not found" };
+      polls += 1;
+      return polls < 2
+        ? { state: "pending" }
+        : { state: "ready", id: "mem_01A", summary: "a.rs parses lazily" };
+    },
+    async (asked) => {
+      let settled = 0;
+      const memories = findingMemories({ onSettled: () => (settled += 1) });
+      const pending = memories.key(["mem_01A", "mem_01GONE"]);
+      assert.equal(memories.summary("mem_01A"), null, "pending");
+      await settle();
+      assert.equal(settled, 1, "the failed one settled");
+      mock.timers.tick(MEMORY_POLL_MS);
+      await settle();
+      assert.equal(settled, 2);
+      assert.equal(memories.summary("mem_01A"), "a.rs parses lazily");
+      assert.equal(memories.summary("mem_01GONE"), null, "a memory that cannot be read");
+      assert.notEqual(memories.key(["mem_01A", "mem_01GONE"]), pending, "the dialogs draw again");
+      assert.equal(memories.summary("not an id"), null);
+      assert.deepEqual(asked, [
+        "GET api/memory?id=mem_01A",
+        "GET api/memory?id=mem_01GONE",
+        "GET api/memory?id=mem_01A",
+      ]);
+
+      const opened = [];
+      const named = findingMemoryLink("mem_01A", memories.summary("mem_01A"), (id) =>
+        opened.push(id),
+      );
+      assert.equal(named.tagName, "BUTTON");
+      assert.equal(named.textContent, "mem_01A · a.rs parses lazily");
+      assert.equal(named.attributes.get("data-memory"), "mem_01A");
+      named.click();
+      assert.deepEqual(opened, ["mem_01A"]);
+      assert.equal(findingMemoryLink("mem_01GONE", null, () => {}).textContent, "mem_01GONE");
+    },
+  );
+});
 
 // ---- The Remember dialog ---------------------------------------------------------------------
 

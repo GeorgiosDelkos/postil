@@ -41,7 +41,7 @@ use crate::analysis::AnalysisRun;
 use crate::error::{Error, Result};
 use crate::files::version_of;
 use crate::report::Report;
-use crate::review::{Diff, Finding, Stage, Work};
+use crate::review::{Diff, Finding, MemoryBlock, Stage, Work};
 use crate::run::{FORCE_AFTER, lock};
 use crate::usage::ledger::{self, LedgerRecord, LedgerSink, RECORD_VERSION, RunOrigin, RunOutcome};
 use crate::usage::now_secs;
@@ -65,7 +65,8 @@ pub(super) struct Opening<'a> {
     pub(super) notes: Vec<String>,
     /// The prompt's text as it is built when the run is sent. The agent receives it without
     /// the line about team memory, or with it, when the run's start finds otherwise
-    /// (`Runner::start`).
+    /// (`Runner::start`); a review's first stage receives it with the review's team memories,
+    /// which its start recalls after this is logged (`Runner::recall_for_review`).
     pub(super) prompt: String,
     pub(super) origin: Origin,
     /// Whether the run's thread only reads ([`Header::read_only`]).
@@ -86,11 +87,13 @@ pub(super) enum InThread<'a> {
 /// header); version 4 the `snapshot` entry; version 5 an execute call's `command` and `exit`
 /// on the `tool` and `toolUpdate` entries; version 6 the `report` entry; version 7 `readOnly`
 /// in the header and the `undone` entry; version 8 an analysis run (`analysis` in the header,
-/// the `noAnalysis` entry); version 9 a memory draft (`remember` in the header). Every older
-/// version reads: a log before version 4 has no snapshots, one before version 5 no commands or
-/// exit codes, one before version 6 no report, one before version 7 is a run that may change
-/// files, one before version 8 is no analysis, and one before version 9 no memory draft.
-const LOG_VERSION: u32 = 9;
+/// the `noAnalysis` entry); version 9 a memory draft (`remember` in the header); version 10 a
+/// finding's team memory (`memory` on a finding of the `findings` entry). Every older version
+/// reads: a log before version 4 has no snapshots, one before version 5 no commands or exit
+/// codes, one before version 6 no report, one before version 7 is a run that may change files,
+/// one before version 8 is no analysis, one before version 9 no memory draft, and one before
+/// version 10 no finding names a memory.
+const LOG_VERSION: u32 = 10;
 
 /// One run and its log.
 pub(crate) struct Run {
@@ -217,7 +220,9 @@ pub(super) struct Header {
     /// The ids of the notes sent.
     pub(super) notes: Vec<String>,
     /// The prompt's text as it was built when the run was sent; the agent may have received
-    /// it with or without the line about team memory (`Runner::start`).
+    /// it with or without the line about team memory (`Runner::start`). A review's first stage
+    /// also received the review's team memories, which this does not hold: they were recalled
+    /// after it was logged (`Runner::recall_for_review`). The stages after it hold them.
     pub(super) prompt: String,
     /// Seconds since the Unix epoch.
     started_at: u64,
@@ -1158,6 +1163,7 @@ impl RunState {
             reply: self.reply(),
             diffs,
             report,
+            memories: MemoryBlock::default(),
         }
     }
 
@@ -1971,6 +1977,78 @@ mod tests {
         run.record_snapshot(Point::Before, "b".to_owned());
         assert_eq!(points(&run), 1, "an ended run takes no snapshot");
         drop(run);
+        drop(fs::remove_dir_all(dir.parent().unwrap()));
+    }
+
+    /// Version 10 adds a finding's memory: a log of 8 or 9 reads with none, a finding without
+    /// one is written as before, one with it reads back, and version 11 is refused.
+    #[test]
+    fn a_finding_s_memory_is_written_from_version_10_and_older_logs_read_without() {
+        let dir = std::env::temp_dir()
+            .join(format!("postil-run-memory-{}", std::process::id()))
+            .join("runs");
+        fs::create_dir_all(&dir).unwrap();
+        let finding = |memory: Option<&str>| Finding {
+            id: "F1".to_owned(),
+            note: None,
+            path: None,
+            line: None,
+            text: "eager".to_owned(),
+            fix: None,
+            memory: memory.map(str::to_owned),
+        };
+        let run = create(&dir, "p");
+        run.record(Entry::Findings {
+            findings: vec![finding(Some("mem_01A")), finding(None)],
+            problem: None,
+        });
+        drop(run);
+        let file = dir.join("R1.jsonl");
+        let written = fs::read_to_string(&file).unwrap();
+        let (head, entries) = written.split_once('\n').unwrap();
+        assert!(head.starts_with(r#"{"version":10,"#), "{head}");
+        assert!(
+            entries.contains(r#""fix":null,"memory":"mem_01A"},{"id":"F1""#),
+            "{entries}"
+        );
+        assert!(
+            entries.contains(r#""fix":null}]"#),
+            "no memory, no field: {entries}"
+        );
+        let read = |file: &Path| -> Vec<Option<String>> {
+            Run::read(file)
+                .unwrap()
+                .state()
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Findings { findings, .. } => {
+                        Some(findings.iter().map(|f| f.memory.clone()).collect())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(read(&file), [Some("mem_01A".to_owned()), None]);
+
+        let older = |version: u32| {
+            let line = concat!(
+                r#"{"kind":"findings","findings":[{"id":"F1","note":null,"path":null,"#,
+                r#""line":null,"text":"x","fix":null}],"problem":null}"#,
+            );
+            let head = head.replace(r#""version":10"#, &format!(r#""version":{version}"#));
+            let file = dir.join(format!("V{version}.jsonl"));
+            fs::write(&file, format!("{head}\n{line}\n")).unwrap();
+            file
+        };
+        for version in [8, 9] {
+            assert_eq!(read(&older(version)), [None], "version {version}");
+        }
+        let problem = Run::read(&older(11)).unwrap_err();
+        assert!(
+            problem.contains("it is version 11, and this build of Postil reads versions 1 to 10"),
+            "{problem}"
+        );
         drop(fs::remove_dir_all(dir.parent().unwrap()));
     }
 }

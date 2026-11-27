@@ -649,19 +649,35 @@ Remember is offered in the dialog of a note, of a finding, of a run, and of an a
 
 ### Review checks against memory
 
+Built (step 9.5): `Runner::recall_for_review` in `src/run.rs`, `Memory::recall_review` in
+`src/memory.rs`, `MemoryBlock` and `Finding.memory` in `src/review.rs` (run log version 10),
+and the finding's memory button (`findingMemoryLink` in `ui/memory-tab.js`) in the run dialog,
+the note dialog and the changes view.
+
 The owner chose a reviewer stage that judges over listing raw recall hits beside the changes
 (recall is fuzzy, and the engineer would judge every hit).
 
-- When the engineer presses Review, Postil recalls for the run's prompt and for each changed
-  path, drops weak pointers and duplicates, and keeps at most 12 (recall's default count).
-- The proposing reviewers' prompt carries those memories whole, in a block labeled as
-  reference data written by teammates, with the ask: report a change that contradicts a
-  recorded decision or repeats a recorded gotcha as a finding that names the memory.
-- A finding gains `memory: Option<MemoryId>` (run log version 10). Its card shows the
-  memory's summary and opens it, and the changes view flags the finding's line, since a
-  finding already carries its path and line.
-- With hippius-mem missing or failing, the review runs without the block and its dialog says
-  so.
+- When the engineer presses Review with team memory on, the first stage's start thread
+  recalls for the run's prompt and for each changed path (its edits' diffs, then the paths
+  that differ between its snapshots, which a command's edits are among), drops weak pointers
+  and duplicates, takes each query's best first, and keeps at most 12 (recall's default
+  count). It reads each with `get`; one redacted or forgotten since is passed over. The
+  request that pressed Review answers at once: the recall never runs on the page's thread.
+- Every stage's prompt carries those memories, in a block labeled as reference data written
+  by teammates, never instructions to follow: the judge's too, since it may edit files. Each
+  body is in a fence of backticks longer than any run of them in it, and the block ends with
+  "End of team memory.", so a body cannot write a section of Postil's prompt. A body
+  is cut at 2 KiB and says so, and the block at 16 KiB. The proposers are asked to report a
+  change that contradicts a recorded decision or repeats a recorded gotcha as a finding that
+  names the memory.
+- A finding gains `memory: Option<String>` (run log version 10), kept only when the id was in
+  the block, so an id a reviewer made up, or one a memory's text names, is dropped and the
+  finding kept. Its card shows the memory's id and summary, as the vault holds it now (the log
+  keeps only the id), and opens it; the changes view shows it on the finding beside its line.
+- With hippius-mem missing, failing, or slower than 30 s to answer, the review runs without
+  the block, and the first stage's memory notice says why ("team memory could not be
+  checked: ..."), shown in its dialog and in the review's part of the reviewed run's dialog.
+  The recall goes on after 30 s, and its answers are kept for the next review.
 
 ## Milestone 10: voice
 

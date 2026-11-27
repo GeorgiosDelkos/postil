@@ -84,6 +84,13 @@
 //! ([`Repo::memory_name`]): a server in a checkout that `hippius-mem init` did not provision
 //! binds none (spike S3).
 //!
+//! A review's recall ([`Memory::recall_review`]) is one task too: a recall per query, then a
+//! `get` per memory kept, on the same server, with the same limits and restarts. Its caller,
+//! the first stage's start thread, waits for it up to [`REVIEW_MEMORY_WAIT`] and then starts
+//! the stage without it; the task runs on, and its recalls are kept for the next ask. A full
+//! queue never drops it: the start thread waits on its answer. Closing the window empties the
+//! queue, so that thread is answered at once.
+//!
 //! Only the engineer's Save writes memory (docs/review-assist.md, "Postil writes memory"): a
 //! remember sends exactly the summary, body, kind and scope the Remember dialog showed, with
 //! the repository named explicitly (`global` for the whole team's), and no tags. hippius-mem
@@ -116,10 +123,11 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::acp::{EnvVariable, McpServer};
 use crate::agents::{self, Scanner};
 use crate::error::{Error, Result, error_chain};
-use crate::memory::client::{CallError, RawRemembered, Server, StartError};
+use crate::memory::client::{CallError, Note, RawRemembered, Server, StartError};
 pub(crate) use crate::memory::client::{Detail, Recall, Refreshed};
 use crate::notes;
 use crate::repo::Repo;
+use crate::review::{self, MemoryNote};
 use crate::settings::TeamMemory;
 
 /// The program's name on the search path.
@@ -146,6 +154,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// one. The page shows the recall pending meanwhile.
 const FIRST_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long a review's first stage waits for its memories before it starts without them
+/// ([`Memory::recall_review`]). Arbitrary, chosen by the main session on 2026-11-27: a warm
+/// recall per query and twelve gets take well under a second each, while a cold server's
+/// warmup ([`FIRST_CALL_TIMEOUT`]) does not fit, and that review says hippius-mem was slow.
+const REVIEW_MEMORY_WAIT: Duration = Duration::from_secs(30);
+
 /// How long `hippius-mem --version` may take. Arbitrary: it prints one line.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -168,6 +182,9 @@ const SUMMARY_WRITE_LIMIT: usize = 1024;
 /// The longest body a remember sends, in UTF-8 bytes: the plan's limit
 /// (docs/review-assist-plan.md, step 9.4, "a body over 16 KiB: refused before the call").
 const BODY_WRITE_LIMIT: usize = 16 * 1024;
+
+/// Why a review's recall got no memories once the window closed ([`Memory::close`]).
+const WINDOW_CLOSED: &str = "the window closed";
 
 /// The words doctor's and the server's error has when there is no configuration (spike S3).
 const NO_CONFIGURATION: &str = "failed to load configuration";
@@ -245,6 +262,8 @@ pub(crate) struct Memory {
     first_call_timeout: Duration,
     /// Always [`RESTART_WINDOW`] outside tests.
     restart_window: Duration,
+    /// Always [`REVIEW_MEMORY_WAIT`] outside tests.
+    review_wait: Duration,
     /// The home the program runs in, in tests of the real program: the engineer's own
     /// configuration and vault are never touched.
     #[cfg(test)]
@@ -302,6 +321,7 @@ impl Memory {
             call_timeout: CALL_TIMEOUT,
             first_call_timeout: FIRST_CALL_TIMEOUT,
             restart_window: RESTART_WINDOW,
+            review_wait: REVIEW_MEMORY_WAIT,
             #[cfg(test)]
             isolation: None,
         }
@@ -731,10 +751,68 @@ impl Memory {
         self.ask(Task::Remember(job), |calls| calls.remembered.remove(&key))
     }
 
+    /// The memories a review checks the work against, recalled for `queries`: the run's prompt
+    /// and each path it changed (docs/review-assist.md, "Review checks against memory"). Each
+    /// query's strong pointers are taken in turn by rank, the best of every query first, each
+    /// memory once, and read with `get` until [`review::MAX_MEMORIES`] are found; one `get` no
+    /// longer finds (redacted or forgotten) is passed over. A query is cut at
+    /// [`RECALL_TEXT_LIMIT`], and its recall is kept as the page's are.
+    ///
+    /// Waits for a check under way as [`Memory::for_run`] does, then for the memory thread up to
+    /// [`REVIEW_MEMORY_WAIT`]: called on a stage's start thread, which holds no lock. With no
+    /// queries, asks nothing.
+    ///
+    /// # Errors
+    ///
+    /// Why no memory was read, for the review's notice: hippius-mem is not ready or cannot be
+    /// asked, a call failed, the project changed, the queue is full, or the wait ran out.
+    pub(crate) fn recall_review(
+        &self,
+        queries: Vec<String>,
+    ) -> std::result::Result<Vec<MemoryNote>, String> {
+        if let Some(why) = not_ready(self.checked_state().as_ref()) {
+            return Err(why);
+        }
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply, answer) = mpsc::sync_channel(1);
+        {
+            let mut inner = self.lock();
+            if let Some(why) = inner.calls.health.problem() {
+                return Err(why);
+            }
+            // No memory thread runs to answer it.
+            if inner.calls.closed {
+                return Err(WINDOW_CLOSED.to_owned());
+            }
+            inner.calls.reviews += 1;
+            let task = ReviewRecall {
+                id: inner.calls.reviews,
+                queries: queries.into_iter().map(cut).collect(),
+                reply,
+            };
+            self.queue(&mut inner, Task::Review(task))
+                .map_err(|error| error_chain(&error))?;
+        }
+        match answer.recv_timeout(self.review_wait) {
+            Ok(found) => found,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "{PROGRAM} was slow to answer (over {})",
+                duration_words(self.review_wait)
+            )),
+            // Dropped from the queue before it ran: the server cannot be asked, another
+            // project opened, or the window closed.
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.stopped_why()),
+        }
+    }
+
     /// Stops the memory thread and its server: the window closes. Does not wait for either.
+    /// The tasks queued go, so a review's start thread waiting on one is answered at once.
     pub(crate) fn close(&self) {
         let mut inner = self.lock();
         inner.calls.closed = true;
+        inner.calls.queue.clear();
         inner.calls.kill_server();
         self.shared.work.notify_all();
     }
@@ -756,6 +834,18 @@ impl Memory {
         if let Some(reply) = inner.calls.health.reply() {
             return Ok(reply);
         }
+        self.queue(&mut inner, task)?;
+        Ok(Reply::Pending)
+    }
+
+    /// Queues `task` for the memory thread, under the state's lock `inner`, and starts the
+    /// thread on the first call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoProject`] with no project open, [`Error::StartMemory`] when the thread cannot
+    /// start, and [`Error::MemoryBusy`] when the queue is full of tasks it never drops.
+    fn queue(&self, inner: &mut Inner, task: Task) -> Result<()> {
         if inner.project.is_none() {
             return Err(Error::NoProject);
         }
@@ -771,7 +861,21 @@ impl Memory {
             return Err(Error::MemoryBusy);
         }
         self.shared.work.notify_all();
-        Ok(Reply::Pending)
+        Ok(())
+    }
+
+    /// Why a call stopped with nothing to store ([`Done::Unusable`]), or a queued task was
+    /// dropped: the window closed, the health's reason, else a new check or another project.
+    fn stopped_why(&self) -> String {
+        let inner = self.lock();
+        if inner.calls.closed {
+            return WINDOW_CLOSED.to_owned();
+        }
+        inner
+            .calls
+            .health
+            .problem()
+            .unwrap_or_else(|| format!("a new check of {PROGRAM} or another project stopped it"))
     }
 
     /// The memory thread: runs the queued tasks one at a time on the server it alone owns,
@@ -856,6 +960,105 @@ impl Memory {
                 });
             }
             Task::Remember(job) => self.run_remember(server, next, job),
+            Task::Review(review) => {
+                let found = self.review_memories(server, next, &review.queries);
+                self.lock().calls.running = None;
+                self.shared.changed.notify_all();
+                // Fails only when the start thread stopped waiting and dropped its end: no one
+                // reads the answer then. One send on a channel of one never finds it full.
+                drop(review.reply.try_send(found));
+            }
+        }
+    }
+
+    /// A review's memories ([`Memory::recall_review`]): a recall per query, a recall kept for
+    /// the query reused, then a `get` per memory kept.
+    fn review_memories(
+        &self,
+        server: &mut Option<Running>,
+        next: &Next,
+        queries: &[String],
+    ) -> std::result::Result<Vec<MemoryNote>, String> {
+        let mut recalls = Vec::with_capacity(queries.len());
+        for query in queries {
+            recalls.push(self.review_recall(server, next, query)?);
+        }
+        let mut notes = Vec::new();
+        for id in strong_by_rank(&recalls) {
+            if notes.len() == review::MAX_MEMORIES {
+                break;
+            }
+            let arguments = serde_json::json!({ "id": id.0 });
+            // hippius-mem's `MemError::NotFound`, which a redacted or forgotten memory gives
+            // (https://github.com/thenervelab/hippius-mem/blob/db9261b/hippius-mem-core/src/error.rs#L15).
+            let gone = format!("note {} not found", id.0);
+            let done = self.perform(
+                server,
+                next,
+                Resend::OnExit,
+                |server, deadline| match server.call_tool::<Note>("get", &arguments, deadline) {
+                    Ok(note) => Ok(Some(note)),
+                    Err(CallError::Refused(message)) if message == gone => Ok(None),
+                    Err(error) => Err(error),
+                },
+            );
+            if let Some(note) = self.found(done)? {
+                notes.push(MemoryNote {
+                    id: id.0,
+                    kind: note.kind,
+                    author: note.author,
+                    summary: note.summary,
+                    body: note.body,
+                });
+            }
+        }
+        Ok(notes)
+    }
+
+    /// The recall for `query`: the one kept, else a call, whose answer is kept as a page's
+    /// recall is.
+    fn review_recall(
+        &self,
+        server: &mut Option<Running>,
+        next: &Next,
+        query: &str,
+    ) -> std::result::Result<Recall, String> {
+        let kept = {
+            let inner = self.lock();
+            let current = inner.calls.epoch == next.epoch;
+            match inner.calls.recalls.get(query) {
+                Some(Ok(recall)) if current => Some(recall.clone()),
+                // A failure stays for the page to read once.
+                Some(_) | None => None,
+            }
+        };
+        if let Some(recall) = kept {
+            return Ok(recall);
+        }
+        let arguments = RecallArguments {
+            text: query,
+            repo: next.project.repo.as_deref(),
+        };
+        let done = self.perform(server, next, Resend::OnExit, |server, deadline| {
+            server.call_tool("recall", &arguments, deadline)
+        });
+        let recall: Recall = self.found(done)?;
+        let mut inner = self.lock();
+        if inner.calls.epoch == next.epoch {
+            inner
+                .calls
+                .recalls
+                .insert(query.to_owned(), Ok(recall.clone()));
+        }
+        Ok(recall)
+    }
+
+    /// What a review's call found, or why it found nothing.
+    fn found<T>(&self, done: Done<T>) -> std::result::Result<T, String> {
+        match done {
+            Done::Found(found) => Ok(found),
+            Done::Failed(error) => Err(error),
+            Done::Unusable => Err(self.stopped_why()),
         }
     }
 
@@ -1386,6 +1589,35 @@ enum Task {
     Detail(MemoryId),
     Refresh,
     Remember(RememberJob),
+    Review(ReviewRecall),
+}
+
+/// A review's recall ([`Memory::recall_review`]): its queries, each cut, and where its answer
+/// goes. Equal only to itself, by `id`: two reviews of the same work each wait on their own
+/// answer. Its `Debug` counts the queries: they quote the engineer's notes.
+#[derive(Clone)]
+struct ReviewRecall {
+    /// [`Calls::reviews`] when it was asked.
+    id: u64,
+    queries: Vec<String>,
+    reply: mpsc::SyncSender<std::result::Result<Vec<MemoryNote>, String>>,
+}
+
+impl PartialEq for ReviewRecall {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ReviewRecall {}
+
+impl fmt::Debug for ReviewRecall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReviewRecall")
+            .field("id", &self.id)
+            .field("queries", &self.queries.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1416,6 +1648,8 @@ struct Calls {
     refreshed: Option<Answer<Refreshed>>,
     /// Each remember's ending, until read once ([`Memory::remember`]).
     remembered: HashMap<RememberJob, Answer<Remembered>>,
+    /// Counts the reviews' recalls asked, to tell each apart ([`ReviewRecall::id`]).
+    reviews: u64,
     health: Health,
     /// When the server last exited on its own (module docs).
     last_death: Option<Instant>,
@@ -1453,9 +1687,9 @@ impl Calls {
 
     /// Queues `task` unless it is queued or running already. A full queue drops one first:
     /// the oldest recall for a file that is not open, else the oldest recall or read. A
-    /// refresh and a remember are never dropped: each is a click the page waits on, and a
-    /// dropped remember would lose the engineer's text. Returns false, queuing nothing, when
-    /// the queue is full of those.
+    /// refresh, a remember and a review's recall are never dropped: each is a click the page,
+    /// or a stage's start, waits on, and a dropped remember would lose the engineer's text.
+    /// Returns false, queuing nothing, when the queue is full of those.
     fn enqueue(&mut self, task: Task) -> bool {
         if self.running.as_ref() == Some(&task) || self.queue.contains(&task) {
             return true;
@@ -1464,11 +1698,11 @@ impl Calls {
             let open = self.open_file.as_deref();
             let closed_file = self.queue.iter().position(|queued| match queued {
                 Task::Recall(query) => query.file.is_some() && query.file.as_deref() != open,
-                Task::Detail(_) | Task::Refresh | Task::Remember(_) => false,
+                Task::Detail(_) | Task::Refresh | Task::Remember(_) | Task::Review(_) => false,
             });
             let droppable = |queued: &Task| match queued {
                 Task::Recall(_) | Task::Detail(_) => true,
-                Task::Refresh | Task::Remember(_) => false,
+                Task::Refresh | Task::Remember(_) | Task::Review(_) => false,
             };
             let Some(index) = closed_file.or_else(|| self.queue.iter().position(droppable)) else {
                 return false;
@@ -1538,6 +1772,26 @@ impl Health {
             Self::Halted(error) => Reply::Failed {
                 error: error.clone(),
             },
+        })
+    }
+
+    /// Why the server cannot be asked, in words, as [`Health::reply`] says it; `None` when it
+    /// can.
+    fn problem(&self) -> Option<String> {
+        Some(match self.reply::<()>()? {
+            Reply::Unavailable { message, .. } => message,
+            Reply::Incompatible {
+                server_version,
+                missing,
+                ..
+            } => format!(
+                "this {PROGRAM} ({server_version}) lacks {}",
+                missing.join(", ")
+            ),
+            Reply::Failed { error } => error,
+            Reply::Pending | Reply::Ready(()) => {
+                unreachable!("a health that is not usable answers why, never pending or ready")
+            }
         })
     }
 }
@@ -1632,6 +1886,33 @@ fn settled<K: Hash + Eq, T: Clone>(
         Ok(found) => Some(Ok(found.clone())),
         Err(_) => answers.remove(key),
     }
+}
+
+/// The strong pointers of `recalls` with an id that checks, taken in turn by rank: every
+/// recall's best, then every recall's second, and so on, each memory once. One query with many
+/// hits then cannot push out another's best.
+fn strong_by_rank(recalls: &[Recall]) -> Vec<MemoryId> {
+    let lists: Vec<Vec<MemoryId>> = recalls
+        .iter()
+        .map(|recall| {
+            recall
+                .pointers
+                .iter()
+                .filter(|pointer| !pointer.weak)
+                .filter_map(|pointer| MemoryId::parse(&pointer.id).ok())
+                .collect()
+        })
+        .collect();
+    let deepest = lists.iter().map(Vec::len).max().unwrap_or(0);
+    let mut ids: Vec<MemoryId> = Vec::new();
+    for rank in 0..deepest {
+        for id in lists.iter().filter_map(|list| list.get(rank)) {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    ids
 }
 
 /// `text` cut at [`RECALL_TEXT_LIMIT`], on a character boundary.
@@ -1924,6 +2205,23 @@ impl Memory {
         self
     }
 
+    /// Replaces how long a review's start waits for its memories.
+    pub(crate) fn with_review_wait(mut self, wait: Duration) -> Self {
+        self.review_wait = wait;
+        self
+    }
+
+    /// Waits until `count` tasks are queued, behind the one running: a test then knows a
+    /// review's recall is waiting its turn.
+    pub(crate) fn wait_queued(&self, count: usize) {
+        // Arbitrary, as the site tests' own wait: far above the milliseconds a queue takes.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.lock().calls.queue.len() < count {
+            assert!(Instant::now() < deadline, "{count} tasks were never queued");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Remembers `note` (the arguments of hippius-mem's `remember`) through a server of its
     /// own in `dir`, which exits before this returns, and gives the memory's id. hippius-mem
     /// 0.7.1 has no command that remembers: a test seeds its vault this way.
@@ -2082,5 +2380,74 @@ mod tests {
         let latin1 = Some(OsString::from_vec(b"/caf\xe9.toml".to_vec()));
         let error = user_config_from(latin1, None, Some(OsString::from("/home")), cwd).unwrap_err();
         assert!(error.contains("is not UTF-8"), "{error}");
+    }
+
+    /// One query with many hits does not push out another query's best: the review takes
+    /// every query's first, then every query's second, each memory once, strong ones only.
+    #[test]
+    fn a_review_takes_each_query_s_best_first() {
+        let recall = |pointers: &[(&str, bool)]| -> Recall {
+            let pointers: Vec<_> = pointers
+                .iter()
+                .map(|(id, weak)| {
+                    serde_json::json!({ "id": id, "summary": "s", "weak": weak,
+                                        "author": "a", "updated": 1 })
+                })
+                .collect();
+            serde_json::from_value(serde_json::json!({ "pointers": pointers })).unwrap()
+        };
+        let recalls = [
+            recall(&[("mem_01A", false), ("mem_01B", false), ("mem_01C", false)]),
+            recall(&[("mem_01W", true), ("mem_01D", false)]),
+            recall(&[("mem_01E", false), ("mem_01A", false), ("not an id", false)]),
+        ];
+        let ids: Vec<String> = strong_by_rank(&recalls)
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        assert_eq!(ids, ["mem_01A", "mem_01D", "mem_01E", "mem_01B", "mem_01C"]);
+    }
+
+    /// Two reviews of the same work each wait on their own answer, so each is queued; a full
+    /// queue drops a page's recall to make room, never a review's.
+    #[test]
+    fn every_review_s_recall_is_queued_and_never_dropped() {
+        let review = |id| {
+            let (reply, _answer) = mpsc::sync_channel(1);
+            Task::Review(ReviewRecall {
+                id,
+                queries: vec!["secret prompt".to_owned(), "a.txt".to_owned()],
+                reply,
+            })
+        };
+        let mut calls = Calls::default();
+        assert!(calls.enqueue(review(1)));
+        assert!(calls.enqueue(review(2)));
+        assert!(calls.enqueue(review(2)), "the same one is queued once");
+        assert_eq!(calls.queue.len(), 2);
+
+        let recall = |n: usize| {
+            Task::Recall(Query {
+                text: format!("q{n}"),
+                file: None,
+            })
+        };
+        for n in 2..QUEUE_CAP {
+            assert!(calls.enqueue(recall(n)));
+        }
+        assert!(calls.enqueue(review(3)), "a recall makes room");
+        let reviews = calls
+            .queue
+            .iter()
+            .filter(|task| matches!(task, Task::Review(_)))
+            .count();
+        assert_eq!((calls.queue.len(), reviews), (QUEUE_CAP, 3));
+
+        let shown = format!("{:?}", review(4));
+        assert!(
+            shown.contains("id: 4") && shown.contains("queries: 2"),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret"), "{shown}");
     }
 }

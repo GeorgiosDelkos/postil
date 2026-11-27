@@ -811,6 +811,69 @@ test("a run's dialog shows what the team recorded about its notes and changes", 
   await page.locator("#memory-dialog .run-message").filter({ hasText: "It is lazy." }).waitFor();
 });
 
+test("a finding shows the team memory it names, on its card and in the changes view", async (t) => {
+  // `review-memory` plays the author and both reviewers; the proposer names mem_01A, which the
+  // fake hippius-mem recalls, and mem_01NOTGIVEN, which no recall gave.
+  const { page, api } = await openProject(t, "review-memory", "new-memory-server");
+  // Team memory turns on only once hippius-mem's check found it ready.
+  const checked = Date.now() + WAIT;
+  while ((await api("api/settings")).memory?.state?.kind !== "ready") {
+    assert.ok(Date.now() < checked, "hippius-mem was not found ready");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const current = await api("api/settings");
+  const settings = {
+    ...current.settings,
+    reviewers: [{ name: "Fake" }, { name: "Fake" }],
+    agentMemory: true,
+  };
+  await api("api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ revision: current.revision, settings }),
+  });
+  const note = await addNote(api, "Rename two.");
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes: [note.id] }) });
+  // Until run `id` exists and has ended.
+  const ended = async (id) => {
+    const deadline = Date.now() + WAIT;
+    for (;;) {
+      const response = await fetch(new URL(`api/run?id=${id}`, page.url()));
+      if (response.ok && (await response.json()).status === "ended") return;
+      assert.ok(Date.now() < deadline, `${id} did not end`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+  await ended("R1");
+  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
+  await ended("R3");
+
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  const cited = detail.locator('.run-card-group [data-memory="mem_01A"]');
+  // The summary comes once the page read the memory.
+  await cited.filter({ hasText: /^mem_01A · a\.rs parses lazily$/ }).waitFor();
+  assert.equal(await detail.locator("[data-memory]").count(), 1, "an id not given is dropped");
+  await cited.click();
+  const memory = page.locator("#memory-dialog");
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+  await page.keyboard.press("Escape");
+  await memory.waitFor({ state: "hidden" });
+
+  await detail.getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  const flagged = changes.locator('.changes-finding [data-memory="mem_01A"]');
+  await flagged.filter({ hasText: /^mem_01A · a\.rs parses lazily$/ }).waitFor();
+  await flagged.click();
+  await memory
+    .locator(".run-message")
+    .filter({ hasText: /^It is lazy\.$/ })
+    .waitFor();
+});
+
 test("a sent note's thread drafts the memory, and is free again once the draft ended", async (t) => {
   const { page, api } = await openProject(t, "memory-draft", "new-memory-server");
   const note = await addNote(api, "Keep src/a.rs to three lines.");

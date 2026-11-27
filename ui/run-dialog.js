@@ -6,7 +6,7 @@
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, agentLogoIcon, el, statusIcon } from "./dom.js";
 import { shortPlace } from "./note-place.js";
-import { runMemory } from "./memory-tab.js";
+import { findingMemories, findingMemoryLink, runMemory } from "./memory-tab.js";
 import { keptQuestion } from "./question-form.js";
 import { MAX_LIVE } from "./run-store.js";
 import {
@@ -33,6 +33,11 @@ import {
 } from "./status.js";
 
 const capital = (word) => word.charAt(0).toUpperCase() + word.slice(1);
+
+// The memories a review's findings name, each once; none without a review.
+const citedIds = (review) => [
+  ...new Set((review?.findings ?? []).map((finding) => finding.memory).filter(Boolean)),
+];
 
 // What a Checks row says of each evidence state (`evidence` in run.js). "An edit after it"
 // rather than "stale": a formatter run as a command also changes files, unseen, so the row
@@ -74,10 +79,13 @@ export function runDialog({
   // What the dialog writes in place while the stamp it was drawn from holds: the text the
   // agent streams, and the time. Each writes what is now known of its run.
   let streamed = [];
-  // The thread's Memory section: drawn again when its recall comes in.
+  // The thread's Memory section: drawn again when its recall comes in. So are the memories the
+  // review's findings name, once each summary is read.
   const memory = runMemory({ openMemory, onSettled: () => drawDetail() });
+  const cited = findingMemories({ onSettled: () => drawDetail() });
   detailEl.addEventListener("close", () => {
     memory.stop();
+    cited.stop();
     detail = null;
     detailDrawn = null;
     asking = null;
@@ -145,6 +153,7 @@ export function runDialog({
       const live = root.review ? (isLive(root) ? root : undefined) : liveOf(root.id);
       const liveKey = `${live?.id}:${live?.status}`;
       const memoryKey = memory.key((thread.at(-1) ?? root).id);
+      const citedKey = cited.key(citedIds(review));
       stamp = [
         `run:${root.id}`,
         threadKey(thread),
@@ -152,13 +161,18 @@ export function runDialog({
         liveKey,
         busyThread(root.id),
         memoryKey,
+        citedKey,
       ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
       const review = reviewOf(view.id, store.knownViews());
       const finding = review?.findings.find((item) => item.id === detail.finding);
       if (!finding) return;
-      stamp = [`finding:${view.id}:${finding.id}`, JSON.stringify(finding)];
+      stamp = [
+        `finding:${view.id}:${finding.id}`,
+        JSON.stringify(finding),
+        cited.key(finding.memory ? [finding.memory] : []),
+      ];
       draw = () => findingDetail(view, finding);
     } else {
       const index = steps.findIndex((step) => step.key === detail.key);
@@ -724,9 +738,23 @@ export function runDialog({
       button.addEventListener("click", () =>
         openDetail({ kind: "finding", id: view.id, finding: finding.id }),
       );
-      cards.append(button);
+      if (!finding.memory) {
+        cards.append(button);
+        continue;
+      }
+      // The memory's button goes beside the card, not in it: a button in a button gets both
+      // clicks.
+      const group = el("div", "run-card-group");
+      const memoryLink = findingMemoryLink(
+        finding.memory,
+        cited.summary(finding.memory),
+        openMemory,
+      );
+      group.append(button, memoryLink);
+      cards.append(group);
     }
     part.append(cards);
+    for (const notice of review.notices) part.append(el("div", "run-notice", notice));
     for (const problem of review.problems)
       part.append(el("div", "run-notice", `A reviewer's findings could not be read: ${problem}`));
     return part;
@@ -750,6 +778,10 @@ export function runDialog({
     body.append(nav, section("Finding", el("div", "run-detail-text", finding.text)));
     if (finding.fix)
       body.append(section("Proposed fix", el("div", "run-detail-text", finding.fix)));
+    if (finding.memory) {
+      const link = findingMemoryLink(finding.memory, cited.summary(finding.memory), openMemory);
+      body.append(section("Team memory", link));
+    }
     const verdict =
       finding.verdict.text ||
       {

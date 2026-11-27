@@ -474,7 +474,10 @@ Built in `src/run.rs` and `src/run/log.rs`, with the API the page calls (`src/si
   diagrams name it. Older logs read as no analysis. Run log version 9 adds `remember: {of}`
   to the header of a memory draft (docs/review-assist.md, "Postil writes memory"): a read-only
   run in the thread whose latest turn is `of`, whatever the thread's mode, never the latest run
-  of the Run tab, whose reply ends with the draft. Older logs read as no draft.
+  of the Run tab, whose reply ends with the draft. Older logs read as no draft. Run log version
+  10 adds `memory` to a finding of the `findings` entry: the id of the team memory the finding
+  names, one the review's memory block held (docs/review-assist.md, "Review checks against
+  memory"), and absent otherwise. Older logs read as findings that name no memory.
 - **Notes** are marked sent, with the run's id, once the agent shows it took the turn: its
   first update, a permission request, or a stop. A run that fails to start, or whose prompt
   the agent refuses, leaves them open. `review.json` is version 2 for this field, `state`,
@@ -545,6 +548,10 @@ owner on 2026-11-23:
   of notes; a run's dialog has a Review section with a card per reviewer (it opens that
   reviewer's run) and a card per finding with its verdict (it opens the finding whole), and a
   note's dialog shows the findings about that note, in full.
+- **With team memory on, every stage checks the work against it.** The first stage's start
+  recalls memories for the reviewed run's prompt and changed paths, and every stage's prompt
+  carries them as reference data written by teammates; a finding may name one, which its card
+  opens (docs/review-assist.md, "Review checks against memory").
 
 ### Follow-ups
 

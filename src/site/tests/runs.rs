@@ -2070,8 +2070,8 @@ fn an_unreadable_newest_log_is_skipped_and_named() {
         ("\n", "its first line is not a run header"),
         ("not a header\n", "its first line is not a run header"),
         (
-            r#"{"version":10,"id":"R3","newField":1}"#,
-            "it is version 10, and this build of Postil reads versions 1 to 9",
+            r#"{"version":11,"id":"R3","newField":1}"#,
+            "it is version 11, and this build of Postil reads versions 1 to 10",
         ),
         (
             &*header("R3").replace(

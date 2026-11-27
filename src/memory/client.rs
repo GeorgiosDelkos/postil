@@ -396,17 +396,19 @@ struct Content {
 /// What `recall` found: hippius-mem's pointers, best first.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Recall {
-    pointers: Vec<Pointer>,
+    pub(super) pointers: Vec<Pointer>,
 }
 
 /// One memory `recall` found. `updated` is in milliseconds since the Unix epoch.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Pointer {
-    id: String,
+    /// Unchecked: [`MemoryId::parse`](crate::memory::MemoryId::parse) checks it before a call
+    /// uses it.
+    pub(super) id: String,
     summary: String,
     /// A low-confidence guess (hippius-mem 0.7.1 leaves the field out otherwise).
     #[serde(default)]
-    weak: bool,
+    pub(super) weak: bool,
     author: String,
     updated: u64,
 }
@@ -503,14 +505,14 @@ pub(crate) struct Refreshed {
 pub(super) struct Note {
     id: String,
     #[serde(rename = "note_type")]
-    kind: String,
-    author: String,
+    pub(super) kind: String,
+    pub(super) author: String,
     created: u64,
     updated: u64,
     #[serde(default)]
     tags: Vec<String>,
-    summary: String,
-    body: String,
+    pub(super) summary: String,
+    pub(super) body: String,
 }
 
 /// `history`'s result.

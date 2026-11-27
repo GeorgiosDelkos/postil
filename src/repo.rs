@@ -376,13 +376,7 @@ impl Repo {
     /// logs, which a hand edit can change), and the git errors, such as a snapshot that
     /// `git gc` pruned.
     pub(crate) fn diff(&self, before: &str, after: &str) -> Result<String> {
-        for id in [before, after] {
-            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(Error::BadRequest(format!(
-                    "snapshot {id:?}: expected a git object id"
-                )));
-            }
-        }
+        check_snapshots(before, after)?;
         git(
             &self.root,
             &[
@@ -402,6 +396,26 @@ impl Repo {
                 after,
             ],
         )
+    }
+
+    /// The paths that differ from snapshot `before` to snapshot `after`, each once, in git's
+    /// order: a renamed file is its old path and its new one. A command's edits, which report
+    /// no diff to Postil, are among them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Repo::diff`].
+    pub(crate) fn changed_paths(&self, before: &str, after: &str) -> Result<Vec<String>> {
+        check_snapshots(before, after)?;
+        let names = git(
+            &self.root,
+            &["diff", "--name-only", "--no-renames", "-z", before, after],
+        )?;
+        Ok(names
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// The commit `HEAD` names, or `None` in a repository with no commit yet.
@@ -1076,6 +1090,23 @@ fn memory_repo_name(url: &str) -> Option<&str> {
 /// Runs `git` in `dir` and returns what it printed.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     run_git(dir, None, args)
+}
+
+/// Checks that `before` and `after` are hexadecimal object ids before they reach git: they come
+/// from run logs, which a hand edit can change.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] naming the first that is not.
+fn check_snapshots(before: &str, after: &str) -> Result<()> {
+    for id in [before, after] {
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::BadRequest(format!(
+                "snapshot {id:?}: expected a git object id"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Runs `git rev-parse <option>` in `dir` and returns the one path it prints, byte for byte:

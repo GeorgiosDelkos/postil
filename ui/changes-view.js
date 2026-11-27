@@ -11,6 +11,7 @@
 // and a review's findings show beside their lines. Files order is the diff's own.
 
 import { el } from "./dom.js";
+import { findingMemories, findingMemoryLink } from "./memory-tab.js";
 import { findingsByLine, hunkRisk, notesByLine, parsePatch, walkthrough } from "./patch.js";
 import { segmented } from "./settings-controls.js";
 
@@ -23,8 +24,18 @@ const LINES_SHOWN = 400;
 // header, `controls` being elements to show beside the meta; `notes()` gives the notes;
 // `noteCard(note)` builds a note's card, which opens its dialog; `addNote(path, line)` writes a
 // note on 1-based line `line` of `path`; `onError(text)` shows a failure; `onClose()` runs when
-// the view closes, to give the pane back to the file.
-export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onError, onClose }) {
+// the view closes, to give the pane back to the file; `openMemory(id)` opens the team memory a
+// finding names.
+export function changesView({
+  viewEl,
+  setHeader,
+  notes,
+  noteCard,
+  addNote,
+  onError,
+  onClose,
+  openMemory,
+}) {
   // What is shown: `{ from, to, run }`, or null while the view is closed.
   let shown = null;
   let request = 0;
@@ -37,6 +48,15 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
   let opened = new Set();
   // The index of the current step among the drawn `.changes-step` sections.
   let current = 0;
+  // The memories the findings name: drawn again where it was as each summary is read.
+  const cited = findingMemories({
+    onSettled: () => {
+      if (!read) return;
+      const top = viewEl.scrollTop;
+      draw();
+      viewEl.scrollTop = top;
+    },
+  });
 
   // Shows what runs `from` to `to` changed. `run` is `{ report, findings }` for a single run:
   // its author's report (null when it gave none) and its latest review's findings. Null for a
@@ -410,6 +430,9 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     );
     card.append(head, el("div", "note-body", finding.text));
     if (finding.fix) card.append(el("div", "changes-finding-fix", `Fix: ${finding.fix}`));
+    if (finding.memory) {
+      card.append(findingMemoryLink(finding.memory, cited.summary(finding.memory), openMemory));
+    }
     return card;
   }
 
@@ -466,6 +489,7 @@ export function changesView({ viewEl, setHeader, notes, noteCard, addNote, onErr
     if (!shown) return;
     shown = null;
     read = null;
+    cited.stop();
     request += 1;
     viewEl.hidden = true;
     viewEl.replaceChildren();

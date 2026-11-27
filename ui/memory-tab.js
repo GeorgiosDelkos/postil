@@ -1,10 +1,18 @@
 // The tray's Memory tab, and the run dialog's Memory section (docs/review-assist.md, "Postil
 // shows memory"): the memories hippius-mem recalls for the open file, or for a run's prompt and
 // changed paths, one card each with the summary, the author and the age. A card opens the
-// memory's dialog (memory-dialog.js). memory.js has the rules.
+// memory's dialog (memory-dialog.js). Also the memory a review's finding names, on its card.
+// memory.js has the rules.
 
 import { el } from "./dom.js";
-import { memoryAge, partitionPointers, pollMemory, replyProblem, shortAuthor } from "./memory.js";
+import {
+  isMemoryId,
+  memoryAge,
+  partitionPointers,
+  pollMemory,
+  replyProblem,
+  shortAuthor,
+} from "./memory.js";
 
 // What a recall's reply shows: its cards, the pending line, or why there are none. `nothing`
 // is the line for a recall that found nothing strong. `openSettings`, when given, is offered
@@ -194,4 +202,59 @@ export function runMemory({ openMemory, onSettled }) {
       replies.clear();
     },
   };
+}
+
+// The memories review findings name (src/review.rs, `Finding.memory`), each read once with
+// `GET api/memory` while a view shows it, again every MEMORY_POLL_MS while pending. The run
+// log keeps only the id: the summary is read here, as the vault holds it now.
+// `summary(id)` is the summary once read, else null (pending, or it cannot be read);
+// `key(ids)` changes when one of `ids` settles, and `onSettled()` is called then, for the view
+// to draw again. `stop()` ends every ask and forgets the answers: the view closed.
+export function findingMemories({ onSettled }) {
+  const replies = new Map();
+  const asking = new Map();
+
+  function replyOf(id) {
+    const known = replies.get(id);
+    if (known) return known;
+    // Only an id as hippius-mem writes them is sent (src/memory.rs, `MemoryId`).
+    if (!isMemoryId(id)) return { state: "failed" };
+    if (!asking.has(id)) {
+      const stop = pollMemory(`api/memory?id=${encodeURIComponent(id)}`, {
+        onReply: (reply) => {
+          if (reply.state === "pending") return;
+          asking.delete(id);
+          replies.set(id, reply);
+          onSettled();
+        },
+      });
+      asking.set(id, stop);
+    }
+    return { state: "pending" };
+  }
+
+  return {
+    summary(id) {
+      const reply = replyOf(id);
+      return reply.state === "ready" ? reply.summary : null;
+    },
+    key: (ids) => ids.map((id) => `${id}:${replyOf(id).state}`).join(" "),
+    stop() {
+      for (const stop of asking.values()) stop();
+      asking.clear();
+      replies.clear();
+    },
+  };
+}
+
+// The memory a finding names, as a button that opens it (`openMemory(id)`): its id and
+// summary, or the id alone while the summary is not known. A sibling of the finding's own card,
+// never inside it: a button in a button gets both clicks.
+export function findingMemoryLink(id, summary, openMemory) {
+  const button = el("button", "finding-memory", summary ? `${id} · ${summary}` : id);
+  button.type = "button";
+  button.title = "Open the team memory this finding names";
+  button.setAttribute("data-memory", id);
+  button.addEventListener("click", () => openMemory(id));
+  return button;
 }

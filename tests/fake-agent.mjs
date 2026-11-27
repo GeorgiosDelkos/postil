@@ -424,6 +424,38 @@ async function prompt(id, params) {
       say('It returns early.\n\n```json\n{"checks": [{"command": "cargo test", "result": "passed"}]}\n```');
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "review-memory":
+      // Plays the author and both reviewers of a review with team memory (src/review.rs),
+      // told apart by the prompt; each echoes its prompt as every scenario does ("got"). The
+      // author edits a.txt with a diff it reports and writes b.txt as a command would, with no
+      // diff. The proposer names a memory the fake hippius-mem recalls (mem_01A) and one no
+      // recall gave.
+      if (blocks[0].includes("Do not change any file")) {
+        const finding = (note, path, line, text, fix, memory) =>
+          ({ note, path, line, finding: text, fix, memory });
+        const findings = [
+          finding("N1", "a.txt", 1, "a.txt is read eagerly", "read it lazily", "mem_01A"),
+          finding(null, "b.txt", null, "b.txt is new", null, "mem_01NOTGIVEN"),
+        ];
+        say(`Found two.\n\n\`\`\`json\n${JSON.stringify(findings)}\n\`\`\``);
+      } else if (blocks[0].includes("You are the last reviewer")) {
+        say("F1: accepted - read lazily\nF2: rejected - fine as it is");
+      } else {
+        update({
+          sessionUpdate: "tool_call",
+          toolCallId: "w1",
+          title: "Edit a.txt",
+          kind: "edit",
+          status: "completed",
+          content: [
+            { type: "diff", path: `${process.cwd()}/a.txt`, oldText: "a", newText: "a\nedited" },
+          ],
+        });
+        writeFileSync(`${process.cwd()}/a.txt`, "a\nedited\n");
+        writeFileSync(`${process.cwd()}/b.txt`, "b\n");
+        say("N1: edited a.txt");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
     case "reviewer-silent":
       // A proposer whose reply has no findings block.
       say("Looks fine to me.");

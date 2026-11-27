@@ -202,6 +202,7 @@ const changes = changesView({
   },
   onError: showToast,
   onClose: () => code.restoreHeader(),
+  openMemory: (id) => memoryDetail.open(id),
 });
 
 const noteDetail = noteDialog($("note-dialog"), {

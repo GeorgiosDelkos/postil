@@ -5,6 +5,7 @@
 import { diffView, fillMarkdown, reviewSection } from "./dialog-parts.js";
 import { actOnSecondClick, el, statusIcon } from "./dom.js";
 import { isMemoryId } from "./memory.js";
+import { findingMemoryLink } from "./memory-tab.js";
 import { fullPlace, onLines } from "./note-place.js";
 import { keptQuestion } from "./question-form.js";
 import { foldRun, isAsk, isLive, isResolved, openQuestion, statusLine } from "./run.js";
@@ -430,6 +431,8 @@ export function noteDialog(
       if (finding.fix) item.append(el("div", "note-dialog-said muted", `Proposed: ${finding.fix}`));
       if (finding.verdict.text)
         item.append(el("div", "note-dialog-said", `Judged: ${finding.verdict.text}`));
+      // The id alone: the run dialog and the changes view read the summary.
+      if (finding.memory) item.append(findingMemoryLink(finding.memory, null, openMemory));
       part.append(item);
     }
     return part;

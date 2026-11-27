@@ -235,7 +235,9 @@ const runNumber = (view) => Number(view.id.slice(1));
 // (`agentSaid`, the judge answers "F1: accepted - ..."), "answered" for a line that says
 // neither, "judging" while the judge runs, "waiting" before it starts, "no word" when it
 // ended without a line, and "not judged" when a single reviewer only proposed or the review
-// stopped before its judge (a stage failed or was stopped).
+// stopped before its judge (a stage failed or was stopped). A finding keeps the team memory it
+// names (`memory`). `notices` are the stages' memory notices, each once: why a stage's team
+// memory could not be checked, or why its agent got no team memory.
 export function reviewOf(id, views) {
   const stages = views
     .filter((view) => view?.review?.of === id)
@@ -283,7 +285,8 @@ export function reviewOf(id, views) {
       .filter((entry) => entry.kind === "findings" && entry.problem)
       .map((entry) => `${view.id}: ${entry.problem}`),
   );
-  return { stages: chain, reviewers, findings, problems };
+  const notices = [...new Set(chain.map((view) => view.memoryNotice).filter(Boolean))];
+  return { stages: chain, reviewers, findings, problems, notices };
 }
 
 // Why a failed run failed, from its log, or null.
@@ -306,16 +309,18 @@ export function reviewKey(review) {
       stage.status,
       statusLine(stage),
     ]),
-    review.findings.map(({ id, note, text, fix, path, line, verdict }) => [
+    review.findings.map(({ id, note, text, fix, path, line, memory, verdict }) => [
       id,
       note,
       text,
       fix,
       path,
       line,
+      memory ?? null,
       verdict.word,
     ]),
     review.problems,
+    review.notices,
   ];
 }
 

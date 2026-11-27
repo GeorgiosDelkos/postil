@@ -410,6 +410,17 @@ struct Pending {
     /// The thread the agent works in.
     thread: Thread,
     worktree: Worktree,
+    /// For a review's first stage, the reviewed run's snapshots: its start recalls the team
+    /// memories for the review ([`Runner::recall_for_review`]).
+    review_recall: Option<ReviewSnapshots>,
+}
+
+/// The snapshots taken before and after a reviewed run, when it has them: the paths that
+/// differ between them are the ones it changed, a command's edits included.
+#[derive(Debug)]
+struct ReviewSnapshots {
+    before: Option<String>,
+    after: Option<String>,
 }
 
 /// Whether a run's worktree is still to be made, on the start thread, before its agent.
@@ -441,6 +452,8 @@ struct NewRun {
     /// The review the run is a stage of, which becomes the one under way; `None` ends the
     /// review under way, if any.
     review: Option<Chain>,
+    /// As [`Pending::review_recall`].
+    review_recall: Option<ReviewSnapshots>,
     place: Place,
 }
 
@@ -622,6 +635,7 @@ impl Runner {
             // A new thread works in a new worktree, which a kept agent's session is not in.
             conversation: Conversation::Fresh,
             review: None,
+            review_recall: None,
             place: Place::New {
                 fork,
                 title,
@@ -669,6 +683,7 @@ impl Runner {
             origin: Origin::Notes,
             conversation: Conversation::Fresh,
             review: None,
+            review_recall: None,
             place: Place::New {
                 fork,
                 title,
@@ -729,6 +744,7 @@ impl Runner {
             origin: Origin::Analysis(run),
             conversation: Conversation::Fresh,
             review: None,
+            review_recall: None,
             place: Place::New {
                 fork,
                 title,
@@ -901,6 +917,7 @@ impl Runner {
                 Conversation::Fresh
             },
             review: None,
+            review_recall: None,
             place: Place::Open(record),
         };
         self.launch(slots, new, |_| Ok(Content { notes, prompt }))
@@ -1013,6 +1030,7 @@ impl Runner {
             memory: TeamMemory::Off,
             origin: Origin::Remember(Remember { of: of.to_owned() }),
             review: None,
+            review_recall: None,
             place: Place::Open(record),
         };
         let mut id = None;
@@ -1096,7 +1114,7 @@ impl Runner {
             ));
         }
         let reviewed = self.run_by_id(of)?;
-        let (notes, work, files) = {
+        let (notes, work, files, snapshots) = {
             let state = reviewed.state();
             if state.header.review.is_some() {
                 return Err(Error::BadRequest(format!("{of} is itself a review")));
@@ -1116,7 +1134,11 @@ impl Runner {
             }
             let work = state.work();
             let files = edited_files(&work.diffs);
-            (state.header.notes.clone(), work, files)
+            let snapshots = ReviewSnapshots {
+                before: state.snapshot(Point::Before).map(str::to_owned),
+                after: state.snapshot(Point::After).map(str::to_owned),
+            };
+            (state.header.notes.clone(), work, files, snapshots)
         };
         let chain = Chain {
             stage: Stage {
@@ -1131,7 +1153,7 @@ impl Runner {
             findings: Vec::new(),
             memory,
         };
-        self.start_stage(self.slots(), chain)
+        self.start_stage(self.slots(), chain, Some(snapshots))
     }
 
     /// The run `of`, this window's when it is one of its threads' latest, else read from its
@@ -1165,8 +1187,15 @@ impl Runner {
 
     /// Starts `chain`'s current stage as a new run, with a fresh agent, so a reviewer never
     /// inherits the reviewed agent's conversation; `chain` becomes the review under way. The
-    /// stage works in the reviewed run's thread, read again for each stage.
-    fn start_stage(self: &Arc<Self>, slots: MutexGuard<'_, Slots>, chain: Chain) -> Result<()> {
+    /// stage works in the reviewed run's thread, read again for each stage. The first stage
+    /// gets the reviewed run's `snapshots`, and its start recalls the review's team memories,
+    /// which the chain then carries to the stages after it.
+    fn start_stage(
+        self: &Arc<Self>,
+        slots: MutexGuard<'_, Slots>,
+        chain: Chain,
+        snapshots: Option<ReviewSnapshots>,
+    ) -> Result<()> {
         // Refused here, before a run log is made; `launch` reads it again under the thread's
         // lock.
         let record = self.open_thread(&chain.stage.of)?;
@@ -1189,6 +1218,7 @@ impl Runner {
             conversation: Conversation::Fresh,
             place: Place::Open(record),
             review: Some(chain),
+            review_recall: snapshots,
         };
         self.launch(slots, new, |_| Ok(content))
     }
@@ -1211,7 +1241,7 @@ impl Runner {
         let Some(chain) = slot.chain.take() else {
             return;
         };
-        if let Err(error) = self.start_stage(slots, chain) {
+        if let Err(error) = self.start_stage(slots, chain, None) {
             // The chain went with the stage that could not start, so the review ends, and the
             // stage that ended says why.
             ended.state().problem.get_or_insert(format!(
@@ -1262,6 +1292,7 @@ impl Runner {
             origin,
             conversation,
             review,
+            review_recall,
             place,
         } = new;
         let snapshot = place.mode() == Mode::Work
@@ -1328,6 +1359,7 @@ impl Runner {
                 generation: slot.generation,
                 thread,
                 worktree,
+                review_recall,
             };
             if let Err(error) = self.start(pending) {
                 // No thread will make the worktree: the thread goes, as one whose worktree
@@ -1666,11 +1698,7 @@ impl Runner {
             let prompt = state.header.prompt.as_str();
             let asked = match &state.header.follow_up {
                 Some(follow_up) => follow_up.text.as_str(),
-                None => prompt
-                    .strip_prefix(notes::INTRO)
-                    .map(|rest| rest.strip_prefix(notes::TEAM_MEMORY).unwrap_or(rest))
-                    .and_then(|rest| rest.strip_prefix(report::ASK))
-                    .unwrap_or(prompt),
+                None => notes_asked(prompt),
             };
             text.push_str("\n\n");
             text.push_str(asked.trim());
@@ -2271,7 +2299,9 @@ impl Runner {
     /// The agent's session gets team memory when the run asks for it and hippius-mem is Ready
     /// ([`Memory::for_run`], which may wait for a check). Its prompt of notes has the line about
     /// team memory exactly when the session got the server, whether or not it was built with
-    /// it ([`Prompt::for_memory`]); when it got none, the run's dialog says why, once.
+    /// it ([`Prompt::for_memory`]); when it got none, the run's dialog says why, once. A review's
+    /// first stage with team memory on recalls the review's memories first
+    /// ([`Runner::recall_for_review`]).
     ///
     /// # Errors
     ///
@@ -2285,16 +2315,17 @@ impl Runner {
             pending.thread.clone(),
         );
         let start_agent = move || {
+            let mut pending = pending;
             let generation = pending.generation;
             let id = pending.thread.id.clone();
+            if !runner.ready_for_agent(&mut pending) {
+                return (runner.notify)();
+            }
             let failed = |error: &Error| {
                 pending.run.record(Entry::Failed {
                     error: error_chain(error),
                 });
             };
-            if !matches!(pending.worktree, Worktree::Made) && !runner.make_for(&pending) {
-                return (runner.notify)();
-            }
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.
             let search_path = runner.agents.wait();
@@ -2363,8 +2394,8 @@ impl Runner {
                         TeamMemory::Off
                     };
                     if let Some(refused) = servers_refused {
-                        pending.run.state().memory_notice =
-                            Some(format!("team memory was not given: {refused}"));
+                        let notice = format!("team memory was not given: {refused}");
+                        first_memory_notice(&pending.run, notice);
                     }
                     let prompt = pending.prompt.for_memory(given);
                     let root = &pending.thread.path;
@@ -2447,6 +2478,117 @@ impl Runner {
             pending.run.record_snapshot(Point::Before, before);
         }
         true
+    }
+
+    /// Readies `pending` on its start thread, before its agent starts: makes its worktree when
+    /// it is still to be made ([`Runner::make_for`]), then, for a review's first stage with
+    /// team memory on, recalls the review's memories ([`Runner::recall_for_review`]). Returns
+    /// whether the agent is to start, as `make_for` does.
+    fn ready_for_agent(&self, pending: &mut Pending) -> bool {
+        if !matches!(pending.worktree, Worktree::Made) && !self.make_for(pending) {
+            return false;
+        }
+        if let Some(snapshots) = pending.review_recall.take()
+            && pending.memory == TeamMemory::On
+        {
+            self.recall_for_review(pending, &snapshots);
+        }
+        true
+    }
+
+    /// Recalls the team memories the review whose first stage is `pending` checks the work
+    /// against (docs/review-assist.md, "Review checks against memory"), for the reviewed run's
+    /// prompt and each path it changed: its edits' diffs, then the paths that differ between its
+    /// `snapshots`, which a command's edits are among. The chain keeps them for every stage, and
+    /// the stage's prompt is built again with them. When none can be read, the stage runs as it
+    /// was, and says why as its run's memory notice, never as its problem: the run did not fail.
+    ///
+    /// Runs on the stage's start thread, with no lock held while git runs and while it waits
+    /// for hippius-mem ([`Memory::recall_review`], up to 30 s). A Stop meanwhile lets the stage
+    /// go, and the memories are dropped.
+    fn recall_for_review(&self, pending: &mut Pending, snapshots: &ReviewSnapshots) {
+        let id = &pending.thread.id;
+        let (asked, files) = {
+            let slots = self.slots();
+            if slots.let_go(id, pending.generation) {
+                return;
+            }
+            let Some(chain) = slots.by_thread.get(id).and_then(|slot| slot.chain.as_ref()) else {
+                return;
+            };
+            (
+                notes_asked(&chain.work.prompt).trim().to_owned(),
+                chain.files.clone(),
+            )
+        };
+        let found = self
+            .review_queries(asked, files, snapshots)
+            .and_then(|queries| self.memory.recall_review(queries));
+        let block = match found {
+            Ok(found) => review::MemoryBlock::new(found),
+            Err(why) => {
+                pending.run.state().memory_notice =
+                    Some(format!("team memory could not be checked: {why}"));
+                return;
+            }
+        };
+        if block.is_empty() {
+            return;
+        }
+        let mut slots = self.slots();
+        if slots.let_go(id, pending.generation) {
+            return;
+        }
+        let Some(chain) = slots
+            .by_thread
+            .get_mut(id)
+            .and_then(|slot| slot.chain.as_mut())
+        else {
+            return;
+        };
+        // Only the first stage recalls (`Runner::review`), and the first of a chain proposes.
+        debug_assert!(
+            !chain.stage.judges(),
+            "a review's memories are recalled for its first stage, which proposes"
+        );
+        chain.work.memories = block;
+        pending.prompt.text = review::propose_prompt(&chain.work);
+    }
+
+    /// What a review recalls for: the reviewed run's notes as asked (`asked`, left out when
+    /// empty), then each path it changed once, `files` (its edits' diffs) first.
+    ///
+    /// # Errors
+    ///
+    /// Why the paths that differ between `snapshots` could not be read ([`Repo::changed_paths`]).
+    fn review_queries(
+        &self,
+        asked: String,
+        files: Vec<String>,
+        snapshots: &ReviewSnapshots,
+    ) -> std::result::Result<Vec<String>, String> {
+        let mut paths = files;
+        if let (Some(before), Some(after)) = (&snapshots.before, &snapshots.after)
+            && before != after
+        {
+            let changed = self.repo.changed_paths(before, after).map_err(|error| {
+                format!(
+                    "the reviewed run's changed paths could not be read: {}",
+                    error_chain(&error)
+                )
+            })?;
+            for path in changed {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        let mut queries = Vec::with_capacity(paths.len() + 1);
+        if !asked.is_empty() {
+            queries.push(asked);
+        }
+        queries.extend(paths);
+        Ok(queries)
     }
 
     /// Takes new thread `id`, whose worktree will not be made, out of the record, and removes
@@ -2811,8 +2953,11 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
 /// then cleared. A proposer's findings are logged here, before the end, while the run still
 /// takes entries.
 fn decide(slot: &mut Slot, run: &Run, stage: &Stage, undone: Option<String>) -> bool {
-    let found = slot.chain.as_ref().map_or(0, |chain| chain.findings.len());
-    let findings = end_stage(run, stage, found, undone);
+    let none = review::MemoryBlock::default();
+    let (found, memories) = slot.chain.as_ref().map_or((0, &none), |chain| {
+        (chain.findings.len(), &chain.work.memories)
+    });
+    let findings = end_stage(run, stage, found, memories, undone);
     let goes = match (findings, slot.chain.as_mut()) {
         (Some(findings), Some(chain)) => goes_on(chain, findings),
         _ => false,
@@ -2863,21 +3008,23 @@ fn goes_on(chain: &mut Chain, findings: Vec<Finding>) -> bool {
 }
 
 /// Ends review stage `stage` of `run`, whose turn ended well, before its end is logged: a
-/// proposer's findings are read from its reply (numbered after the `found` before it) and
-/// logged. `undone` says why the proposer's edits were put back ([`undo_read_only`]), if it
-/// made any. Returns the findings for the next stage; `None` when the review ends here: this
-/// was the judge, or a proposer changed files.
+/// proposer's findings are read from its reply (numbered after the `found` before it, a memory
+/// kept only when `memories`, the stage's block, held it) and logged. `undone` says why the
+/// proposer's edits were put back ([`undo_read_only`]), if it made any. Returns the findings for
+/// the next stage; `None` when the review ends here: this was the judge, or a proposer changed
+/// files.
 fn end_stage(
     run: &Run,
     stage: &Stage,
     found: usize,
+    memories: &review::MemoryBlock,
     undone: Option<String>,
 ) -> Option<Vec<Finding>> {
     if stage.judges() {
         return None;
     }
     let reply = run.state().reply();
-    let (findings, problem) = match review::findings_in(&reply, found + 1) {
+    let (findings, problem) = match review::findings_in(&reply, found + 1, memories) {
         Ok(findings) => (findings, None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
@@ -3213,6 +3360,17 @@ fn commit_message(header: &Header, point: Point) -> String {
     }
 }
 
+/// What a prompt of notes asks, without the words every such prompt starts with: the
+/// introduction, the line about team memory and the ask for a report. A prompt that does not
+/// start with them is given whole.
+fn notes_asked(prompt: &str) -> &str {
+    prompt
+        .strip_prefix(notes::INTRO)
+        .map(|rest| rest.strip_prefix(notes::TEAM_MEMORY).unwrap_or(rest))
+        .and_then(|rest| rest.strip_prefix(report::ASK))
+        .unwrap_or(prompt)
+}
+
 /// The files `diffs` edit, each once, in the order first edited.
 fn edited_files(diffs: &[Diff]) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
@@ -3251,15 +3409,24 @@ fn begin(agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt, root: &Path)
 
 /// The MCP servers `memory` gives `run`'s agent. A notice that it gives none goes on `run` at
 /// once, so a run that then fails to start says it too: the notice is given once
-/// ([`Memory::for_run`]).
+/// ([`Memory::for_run`]), unless the run has one already ([`first_memory_notice`]).
 fn mcp_servers(run: &Run, memory: RunMemory) -> Vec<McpServer> {
     match memory {
         RunMemory::Server(server) => vec![server],
         RunMemory::None { notice } => {
-            run.state().memory_notice = notice;
+            if let Some(notice) = notice {
+                first_memory_notice(run, notice);
+            }
             Vec::new()
         }
     }
+}
+
+/// Gives `run` the memory notice `notice` unless it has one: the first stays. A review's
+/// recall that failed comes before the start finds no server or the agent refuses it, and says
+/// why the review has no memories.
+fn first_memory_notice(run: &Run, notice: String) {
+    run.state().memory_notice.get_or_insert(notice);
 }
 
 /// The prompt as ACP content: the text, then a link to each file with notes. Every agent
@@ -3326,6 +3493,13 @@ mod tests {
                 reply: "secret reply".to_owned(),
                 diffs: Vec::new(),
                 report: None,
+                memories: review::MemoryBlock::new(vec![review::MemoryNote {
+                    id: "mem_01A".to_owned(),
+                    kind: "gotcha".to_owned(),
+                    author: "5CrAuthor".to_owned(),
+                    summary: "secret summary".to_owned(),
+                    body: "secret body".to_owned(),
+                }]),
             },
             notes: vec!["N1".to_owned()],
             files: Vec::new(),
@@ -3336,6 +3510,7 @@ mod tests {
                 line: None,
                 text: "secret finding".to_owned(),
                 fix: Some("secret fix".to_owned()),
+                memory: Some("mem_01A".to_owned()),
             }],
             memory: TeamMemory::Off,
         };
