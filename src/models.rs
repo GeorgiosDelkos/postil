@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::acp::{Agent, Launch, ModelOption, Stopper};
+use crate::acp::{Agent, Launch, ModelOption, Opened, Stopper};
 use crate::agents::Scanner;
 use crate::error::error_chain;
 
@@ -303,6 +303,7 @@ fn probe_models(command: &str, search_path: &OsStr, started: &dyn Fn(Stopper)) -
         command,
         cwd: &cwd,
         search_path,
+        mcp_servers: &[],
         timeout: PROBE_TIMEOUT,
     };
     // The session's events (an agent may announce its commands) are not needed.
@@ -312,7 +313,7 @@ fn probe_models(command: &str, search_path: &OsStr, started: &dyn Fn(Stopper)) -
     };
     started(starting.stopper());
     match starting.open_session(None) {
-        Ok(agent) => ModelReport::Ready {
+        Ok(Opened { agent, .. }) => ModelReport::Ready {
             current: agent.model().map(str::to_owned),
             options: agent.offered_models().to_vec(),
         },

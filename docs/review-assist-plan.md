@@ -63,7 +63,7 @@ step named.
 | S4 | `@dagrejs/dagre` at a release at least two weeks old: is there one browser file with a global, its size, and the layout time for 200 nodes in WKWebView? | 8.3 | Over 50 ms or no browser build: a layered layout of our own, limited to 60 nodes. |
 | S5 | `cargo deny check` with `tree-sitter-tags`, `objc2-speech`, `objc2-avf-audio` added. | 7.7, 10.1 | A license outside `deny.toml`'s list: ask the owner before adding an exception. |
 | S6 | Speech: does `supportsOnDeviceRecognition` hold for the development Mac's languages, and what does a denied permission return? | 10.1 | No on-device model for a language: dictation reports it, as designed. |
-| S7 | ACP schema at the commit `src/acp/wire.rs` pins: the stdio form of `mcpServers`, and whether an agent may refuse it. | 9.3 | Refusal is possible: `session/new` is retried once with none, and the run says so. |
+| S7 | ACP schema at the commit `src/acp/wire.rs` pins: the stdio form of `mcpServers`, and whether an agent may refuse it. | 9.3 | Refusal is possible: `session/new` is retried once with none, and the run says so. Done: refusal is possible, so it is retried (design, "Open questions", 12). |
 
 ## Rules for every step
 

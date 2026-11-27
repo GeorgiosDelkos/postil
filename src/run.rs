@@ -81,12 +81,13 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::acp::{
-    Agent, ContentBlock, ElicitationReply, Event, Launch, PermissionKind, PermissionOption,
-    PermissionRequest, StopReason, Stopper, ToolKind, TurnEnd,
+    Agent, ContentBlock, ElicitationReply, Event, Launch, McpServer, Opened, PermissionKind,
+    PermissionOption, PermissionRequest, StopReason, Stopper, ToolKind, TurnEnd,
 };
 use crate::agents::{self, AgentChoice, Scanner};
 use crate::analysis::{self, AnalysisJob, Planned};
 use crate::error::{Error, Result, error_chain};
+use crate::memory::{Memory, RunMemory};
 use crate::notes::{self, NewNote, Prompt, Review};
 use crate::repo::Repo;
 use crate::report;
@@ -95,6 +96,7 @@ use crate::run::log::{
     Changes, Entry, FollowUp, Header, InThread, MAX_LIVE, Opening, Origin, Point, Run, RunView,
     held_threads, hold_thread_lock, read_header, remove_thread_lock, run_number, run_numbers,
 };
+use crate::settings::TeamMemory;
 use crate::thread::{self, Mode, State, Thread};
 use crate::usage::ledger::LedgerSink;
 
@@ -118,6 +120,8 @@ pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
 pub(crate) struct Runner {
     repo: Arc<Repo>,
     agents: Scanner,
+    /// Team memory, which a fresh agent gets when the run asks for it ([`Memory::for_run`]).
+    memory: Memory,
     notify: Notify,
     /// Postil's home folder, `~/.postil`, under which threads' worktrees live
     /// (`thread.rs`); `None` when the home folder is unknown, which refuses every send.
@@ -203,6 +207,8 @@ struct Chain {
     /// The files the reviewed run changed, linked in each reviewer's prompt.
     files: Vec<String>,
     findings: Vec<Finding>,
+    /// Whether each stage's agent gets team memory, as the settings said when the review began.
+    memory: TeamMemory,
 }
 
 impl fmt::Debug for Chain {
@@ -381,6 +387,10 @@ struct Pending {
     run: Arc<Run>,
     ids: Vec<String>,
     prompt: Prompt,
+    /// Whether the agent gets team memory. The prompt was built with the line about it when
+    /// hippius-mem was Ready as the run was sent ([`Runner::prompt_memory`]); the start gives
+    /// the line to an agent that got the server, and only to it.
+    memory: TeamMemory,
     generation: u64,
     /// The thread the agent works in.
     thread: Thread,
@@ -411,6 +421,8 @@ struct NewRun {
     agent: AgentChoice,
     origin: Origin,
     conversation: Conversation,
+    /// Whether a fresh agent gets team memory; a kept one has the session it had.
+    memory: TeamMemory,
     /// The review the run is a stage of, which becomes the one under way; `None` ends the
     /// review under way, if any.
     review: Option<Chain>,
@@ -490,9 +502,15 @@ enum Conversation {
 }
 
 impl Runner {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a separate part of the window the runner shares, from one caller \
+                  (`Site::open`); a struct to carry them would serve that call alone"
+    )]
     pub(crate) fn new(
         repo: Arc<Repo>,
         agents: Scanner,
+        memory: Memory,
         notify: Notify,
         home: Option<PathBuf>,
         usage_file: Option<PathBuf>,
@@ -513,6 +531,7 @@ impl Runner {
         Arc::new(Self {
             repo,
             agents,
+            memory,
             notify,
             home,
             usage_file,
@@ -530,13 +549,23 @@ impl Runner {
     }
 
     /// The prompt the notes `ids` make, as the agent will receive it: its text and the files
-    /// linked after it.
+    /// linked after it, with the line about team memory when `memory` is on and Ready.
     ///
     /// # Errors
     ///
     /// As [`notes::prompt`].
-    pub(crate) fn preview(&self, ids: &[String]) -> Result<Prompt> {
-        notes::prompt(&self.repo, ids)
+    pub(crate) fn preview(&self, ids: &[String], memory: TeamMemory) -> Result<Prompt> {
+        notes::prompt(&self.repo, ids, self.prompt_memory(memory))
+    }
+
+    /// Whether a prompt of notes has the line about team memory: when `memory` is on and
+    /// hippius-mem is Ready now. Never waits for a check ([`Memory::is_ready`]).
+    fn prompt_memory(&self, memory: TeamMemory) -> TeamMemory {
+        if memory == TeamMemory::On && self.memory.is_ready() {
+            TeamMemory::On
+        } else {
+            TeamMemory::Off
+        }
     }
 
     /// Starts a run: sends the notes `ids` to a fresh `agent`, in a new thread (docs/design.md,
@@ -554,7 +583,12 @@ impl Runner {
     /// live, and [`Error::RunElsewhere`] while another window holds `runs/active.lock`; as
     /// [`notes::prompt`]; [`Error::NoCommit`] in a repository with no commit; and the errors
     /// of [`thread::plan`] and [`thread::add`], which fail the run.
-    pub(crate) fn send(self: &Arc<Self>, agent: AgentChoice, ids: &[String]) -> Result<()> {
+    pub(crate) fn send(
+        self: &Arc<Self>,
+        agent: AgentChoice,
+        ids: &[String],
+        memory: TeamMemory,
+    ) -> Result<()> {
         let slots = self.slots();
         // A note is marked sent only once its agent takes the turn, so until then it reads as
         // open: a second send would put it in two threads at once.
@@ -563,11 +597,12 @@ impl Runner {
                 "{note} is in {run}, which is under way: wait for it, or stop it"
             )));
         }
-        let prompt = notes::prompt(&self.repo, ids)?;
+        let prompt = notes::prompt(&self.repo, ids, self.prompt_memory(memory))?;
         let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
         let title = notes::body(&self.repo, &ids[0])?;
         let new = NewRun {
             agent,
+            memory,
             origin: Origin::Notes,
             // A new thread works in a new worktree, which a kept agent's session is not in.
             conversation: Conversation::Fresh,
@@ -600,7 +635,12 @@ impl Runner {
     /// question; and as [`Runner::send`]: [`Error::TooManyRuns`], [`Error::RunElsewhere`], and
     /// the errors that fail the run. Only those after the note is saved leave it, with its
     /// failed run.
-    pub(crate) fn ask(self: &Arc<Self>, agent: AgentChoice, new: NewNote) -> Result<Review> {
+    pub(crate) fn ask(
+        self: &Arc<Self>,
+        agent: AgentChoice,
+        new: NewNote,
+        memory: TeamMemory,
+    ) -> Result<Review> {
         let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
         // Checked before the note is saved, where `thread::plan` and `thread::add` would fail
         // the run only after it.
@@ -610,6 +650,7 @@ impl Runner {
         let title = checked.body().to_owned();
         let new = NewRun {
             agent,
+            memory,
             origin: Origin::Notes,
             conversation: Conversation::Fresh,
             review: None,
@@ -647,6 +688,7 @@ impl Runner {
         self: &Arc<Self>,
         agent: AgentChoice,
         job: AnalysisJob,
+        memory: TeamMemory,
     ) -> Result<String> {
         // Checked here: a missing agent would fail only on the start thread, after the thread
         // is made.
@@ -668,6 +710,7 @@ impl Runner {
         }
         let new = NewRun {
             agent,
+            memory,
             origin: Origin::Analysis(run),
             conversation: Conversation::Fresh,
             review: None,
@@ -764,6 +807,7 @@ impl Runner {
         of: &str,
         agent: AgentChoice,
         text: &str,
+        memory: TeamMemory,
     ) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
@@ -854,6 +898,7 @@ impl Runner {
         };
         let new = NewRun {
             agent,
+            memory,
             origin: Origin::FollowUp(FollowUp {
                 of: of.to_owned(),
                 text: text.to_owned(),
@@ -930,7 +975,12 @@ impl Runner {
     /// [`Runner::view_of`] for the reviewed run; [`Error::WriteRun`] when the first stage's
     /// log cannot be created; and as [`Runner::open_thread`] for the thread, and
     /// [`Runner::launch`].
-    pub(crate) fn review(self: &Arc<Self>, of: &str, reviewers: Vec<AgentChoice>) -> Result<()> {
+    pub(crate) fn review(
+        self: &Arc<Self>,
+        of: &str,
+        reviewers: Vec<AgentChoice>,
+        memory: TeamMemory,
+    ) -> Result<()> {
         if reviewers.is_empty() {
             return Err(Error::BadRequest(
                 "no reviewers are set: add them in Settings".to_owned(),
@@ -970,6 +1020,7 @@ impl Runner {
             notes,
             files,
             findings: Vec::new(),
+            memory,
         };
         self.start_stage(self.slots(), chain)
     }
@@ -1024,6 +1075,7 @@ impl Runner {
         };
         let new = NewRun {
             agent: chain.reviewers[chain.stage.reviewer - 1].clone(),
+            memory: chain.memory,
             origin: Origin::Review(chain.stage.clone()),
             conversation: Conversation::Fresh,
             place: Place::Open(record),
@@ -1095,6 +1147,7 @@ impl Runner {
         }
         let NewRun {
             agent,
+            memory,
             origin,
             conversation,
             review,
@@ -1156,6 +1209,7 @@ impl Runner {
             let replaced = slot.release();
             let pending = Pending {
                 agent,
+                memory,
                 run: Arc::clone(&run),
                 ids: marks,
                 prompt,
@@ -1502,6 +1556,7 @@ impl Runner {
                 Some(follow_up) => follow_up.text.as_str(),
                 None => prompt
                     .strip_prefix(notes::INTRO)
+                    .map(|rest| rest.strip_prefix(notes::TEAM_MEMORY).unwrap_or(rest))
                     .and_then(|rest| rest.strip_prefix(report::ASK))
                     .unwrap_or(prompt),
             };
@@ -2094,6 +2149,11 @@ impl Runner {
     /// meanwhile (the run cancelled, the project closed). A new thread's worktree is made
     /// there first ([`thread::make`]), which takes as long as a checkout.
     ///
+    /// The agent's session gets team memory when the run asks for it and hippius-mem is Ready
+    /// ([`Memory::for_run`], which may wait for a check). Its prompt of notes has the line about
+    /// team memory exactly when the session got the server, whether or not it was built with
+    /// it ([`Prompt::for_memory`]); when it got none, the run's dialog says why, once.
+    ///
     /// # Errors
     ///
     /// The system's error when that thread cannot be spawned; the caller records it in the
@@ -2119,6 +2179,7 @@ impl Runner {
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.
             let search_path = runner.agents.wait();
+            let servers = mcp_servers(&pending.run, runner.memory.for_run(pending.memory));
             if runner.slots().let_go(&id, generation) {
                 return;
             }
@@ -2126,6 +2187,7 @@ impl Runner {
                 command: &pending.agent.command,
                 cwd: &pending.thread.path,
                 search_path: &search_path,
+                mcp_servers: &servers,
                 timeout: START_TIMEOUT,
             };
             // Weak: the runner owns the agent, whose reader thread owns this callback.
@@ -2170,9 +2232,24 @@ impl Runner {
                     slot.agent = Held::None;
                     failed(&error);
                 }
-                Ok(agent) => {
+                Ok(Opened {
+                    agent,
+                    servers_refused,
+                }) => {
+                    // The line goes with the server, whatever the state was when the prompt was
+                    // built: a check may have ended Ready meanwhile, or the agent refused it.
+                    let given = if !servers.is_empty() && servers_refused.is_none() {
+                        TeamMemory::On
+                    } else {
+                        TeamMemory::Off
+                    };
+                    if let Some(refused) = servers_refused {
+                        pending.run.state().memory_notice =
+                            Some(format!("team memory was not given: {refused}"));
+                    }
+                    let prompt = pending.prompt.for_memory(given);
                     let root = &pending.thread.path;
-                    begin(&agent, &pending.run, &pending.ids, &pending.prompt, root);
+                    begin(&agent, &pending.run, &pending.ids, &prompt, root);
                     slot.agent = Held::Ready(pending.agent, agent);
                 }
             }
@@ -2794,11 +2871,12 @@ fn fresh_follow_up(thread: &[Arc<Run>], text: &str, mode: Mode) -> String {
     });
     for run in thread {
         let state = run.state();
-        let asked = state
-            .header
-            .follow_up
-            .as_ref()
-            .map_or(state.header.prompt.as_str(), |follow_up| &follow_up.text);
+        // Without the line about team memory, an instruction to that agent, which this one
+        // may not have.
+        let asked = state.header.follow_up.as_ref().map_or_else(
+            || notes::without_team_memory(&state.header.prompt),
+            |follow_up| follow_up.text.clone(),
+        );
         write!(
             prompt,
             "\n{} was asked:\n\n{}\n\nIt answered:\n\n{}\n",
@@ -2957,6 +3035,19 @@ fn begin(agent: &Agent, run: &Run, ids: &[String], prompt: &Prompt, root: &Path)
     run.record(Entry::Started);
 }
 
+/// The MCP servers `memory` gives `run`'s agent. A notice that it gives none goes on `run` at
+/// once, so a run that then fails to start says it too: the notice is given once
+/// ([`Memory::for_run`]).
+fn mcp_servers(run: &Run, memory: RunMemory) -> Vec<McpServer> {
+    match memory {
+        RunMemory::Server(server) => vec![server],
+        RunMemory::None { notice } => {
+            run.state().memory_notice = notice;
+            Vec::new()
+        }
+    }
+}
+
 /// The prompt as ACP content: the text, then a link to each file with notes. Every agent
 /// accepts both block types, so no capability check is needed.
 fn prompt_blocks(prompt: &Prompt, root: &Path) -> Vec<ContentBlock> {
@@ -3032,6 +3123,7 @@ mod tests {
                 text: "secret finding".to_owned(),
                 fix: Some("secret fix".to_owned()),
             }],
+            memory: TeamMemory::Off,
         };
         let shown = format!("{chain:?}");
         assert!(

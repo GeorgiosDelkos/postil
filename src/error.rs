@@ -4,6 +4,8 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::acp::AUTH_REQUIRED;
+
 /// A specialized `Result` for this crate.
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
@@ -558,7 +560,7 @@ impl fmt::Display for Error {
             // (docs/design.md, "Agents").
             Self::AgentRefused {
                 step,
-                code: -32000,
+                code: AUTH_REQUIRED,
                 message,
             } => write!(
                 f,

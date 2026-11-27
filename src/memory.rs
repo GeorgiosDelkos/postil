@@ -17,6 +17,25 @@
 //! which share its origin), and in the temporary directory otherwise. Opening another project
 //! checks again ([`Memory::open_project`]).
 //!
+//! # Configuration
+//!
+//! Every hippius-mem Postil starts, and the one each agent starts ([`Memory::for_run`]), reads
+//! the engineer's own configuration file: `HIPPIUS_MEM_CONFIG` names it, set to the one in
+//! Postil's own environment when there is one, else to the global file hippius-mem's
+//! `quickstart` writes ([`user_config`]). Without it, hippius-mem reads a `hippius-mem.toml`
+//! in its working directory first (`Config::from_env_and_file` in `hippius-mem/src/config.rs`
+//! at db9261b), and that directory is the project's root or a worktree of it: a reviewed
+//! repository could ship one that sends the engineer's notes and prompts to an endpoint it
+//! names, and answers recalls with notes of its choosing. With it set, that file is never read
+//! (decided 2026-11-27, docs/review-assist.md, "Open questions", 6). The working directory
+//! still picks the profile by its git origin.
+//!
+//! # Agents
+//!
+//! A run whose switch is on gives its agent hippius-mem's MCP server while the state is
+//! Ready, and starts without it otherwise; its dialog says so the first time in a spell of
+//! not being Ready, which a Ready check or another project ends ([`Memory::for_run`]).
+//!
 //! Both run on threads of their own: the thread that answers the page serves one request at
 //! a time, and a `doctor` that hangs, or a first `quickstart` that downloads its model, would
 //! freeze every view. The page asks again every 250 ms while a job runs
@@ -67,7 +86,7 @@
 mod client;
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hash;
 use std::io::{self, Read};
@@ -79,11 +98,13 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::acp::{EnvVariable, McpServer};
 use crate::agents::{self, Scanner};
 use crate::error::{Error, Result};
 use crate::memory::client::{CallError, Server, StartError};
 pub(crate) use crate::memory::client::{Detail, Recall, Refreshed};
 use crate::repo::Repo;
+use crate::settings::TeamMemory;
 
 /// The program's name on the search path.
 pub(crate) const PROGRAM: &str = "hippius-mem";
@@ -187,6 +208,9 @@ pub(crate) struct Status {
 pub(crate) struct Memory {
     /// Where the program is looked for; a job waits for its scan.
     agents: Scanner,
+    /// The configuration file every hippius-mem started reads (module docs, "Configuration"),
+    /// absolute and UTF-8; else why there is none, and no hippius-mem runs.
+    config: std::result::Result<PathBuf, String>,
     shared: Arc<Shared>,
     /// How long `doctor` may take: always [`DOCTOR_TIMEOUT`] outside tests.
     doctor_timeout: Duration,
@@ -224,6 +248,9 @@ struct Inner {
     project: Option<Project>,
     /// The memory server's tasks and answers (module docs, "The memory server").
     calls: Calls,
+    /// Whether a run was told it started without team memory since the state was last found
+    /// Ready, or the project changed (module docs, "Agents").
+    told_not_given: bool,
     /// How many jobs have ended, stored or dropped, so a test can wait for a dropped one.
     #[cfg(test)]
     finished: u64,
@@ -241,6 +268,7 @@ impl Memory {
     pub(crate) fn new(agents: Scanner) -> Self {
         Self {
             agents,
+            config: user_config(),
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner::default()),
                 changed: Condvar::new(),
@@ -321,6 +349,7 @@ impl Memory {
         let mut inner = self.lock();
         inner.project = Some(project);
         inner.calls.switch();
+        inner.told_not_given = false;
         self.shared.work.notify_all();
         if inner.job == 0 || inner.setup == Some(Setup::Running) {
             return;
@@ -385,6 +414,9 @@ impl Memory {
             inner.setup = Some(setup);
         }
         if inner.job == number {
+            if matches!(state, State::Ready { .. }) {
+                inner.told_not_given = false;
+            }
             inner.state = Some(state);
             // The state the engineer sees is new, so the memory server's is too: what it found
             // unusable is asked again, and a start or call begun before this check can neither
@@ -403,7 +435,15 @@ impl Memory {
 
     /// The state `doctor` reports for the program at `path`.
     fn doctor(&self, path: PathBuf, at: &Place<'_>) -> State {
-        let command = self.command(&path, at, &["doctor"]);
+        let command = match self.command(&path, at, &["doctor"]) {
+            Ok(command) => command,
+            Err(problem) => {
+                return State::Unconfigured {
+                    path,
+                    problem: Some(problem),
+                };
+            }
+        };
         let problem = match run(command, self.doctor_timeout) {
             Outcome::Exited { code: Some(0), .. } => return State::Ready { path },
             // It exits 1 for every error, so only its message says why (module docs).
@@ -428,7 +468,12 @@ impl Memory {
 
     /// Runs `quickstart --no-wire` with the program at `path`.
     fn quickstart(&self, path: &Path, at: &Place<'_>) -> Setup {
-        let command = self.command(path, at, &["quickstart", "--no-wire"]);
+        // It writes the file `HIPPIUS_MEM_CONFIG` names (`resolve_target_path` in
+        // `hippius-mem/src/join_bundle.rs` at db9261b), the one every later run reads.
+        let command = match self.command(path, at, &["quickstart", "--no-wire"]) {
+            Ok(command) => command,
+            Err(error) => return Setup::Failed { error },
+        };
         match run(command, SETUP_TIMEOUT) {
             Outcome::Exited {
                 code: Some(0),
@@ -452,20 +497,18 @@ impl Memory {
     }
 
     /// The program at `path` with `args`, on the search path, in the job's directory (module
-    /// docs), without colours. hippius-mem reads a `hippius-mem.toml` in that directory before
-    /// the global configuration, and picks its profile by the directory's git origin, so the
-    /// open project's own file and origin decide what doctor checks, as they will for the
-    /// agents' server (docs/review-assist.md, open question 6). Never Postil's own working
-    /// directory, which is `/` from the Finder and any folder from a terminal: it is no
-    /// project's.
-    #[cfg_attr(
-        not(test),
-        expect(
-            clippy::unused_self,
-            reason = "tests run the program in a home of their own"
-        )
-    )]
-    fn command(&self, path: &Path, at: &Place<'_>, args: &[&str]) -> Command {
+    /// docs), without colours, reading the engineer's configuration file (module docs,
+    /// "Configuration"); why there is none to read, when there is none. hippius-mem picks its
+    /// profile by the directory's git origin, so the open project's origin decides what doctor
+    /// checks, as it does for the agents' server. Never Postil's own working directory, which
+    /// is `/` from the Finder and any folder from a terminal: it is no project's.
+    fn command(
+        &self,
+        path: &Path,
+        at: &Place<'_>,
+        args: &[&str],
+    ) -> std::result::Result<Command, String> {
+        let config = self.config.as_ref().map_err(Clone::clone)?;
         let mut command = Command::new(path);
         command
             .args(args)
@@ -476,7 +519,9 @@ impl Memory {
         if let Some(isolation) = &self.isolation {
             isolation.apply(&mut command);
         }
-        command
+        // After the isolation, which removes every `HIPPIUS_MEM_*` variable.
+        command.env("HIPPIUS_MEM_CONFIG", config);
+        Ok(command)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -495,6 +540,92 @@ impl fmt::Debug for Memory {
         f.debug_struct("Memory")
             .field("inner", &*self.lock())
             .finish_non_exhaustive()
+    }
+}
+
+/// What a run's agent gets of team memory ([`Memory::for_run`]).
+#[derive(Debug)]
+pub(crate) enum RunMemory {
+    /// hippius-mem's MCP server, for the session to start.
+    Server(McpServer),
+    /// Nothing: the switch is off, or hippius-mem is not Ready. `notice` says so, for the run's
+    /// dialog, the first time in a spell of not being Ready (module docs, "Agents").
+    None { notice: Option<String> },
+}
+
+/// The agents' side of [`Memory`] (module docs, "Agents").
+impl Memory {
+    /// Whether the state is Ready now, as [`Memory::status`] reads it. Never waits for a
+    /// check; starts the first one when none ran.
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self.status().state, Some(State::Ready { .. }))
+    }
+
+    /// What a run's agent gets of team memory when `wanted` is on: hippius-mem's server while
+    /// the state is Ready, else nothing, and the first time, a notice that says why. Waits for
+    /// a check under way, and starts the first one when none ran, so a run that starts right
+    /// after launch is not given less: called on a run's start thread, which holds no lock and
+    /// waits for the agent scan already. A check's doctor is stopped at [`DOCTOR_TIMEOUT`].
+    pub(crate) fn for_run(&self, wanted: TeamMemory) -> RunMemory {
+        if wanted == TeamMemory::Off {
+            return RunMemory::None { notice: None };
+        }
+        let path = match self.checked_state() {
+            Some(State::Ready { path }) => path,
+            other => {
+                let why = not_ready(other.as_ref()).expect("a state that is not Ready says why");
+                return self.not_given(&why);
+            }
+        };
+        let config = match &self.config {
+            Ok(config) => config,
+            Err(why) => return self.not_given(why),
+        };
+        match stdio_server(&path, &self.agents.wait(), config) {
+            Some(server) => RunMemory::Server(server),
+            None => self.not_given(&format!(
+                "the path of {}, or the search path it gets as its PATH, is not UTF-8, which ACP \
+                 cannot carry",
+                path.display()
+            )),
+        }
+    }
+
+    /// [`Memory::status`]'s state, once a check under way found one: waited for up to the
+    /// doctor's limit, and not at all while a set up runs, whose `quickstart` may take minutes
+    /// ([`SETUP_TIMEOUT`]) and drops the check's result. `None` when it is still unknown.
+    fn checked_state(&self) -> Option<State> {
+        let status = self.status();
+        if status.state.is_some() {
+            return status.state;
+        }
+        let deadline = Instant::now() + self.doctor_timeout;
+        let mut inner = self.lock();
+        // A first check that could not start leaves the job number at 0: nothing would end the
+        // wait, and the state stays unknown.
+        while inner.state.is_none() && inner.job != 0 && inner.setup != Some(Setup::Running) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            inner = self
+                .shared
+                .changed
+                .wait_timeout(inner, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(inner);
+        // Read again: a program removed while doctor ran is Missing now.
+        self.status().state
+    }
+
+    /// Nothing for the run, with `why` as its notice unless a run was told already.
+    fn not_given(&self, why: &str) -> RunMemory {
+        let told = std::mem::replace(&mut self.lock().told_not_given, true);
+        RunMemory::None {
+            notice: (!told).then(|| format!("team memory was not given: {why}")),
+        }
     }
 }
 
@@ -763,7 +894,14 @@ impl Memory {
             search_path: &search_path,
             dir: &next.project.root,
         };
-        let server = match Server::spawn(self.command(&path, &at, &[])) {
+        let command = match self.command(&path, &at, &[]) {
+            Ok(command) => command,
+            Err(why) => {
+                self.unusable(next, Health::Unconfigured(why));
+                return Err(Failure::Done(Done::Unusable));
+            }
+        };
+        let server = match Server::spawn(command) {
             Ok(server) => server,
             // Removed between the search and the start.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -827,7 +965,7 @@ impl Memory {
     /// The version `hippius-mem --version` prints, without the program's name; `None` when it
     /// prints none.
     fn version(&self, path: &Path, at: &Place<'_>) -> Option<String> {
-        let command = self.command(path, at, &["--version"]);
+        let command = self.command(path, at, &["--version"]).ok()?;
         let Outcome::Exited {
             code: Some(0),
             stdout,
@@ -1240,6 +1378,99 @@ fn find(search_path: &OsStr) -> Option<PathBuf> {
     agents::find_program(PROGRAM, search_path)
 }
 
+/// The engineer's configuration file (module docs, "Configuration"), from Postil's environment
+/// and working directory at launch ([`user_config_from`]).
+fn user_config() -> std::result::Result<PathBuf, String> {
+    user_config_from(
+        std::env::var_os("HIPPIUS_MEM_CONFIG"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// The engineer's configuration file from the values of `HIPPIUS_MEM_CONFIG`,
+/// `XDG_CONFIG_HOME` and `HOME`, and Postil's working directory `cwd`: `HIPPIUS_MEM_CONFIG`
+/// when it names one, else the global file hippius-mem's `quickstart` writes,
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`, as hippius-mem resolves
+/// both (`resolve_target_path` in `hippius-mem/src/join_bundle.rs`, `global_config_path` in
+/// `hippius-mem/src/setup/mcp.rs`, at db9261b); else why there is none.
+///
+/// Always an absolute path: hippius-mem runs in the project's root or a run's worktree, where
+/// a relative one would name a file of the reviewed repository. A relative
+/// `HIPPIUS_MEM_CONFIG` is taken from `cwd`, where the engineer set it; a relative
+/// `XDG_CONFIG_HOME` or `HOME` is passed over, as the XDG specification says of the first and
+/// `files::config_dir` does. A path that is not UTF-8 is refused: hippius-mem reads the
+/// variable as UTF-8, and when it cannot, reads the working directory's `hippius-mem.toml`
+/// (`from_env_and_file_with_default` in `hippius-mem/src/config.rs`).
+fn user_config_from(
+    config: Option<OsString>,
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+    cwd: Option<&Path>,
+) -> std::result::Result<PathBuf, String> {
+    let set = |value: Option<OsString>| {
+        value
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+    };
+    let path = match set(config) {
+        Some(config) if config.is_absolute() => config,
+        Some(config) => cwd.map(|cwd| cwd.join(&config)).ok_or_else(|| {
+            format!(
+                "HIPPIUS_MEM_CONFIG is the relative path {}, and Postil's working directory is \
+                 unknown: set it to an absolute path",
+                config.display()
+            )
+        })?,
+        None => set(xdg_config_home)
+            .filter(|xdg| xdg.is_absolute())
+            .or_else(|| {
+                set(home)
+                    .filter(|home| home.is_absolute())
+                    .map(|home| home.join(".config"))
+            })
+            .ok_or_else(|| {
+                "cannot tell where hippius-mem's configuration is: set HOME, or \
+                 HIPPIUS_MEM_CONFIG, to an absolute path in the environment Postil starts in"
+                    .to_owned()
+            })?
+            .join("hippius-mem/hippius-mem.toml"),
+    };
+    if path.to_str().is_none() {
+        return Err(format!(
+            "hippius-mem's configuration file {} is not UTF-8, which hippius-mem cannot read: \
+             name another with HIPPIUS_MEM_CONFIG",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// hippius-mem at `path` as an agent starts it (`session/new`, spike S7): with no argument, the
+/// search path as its `PATH`, no colours, and the configuration file `config` (module docs,
+/// "Configuration"). The agent starts it in the session's working directory, the run's
+/// worktree, whose git origin is the project's: it picks the profile doctor checked. `None`
+/// when a path is not UTF-8, which ACP's strings cannot carry.
+fn stdio_server(path: &Path, search_path: &OsStr, config: &Path) -> Option<McpServer> {
+    let variable = |name: &str, value: &OsStr| {
+        Some(EnvVariable {
+            name: name.to_owned(),
+            value: value.to_str()?.to_owned(),
+        })
+    };
+    Some(McpServer {
+        name: PROGRAM.to_owned(),
+        command: path.to_str()?.to_owned(),
+        args: Vec::new(),
+        env: vec![
+            variable("PATH", search_path)?,
+            variable("NO_COLOR", OsStr::new("1"))?,
+            variable("HIPPIUS_MEM_CONFIG", config.as_os_str())?,
+        ],
+    })
+}
+
 /// How a run of the program ended.
 #[derive(Debug)]
 enum Outcome {
@@ -1400,7 +1631,10 @@ impl Memory {
             dir,
         };
         let deadline = Instant::now() + self.call_timeout;
-        let mut server = Server::spawn(self.command(&path, &at, &[])).expect("the server starts");
+        let command = self
+            .command(&path, &at, &[])
+            .expect("a test's home names the configuration file");
+        let mut server = Server::spawn(command).expect("the server starts");
         server
             .handshake(deadline)
             .expect("the server answers its handshake");
@@ -1428,6 +1662,7 @@ impl Memory {
             home: home.to_owned(),
             model_cache: model_cache.map(Path::to_owned),
         });
+        self.config = Ok(home.join(".config/hippius-mem/hippius-mem.toml"));
         self
     }
 
@@ -1458,5 +1693,86 @@ impl Memory {
                 .wait(inner)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::*;
+
+    const FILE: &str = "hippius-mem/hippius-mem.toml";
+
+    #[test]
+    fn the_engineer_s_own_value_wins_then_xdg_then_home() {
+        let cwd = Some(Path::new("/launch"));
+        let config = user_config_from(
+            Some(OsString::from("/mine.toml")),
+            Some(OsString::from("/xdg")),
+            Some(OsString::from("/home")),
+            cwd,
+        );
+        assert_eq!(config, Ok(PathBuf::from("/mine.toml")));
+        let config = user_config_from(
+            None,
+            Some(OsString::from("/xdg")),
+            Some(OsString::from("/home")),
+            cwd,
+        );
+        assert_eq!(config, Ok(Path::new("/xdg").join(FILE)));
+        // Blank counts as unset, as hippius-mem reads it.
+        let config = user_config_from(
+            Some(OsString::from(" ")),
+            Some(OsString::from("")),
+            Some(OsString::from("/home")),
+            cwd,
+        );
+        assert_eq!(config, Ok(Path::new("/home/.config").join(FILE)));
+    }
+
+    #[test]
+    fn a_relative_value_never_names_a_file_in_the_repository() {
+        let cwd = Some(Path::new("/launch"));
+        let config = user_config_from(
+            Some(OsString::from("mine.toml")),
+            None,
+            Some(OsString::from("/home")),
+            cwd,
+        );
+        assert_eq!(config, Ok(PathBuf::from("/launch/mine.toml")));
+        let config = user_config_from(
+            None,
+            Some(OsString::from("xdg")),
+            Some(OsString::from("/home")),
+            cwd,
+        );
+        assert_eq!(config, Ok(Path::new("/home/.config").join(FILE)));
+        let error = user_config_from(
+            Some(OsString::from("mine.toml")),
+            None,
+            Some(OsString::from("/home")),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("set it to an absolute path"), "{error}");
+        let error = user_config_from(
+            None,
+            Some(OsString::from("xdg")),
+            Some(OsString::from("home")),
+            cwd,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot tell where"), "{error}");
+    }
+
+    #[test]
+    fn no_home_and_a_path_that_is_not_utf_8_are_refused() {
+        let cwd = Some(Path::new("/launch"));
+        let error = user_config_from(None, None, None, cwd).unwrap_err();
+        assert!(error.contains("set HOME"), "{error}");
+        let latin1 = Some(OsString::from_vec(b"/caf\xe9.toml".to_vec()));
+        let error = user_config_from(latin1, None, Some(OsString::from("/home")), cwd).unwrap_err();
+        assert!(error.contains("is not UTF-8"), "{error}");
     }
 }

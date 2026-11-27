@@ -79,6 +79,13 @@ pub(crate) enum Theme {
     Dark,
 }
 
+/// Whether agents get team memory: the `agentMemory` switch, as runs take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamMemory {
+    Off,
+    On,
+}
+
 /// The settings in effect, each rule in the module docs kept: made only from a
 /// [`RawSettings`] that passes them, so settings that break one never reach the file, the
 /// page, or a run. Serialized as the [`RawSettings`] it holds.
@@ -141,8 +148,12 @@ impl Settings {
         self.0.reopen_last_project
     }
 
-    pub(crate) fn agent_memory(&self) -> bool {
-        self.0.agent_memory
+    pub(crate) fn team_memory(&self) -> TeamMemory {
+        if self.0.agent_memory {
+            TeamMemory::On
+        } else {
+            TeamMemory::Off
+        }
     }
 
     pub(crate) fn custom_agents(&self) -> &[CustomAgent] {

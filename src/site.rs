@@ -30,7 +30,7 @@ use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
 use crate::run::{Ending, Notify, Runner};
-use crate::settings::{self, CustomAgent, RawSettings, Settings};
+use crate::settings::{self, CustomAgent, RawSettings, Settings, TeamMemory};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
     now_secs,
@@ -720,13 +720,19 @@ impl Site {
         }
     }
 
-    /// Replaces the memory; it runs in the open project, when one is open.
+    /// Replaces the memory; it runs in the open project, when one is open, which is opened
+    /// again so that its runner hands this memory to its runs.
     #[cfg(test)]
     pub(crate) fn with_memory(mut self, memory: Memory) -> Self {
-        if let Ok(repo) = self.repo() {
-            memory.open_project(&repo);
-        }
         self.memory = memory;
+        let open = self.project.borrow_mut().take();
+        if let Some(open) = open {
+            let repo = Repo::open(open.repo.root()).expect("the open project opens again");
+            open.definitions.close();
+            open.runner.close();
+            self.open(repo, LiveRun::Stop)
+                .expect("no project is open, so none refuses");
+        }
         self
     }
 
@@ -780,10 +786,17 @@ impl Site {
             return Ok(());
         }
         self.memory.open_project(&repo);
+        // A run gives its agent team memory only once a check found hippius-mem Ready, and the
+        // first check would otherwise wait for the first send or the settings dialog: the send
+        // step's preview would leave out the line about it that the send then has.
+        if self.current_settings().team_memory() == TeamMemory::On {
+            drop(self.memory.status());
+        }
         let repo = Arc::new(repo);
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
+            self.memory.clone(),
             Arc::clone(&self.notify),
             self.home.clone(),
             self.usage_file.clone(),
@@ -1033,8 +1046,9 @@ impl Site {
     }
 
     fn analyze(&self, job: AnalysisJob) -> Result<Vec<u8>> {
-        let agent = self.current_settings().analyzer()?;
-        let run = self.runner()?.analyze(agent, job)?;
+        let settings = self.current_settings();
+        let agent = settings.analyzer()?;
+        let run = self.runner()?.analyze(agent, job, settings.team_memory())?;
         Ok(to_json(&serde_json::json!({ "run": run })))
     }
 
@@ -1414,7 +1428,8 @@ impl Site {
             Some(name) => settings.chosen_agent(name)?,
             None => settings.default_agent()?,
         };
-        self.runner()?.send(agent, &request.notes)?;
+        self.runner()?
+            .send(agent, &request.notes, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1423,8 +1438,11 @@ impl Site {
     /// ask last (`Runner::ask`). The page fetches the run, as after a send.
     fn ask(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: AskRun = parse_body(body, Error::InvalidNote)?;
-        let agent = self.current_settings().default_agent()?;
-        let review = self.runner()?.ask(agent, request.note)?;
+        let settings = self.current_settings();
+        let agent = settings.default_agent()?;
+        let review = self
+            .runner()?
+            .ask(agent, request.note, settings.team_memory())?;
         Ok(to_json(&review))
     }
 
@@ -1441,7 +1459,8 @@ impl Site {
     /// The reply to `GET /api/run/preview?notes=N1,N2`.
     fn preview_run(&self, ids: &str) -> Result<Vec<u8>> {
         let ids: Vec<String> = ids.split(',').map(str::to_owned).collect();
-        let prompt = self.runner()?.preview(&ids)?;
+        let memory = self.current_settings().team_memory();
+        let prompt = self.runner()?.preview(&ids, memory)?;
         let uncommitted = self.uncommitted_among(&prompt.files)?;
         Ok(to_json(&PreviewView {
             prompt: prompt.text,
@@ -1499,7 +1518,8 @@ impl Site {
         // Loaded once, so every reviewer is checked against the same revision of the file.
         let settings = self.current_settings();
         let reviewers = settings.reviewer_choices()?;
-        self.runner()?.review(&review.of, reviewers)?;
+        self.runner()?
+            .review(&review.of, reviewers, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1509,10 +1529,9 @@ impl Site {
     fn follow_up(&self, body: &[u8]) -> Result<Vec<u8>> {
         let follow: FollowRun = parse_body(body, Error::BadRequest)?;
         let runner = self.runner()?;
-        let agent = self
-            .current_settings()
-            .chosen_agent(&runner.agent_of(&follow.of)?)?;
-        runner.follow_up(&follow.of, agent, &follow.text)?;
+        let settings = self.current_settings();
+        let agent = settings.chosen_agent(&runner.agent_of(&follow.of)?)?;
+        runner.follow_up(&follow.of, agent, &follow.text, settings.team_memory())?;
         Ok(b"{}".to_vec())
     }
 
@@ -1603,7 +1622,9 @@ impl Site {
         // Only turning it on is refused, so a hippius-mem removed later does not block every
         // other change. The state is the latest check's, never waited for: a check can take
         // seconds, and the dialog offers the switch only once it is ready.
-        if settings.agent_memory() && !self.current_settings().agent_memory() {
+        if settings.team_memory() == TeamMemory::On
+            && self.current_settings().team_memory() == TeamMemory::Off
+        {
             let state = self.memory.status().state;
             if let Some(problem) = memory::not_ready(state.as_ref()) {
                 return Err(Error::MemoryNotReady(problem));

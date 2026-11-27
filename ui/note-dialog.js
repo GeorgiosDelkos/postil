@@ -234,6 +234,7 @@ export function noteDialog(
     const actions = el("span", "note-dialog-actions");
     actions.append(open, make);
     label.append(actions);
+    if (run.memoryNotice) answer.append(el("div", "run-notice", run.memoryNotice));
     if (run.problem) answer.append(el("div", "run-notice", run.problem));
     const text = replyText(run);
     if (text) {

@@ -331,7 +331,7 @@ since 2026-07-20 and changes how a turn ends; the app does not negotiate it.
 | Direction | Method | Used for |
 |---|---|---|
 | app to agent | `initialize` | Version and capabilities. The app advertises `fs` and `terminal` as false, and form questions (`elicitation.form`). |
-| app to agent | `session/new` | `cwd` is the repository root, `mcpServers` is empty. The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
+| app to agent | `session/new` | `cwd` is the run's worktree. `mcpServers` holds hippius-mem in the stdio form when team memory is on and Ready, else it is empty; an agent that refuses the server is asked once more with none (docs/review-assist.md, "Agents get it"). The reply's model id (`models.currentModelId`, or Grok's `_meta`) is kept for the usage ledger. |
 | app to agent | `session/prompt` | The notes. The response's `stopReason` ends the turn; its `usage` token counts, when sent, go to the usage ledger. |
 | app to agent | `session/cancel` | `Esc`. Every pending permission request is answered `cancelled`, every open question `cancel`. |
 | agent to app | `session/update` | `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, and `usage_update` (context fill and the session's cumulative cost, for the usage ledger, never shown in the run panel). Other kinds, and kinds or enum values newer than the pinned schema, are ignored or read as "other". |

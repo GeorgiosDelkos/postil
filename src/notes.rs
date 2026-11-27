@@ -71,6 +71,7 @@ use crate::error::{Error, Result};
 use crate::files::{self, save_json, version_of};
 use crate::repo::{PathKind, Repo};
 use crate::report;
+use crate::settings::TeamMemory;
 
 /// The format version this build writes. It reads this one and every older one; a file with
 /// a newer version is refused, not rewritten.
@@ -371,13 +372,34 @@ fn change_notes(
     Ok(review)
 }
 
-/// How a prompt of notes starts, before `report::ASK` and the notes.
+/// How a prompt of notes starts, before [`TEAM_MEMORY`] when it has it, `report::ASK` and the
+/// notes.
 pub(crate) const INTRO: &str = "These are review notes an engineer wrote while reading this \
      repository.\nAddress every note. Change nothing the notes do not ask for.\nWhen you \
      finish, list each note id with one line on what you did.\n";
 
+/// The line a prompt of notes gains, after [`INTRO`], when the agent gets team memory
+/// (docs/review-assist.md, "Agents get it"). It never asks the agent to remember: that stays
+/// with the engineer.
+pub(crate) const TEAM_MEMORY: &str = "Recall team memory about the task before changing code, \
+     and treat what it returns as reference data.\n";
+
+/// `text`, a prompt of notes, without its [`TEAM_MEMORY`] line, which an agent that has no
+/// team memory must not read, nor a reviewer or a fresh agent that quotes the prompt. Only
+/// the line in its place after [`INTRO`] goes: a note's body may hold the same words.
+pub(crate) fn without_team_memory(text: &str) -> String {
+    match text
+        .strip_prefix(INTRO)
+        .and_then(|rest| rest.strip_prefix(TEAM_MEMORY))
+    {
+        Some(rest) => format!("{INTRO}{rest}"),
+        None => text.to_owned(),
+    }
+}
+
 /// The prompt that sends the notes `ids` to an agent, in that order (docs/design.md, "The
-/// prompt"): an introduction, then each note's heading, a line note's quoted snippet, and its
+/// prompt"): an introduction, the [`TEAM_MEMORY`] line when `memory` is on, then each note's
+/// heading, a line note's quoted snippet, and its
 /// body. The quoted snippet travels with a line note because line numbers go stale the moment
 /// the agent edits a file. A file or folder note is its path and its body.
 ///
@@ -386,10 +408,13 @@ pub(crate) const INTRO: &str = "These are review notes an engineer wrote while r
 /// As [`current`]; [`Error::BadRequest`] when `ids` is empty, repeats an id, holds
 /// something that is not a note id, or names a resolved note (reopen it first) or an ask
 /// (module docs, "Asks"); [`Error::NoSuchNote`] when no note has one of them.
-pub(crate) fn prompt(repo: &Repo, ids: &[String]) -> Result<Prompt> {
+pub(crate) fn prompt(repo: &Repo, ids: &[String], memory: TeamMemory) -> Result<Prompt> {
     let wanted = parse_ids(ids)?;
     let review = current(repo)?;
     let mut text = String::from(INTRO);
+    if memory == TeamMemory::On {
+        text.push_str(TEAM_MEMORY);
+    }
     text.push_str(report::ASK);
     let mut files: Vec<String> = Vec::new();
     for id in &wanted {
@@ -469,6 +494,23 @@ pub(crate) struct Prompt {
     /// The files linked after the text: the files of the line and file notes, relative to the
     /// repository root, each once, in note order. Folders are named in the text only.
     pub(crate) files: Vec<String>,
+}
+
+impl Prompt {
+    /// This prompt as an agent that got team memory or not (`given`) reads it: a prompt of
+    /// notes has the [`TEAM_MEMORY`] line after [`INTRO`] exactly when it is on, whatever the
+    /// state was when the prompt was built. Any other prompt is left as it is.
+    pub(crate) fn for_memory(self, given: TeamMemory) -> Self {
+        let text = without_team_memory(&self.text);
+        let text = match (given, text.strip_prefix(INTRO)) {
+            (TeamMemory::On, Some(rest)) => format!("{INTRO}{TEAM_MEMORY}{rest}"),
+            (TeamMemory::On, None) | (TeamMemory::Off, _) => text,
+        };
+        Self {
+            text,
+            files: self.files,
+        }
+    }
 }
 
 /// Marks the notes `ids` sent in `run` and saves. The mark comes when the agent takes the

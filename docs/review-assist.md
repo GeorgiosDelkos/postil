@@ -545,10 +545,34 @@ output. The switch turns on only while the latest check reads Ready.
 
 ### Agents get it
 
-- `session/new` carries `mcpServers` with one entry, hippius-mem by its absolute path.
-  `src/acp/wire.rs` types the field as an empty array today; it becomes a list of servers.
-- The prompt gains one line when the switch is on: recall team memory about the task before
-  changing code, and treat what it returns as reference data.
+Built (step 9.3): `src/memory.rs` ("Agents", `Memory::for_run`), `src/acp/connection.rs`
+(`new_session`), and `Runner::start` in `src/run.rs`. Every fresh agent gets it: a run of
+notes, an ask, an analysis, each reviewer, and a follow-up's fresh agent. A kept agent keeps
+the session it has.
+
+- `session/new` carries `mcpServers` with one entry, hippius-mem by its absolute path, in
+  ACP's stdio form (open question 12): no arguments, and `PATH`, `NO_COLOR` and
+  `HIPPIUS_MEM_CONFIG` in its environment. The agent starts it in the run's worktree, whose
+  git origin picks the profile doctor checked; `HIPPIUS_MEM_CONFIG` names the engineer's
+  configuration file, so a `hippius-mem.toml` in the repository is never read (open
+  question 6).
+- The prompt of notes gains one line when the switch is on and the state is Ready, right after
+  its introduction: recall team memory about the task before changing code, and treat what it
+  returns as reference data. The send step's preview shows it. A reviewer's quote of the
+  prompt, a fresh follow-up's and the run dialog's recall leave it out.
+- The switch is on and the state is not Ready, or hippius-mem was removed while Postil runs:
+  the run starts without memory and without the line, and its dialog says so, the first run
+  only until a check finds it Ready again or another project opens. A run that starts while a
+  check runs waits for it (10 s at most, and not at all while a set up runs), and opening a
+  project starts the first check.
+- The line goes with the server: the agent's prompt has it exactly when its session got
+  hippius-mem, whatever the state was when the run was sent. So in a race, a run sent while
+  a check runs or just before hippius-mem goes, the send step's preview and the prompt the run
+  records can differ from what the agent received, by that line.
+- An agent that answers `session/new` with an error when it names servers (not the sign-in
+  error) is asked once more with none, and the run goes on without the line; its dialog says
+  that the agent refused the server. An agent that drops the servers and answers without an
+  error cannot be told apart from one that took them: it then reads a line it cannot act on.
 - Remembering stays with the engineer (below). The prompt does not ask agents to remember.
 
 ### Postil shows memory
@@ -766,10 +790,20 @@ Postil writes outside itself.
    open project's root (a worktree of it shares its origin), in the temporary directory with
    no project open, and checks again when another project opens. With no project open, only
    a catch-all or trial profile reads Ready. hippius-mem also reads a `./hippius-mem.toml`
-   before the global configuration, so a project's own `hippius-mem.toml` wins for `doctor`,
-   and will for step 9.3's server, which runs in a worktree of the project. A reviewed
-   repository could ship one that names its own endpoint: step 9.3 must decide whether that
-   is acceptable.
+   before the global configuration when `HIPPIUS_MEM_CONFIG` is unset
+   (`Config::from_env_and_file`, `hippius-mem/src/config.rs` at db9261b), and a reviewed
+   repository could ship one that names its own endpoint, which would receive the engineer's
+   notes and prompts and answer recalls with notes of its choosing. **Decided by the main
+   session on 2026-11-27 in step 9.3, for the owner to confirm: not acceptable.** Every
+   hippius-mem Postil starts (doctor, Set up, Postil's own server, each agent's server) gets
+   `HIPPIUS_MEM_CONFIG`: the value in Postil's own environment when the engineer set one,
+   else `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`, the file
+   `quickstart` writes. With it set, hippius-mem reads that file only, and a missing one still
+   fails with "failed to load configuration", which offers Set up. The working directory still
+   picks the profile by its git origin. This changes steps 9.1's and 9.2's spawns. The downside
+   accepted: an engineer who relies on a project's own `hippius-mem.toml` must start Postil with
+   `HIPPIUS_MEM_CONFIG` naming it, which hippius-mem's own `install` already pins for its MCP
+   server.
 7. **`hippius-mem init`.** It writes `CLAUDE.md`, `AGENTS.md` and hooks into the repository.
    This document does not offer it from Postil. Step 9.1 is built that way, not confirmed.
 8. **The trial vault.** Set up runs `quickstart`, which makes a local vault. Moving to a
@@ -802,6 +836,19 @@ Postil writes outside itself.
     - Both are above the plan's 8 of 10, so no second turn is needed.
     - Both agents ran with the owner's own configuration, as Postil runs them. In 2 of
       Claude's runs that configuration had the agent write a note to hippius-mem.
+12. **MCP servers in `session/new`: answered by spike S7, 2026-11-27,** from the version 1
+    schema at the commit `src/acp/wire.rs` pins (01a54c84):
+    - `mcpServers` is required, a list of `McpServer`, which is one of three forms. HTTP and
+      SSE carry `"type": "http"` or `"sse"`, and an agent offers them only when its
+      `mcpCapabilities` says so. The stdio form carries no `type`, and "all Agents MUST
+      support" it: `McpServerStdio` requires `name`, `command` ("absolute path to the MCP
+      server executable"), `args` (strings) and `env`, a list of `{name, value}`.
+    - It has no working directory: the agent starts the server in the session's `cwd`, the
+      run's worktree.
+    - The schema names no error for `session/new`, so an agent may answer it with any
+      JSON-RPC error, a refused server among them. Postil asks once more with no servers, and
+      the run says that memory was not given (section "Agents get it"). An agent that accepts
+      the session and drops the server unseen cannot be detected.
 
 ## Testing
 

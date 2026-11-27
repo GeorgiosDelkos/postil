@@ -433,6 +433,27 @@ test("an undone edit redraws the run dialog with its notice", () => {
   assert.notEqual(undone, drawn);
 });
 
+test("a run that started without team memory redraws its dialogs with the notice", () => {
+  // The server sets `memoryNotice` as the agent starts (src/run.rs, `Runner::start`), with no
+  // entry of its own: only the key shows it changed.
+  const notice = {
+    memoryNotice: "team memory was not given: hippius-mem is not installed on PATH",
+  };
+  const start = [said("Done")];
+  assert.notEqual(
+    threadKey([streaming("R1", "running", start, notice)]),
+    threadKey([streaming("R1", "running", start)]),
+    "the run dialog",
+  );
+  const note = sent("N1", "R1");
+  const shown = [false, "Claude", [], true];
+  assert.notEqual(
+    noteDialogKey(note, streaming("R1", "running", start, notice), null, shown),
+    noteDialogKey(note, streaming("R1", "running", start), null, shown),
+    "the note's dialog",
+  );
+});
+
 test("an analysis run's dialog redraws for what it was asked and for why nothing was stored", () => {
   // The server sets the problem from the `noAnalysis` entry (src/run/log.rs, `apply`).
   const asked = { analysis: { kind: "analyze" } };

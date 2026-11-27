@@ -7,6 +7,8 @@
 
 use super::*;
 use crate::memory::{self, Memory, State};
+use crate::notes;
+use crate::settings::TeamMemory;
 use crate::testing::TempDir;
 
 const CHECK: &str = "postil://localhost/api/memory/check";
@@ -1242,4 +1244,536 @@ fn the_real_hippius_mem_recalls_by_path_and_reads_a_memory_and_its_history() {
         ["none", "local", "chain"].contains(&history[0]["anchor"].as_str().unwrap()),
         "{detail}"
     );
+}
+
+// ---- Agents get it --------------------------------------------------------------------------
+
+/// What [`memory_runs`] sets up besides the site, kept until the test ends.
+struct Agents {
+    /// The fake hippius-mem, in a folder whose name has a space.
+    program: PathBuf,
+    /// Where it logs ([`server_script`]), and `configs`, a line per start: its arguments and
+    /// the configuration file it was told to read, split by `|`.
+    log: TempDir,
+    /// The home whose configuration file the program is told to read.
+    home: TempDir,
+    _dir: TempDir,
+}
+
+impl Agents {
+    /// The server a session gets: the program by its absolute path, spaces and all.
+    fn server(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "hippius-mem",
+            "command": self.program,
+            "args": [],
+            "env": [
+                { "name": "PATH", "value": self.program.parent().unwrap() },
+                { "name": "NO_COLOR", "value": "1" },
+                { "name": "HIPPIUS_MEM_CONFIG", "value": self.config() },
+            ],
+        })
+    }
+
+    fn config(&self) -> PathBuf {
+        self.home
+            .path()
+            .join(".config/hippius-mem/hippius-mem.toml")
+    }
+
+    /// The fake server's script ([`server_script`]).
+    fn serving(&self) -> String {
+        server_script(self.log.path(), "hippius-mem 0.7.1", "")
+    }
+
+    /// Writes the program, running `body` after it logs its start.
+    fn write(&self, body: &str) {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"$HIPPIUS_MEM_CONFIG\" >> {}/configs\n{body}\n",
+            self.log.path().display()
+        );
+        fs::write(&self.program, script).unwrap();
+        fs::set_permissions(&self.program, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// A site on `repo` whose agent, and only reviewer, is the fake agent in `scenario`, and whose
+/// hippius-mem is a fake that passes doctor and serves MCP, Ready, with team memory `memory`.
+fn memory_runs(
+    repo: &TempRepo,
+    scenario: &str,
+    memory: TeamMemory,
+) -> (Site, mpsc::Receiver<()>, Agents) {
+    // Named after the repository, which each test names apart.
+    let name = repo
+        .root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let dir = TempDir::new(&format!("{name}-tools"));
+    let tools = dir.path().join("team tools");
+    fs::create_dir_all(&tools).unwrap();
+    let agents = Agents {
+        program: tools.join(memory::PROGRAM),
+        log: TempDir::new(&format!("{name}-log")),
+        home: TempDir::new(&format!("{name}-home")),
+        _dir: dir,
+    };
+    agents.write(&agents.serving());
+    let (site, nudges) = run_site(repo, scenario);
+    let search_path = tools.into_os_string();
+    let scanner = Scanner::new(move || search_path.clone());
+    let site = site.with_memory(Memory::new(scanner).with_home(agents.home.path(), None));
+    assert!(matches!(site.memory.wait(), State::Ready { .. }));
+    set_memory_agent(&site, scenario, memory);
+    (site, nudges, agents)
+}
+
+/// Saves the fake agent in `scenario` as the agent and the only reviewer, with team memory
+/// `memory`.
+fn set_memory_agent(site: &Site, scenario: &str, memory: TeamMemory) {
+    let settings = serde_json::json!({
+        "customAgents": [{ "name": "Fake", "command": fake_agent(scenario) }],
+        "enabledAgents": ["Fake"],
+        "agent": { "name": "Fake" },
+        "reviewers": [{ "name": "Fake" }],
+        "agentMemory": memory == TeamMemory::On,
+    });
+    let (status, body) = save(site, &settings.to_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The text of run `run`'s first message that starts with `start`, without it.
+fn said<'a>(run: &'a serde_json::Value, start: &str) -> &'a str {
+    run["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["text"].as_str())
+        .find_map(|text| text.strip_prefix(start))
+        .unwrap_or_else(|| panic!("no message {start:?} in {run}"))
+}
+
+/// The `session/new` params the fake agent of `run` received, in order.
+fn sessions(run: &serde_json::Value) -> Vec<serde_json::Value> {
+    serde_json::from_str(said(run, "sessions ")).unwrap()
+}
+
+/// The MCP servers of the one session the fake agent of `run` opened.
+fn servers_of(run: &serde_json::Value) -> serde_json::Value {
+    let sessions = sessions(run);
+    assert_eq!(sessions.len(), 1, "{run}");
+    sessions[0]["mcpServers"].clone()
+}
+
+/// Waits until run `id` has ended or failed, and returns it.
+fn run_ended(site: &Site, nudges: &mpsc::Receiver<()>, id: &str) -> serde_json::Value {
+    loop {
+        let run = get_json(site, &format!("{RUN}?id={id}"));
+        if ["ended", "failed"].contains(&run["status"].as_str().unwrap_or("")) {
+            return run;
+        }
+        nudges
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|_| panic!("no change while waiting for {id}: {run}"));
+    }
+}
+
+/// Sends note `note` and returns its run once it ended.
+fn sent(site: &Site, nudges: &mpsc::Receiver<()>, note: &str) -> serde_json::Value {
+    let (status, body) = send(site, &[note]);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = get_json(site, RUN)["id"].as_str().unwrap().to_owned();
+    run_ended(site, nudges, &id)
+}
+
+#[test]
+fn a_run_gives_the_agent_team_memory() {
+    let repo = TempRepo::new("memory-agents");
+    repo.write("a.txt", "a\n");
+    repo.write("src/a.rs", "fn a() {\n    one();\n}\n");
+    repo.write("src/b.rs", "// b\n\nfn two() {\n}\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+
+    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    let prompt = preview["prompt"].as_str().unwrap();
+    assert!(
+        prompt.starts_with(&format!("{}{}", notes::INTRO, notes::TEAM_MEMORY)),
+        "the line right after the introduction: {prompt}"
+    );
+    assert!(
+        !prompt.to_lowercase().contains("remember"),
+        "remembering stays with the engineer: {prompt}"
+    );
+
+    let run = sent(&site, &nudges, "N1");
+    assert_eq!(run["status"], "ended", "{run}");
+    assert_eq!(
+        run["prompt"], preview["prompt"],
+        "the preview is the prompt sent"
+    );
+    assert!(said(&run, "got ").contains(notes::TEAM_MEMORY), "{run}");
+    let sessions = sessions(&run);
+    assert_eq!(sessions.len(), 1, "{run}");
+    let keys: Vec<&String> = sessions[0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["cwd", "mcpServers"], "{run}");
+    assert_eq!(
+        sessions[0]["mcpServers"],
+        serde_json::json!([agents.server()])
+    );
+    assert_eq!(run["memoryNotice"], serde_json::Value::Null, "{run}");
+
+    // The run dialog's recall leaves the line out, as it leaves out the introduction.
+    let reply = settle(&site, &Method::GET, &format!("{RECALL}?run=R1"));
+    assert_eq!(reply["state"], "ready", "{reply}");
+    let recalled = calls(&agents.log);
+    let recalled = recalled
+        .lines()
+        .find(|line| line.contains(r#""name":"recall""#))
+        .unwrap();
+    assert!(recalled.contains("check it"), "{recalled}");
+    assert!(!recalled.contains("Recall team memory"), "{recalled}");
+
+    // Every hippius-mem Postil started, doctor and its own server, read the engineer's file.
+    let config = agents.config();
+    let starts = fs::read_to_string(agents.log.path().join("configs")).unwrap();
+    for start in starts.lines() {
+        assert!(
+            start.ends_with(&format!("|{}", config.display())),
+            "{starts}"
+        );
+    }
+    assert!(
+        starts
+            .lines()
+            .any(|start| start == format!("doctor|{}", config.display()))
+    );
+    assert!(
+        starts
+            .lines()
+            .any(|start| start == format!("|{}", config.display()))
+    );
+}
+
+#[test]
+fn readers_reviewers_and_fresh_follow_ups_get_it_too() {
+    let repo = TempRepo::new("memory-agents-others");
+    repo.write("a.txt", "a\n");
+    repo.write("src/a.rs", "fn a() {\n    one();\n}\n");
+    repo.write("src/b.rs", "// b\n\nfn two() {\n}\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+    sent(&site, &nudges, "N1");
+
+    // A read-only run gets it too: recall is a read. An ask:
+    let ask = serde_json::json!({
+        "note": {
+            "path": "a.txt",
+            "lines": { "start": 1, "end": 1 },
+            "snippet": "a",
+            "body": "Why a?",
+        },
+    });
+    let (status, body) = post(&site, &format!("{RUN}/ask"), &ask.to_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let asked = run_ended(&site, &nudges, "R2");
+    assert_eq!(servers_of(&asked), serde_json::json!([agents.server()]));
+
+    // An analysis:
+    let (status, body) = post(
+        &site,
+        "postil://localhost/api/analysis",
+        r#"{"kind": "analyze"}"#,
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let analysis = run_ended(&site, &nudges, "R3");
+    assert_eq!(servers_of(&analysis), serde_json::json!([agents.server()]));
+
+    // A reviewer, whose quote of the author's prompt leaves the line out:
+    let of = serde_json::json!({ "of": "R1" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/review"), &of);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reviewer = run_ended(&site, &nudges, "R4");
+    assert_eq!(servers_of(&reviewer), serde_json::json!([agents.server()]));
+    // Up to the author's reply, in which the fake author echoes its whole prompt.
+    let (quoted, _) = reviewer["prompt"]
+        .as_str()
+        .unwrap()
+        .split_once("The agent's reply:")
+        .unwrap();
+    assert!(quoted.contains("check it"), "{quoted}");
+    assert!(!quoted.contains(notes::TEAM_MEMORY), "{quoted}");
+
+    // A fresh agent's follow-up (the review took the thread's kept agent), whose quote of the
+    // first prompt leaves it out too.
+    let follow = serde_json::json!({ "of": "R1", "text": "And b?" }).to_string();
+    let (status, body) = post(&site, &format!("{RUN}/follow"), &follow);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let followed = run_ended(&site, &nudges, "R5");
+    assert_eq!(servers_of(&followed), serde_json::json!([agents.server()]));
+    let (fresh, _) = followed["prompt"]
+        .as_str()
+        .unwrap()
+        .split_once("It answered:")
+        .unwrap();
+    assert!(fresh.starts_with("You are continuing work"), "{fresh}");
+    assert!(fresh.contains("check it"), "{fresh}");
+    assert!(!fresh.contains(notes::TEAM_MEMORY), "{fresh}");
+}
+
+#[test]
+fn the_setting_off_gives_none_and_no_prompt_line() {
+    let repo = TempRepo::new("memory-agents-off");
+    repo.write("a.txt", "a\n");
+    let (site, nudges, _agents) = memory_runs(&repo, "echo-session", TeamMemory::Off);
+    post_note(&site, "a.txt", 1, 1, "check it");
+
+    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    let prompt = preview["prompt"].as_str().unwrap();
+    assert!(!prompt.contains(notes::TEAM_MEMORY), "{prompt}");
+
+    let run = sent(&site, &nudges, "N1");
+    assert_eq!(servers_of(&run), serde_json::json!([]));
+    assert!(!said(&run, "got ").contains(notes::TEAM_MEMORY), "{run}");
+    // Off is the engineer's choice: nothing to say about it.
+    assert_eq!(run["memoryNotice"], serde_json::Value::Null, "{run}");
+}
+
+#[test]
+fn a_refused_server_list_is_retried_without() {
+    let repo = TempRepo::new("memory-agents-refused");
+    repo.write("a.txt", "a\n");
+    let (site, nudges, agents) = memory_runs(&repo, "refuse-servers", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+    post_note(&site, "a.txt", 1, 1, "and again");
+
+    let run = sent(&site, &nudges, "N1");
+    assert_eq!(run["status"], "ended", "the run goes on without: {run}");
+    let sessions = sessions(&run);
+    assert_eq!(sessions.len(), 2, "one retry: {run}");
+    assert_eq!(
+        sessions[0]["mcpServers"],
+        serde_json::json!([agents.server()])
+    );
+    assert_eq!(sessions[1]["mcpServers"], serde_json::json!([]));
+    assert_eq!(
+        run["memoryNotice"],
+        "team memory was not given: the agent refused session/new with its MCP servers: MCP \
+         servers are disabled (-32602)"
+    );
+    // The agent without memory is not told to recall it. The run's record keeps the prompt as
+    // it was built when the run was sent.
+    assert!(!said(&run, "got ").contains(notes::TEAM_MEMORY), "{run}");
+    let recorded = run["prompt"].as_str().unwrap();
+    assert!(recorded.contains(notes::TEAM_MEMORY), "{recorded}");
+
+    // Refused again without servers: the run fails with the agent's refusal.
+    set_memory_agent(&site, "refuse-sessions", TeamMemory::On);
+    let run = sent(&site, &nudges, "N2");
+    assert_eq!(run["status"], "failed", "{run}");
+    let failed = run["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "failed")
+        .unwrap();
+    assert_eq!(
+        failed["error"], "the agent refused session/new: no sessions today (-32602)",
+        "{run}"
+    );
+}
+
+#[test]
+fn unready_or_removed_memory_starts_runs_without_it_and_warns_once() {
+    let repo = TempRepo::new("memory-agents-unready");
+    repo.write("a.txt", "a\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    for body in ["one", "two", "three", "four", "five"] {
+        post_note(&site, "a.txt", 1, 1, body);
+    }
+    let not_given = |run: &serde_json::Value| {
+        assert_eq!(servers_of(run), serde_json::json!([]));
+        assert!(!said(run, "got ").contains(notes::TEAM_MEMORY), "{run}");
+        let recorded = run["prompt"].as_str().unwrap();
+        assert!(!recorded.contains(notes::TEAM_MEMORY), "{recorded}");
+    };
+
+    // Not set up: the first run says so, the next one does not.
+    agents.write("echo 'Error: failed to load configuration' >&2\nexit 1");
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+    assert!(matches!(site.memory.wait(), State::Unconfigured { .. }));
+    let run = sent(&site, &nudges, "N1");
+    not_given(&run);
+    assert_eq!(
+        run["memoryNotice"],
+        "team memory was not given: Error: failed to load configuration"
+    );
+    let run = sent(&site, &nudges, "N2");
+    not_given(&run);
+    assert_eq!(
+        run["memoryNotice"],
+        serde_json::Value::Null,
+        "said once: {run}"
+    );
+
+    // Ready again, then removed while Postil runs: said again, once.
+    agents.write(&agents.serving());
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+    assert!(matches!(site.memory.wait(), State::Ready { .. }));
+    let run = sent(&site, &nudges, "N3");
+    assert_eq!(servers_of(&run), serde_json::json!([agents.server()]));
+    fs::remove_file(&agents.program).unwrap();
+    let run = sent(&site, &nudges, "N4");
+    not_given(&run);
+    assert_eq!(
+        run["memoryNotice"],
+        "team memory was not given: hippius-mem is not installed on PATH"
+    );
+    let run = sent(&site, &nudges, "N5");
+    not_given(&run);
+    assert_eq!(
+        run["memoryNotice"],
+        serde_json::Value::Null,
+        "said once: {run}"
+    );
+}
+
+/// The fake server whose `doctor` and `quickstart` wait until the file `gate` exists.
+fn gated(agents: &Agents, gate: &Path) -> String {
+    format!(
+        "case \"$*\" in\ndoctor|'quickstart --no-wire') while [ ! -e {} ]; do /bin/sleep 0.05; \
+         done ;;\nesac\n{}",
+        gate.display(),
+        agents.serving()
+    )
+}
+
+#[test]
+fn a_run_sent_while_a_check_runs_gets_the_line_with_the_server() {
+    let repo = TempRepo::new("memory-agents-race");
+    repo.write("a.txt", "a\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+    let gate = agents.log.path().join("gate");
+    agents.write(&gated(&agents, &gate));
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+
+    // Not Ready while doctor runs: the preview, and the prompt as built, have no line.
+    let preview = get_json(&site, &format!("{RUN}/preview?notes=N1"));
+    assert!(
+        !preview["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(notes::TEAM_MEMORY)
+    );
+    let (status, body) = send(&site, &["N1"]);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The start waits for the check, which then finds it Ready.
+    fs::write(&gate, "").unwrap();
+    let id = get_json(&site, RUN)["id"].as_str().unwrap().to_owned();
+    let run = run_ended(&site, &nudges, &id);
+    assert_eq!(servers_of(&run), serde_json::json!([agents.server()]));
+    assert!(
+        said(&run, "got ").contains(&format!("{}{}", notes::INTRO, notes::TEAM_MEMORY)),
+        "the agent that has the server is told of it: {run}"
+    );
+    assert_eq!(run["memoryNotice"], serde_json::Value::Null, "{run}");
+}
+
+#[test]
+fn a_run_does_not_wait_for_a_set_up() {
+    let repo = TempRepo::new("memory-agents-setup");
+    repo.write("a.txt", "a\n");
+    let (site, nudges, agents) = memory_runs(&repo, "echo-session", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+    let gate = agents.log.path().join("gate");
+    agents.write(&gated(&agents, &gate));
+    // A check runs, then a set up, whose quickstart may take minutes and drops the check.
+    assert_eq!(post(&site, CHECK, "").0, StatusCode::OK);
+    assert_eq!(post(&site, SETUP, "").0, StatusCode::OK);
+
+    let started = Instant::now();
+    let run = sent(&site, &nudges, "N1");
+    // Far below the doctor's limit, 10 s, which bounds every other wait.
+    assert!(started.elapsed() < Duration::from_secs(5), "{run}");
+    assert_eq!(servers_of(&run), serde_json::json!([]));
+    assert_eq!(
+        run["memoryNotice"],
+        "team memory was not given: hippius-mem is still being checked"
+    );
+    fs::write(&gate, "").unwrap();
+    site.memory.wait();
+}
+
+#[test]
+fn an_agent_that_asks_for_a_sign_in_is_not_asked_again_without_servers() {
+    let repo = TempRepo::new("memory-agents-auth");
+    repo.write("a.txt", "a\n");
+    let (site, nudges, _agents) = memory_runs(&repo, "auth", TeamMemory::On);
+    post_note(&site, "a.txt", 1, 1, "check it");
+
+    let run = sent(&site, &nudges, "N1");
+    assert_eq!(run["status"], "failed", "{run}");
+    let failed = run["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "failed")
+        .unwrap();
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("needs you to sign in"), "{error}");
+    assert!(error.ends_with("(session/new 1)"), "asked once: {error}");
+}
+
+#[test]
+fn a_repository_s_configuration_file_does_not_override_the_engineer_s() {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if agents::find_program(memory::PROGRAM, &path).is_none() {
+        eprintln!("skipped: hippius-mem is not installed on PATH");
+        return;
+    }
+    let repo = TempRepo::new("memory-real-config");
+    // hippius-mem reads a hippius-mem.toml in its working directory first, unless told which
+    // file to read; one with a key it does not know fails every command that reads it.
+    repo.write("hippius-mem.toml", "chosen_by_the_repository = true\n");
+    let home = TempDir::new("memory-real-config-home");
+    let model_cache = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".cache/hippius-mem/fastembed"))
+        .filter(|cache| cache.is_dir());
+    let scanner = Scanner::new(move || path.clone());
+    let memory = Memory::new(scanner.clone()).with_home(home.path(), model_cache.as_deref());
+    let site = Site::new(Some(&repo.config()), None, None, scanner, quiet()).with_memory(memory);
+    site.open(Repo::open(&repo.root).unwrap(), LiveRun::Stop)
+        .unwrap();
+
+    // doctor runs in the project's root, and finds no configuration of the engineer's.
+    let State::Unconfigured { problem, .. } = site.memory.wait() else {
+        panic!("a fresh home has no configuration");
+    };
+    let problem = problem.unwrap_or_default();
+    assert!(
+        problem.contains("failed to load configuration"),
+        "{problem}"
+    );
+    assert!(!problem.contains("chosen_by_the_repository"), "{problem}");
+
+    assert_eq!(post(&site, SETUP, "").0, StatusCode::OK);
+    let view = settled(&site);
+    let error = view["setup"]["error"].as_str().unwrap_or("");
+    if error.contains("embedding model") {
+        eprintln!("skipped: hippius-mem could not get its embedding model (no network?): {error}");
+        return;
+    }
+    assert_eq!(view["state"]["kind"], "ready", "{view}");
+    let written = home.path().join(".config/hippius-mem/hippius-mem.toml");
+    assert!(
+        written.is_file(),
+        "set up wrote the engineer's file: {view}"
+    );
+
+    // Postil's own server, in the project's root, reads the engineer's file too.
+    let reply = recall(&site, "a.txt");
+    assert_eq!(reply["state"], "ready", "{reply}");
 }

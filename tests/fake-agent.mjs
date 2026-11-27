@@ -124,6 +124,9 @@ let model = null;
 
 // Prompts this process received, so a test can tell a kept agent from a new one.
 let prompts = 0;
+// The params of each `session/new` this process received, in order: "echo-session" and
+// "refuse-servers" say them in each turn, so a test sees the MCP servers the app gave.
+const sessions = [];
 // A file in the session's working directory, as agents report paths: absolute.
 const file = `${process.cwd()}/src/a.rs`;
 
@@ -236,6 +239,17 @@ async function prompt(id, params) {
   say(`got ${blocks.join(" | ")}`);
   say(`prompt ${prompts}`);
   switch (scenario) {
+    case "echo-session":
+    case "refuse-servers":
+      // Answers each kind of run well enough to end: an analysis with its diagrams, a
+      // proposer with no findings, and any other run with the sessions alone.
+      say(`sessions ${JSON.stringify(sessions)}`);
+      if (blocks[0].startsWith("Analyze this repository")) {
+        say(`\`\`\`json\n${JSON.stringify(analysisReply(blocks[0]))}\n\`\`\``);
+      } else if (blocks[0].includes("Do not change any file")) {
+        say("Found none.\n\n```json\n[]\n```");
+      }
+      return send({ id, result: { stopReason: "end_turn" } });
     case "turn": {
       // Agents send notifications and update kinds the app does not use.
       send({ method: "_x.ai/session/setup", params: { phase: "auth" } });
@@ -696,9 +710,21 @@ const handle = (line) => {
       }
       return initialize(message.id);
     case "session/new":
+      sessions.push(message.params);
       if (scenario === "no-session-id") return send({ id: message.id, result: {} });
+      // An agent whose configuration forbids MCP servers from the client refuses a session
+      // that names any, as the schema lets it; "refuse-sessions" refuses every session.
+      if (scenario === "refuse-servers" && message.params.mcpServers.length > 0) {
+        return send({ id: message.id, error: { code: -32602, message: "MCP servers are disabled" } });
+      }
+      if (scenario === "refuse-sessions") {
+        return send({ id: message.id, error: { code: -32602, message: "no sessions today" } });
+      }
       if (scenario === "auth") {
-        return send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
+        // Says how many sessions it was asked for, so a test sees that a sign-in is not asked
+        // again without the MCP servers.
+        const asked = `Authentication required (session/new ${sessions.length})`;
+        return send({ id: message.id, error: { code: -32000, message: asked } });
       }
       if (scenario === "spawns-child") {
         // A grandchild in the agent's process group, as `npx` leaves `node` running. Its pid

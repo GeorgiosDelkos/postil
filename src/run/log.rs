@@ -63,7 +63,9 @@ pub(super) struct Opening<'a> {
     pub(super) agent: &'a str,
     /// The notes the run carries: it goes with the last of them.
     pub(super) notes: Vec<String>,
-    /// The prompt's text, as the agent receives it.
+    /// The prompt's text as it is built when the run is sent. The agent receives it without
+    /// the line about team memory, or with it, when the run's start finds otherwise
+    /// (`Runner::start`).
     pub(super) prompt: String,
     pub(super) origin: Origin,
     /// Whether the run's thread only reads ([`Header::read_only`]).
@@ -195,6 +197,11 @@ pub(super) struct RunState {
     kinds: HashMap<String, ToolKind>,
     /// Why the log is incomplete, the notes were not marked sent, or a review stopped here.
     pub(super) problem: Option<String>,
+    /// Why the agent started without team memory, when the run was the one to say so
+    /// (`memory.rs`, "Agents"). Kept apart from `problem`, whose first text wins: set as the
+    /// agent starts, it would hide every later one, and the page reads `problem` as the run's
+    /// trouble. Not in the log, as `problem` is not.
+    pub(super) memory_notice: Option<String>,
 }
 
 /// The first line of a run log.
@@ -208,7 +215,8 @@ pub(super) struct Header {
     pub(super) agent: String,
     /// The ids of the notes sent.
     pub(super) notes: Vec<String>,
-    /// The prompt's text, as the agent received it.
+    /// The prompt's text as it was built when the run was sent; the agent may have received
+    /// it with or without the line about team memory (`Runner::start`).
     pub(super) prompt: String,
     /// Seconds since the Unix epoch.
     started_at: u64,
@@ -463,6 +471,9 @@ pub(crate) struct RunView {
     /// How many entries the run has; the page asks for the ones after it next time.
     total: usize,
     problem: Option<String>,
+    /// Why the agent started without team memory, when the run says so (`memory.rs`,
+    /// "Agents"). Apart from `problem`, which the page reads as the run's trouble.
+    memory_notice: Option<String>,
     /// Milliseconds until a second Stop ends the agent, 0 once it would, while this process
     /// is stopping the run; the page offers Force stop from then on, after a reload too.
     force_in: Option<u64>,
@@ -895,6 +906,7 @@ impl Run {
             entries: state.entries.get(after..).unwrap_or_default().to_vec(),
             total: state.entries.len(),
             problem: state.problem.clone(),
+            memory_notice: state.memory_notice.clone(),
             force_in: state.cancel_asked.filter(|_| state.live()).map(|at| {
                 u64::try_from(FORCE_AFTER.saturating_sub(at.elapsed()).as_millis())
                     .expect("at most FORCE_AFTER, 3 s")
@@ -940,6 +952,7 @@ impl RunState {
             answered: BTreeSet::new(),
             kinds: HashMap::new(),
             problem: None,
+            memory_notice: None,
         }
     }
 

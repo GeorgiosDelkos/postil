@@ -310,6 +310,7 @@ export function runDialog({
     if (reply) body.append(reply);
     const report = reportNotice(view);
     if (report) body.append(el("div", "run-notice", report));
+    if (view.memoryNotice) body.append(el("div", "run-notice", view.memoryNotice));
     if (view.problem) body.append(el("div", "run-notice", view.problem));
     for (const turn of thread.slice(1)) body.append(...followUpPart(turn));
     if (!view.review) {
@@ -537,6 +538,7 @@ export function runDialog({
     if (reply) parts.push(reply);
     const report = reportNotice(turn);
     if (report) parts.push(el("div", "run-notice", report));
+    if (turn.memoryNotice) parts.push(el("div", "run-notice", turn.memoryNotice));
     if (turn.problem) parts.push(el("div", "run-notice", turn.problem));
     return parts;
   }

@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::notes;
 use crate::report::{self, Report, Risk, Step};
 
 /// Where a review run stands: it reviews run `of` as reviewer `reviewer` (from 1) of `reviewers`.
@@ -176,10 +177,11 @@ fn rated_low(text: &mut String, work: &Work) {
 
 /// The reviewed work, as every reviewer reads it. The prompt is quoted without its ask for
 /// the author's report ([`report::ASK`]): a reviewer that obeyed it would end with that object
-/// instead of its findings.
+/// instead of its findings. Nor with its line about team memory
+/// ([`notes::without_team_memory`]): an instruction to the author, which a reviewer may read
+/// as its own whether or not it has team memory.
 fn context(text: &mut String, work: &Work) {
-    let notes = work
-        .prompt
+    let notes = notes::without_team_memory(&work.prompt)
         .replace(report::ASK, "")
         .replace(report::ASK_AGAIN, "");
     write!(
