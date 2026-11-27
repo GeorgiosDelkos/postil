@@ -9,6 +9,7 @@ mod acp;
 mod agents;
 mod anchor;
 mod clone;
+mod definitions;
 mod dialog;
 mod disk;
 mod error;

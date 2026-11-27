@@ -17,10 +17,11 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
+use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::folders::{self, Folders};
-use crate::highlight::{Highlighter, Token};
+use crate::highlight::{self, Highlighter, Token};
 use crate::layout::{self, Layout, RawLayout};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
@@ -50,6 +51,16 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/tree.js",
         "text/javascript",
         include_bytes!("../ui/tree.js"),
+    ),
+    (
+        "/definitions.js",
+        "text/javascript",
+        include_bytes!("../ui/definitions.js"),
+    ),
+    (
+        "/definitions-dialog.js",
+        "text/javascript",
+        include_bytes!("../ui/definitions-dialog.js"),
     ),
     (
         "/icons.js",
@@ -322,6 +333,8 @@ struct Project {
     repo: Arc<Repo>,
     /// The project's runs and the agent kept between them.
     runner: Arc<Runner>,
+    /// Where each name is defined, indexed on a thread of its own.
+    definitions: Definitions,
     /// Why the recent projects could not be updated when this project opened, shown under
     /// the branch name. Kept with the project, so every page load of it shows the line.
     warning: Option<String>,
@@ -601,6 +614,8 @@ enum LiveRun {
 #[derive(Debug, Serialize)]
 struct FileView<'a> {
     path: &'a str,
+    /// Whether the file's language has definitions to jump to.
+    definitions: bool,
     lines: Vec<Vec<Token<'a>>>,
 }
 
@@ -690,15 +705,19 @@ impl Site {
             self.home.clone(),
             self.usage_file.clone(),
         );
+        let definitions = Definitions::new(Arc::clone(&repo));
         let old = project.replace(Project {
             repo,
             runner,
+            definitions,
             warning,
         });
         drop(project);
-        // Stops the agent of the project this one replaces, after the borrow ends: that waits
-        // for its process.
+        // Stops the index and the agent of the project this one replaces, after the borrow
+        // ends: stopping the agent waits for its process. The index is told first, as that
+        // waits for nothing.
         if let Some(old) = old {
+            old.definitions.close();
             old.runner.close();
         }
         Ok(())
@@ -739,6 +758,9 @@ impl Site {
                 },
                 _ => not_allowed("GET"),
             },
+            path if path == "/api/definitions" || path.starts_with("/api/definitions/") => {
+                self.respond_definitions(path, method, query)
+            }
             "/api/notes" => self.respond_notes(method, query, body),
             "/api/notes/resolve" => match *method {
                 Method::POST => self.change_note(query, |site, repo, id| {
@@ -861,7 +883,39 @@ impl Site {
     fn file_view(&self, path: &str) -> Result<Vec<u8>> {
         let text = self.repo()?.read(path)?;
         let lines = self.highlighter.lines(path, &text)?;
-        Ok(to_json(&FileView { path, lines }))
+        Ok(to_json(&FileView {
+            path,
+            definitions: highlight::tags_grammar(path).is_some(),
+            lines,
+        }))
+    }
+
+    /// The reply to `GET /api/definitions?name=x&from=path`: where `x` is defined, those
+    /// nearest the file `from` first, or `{"state": "building"}` until the index is first
+    /// built. Reads no file: the index is built on its own thread.
+    fn definitions(&self, query: &str) -> Result<Vec<u8>> {
+        let name = query_value(query, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                Error::BadRequest("expected ?name=<percent-encoded name>&from=<path>".to_owned())
+            })?;
+        let from = query_value(query, "from").unwrap_or_default();
+        let project = self.project.borrow();
+        let project = project.as_ref().ok_or(Error::NoProject)?;
+        Ok(to_json(&project.definitions.lookup(&name, &from)))
+    }
+
+    /// The reply to `POST /api/definitions/refresh`, which the page sends when the window
+    /// regains focus and when a run moves on (`refresh` in `ui/app.js`): the index looks at
+    /// the files again, on its own thread. Answers `{}` at once.
+    fn refresh_definitions(&self) -> Result<Vec<u8>> {
+        let project = self.project.borrow();
+        project
+            .as_ref()
+            .ok_or(Error::NoProject)?
+            .definitions
+            .refresh();
+        Ok(b"{}".to_vec())
     }
 
     /// The reply to `GET /api/notes`: every note, moved to where its snippet is now. Reads
@@ -932,6 +986,21 @@ impl Site {
             _ => not_allowed(
                 "GET the notes, POST a new one, PATCH ?id=N1 its text, or DELETE ?id=N1",
             ),
+        }
+    }
+
+    /// The replies to `/api/definitions` and `/api/definitions/refresh`.
+    fn respond_definitions(&self, path: &str, method: &Method, query: &str) -> Reply {
+        match path {
+            "/api/definitions" => match *method {
+                Method::GET => json_or_error(self.definitions(query)),
+                _ => not_allowed("GET ?name=<name>&from=<path>"),
+            },
+            "/api/definitions/refresh" => match *method {
+                Method::POST => json_or_error(self.refresh_definitions()),
+                _ => not_allowed("POST with no body"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
 
@@ -1534,6 +1603,8 @@ impl std::fmt::Debug for Site {
 impl Drop for Site {
     fn drop(&mut self) {
         if let Some(project) = self.project.borrow_mut().take() {
+            // The index first, as in `open`: telling it to stop waits for nothing.
+            project.definitions.close();
             project.runner.close();
         }
         // A model probe's agent would otherwise run on until its timeout.

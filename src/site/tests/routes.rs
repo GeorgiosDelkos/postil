@@ -50,6 +50,16 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     ),
     ("/api/file", &[Method::GET], "GET"),
     (
+        "/api/definitions",
+        &[Method::GET],
+        "GET ?name=<name>&from=<path>",
+    ),
+    (
+        "/api/definitions/refresh",
+        &[Method::POST],
+        "POST with no body",
+    ),
+    (
         "/api/run",
         &[Method::GET, Method::POST],
         "GET the latest run (?after=<entries seen>) or one run (?id=R1), or POST a new one",

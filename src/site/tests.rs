@@ -4,6 +4,7 @@
 //! `use super::*`: an area that needs those modules imports them by path.
 
 mod asks;
+mod definitions;
 mod files;
 mod notes;
 mod page_e2e;
@@ -78,8 +79,11 @@ impl TempRepo {
         assert!(status.success(), "git {args:?}");
     }
 
+    /// Writes `file`, making its folders first.
     pub(crate) fn write(&self, file: &str, text: &str) {
-        fs::write(self.root.join(file), text).unwrap();
+        let path = self.root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
     }
 
     /// A site with this repository open.
