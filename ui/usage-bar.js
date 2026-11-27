@@ -1,7 +1,7 @@
 // Live provider quota strip in the sidebar footer, its click popover, and inline mini quota
 // badges for agent picker menus (`#agent-picker` and `+ Add reviewer`).
 //
-// Shares the `api/usage` payload with `usage-dialog.js` and caches finished replies for 60 s so
+// Shares the `api/usage` payload with `usage-dialog.js` and caches finished replies for 5 min so
 // window focus events and menu opens never spam provider probes.
 
 import { agentLogoIcon, el } from "./dom.js";
@@ -11,7 +11,9 @@ import {
   formatPercent,
   formatReset,
   formatTokens,
+  hasQuotaData,
   highestQuotaTone,
+  mergeUsageView,
   quotaTone,
   rangeLabel,
   tightestQuotaText,
@@ -20,21 +22,27 @@ import {
   visibleQuotaAgents,
 } from "./usage.js";
 
-const POLL_MS = 250;
-const FRESH_MS = 60_000;
-const MAX_POLLS = 150;
+const POLL_MS = 1000;
+const FRESH_MS = 300_000;
+const ERROR_FRESH_MS = 60_000;
+const AUTO_REFRESH_COOLDOWN_MS = 60_000;
+const MAX_POLLS = 45;
 
 export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
   const ui = {
     view: null,
     settings: null,
     fetchedAtMs: 0,
+    lastForceAtMs: 0,
+    inFlight: false,
     refreshing: false,
     error: null,
     pollTimer: null,
     polls: 0,
     asked: 0,
     started: false,
+    stripKey: "",
+    popoverKey: "",
   };
 
   function updateWarnDot(tone) {
@@ -52,20 +60,22 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
   }
 
   function applyView(view, { fromDialog = false } = {}) {
-    ui.view = view;
+    const merged = mergeUsageView(ui.view, view);
+    ui.view = merged;
     ui.fetchedAtMs = Date.now();
     ui.refreshing = false;
     ui.error = null;
-    updateWarnDot(highestQuotaTone(view.agents));
+    updateWarnDot(highestQuotaTone(merged.agents));
 
     clearTimeout(ui.pollTimer);
     ui.pollTimer = null;
-    if (!fromDialog && (view.scanning || view.polling) && ui.polls < MAX_POLLS) {
+    if (!fromDialog && (merged.scanning || merged.polling) && ui.polls < MAX_POLLS) {
       ui.polls += 1;
       ui.pollTimer = setTimeout(() => {
+        ui.pollTimer = null;
         fetchUsage({ force: false, allowStale: true }).catch(() => {});
       }, POLL_MS);
-    } else if (!view.scanning && !view.polling) {
+    } else if (!merged.scanning && !merged.polling) {
       ui.polls = 0;
     }
 
@@ -73,14 +83,28 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     if (!popoverEl.hidden) renderPopover();
   }
 
-  async function fetchUsage({ force = false, allowStale = false } = {}) {
+  function hasErrorQuota() {
+    return (ui.view?.agents ?? []).some((agent) => agent?.quota?.status === "error");
+  }
+
+  async function fetchUsage({ force = false, allowStale = false, manual = false } = {}) {
     if (!ui.started) return;
+    const now = Date.now();
     const settled = ui.view && !ui.view.scanning && !ui.view.polling;
-    if (!force && !allowStale && settled && Date.now() - ui.fetchedAtMs < FRESH_MS) {
-      return;
+    const freshWindow = hasErrorQuota() ? ERROR_FRESH_MS : FRESH_MS;
+    if (!force) {
+      if (ui.inFlight) return;
+      if (!allowStale && settled && now - ui.fetchedAtMs < freshWindow) return;
+    } else if (!manual) {
+      if (ui.inFlight || ui.pollTimer !== null) return;
+      if (now - ui.lastForceAtMs < AUTO_REFRESH_COOLDOWN_MS) return;
     }
     const token = ++ui.asked;
+    ui.inFlight = true;
     if (force) {
+      clearTimeout(ui.pollTimer);
+      ui.pollTimer = null;
+      ui.lastForceAtMs = now;
       ui.refreshing = true;
       ui.polls = 0;
       if (!popoverEl.hidden) renderPopover();
@@ -90,9 +114,11 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     try {
       const view = await request(usageUrl(base, "project", "7d"), init);
       if (token !== ui.asked) return;
+      ui.inFlight = false;
       applyView(view);
     } catch (error) {
       if (token !== ui.asked) return;
+      ui.inFlight = false;
       ui.refreshing = false;
       ui.error = String(error.message ?? error);
       if (!popoverEl.hidden) renderPopover();
@@ -109,7 +135,21 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     const candidates = visibleQuotaAgents(ui.view?.agents, enabledNames());
     const active = candidates.filter((agent) => Boolean(tightestQuotaText(agent.quota)));
 
-    if (active.length === 0) {
+    const key = JSON.stringify(
+      active.map((agent) => {
+        const tightest = tightestQuotaWindow(agent.quota);
+        return [
+          agent.name,
+          tightest ? [tightest.usedPercent, tightest.tone] : null,
+          tightestQuotaText(agent.quota),
+        ];
+      }),
+    );
+    const shouldHide = active.length === 0;
+    if (key === ui.stripKey && stripEl.hidden === shouldHide) return;
+    ui.stripKey = key;
+
+    if (shouldHide) {
       closePopover();
       stripEl.hidden = true;
       stripEl.replaceChildren();
@@ -144,17 +184,28 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
 
   // ---- Click Popover --------------------------------------------------------------------
 
-  function renderPopover() {
+  function renderPopover({ force = false } = {}) {
+    const busy =
+      ui.refreshing || (Boolean(ui.view?.scanning || ui.view?.polling) && ui.pollTimer !== null);
+    const agents = visibleQuotaAgents(ui.view?.agents, enabledNames());
+    const key = JSON.stringify({
+      busy,
+      error: ui.error,
+      range: ui.view?.range ?? "7d",
+      summary: ui.view?.summary ?? null,
+      agents: agents.map((agent) => ({ name: agent.name, quota: agent.quota })),
+    });
+    if (!force && key === ui.popoverKey) return;
+    ui.popoverKey = key;
+
     const hadFocus = popoverEl.contains(document.activeElement);
     const head = el("header", "quota-popover-head");
     head.append(el("span", "quota-popover-title", "Live Quotas"));
-    const busy =
-      ui.refreshing || (Boolean(ui.view?.scanning || ui.view?.polling) && ui.pollTimer !== null);
     const refreshBtn = el("button", "button quota-popover-btn", busy ? "Refreshing…" : "Refresh");
     refreshBtn.type = "button";
     refreshBtn.disabled = busy;
     refreshBtn.addEventListener("click", () => {
-      fetchUsage({ force: true });
+      fetchUsage({ force: true, manual: true });
     });
     head.append(refreshBtn);
 
@@ -164,7 +215,6 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
       err.style.padding = "10px 12px";
       list.append(err);
     }
-    const agents = visibleQuotaAgents(ui.view?.agents, enabledNames());
     const nowSecs = Date.now() / 1000;
 
     for (const agent of agents) {
@@ -181,16 +231,18 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
       section.append(titleRow);
 
       const quota = agent.quota;
-      if (!quota || quota.status === "loading") {
-        section.append(el("p", "usage-note", "Checking live quota…"));
-      } else if (quota.status !== "ok") {
-        section.append(
-          el(
-            "p",
-            `usage-note${quota.status === "error" ? " is-error" : ""}`,
-            quota.message ?? "Live quota unavailable",
-          ),
-        );
+      if (!hasQuotaData(quota)) {
+        if (!quota || quota.status === "loading") {
+          section.append(el("p", "usage-note", "Checking live quota…"));
+        } else {
+          section.append(
+            el(
+              "p",
+              `usage-note${quota.status === "error" ? " is-error" : ""}`,
+              quota.message ?? "Live quota unavailable",
+            ),
+          );
+        }
       } else {
         const rows = el("div", "quota-popover-windows");
         for (const win of quota.windows ?? []) {
@@ -219,6 +271,9 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
           rows.append(credit);
         }
         section.append(rows);
+        if (quota.status === "error" && quota.message) {
+          section.append(el("p", "usage-note is-error", quota.message));
+        }
       }
       list.append(section);
     }
@@ -262,7 +317,7 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     if (stripEl.hidden) return;
     popoverEl.hidden = false;
     stripEl.setAttribute("aria-expanded", "true");
-    renderPopover();
+    renderPopover({ force: true });
     popoverEl.focus();
     fetchUsage();
   }
@@ -336,8 +391,8 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
       ui.started = true;
       fetchUsage({ force: false, allowStale: true });
     },
-    refresh({ force = false } = {}) {
-      fetchUsage({ force });
+    refresh({ force = false, manual = false } = {}) {
+      fetchUsage({ force, manual });
     },
     syncView(view) {
       applyView(view, { fromDialog: true });
@@ -345,10 +400,18 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
     setSettings(settings) {
       ui.settings = settings;
       renderStrip();
+      if (!popoverEl.hidden) renderPopover();
+      if (!ui.started || ui.inFlight || ui.pollTimer !== null) return;
+      if (!ui.view) {
+        fetchUsage({ force: false, allowStale: true });
+        return;
+      }
       const missing = (settings?.enabledAgents ?? []).some(
-        (name) => !ui.view?.agents?.some((a) => a.name === name && a.quota?.status !== "loading"),
+        (name) => !ui.view.agents?.some((a) => a.name === name),
       );
-      if (missing) fetchUsage({ force: false, allowStale: true });
+      if (missing && Date.now() - ui.fetchedAtMs >= FRESH_MS) {
+        fetchUsage({ force: false });
+      }
     },
     closePopover,
     quotaFor,

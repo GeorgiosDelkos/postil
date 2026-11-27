@@ -86,13 +86,20 @@ export function formatCredits(credits) {
   return "";
 }
 
+// Whether `quota` carries displayable windows or credits (including cached data preserved
+// during a background refresh or after a transient probe error).
+export function hasQuotaData(quota) {
+  if (!quota || quota.status === "unavailable") return false;
+  return (Array.isArray(quota.windows) && quota.windows.length > 0) || Boolean(quota.credits);
+}
+
 // Highest alert tone across cached quota windows for the sidebar indicator:
 // "critical" (>= 95%), "warn" (>= 90%), or null.
 export function highestQuotaTone(agents) {
   if (!Array.isArray(agents)) return null;
   let tone = null;
   for (const agent of agents) {
-    if (agent.quota?.status !== "ok") continue;
+    if (!hasQuotaData(agent.quota)) continue;
     for (const win of agent.quota.windows ?? []) {
       if (win.usedPercent >= 95) return "critical";
       if (win.usedPercent >= 90) tone = "warn";
@@ -144,7 +151,12 @@ export function tokenBreakdownTitle(row) {
 // Primary compact quota windows (`5h`, `wk`, `1d`, `mo`) for the sidebar strip and agent
 // picker menus. Falls back to the first two windows when none carries `shortLabel`.
 export function compactQuotaWindows(quota) {
-  if (quota?.status !== "ok" || !Array.isArray(quota.windows) || quota.windows.length === 0) {
+  if (
+    !quota ||
+    quota.status === "unavailable" ||
+    !Array.isArray(quota.windows) ||
+    quota.windows.length === 0
+  ) {
     return [];
   }
   const tagged = quota.windows.filter((win) => win.shortLabel);
@@ -187,8 +199,39 @@ export function tightestQuotaWindow(quota) {
 export function tightestQuotaText(quota) {
   const tightest = tightestQuotaWindow(quota);
   if (tightest) return `${tightest.label} ${formatPercent(tightest.usedPercent)}`;
-  if (quota?.status === "ok" && quota.credits) return formatCredits(quota.credits);
+  if (quota && quota.status !== "unavailable" && quota.credits) {
+    return formatCredits(quota.credits);
+  }
   return "";
+}
+
+// Merges a newly fetched usage view with the previous one so agents and their last-known-good
+// quotas are never lost while a scan/probe is in flight or after a transient probe error.
+export function mergeUsageView(previousView, nextView) {
+  if (!nextView) return previousView ?? null;
+  const prevAgents = previousView?.agents;
+  if (!Array.isArray(prevAgents) || prevAgents.length === 0) return nextView;
+
+  if (!Array.isArray(nextView.agents)) {
+    return { ...nextView, agents: prevAgents };
+  }
+
+  const prevByName = new Map(prevAgents.map((agent) => [agent.name, agent]));
+  const agents = nextView.agents.map((agent) => {
+    const quota = agent.quota;
+    if (hasQuotaData(quota) || quota?.status === "unavailable") return agent;
+    const prevQuota = prevByName.get(agent.name)?.quota;
+    if (!hasQuotaData(prevQuota)) return agent;
+    return {
+      ...agent,
+      quota: {
+        ...prevQuota,
+        status: quota?.status ?? prevQuota.status,
+        message: quota?.message,
+      },
+    };
+  });
+  return { ...nextView, agents };
 }
 
 // Built-in agents to show in the sidebar quota strip and popover: enabled built-in agents when
