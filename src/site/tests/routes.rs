@@ -72,13 +72,19 @@ const ROUTES: &[(&str, &[Method], &str)] = &[
     (
         "/api/analysis",
         &[Method::GET, Method::POST, Method::DELETE],
-        "GET, POST {\"kind\": ...}, or DELETE ?diagram=<diagram id>",
+        "GET, GET ?at=<commit>, POST {\"kind\": ...}, or DELETE ?diagram=<id>",
     ),
     (
         "/api/analysis/update",
         &[Method::POST],
         "POST {\"diagram\": ...}, or with no body for every diagram",
     ),
+    (
+        "/api/analysis/start-over",
+        &[Method::POST],
+        "POST with no body",
+    ),
+    ("/api/analysis/check", &[Method::POST], "POST with no body"),
     (
         "/api/definitions",
         &[Method::GET],

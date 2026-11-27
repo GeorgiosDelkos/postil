@@ -11,14 +11,13 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Analysis, Diagram, DiagramId, DiagramKind, NodeId, RefDetail, RunId, VerifiedState, current,
-    load,
+    Analysis, CodeRef, CommitId, Diagram, DiagramId, DiagramKind, Edge, NodeId, RefDetail,
+    VerifiedState, current, load,
 };
 use crate::anchor::Target;
 use crate::error::{Error, Result};
 use crate::notes::ASK_RULES;
 use crate::repo::{PathKind, Repo};
-use crate::thread;
 
 /// The longest question a flow takes, in characters (docs/review-assist-plan.md, 8.5).
 /// Arbitrary: a question is a sentence, and the thread's branch is named from it.
@@ -96,6 +95,22 @@ pub(crate) struct Planned {
     pub(crate) prompt: String,
 }
 
+/// What the page's request comes to ([`plan`]).
+#[derive(Debug)]
+pub(crate) enum Plan {
+    /// A run to start. When `moves_checked` (an Update of every diagram), its start moves
+    /// the analysis's `checked` to the commit it starts from ([`super::move_checked`]): the
+    /// update brings the Architecture up to that commit.
+    Run {
+        planned: Planned,
+        moves_checked: bool,
+    },
+    /// An Update of every diagram with nothing outdated and no file to place, while
+    /// `checked` is not `HEAD`, this commit (the checkout moved to another history): no run,
+    /// and `checked` moves there.
+    MoveChecked(CommitId),
+}
+
 /// Checks `job` against `repo` and its analysis, and plans its run. Reads the analysis, and for
 /// an update places it, lists the files, and reads each diagram's thread for the commit its run
 /// started from. Writes nothing.
@@ -107,9 +122,12 @@ pub(crate) struct Planned {
 /// update with nothing to update or no analysis, a kind sent to the wrong route);
 /// [`Error::NoSuchDiagram`] for an update of a diagram there is not; and as [`load`],
 /// [`current`], [`Repo::files`] and [`Repo::kind`].
-pub(crate) fn plan(repo: &Repo, job: AnalysisJob) -> Result<Planned> {
+pub(crate) fn plan(repo: &Repo, job: AnalysisJob) -> Result<Plan> {
     match job {
-        AnalysisJob::New(request) => plan_new(repo, request),
+        AnalysisJob::New(request) => Ok(Plan::Run {
+            planned: plan_new(repo, request)?,
+            moves_checked: false,
+        }),
         AnalysisJob::Update(request) => plan_update(repo, request),
     }
 }
@@ -211,7 +229,7 @@ fn subject(repo: &Repo, of: &str) -> Result<String> {
     }
 }
 
-fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Planned> {
+fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Plan> {
     let UpdateRequest { diagram } = request;
     let scope = diagram
         .as_deref()
@@ -231,99 +249,98 @@ fn plan_update(repo: &Repo, request: UpdateRequest) -> Result<Planned> {
     {
         return Err(Error::NoSuchDiagram { id: id.to_string() });
     }
-    let in_scope = |diagram: &&Diagram| scope.is_none_or(|id| diagram.id == id);
-    let outdated: Vec<NodeId> = analysis
-        .diagrams
-        .iter()
-        .filter(in_scope)
-        .flat_map(|diagram| &diagram.nodes)
-        .filter(|node| {
-            node.anchors.iter().any(|anchor| {
-                matches!(
-                    anchor.detail,
-                    RefDetail::Verified {
-                        placed: VerifiedState::Outdated,
-                        ..
-                    }
-                )
-            })
-        })
-        .map(|node| node.id)
-        .collect();
-    let new_files = off_the_map(repo, &analysis, scope)?;
+    let in_scope = |diagram: &Diagram| scope.is_none_or(|id| diagram.id == id);
+    let outdated = outdated_nodes(&analysis, in_scope);
+    let new_files = super::off_the_map(repo, &analysis, scope)?;
+    // Only an update of every diagram brings the whole Architecture up to the commit it starts
+    // from: one of a single diagram leaves the others' outdated nodes to the forced update.
+    let moves_checked = super::has_architecture(&analysis) && scope.is_none();
     if outdated.is_empty() && new_files.is_empty() {
+        if moves_checked
+            && let Some(head) = CommitId::of_head(repo)?
+            && analysis.checked.as_ref() != Some(&head)
+        {
+            return Ok(Plan::MoveChecked(head));
+        }
         return Err(Error::BadRequest(
             "nothing is outdated and no file was added since the analysis: there is nothing to \
              update"
                 .to_owned(),
         ));
     }
-    let prompt = update_prompt(&analysis, scope, &outdated, &new_files);
-    Ok(Planned {
-        run: AnalysisRun {
-            kind: AnalysisKind::Update,
-            of: scope.map(|id| id.to_string()),
-            nodes: outdated,
+    let prompt = update_prompt(&analysis, in_scope, &outdated, &new_files);
+    Ok(Plan::Run {
+        planned: Planned {
+            run: AnalysisRun {
+                kind: AnalysisKind::Update,
+                of: scope.map(|id| id.to_string()),
+                nodes: outdated,
+            },
+            title: "update analysis".to_owned(),
+            prompt,
         },
-        title: "update analysis".to_owned(),
-        prompt,
+        moves_checked,
     })
 }
 
-/// The files in the file list that no verified reference of the analysis covers and that
-/// were added since the run of a top-level Architecture diagram in scope: what an update asks
-/// to place. A diagram whose run has no thread in the record (an analysis written by hand)
-/// adds nothing: every file would read as new. Sorted, as [`Repo::files`] lists them.
-fn off_the_map(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result<Vec<String>> {
-    let runs: Vec<RunId> = analysis
-        .diagrams
-        .iter()
-        .filter(|diagram| scope.is_none_or(|id| diagram.id == id))
-        .filter(|diagram| {
-            matches!(diagram.kind, DiagramKind::Architecture) && diagram.parent.is_none()
-        })
-        .map(|diagram| diagram.run)
-        .collect();
-    let mut known: Option<HashSet<String>> = None;
-    for run in runs {
-        let Some(fork) = thread::find(repo, &run.to_string())?.map(|thread| thread.fork) else {
-            continue;
-        };
-        // A commit gone from the repository (a history rewritten since) gives no list, so
-        // nothing reads as new.
-        let Ok(at_fork) = repo.files_at(&fork) else {
-            continue;
-        };
-        // A file is new when some diagram's run did not see it: known are the files all saw.
-        known = Some(match known {
-            Some(seen) => seen.intersection(&at_fork).cloned().collect(),
-            None => at_fork,
-        });
+/// The run of a forced update (docs/review-assist-plan.md, 8.7): an Update of the Architecture
+/// diagrams of `analysis`, which is placed where its code is in the commit the run starts from,
+/// whose files are `files`; `added` are the files added since `checked` that no reference
+/// covers. Flow and Data diagrams wait for an Update the engineer asks for. Reads the record
+/// of threads.
+///
+/// # Errors
+///
+/// As [`thread::all`](crate::thread::all).
+pub(super) fn plan_architecture_update(
+    repo: &Repo,
+    analysis: &Analysis,
+    files: &HashSet<String>,
+    added: &[String],
+) -> Result<Planned> {
+    let architecture = |diagram: &Diagram| diagram.kind == DiagramKind::Architecture;
+    let outdated = outdated_nodes(analysis, architecture);
+    let new_files = super::off_the_map_at(repo, analysis, files, added)?;
+    Ok(Planned {
+        prompt: update_prompt(analysis, architecture, &outdated, &new_files),
+        run: AnalysisRun {
+            kind: AnalysisKind::Update,
+            of: None,
+            nodes: outdated,
+        },
+        title: "update analysis".to_owned(),
+    })
+}
+
+/// The nodes of the diagrams `in_scope` keeps that an update sends as outdated: those with an
+/// outdated reference, and those with an edge out of them whose reference is outdated, since
+/// an update may change only the nodes it sends, and an edge goes with its `from` node.
+fn outdated_nodes(analysis: &Analysis, in_scope: impl Fn(&Diagram) -> bool) -> Vec<NodeId> {
+    let mut outdated = Vec::new();
+    for diagram in analysis.diagrams.iter().filter(|diagram| in_scope(diagram)) {
+        for node in &diagram.nodes {
+            let edges = diagram.edges.iter().filter(|edge| edge.from == node.id);
+            let stale = node.anchors.iter().any(is_outdated)
+                || edges
+                    .filter_map(|edge| edge.anchor.as_ref())
+                    .any(is_outdated);
+            if stale {
+                outdated.push(node.id);
+            }
+        }
     }
-    let Some(known) = known else {
-        return Ok(Vec::new());
-    };
-    let covers = |file: &str| {
-        analysis.diagrams.iter().any(|diagram| {
-            diagram
-                .nodes
-                .iter()
-                .flat_map(|node| &node.anchors)
-                .chain(diagram.edges.iter().filter_map(|edge| edge.anchor.as_ref()))
-                .filter(|anchor| matches!(anchor.detail, RefDetail::Verified { .. }))
-                .any(|anchor| {
-                    file == anchor.path
-                        || file
-                            .strip_prefix(anchor.path.as_str())
-                            .is_some_and(|rest| rest.starts_with('/'))
-                })
-        })
-    };
-    Ok(repo
-        .files()?
-        .into_iter()
-        .filter(|file| !known.contains(file) && !covers(file))
-        .collect())
+    outdated
+}
+
+/// Whether `anchor` was verified and its code is no longer where it is placed.
+fn is_outdated(anchor: &CodeRef) -> bool {
+    matches!(
+        anchor.detail,
+        RefDetail::Verified {
+            placed: VerifiedState::Outdated,
+            ..
+        }
+    )
 }
 
 /// How a reply's diagrams are written, for Analyze, a deeper analysis and a flow.
@@ -381,7 +398,7 @@ fn flow_prompt(question: &str, from: Option<&str>) -> String {
 
 fn update_prompt(
     analysis: &Analysis,
-    scope: Option<DiagramId>,
+    in_scope: impl Fn(&Diagram) -> bool,
     outdated: &[NodeId],
     new_files: &[String],
 ) -> String {
@@ -391,11 +408,7 @@ fn update_prompt(
          cite it.\n",
     );
     let line = "writing to a String cannot fail";
-    for diagram in analysis
-        .diagrams
-        .iter()
-        .filter(|diagram| scope.is_none_or(|id| diagram.id == id))
-    {
+    for diagram in analysis.diagrams.iter().filter(|diagram| in_scope(diagram)) {
         let stale: Vec<_> = diagram
             .nodes
             .iter()
@@ -429,26 +442,22 @@ fn update_prompt(
             )
             .expect(line);
             for anchor in &node.anchors {
-                match &anchor.detail {
-                    RefDetail::Verified {
-                        target: Target::Lines { lines, snippet },
-                        placed: VerifiedState::Outdated,
-                    } => {
-                        write!(
-                            text,
-                            "It cited {} lines {} to {}, which read:\n{}\n",
-                            anchor.path,
-                            lines.start,
-                            lines.end,
-                            indented(snippet)
-                        )
-                        .expect(line);
-                    }
-                    RefDetail::Verified {
-                        placed: VerifiedState::Outdated,
-                        ..
-                    } => writeln!(text, "It cited {}, which is gone.", anchor.path).expect(line),
-                    RefDetail::Verified { .. } | RefDetail::Unverified { .. } => {}
+                write_outdated(&mut text, "It cited", anchor);
+            }
+            // A replaced node loses its edges out (`merge::update_one`): the reply gives back
+            // those that still hold, an outdated one cited anew.
+            let edges: Vec<&Edge> = diagram
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node.id)
+                .collect();
+            if !edges.is_empty() {
+                text.push_str(
+                    "Its edges out go with it when it is replaced; give back in edges those that \
+                     still hold, citing the code as it is now:\n",
+                );
+                for edge in edges {
+                    write_edge(&mut text, edge);
                 }
             }
         }
@@ -485,6 +494,66 @@ fn update_prompt(
     );
     text.push_str(ASK_RULES);
     text
+}
+
+/// Writes what `anchor` cited, after `lead`, when it is outdated; nothing otherwise.
+fn write_outdated(text: &mut String, lead: &str, anchor: &CodeRef) {
+    let line = "writing to a String cannot fail";
+    match &anchor.detail {
+        RefDetail::Verified {
+            target: Target::Lines { lines, snippet },
+            placed: VerifiedState::Outdated,
+        } => {
+            write!(
+                text,
+                "{lead} {} lines {} to {}, which read:\n{}\n",
+                anchor.path,
+                lines.start,
+                lines.end,
+                indented(snippet)
+            )
+            .expect(line);
+        }
+        RefDetail::Verified {
+            placed: VerifiedState::Outdated,
+            ..
+        } => writeln!(text, "{lead} {}, which is gone.", anchor.path).expect(line),
+        RefDetail::Verified { .. } | RefDetail::Unverified { .. } => {}
+    }
+}
+
+/// Writes `edge` as a line of an outdated node's edges out: where it goes, its label, and what it
+/// cites, quoted when that is outdated.
+fn write_edge(text: &mut String, edge: &Edge) {
+    let line = "writing to a String cannot fail";
+    write!(text, "- to {}, \"{}\"", edge.to, edge.label).expect(line);
+    let Some(anchor) = &edge.anchor else {
+        text.push_str(".\n");
+        return;
+    };
+    match &anchor.detail {
+        RefDetail::Verified {
+            placed: VerifiedState::Outdated,
+            ..
+        } => {
+            text.push_str(": ");
+            write_outdated(text, "it cited", anchor);
+        }
+        RefDetail::Verified {
+            target: Target::Lines { lines, .. },
+            placed: VerifiedState::Found,
+        } => writeln!(
+            text,
+            ": it cites {} lines {} to {}.",
+            anchor.path, lines.start, lines.end
+        )
+        .expect(line),
+        RefDetail::Verified {
+            target: Target::Path(_),
+            placed: VerifiedState::Found,
+        } => writeln!(text, ": it cites {}.", anchor.path).expect(line),
+        RefDetail::Unverified { .. } => text.push_str(".\n"),
+    }
 }
 
 /// `snippet` with each line indented by four spaces, so a prompt quotes code without a fence.

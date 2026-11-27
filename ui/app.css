@@ -66,6 +66,13 @@
   --added-wash: rgb(166 201 149 / 10%);
   --removed: #e0949b;
   --removed-wash: rgb(224 148 155 / 10%);
+  /* The map (ui/diagram-view.js): a node's selection and the lines it stands for in the code.
+     A muted orchid (hue about 307 degrees here, 314 in Paper), in the gap between the keyword
+     color's violet (about 265) and the removed rose (about 355), and apart from the accent's
+     blue, the note's amber and the added green: a mapped line's keywords stay readable as
+     keywords. A violet (#b8a5d6) was tried first and was the keyword color's twin. */
+  --map: #d79ad0;
+  --map-wash: rgb(215 154 208 / 10%);
   --attention: #f0907f;
   --attention-border: #5a3b38;
 
@@ -135,6 +142,8 @@
     --added-wash: rgb(28 115 52 / 9%);
     --removed: #b3261e;
     --removed-wash: rgb(179 38 30 / 8%);
+    --map: #a33a8a;
+    --map-wash: rgb(163 58 138 / 8%);
     --attention: #b4471f;
     --attention-border: #e7b9a6;
 
@@ -478,6 +487,15 @@ kbd {
   cursor: text;
 }
 
+/* Before the note rules: a note on the lines a map node stands for shows as noted. */
+.ln.mapped {
+  background: var(--map-wash);
+}
+
+.ln.mapped .n {
+  color: var(--map);
+}
+
 .ln.noted {
   background: var(--note-wash);
 }
@@ -511,6 +529,86 @@ kbd {
   font: 12px "Geist", sans-serif;
   line-height: var(--line-height);
   color: var(--note);
+}
+
+/* The map's node on a line (docs/review-assist.md, "The link shown in the code"): a stripe at
+   the gutter's left edge, left of the +, dashed when the node's code is outdated. Under a line
+   whose composer is open it reaches past the composer to the node's next line. A height, not
+   `bottom: 0`: an empty button is sized by its content, which `top` and `bottom` may not
+   override in WebKit. */
+.ln .map-stripe {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 6px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 3px solid var(--map);
+  background: none;
+  cursor: pointer;
+}
+
+.ln .map-stripe.outdated {
+  border-left-style: dashed;
+}
+
+.ln .map-stripe.continues {
+  height: calc(100% + var(--composer-height, 138px));
+}
+
+/* A flow's step number, while the map shows that flow. The + takes its place on hover. */
+.ln .map-step {
+  position: absolute;
+  left: 6px;
+  width: 16px;
+  text-align: center;
+  font: 600 10.5px "Geist", sans-serif;
+  line-height: var(--line-height);
+  color: var(--map);
+  pointer-events: none;
+}
+
+.ln:hover .map-step {
+  opacity: 0;
+}
+
+/* The node's name at the end of its first line, cut at 180 px with the whole name in its
+   title, and the count of other diagrams on the line. */
+.ln .map-chip,
+.ln .map-chip-more {
+  flex: none;
+  align-self: center;
+  height: 17px;
+  padding: 0 7px;
+  margin-right: 6px;
+  background: var(--map-wash);
+  border: 1px solid var(--map);
+  border-radius: 5px;
+  color: var(--map);
+  font: 500 11.5px/15px "Geist", sans-serif;
+  white-space: nowrap;
+  user-select: none;
+  cursor: pointer;
+}
+
+.ln .map-chip {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ln .map-chip-more {
+  padding: 0 5px;
+}
+
+/* A code column under 520 px has no room for chips; the stripes stay. `.code` is the
+   container. */
+@container (width < 520px) {
+  .ln .map-chip,
+  .ln .map-chip-more {
+    display: none;
+  }
 }
 
 .k { color: var(--syntax-keyword); }
@@ -2301,8 +2399,19 @@ body.keyboard-input .slot-add:focus-visible {
   accent-color: var(--accent);
 }
 
+/* The code pane holds the map, when open, and the code column beside it. The send step's
+   prompt and the changes view cover the code column only, so the map stays beside them. */
 .code-pane {
+  flex-direction: row;
+}
+
+.code-column {
   position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .prompt-preview {
@@ -2901,6 +3010,11 @@ body.keyboard-input .slot-add:focus-visible {
 
 #divider-tray {
   right: calc(var(--tray-width, 320px) + 8px);
+}
+
+/* On the map's right border: the map starts a gap right of the file list (ui/panes.js). */
+#divider-map {
+  left: calc(var(--sidebar-width, 248px) + var(--map-width, 400px) + 4px);
 }
 
 .divider::after {
@@ -3910,7 +4024,8 @@ body.focus-mode > .tray {
   overflow: hidden;
 }
 
-body.focus-mode > .divider {
+body.focus-mode > .divider,
+body.focus-mode .map-pane {
   display: none;
 }
 
@@ -4451,4 +4566,643 @@ body.focus-mode .code {
   font-size: 11.5px;
   color: var(--accent);
   border-color: var(--accent);
+}
+
+/* The map (docs/review-assist.md, "What the engineer sees"; ui/diagram-view.js): the diagrams
+   in the code pane, left of the code. Drawn as SVG at fixed sizes in CSS px (ui/diagram.js), so
+   the code's font size never moves a node. */
+
+.repo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.repo-row .repo-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.map-toggle {
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.map-toggle:hover {
+  background: var(--hover);
+}
+
+.map-toggle[aria-pressed="true"] {
+  border-color: var(--map);
+  color: var(--map);
+}
+
+.map-pane {
+  flex: none;
+  width: var(--map-width, 400px);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+
+/* A window too narrow for both shows the map alone, across the code pane (ui/panes.js). */
+.code-pane.map-full > .map-pane {
+  width: auto;
+  flex: 1;
+  border-right: 0;
+}
+
+.code-pane.map-full > .code-column {
+  display: none;
+}
+
+.map-header {
+  gap: 10px;
+}
+
+/* The room between the change map's esc and the counts, cut with an ellipsis when short. */
+.map-crumbs {
+  flex: 1;
+  min-width: 0;
+}
+
+.map-crumb {
+  padding: 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.map-crumb:hover {
+  color: var(--text-strong);
+}
+
+.map-dropped {
+  color: var(--attention);
+}
+
+.map-tools {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.map-kinds {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.map-kind {
+  height: 26px;
+  padding: 0 10px;
+  background: transparent;
+  border: 0;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.map-kind + .map-kind {
+  border-left: 1px solid var(--border-strong);
+}
+
+.map-kind[aria-pressed="true"] {
+  background: var(--raised);
+  color: var(--text-strong);
+}
+
+.map-search {
+  flex: 1;
+  min-width: 120px;
+  height: 26px;
+  padding: 0 8px;
+}
+
+.map-top {
+  height: 26px;
+}
+
+.map-update {
+  height: 26px;
+}
+
+/* The Flows list: the box that asks for a flow, then a row per flow. */
+.map-flows {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.map-flow-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.map-flow-question {
+  flex: 1;
+  min-width: 120px;
+  height: 26px;
+  padding: 0 8px;
+}
+
+.map-flow-trace {
+  height: 26px;
+}
+
+.map-flow-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 40%;
+  padding: 0 4px 0 8px;
+  height: 22px;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--map);
+  border-radius: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* The label gives way to the ×, which stays whole. */
+.map-flow-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-flow-chip-clear {
+  flex: none;
+}
+
+.map-flow-chip-clear,
+.map-flow-delete {
+  padding: 0 4px;
+  background: none;
+  border: 0;
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.map-flow-chip-clear:hover,
+.map-flow-delete:hover {
+  color: var(--text-strong);
+}
+
+.map-flow-problem {
+  margin: 0;
+  color: var(--attention);
+  font-size: 12px;
+}
+
+.map-flow-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.map-flow-list:empty {
+  display: none;
+}
+
+.map-flow-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+}
+
+.map-flow-item:hover {
+  background: var(--hover);
+}
+
+.map-flow-open {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  background: none;
+  border: 0;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.map-flow-open[aria-current="true"] {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+
+/* The first click of Delete arms it, as a note card's does. */
+.map-flow-item.confirming .map-flow-delete {
+  color: var(--attention);
+}
+
+/* Not on the map: the files added since the diagram's run that no node covers. */
+.map-unmapped {
+  flex: none;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.map-unmapped-title {
+  color: var(--note);
+  cursor: pointer;
+}
+
+.map-unmapped-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 160px;
+  margin-top: 4px;
+  overflow-y: auto;
+}
+
+.map-unmapped-file {
+  padding: 2px 6px;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-soft);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.map-unmapped-file:hover {
+  background: var(--hover);
+  color: var(--text-strong);
+}
+
+.map-unmapped-more,
+.map-unmapped-note {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+}
+
+.map-run {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.map-run .button {
+  height: 26px;
+}
+
+.map-run-status {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+}
+
+.map-run-problem {
+  color: var(--attention);
+}
+
+.map-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  outline: none;
+  cursor: grab;
+}
+
+.map-body.panning {
+  cursor: grabbing;
+}
+
+.map-card {
+  margin: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  cursor: default;
+  user-select: text;
+}
+
+.map-card p {
+  margin: 0;
+}
+
+.map-empty-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.map-empty-note {
+  color: var(--text-muted);
+}
+
+.map-error p {
+  color: var(--attention);
+  overflow-wrap: anywhere;
+}
+
+.map-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.map-group-box {
+  fill: var(--card);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.map-group-label {
+  fill: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.map-group-head {
+  cursor: pointer;
+  outline: none;
+}
+
+.map-group-head:hover .map-group-label {
+  fill: var(--text-strong);
+}
+
+/* A search match, or the boundary of the code pane's line; before the selection, as for cards. */
+.map-group-head.ringed .map-group-label {
+  fill: var(--accent);
+}
+
+.map-group-head.selected .map-group-label,
+.map-group-head:focus-visible .map-group-label {
+  fill: var(--map);
+}
+
+.map-edge-line {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.map-arrow {
+  fill: var(--border-strong);
+}
+
+.map-edge-label {
+  fill: var(--text-muted);
+  font-size: 11px;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+}
+
+.map-node {
+  cursor: pointer;
+  outline: none;
+}
+
+.map-node-box {
+  fill: var(--raised);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.map-node-band,
+.map-node-inset {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.map-node-label {
+  fill: var(--text-strong);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.map-node-summary {
+  fill: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.map-node-deeper {
+  fill: var(--text-muted);
+  font-size: 14px;
+}
+
+.map-node:hover .map-node-box {
+  fill: var(--hover);
+}
+
+/* The agent's citation never matched the code: the card says so and is drawn dashed. */
+.map-node.unverified .map-node-box {
+  stroke-dasharray: 4 3;
+}
+
+.map-node.unverified .map-node-summary {
+  fill: var(--attention);
+}
+
+.map-node.outdated .map-node-summary {
+  fill: var(--note);
+}
+
+/* Its code moved or went since the analysis: dashed in the note color, which Update fixes. A
+   boundary is marked as a card is. */
+.map-node.outdated .map-node-box,
+.map-group.outdated .map-group-box {
+  stroke: var(--note);
+  stroke-dasharray: 4 3;
+}
+
+.map-group.unverified .map-group-box {
+  stroke-dasharray: 4 3;
+}
+
+/* A flow's step number, before the label. */
+.map-node-step {
+  fill: var(--map);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+/* A change map's touched node: filled with the added color mixed into the card's own, opaque, so
+   the edges drawn straight behind cards do not show through, and light enough that the label
+   and summary keep their contrast in both palettes. */
+.map-node.touched .map-node-box {
+  fill: color-mix(in srgb, var(--added) 18%, var(--raised));
+  stroke: var(--added);
+  stroke-width: 1.5;
+}
+
+.map-node.touched:hover .map-node-box {
+  fill: color-mix(in srgb, var(--added) 18%, var(--hover));
+}
+
+.map-node.touched .map-node-band,
+.map-node.touched .map-node-inset {
+  stroke: var(--added);
+}
+
+/* One edge from a touched node: outlined only. Before the ring and the selection, which win. */
+.map-node.near .map-node-box,
+.map-group.near .map-group-box {
+  stroke: var(--added);
+  stroke-width: 1.5;
+}
+
+.map-group.touched .map-group-box {
+  fill: color-mix(in srgb, var(--added) 12%, var(--card));
+  stroke: var(--added);
+  stroke-width: 1.5;
+}
+
+/* The change map's way back: never shrunk, so the crumbs beside it take the ellipsis. */
+.map-change-exit {
+  flex: none;
+}
+
+/* A search match, or the node of the code pane's line. */
+.map-node.ringed .map-node-box {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+/* After the ring: the selected node shows as selected when a search also matches it. */
+.map-node.selected .map-node-box {
+  stroke: var(--map);
+  stroke-width: 2;
+}
+
+.map-node:focus-visible .map-node-box,
+body.keyboard-input .map-node:focus .map-node-box {
+  stroke: var(--map);
+  stroke-width: 2.5;
+}
+
+/* Analyze deeper and Trace from here, in a node's dialog. */
+.node-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.node-show,
+.node-deeper {
+  align-self: flex-start;
+}
+
+.node-detail {
+  user-select: text;
+}
+
+.node-anchors,
+.node-edges,
+.node-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.node-anchor,
+.node-edge-node,
+.node-edge-code {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 8px;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font: 12px var(--font-mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.node-anchor:hover:not(:disabled),
+.node-edge-node:hover,
+.node-edge-code:hover {
+  background: var(--hover);
+}
+
+.node-anchor:disabled {
+  cursor: default;
+}
+
+.node-anchor-place {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.node-anchor-state {
+  color: var(--attention);
+  font-family: "Geist", system-ui, sans-serif;
+}
+
+.node-anchor.outdated .node-anchor-state {
+  color: var(--note);
+}
+
+.node-edge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.node-edge-node {
+  font-family: "Geist", system-ui, sans-serif;
+  font-size: 12.5px;
+}
+
+.node-edge-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.node-edge-code {
+  color: var(--text-muted);
 }

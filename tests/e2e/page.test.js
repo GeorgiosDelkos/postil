@@ -7,8 +7,10 @@
 // the node under the pointer while it drew the run again (docs/review-2026-11-23.md, D4).
 
 import assert from "node:assert/strict";
-import { unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, sep } from "node:path";
 import { after, before, test } from "node:test";
 
 import { webkit } from "playwright-core";
@@ -261,16 +263,23 @@ test("a review's finding shows beside its line, unfolds its hunk as eyes, and on
     assert.ok(Date.now() < deadline, `R1 is ${status}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
 
+  // Its changes open before the review, with no finding yet; shown again after it, the same
+  // diff is not read again, but the findings are the review's.
   await page.locator("#tab-run").click();
   await page.locator("#run .run-entry").click();
   const detail = page.locator("#run-detail");
+  await detail.getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  await changes.locator(".changes-step-number", { hasText: /^Step 1 of 1$/ }).waitFor();
+  assert.equal(await changes.locator(".changes-finding").count(), 0, "no review yet");
+  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
+
+  await page.locator("#run .run-entry").click();
   // The run's dialog lists the findings once the page holds the review.
   await detail.locator(".run-card.finding").filter({ hasText: "no test" }).waitFor();
   await detail.getByRole("button", { name: "Changes" }).click();
 
-  const changes = page.locator("#changes-view");
   await changes
     .locator(":scope > .changes-loose .changes-finding", { hasText: "no test" })
     .waitFor();
@@ -1494,4 +1503,1237 @@ test("Cmd-[ comes back to where the file was scrolled", async (t) => {
   await page.keyboard.press("Meta+BracketLeft");
   await page.locator("#crumbs b").filter({ hasText: "long.rs" }).waitFor();
   await page.waitForFunction((top) => document.getElementById("code").scrollTop === top, scrolled);
+});
+
+// ---- The map (docs/review-assist-plan.md, 8.3) --------------------------------------------
+
+// An analysis of the default files, written by hand as an agent's run would leave it: a
+// component on line 2 of src/a.rs inside a boundary, a store on src/b.rs, and an edge between
+// the two cards (src/analysis.rs, "The file").
+const ANALYSIS = {
+  version: 2,
+  diagrams: [
+    {
+      id: "D1",
+      kind: "architecture",
+      title: "System",
+      run: "R1",
+      nodes: [
+        {
+          id: "D1.1",
+          kind: "component",
+          label: "Parser",
+          summary: "reads the input",
+          detail: "Turns **text** into tokens.",
+          group: "D1.3",
+          anchors: [
+            { path: "src/a.rs", target: "lines", lines: { start: 2, end: 2 }, snippet: "two" },
+          ],
+        },
+        {
+          id: "D1.2",
+          kind: "store",
+          label: "Cache",
+          summary: "keeps tokens",
+          detail: "",
+          anchors: [{ path: "src/b.rs", target: "file", state: "found" }],
+        },
+        {
+          id: "D1.3",
+          kind: "boundary",
+          label: "Process",
+          summary: "",
+          detail: "",
+          anchors: [{ path: "src", target: "folder" }],
+        },
+      ],
+      edges: [{ from: "D1.1", to: "D1.2", label: "fills" }],
+    },
+  ],
+};
+
+// Writes `analysis` into the open project's analysis file, as an analysis run would.
+async function writeAnalysis(api, analysis = ANALYSIS) {
+  const { root } = await api("api/repo");
+  mkdirSync(join(root, ".git/postil"), { recursive: true });
+  writeFileSync(join(root, ".git/postil/analysis.json"), JSON.stringify(analysis));
+}
+
+// Opens a project with `ANALYSIS` written, and counts the page's requests for the layout
+// library.
+async function openMapped(t, scenario = "flood", options = {}) {
+  const opened = await openProject(t, scenario, "new", options);
+  await writeAnalysis(opened.api);
+  const dagre = [];
+  opened.page.on("request", (request) => {
+    if (request.url().endsWith("vendor/dagre.min.js")) dagre.push(request.url());
+  });
+  return { ...opened, dagre };
+}
+
+// The card whose label is `label`, whole: `hasText` alone matches any card whose text holds it
+// anywhere, case-insensitively ("Far" in "runs on far past").
+const node = (page, label) => {
+  const exact = new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+  return page
+    .locator(".map-node")
+    .filter({ has: page.locator(".map-node-label", { hasText: exact }) });
+};
+
+test("the map loads its layout only when opened, and a node's click opens its lines", async (t) => {
+  const { page, dagre } = await openMapped(t);
+  assert.deepEqual(dagre, [], "a window that never opens the map never loads dagre");
+
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").waitFor();
+  assert.equal(dagre.length, 1);
+  assert.equal(await page.locator("#toggle-map").getAttribute("aria-pressed"), "true");
+
+  await node(page, "Parser").click();
+  await page.locator("#crumbs b").filter({ hasText: "a.rs" }).waitFor();
+  await page.locator('#code-rows .ln.mapped[data-line="1"]').waitFor();
+  assert.equal(await page.locator("#code-rows .ln.mapped").count(), 1, "line 2 alone");
+  assert.match(await node(page, "Parser").getAttribute("class"), /\bselected\b/);
+
+  // Closing and opening again loads nothing more.
+  await page.evaluate(() => window.postil.menu("map"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.equal(dagre.length, 1);
+});
+
+test("the changes view opens beside the map, and Escape closes it, not the map", async (t) => {
+  const { page, api } = await openMapped(t);
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").waitFor();
+  await startRun(page, api, [await addNote(api, "Rename two.")]);
+  await page.locator("#run .run-entry").click();
+  await page.locator("#run-detail").getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  await changes.waitFor();
+
+  const map = await page.locator("#map").boundingBox();
+  const covered = await changes.boundingBox();
+  assert.ok(covered.x >= map.x + map.width - 1, "the changes view covers the code, not the map");
+  await node(page, "Parser").waitFor();
+
+  await page.locator("#tab-notes").focus();
+  await page.keyboard.press("Escape");
+  await changes.waitFor({ state: "hidden" });
+  assert.ok(await page.locator("#map").isVisible(), "the map stays");
+});
+
+test("the map's divider resizes the map and keeps its width; focus mode hides the map", async (t) => {
+  const { page, api } = await openMapped(t);
+  // Room for the map to grow beside the code (ui/panes.js, `fit`).
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").waitFor();
+  const divider = page.locator("#divider-map");
+  const before = await page.locator("#map").boundingBox();
+  const box = await divider.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + 200);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 60, box.y + 200, { steps: 4 });
+  await page.mouse.up();
+  const after = await page.locator("#map").boundingBox();
+  assert.ok(Math.abs(after.width - before.width - 60) <= 2, `${before.width} to ${after.width}`);
+  // The width is saved after 300 ms of quiet (dividers.js): read until it lands.
+  const deadline = Date.now() + WAIT;
+  let saved = (await api("api/layout")).map;
+  while (Math.abs(saved - after.width) > 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    saved = (await api("api/layout")).map;
+  }
+  assert.ok(Math.abs(saved - after.width) <= 2, `saved ${saved}, drawn ${after.width}`);
+
+  await page.evaluate(() => window.postil.menu("focus-mode"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.ok(!(await divider.isVisible()), "nor its divider");
+  // Cmd-Shift-M leaves focus mode, the map open as it was.
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+});
+
+test("a node's dialog shows its detail, code, connections and notes, and Add note writes there", async (t) => {
+  const { page, api } = await openMapped(t);
+  const request = {
+    path: "src/a.rs",
+    lines: { start: 2, end: 2 },
+    snippet: "two",
+    body: "On two.",
+  };
+  await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  // The page read the notes as it opened, before this one: the window's focus reads them again,
+  // as it does on returning from another app.
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator("#notes").getByText("On two.").waitFor();
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").dblclick();
+
+  const dialog = page.locator("#node-dialog");
+  await dialog.waitFor();
+  assert.equal(await dialog.locator(".note-dialog-title").textContent(), "Parser");
+  // The detail is the Markdown subset, drawn as elements, never as HTML.
+  assert.equal(await dialog.locator(".node-detail strong").textContent(), "text");
+  await dialog.locator(".node-anchor").filter({ hasText: "src/a.rs:2" }).waitFor();
+  await dialog.locator(".node-edge").filter({ hasText: "Cache" }).waitFor();
+  await dialog.getByText("On two.").waitFor();
+
+  await dialog.getByRole("button", { name: "Add note" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  await page.locator("#note-body").waitFor();
+  assert.equal(await page.locator("#code-rows .ln.selected").getAttribute("data-line"), "1");
+});
+
+test("the keyboard moves between nodes, and Enter opens the dialog", async (t) => {
+  const { page } = await openMapped(t);
+  await page.locator("#toggle-map").click();
+  await node(page, "Parser").focus();
+  // The arrow that points from Parser to Cache as dagre placed them: the edge between them
+  // crosses a boundary, so it is not laid out and does not put Cache to the right
+  // (ui/diagram.js, `layoutDiagram`).
+  const from = await node(page, "Parser").boundingBox();
+  const to = await node(page, "Cache").boundingBox();
+  const [dx, dy] = [to.x - from.x, to.y - from.y];
+  const vertical = Math.abs(dy) > Math.abs(dx);
+  const arrow = vertical ? (dy > 0 ? "ArrowDown" : "ArrowUp") : dx > 0 ? "ArrowRight" : "ArrowLeft";
+  await page.keyboard.press(arrow);
+  await page.waitForFunction(() => document.activeElement?.dataset?.nodeId === "D1.2");
+  await page.keyboard.press("Enter");
+  await page.locator("#node-dialog .note-dialog-title").filter({ hasText: "Cache" }).waitFor();
+  await page.keyboard.press("Escape");
+  await page.locator("#node-dialog").waitFor({ state: "hidden" });
+  await page.locator("#map .map-body").focus();
+  await page.keyboard.press("/");
+  await page.waitForFunction(() => document.activeElement?.classList.contains("map-search"));
+});
+
+test("a failed load of the layout library offers Retry, and the code still opens", async (t) => {
+  const { page } = await openMapped(t);
+  await page.route("**/vendor/dagre.min.js", (route) => route.abort());
+  await page.locator("#toggle-map").click();
+  const retry = page.locator(".map-retry");
+  await retry.waitFor();
+
+  await openFile(page, "src/b.rs");
+  await page.locator("#code-rows .ln").first().waitFor();
+
+  await page.unroute("**/vendor/dagre.min.js");
+  await retry.click();
+  await node(page, "Parser").waitFor();
+});
+
+test("with no analysis the map names the Analyzer, and Analyze draws one that keeps the selection", async (t) => {
+  // The repository the fake agent's analysis cites (tests/fake-agent.mjs, `analysisReply`).
+  const files = { "src/a.rs": "fn a() {\n    one();\n}\n", "src/b.rs": "x\ny\nfn two() {\n}\n" };
+  const { page } = await openProject(t, "analysis", "new", { files });
+  await page.locator("#toggle-map").click();
+  const empty = page.locator(".map-empty");
+  await empty.waitFor();
+  assert.match(await empty.textContent(), /Fake reads the last commit \(HEAD\), read-only/);
+
+  await empty.getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  await node(page, "Page").click();
+  await page.locator('#code-rows .ln.mapped[data-line="1"]').waitFor();
+
+  // The window regains focus: the analysis is read again, and the node stays selected.
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.waitForFunction(() =>
+    document.querySelector(".map-node.selected")?.textContent.includes("Page"),
+  );
+});
+
+test("a window too narrow for the map and the code shows one at a time", async (t) => {
+  const { page } = await openMapped(t);
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.ok(!(await page.locator("#code").isVisible()), "the map takes the whole pane");
+  assert.ok(!(await page.locator("#divider-map").isVisible()));
+
+  await page.evaluate(() => window.postil.menu("map"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.ok(await page.locator("#code").isVisible(), "Cmd-Shift-M switches to the code");
+  await page.evaluate(() => window.postil.menu("map"));
+  // A click opens the node's dialog, so a double-click is not cut short by the switch; its
+  // Show in code gives the pane to the code.
+  await node(page, "Parser").click();
+  const dialog = page.locator("#node-dialog");
+  await dialog.waitFor();
+  assert.ok(await page.locator("#map").isVisible(), "the map stays until asked");
+  await dialog.getByRole("button", { name: "Show in code" }).click();
+  await page.locator('#code-rows .ln.mapped[data-line="1"]').waitFor();
+  assert.ok(!(await page.locator("#map").isVisible()));
+});
+
+test("focus mode in a narrow window shows the code, and Cmd-Shift-M comes back to the map", async (t) => {
+  const { page } = await openMapped(t);
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+
+  await page.evaluate(() => window.postil.menu("focus-mode"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.ok(await page.locator("#code").isVisible(), "focus mode shows the code, not nothing");
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.ok(!(await page.locator("#code").isVisible()), "out of focus mode onto the map");
+
+  // Switched to the code first, then focus mode and Cmd-Shift-M: the map, all the same.
+  await page.evaluate(() => window.postil.menu("map"));
+  await page.locator("#map").waitFor({ state: "hidden" });
+  await page.evaluate(() => window.postil.menu("focus-mode"));
+  await page.evaluate(() => window.postil.menu("map"));
+  await node(page, "Parser").waitFor();
+  assert.ok(!(await page.locator("#code").isVisible()));
+});
+
+test("an analysis file this build cannot read offers Start over, which clears the map", async (t) => {
+  const { page, api } = await openProject(t);
+  const { root } = await api("api/repo");
+  mkdirSync(join(root, ".git/postil"), { recursive: true });
+  writeFileSync(join(root, ".git/postil/analysis.json"), "{ not json");
+  await page.locator("#toggle-map").click();
+  const error = page.locator(".map-error");
+  await error.waitFor();
+  assert.match(await error.textContent(), /analysis\.json/);
+
+  const response = page.waitForResponse((each) => each.url().endsWith("api/analysis/start-over"));
+  await error.getByRole("button", { name: "Start over" }).click();
+  const { trashed } = await (await response).json();
+  // Out of the engineer's Trash again, but only the file this test wrote, found in a Trash.
+  const inTrash =
+    trashed.startsWith(join(homedir(), ".Trash") + sep) || trashed.split(sep).includes(".Trashes");
+  assert.ok(inTrash, `${trashed} is in no Trash`);
+  assert.equal(readFileSync(trashed, "utf8"), "{ not json");
+  unlinkSync(trashed);
+  await page.locator(".map-empty").waitFor();
+});
+
+// ---- The link shown in the code (docs/review-assist-plan.md, 8.4) --------------------------
+
+// `src/m.rs`, 200 lines `l1` to `l200`, tall enough to scroll a node's lines out of view.
+const MARKED_LINES = Array.from({ length: 200 }, (_, index) => `l${index + 1}`);
+const MARKED_FILES = { "src/m.rs": `${MARKED_LINES.join("\n")}\n` };
+const markedCite = (start, end) => ({
+  path: "src/m.rs",
+  target: "lines",
+  lines: { start, end },
+  snippet: MARKED_LINES.slice(start - 1, end).join("\n"),
+});
+const markedNode = (id, label, anchors) => ({
+  id,
+  kind: "component",
+  label,
+  summary: "",
+  detail: "",
+  anchors,
+});
+const LONG_LABEL = "A parser whose name runs on far past the room a chip in the code may take";
+
+// An Architecture diagram of src/m.rs: Server on lines 2 to 6, the long-named parser inside it
+// on 3 and 4, Old on lines 10 and 11, whose snippet is no longer there (outdated), and Far on
+// 150 to 152; and a Data diagram whose Token is on line 3 too.
+const MARKED = {
+  version: 2,
+  diagrams: [
+    {
+      id: "D1",
+      kind: "architecture",
+      title: "System",
+      run: "R1",
+      nodes: [
+        markedNode("D1.1", "Server", [markedCite(2, 6)]),
+        markedNode("D1.2", LONG_LABEL, [markedCite(3, 4)]),
+        markedNode("D1.3", "Old", [{ ...markedCite(10, 11), snippet: "gone\nnow" }]),
+        markedNode("D1.4", "Far", [markedCite(150, 152)]),
+      ],
+      edges: [],
+    },
+    {
+      id: "D2",
+      kind: "data",
+      title: "Types",
+      run: "R1",
+      nodes: [{ ...markedNode("D2.1", "Token", [markedCite(3, 3)]), kind: "store" }],
+      edges: [],
+    },
+  ],
+};
+
+// `MARKED` with a flow of two steps: Read on lines 20 and 21, then Write on line 25.
+const MARKED_FLOW = {
+  ...MARKED,
+  diagrams: [
+    ...MARKED.diagrams,
+    {
+      id: "D3",
+      kind: "flow",
+      title: "Load",
+      run: "R1",
+      nodes: [
+        markedNode("D3.1", "Read", [markedCite(20, 21)]),
+        markedNode("D3.2", "Write", [markedCite(25, 25)]),
+      ],
+      edges: [],
+    },
+  ],
+};
+
+// Opens a project of `MARKED_FILES` with `analysis` written, src/m.rs open, its stripes drawn,
+// and counts the page's requests for the layout library.
+async function openMarked(t, analysis = MARKED) {
+  const opened = await openProject(t, "flood", "new", { files: MARKED_FILES });
+  await writeAnalysis(opened.api, analysis);
+  const dagre = [];
+  opened.page.on("request", (request) => {
+    if (request.url().endsWith("vendor/dagre.min.js")) dagre.push(request.url());
+  });
+  // The page read no analysis as it opened: the window's focus reads it again.
+  await opened.page.evaluate(() => dispatchEvent(new Event("focus")));
+  await openFile(opened.page, "src/m.rs");
+  await opened.page.locator('#code-rows .ln[data-line="1"] .map-stripe').waitFor();
+  return { ...opened, dagre };
+}
+
+const row = (page, index) => page.locator(`#code-rows .ln[data-line="${index}"]`);
+
+// The map's card of node `id`, by its id: one label may hold another ("far" in the parser's).
+const card = (page, id) => page.locator(`#map .map-node[data-node-id="${id}"]`);
+
+// Waits until node `id` is the only card with class `state` ("selected" or "ringed").
+const onlyNode = (page, state, id) =>
+  page.waitForFunction(
+    ([name, wanted]) => {
+      const cards = [...document.querySelectorAll(`.map-node.${name}`)];
+      return cards.length === 1 && cards[0].dataset.nodeId === wanted;
+    },
+    [state, id],
+  );
+
+test("stripes and chips show before the map opens, and a chip opens the map at its node", async (t) => {
+  const { page, dagre } = await openMarked(t);
+  assert.deepEqual(dagre, [], "the stripes need no layout");
+  // Server's five lines and Old's two, solid and dashed.
+  assert.equal(await page.locator("#code-rows .map-stripe").count(), 7);
+  assert.equal(await page.locator("#code-rows .map-stripe.outdated").count(), 2);
+  assert.equal(await row(page, 9).locator(".map-stripe.outdated").count(), 1);
+  assert.equal(await row(page, 0).locator(".map-stripe").count(), 0);
+
+  // A chip on each node's first line, the long one cut with its whole name in its title, and
+  // the Data diagram's Token behind +1.
+  assert.equal(await row(page, 1).locator(".map-chip").textContent(), "Server");
+  const long = row(page, 2).locator(".map-chip");
+  assert.equal(await long.getAttribute("title"), LONG_LABEL);
+  assert.ok((await long.boundingBox()).width <= 180, "cut at 180 px");
+  assert.equal(await row(page, 2).locator(".map-chip-more").textContent(), "+1");
+  assert.equal(await row(page, 3).locator(".map-chip").count(), 0, "one chip per node");
+
+  // View > Map Markers turns them off, and on again.
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.equal(await page.locator("#code-rows .map-stripe, #code-rows .map-chip").count(), 0);
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.equal(await page.locator("#code-rows .map-stripe").count(), 7);
+
+  // The chip opens the map, whose layout loads first, at its node.
+  await row(page, 1).locator(".map-chip").click();
+  await onlyNode(page, "selected", "D1.1");
+  assert.equal(dagre.length, 1);
+  // The code column beside the map at 1280 px is under 520 px: chips go, stripes stay.
+  assert.ok(!(await row(page, 1).locator(".map-chip").isVisible()), "no chip in a narrow column");
+  assert.ok(await row(page, 1).locator(".map-stripe").isVisible());
+
+  // With room, +1 lists the other diagram, and its item opens that diagram at Token.
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await row(page, 2).locator(".map-chip-more").click();
+  await page.locator("#context-menu .menu-item").filter({ hasText: "Token" }).click();
+  await onlyNode(page, "selected", "D2.1");
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+});
+
+test("a click on a stripe keeps the line selection, and the map follows the code's line", async (t) => {
+  const { page } = await openMarked(t);
+  await row(page, 2).locator(".n").click();
+  await row(page, 3)
+    .locator(".n")
+    .click({ modifiers: ["Shift"] });
+  await row(page, 4).locator(".map-stripe").click();
+  await onlyNode(page, "selected", "D1.1");
+  assert.deepEqual(
+    await page
+      .locator("#code-rows .ln.selected")
+      .evaluateAll((rows) => rows.map((each) => each.dataset.line)),
+    ["2", "3"],
+    "the selection stays",
+  );
+  // The selection's moving end is on line 4, the parser's.
+  await onlyNode(page, "ringed", "D1.2");
+
+  // No selection: the first visible line, followed in the scroll's frame even where the scroll
+  // draws no new rows (line 10, inside the rendered window).
+  await page.locator("#code").focus();
+  await page.keyboard.press("Escape");
+  await page.locator(".map-node.ringed").waitFor({ state: "detached" });
+  const scrollTo = (line) =>
+    page.locator("#code").evaluate((code, at) => {
+      const height = parseFloat(getComputedStyle(code).getPropertyValue("--line-height"));
+      code.scrollTop = 12 + (at - 0.5) * height;
+    }, line);
+  await scrollTo(10);
+  await onlyNode(page, "ringed", "D1.3");
+
+  // Far moved off the map's screen: scrolled to in the code, it is ringed and panned to, in the
+  // same diagram.
+  const body = await page.locator("#map .map-body").boundingBox();
+  const far = await card(page, "D1.4").boundingBox();
+  await page.mouse.move(body.x + body.width / 2, body.y + body.height / 2);
+  await page.mouse.wheel(0, -(body.y + body.height - far.y + 20));
+  await page.waitForFunction(
+    (bottom) =>
+      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().top >
+      bottom,
+    body.y + body.height,
+  );
+  await scrollTo(150);
+  await onlyNode(page, "ringed", "D1.4");
+  await page.waitForFunction(
+    ({ top, bottom }) => {
+      const box = document
+        .querySelector('#map .map-node[data-node-id="D1.4"]')
+        .getBoundingClientRect();
+      return box.top >= top && box.bottom <= bottom;
+    },
+    { top: body.y, bottom: body.y + body.height },
+  );
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "System");
+
+  // The code never switches the diagram: with Types open, line 150, which only System's Far
+  // covers, rings nothing, and line 3 rings Types' Token.
+  await page.locator(".map-kind").filter({ hasText: "Data" }).click();
+  await page.locator(".map-crumbs b").filter({ hasText: "Types" }).waitFor();
+  await scrollTo(150);
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  assert.equal(await page.locator(".map-node.ringed").count(), 0);
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+  await scrollTo(3);
+  await onlyNode(page, "ringed", "D2.1");
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+});
+
+test("a flow's step numbers show in the gutter only while the map shows that flow", async (t) => {
+  const { page } = await openMarked(t, MARKED_FLOW);
+  const steps = () =>
+    page
+      .locator("#code-rows .map-step")
+      .evaluateAll((all) =>
+        all.map((step) => [step.closest(".ln").dataset.line, step.textContent]),
+      );
+  assert.deepEqual(await steps(), [], "none with the map closed");
+
+  await page.locator("#toggle-map").click();
+  await node(page, "Server").waitFor();
+  assert.deepEqual(await steps(), [], "none while the Architecture shows");
+
+  const kind = (name) => page.locator(".map-kind").filter({ hasText: name }).click();
+  await kind("Flows");
+  await node(page, "Read").waitFor();
+  // Each step on the first line of its reference: lines 20 and 25.
+  assert.deepEqual(await steps(), [
+    ["19", "1"],
+    ["24", "2"],
+  ]);
+  await kind("Architecture");
+  await node(page, "Server").waitFor();
+  assert.deepEqual(await steps(), []);
+  await kind("Flows");
+  await node(page, "Read").waitFor();
+  assert.equal((await steps()).length, 2, "back with the flow");
+
+  await page.locator("#toggle-map").click();
+  await page.locator("#map").waitFor({ state: "hidden" });
+  assert.deepEqual(await steps(), [], "gone with the map closed");
+});
+
+test("a pan towards the code's node stops when another diagram opens", async (t) => {
+  const { page } = await openMarked(t);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.locator("#toggle-map").click();
+  await card(page, "D1.4").waitFor();
+  // Far off the map's screen, as in the test above.
+  const body = await page.locator("#map .map-body").boundingBox();
+  const far = await card(page, "D1.4").boundingBox();
+  await page.mouse.move(body.x + body.width / 2, body.y + body.height / 2);
+  await page.mouse.wheel(0, -(body.y + body.height - far.y + 20));
+  await page.waitForFunction(
+    (bottom) =>
+      document.querySelector('#map .map-node[data-node-id="D1.4"]').getBoundingClientRect().top >
+      bottom,
+    body.y + body.height,
+  );
+  // Line 150 starts a 160 ms glide to Far; Data opens two frames in, and Types must stay
+  // where it is drawn.
+  const moved = await page.evaluate(async () => {
+    const code = document.getElementById("code");
+    const height = parseFloat(getComputedStyle(code).getPropertyValue("--line-height"));
+    code.scrollTop = 12 + 149.5 * height;
+    const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    await frame();
+    await frame();
+    const ringed = document.querySelector(".map-node.ringed")?.dataset.nodeId;
+    [...document.querySelectorAll(".map-kind")].find((each) => each.textContent === "Data").click();
+    const pane = () => document.querySelector("#map .map-viewport").getAttribute("transform");
+    const drawn = pane();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const crumb = document.querySelector(".map-crumbs b").textContent;
+    return { ringed, crumb, drawn, later: pane() };
+  });
+  assert.equal(moved.ringed, "D1.4", "the glide had started");
+  assert.equal(moved.crumb, "Types");
+  assert.equal(moved.later, moved.drawn, "Types stays where it was drawn");
+});
+
+test("a note shown in the code moves the ring off the node the map showed", async (t) => {
+  const { page, api } = await openMarked(t);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  const request = { path: "src/m.rs", lines: { start: 3, end: 3 }, snippet: "l3", body: "Three." };
+  await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator(".note-item").first().waitFor();
+  await page.locator("#toggle-map").click();
+  // Far's code shown, a third of the way down: the map follows Far, not the first line.
+  await card(page, "D1.4").click();
+  await onlyNode(page, "ringed", "D1.4");
+  await page.waitForFunction(() => document.getElementById("code").scrollTop > 1000);
+
+  await page.locator(".note-item .note-card, .note-item button").first().click();
+  await page.locator("#note-dialog button").filter({ hasText: "Show in code" }).click();
+  await page.waitForFunction(() => document.getElementById("code").scrollTop < 200);
+  await page.waitForFunction(
+    () => !document.querySelector('.map-node.ringed[data-node-id="D1.4"]'),
+  );
+});
+
+test("a stripe's node keeps the focus when the map, opened by the stripe, reads the analysis", async (t) => {
+  const { page } = await openMarked(t);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.locator("#toggle-map").click();
+  await card(page, "D1.1").waitFor();
+  await page.locator("#toggle-map").click();
+  await page.locator("#map").waitFor({ state: "hidden" });
+
+  // The map opens drawn from the analysis it holds, at once, and draws again once it has read
+  // it anew. The card focused by the click is taken in the click's own task, before that.
+  await page.evaluate(() => {
+    document.querySelector('#code-rows .ln[data-line="9"] .map-stripe').click();
+    window.focusedCard = document.activeElement;
+  });
+  assert.equal(await page.evaluate(() => window.focusedCard.dataset.nodeId), "D1.3");
+  await page.waitForFunction(() => !window.focusedCard.isConnected);
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset?.nodeId), "D1.3");
+});
+
+test("the stripe continues past the composer, and a note on a striped line shows both", async (t) => {
+  const { page } = await openMarked(t);
+  await row(page, 2).locator(".n").click();
+  await page.keyboard.press("c");
+  await page.locator("#note-body").waitFor();
+  // Down to the parser's next line, once the composer is measured (code-view.js).
+  await page.waitForFunction(() => {
+    const stripe = document.querySelector('.ln[data-line="2"] .map-stripe.continues');
+    const next = document.querySelector('.ln[data-line="3"]');
+    if (!stripe || !next) return false;
+    return Math.abs(stripe.getBoundingClientRect().bottom - next.getBoundingClientRect().top) <= 1;
+  });
+  assert.equal(await row(page, 3).locator(".map-stripe:not(.continues)").count(), 1);
+
+  await page.locator("#note-body").fill("On three.");
+  await page.keyboard.press("Meta+Enter");
+  await row(page, 2).locator(".remark").waitFor();
+  // The chip comes before the remark, drawn in either order.
+  const order = () =>
+    row(page, 2).evaluate((line) =>
+      [...line.children]
+        .map((child) => child.className)
+        .filter((name) => ["map-chip", "map-chip-more", "remark"].includes(name)),
+    );
+  assert.match(await row(page, 2).getAttribute("class"), /\bnoted\b/);
+  assert.equal(await row(page, 2).locator(".map-stripe:not(.continues)").count(), 1);
+  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "remark"]);
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.deepEqual(await order(), ["remark"]);
+  await page.evaluate(() => window.postil.menu("map-markers"));
+  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "remark"]);
+});
+
+test("Cmd-C over striped and chipped lines copies their code alone", async (t) => {
+  const { page } = await openMarked(t);
+  // What the page puts on the clipboard: the whole lines of a gutter selection through the
+  // Clipboard API, a text selection through the copy event (code-view.js, `copyLines`).
+  await page.evaluate(() => {
+    window.written = [];
+    window.copyEvents = [];
+    navigator.clipboard.writeText = async (text) => window.written.push(text);
+    addEventListener("copy", (event) => {
+      window.copyEvents.push(event.clipboardData.getData("text/plain"));
+    });
+  });
+  const taken = (name) => page.evaluate((key) => window[key].splice(0), name);
+
+  await row(page, 1).locator(".n").click();
+  await row(page, 2)
+    .locator(".n")
+    .click({ modifiers: ["Shift"] });
+  await page.keyboard.press("Meta+c");
+  await page.waitForFunction(() => window.written.length > 0);
+  assert.deepEqual(await taken("written"), ["l2\nl3"]);
+
+  // A drag across the code of the same two lines, the chips and +1 between them.
+  const from = await row(page, 1).locator(".c").boundingBox();
+  const to = await row(page, 2).locator(".c").boundingBox();
+  await page.mouse.move(from.x + 1, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(to.x + to.width - 1, to.y + to.height / 2, { steps: 4 });
+  await page.mouse.up();
+  await taken("copyEvents");
+  await page.keyboard.press("Meta+c");
+  await page.waitForFunction(() => window.copyEvents.length > 0);
+  assert.deepEqual(await taken("copyEvents"), ["l2\nl3"]);
+  assert.deepEqual(await taken("written"), [], "the browser copied the text selection");
+});
+
+// ---- Deeper, flows, data, outdated and Update (docs/review-assist-plan.md, 8.5) ------------
+
+// The repository the fake agent's analysis cites (tests/fake-agent.mjs, `analysisReply`).
+const ANALYZED_FILES = {
+  "src/a.rs": "fn a() {\n    one();\n}\n",
+  "src/b.rs": "x\ny\nfn two() {\n}\n",
+};
+
+// Opens a project on `ANALYZED_FILES` whose Analyzer is the fake agent's `analysis`.
+const openAnalyzed = (t) => openProject(t, "analysis", "new", { files: ANALYZED_FILES });
+
+// The switcher's button for `kind`, by its whole name.
+const kindButton = (page, name) => page.locator(".map-kind", { hasText: new RegExp(`^${name}$`) });
+
+// The context menu's item whose label starts with `label`.
+const menuItem = (page, label) =>
+  page.locator("#context-menu").getByRole("menuitem", { name: new RegExp(`^${label}`) });
+
+test("the menu item on a folder starts a run, and Data and a node's Analyze deeper draw theirs", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator('#files .dir[data-path="src"]').click({ button: "right" });
+  await menuItem(page, "Analyze Deeper").click();
+
+  // No node covers src yet: its diagram is at the top, and the map opens on it.
+  await node(page, "Inner").waitFor();
+  assert.ok(await page.locator("#map").isVisible());
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Inside");
+
+  // Data has none yet: its card offers Analyze, which draws both kinds.
+  await kindButton(page, "Data").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Note").waitFor();
+  assert.equal(await page.locator(".map-crumbs b").textContent(), "Types");
+
+  // A node's dialog asks for its inside, which opens under it.
+  await kindButton(page, "Architecture").click();
+  await node(page, "Page").dblclick();
+  await page.locator("#node-dialog").getByRole("button", { name: "Analyze deeper" }).click();
+  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  await node(page, "Inner").waitFor();
+
+  // Back up, Enter on Page goes into the diagram it has.
+  await page.locator(".map-crumb", { hasText: /^System$/ }).click();
+  await node(page, "Page").focus();
+  await page.keyboard.press("Enter");
+  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+
+  // A right-click on Store analyzes its inside, which opens under it.
+  await page.locator(".map-crumb", { hasText: /^System$/ }).click();
+  const store = await node(page, "Store").getAttribute("data-node-id");
+  await node(page, "Store").click({ button: "right" });
+  await menuItem(page, "Analyze Deeper").click();
+  await page.locator(".map-crumbs", { hasText: /^System › Inside$/ }).waitFor();
+  const { diagrams } = await api("api/analysis");
+  assert.ok(
+    diagrams.some((diagram) => diagram.parent === store),
+    "a diagram under Store",
+  );
+});
+
+test("Trace from here on a node starts at its id, its chip clears, and a flow's draft holds Quit and Send", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  const pageId = await node(page, "Page").getAttribute("data-node-id");
+
+  // From the dialog, then the chip's × clears where it starts.
+  await node(page, "Page").dblclick();
+  await page.locator("#node-dialog").getByRole("button", { name: "Trace from here" }).click();
+  const chip = page.locator(".map-flow-chip");
+  await chip.locator(".map-flow-chip-label", { hasText: /^From Page$/ }).waitFor();
+  await chip.locator(".map-flow-chip-clear").click();
+  await chip.waitFor({ state: "hidden" });
+
+  // From the right-click menu on the node; the flow asked for starts at its id.
+  await kindButton(page, "Architecture").click();
+  await node(page, "Page").click({ button: "right" });
+  await menuItem(page, "Trace from Here").click();
+  await chip.locator(".map-flow-chip-label", { hasText: /^From Page$/ }).waitFor();
+  const question = page.locator(".map-flow-question");
+  await question.fill("How is a page drawn?");
+  await question.press("Enter");
+  await node(page, "send").waitFor();
+  const [id] = (await api("api/runs")).runs;
+  assert.deepEqual((await api(`api/run?id=${id}`)).analysis, { kind: "flow", of: pageId });
+
+  // A question not asked yet holds Quit and Send, as a note's draft does, and goes once cleared.
+  await page.evaluate(() => {
+    window.posted = [];
+    window.ipc.postMessage = (message) => window.posted.push(message);
+  });
+  await question.fill("Half a question");
+  await page.locator("#code").click();
+  await page.evaluate(() => window.postil.menu("quit"));
+  const problem = page.locator(".map-flow-problem");
+  await problem.filter({ hasText: /^Trace or clear this question before quitting\.$/ }).waitFor();
+  await page.waitForFunction(() => document.activeElement?.classList.contains("map-flow-question"));
+  assert.deepEqual(await page.evaluate(() => window.posted), []);
+
+  const note = { path: "src/a.rs", lines: { start: 1, end: 1 }, snippet: "fn a() {" };
+  await api("api/notes", {
+    method: "POST",
+    body: JSON.stringify({ ...note, body: "Rename one." }),
+  });
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await page.locator("#notes").getByText("Rename one.").waitFor();
+  await page.locator("#send-button").click();
+  await problem.filter({ hasText: /^Trace or clear this question before sending\.$/ }).waitFor();
+  assert.ok(await page.locator("#prompt-preview").isHidden(), "the send step did not open");
+
+  await question.fill("");
+  await page.evaluate(() => window.postil.menu("quit"));
+  assert.deepEqual(await page.evaluate(() => window.posted), ["quit"]);
+});
+
+test("a flow's question is refused in the page, Trace from Here starts at the file, and Delete takes two clicks", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  // No Architecture yet: Flows is open to choose all the same.
+  await kindButton(page, "Flows").click();
+  const question = page.locator(".map-flow-question");
+  const problem = page.locator(".map-flow-problem");
+  await page.locator(".map-flow-trace").click();
+  await problem.filter({ hasText: /^Ask a question/ }).waitFor();
+  await question.fill("q".repeat(301));
+  await question.press("Enter");
+  await problem.filter({ hasText: /not 301\.$/ }).waitFor();
+  assert.deepEqual((await api("api/runs")).runs, [], "no run started");
+
+  await openFile(page, "src/a.rs");
+  await page.locator('#code-rows .ln[data-line="1"] .c').click({ button: "right" });
+  await menuItem(page, "Trace from Here").click();
+  await page.locator(".map-flow-chip", { hasText: /^From src\/a\.rs/ }).waitFor();
+  assert.ok(await problem.isHidden(), "a fresh question has nothing to say yet");
+  await page.waitForFunction(() => document.activeElement?.classList.contains("map-flow-question"));
+  await question.fill("How is a note sent?");
+  await question.press("Enter");
+
+  // The new flow opens, its steps numbered in the order the Analyzer gave them.
+  await node(page, "send").waitFor();
+  const steps = await page
+    .locator("#map .map-node")
+    .evaluateAll((cards) =>
+      cards.map(
+        (card) =>
+          `${card.querySelector(".map-node-step").textContent} ${card.querySelector(".map-node-label").textContent}`,
+      ),
+    );
+  assert.deepEqual(steps, ["1 send", "2 check", "3 apply"]);
+  const [id] = (await api("api/runs")).runs;
+  const run = await api(`api/run?id=${id}`);
+  assert.deepEqual(run.analysis, { kind: "flow", of: "src/a.rs" });
+
+  // One click arms Delete and the pointer leaving its row disarms it; two delete the flow.
+  // WebKit gives a clicked button no focus, so it is the row's mouseleave that disarms here,
+  // not the button's blur (dom.js, `actOnSecondClick`).
+  const row = page.locator(".map-flow-item", {
+    has: page.locator(".map-flow-open", { hasText: /^A flow$/ }),
+  });
+  const remove = row.locator(".map-flow-delete");
+  await remove.click();
+  await remove.filter({ hasText: /^Delete$/ }).waitFor();
+  await question.hover();
+  await remove.filter({ hasText: /^×$/ }).waitFor();
+  await remove.click();
+  await remove.click();
+  await row.waitFor({ state: "detached" });
+  await page.locator(".map-empty", { hasText: /^No flow yet/ }).waitFor();
+  const left = await api("api/analysis");
+  assert.deepEqual(
+    left.diagrams.filter((diagram) => diagram.kind === "flow"),
+    [],
+  );
+});
+
+test("an outdated node is marked, Not on the map lists 20 files of 205, and Update renews both", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+
+  // Page's line goes, and 205 files no node covers are added, not committed yet: the map
+  // shows them, and they force no update (docs/review-assist-plan.md, 8.7).
+  const { root } = await api("api/repo");
+  writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
+  mkdirSync(join(root, "extra"));
+  for (let n = 0; n < 205; n += 1) {
+    writeFileSync(join(root, `extra/e${String(n).padStart(3, "0")}.rs`), "fn e() {}\n");
+  }
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+
+  await page.waitForFunction(() =>
+    document.querySelector('.map-node[data-node-id="D1.1"]')?.classList.contains("outdated"),
+  );
+  const unmapped = page.locator(".map-unmapped");
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 205$/ }).click();
+  assert.equal(await unmapped.locator(".map-unmapped-file").count(), 20);
+  await unmapped.locator(".map-unmapped-more", { hasText: /^and 185 more$/ }).waitFor();
+  await unmapped
+    .locator(".map-unmapped-note", { hasText: /^Update sends at most 200 paths\.$/ })
+    .waitFor();
+  assert.deepEqual(await api("api/analysis/check", { method: "POST" }), { state: "same" });
+
+  // Committed, they force an update on the next focus. The fake Analyzer renews Page and
+  // places e000 alone: the other 204 stay listed, the diagram's run being the one that made
+  // it, which did not see them.
+  execFileSync("git", ["-C", root, "add", "-A"]);
+  execFileSync("git", ["-C", root, "commit", "-q", "-m", "Add extra"]);
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
+  await node(page, "Renewed").waitFor();
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 204$/ }).waitFor();
+  assert.equal(
+    await unmapped.locator(".map-unmapped-file", { hasText: /^extra\/e000\.rs$/ }).count(),
+    0,
+  );
+
+  // Update places the next, e001.
+  await page.locator(".map-update").click();
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 203$/ }).waitFor();
+
+  // A file in the list opens in the code.
+  await unmapped.locator(".map-unmapped-file", { hasText: /^extra\/e002\.rs$/ }).click();
+  await page.locator("#crumbs b", { hasText: /^e002\.rs$/ }).waitFor();
+
+  // Analyze deeper of a folder no node covers adds a second Architecture at the top, and the
+  // picker chooses between them.
+  await page.locator('#files .dir[data-path="extra"]').click({ button: "right" });
+  await menuItem(page, "Analyze Deeper").click();
+  await page.locator(".map-crumbs b", { hasText: /^Inside$/ }).waitFor();
+  const picker = page.locator(".map-top");
+  assert.deepEqual(await picker.locator("option").allTextContents(), ["System", "Inside"]);
+  await picker.selectOption({ label: "System" });
+  await page.locator(".map-crumbs b", { hasText: /^System$/ }).waitFor();
+});
+
+test("a branch switch offers one Update, and a blocked or forced update says why", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  const { root } = await api("api/repo");
+  const git = (...args) =>
+    execFileSync("git", ["-C", root, ...args])
+      .toString()
+      .trim();
+  const focus = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+  const strip = page.locator(".map-run");
+  const trunk = git("rev-parse", "--abbrev-ref", "HEAD");
+
+  // A commit on a side branch touches nothing cited, and the analysis is compared with it;
+  // back on the first branch, that commit is no ancestor of HEAD. Page's line is gone there,
+  // uncommitted: its diagram is outdated, and would offer an Update of its own.
+  git("checkout", "-q", "-b", "side");
+  writeFileSync(join(root, "src/c.rs"), "fn c() {}\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "Add c");
+  const moved = await api("api/analysis/check", { method: "POST" });
+  assert.deepEqual(moved, { state: "untouched" });
+  git("checkout", "-q", trunk);
+  writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
+  await focus();
+  await strip
+    .locator(".map-run-status", { hasText: /^The checkout moved to another history\.$/ })
+    .waitFor();
+  await page.waitForFunction(() =>
+    document.querySelector('.map-node[data-node-id="D1.1"]')?.classList.contains("outdated"),
+  );
+  assert.equal(await page.locator("#map .map-update").count(), 1, "one Update in the map");
+  // Update runs, and moves the analysis to this history: the strip goes.
+  await strip.locator(".map-update").click();
+  await node(page, "Renewed").waitFor();
+  await strip.waitFor({ state: "hidden" });
+  assert.deepEqual(await api("api/analysis/check", { method: "POST" }), { state: "same" });
+
+  // The Analyzer cannot start: the strip says why, and the next check tries again. Worker's
+  // lines go, in a commit.
+  await setAnalyzer(api, "Missing");
+  writeFileSync(join(root, "src/b.rs"), "x\ny\n");
+  git("commit", "-q", "-m", "Drop two", "--", "src/b.rs");
+  await focus();
+  await strip
+    .locator(".map-run-problem", { hasText: /^cannot analyze: Missing is not installed/ })
+    .waitFor();
+  assert.deepEqual((await api("api/runs")).runs, ["R2", "R1"]);
+
+  // One that starts: the strip names the commit the update is for while it runs.
+  await setAnalyzer(api, "Slow");
+  await focus();
+  const short = git("rev-parse", "--short=7", "HEAD");
+  await strip
+    .locator(".map-run-status", { hasText: new RegExp(`^Updating after ${short}…$`) })
+    .waitFor();
+  await stopHanging(api, strip);
+});
+
+test("commits made while the page was closed force the update as it opens", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  const { root } = await api("api/repo");
+  await setAnalyzer(api, "Slow");
+
+  // Page's line goes in a commit, and the page loads again with no focus event.
+  writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
+  execFileSync("git", ["-C", root, "commit", "-q", "-am", "Drop one"]);
+  await page.reload();
+  await page.locator("#repo-name").filter({ hasText: /\S/ }).waitFor();
+  if (!(await page.locator("#map").isVisible())) await page.locator("#toggle-map").click();
+  const short = execFileSync("git", ["-C", root, "rev-parse", "--short=7", "HEAD"])
+    .toString()
+    .trim();
+  const strip = page.locator(".map-run");
+  await strip
+    .locator(".map-run-status", { hasText: new RegExp(`^Updating after ${short}…$`) })
+    .waitFor();
+  await stopHanging(api, strip);
+});
+
+// Saves the settings with `name` as the Analyzer, among the custom agents Fake, Missing (a
+// program that is not there) and Slow (the fake agent's `hang`, which runs until stopped).
+async function setAnalyzer(api, name) {
+  const { revision, settings } = await api("api/settings");
+  const fake = settings.customAgents.find((agent) => agent.name === "Fake");
+  const customAgents = [
+    fake,
+    { name: "Missing", command: "/nonexistent/agent-bin" },
+    { name: "Slow", command: fake.command.replace(/ analysis$/, " hang") },
+  ];
+  const enabledAgents = [...new Set([...settings.enabledAgents, "Missing", "Slow"])];
+  const next = { ...settings, customAgents, enabledAgents, analyzer: { name } };
+  await api("api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ revision, settings: next }),
+  });
+}
+
+// Stops the newest run, a forced update of the `hang` agent, and waits until `strip` lets it go.
+// The strip names the run as soon as it exists, so the first Stop may come before its agent has
+// started: that ends the run at once (src/run.rs, `Runner::cancel`), and a second Stop would be
+// refused, the run being under way no more. Once the agent runs, it ignores the first Stop,
+// and only a second, 3 s later (`FORCE_AFTER`), ends it.
+async function stopHanging(api, strip) {
+  const [running] = (await api("api/runs")).runs;
+  const cancel = () =>
+    api("api/run/cancel", { method: "POST", body: JSON.stringify({ run: running }) });
+  const live = async () => isLive(await api(`api/run?id=${encodeURIComponent(running)}`));
+  await cancel();
+  const force = Date.now() + 3_100;
+  while (Date.now() < force && (await live())) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (await live()) await cancel();
+  await strip
+    .locator(".map-run-status", { hasText: /^Updating after/ })
+    .waitFor({ state: "detached" });
+}
+
+// ---- The change map (docs/review-assist-plan.md, 8.6) -------------------------------------
+
+// The files the fake agent's `change-map` run changes (tests/fake-agent.mjs): old.txt it
+// deletes, big.txt it rewrites whole, line 15 of lib.txt alone; it adds new.txt.
+const numbered = (prefix, count) =>
+  Array.from({ length: count }, (_, index) => `${prefix}${index + 1}\n`).join("");
+const CHANGE_FILES = {
+  "old.txt": "1\n2\n3\n4\n",
+  "big.txt": numbered("b", 150),
+  "lib.txt": numbered("l", 20),
+};
+
+const citeLine = (path, line, snippet) => ({
+  path,
+  target: "lines",
+  lines: { start: line, end: line },
+  snippet,
+});
+const component = (id, label, anchors) => ({
+  id,
+  kind: "component",
+  label,
+  summary: "",
+  detail: "",
+  anchors,
+});
+
+// An Architecture of those files: Changed on lib.txt's changed line, Caller one edge from it
+// on line 1, Far two edges away on line 3, Gone on the deleted file and Rewritten on big.txt.
+const CHANGE_ANALYSIS = {
+  version: 2,
+  diagrams: [
+    {
+      id: "D1",
+      kind: "architecture",
+      title: "System",
+      run: "R1",
+      nodes: [
+        component("D1.1", "Changed", [citeLine("lib.txt", 15, "l15")]),
+        component("D1.2", "Caller", [citeLine("lib.txt", 1, "l1")]),
+        component("D1.3", "Gone", [{ path: "old.txt", target: "file", state: "found" }]),
+        component("D1.4", "Rewritten", [{ path: "big.txt", target: "file", state: "found" }]),
+        component("D1.5", "Far", [citeLine("lib.txt", 3, "l3")]),
+      ],
+      edges: [
+        { from: "D1.2", to: "D1.1", label: "calls" },
+        { from: "D1.5", to: "D1.2", label: "uses" },
+      ],
+    },
+  ],
+};
+
+test("Change map waits for an Architecture, marks what the run touched at its fork, and a click opens its hunk", async (t) => {
+  const { page, api } = await openProject(t, "change-map", "new", { files: CHANGE_FILES });
+  const request = { path: "lib.txt", lines: { start: 1, end: 1 }, snippet: "l1", body: "Do it." };
+  const review = await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  const notes = review.notes.map((note) => note.id);
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  // The report's check is listed once the run ended with its report.
+  await detail.locator(".run-check code", { hasText: /^cargo test$/ }).waitFor();
+  await detail.locator(".run-detail-changes").waitFor();
+  assert.equal(await detail.locator(".run-detail-change-map").count(), 0, "no analysis, none");
+
+  // The window's focus reads the analysis again, which draws the open dialog again.
+  const refresh = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+  const [architecture] = CHANGE_ANALYSIS.diagrams;
+  await writeAnalysis(api, { version: 2, diagrams: [{ ...architecture, kind: "data" }] });
+  await refresh();
+  const offered = detail.locator(".run-detail-change-map");
+  await detail.locator(".run-detail-change-map:disabled").waitFor();
+  assert.equal(await offered.getAttribute("title"), "The map has no Architecture diagram");
+
+  // The checkout moves on since the thread's fork: lib.txt's lines are 10 further down, where
+  // the run's hunk is not, so only nodes placed at the fork are touched.
+  const { root } = await api("api/repo");
+  const lib = readFileSync(join(root, "lib.txt"), "utf8");
+  writeFileSync(join(root, "lib.txt"), `${"z\n".repeat(10)}${lib}`);
+  await writeAnalysis(api, CHANGE_ANALYSIS);
+  await refresh();
+  await detail.locator(".run-detail-change-map:enabled").click();
+  await detail.waitFor({ state: "hidden" });
+
+  const map = page.locator("#map");
+  const card = (id) => map.locator(`.map-node[data-node-id="${id}"]`);
+  await map.locator('.map-node.touched[data-node-id="D1.1"]').waitFor();
+  const classes = async (id) => (await card(id).getAttribute("class")).split(/\s+/);
+  assert.ok((await classes("D1.3")).includes("touched"), "the node of the deleted file");
+  assert.ok((await classes("D1.4")).includes("touched"), "the node of the rewritten file");
+  assert.ok((await classes("D1.2")).includes("near"), "one edge from Changed");
+  assert.ok(!(await classes("D1.2")).includes("touched"), "line 1 is outside the hunk");
+  const far = await classes("D1.5");
+  assert.ok(!far.includes("near") && !far.includes("touched"), "two edges away");
+  await map.locator(".map-change-label", { hasText: /^Change map · R\d+$/ }).waitFor();
+  await map.locator(".map-counts", { hasText: /· 3 touched$/ }).waitFor();
+  const unmapped = map.locator(".map-unmapped");
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 1$/ }).click();
+  assert.deepEqual(await unmapped.locator(".map-unmapped-file").allTextContents(), ["new.txt"]);
+
+  // The code pane shows the checkout, where lib.txt moved 10 lines down: its line rings the
+  // node cited there, not the one the fork had on that line.
+  await openFile(page, "lib.txt");
+  await row(page, 24).locator(".n").click();
+  await onlyNode(page, "ringed", "D1.1");
+  await row(page, 14).locator(".n").click();
+  await map.locator(".map-node.ringed").waitFor({ state: "detached" });
+  await row(page, 10).locator(".n").click();
+  await onlyNode(page, "ringed", "D1.2");
+
+  // Changed opens the run's changes at lib.txt's hunk, the walkthrough's last step, scrolled
+  // past the long one before it.
+  await card("D1.1").click();
+  const changes = page.locator("#changes-view");
+  const current = changes.locator('.changes-step[aria-current="step"] .changes-step-number');
+  await current.filter({ hasText: /^Step 3 of 3$/ }).waitFor();
+  // The hunk of `path` is wholly in the view: the last one may not reach its top, with too
+  // little below it to scroll that far.
+  const inView = (path) =>
+    page.waitForFunction((wanted) => {
+      const view = document.getElementById("changes-view");
+      const block = view.querySelector(`.changes-hunk-block[data-path="${wanted}"]`);
+      if (!block) return false;
+      const top = block.getBoundingClientRect().top - view.getBoundingClientRect().top;
+      return top >= 0 && top + block.offsetHeight <= view.clientHeight + 1;
+    }, path);
+  await inView("lib.txt");
+  assert.ok(await changes.evaluate((view) => view.scrollTop > 0), "scrolled down to it");
+
+  // Gone opens the deleted file's hunk, which the report rates mechanical: unfolded. The click
+  // on Changed centred it, which in a pane this narrow pans Gone, at the layout's top left,
+  // out of the map's clipped body: 0 fits the diagram again, as an engineer would.
+  await card("D1.3").focus();
+  await page.keyboard.press("0");
+  await page.waitForFunction(() => {
+    const body = document.querySelector("#map .map-body").getBoundingClientRect();
+    const gone = document.querySelector('#map .map-node[data-node-id="D1.3"]');
+    const box = gone.getBoundingClientRect();
+    return box.left >= body.left && box.right <= body.right && box.top >= body.top;
+  });
+  await card("D1.3").click();
+  await current.filter({ hasText: /^Step 1 of 3$/ }).waitFor();
+  const gone = changes.locator('.changes-hunk-block[data-path="old.txt"]');
+  await gone.locator(".changes-line.del").nth(3).waitFor();
+  assert.equal(await gone.locator(".changes-fold").count(), 0, "unfolded");
+  await inView("old.txt");
+
+  // A file not on the map opens at its hunk in the changes: it is not in the checkout.
+  await unmapped.locator(".map-unmapped-file", { hasText: /^new\.txt$/ }).click();
+  await current.filter({ hasText: /^Not in the walkthrough$/ }).waitFor();
+  await inView("new.txt");
+
+  // Escape closes the changes view, then leaves the change map for the repository's map,
+  // where nothing is touched; the line selected in the code stays.
+  await changes.press("Escape");
+  await changes.waitFor({ state: "hidden" });
+  await page.locator("#code").focus();
+  await page.keyboard.press("Escape");
+  await map.locator(".map-change-label").waitFor({ state: "detached" });
+  await card("D1.1").waitFor();
+  assert.equal(await map.locator(".map-node.touched, .map-node.near").count(), 0);
+  assert.equal(await page.locator("#code-rows .ln.selected").count(), 1, "the selection stays");
+
+  // Opened again, its esc button goes back as well.
+  await page.locator("#run .run-entry").click();
+  await detail.locator(".run-detail-change-map:enabled").click();
+  await map.locator('.map-node.touched[data-node-id="D1.1"]').waitFor();
+  await map.locator(".map-change-exit").click();
+  await map.locator(".map-change-label").waitFor({ state: "detached" });
+  assert.equal(await map.locator(".map-node.touched, .map-node.near").count(), 0);
 });

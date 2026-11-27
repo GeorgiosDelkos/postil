@@ -842,18 +842,22 @@ const LAYOUT: &str = "postil://localhost/api/layout";
 fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
     let repo = TempRepo::new("layout");
     let site = repo.empty_site();
-    let defaults = serde_json::json!({ "sidebar": 248, "tray": 320 });
+    let defaults = serde_json::json!({ "sidebar": 248, "tray": 320, "map": 400 });
     let fresh = get_json(&site, LAYOUT);
     assert_eq!(
         fresh,
         serde_json::json!({
-            "sidebar": 248, "tray": 320,
+            "sidebar": 248, "tray": 320, "map": 400,
             "defaults": defaults,
-            "limits": { "sidebar": [200, 480], "tray": [280, 720] },
+            "limits": { "sidebar": [200, 480], "tray": [280, 720], "map": [320, 960] },
         })
     );
 
-    let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
+    let (status, body) = put(
+        &site,
+        LAYOUT,
+        r#"{"sidebar": 300, "tray": 460, "map": 520}"#,
+    );
     assert_eq!(status, StatusCode::OK, "{body}");
     // Another window, or the next start, reads the same widths: they are the Mac's, not
     // the project's.
@@ -864,19 +868,30 @@ fn pane_widths_are_kept_per_mac_with_their_limits_and_defaults() {
         .unwrap();
     let kept = get_json(&again, LAYOUT);
     assert_eq!(
-        (kept["sidebar"].clone(), kept["tray"].clone()),
-        (300.into(), 460.into())
+        (
+            kept["sidebar"].clone(),
+            kept["tray"].clone(),
+            kept["map"].clone()
+        ),
+        (300.into(), 460.into(), 520.into())
     );
 
     // The whole message, as the page shows it: no serde position, no "unreadable" prefix.
-    let (status, reply) = put(&site, LAYOUT, r#"{"sidebar": 248, "tray": 900}"#);
+    let (status, reply) = put(
+        &site,
+        LAYOUT,
+        r#"{"sidebar": 248, "tray": 900, "map": 400}"#,
+    );
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(reply, "the tray is 900 px wide, outside 280 to 720 px");
     for (body, words) in [
-        (r#"{"sidebar": 100, "tray": 320}"#, "outside 200 to 480"),
+        (
+            r#"{"sidebar": 100, "tray": 320, "map": 400}"#,
+            "outside 200 to 480",
+        ),
         (r#"{"sidebar": 248}"#, "unreadable layout"),
         (
-            r#"{"sidebar": 248, "tray": 320, "x": 1}"#,
+            r#"{"sidebar": 248, "tray": 320, "map": 400, "x": 1}"#,
             "unreadable layout",
         ),
     ] {
@@ -916,7 +931,11 @@ fn a_hand_edited_layout_with_a_width_out_of_range_reads_as_the_defaults() {
 fn without_a_configuration_directory_widths_are_the_defaults_and_not_kept() {
     let site = Site::new(None, None, None, no_agents(), quiet());
     assert_eq!(get_json(&site, LAYOUT)["tray"], 320);
-    let (status, body) = put(&site, LAYOUT, r#"{"sidebar": 300, "tray": 460}"#);
+    let (status, body) = put(
+        &site,
+        LAYOUT,
+        r#"{"sidebar": 300, "tray": 460, "map": 520}"#,
+    );
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("HOME"), "{body}");
 }

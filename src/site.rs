@@ -17,7 +17,7 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
-use crate::analysis::{self, AnalysisJob, AnalyzeRequest, UpdateRequest};
+use crate::analysis::{self, AnalysisJob, AnalyzeRequest, UpdateRequest, Verdict};
 use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
@@ -29,7 +29,7 @@ use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
-use crate::run::{Ending, Notify, Runner};
+use crate::run::{Ending, Notify, Runner, StartedUpdate};
 use crate::settings::{self, CustomAgent, RawSettings, Settings, TeamMemory};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
@@ -225,6 +225,23 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "/welcome.js",
         "text/javascript",
         include_bytes!("../ui/welcome.js"),
+    ),
+    (
+        "/diagram.js",
+        "text/javascript",
+        include_bytes!("../ui/diagram.js"),
+    ),
+    (
+        "/diagram-view.js",
+        "text/javascript",
+        include_bytes!("../ui/diagram-view.js"),
+    ),
+    // The map's layout library (ui/vendor/dagre.LICENSE), loaded by a script element when the
+    // map first opens, not imported.
+    (
+        "/vendor/dagre.min.js",
+        "text/javascript",
+        include_bytes!("../ui/vendor/dagre.min.js"),
     ),
     (
         "/icons.svg",
@@ -545,6 +562,7 @@ struct LayoutView {
 struct LayoutLimits {
     sidebar: [u32; 2],
     tray: [u32; 2],
+    map: [u32; 2],
 }
 
 /// The body of `POST /api/run`.
@@ -695,6 +713,22 @@ enum LiveRun {
     Refuse,
     /// Stops the run.
     Stop,
+}
+
+/// The reply to `POST /api/analysis/check` ([`Site::check_analysis`]), as `{"state": ...}`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum CheckView {
+    /// `checked` is `HEAD`, or another window started the update for it.
+    Same,
+    /// `checked` moved to `HEAD` with no run.
+    Untouched,
+    /// `checked` is gone, or no ancestor of `HEAD`: the pane offers Update.
+    Diverged,
+    /// The forced update `run` started at the commit whose short id is `commit`.
+    Updated { run: String, commit: String },
+    /// The update could not start, for `reason`; the next check tries again.
+    Blocked { reason: String },
 }
 
 /// The reply to `/api/file`.
@@ -1041,10 +1075,16 @@ impl Site {
     }
 
     /// The reply to `GET /api/analysis`: the diagrams, each code reference placed where its
-    /// code is now, or `null` when there is no analysis. Reads the analysis file and never
+    /// code is now, with the files not on the map (`analysis::view`), or `null` when there is
+    /// no analysis. With `?at=<commit>`, the diagrams alone, placed where the code is in that
+    /// commit (`analysis::at`), for a run's change map. Reads the analysis file and never
     /// writes it.
-    fn analysis(&self) -> Result<Vec<u8>> {
-        let analysis = analysis::current(&*self.repo()?)?;
+    fn analysis(&self, query: &str) -> Result<Vec<u8>> {
+        let repo = self.repo()?;
+        if let Some(commit) = query_value(query, "at") {
+            return Ok(to_json(&analysis::at(&repo, &commit)?));
+        }
+        let analysis = analysis::current(&repo)?.map(|analysis| analysis::view(&repo, analysis));
         Ok(to_json(&analysis))
     }
 
@@ -1058,7 +1098,9 @@ impl Site {
 
     /// The reply to `POST /api/analysis/update`, with `{"diagram": "D1"}` or no body for every
     /// diagram: starts an update of the outdated nodes and the files not on the map, as
-    /// [`Site::start_analysis`] starts an analysis.
+    /// [`Site::start_analysis`] starts an analysis. An update of every diagram with nothing
+    /// to send, while the checkout moved to another history, starts no run, moves `checked`,
+    /// and answers `{"run": null}`.
     fn update_analysis(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: UpdateRequest = if body.is_empty() {
             UpdateRequest::default()
@@ -1075,12 +1117,70 @@ impl Site {
         Ok(to_json(&serde_json::json!({ "run": run })))
     }
 
+    /// The reply to `POST /api/analysis/check`, which the page sends on each refresh: compares
+    /// the analysis's `checked` with `HEAD` (`analysis::check_head`), and starts the forced
+    /// update of the settings' Analyzer when the move needs one (`Runner::analyze_checked`).
+    /// Answers what happened ([`CheckView`]); a start that is refused is an answer, not an
+    /// error, since the page checks with the map closed too. The body is not read.
+    fn check_analysis(&self) -> Result<Vec<u8>> {
+        let repo = self.repo()?;
+        let runner = self.runner()?;
+        let view = match analysis::check_head(&repo)? {
+            Verdict::Same => CheckView::Same,
+            Verdict::Untouched => CheckView::Untouched,
+            Verdict::Diverged => CheckView::Diverged,
+            Verdict::Update {
+                expected,
+                head,
+                planned,
+            } => {
+                let settings = self.current_settings();
+                match settings.analyzer() {
+                    Err(error) => CheckView::Blocked {
+                        reason: error_chain(&error),
+                    },
+                    Ok(agent) => match runner.analyze_checked(
+                        agent,
+                        settings.team_memory(),
+                        expected.as_ref(),
+                        &head,
+                        planned,
+                    )? {
+                        StartedUpdate::Started { run, commit } => {
+                            CheckView::Updated { run, commit }
+                        }
+                        StartedUpdate::AlreadyChecked => CheckView::Same,
+                        StartedUpdate::Blocked(reason) => CheckView::Blocked { reason },
+                    },
+                }
+            }
+        };
+        Ok(to_json(&view))
+    }
+
+    /// The reply to `POST /api/analysis/start-over`: moves the analysis file to the Trash, one
+    /// this build cannot read included, and answers `{"trashed": "<where it went>"}`, or
+    /// `{"trashed": null}` when there was no file. Refused while an analysis of this window is
+    /// under way: its merge would write a new file as this one goes.
+    fn start_analysis_over(&self) -> Result<Vec<u8>> {
+        if self.runner()?.analyzing() {
+            return Err(Error::AnalysisRefused(
+                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
+            ));
+        }
+        let trashed = analysis::start_over(&*self.repo()?)?;
+        Ok(to_json(&serde_json::json!({ "trashed": trashed })))
+    }
+
     /// The reply to `DELETE /api/analysis?diagram=D3`: deletes the diagram, with the diagrams
-    /// below its nodes, and returns the analysis left, placed.
+    /// below its nodes, and returns the analysis left as `GET /api/analysis` does: placed, with
+    /// the files not on the map.
     fn delete_diagram(&self, query: &str) -> Result<Vec<u8>> {
         let id = query_value(query, "diagram")
             .ok_or_else(|| Error::BadRequest("expected ?diagram=<diagram id>".to_owned()))?;
-        Ok(to_json(&analysis::delete(&*self.repo()?, &id)?))
+        let repo = self.repo()?;
+        let left = analysis::delete(&repo, &id)?;
+        Ok(to_json(&analysis::view(&repo, left)))
     }
 
     /// The reply to `POST /api/notes`: adds the note in the body, saves, and returns all
@@ -1171,14 +1271,24 @@ impl Site {
         let query = request.uri().query().unwrap_or("");
         match request.uri().path() {
             "/api/analysis" => match *method {
-                Method::GET => json_or_error(self.analysis()),
+                Method::GET => json_or_error(self.analysis(query)),
                 Method::POST => json_or_error(self.start_analysis(body)),
                 Method::DELETE => json_or_error(self.delete_diagram(query)),
-                _ => not_allowed("GET, POST {\"kind\": ...}, or DELETE ?diagram=<diagram id>"),
+                _ => not_allowed(
+                    "GET, GET ?at=<commit>, POST {\"kind\": ...}, or DELETE ?diagram=<id>",
+                ),
             },
             "/api/analysis/update" => match *method {
                 Method::POST => json_or_error(self.update_analysis(body)),
                 _ => not_allowed("POST {\"diagram\": ...}, or with no body for every diagram"),
+            },
+            "/api/analysis/start-over" => match *method {
+                Method::POST => json_or_error(self.start_analysis_over()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/analysis/check" => match *method {
+                Method::POST => json_or_error(self.check_analysis()),
+                _ => not_allowed("POST with no body"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
@@ -1435,6 +1545,7 @@ impl Site {
             limits: LayoutLimits {
                 sidebar: [*layout::SIDEBAR.start(), *layout::SIDEBAR.end()],
                 tray: [*layout::TRAY.start(), *layout::TRAY.end()],
+                map: [*layout::MAP.start(), *layout::MAP.end()],
             },
         })
     }
@@ -2081,6 +2192,7 @@ fn json_or_error(body: Result<Vec<u8>>) -> Reply {
                 | Error::ParseAnalysis { .. }
                 | Error::InvalidAnalysis { .. }
                 | Error::WriteAnalysis { .. }
+                | Error::TrashAnalysis { .. }
                 | Error::WriteRecent { .. }
                 | Error::WriteSettings { .. }
                 | Error::WriteRun { .. }

@@ -271,6 +271,39 @@ pub(crate) fn config_dir() -> Result<PathBuf> {
     )
 }
 
+/// Moves `file` to the Trash, as Finder's Move to Trash does (`NSFileManager`'s
+/// `trashItemAtURL`), and returns where it went, so the engineer can put it back. Not Postil's
+/// own `trash/` folder (`thread.rs`), which is deleted.
+///
+/// # Errors
+///
+/// When `file` cannot be made a file URL, and Foundation's error (no such file, no Trash on
+/// its volume, no permission).
+#[cfg(target_os = "macos")]
+pub(crate) fn move_to_trash(file: &Path) -> io::Result<PathBuf> {
+    use objc2_foundation::{NSFileManager, NSURL};
+
+    let url = NSURL::from_file_path(file)
+        .ok_or_else(|| io::Error::other(format!("{} cannot be made a file URL", file.display())))?;
+    let mut moved = None;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut moved))
+        .map_err(|error| io::Error::other(error.localizedDescription().to_string()))?;
+    let path = moved.and_then(|moved| moved.path()).ok_or_else(|| {
+        io::Error::other(format!(
+            "{} went to the Trash, which named no place",
+            file.display()
+        ))
+    })?;
+    Ok(PathBuf::from(path.to_string()))
+}
+
+/// Off macOS there is no Trash to move to.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn move_to_trash(_file: &Path) -> io::Result<PathBuf> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 /// `config_dir` from the two variables' values, so tests need not change the environment.
 fn config_dir_from(xdg_config_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
     if let Some(config) = xdg_config_home.map(PathBuf::from)

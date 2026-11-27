@@ -1,12 +1,16 @@
 # Postil: review assist
 
-Status: 2026-11-26. Designed. Built so far: an execute call's command and exit code (step
+Status: 2026-11-27. Designed. Built so far: an execute call's command and exit code (step
 7.2), the author's report (7.3), read and logged, the evidence on the run (7.4), the
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
-Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1), and
-analysis runs (8.2), with no page beyond the settings' Analyzer yet, and finding and setting
-up hippius-mem (9.1), which no run uses yet. This document adds to
-`docs/design.md`, which stays the reference for everything built so far.
+Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1),
+analysis runs (8.2), the split pane with the diagram view (8.3), the link shown in the
+code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated nodes,
+"Not on the map" and Update in the page (8.5), the change map (8.6), the forced update
+(8.7), finding and setting up hippius-mem (9.1), the memory client with the Memory tab and
+the run's Memory section (9.2), team memory given to agents (9.3), Remember (9.4), and
+reviews checked against memory (9.5). Milestone 10 (voice) is not built. This document adds
+to `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
 what this document assumes and the owner has not confirmed.
@@ -262,7 +266,10 @@ because both directions of the link stay visible.
   narrow for both, the diagram takes the whole pane and `Cmd-Shift-M` switches between the
   two. The width is kept in `layout.json`.
 - **The header** holds a breadcrumb (Architecture, then each component deepened into), three
-  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated.
+  kinds (Architecture, Flows, Data), a node search on `/`, and Update when nodes are outdated
+  or files are not on the map. As built (8.5): every kind can be chosen before it has a
+  diagram, whose empty card offers to make one; Flows shows the list of flows with the box
+  that asks for one, and "Not on the map" lists 20 of the files and counts them all.
 - **A node** is a small card: its label, one line of summary, and a mark when it is outdated
   or unverified. Everything else is in its dialog, by the rule of "Cards and dialogs": the
   detail, every anchor, the edges in and out, the notes on its lines, Ask, and Add note.
@@ -289,7 +296,7 @@ The owner asked for the link to be visible in the code, as notes are.
 
 - **A stripe** at the gutter's left edge spans the node's lines, and **a chip** at the end of
   the first line names the node. A click on either opens the map at that node.
-- **A color of its own,** `--map`, a muted violet in both palettes. Amber stays reserved for
+- **A color of its own,** `--map`, a muted orchid in both palettes. Amber stays reserved for
   notes, steel for focus. This is a second rare accent, which "Look and feel" does not allow
   yet; the owner approved the stripe and chip on 2026-11-25 and that section is amended.
 - **One stripe per line.** Lines covered by nested nodes show the innermost node of the
@@ -335,25 +342,30 @@ The owner asked for the link to be visible in the code, as notes are.
   of the run's diff overlaps one of its anchors, placed in the run's snapshot before the run.
   Touched nodes fill with the added color, nodes one edge from a touched node get an outline,
   and changed files that no node covers list under "Not on the map". A click on a touched
-  node opens the changes view at its hunks.
+  node opens the changes view at its hunks. Built in step 8.6: `GET /api/analysis?at=<commit>`
+  places the analysis with `git show` at the snapshot before the run, so a checkout that moved
+  since does not mark the wrong nodes; only Architecture diagrams are drawn.
 
 ### Data structures
 
 Built in step 8.1 (`src/analysis.rs`, `GET /api/analysis`): the types below, the file at
-version 1 (version 2 from step 8.2, which adds each diagram's `dropped`) without `checked`,
-which comes with the code that reads it in step 8.7 (version 3),
-checking a citation, and placing every verified reference on each read. As built, an unverified
-reference has no `target`, only its path and, when its file could not be read, a `reason`:
-its lines may be zero, reversed or past the end of a file that may not exist.
+version 1 (version 2 from step 8.2, which adds each diagram's `dropped`; version 3 from step
+8.7, which adds `checked`, absent until a run stores an Architecture and in files of version 1
+and 2), checking a citation, and placing every verified reference on each read. As built, an
+unverified reference has no `target`, only its path and, when its file could not be read, a
+`reason`: its lines may be zero, reversed or past the end of a file that may not exist.
+A file the page cannot use (unreadable, not of the format, or from a newer build) shows its
+reason in the map with Start over (step 8.3, `POST /api/analysis/start-over`), which moves the
+file to the macOS Trash, refused while an analysis runs in the window.
 
 Looked up: every anchor of the open file, on each file open. Iterated: one diagram's nodes
 and edges, on each draw. Changed: whole diagrams, by an analysis run. A repository holds tens
 of diagrams of tens of nodes, so every operation is a scan, as for notes.
 
 ```rust
-/// `<git dir>/postil/analysis.json`, version 2.
+/// `<git dir>/postil/analysis.json`, version 3.
 struct Analysis {
-    checked: CommitId,        // The commit the Architecture was last compared with.
+    checked: Option<CommitId>, // The commit the Architecture was last compared with.
     diagrams: Vec<Diagram>,
 }
 
@@ -461,7 +473,9 @@ pane's header can say it.
 - **Outdated** is worked out on every read, as a note's anchor is: the snippet is no longer
   in the file. A node with an outdated anchor is marked in the diagram and dashed in the code.
 - **Not on the map** is every file in the file list that no anchor covers and that was added
-  since the diagram's run.
+  since the diagram's run. An Update keeps the diagram's run (chosen by the agent 2026-11-27,
+  for the owner to confirm): a file it places is covered and leaves the list, and one it does
+  not place stays listed until an Update places it.
 - **Update** sends the Analyzer only the outdated nodes, each with its old snippet, and the
   files not on the map. The reply replaces those nodes by id, adds nodes and edges, and may
   delete a node whose code is gone. The owner chose this over a full analysis as the only
@@ -506,6 +520,27 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
   Update, and `checked` moves when it is pressed. Decided 2026-11-25 while planning.
 - A repository with no analysis has nothing to update, and nothing runs.
 
+As built (8.7): `POST /api/analysis/check` (`src/analysis/check.rs`, `analysis::check_head`)
+runs on the page's start, on each refresh (the window's focus, a run's status change, another
+live run's end) and when the settings change, whether or not the map is open. It reads the
+two commits only (`Repo::changed_paths`, `git diff --name-status --no-renames
+--ignore-submodules=all`; `git ls-tree`; `git show`), never the working tree, and holds no lock
+while it does: every write of `checked` is a compare and swap under `analysis.lock`. Only a
+reference whose path, or a folder above it, changed between `checked` and `HEAD` can start a
+run: after an update that failed at one commit, a later commit that touches none of its nodes
+starts none. The update is the Architecture's alone; a node whose only outdated reference is
+an edge's is sent. An update that replaces a node drops its edges out, which its prompt lists
+for the reply to give back, so a broken edge cannot force an update on every later commit.
+`checked` is claimed inside the run's creation, once the cap of 3 is checked and before the
+run's log exists, so of two windows one starts the run. A refused start answers `{"state":
+"blocked", "reason"}`, shown in the pane's strip, not an HTTP error. An Update of every diagram
+moves `checked` as it starts (on another history with nothing outdated it starts no run and
+answers `{"run": null}`); an Update of one diagram does not. A run that stores an Architecture
+sets `checked` to its fork when it is Analyze or the analysis had none; any other run leaves
+it. A file of version 1 or 2 is compared from the fork of its newest top-level Architecture
+diagram's run, or from `HEAD` when that run's thread is not in the record (an analysis written
+by hand); an analysis with no Architecture is not compared, and not written.
+
 ### Drawing and layout
 
 - **Postil draws the SVG**: cards as rounded rectangles in the palette's variables, edges as
@@ -514,9 +549,10 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
   no document (which node covers a line, which nodes a diff touches) with tests beside it.
 - **Layout comes from one vendored file**, the page's first third-party JavaScript:
   `@dagrejs/dagre` (MIT), kept as `ui/vendor/dagre.min.js` with its license, the way
-  `ui/icons.svg` is kept at a pinned commit. Version 3.1.4 was published on 2026-11-24; the
-  pin is a release at least two weeks old on the day it is vendored. Its size in the binary
-  is measured then and recorded in `docs/design.md`, "Dependencies".
+  `ui/icons.svg` is kept at a pinned commit. As built (8.3): version 3.1.3, the newest at
+  least two weeks old on 2026-11-26 (3.1.4 is from 2026-11-24), 49,326 bytes, recorded in
+  `docs/design.md`, "Dependencies", with why edges across boundaries are drawn straight and
+  not laid out by dagre.
 - **It loads when the map first opens**, so launch pays nothing for it.
 - **Rejected:** `elkjs` 0.12.1 (EPL-2.0 or GPL-3.0-or-later, 8.2 MB unpacked on npm against
   1.4 MB) and a layout of our own (the owner chose a vendored one: layout quality on large
@@ -779,7 +815,9 @@ Postil writes outside itself.
 3. **Keys.** `q` to ask, `Cmd`-click to jump, `Cmd-Shift-M` for the map, `n` and `p` for
    steps. The key held to talk is not chosen: Right Option is the proposal, since Fn
    belongs to macOS dictation.
-4. **The map's color.** A muted violet; the mockups show it for approval.
+4. **The map's color.** A muted violet; the mockups show it for approval. As built (8.3):
+   `--map` is a muted orchid, `#d79ad0` in Graphite and `#a33a8a` in Paper, its wash the same at
+   10% and 8%: the violet first tried matched the keyword color (`--syntax-keyword`).
 5. **Exit status: answered by spike S1, 2026-11-25.** Claude (`claude-agent-acp` 0.94.0)
    and Grok (1.0.92) ran `echo hello`, `sh -c 'echo failing >&2; exit 3'`,
    `ls no-such-directory` and a Python test through Postil's own connection, in a scratch

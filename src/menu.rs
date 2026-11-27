@@ -20,10 +20,12 @@ pub(crate) enum Command {
     SetupWizard,
     Quit,
     FocusMode,
+    Map,
+    MapMarkers,
 }
 
 impl Command {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::OpenFolder,
         Self::SwitchProject,
         Self::GoToFile,
@@ -33,6 +35,8 @@ impl Command {
         Self::SetupWizard,
         Self::Quit,
         Self::FocusMode,
+        Self::Map,
+        Self::MapMarkers,
     ];
 
     /// The menu item's id, which is also the name `window.postil.menu` takes in `ui/app.js`.
@@ -47,6 +51,8 @@ impl Command {
             Self::SetupWizard => "setup-wizard",
             Self::Quit => "quit",
             Self::FocusMode => "focus-mode",
+            Self::Map => "map",
+            Self::MapMarkers => "map-markers",
         }
     }
 
@@ -136,6 +142,11 @@ fn build() -> muda::Result<Menu> {
         true,
         &[
             &Command::Usage.item("Usage…", shift_command(Code::KeyU)),
+            &Command::Map.item("Map", shift_command(Code::KeyM)),
+            // A plain item, not a check item: muda ticks a check item before the page hears of
+            // the click, and the page's session flag resets with every reload, so a tick would
+            // drift from what the code shows.
+            &Command::MapMarkers.plain_item("Map Markers"),
             &Command::FocusMode.item("Focus Mode", command(Code::Backslash)),
             &separator(),
             &PredefinedMenuItem::fullscreen(None),

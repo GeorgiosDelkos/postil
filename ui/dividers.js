@@ -1,18 +1,32 @@
-// The dividers beside the file list and the tray, which resize them. The widths are kept per
-// Mac in layout.json (src/layout.rs); ui/panes.js has the rules. Until the kept widths arrive,
-// app.css's defaults stand.
+// The dividers beside the file list, the map and the tray, which resize them. The widths are
+// kept per Mac in layout.json (src/layout.rs); ui/panes.js has the rules. Until the kept widths
+// arrive, app.css's defaults stand.
 
 import { $, showToast } from "./dom.js";
-import { BIG_STEP, STEP, dragFiles, dragTray, fit, reset, step } from "./panes.js";
+import { BIG_STEP, STEP, drag, fit, reset, step } from "./panes.js";
 
-// Wires both dividers and the window's resize. Returns `{ load }`, which reads the kept widths.
-export function dividers() {
+// Each divider's element, the layout key it sets, and the CSS variable that width goes to.
+const DIVIDERS = {
+  files: { id: "divider-files", key: "sidebar", prop: "--sidebar-width" },
+  map: { id: "divider-map", key: "map", prop: "--map-width" },
+  tray: { id: "divider-tray", key: "tray", prop: "--tray-width" },
+};
+
+// Wires the dividers and the window's resize. `onNarrow(narrow)` is called after every draw
+// with whether the window is too narrow for the open map beside the code (panes.js, `fit`).
+// Returns `{ load, setMapOpen, isNarrow }`: `load` reads the kept widths, `setMapOpen` draws the
+// panes with the map open or closed.
+export function dividers({ onNarrow }) {
   const panes = {
-    // As `api/layout` gives them: { sidebar, tray }, the defaults, and the limits.
+    // As `api/layout` gives them: { sidebar, tray, map }, the defaults, and the limits.
     layout: null,
     defaults: null,
     limits: null,
-    // The divider being dragged: "files" or "tray".
+    // Whether the map shows; kept for the window's session only, not in layout.json.
+    mapOpen: false,
+    // Whether the last draw found the window too narrow for the map beside the code.
+    narrow: false,
+    // The divider being dragged: a key of DIVIDERS.
     dragging: null,
     saveTimer: 0,
   };
@@ -23,10 +37,8 @@ export function dividers() {
     const { defaults, limits, ...layout } = await response.json();
     panes.defaults = defaults;
     panes.limits = limits;
-    for (const [id, [min, max]] of [
-      ["divider-files", limits.sidebar],
-      ["divider-tray", limits.tray],
-    ]) {
+    for (const { id, key } of Object.values(DIVIDERS)) {
+      const [min, max] = limits[key];
       $(id).setAttribute("aria-valuemin", String(min));
       $(id).setAttribute("aria-valuemax", String(max));
     }
@@ -43,14 +55,23 @@ export function dividers() {
     panes.saveTimer = setTimeout(saveLayout, 300);
   }
 
+  function options() {
+    return { mapOpen: panes.mapOpen };
+  }
+
   function drawLayout() {
-    if (!panes.layout) return;
-    const { sidebar, tray } = fit(panes.layout, panes.limits, innerWidth);
-    const root = document.documentElement.style;
-    root.setProperty("--sidebar-width", `${sidebar}px`);
-    root.setProperty("--tray-width", `${tray}px`);
-    $("divider-files").setAttribute("aria-valuenow", String(sidebar));
-    $("divider-tray").setAttribute("aria-valuenow", String(tray));
+    if (panes.layout) {
+      const drawn = fit(panes.layout, panes.limits, innerWidth, options());
+      const root = document.documentElement.style;
+      for (const { id, key, prop } of Object.values(DIVIDERS)) {
+        root.setProperty(prop, `${drawn[key]}px`);
+        $(id).setAttribute("aria-valuenow", String(drawn[key]));
+      }
+      panes.narrow = drawn.narrow;
+    }
+    // The map's divider shows only beside the map; a narrow window shows the map alone.
+    $("divider-map").hidden = !panes.mapOpen || panes.narrow;
+    onNarrow(panes.narrow);
   }
 
   async function saveLayout() {
@@ -60,10 +81,7 @@ export function dividers() {
     if (!response.ok) showToast(await response.text());
   }
 
-  for (const [id, divider] of [
-    ["divider-files", "files"],
-    ["divider-tray", "tray"],
-  ]) {
+  for (const [divider, { id }] of Object.entries(DIVIDERS)) {
     const el = $(id);
     const stop = () => {
       if (panes.dragging !== divider) return;
@@ -84,10 +102,8 @@ export function dividers() {
       if (panes.dragging !== divider) return;
       // A release outside the window can arrive without a pointerup here.
       if ((event.buttons & 1) === 0) return stop();
-      const next =
-        divider === "files"
-          ? dragFiles(panes.layout, panes.limits, event.clientX, innerWidth)
-          : dragTray(panes.layout, panes.limits, event.clientX, innerWidth);
+      const { layout, limits } = panes;
+      const next = drag(layout, limits, divider, event.clientX, innerWidth, options());
       setLayout(next, { save: false });
     });
     // Fires after pointerup and pointercancel, and also when the capture is lost without either:
@@ -103,7 +119,8 @@ export function dividers() {
       event.stopPropagation();
       const size = event.shiftKey ? BIG_STEP : STEP;
       const delta = event.key === "ArrowRight" ? size : -size;
-      setLayout(step(panes.layout, panes.limits, divider, delta, innerWidth), { save: true });
+      const next = step(panes.layout, panes.limits, divider, delta, innerWidth, options());
+      setLayout(next, { save: true });
     });
   }
 
@@ -111,5 +128,14 @@ export function dividers() {
   // not a change of layout, so nothing is saved.
   window.addEventListener("resize", drawLayout);
 
-  return { load: loadLayout };
+  return {
+    load: loadLayout,
+    // Opening or closing the map changes what the other panes must leave room for, so the
+    // panes are fitted again; nothing is saved.
+    setMapOpen: (open) => {
+      panes.mapOpen = open;
+      drawLayout();
+    },
+    isNarrow: () => panes.narrow,
+  };
 }

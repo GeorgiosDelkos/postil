@@ -100,3 +100,61 @@ test("a memory draft's thread is busy while the draft runs, and free once it end
   await store.sync();
   assert.equal(store.threadLive("R1"), false);
 });
+
+test("a live run of another thread is followed while there is no latest run, as an analysis", async (t) => {
+  // An analysis is never the latest run: `api/run` answers null all along.
+  const analysis = { id: "R1", status: "running", total: 1, entries: ["a"], analysis: {} };
+  const replies = new Map([
+    ["api/run?after=0", null],
+    ["api/runs", { runs: ["R1"], live: [{ id: "R1", thread: "R1" }] }],
+    ["api/run?id=R1&after=0", analysis],
+    ["api/run?id=R1&after=1", { ...analysis, status: "ended", total: 2, entries: ["b"] }],
+  ]);
+  t.mock.method(globalThis, "fetch", async (url) => new Response(JSON.stringify(replies.get(url))));
+  const ended = [];
+  const store = runStore({
+    render() {},
+    onChange: (_run, _previous, { liveEnded }) => ended.push(liveEnded),
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+
+  await store.track();
+  assert.equal(store.byId("R1").status, "running");
+  // The nudge of its next entry: the list is not stale, and still the run is read again.
+  await store.sync();
+  assert.equal(store.byId("R1").status, "ended");
+  assert.deepEqual(store.byId("R1").entries, ["a", "b"]);
+  // The page is told when it ended, and only then: it refreshes, and checks HEAD again.
+  assert.deepEqual(ended, [false, true]);
+});
+
+test("a live run that ended after forget() is read final and reported", async (t) => {
+  const analysis = { id: "R1", status: "running", total: 1, entries: ["a"], analysis: {} };
+  let live = [{ id: "R1", thread: "R1" }];
+  const replies = new Map([
+    ["api/run?after=0", null],
+    ["api/run?id=R1&after=0", analysis],
+    ["api/run?id=R1&after=1", { ...analysis, status: "ended", total: 2, entries: ["b"] }],
+  ]);
+  t.mock.method(globalThis, "fetch", async (url) => {
+    const reply = url === "api/runs" ? { runs: ["R1"], live } : replies.get(url);
+    return new Response(JSON.stringify(reply));
+  });
+  const ended = [];
+  const store = runStore({
+    render() {},
+    onChange: (_run, _previous, { liveEnded }) => ended.push(liveEnded),
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+
+  await store.track();
+  assert.equal(store.byId("R1").status, "running");
+  // The window's focus forgets what may have changed; R1 ends, and the list no longer names it.
+  store.forget();
+  live = [];
+  await store.sync();
+  assert.equal(store.byId("R1").status, "ended");
+  assert.deepEqual(ended, [false, true]);
+});

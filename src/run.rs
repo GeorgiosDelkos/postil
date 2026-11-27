@@ -56,10 +56,12 @@
 //! the run still holds its thread's lock, for the read, the merge and the save of the file:
 //! milliseconds, since the reply's citations are checked before it is taken. An ask saves its note
 //! under it inside [`Run::create`], so under the slots and `runs/active.lock`
-//! ([`Runner::ask`]). The save holds it for milliseconds; a lock another process keeps is
-//! waited for up to `files::LOCK_WAIT`, 2 s, before the ask fails. Every page request and
-//! agent event waits that long then, and another window's send gives up on
-//! `runs/active.lock` after its 200 ms (`RunElsewhere`). Accepted over trying the lock for
+//! ([`Runner::ask`]), and so does an analysis run that moves `checked`: the forced update's
+//! claim ([`Runner::analyze_checked`]) and an Update of every diagram ([`Runner::analyze`]).
+//! The save holds it for milliseconds; a lock another process keeps is waited for up to
+//! `files::LOCK_WAIT`, 2 s, before the ask fails. Every page request and agent event waits
+//! that long then, and another window's send gives up on `runs/active.lock` after its 200 ms
+//! (`RunElsewhere`). Accepted over trying the lock for
 //! that same moment: only a script holding `review.lock` costs it, and a second way of
 //! taking the lock would serve this one caller.
 //! The page is told about every change through `notify`, and fetches what it has not seen.
@@ -85,7 +87,7 @@ use crate::acp::{
     PermissionOption, StopReason, Stopper, ToolKind, TurnEnd,
 };
 use crate::agents::{self, AgentChoice, Scanner};
-use crate::analysis::{self, AnalysisJob, Planned};
+use crate::analysis::{self, AnalysisJob, CommitId, Plan, Planned};
 use crate::error::{Error, Result, error_chain};
 use crate::memory::{Memory, RunMemory};
 use crate::notes::{self, NewNote, Prompt, Review};
@@ -395,6 +397,26 @@ impl Slot {
     }
 }
 
+/// How [`Runner::analyze_checked`] answered.
+#[derive(Debug)]
+pub(crate) enum StartedUpdate {
+    /// Run `run` started, and `checked` moved to the commit it starts from, which people know
+    /// by `commit`, its short id.
+    Started { run: String, commit: String },
+    /// Another window moved `checked` first, and started the update there.
+    AlreadyChecked,
+    /// The run could not start, for the reason given; `checked` stays, so the next check tries
+    /// again.
+    Blocked(String),
+}
+
+/// The refusal of an analysis run while one of this window is under way.
+fn analysis_under_way() -> Error {
+    Error::AnalysisRefused(
+        "an analysis of this window is under way: wait for it, or stop it".to_owned(),
+    )
+}
+
 /// A send that waits for its agent to start.
 #[derive(Debug)]
 struct Pending {
@@ -702,11 +724,21 @@ impl Runner {
         Ok(saved.expect("launch succeeded, so Run::create called the content closure"))
     }
 
+    /// Whether an analysis run of this window is under way, or its worktree is being made.
+    /// Takes the slots' lock for the look only.
+    pub(crate) fn analyzing(&self) -> bool {
+        self.slots().analyzing()
+    }
+
     /// Starts an analysis run of `agent`, read-only in a new thread of its own that ends with
     /// the run (docs/review-assist.md, "An analysis run"), as `job` asks, and returns the run's
-    /// id. Its reply is merged into the analysis as its turn ends well ([`finish_analysis`]).
-    /// Waits for the agent scan, once per app, and for locks as [`Runner::send`] does. Reads
-    /// the analysis, and for an update the file list and the record ([`analysis::plan`]).
+    /// id; or, for an Update of every diagram with nothing to send while the checkout moved
+    /// to another history ([`Plan::MoveChecked`]), moves `checked` there and returns `None`. Its
+    /// reply is merged into the analysis as its turn ends well ([`finish_analysis`]). An Update
+    /// of every diagram moves `checked` to the run's fork as it starts, under the slots and
+    /// `runs/active.lock` ([`analysis::move_checked`]). Waits for the agent scan, once per app,
+    /// and for locks as [`Runner::send`] does. Reads the analysis, and for an update the file
+    /// list and the record ([`analysis::plan`]).
     ///
     /// # Errors
     ///
@@ -719,24 +751,156 @@ impl Runner {
         agent: AgentChoice,
         job: AnalysisJob,
         memory: TeamMemory,
-    ) -> Result<String> {
-        // Checked here: a missing agent would fail only on the start thread, after the thread
-        // is made.
-        if !agents::is_installed(&agent, &self.agents.wait()) {
+    ) -> Result<Option<String>> {
+        self.analysis_ready(&agent)?;
+        let fork = CommitId::of_head(&self.repo)?.ok_or(Error::NoCommit)?;
+        self.home.as_deref().ok_or(Error::NoHome)?;
+        thread::all(&self.repo)?;
+        let (planned, moves_checked) = match analysis::plan(&self.repo, job)? {
+            Plan::Run {
+                planned,
+                moves_checked,
+            } => (planned, moves_checked),
+            Plan::MoveChecked(head) => {
+                analysis::move_checked(&self.repo, &head)?;
+                return Ok(None);
+            }
+        };
+        let mut id = None;
+        self.start_analysis(agent, memory, &fork, planned, |run| {
+            if moves_checked {
+                analysis::move_checked(&self.repo, &fork)?;
+            }
+            id = Some(run.to_owned());
+            Ok(())
+        })?;
+        Ok(Some(id.expect(
+            "start_analysis succeeded, so it called the opening closure",
+        )))
+    }
+
+    /// Starts the forced update `planned` (docs/review-assist-plan.md, 8.7) of `agent`, as
+    /// [`Runner::analyze`] starts an analysis, when it can claim `checked` from `expected` to
+    /// `head` ([`analysis::claim_check`]): under the slots and `runs/active.lock`, once the cap
+    /// of 3 live runs is checked and before the run's log exists, so a refused start leaves
+    /// `checked` as it was, and of two windows only the first starts a run.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Runner::analyze`] other than the reasons it reports in
+    /// [`StartedUpdate::Blocked`]: an Analyzer that is not installed, an analysis of this
+    /// window under way, no home folder, a worktree path with a colon, the cap of 3, another
+    /// window's lock.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the Analyzer and its team memory, then the claim and the run it starts: \
+                  each a value the caller has apart, none of them a group elsewhere"
+    )]
+    pub(crate) fn analyze_checked(
+        self: &Arc<Self>,
+        agent: AgentChoice,
+        memory: TeamMemory,
+        expected: Option<&CommitId>,
+        head: &CommitId,
+        planned: Planned,
+    ) -> Result<StartedUpdate> {
+        let blocked = |error: &Error| Ok(StartedUpdate::Blocked(error_chain(error)));
+        // Before the claim, which they would otherwise fail only after: the thread's place
+        // is planned once the run has its number (`Runner::place`).
+        let ready = self
+            .analysis_ready(&agent)
+            .and_then(|()| thread::all(&self.repo))
+            .and_then(|_| {
+                let home = self.home.as_deref();
+                thread::plan(&self.repo, home, "R1", head.as_str(), &planned.title)
+            });
+        match ready {
+            Ok(_) => {}
+            Err(
+                error @ (Error::AnalysisRefused(_) | Error::NoHome | Error::ColonInPath { .. }),
+            ) => return blocked(&error),
+            Err(error) => return Err(error),
+        }
+        let mut lost = false;
+        let mut id = None;
+        let started = self.start_analysis(agent, memory, head, planned, |run| {
+            if !analysis::claim_check(&self.repo, expected, head)? {
+                lost = true;
+                return Err(Error::AnalysisRefused(
+                    "another window started this update".to_owned(),
+                ));
+            }
+            id = Some(run.to_owned());
+            Ok(())
+        });
+        match started {
+            Ok(()) => Ok(StartedUpdate::Started {
+                run: id.expect("start_analysis succeeded, so it called the opening closure"),
+                commit: head.short().to_owned(),
+            }),
+            Err(_) if lost => Ok(StartedUpdate::AlreadyChecked),
+            Err(error @ Error::AnalysisRefused(_)) => blocked(&error),
+            // Another window's start causes these too: when it claimed `checked`, the update
+            // is under way there.
+            Err(error @ (Error::TooManyRuns { .. } | Error::RunElsewhere)) => {
+                if analysis::is_checked_at(&self.repo, head)? {
+                    Ok(StartedUpdate::AlreadyChecked)
+                } else {
+                    blocked(&error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Refuses an analysis run of `agent` before its plan: an Analyzer that is not installed
+    /// would fail only on the start thread, after the thread is made; an analysis of this window
+    /// under way has not written the analysis the plan reads (an update would be refused as
+    /// having nothing to update), and the plan runs git for an update. Checked again under the
+    /// slots' lock ([`Runner::start_analysis`]), which a run may have taken since.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AnalysisRefused`] saying which.
+    fn analysis_ready(&self, agent: &AgentChoice) -> Result<()> {
+        if !agents::is_installed(agent, &self.agents.wait()) {
             return Err(Error::AnalysisRefused(format!(
                 "{} is not installed: install it, or choose another Analyzer in Settings",
                 agent.name
             )));
         }
-        let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
-        self.home.as_deref().ok_or(Error::NoHome)?;
-        thread::all(&self.repo)?;
-        let Planned { run, title, prompt } = analysis::plan(&self.repo, job)?;
+        if self.analyzing() {
+            return Err(analysis_under_way());
+        }
+        Ok(())
+    }
+
+    /// Launches the analysis run `planned` of `agent`, with team memory as `memory` says, in a
+    /// new read-only thread at commit `fork`, calling `opening` with the run's id under the
+    /// slots and `runs/active.lock` before its log exists ([`Run::create`]): an error there
+    /// starts nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AnalysisRefused`] when an analysis of this window is under way; the error of
+    /// `opening`; and as [`Runner::launch`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the two callers differ in the fork and the opening only: a struct of the \
+                  rest would be built once at each call and taken apart at once"
+    )]
+    fn start_analysis(
+        self: &Arc<Self>,
+        agent: AgentChoice,
+        memory: TeamMemory,
+        fork: &CommitId,
+        planned: Planned,
+        opening: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<()> {
+        let Planned { run, title, prompt } = planned;
         let slots = self.slots();
         if slots.analyzing() {
-            return Err(Error::AnalysisRefused(
-                "an analysis of this window is under way: wait for it, or stop it".to_owned(),
-            ));
+            return Err(analysis_under_way());
         }
         let new = NewRun {
             agent,
@@ -746,14 +910,13 @@ impl Runner {
             review: None,
             review_recall: None,
             place: Place::New {
-                fork,
+                fork: fork.as_str().to_owned(),
                 title,
                 mode: Mode::Read,
             },
         };
-        let mut id = None;
         self.launch(slots, new, |run| {
-            id = Some(run.to_owned());
+            opening(run)?;
             Ok(Content {
                 notes: Vec::new(),
                 prompt: Prompt {
@@ -761,8 +924,7 @@ impl Runner {
                     files: Vec::new(),
                 },
             })
-        })?;
-        Ok(id.expect("launch succeeded, so Run::create called the content closure"))
+        })
     }
 
     /// The thread `id`, open with its worktree on disk, or evicted, whose run makes it again.
@@ -2556,7 +2718,9 @@ impl Runner {
     }
 
     /// What a review recalls for: the reviewed run's notes as asked (`asked`, left out when
-    /// empty), then each path it changed once, `files` (its edits' diffs) first.
+    /// empty), then each path it changed once, `files` (its edits' diffs) first, then the
+    /// paths that differ between its snapshots: a command's edits, which report no diff to
+    /// Postil, are among them. A renamed file is its old path and its new one.
     ///
     /// # Errors
     ///
@@ -2577,9 +2741,9 @@ impl Runner {
                     error_chain(&error)
                 )
             })?;
-            for path in changed {
-                if !paths.contains(&path) {
-                    paths.push(path);
+            for changed in changed {
+                if !paths.contains(&changed.path) {
+                    paths.push(changed.path);
                 }
             }
         }

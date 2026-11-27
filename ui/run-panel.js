@@ -12,13 +12,15 @@ import { runTab } from "./run-tab.js";
 import { foldRun, isLive, openPermission, permissionKey, permissionKeys } from "./run.js";
 
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
-// sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous)` is
-// called after every fetch that changed the latest run, so the page can follow it (switch
-// tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
+// sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous,
+// { liveEnded })` is called after every fetch that changed the latest run, so the page can
+// follow it (switch tabs, re-read files), `liveEnded` whether another live run ended in it
+// (run-store.js); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
 // by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
 // file in the code pane; `reviewers()` names the settings' reviewers, in order;
 // `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
-// `openMemory(id)` opens a team memory's dialog.
+// `openMemory(id)` opens a team memory's dialog; `changeMapState()` and `showChangeMap(from,
+// to)` offer and show what they touched on the map (run-dialog.js).
 export function runPanel({
   panelEl,
   headerEl,
@@ -33,6 +35,8 @@ export function runPanel({
   reviewers,
   showChanges,
   openMemory,
+  changeMapState,
+  showChangeMap,
 }) {
   // `tab` is built below: the store draws only after a fetch, never while it is built.
   const store = runStore({ render: () => tab.render(), onChange, onLoaded, onError });
@@ -45,6 +49,8 @@ export function runPanel({
     reviewers,
     showChanges,
     openMemory,
+    changeMapState,
+    showChangeMap,
     onError,
   });
   const tab = runTab({ store, dialog, panelEl, headerEl, statusEl });
@@ -94,5 +100,11 @@ export function runPanel({
     started: store.started,
     // Opens the dialog of run `id`'s thread.
     openRun: (id) => dialog.open({ kind: "run", id }),
+    // Draws the open dialog again when what it shows changed: an analysis read since changes
+    // its Change map.
+    drawDialog: dialog.draw,
+    // An analysis run, which the map starts and shows: followed, and stopped by its id.
+    track: store.track,
+    stopRun: store.stop,
   };
 }

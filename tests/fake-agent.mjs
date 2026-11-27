@@ -192,7 +192,9 @@ function analysisReply(text) {
     };
   }
   if (text.startsWith("Trace one behavior")) {
-    const steps = ["first", "second", "third"].map((key) => node(key, "component", key, [{ path: "src/a.rs" }]));
+    // In step order, which is neither the keys' order nor the edges': the last step loops back
+    // to the first, as a retry does.
+    const steps = ["send", "check", "apply"].map((key) => node(key, "component", key, [{ path: "src/a.rs" }]));
     return {
       diagrams: [
         {
@@ -200,8 +202,9 @@ function analysisReply(text) {
           title: "A flow",
           nodes: steps,
           edges: [
-            { from: "first", to: "second", label: "then", anchor: null },
-            { from: "second", to: "third", label: "then", anchor: null },
+            { from: "send", to: "check", label: "then", anchor: null },
+            { from: "check", to: "apply", label: "then", anchor: null },
+            { from: "apply", to: "send", label: "again", anchor: null },
           ],
         },
       ],
@@ -214,7 +217,10 @@ function analysisReply(text) {
   const healthy = [...text.matchAll(/^- (D\d+\.\d+) "[^"\n]*"$/gm)].map((match) => match[1]);
   const diagram = text.match(/^Diagram (D\d+)/m)?.[1] ?? null;
   const [first, ...rest] = outdated;
-  const added = node("added", "component", "Added", [{ path: "src/a.rs" }], { group: "nowhere" });
+  // The added node places the first file not on the map, when the prompt lists any, and
+  // leaves the others where they are.
+  const placed = text.match(/as a new node:\n- (\S+)\n/)?.[1] ?? "src/a.rs";
+  const added = node("added", "component", "Added", [{ path: placed }], { group: "nowhere" });
   const nodes = [{ ...added, summary: "S".repeat(200) }];
   const edges = [{ from: "added", to: "ghost", label: "to no node", anchor: null }];
   if (first) {
@@ -529,6 +535,29 @@ async function prompt(id, params) {
           { command: "cargo test", result: "passed" },
           { command: "cargo build", result: "maybe" },
         ],
+      };
+      say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
+    case "change-map": {
+      // What the change map draws (docs/review-assist-plan.md, 8.6): deletes old.txt, which
+      // the report rates mechanical (folded, first), rewrites every line of big.txt (a long
+      // step in between), changes line 15 of lib.txt alone (last), and adds new.txt.
+      const cwd = process.cwd();
+      rmSync(`${cwd}/old.txt`);
+      const big = Array.from({ length: 150 }, (_, index) => `B${index + 1}\n`).join("");
+      writeFileSync(`${cwd}/big.txt`, big);
+      const lib = Array.from({ length: 20 }, (_, index) => `l${index + 1}\n`).join("");
+      writeFileSync(`${cwd}/lib.txt`, lib.replace("l15\n", "fifteen\n"));
+      writeFileSync(`${cwd}/new.txt`, "new\n");
+      say("N1: done");
+      const report = {
+        steps: [
+          { path: "old.txt", lines: [1, 4], why: "no longer used", risk: "mechanical" },
+          { path: "big.txt", lines: [1, 150], why: "renamed", risk: "routine" },
+          { path: "lib.txt", lines: [15, 15], why: "the change", risk: "routine" },
+        ],
+        checks: [{ command: "cargo test", result: "passed" }],
       };
       say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
       return send({ id, result: { stopReason: "end_turn" } });

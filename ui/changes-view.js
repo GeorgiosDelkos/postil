@@ -57,11 +57,25 @@ export function changesView({
       viewEl.scrollTop = top;
     },
   });
+  // While a draw scrolls to a hunk (`focusOn`): `match(file, hunk)`, which says whether a hunk
+  // is wanted (`hunk` null for a file with none), and the first element drawn for one.
+  let focus = null;
+  let target = null;
 
   // Shows what runs `from` to `to` changed. `run` is `{ report, findings }` for a single run:
   // its author's report (null when it gave none) and its latest review's findings. Null for a
-  // thread of several runs, which keeps Files order.
-  async function show(from, to, run = null) {
+  // thread of several runs, which keeps Files order. With `match`, scrolled to the first hunk
+  // it holds (`focusOn`): a click on a touched node of the change map. The same changes shown
+  // already, between two snapshots, are not read again, and keep their order and the hunks
+  // opened; compared with the files as they are now, they may have changed since, and are.
+  async function show(from, to, run = null, { match = null } = {}) {
+    if (shown && read && !read.sinceNow && shown.from === from && shown.to === to) {
+      // A review that ended since brings its findings.
+      shown.run = run;
+      viewEl.focus();
+      focusOn(match);
+      return;
+    }
     shown = { from, to, run };
     read = null;
     opened = new Set();
@@ -89,7 +103,53 @@ export function changesView({
       return;
     }
     read = { files: parsePatch(reply.patch), sinceNow: reply.after === null };
+    focusOn(match);
+  }
+
+  // Draws the view and scrolls it to the first hunk `match(file, hunk)` holds, or to the first
+  // file with no hunks it holds (`hunk` null), opened if folded and drawn whole wherever it
+  // is, so neither a fold nor the `LINES_SHOWN` limit hides it. With no match, draws only.
+  function focusOn(match) {
+    focus = match;
+    target = null;
+    if (match) {
+      for (const file of read.files)
+        for (const hunk of file.hunks) if (match(file, hunk)) opened.add(hunk);
+    }
     draw();
+    focus = null;
+    if (!target) return;
+    const step = target.closest(".changes-step");
+    if (step) {
+      current = steps().indexOf(step);
+      markCurrent();
+    }
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const padding = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;
+    const top =
+      target.getBoundingClientRect().top -
+      viewEl.getBoundingClientRect().top +
+      viewEl.scrollTop -
+      padding;
+    viewEl.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
+    target = null;
+  }
+
+  // Whether the draw under way scrolls to one of `entries` (`{ file, hunk }`): they are then
+  // drawn whole.
+  function holdsFocus(entries) {
+    return Boolean(focus) && entries.some(({ file, hunk }) => focus(file, hunk));
+  }
+
+  // `element`, drawn for `hunk` of `file`, is what the draw scrolls to when it is the first
+  // that `focus` asks for.
+  function aim(element, file, hunk) {
+    if (focus && !target && focus(file, hunk)) target = element;
+  }
+
+  // A file's hunks as entries, or the file alone when it has none.
+  function entriesOf(file) {
+    return file.hunks.length ? file.hunks.map((hunk) => ({ file, hunk })) : [{ file, hunk: null }];
   }
 
   function hasSteps() {
@@ -129,7 +189,10 @@ export function changesView({
     if (order === "walkthrough") parts.push(...walkthroughParts(guide, files, marks));
     else {
       const risks = risksOf(guide);
-      for (const file of files) parts.push(fileView(file, marks, risks));
+      for (const file of files) {
+        const limit = holdsFocus(entriesOf(file)) ? Infinity : LINES_SHOWN;
+        parts.push(fileView(file, marks, risks, limit));
+      }
     }
     viewEl.replaceChildren(...parts);
     markCurrent();
@@ -220,10 +283,18 @@ export function changesView({
     const ordered = eyesFirst
       ? [...named.filter(isEyes), ...named.filter((group) => !isEyes(group))]
       : named;
+    const limit = (entries) => (holdsFocus(entries) ? Infinity : LINES_SHOWN);
     const parts = ordered.map((group) =>
-      stepView(group, groups.length, { marks, findings: looseFindings.get(group) }),
+      stepView(
+        group,
+        groups.length,
+        { marks, findings: looseFindings.get(group) },
+        limit(group.entries),
+      ),
     );
-    if (rest.length || restFindings.length) parts.push(restView(rest, marks, restFindings));
+    if (rest.length || restFindings.length) {
+      parts.push(restView(rest, marks, restFindings, limit(rest)));
+    }
     // A step that names no changed line is listed last, so a wrong report is visible.
     for (const group of empty) parts.push(stepView(group, groups.length, { marks, findings: [] }));
     return parts;
@@ -290,6 +361,7 @@ export function changesView({
       }
       if (!entry.hunk) {
         rows.append(noHunks(file));
+        aim(rows.parentElement, file, null);
         continue;
       }
       const risk = risks.get(entry.hunk) ?? null;
@@ -312,6 +384,7 @@ export function changesView({
     if (unplaced.length) part.append(findingCards(unplaced));
     if (file.binary || file.hunks.length === 0) {
       part.append(noHunks(file));
+      aim(part, file, null);
       return part;
     }
     const rows = el("div", "changes-rows");
@@ -365,6 +438,9 @@ export function changesView({
   function hunkView(file, hunk, { risk, marks, limit }) {
     const shownRisk = risk && hunkRisk(risk, hunk, marks.findings.placed);
     const block = el("div", "changes-hunk-block");
+    block.dataset.path = file.path;
+    block.dataset.oldStart = String(hunk.oldStart);
+    aim(block, file, hunk);
     if (shownRisk) block.dataset.risk = shownRisk;
     const marked = hunk.lines.some((line) => line.new !== null && marks.notes.has(line.new));
     if (shownRisk === "mechanical" && !marked && !opened.has(hunk)) {

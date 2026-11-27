@@ -54,6 +54,27 @@ pub struct BenchReport {
     pub page: String,
 }
 
+impl BenchReport {
+    /// Why the run missed a budget the page checks, in words, or `None` when it kept every one:
+    /// today the map's 200-node layout (`diagram` in `ui/bench.js`). A page report without that
+    /// part, or one that cannot be read, misses it: the bench would otherwise pass unmeasured.
+    pub fn over_budget(&self) -> Option<String> {
+        let page: serde_json::Value = match serde_json::from_str(&self.page) {
+            Ok(page) => page,
+            Err(error) => return Some(format!("the page's report is not JSON: {error}")),
+        };
+        let diagram = &page["diagram"];
+        match diagram["withinBudget"].as_bool() {
+            Some(true) => None,
+            Some(false) => Some(format!(
+                "the 200-node map layout took {} ms, over its {} ms budget",
+                diagram["layoutMs"], diagram["budgetMs"]
+            )),
+            None => Some("the page's report has no map layout time".to_owned()),
+        }
+    }
+}
+
 /// Opens the window and returns when it closes. With `dir`, the window opens on the
 /// repository that contains it; without, on the welcome screen.
 ///
@@ -266,7 +287,9 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
                 | Command::Settings
                 | Command::Usage
                 | Command::SetupWizard
-                | Command::FocusMode => Unanswered::Ignore,
+                | Command::FocusMode
+                | Command::Map
+                | Command::MapMarkers => Unanswered::Ignore,
             };
             ask_page(&app.page, command.id(), unanswered);
         }
@@ -662,6 +685,26 @@ mod tests {
 
     fn drag(paths: &[&Path]) -> Vec<PathBuf> {
         paths.iter().map(|path| path.to_path_buf()).collect()
+    }
+
+    #[test]
+    fn a_bench_over_the_map_layout_budget_or_without_it_fails() {
+        let report = |page: &str| BenchReport {
+            launch_to_paint: Duration::ZERO,
+            page: page.to_owned(),
+        };
+        let within = r#"{"diagram": {"layoutMs": 31, "budgetMs": 150, "withinBudget": true}}"#;
+        assert_eq!(report(within).over_budget(), None);
+        let over = r#"{"diagram": {"layoutMs": 180, "budgetMs": 150, "withinBudget": false}}"#;
+        assert_eq!(
+            report(over).over_budget().as_deref(),
+            Some("the 200-node map layout took 180 ms, over its 150 ms budget")
+        );
+        assert!(
+            report(r#"{"frames": 300}"#).over_budget().is_some(),
+            "unmeasured"
+        );
+        assert!(report("not json").over_budget().is_some());
     }
 
     #[test]

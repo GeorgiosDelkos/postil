@@ -54,7 +54,9 @@ const CHECK_WORDS = {
 // note by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)`
 // shows a file in the code pane; `reviewers()` names the settings' reviewers, in order;
 // `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;
-// `openMemory(id)` opens a team memory's dialog.
+// `openMemory(id)` opens a team memory's dialog; `changeMapState()` says whether the map can
+// show what they touched: "none" with no analysis, "no-architecture" when it has no
+// Architecture diagram, else "ready"; `showChangeMap(from, to)` shows it.
 export function runDialog({
   store,
   detailEl,
@@ -64,6 +66,8 @@ export function runDialog({
   reviewers,
   showChanges,
   openMemory,
+  changeMapState,
+  showChangeMap,
   onError,
 }) {
   // What the dialog shows while open: `{ kind: "run", id }` or `{ kind: "step", id, key }`;
@@ -162,6 +166,8 @@ export function runDialog({
         busyThread(root.id),
         memoryKey,
         citedKey,
+        // An analysis read since, or deleted, changes the Change map button.
+        changeMapState(),
       ];
       draw = () => runDetail(root, stepsOf(root), notes, review, thread, record);
     } else if (detail.kind === "finding") {
@@ -304,7 +310,10 @@ export function runDialog({
       });
       noteCards.append(button);
     }
-    body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    // An analysis carries no notes: its diagrams name it (src/run.rs, `Runner::analyze`).
+    if (!view.analysis) {
+      body.append(section(notes.length === 1 ? "Note" : `Notes · ${notes.length}`, noteCards));
+    }
     // What the team recorded about the thread's prompt and changed paths; left out when
     // hippius-mem cannot run here.
     const remembered = memory.view(latest.id);
@@ -330,7 +339,8 @@ export function runDialog({
     if (!view.review) {
       // A thread that only reads changed nothing to review (src/run.rs, `Runner::review`).
       if (!readsOnly(view, record)) body.append(reviewPart(view, review));
-      body.append(followUpBox(view, latest));
+      // An analysis takes no follow-up (`POST api/run/follow` refuses one): analyze again.
+      if (!view.analysis) body.append(followUpBox(view, latest));
     }
 
     const started = new Date(view.startedAt * 1000).toLocaleTimeString([], {
@@ -371,6 +381,8 @@ export function runDialog({
         showChanges(view.id, latest.id);
       });
       actions.push(button);
+      const map = changeMapButton(view, latest);
+      if (map) actions.push(map);
     }
     const head = detailHeader(statusIcon(iconKind(latest)), title, status(), actions);
     const where = head.querySelector(".note-dialog-where");
@@ -378,6 +390,30 @@ export function runDialog({
       where.textContent = status();
     });
     return [head, body];
+  }
+
+  // Change map, beside Changes: what runs `view` to `latest` touched on the map's Architecture
+  // (docs/review-assist.md, "The four kinds"). None without an analysis; disabled, with why,
+  // when it has no Architecture diagram.
+  function changeMapButton(view, latest) {
+    const state = changeMapState();
+    if (state === "none") return null;
+    const button = el("button", "button run-detail-change-map", "Change map");
+    button.type = "button";
+    if (state === "no-architecture") {
+      button.disabled = true;
+      button.title = "The map has no Architecture diagram";
+      return button;
+    }
+    button.title =
+      latest.id === view.id
+        ? `What ${view.id} touched on the map`
+        : `What ${view.id} to ${latest.id} touched on the map`;
+    button.addEventListener("click", () => {
+      detailEl.close();
+      showChangeMap(view.id, latest.id);
+    });
+    return button;
   }
 
   // The thread's branch, and what ends the thread (docs/design.md, "Ending a thread"): Apply
