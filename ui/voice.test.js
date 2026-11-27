@@ -79,6 +79,24 @@ test("normalization handles case, punctuation, and number words", () => {
     text: "fix the race.",
     label: "Note",
   });
+  assert.deepEqual(command("Note:check the lock", FULL_CONTEXT), {
+    type: "note",
+    text: "check the lock",
+    label: "Note",
+  });
+  assert.deepEqual(command("Go to Rollover.", FULL_CONTEXT), {
+    type: "goto",
+    name: "Rollover",
+    label: "Go to",
+  });
+});
+
+test("modal dialogs block background commands while still allowing resolve", () => {
+  const modal = { ...FULL_CONTEXT, dialogOpen: true };
+  assert.deepEqual(command("resolve", modal), { type: "resolve", label: "Resolve" });
+  assert.deepEqual(command("send", modal), { type: "noop", reason: "Close the dialog first." });
+  assert.deepEqual(command("stop", modal), { type: "noop", reason: "Close the dialog first." });
+  assert.deepEqual(command("next", modal), { type: "noop", reason: "Close the dialog first." });
 });
 
 test("utterances outside the grammar or destructive actions do not match", () => {

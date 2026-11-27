@@ -616,7 +616,7 @@ export function changesView({
     const blocks = [...viewEl.querySelectorAll(".changes-hunk-block")];
     if (blocks.length === 0) return false;
     const next = Math.max(0, Math.min(blocks.length - 1, current + by));
-    if (next === current && blocks.length > 1 && by !== 0) return false;
+    if (next === current && by !== 0) return false;
     current = next;
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     const padding = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;

@@ -13,6 +13,7 @@ import { contextMenu } from "./context-menu.js";
 import { diagramView } from "./diagram-view.js";
 import { fileMarks } from "./diagram.js";
 import {
+  getDictationContext,
   isBoxDictating,
   setDictationContext,
   startDictationFor,
@@ -36,7 +37,7 @@ import { reportOf, reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
 import { usageBar } from "./usage-bar.js";
 import { usageDialog } from "./usage-dialog.js";
-import { command as voiceCommand } from "./voice.js";
+import { command as voiceCommand, normalize as normalizeVoice } from "./voice.js";
 import { welcomeScreen } from "./welcome.js";
 import { wizardDialog } from "./wizard-dialog.js";
 
@@ -668,25 +669,35 @@ const HOLD_DELAY_MS = 200;
 let holdTimer = null;
 let holdMode = null; // "box" | "command" | null
 let voiceUnsub = null;
+let voiceSessionId = 0;
 let voiceTranscript = "";
 let voiceHandled = false;
 
 function currentVoiceContext() {
-  const latestRun = runs.run();
+  const projectOpen = state.projectOpen && !welcome.isShown();
+  const dialogOpen = Boolean(document.querySelector("dialog[open]"));
+  const latestRun = projectOpen ? runs.run() : null;
   const hasSnapshot = Boolean(
     latestRun?.entries?.some((entry) => entry.kind === "snapshot" && entry.point === "before"),
   );
-  const canSend = state.projectOpen && state.notes.some((note) => isOpen(note) && !isAsk(note));
+  const canSend = projectOpen && state.notes.some((note) => isOpen(note) && !isAsk(note));
+  const changesOpen = projectOpen && changes.isOpen();
+  const hasTarget = projectOpen
+    ? changesOpen
+      ? Boolean(changes.currentTarget())
+      : Boolean(state.selection && !state.composer)
+    : false;
   return {
-    projectOpen: state.projectOpen && !welcome.isShown(),
-    changesOpen: changes.isOpen(),
+    projectOpen,
+    dialogOpen,
+    changesOpen,
     hasChanges: Boolean(latestRun && hasSnapshot),
-    hasTarget: Boolean(state.selection || changes.currentTarget()),
-    composerOpen: Boolean(state.composer),
-    noteDialogOpen: noteDetail.isOpen(),
-    sendOpen: Boolean(state.send),
+    hasTarget,
+    composerOpen: projectOpen && Boolean(state.composer),
+    noteDialogOpen: noteDetail.canResolve(),
+    sendOpen: projectOpen && Boolean(state.send),
     canSend,
-    liveRun: runs.live(),
+    liveRun: projectOpen && runs.live(),
   };
 }
 
@@ -747,6 +758,8 @@ async function runVoiceCommand(transcript) {
       break;
     }
     case "goto":
+      changes.close();
+      tray.closeSend();
       showCode();
       await code.jumpToName(cmd.name);
       break;
@@ -783,6 +796,7 @@ function finishVoiceCommandSession() {
     voiceUnsub();
     voiceUnsub = null;
   }
+  if (holdMode === "command") holdMode = null;
   if (!voiceHandled && voiceTranscript.trim()) {
     voiceHandled = true;
     void runVoiceCommand(voiceTranscript);
@@ -793,9 +807,18 @@ function finishVoiceCommandSession() {
 function startVoiceCommandSession() {
   const bridge = window.postil?.dictation;
   if (!bridge) return;
+  if (voiceUnsub) {
+    // Cleanly cancel any previous stopping session before starting a new one so listeners never leak.
+    voiceUnsub();
+    voiceUnsub = null;
+    bridge.cancel();
+  }
+  voiceSessionId += 1;
+  const session = voiceSessionId;
   voiceTranscript = "";
   voiceHandled = false;
   voiceUnsub = bridge.subscribe((event) => {
+    if (session !== voiceSessionId) return;
     if (event.type === "transcript") {
       voiceTranscript = event.text ?? "";
       if (event.isFinal && !voiceHandled) {
@@ -818,7 +841,8 @@ function startVoiceCommandSession() {
       finishVoiceCommandSession();
     }
   });
-  bridge.start();
+  const context = getDictationContext();
+  bridge.start(context.length > 0 ? { context } : undefined);
 }
 
 function endHoldToTalk() {
@@ -842,13 +866,27 @@ window.addEventListener("keydown", (event) => {
     holdTimer = setTimeout(() => {
       holdTimer = null;
       const focused = document.activeElement;
-      if (
-        focused &&
-        focused.matches("textarea, input[type='text'], input:not([type])") &&
-        startDictationFor(focused)
-      ) {
-        holdMode = "box";
-      } else if (!isBoxDictating()) {
+      const inTextInput = Boolean(
+        focused?.matches("textarea, input[type='text'], input:not([type]), [contenteditable]"),
+      );
+      if (inTextInput) {
+        const inComposer = Boolean(state.composer?.node?.contains(focused));
+        const options = inComposer
+          ? {
+              onFinal: (text) => {
+                if (normalizeVoice(text) !== "save") return false;
+                showToast("Save");
+                code.closeComposer({ save: true });
+                return true;
+              },
+            }
+          : undefined;
+        if (startDictationFor(focused, options)) {
+          holdMode = "box";
+        }
+        return;
+      }
+      if (!isBoxDictating()) {
         holdMode = "command";
         startVoiceCommandSession();
       }

@@ -30,6 +30,8 @@ const NUMBER_WORDS = new Map([
   ["twenty", "20"],
 ]);
 
+const TRAILING_PUNCT = /[.,!?;:"'()[\]{}]+$/;
+
 // Normalizes an utterance for command matching: lowercases, strips surrounding/sentence
 // punctuation, converts standalone number words to digits, and collapses whitespace.
 export function normalize(transcript) {
@@ -46,12 +48,10 @@ export function normalize(transcript) {
     .join(" ");
 }
 
-// Preserves original casing/punctuation inside the free-form tail after a prefix like "note "
-// or "ask ", trimming only leading separator punctuation/spaces.
-function extractTail(raw, wordCount) {
-  const tokens = raw.trim().split(/\s+/);
-  const rest = tokens.slice(wordCount).join(" ").trim();
-  return rest.replace(/^[,.:;-]+\s*/, "").trim();
+// Strips a matched command prefix from `raw` while preserving original casing and punctuation
+// in the remaining tail (handling punctuation attached directly to the keyword, e.g. "Note:x").
+function extractAfterPrefix(raw, prefixRe) {
+  return raw.trim().replace(prefixRe, "").trim();
 }
 
 // Matches a full utterance against the fixed voice command grammar and checks `context` so a
@@ -61,42 +61,72 @@ export function command(transcript, context = {}) {
   const norm = normalize(transcript);
   if (!norm) return null;
 
-  if (norm === "next") {
-    if (!context.changesOpen) return { type: "noop", reason: "Nothing to step through." };
-    return { type: "next", label: "Next" };
-  }
-
-  if (norm === "previous" || norm === "prev") {
-    if (!context.changesOpen) return { type: "noop", reason: "Nothing to step through." };
-    return { type: "previous", label: "Previous" };
-  }
-
-  if (norm === "save") {
-    if (!context.composerOpen) return { type: "noop", reason: "Nothing to save." };
-    return { type: "save", label: "Save" };
-  }
-
-  if (norm === "show map") {
-    if (!context.projectOpen) return { type: "noop", reason: "No project open." };
-    return { type: "show-map", label: "Show map" };
-  }
-
-  if (norm === "show code") {
-    if (!context.projectOpen) return { type: "noop", reason: "No project open." };
-    return { type: "show-code", label: "Show code" };
-  }
-
-  if (norm === "show changes") {
-    if (!context.hasChanges) return { type: "noop", reason: "No changes to show." };
-    return { type: "show-changes", label: "Show changes" };
-  }
-
+  // Resolve is the one command allowed while a modal dialog (specifically the note dialog) is open.
   if (norm === "resolve") {
     if (!context.noteDialogOpen) return { type: "noop", reason: "Nothing to resolve." };
     return { type: "resolve", label: "Resolve" };
   }
 
+  const blockedByDialog = () =>
+    context.dialogOpen ? { type: "noop", reason: "Close the dialog first." } : null;
+
+  if (norm === "next") {
+    return (
+      blockedByDialog() ??
+      (context.changesOpen
+        ? { type: "next", label: "Next" }
+        : { type: "noop", reason: "Nothing to step through." })
+    );
+  }
+
+  if (norm === "previous" || norm === "prev") {
+    return (
+      blockedByDialog() ??
+      (context.changesOpen
+        ? { type: "previous", label: "Previous" }
+        : { type: "noop", reason: "Nothing to step through." })
+    );
+  }
+
+  if (norm === "save") {
+    return (
+      blockedByDialog() ??
+      (context.composerOpen
+        ? { type: "save", label: "Save" }
+        : { type: "noop", reason: "Nothing to save." })
+    );
+  }
+
+  if (norm === "show map") {
+    return (
+      blockedByDialog() ??
+      (context.projectOpen
+        ? { type: "show-map", label: "Show map" }
+        : { type: "noop", reason: "No project open." })
+    );
+  }
+
+  if (norm === "show code") {
+    return (
+      blockedByDialog() ??
+      (context.projectOpen
+        ? { type: "show-code", label: "Show code" }
+        : { type: "noop", reason: "No project open." })
+    );
+  }
+
+  if (norm === "show changes") {
+    return (
+      blockedByDialog() ??
+      (context.hasChanges
+        ? { type: "show-changes", label: "Show changes" }
+        : { type: "noop", reason: "No changes to show." })
+    );
+  }
+
   if (norm === "send") {
+    const blocked = blockedByDialog();
+    if (blocked) return blocked;
     if (!context.sendOpen && !context.canSend) {
       return { type: "noop", reason: "Nothing to send." };
     }
@@ -108,43 +138,71 @@ export function command(transcript, context = {}) {
   }
 
   if (norm === "stop") {
-    if (!context.liveRun) return { type: "noop", reason: "No run to stop." };
-    return { type: "stop", label: "Stop run" };
+    return (
+      blockedByDialog() ??
+      (context.liveRun
+        ? { type: "stop", label: "Stop run" }
+        : { type: "noop", reason: "No run to stop." })
+    );
   }
 
   if (norm.startsWith("note ")) {
-    const text = extractTail(transcript, 1);
+    const text = extractAfterPrefix(transcript, /^note\b[\s,.:;-]*/i);
     if (!text) return null;
-    if (!context.hasTarget) return { type: "noop", reason: "Nothing selected for a note." };
-    return { type: "note", text, label: "Note" };
+    return (
+      blockedByDialog() ??
+      (context.hasTarget
+        ? { type: "note", text, label: "Note" }
+        : { type: "noop", reason: "Nothing selected for a note." })
+    );
   }
 
   if (norm.startsWith("ask ")) {
-    const text = extractTail(transcript, 1);
+    const text = extractAfterPrefix(transcript, /^ask\b[\s,.:;-]*/i);
     if (!text) return null;
-    if (!context.hasTarget) return { type: "noop", reason: "Nothing selected to ask about." };
-    return { type: "ask", text, label: "Ask" };
+    return (
+      blockedByDialog() ??
+      (context.hasTarget
+        ? { type: "ask", text, label: "Ask" }
+        : { type: "noop", reason: "Nothing selected to ask about." })
+    );
   }
 
   if (norm.startsWith("open ")) {
     const query = norm.slice("open ".length).trim();
     if (!query) return null;
-    if (!context.projectOpen) return { type: "noop", reason: "No project open." };
-    return { type: "open", query, label: "Open" };
+    return (
+      blockedByDialog() ??
+      (context.projectOpen
+        ? { type: "open", query, label: "Open" }
+        : { type: "noop", reason: "No project open." })
+    );
   }
 
   if (norm.startsWith("go to ")) {
-    const name = extractTail(transcript, 2);
+    const name = extractAfterPrefix(transcript, /^go\s+to\b[\s,.:;-]*/i)
+      .replace(TRAILING_PUNCT, "")
+      .trim();
     if (!name) return null;
-    if (!context.projectOpen) return { type: "noop", reason: "No project open." };
-    return { type: "goto", name, label: "Go to" };
+    return (
+      blockedByDialog() ??
+      (context.projectOpen
+        ? { type: "goto", name, label: "Go to" }
+        : { type: "noop", reason: "No project open." })
+    );
   }
 
   if (norm.startsWith("goto ")) {
-    const name = extractTail(transcript, 1);
+    const name = extractAfterPrefix(transcript, /^goto\b[\s,.:;-]*/i)
+      .replace(TRAILING_PUNCT, "")
+      .trim();
     if (!name) return null;
-    if (!context.projectOpen) return { type: "noop", reason: "No project open." };
-    return { type: "goto", name, label: "Go to" };
+    return (
+      blockedByDialog() ??
+      (context.projectOpen
+        ? { type: "goto", name, label: "Go to" }
+        : { type: "noop", reason: "No project open." })
+    );
   }
 
   return null;
