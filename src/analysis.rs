@@ -19,8 +19,10 @@
 //!
 //! # The file
 //!
-//! The analysis lives in `<git dir>/postil/analysis.json`, version 2: version 1 without each
-//! diagram's `dropped`, which reads as nothing dropped. Reading it never writes it:
+//! The analysis lives in `<git dir>/postil/analysis.json`, version 3. Version 2 is version 3
+//! without `checked`, the commit the Architecture was last compared with ([`check`]), which
+//! reads as none; version 1 is version 2 without each diagram's `dropped`, which reads as
+//! nothing dropped. Reading it never writes it:
 //! [`current`] places every verified reference where its code is now (`place`) on each read,
 //! whatever state the file stores for it, as notes are placed: a reference whose code is
 //! gone reads as outdated, and found again once the code is back. An unverified reference is
@@ -52,8 +54,14 @@
 //! its own, for diagrams in one json block at the end of its reply ([`prompt`]); [`merge`]
 //! reads that block as the run's turn ends well, checks every citation against the run's
 //! worktree, applies the limits, and only then takes [`lock`], loads, merges and saves.
+//!
+//! # The forced update
+//!
+//! When `HEAD` moves forward past `checked` and the move breaks an Architecture citation or
+//! adds a file no node covers, the page's next refresh starts an Update of the Architecture
+//! ([`check`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io;
@@ -68,18 +76,19 @@ use crate::files::{self, save_json, version_of};
 use crate::repo::{MAX_READ, PathKind, Repo};
 use crate::thread;
 
+mod check;
 mod merge;
 mod prompt;
 
+pub(crate) use check::{Verdict, check_head, claim_check, is_checked_at, move_checked};
 pub(crate) use merge::merge;
 pub(crate) use prompt::{
-    AnalysisJob, AnalysisKind, AnalysisRun, AnalyzeRequest, Planned, UpdateRequest, plan,
+    AnalysisJob, AnalysisKind, AnalysisRun, AnalyzeRequest, Plan, Planned, UpdateRequest, plan,
 };
 
 /// The format version this build writes. It reads every version from 1 on; a newer one is
-/// refused, not rewritten. Version 2 added each diagram's `dropped`. `checked` (the commit the
-/// Architecture was last compared with) is not in it yet: it comes with the code that reads it.
-const VERSION: u32 = 2;
+/// refused, not rewritten. Version 2 added each diagram's `dropped`, version 3 `checked`.
+const VERSION: u32 = 3;
 
 /// Reads the analysis and places every found code reference where its code is now, or
 /// returns `None` when there is no analysis file. Does not write.
@@ -111,13 +120,18 @@ pub(crate) fn at(repo: &Repo, commit: &str) -> Result<Option<Analysis>> {
     let Some(mut analysis) = load(&repo.analysis_file())? else {
         return Ok(None);
     };
+    place_at(&mut analysis, repo, commit, &files);
+    Ok(Some(analysis))
+}
+
+/// Places every verified reference of `analysis` where its code is in commit `commit`, whose
+/// files are `files` ([`Repo::files_at`]), as [`at`] does: with `git show`, each cited file of
+/// the commit once.
+fn place_at(analysis: &mut Analysis, repo: &Repo, commit: &str, files: &HashSet<String>) {
     // Every folder above a file of the commit. A folder with no file in it is not in git.
-    let folders: HashSet<&str> = files
-        .iter()
-        .flat_map(|file| file.match_indices('/').map(|(slash, _)| &file[..slash]))
-        .collect();
+    let folders = folders_above(files.iter().map(String::as_str));
     place_with(
-        &mut analysis,
+        analysis,
         // Only a file of the commit is shown: `git show <commit>:<folder>` lists the folder.
         |path| {
             files
@@ -130,7 +144,13 @@ pub(crate) fn at(repo: &Repo, commit: &str) -> Result<Option<Analysis>> {
             PathKind::Folder => folders.contains(path),
         },
     );
-    Ok(Some(analysis))
+}
+
+/// Every folder above one of `paths`, each as the path from the root to it.
+fn folders_above<'a>(paths: impl Iterator<Item = &'a str>) -> HashSet<&'a str> {
+    paths
+        .flat_map(|path| path.match_indices('/').map(|(slash, _)| &path[..slash]))
+        .collect()
 }
 
 /// Reads the analysis file as it is, with no reference placed, or `None` when there is none.
@@ -172,6 +192,7 @@ pub(crate) fn load(file: &Path) -> Result<Option<Analysis>> {
     let stored: AnalysisFile = serde_json::from_str(&json).map_err(parse_error)?;
     check_graph(&stored.diagrams).map_err(invalid)?;
     Ok(Some(Analysis {
+        checked: stored.checked,
         diagrams: stored.diagrams,
     }))
 }
@@ -228,6 +249,7 @@ pub(crate) fn save(file: &Path, analysis: &Analysis) -> Result<()> {
     load(file)?;
     let stored = StoredAnalysis {
         version: VERSION,
+        checked: analysis.checked.as_ref(),
         diagrams: &analysis.diagrams,
     };
     save_json(file, &stored).map_err(|source| Error::WriteAnalysis {
@@ -625,20 +647,58 @@ fn unmapped(repo: &Repo, analysis: &Analysis) -> Result<BTreeMap<DiagramId, Unma
 ///
 /// As [`thread::all`] and [`Repo::files`].
 fn off_the_map(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result<Vec<String>> {
-    let mut seen = seen_by(repo, analysis, scope)?
-        .into_iter()
-        .map(|seen| seen.files);
-    let Some(first) = seen.next() else {
+    let Some(known) = known_files(repo, analysis, scope)? else {
         return Ok(Vec::new());
     };
-    // A file is new when some diagram's run did not see it: known are the files all saw.
-    let known = seen.fold(first, |known, files| {
-        known.intersection(&files).cloned().collect()
-    });
     Ok(uncovered(repo, analysis)?
         .into_iter()
         .filter(|file| !known.contains(file))
         .collect())
+}
+
+/// [`off_the_map`] for the files of a commit, `files` ([`Repo::files_at`]), not the file list,
+/// and every diagram: what a forced update asks to place ([`check`]). With the paths `added`
+/// since `checked` that no reference covers, even when no diagram's run is in the record, so
+/// a move that adds such a file always has a file to place. Sorted, as git sorts paths.
+///
+/// # Errors
+///
+/// As [`thread::all`].
+fn off_the_map_at(
+    repo: &Repo,
+    analysis: &Analysis,
+    files: &HashSet<String>,
+    added: &[String],
+) -> Result<Vec<String>> {
+    let mut new: BTreeSet<&str> = added.iter().map(String::as_str).collect();
+    if let Some(known) = known_files(repo, analysis, None)? {
+        let cited = cited_paths(analysis);
+        new.extend(
+            files
+                .iter()
+                .filter(|file| !known.contains(*file) && !covered(&cited, file))
+                .map(String::as_str),
+        );
+    }
+    Ok(new.into_iter().map(str::to_owned).collect())
+}
+
+/// The files every run of a top-level Architecture diagram in scope saw ([`seen_by`]), or
+/// `None` when no such diagram's run is in the record. A file is new when some diagram's run
+/// did not see it: known are the files all saw.
+fn known_files(
+    repo: &Repo,
+    analysis: &Analysis,
+    scope: Option<DiagramId>,
+) -> Result<Option<HashSet<String>>> {
+    let mut seen = seen_by(repo, analysis, scope)?
+        .into_iter()
+        .map(|seen| seen.files);
+    Ok(seen.next().map(|first| {
+        seen.fold(first, |known, files| {
+            known.intersection(&files).cloned().collect()
+        })
+    }))
 }
 
 /// The files a top-level Architecture diagram's run saw: those of the commit its thread
@@ -681,6 +741,15 @@ fn seen_by(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result
     Ok(seen)
 }
 
+/// Whether `analysis` has an Architecture diagram, at the top level or below a node: what a
+/// forced update keeps up to date, and what `checked` is about.
+fn has_architecture(analysis: &Analysis) -> bool {
+    analysis
+        .diagrams
+        .iter()
+        .any(|diagram| diagram.kind == DiagramKind::Architecture)
+}
+
 /// The files in the file list that no verified reference of `analysis` covers, one to the file
 /// or to a folder above it. Sorted, as [`Repo::files`] lists them. Looks each file and the
 /// folders above it up in a set of the cited paths, so it costs the files times their depth,
@@ -690,7 +759,17 @@ fn seen_by(repo: &Repo, analysis: &Analysis, scope: Option<DiagramId>) -> Result
 ///
 /// As [`Repo::files`].
 fn uncovered(repo: &Repo, analysis: &Analysis) -> Result<Vec<String>> {
-    let cited: HashSet<&str> = analysis
+    let cited = cited_paths(analysis);
+    Ok(repo
+        .files()?
+        .into_iter()
+        .filter(|file| !covered(&cited, file))
+        .collect())
+}
+
+/// The paths the verified references of `analysis` cite, in every diagram.
+fn cited_paths(analysis: &Analysis) -> HashSet<&str> {
+    analysis
         .diagrams
         .iter()
         .flat_map(|diagram| {
@@ -699,18 +778,15 @@ fn uncovered(repo: &Repo, analysis: &Analysis) -> Result<Vec<String>> {
         })
         .filter(|anchor| matches!(anchor.detail, RefDetail::Verified { .. }))
         .map(|anchor| anchor.path.as_str())
-        .collect();
-    let covered = |file: &str| {
-        cited.contains(file)
-            || file
-                .match_indices('/')
-                .any(|(slash, _)| cited.contains(&file[..slash]))
-    };
-    Ok(repo
-        .files()?
-        .into_iter()
-        .filter(|file| !covered(file))
-        .collect())
+        .collect()
+}
+
+/// Whether a path of `cited` ([`cited_paths`]) is `file` or a folder above it.
+fn covered(cited: &HashSet<&str>, file: &str) -> bool {
+    cited.contains(file)
+        || file
+            .match_indices('/')
+            .any(|(slash, _)| cited.contains(&file[..slash]))
 }
 
 /// Follows the groups from `node` up: each must be a node of `diagram`, and the walk must end
@@ -739,6 +815,10 @@ fn check_group(
 /// version (`AnalysisFile`).
 #[derive(Serialize)]
 pub(crate) struct Analysis {
+    /// The commit the Architecture was last compared with ([`check`]); `None` in a file of
+    /// version 1 or 2, and before the first analysis run stored. Not sent to the page.
+    #[serde(skip)]
+    checked: Option<CommitId>,
     diagrams: Vec<Diagram>,
 }
 
@@ -796,6 +876,9 @@ struct AnalysisFile {
         reason = "declared so `deny_unknown_fields` accepts it; `version_of` reads it first"
     )]
     version: u32,
+    /// Absent in every file of version 1 and 2.
+    #[serde(default)]
+    checked: Option<CommitId>,
     diagrams: Vec<Diagram>,
 }
 
@@ -803,6 +886,8 @@ struct AnalysisFile {
 #[derive(Serialize)]
 struct StoredAnalysis<'a> {
     version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checked: Option<&'a CommitId>,
     diagrams: &'a [Diagram],
 }
 
@@ -1025,6 +1110,13 @@ pub(crate) struct NodeId {
     node: u32,
 }
 
+/// A commit's id, as `analysis.json` stores `checked`: 4 to 64 lowercase hexadecimal digits,
+/// as git writes ids (40 for SHA-1, 64 for SHA-256, at least 4 for a short one written by
+/// hand). Never empty, a ref name, or text git would read as an option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct CommitId(String);
+
 /// The id of the analysis run that made a diagram, written `R1`, as a run log names its run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -1035,6 +1127,35 @@ struct RunId(u64);
 fn positive(digits: &str) -> Option<u64> {
     let number: u64 = digits.parse().ok()?;
     (number > 0 && number.to_string() == digits).then_some(number)
+}
+
+impl CommitId {
+    fn parse(text: &str) -> Option<Self> {
+        let hex = text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        ((4..=64).contains(&text.len()) && hex).then(|| Self(text.to_owned()))
+    }
+
+    /// The id of the commit `HEAD` names, or `None` in a repository with no commit.
+    ///
+    /// # Errors
+    ///
+    /// As [`Repo::head`].
+    pub(crate) fn of_head(repo: &Repo) -> Result<Option<Self>> {
+        Ok(repo.head()?.map(|id| {
+            Self::parse(&id).expect("`git rev-parse --verify` prints a full hexadecimal id")
+        }))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The first 7 digits, as git shortens an id for people.
+    pub(crate) fn short(&self) -> &str {
+        &self.0[..self.0.len().min(7)]
+    }
 }
 
 impl DiagramId {
@@ -1089,6 +1210,16 @@ impl TryFrom<String> for NodeId {
     }
 }
 
+impl TryFrom<String> for CommitId {
+    type Error = String;
+
+    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&text).ok_or_else(|| {
+            format!("commit id {text:?}: expected 4 to 64 lowercase hexadecimal digits")
+        })
+    }
+}
+
 impl TryFrom<String> for RunId {
     type Error = String;
 
@@ -1109,6 +1240,12 @@ impl From<DiagramId> for String {
 impl From<NodeId> for String {
     fn from(id: NodeId) -> Self {
         id.to_string()
+    }
+}
+
+impl From<CommitId> for String {
+    fn from(id: CommitId) -> Self {
+        id.0
     }
 }
 
@@ -1212,6 +1349,7 @@ impl Serialize for CodeRef {
 impl fmt::Debug for Analysis {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Analysis")
+            .field("checked", &self.checked)
             .field("diagrams", &self.diagrams)
             .finish()
     }

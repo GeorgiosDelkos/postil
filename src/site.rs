@@ -17,7 +17,7 @@ use wry::http::header::CONTENT_TYPE;
 use wry::http::{Method, Request, Response, StatusCode};
 
 use crate::agents::{self, BUILT_IN, Scanner};
-use crate::analysis::{self, AnalysisJob, AnalyzeRequest, UpdateRequest};
+use crate::analysis::{self, AnalysisJob, AnalyzeRequest, UpdateRequest, Verdict};
 use crate::definitions::Definitions;
 use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
@@ -28,7 +28,7 @@ use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
-use crate::run::{Ending, Notify, Runner};
+use crate::run::{Ending, Notify, Runner, StartedUpdate};
 use crate::settings::{self, CustomAgent, RawSettings, Settings};
 use crate::usage::{
     ledger::{self, AgentActivity, Range, Scope, Totals},
@@ -629,6 +629,22 @@ enum LiveRun {
     Stop,
 }
 
+/// The reply to `POST /api/analysis/check` ([`Site::check_analysis`]), as `{"state": ...}`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum CheckView {
+    /// `checked` is `HEAD`, or another window started the update for it.
+    Same,
+    /// `checked` moved to `HEAD` with no run.
+    Untouched,
+    /// `checked` is gone, or no ancestor of `HEAD`: the pane offers Update.
+    Diverged,
+    /// The forced update `run` started at the commit whose short id is `commit`.
+    Updated { run: String, commit: String },
+    /// The update could not start, for `reason`; the next check tries again.
+    Blocked { reason: String },
+}
+
 /// The reply to `/api/file`.
 #[derive(Debug, Serialize)]
 struct FileView<'a> {
@@ -969,7 +985,9 @@ impl Site {
 
     /// The reply to `POST /api/analysis/update`, with `{"diagram": "D1"}` or no body for every
     /// diagram: starts an update of the outdated nodes and the files not on the map, as
-    /// [`Site::start_analysis`] starts an analysis.
+    /// [`Site::start_analysis`] starts an analysis. An update of every diagram with nothing
+    /// to send, while the checkout moved to another history, starts no run, moves `checked`,
+    /// and answers `{"run": null}`.
     fn update_analysis(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: UpdateRequest = if body.is_empty() {
             UpdateRequest::default()
@@ -983,6 +1001,40 @@ impl Site {
         let agent = self.current_settings().analyzer()?;
         let run = self.runner()?.analyze(agent, job)?;
         Ok(to_json(&serde_json::json!({ "run": run })))
+    }
+
+    /// The reply to `POST /api/analysis/check`, which the page sends on each refresh: compares
+    /// the analysis's `checked` with `HEAD` (`analysis::check_head`), and starts the forced
+    /// update of the settings' Analyzer when the move needs one (`Runner::analyze_checked`).
+    /// Answers what happened ([`CheckView`]); a start that is refused is an answer, not an
+    /// error, since the page checks with the map closed too. The body is not read.
+    fn check_analysis(&self) -> Result<Vec<u8>> {
+        let repo = self.repo()?;
+        let runner = self.runner()?;
+        let view = match analysis::check_head(&repo)? {
+            Verdict::Same => CheckView::Same,
+            Verdict::Untouched => CheckView::Untouched,
+            Verdict::Diverged => CheckView::Diverged,
+            Verdict::Update {
+                expected,
+                head,
+                planned,
+            } => match self.current_settings().analyzer() {
+                Err(error) => CheckView::Blocked {
+                    reason: error_chain(&error),
+                },
+                Ok(agent) => {
+                    match runner.analyze_checked(agent, expected.as_ref(), &head, planned)? {
+                        StartedUpdate::Started { run, commit } => {
+                            CheckView::Updated { run, commit }
+                        }
+                        StartedUpdate::AlreadyChecked => CheckView::Same,
+                        StartedUpdate::Blocked(reason) => CheckView::Blocked { reason },
+                    }
+                }
+            },
+        };
+        Ok(to_json(&view))
     }
 
     /// The reply to `POST /api/analysis/start-over`: moves the analysis file to the Trash, one
@@ -1111,6 +1163,10 @@ impl Site {
             },
             "/api/analysis/start-over" => match *method {
                 Method::POST => json_or_error(self.start_analysis_over()),
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/analysis/check" => match *method {
+                Method::POST => json_or_error(self.check_analysis()),
                 _ => not_allowed("POST with no body"),
             },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),

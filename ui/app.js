@@ -487,13 +487,16 @@ function editsDone(run) {
   ).length;
 }
 
-// Called after every change to the run.
-function followRun(run, previous) {
+// Called after every change to the run. `liveEnded` says another live run ended: an analysis,
+// or a run whose end frees one of the 3 places a forced update waits for, so the page refreshes
+// and checks HEAD again (`map.check`).
+function followRun(run, previous, { liveEnded } = {}) {
   // An analysis is never the latest run: the map follows it.
   map.runChanged();
   $("tab-run").hidden = run === null;
   if (run === null) {
     if (state.tab === "run") tray.showTab("notes");
+    if (liveEnded) refresh().catch((error) => showToast(String(error)));
     return;
   }
   const fresh = previous?.id !== run.id;
@@ -507,7 +510,9 @@ function followRun(run, previous) {
   // The agent edits files, and the notes are marked sent once it has the prompt: both are
   // read again when the run moves on and when an edit finishes. There is no file watcher
   // (docs/design.md, "Working with the repository").
-  if (!fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run))) {
+  const moved =
+    !fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run));
+  if (moved || liveEnded) {
     refresh().catch((error) => showToast(String(error)));
   } else if (
     !run.problem &&
@@ -627,7 +632,9 @@ function quit() {
 // There is no file watcher (docs/design.md, "Working with the repository"): the file list,
 // the open file, and the notes change while the engineer is in another app, so all three are
 // read again on return and drawn once, so the notes never show on the old text. Not while
-// the composer is open: reading the file again would move its lines under the text.
+// the composer is open: reading the file again would move its lines under the text. The
+// analysis is read again either way, and then compared with HEAD, which may start the forced
+// update (`map.check`).
 let refreshes = 0;
 async function refresh() {
   // A project being opened replaces this page: what a refresh drew would be thrown away,
@@ -646,7 +653,10 @@ async function refresh() {
   // Another window may have analyzed the repository, or the code under a node moved. With the
   // composer open the file is not read again, but the map is.
   if (state.composer) {
-    map.load().catch((error) => showToast(String(error)));
+    map
+      .load()
+      .then(() => map.check())
+      .catch((error) => showToast(String(error)));
     return;
   }
   const path = state.wanted;
@@ -663,7 +673,10 @@ async function refresh() {
   // notes, so both are drawn on the new text. Even when the engineer moved on: a file opened
   // meanwhile is indexed against the analysis the map holds, and dropping this reply would
   // leave it without its stripes until the next focus. Its number keeps a newer reply's.
-  void map.applyAnalysis(analysis).catch((error) => showToast(String(error)));
+  void map
+    .applyAnalysis(analysis)
+    .then(() => map.check())
+    .catch((error) => showToast(String(error)));
   // The engineer moved on while the replies were in flight: their action wins.
   if (state.composer || state.wanted !== path || generation !== refreshes) return;
 
@@ -919,6 +932,8 @@ function applySettings(settings) {
   }
   appliedTheme = settings.theme;
   tray.renderSendBar();
+  // Another Analyzer may start the forced update a missing one held back.
+  if (state.projectOpen) void map.check().catch((error) => showToast(String(error)));
 }
 
 const settings = settingsDialog($("settings"), {
@@ -985,6 +1000,8 @@ async function start() {
     await runBench(state.repo.bench, { code, codeEl });
     return;
   }
+  // Commits made while Postil was closed are checked once it opens.
+  void map.check().catch((error) => showToast(String(error)));
   if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });
 }
 

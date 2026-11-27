@@ -12,9 +12,10 @@ import { runTab } from "./run-tab.js";
 import { foldRun, isLive, openPermission, permissionKey, permissionKeys } from "./run.js";
 
 // `panelEl` is the Run tab's body, `headerEl` the tray header's run part, `statusEl` the
-// sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous)` is
-// called after every fetch that changed the latest run, so the page can follow it (switch
-// tabs, re-read files); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
+// sidebar's agent status, `detailEl` the `<dialog>` a card opens. `onChange(run, previous,
+// { liveEnded })` is called after every fetch that changed the latest run, so the page can
+// follow it (switch tabs, re-read files), `liveEnded` whether another live run ended in it
+// (run-store.js); `onLoaded()` after an older run was read. `noteOf(id)` gives a note
 // by id, or null once it is deleted; `openNote(id)` opens its detail; `openFile(path)` shows a
 // file in the code pane; `reviewers()` names the settings' reviewers, in order;
 // `showChanges(from, to)` shows what runs `from` to `to` changed in the code pane;

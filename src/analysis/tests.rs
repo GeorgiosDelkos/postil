@@ -118,12 +118,16 @@ fn every_kind() -> Analysis {
         reply_cut: true,
     };
     Analysis {
+        checked: Some(CommitId(
+            "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        )),
         diagrams: vec![top, data, flow],
     }
 }
 
 const EVERY_KIND_JSON: &str = r#"{
-  "version": 2,
+  "version": 3,
+  "checked": "0123456789abcdef0123456789abcdef01234567",
   "diagrams": [
     {
       "id": "D1",
@@ -253,6 +257,27 @@ fn the_file_is_pretty_json_ending_in_a_newline_byte_for_byte() {
     let loaded = load(&file).unwrap().unwrap();
     save(&file, &loaded).unwrap();
     assert_eq!(fs::read_to_string(&file).unwrap(), EVERY_KIND_JSON);
+}
+
+#[test]
+fn a_version_2_analysis_reads_without_checked_and_is_written_as_version_3() {
+    let dir = TempDir::new("analysis-version-2");
+    let file = dir.path().join("postil/analysis.json");
+    let _lock = lock(&file).unwrap();
+    let version_2 = EVERY_KIND_JSON.replace(
+        "  \"version\": 3,\n  \"checked\": \"0123456789abcdef0123456789abcdef01234567\",\n",
+        "  \"version\": 2,\n",
+    );
+    fs::write(&file, &version_2).unwrap();
+
+    let loaded = load(&file).unwrap().unwrap();
+    assert_eq!(loaded.checked, None);
+    save(&file, &loaded).unwrap();
+    let written = fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        written,
+        version_2.replace("\"version\": 2", "\"version\": 3")
+    );
 }
 
 #[test]
@@ -625,6 +650,7 @@ fn place_finds_outdated_anchors_again_keeps_unverified_ones_and_scales_to_200() 
     anchors.push(outdated(on_lines("f0.rs", 1, 1, &line(0, 1))));
     anchors.push(CodeRef::unverified("f0.rs".to_owned(), None));
     let mut analysis = Analysis {
+        checked: None,
         diagrams: vec![diagram(
             1,
             DiagramKind::Architecture,
@@ -697,6 +723,7 @@ fn asked(kind: AnalysisKind, of: Option<&str>, nodes: &[&str]) -> AnalysisRun {
 
 fn empty() -> Analysis {
     Analysis {
+        checked: None,
         diagrams: Vec::new(),
     }
 }
@@ -1218,7 +1245,9 @@ fn a_flow_question_of_300_characters_is_asked() {
     };
 
     // 301 is refused in `analyze_deeper_replaces_only_its_branch`, through the route.
-    let planned = flow(300).unwrap();
+    let Plan::Run { planned, .. } = flow(300).unwrap() else {
+        panic!("a flow is a run");
+    };
     assert!(planned.prompt.contains(&"é".repeat(300)));
 }
 

@@ -2128,15 +2128,14 @@ test("an outdated node is marked, Not on the map lists 20 files of 205, and Upda
   await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
   await node(page, "Page").waitFor();
 
-  // Page's line goes, and 205 files no node covers are committed, for the Analyzer to read.
+  // Page's line goes, and 205 files no node covers are added, not committed yet: the map
+  // shows them, and they force no update (docs/review-assist-plan.md, 8.7).
   const { root } = await api("api/repo");
   writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
   mkdirSync(join(root, "extra"));
   for (let n = 0; n < 205; n += 1) {
     writeFileSync(join(root, `extra/e${String(n).padStart(3, "0")}.rs`), "fn e() {}\n");
   }
-  execFileSync("git", ["-C", root, "add", "-A"]);
-  execFileSync("git", ["-C", root, "commit", "-q", "-m", "Add extra"]);
   await page.evaluate(() => dispatchEvent(new Event("focus")));
 
   await page.waitForFunction(() =>
@@ -2149,10 +2148,14 @@ test("an outdated node is marked, Not on the map lists 20 files of 205, and Upda
   await unmapped
     .locator(".map-unmapped-note", { hasText: /^Update sends at most 200 paths\.$/ })
     .waitFor();
+  assert.deepEqual(await api("api/analysis/check", { method: "POST" }), { state: "same" });
 
-  // The fake Analyzer places e000 alone: the other 204 stay listed, the diagram's run being
-  // the one that made it, which did not see them.
-  await page.locator(".map-update").click();
+  // Committed, they force an update on the next focus. The fake Analyzer renews Page and
+  // places e000 alone: the other 204 stay listed, the diagram's run being the one that made
+  // it, which did not see them.
+  execFileSync("git", ["-C", root, "add", "-A"]);
+  execFileSync("git", ["-C", root, "commit", "-q", "-m", "Add extra"]);
+  await page.evaluate(() => dispatchEvent(new Event("focus")));
   await node(page, "Renewed").waitFor();
   await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 204$/ }).waitFor();
   assert.equal(
@@ -2160,9 +2163,13 @@ test("an outdated node is marked, Not on the map lists 20 files of 205, and Upda
     0,
   );
 
+  // Update places the next, e001.
+  await page.locator(".map-update").click();
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 203$/ }).waitFor();
+
   // A file in the list opens in the code.
-  await unmapped.locator(".map-unmapped-file", { hasText: /^extra\/e001\.rs$/ }).click();
-  await page.locator("#crumbs b", { hasText: /^e001\.rs$/ }).waitFor();
+  await unmapped.locator(".map-unmapped-file", { hasText: /^extra\/e002\.rs$/ }).click();
+  await page.locator("#crumbs b", { hasText: /^e002\.rs$/ }).waitFor();
 
   // Analyze deeper of a folder no node covers adds a second Architecture at the top, and the
   // picker chooses between them.
@@ -2174,6 +2181,129 @@ test("an outdated node is marked, Not on the map lists 20 files of 205, and Upda
   await picker.selectOption({ label: "System" });
   await page.locator(".map-crumbs b", { hasText: /^System$/ }).waitFor();
 });
+
+test("a branch switch offers one Update, and a blocked or forced update says why", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  const { root } = await api("api/repo");
+  const git = (...args) =>
+    execFileSync("git", ["-C", root, ...args])
+      .toString()
+      .trim();
+  const focus = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+  const strip = page.locator(".map-run");
+  const trunk = git("rev-parse", "--abbrev-ref", "HEAD");
+
+  // A commit on a side branch touches nothing cited, and the analysis is compared with it;
+  // back on the first branch, that commit is no ancestor of HEAD. Page's line is gone there,
+  // uncommitted: its diagram is outdated, and would offer an Update of its own.
+  git("checkout", "-q", "-b", "side");
+  writeFileSync(join(root, "src/c.rs"), "fn c() {}\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "Add c");
+  const moved = await api("api/analysis/check", { method: "POST" });
+  assert.deepEqual(moved, { state: "untouched" });
+  git("checkout", "-q", trunk);
+  writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
+  await focus();
+  await strip
+    .locator(".map-run-status", { hasText: /^The checkout moved to another history\.$/ })
+    .waitFor();
+  await page.waitForFunction(() =>
+    document.querySelector('.map-node[data-node-id="D1.1"]')?.classList.contains("outdated"),
+  );
+  assert.equal(await page.locator("#map .map-update").count(), 1, "one Update in the map");
+  // Update runs, and moves the analysis to this history: the strip goes.
+  await strip.locator(".map-update").click();
+  await node(page, "Renewed").waitFor();
+  await strip.waitFor({ state: "hidden" });
+  assert.deepEqual(await api("api/analysis/check", { method: "POST" }), { state: "same" });
+
+  // The Analyzer cannot start: the strip says why, and the next check tries again. Worker's
+  // lines go, in a commit.
+  await setAnalyzer(api, "Missing");
+  writeFileSync(join(root, "src/b.rs"), "x\ny\n");
+  git("commit", "-q", "-m", "Drop two", "--", "src/b.rs");
+  await focus();
+  await strip
+    .locator(".map-run-problem", { hasText: /^cannot analyze: Missing is not installed/ })
+    .waitFor();
+  assert.deepEqual((await api("api/runs")).runs, ["R2", "R1"]);
+
+  // One that starts: the strip names the commit the update is for while it runs.
+  await setAnalyzer(api, "Slow");
+  await focus();
+  const short = git("rev-parse", "--short=7", "HEAD");
+  await strip
+    .locator(".map-run-status", { hasText: new RegExp(`^Updating after ${short}…$`) })
+    .waitFor();
+  await stopHanging(api, strip);
+});
+
+test("commits made while the page was closed force the update as it opens", async (t) => {
+  const { page, api } = await openAnalyzed(t);
+  await page.locator("#toggle-map").click();
+  await page.locator(".map-empty").getByRole("button", { name: "Analyze" }).click();
+  await node(page, "Page").waitFor();
+  const { root } = await api("api/repo");
+  await setAnalyzer(api, "Slow");
+
+  // Page's line goes in a commit, and the page loads again with no focus event.
+  writeFileSync(join(root, "src/a.rs"), "fn a() {\n}\n");
+  execFileSync("git", ["-C", root, "commit", "-q", "-am", "Drop one"]);
+  await page.reload();
+  await page.locator("#repo-name").filter({ hasText: /\S/ }).waitFor();
+  if (!(await page.locator("#map").isVisible())) await page.locator("#toggle-map").click();
+  const short = execFileSync("git", ["-C", root, "rev-parse", "--short=7", "HEAD"])
+    .toString()
+    .trim();
+  const strip = page.locator(".map-run");
+  await strip
+    .locator(".map-run-status", { hasText: new RegExp(`^Updating after ${short}…$`) })
+    .waitFor();
+  await stopHanging(api, strip);
+});
+
+// Saves the settings with `name` as the Analyzer, among the custom agents Fake, Missing (a
+// program that is not there) and Slow (the fake agent's `hang`, which runs until stopped).
+async function setAnalyzer(api, name) {
+  const { revision, settings } = await api("api/settings");
+  const fake = settings.customAgents.find((agent) => agent.name === "Fake");
+  const customAgents = [
+    fake,
+    { name: "Missing", command: "/nonexistent/agent-bin" },
+    { name: "Slow", command: fake.command.replace(/ analysis$/, " hang") },
+  ];
+  const enabledAgents = [...new Set([...settings.enabledAgents, "Missing", "Slow"])];
+  const next = { ...settings, customAgents, enabledAgents, analyzer: { name } };
+  await api("api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ revision, settings: next }),
+  });
+}
+
+// Stops the newest run, a forced update of the `hang` agent, and waits until `strip` lets it go.
+// The strip names the run as soon as it exists, so the first Stop may come before its agent has
+// started: that ends the run at once (src/run.rs, `Runner::cancel`), and a second Stop would be
+// refused, the run being under way no more. Once the agent runs, it ignores the first Stop,
+// and only a second, 3 s later (`FORCE_AFTER`), ends it.
+async function stopHanging(api, strip) {
+  const [running] = (await api("api/runs")).runs;
+  const cancel = () =>
+    api("api/run/cancel", { method: "POST", body: JSON.stringify({ run: running }) });
+  const live = async () => isLive(await api(`api/run?id=${encodeURIComponent(running)}`));
+  await cancel();
+  const force = Date.now() + 3_100;
+  while (Date.now() < force && (await live())) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (await live()) await cancel();
+  await strip
+    .locator(".map-run-status", { hasText: /^Updating after/ })
+    .waitFor({ state: "detached" });
+}
 
 // ---- The change map (docs/review-assist-plan.md, 8.6) -------------------------------------
 

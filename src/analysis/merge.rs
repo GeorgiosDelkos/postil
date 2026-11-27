@@ -19,8 +19,8 @@
 //! its prompt sent as outdated ([`AnalysisRun::nodes`]), adds nodes and edges, and may delete
 //! an outdated node, all within the diagram it was asked for when it was asked for one. A
 //! diagram whose parent node goes takes the diagrams below it with it ([`prune_orphans`]); a
-//! node replaced in place keeps its id, and so the diagrams below it. A diagram left with no
-//! node goes too.
+//! node replaced in place keeps its id, and so the diagrams below it, but loses its edges out,
+//! which its prompt lists for the reply to give back. A diagram left with no node goes too.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -30,9 +30,9 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use super::{
-    Analysis, AnalysisKind, AnalysisRun, Cited, CitedLines, CodeRef, Diagram, DiagramId,
+    Analysis, AnalysisKind, AnalysisRun, Cited, CitedLines, CodeRef, CommitId, Diagram, DiagramId,
     DiagramKind, Dropped, Edge, Node, NodeId, NodeKind, ReadFiles, RefDetail, RunId, check_in,
-    load, lock, prune_orphans, save,
+    has_architecture, load, lock, prune_orphans, save,
 };
 use crate::error::error_chain;
 use crate::repo::Repo;
@@ -79,13 +79,29 @@ pub(crate) fn merge(
 ) -> Result<(), String> {
     let run = RunId::try_from(run.to_owned())?;
     let checked = check_reply(reply, worktree)?;
-    let file = repo.analysis_file();
     let failed = |error| error_chain(&error);
+    // The commit the run read: its thread's fork, which a read-only run leaves checked out.
+    let fork = CommitId::of_head(worktree).map_err(failed)?;
+    let file = repo.analysis_file();
     let _lock = lock(&file).map_err(failed)?;
     let mut analysis = load(&file).map_err(failed)?.unwrap_or(Analysis {
+        checked: None,
         diagrams: Vec::new(),
     });
+    let had_architecture = has_architecture(&analysis);
     apply(&mut analysis, checked, run, asked)?;
+    // `checked` is the commit the Architecture was compared with: a run that stored an
+    // Architecture diagram drew it at its fork, when it is Analyze, which draws the whole
+    // Architecture again, or when there was none before. Any other run leaves `checked` where
+    // it was, which the forced update moves (`check`): a flow, or a deeper diagram beside an
+    // Architecture compared at an older commit, says nothing of the rest.
+    let stored_architecture = analysis
+        .diagrams
+        .iter()
+        .any(|diagram| diagram.run == run && diagram.kind == DiagramKind::Architecture);
+    if stored_architecture && (asked.kind == AnalysisKind::Analyze || !had_architecture) {
+        analysis.checked = fork;
+    }
     save(&file, &analysis).map_err(failed)
 }
 
@@ -709,9 +725,14 @@ fn update_one(diagram: &mut Diagram, raw: CheckedDiagram, outdated: &[NodeId]) -
                 dropped.nodes += 1;
                 continue;
             };
-            *existing = node_of(existing.id, node.body);
-            replaced.insert(existing.id);
-            existing.id
+            let id = existing.id;
+            *existing = node_of(id, node.body);
+            replaced.insert(id);
+            // Its edges out go with it: the prompt lists them, and the reply gives back those
+            // that still hold. Kept, an edge whose citation broke would stay outdated, and
+            // force an update on every later commit to its file.
+            diagram.edges.retain(|edge| edge.from != id);
+            id
         } else {
             let Some(key) = node.key.filter(|key| !by_key.contains_key(key)) else {
                 dropped.nodes += 1;

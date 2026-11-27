@@ -6,7 +6,8 @@ walkthrough with its ratings and findings in the changes view (7.5), read-only t
 Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1),
 analysis runs (8.2), the split pane with the diagram view (8.3), the link shown in the
 code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated nodes,
-"Not on the map" and Update in the page (8.5), and the change map (8.6). This document adds to
+"Not on the map" and Update in the page (8.5), the change map (8.6), and the forced update
+(8.7). This document adds to
 `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -346,11 +347,11 @@ The owner asked for the link to be visible in the code, as notes are.
 ### Data structures
 
 Built in step 8.1 (`src/analysis.rs`, `GET /api/analysis`): the types below, the file at
-version 1 (version 2 from step 8.2, which adds each diagram's `dropped`) without `checked`,
-which comes with the code that reads it in step 8.7 (version 3),
-checking a citation, and placing every verified reference on each read. As built, an unverified
-reference has no `target`, only its path and, when its file could not be read, a `reason`:
-its lines may be zero, reversed or past the end of a file that may not exist.
+version 1 (version 2 from step 8.2, which adds each diagram's `dropped`; version 3 from step
+8.7, which adds `checked`, absent until a run stores an Architecture and in files of version 1
+and 2), checking a citation, and placing every verified reference on each read. As built, an
+unverified reference has no `target`, only its path and, when its file could not be read, a
+`reason`: its lines may be zero, reversed or past the end of a file that may not exist.
 A file the page cannot use (unreadable, not of the format, or from a newer build) shows its
 reason in the map with Start over (step 8.3, `POST /api/analysis/start-over`), which moves the
 file to the macOS Trash, refused while an analysis runs in the window.
@@ -360,9 +361,9 @@ and edges, on each draw. Changed: whole diagrams, by an analysis run. A reposito
 of diagrams of tens of nodes, so every operation is a scan, as for notes.
 
 ```rust
-/// `<git dir>/postil/analysis.json`, version 2.
+/// `<git dir>/postil/analysis.json`, version 3.
 struct Analysis {
-    checked: CommitId,        // The commit the Architecture was last compared with.
+    checked: Option<CommitId>, // The commit the Architecture was last compared with.
     diagrams: Vec<Diagram>,
 }
 
@@ -516,6 +517,27 @@ Flow and Data diagrams, and uncommitted edits, still mark nodes outdated and wai
   branches, so the diagram instead says the checkout moved to another history and offers
   Update, and `checked` moves when it is pressed. Decided 2026-11-25 while planning.
 - A repository with no analysis has nothing to update, and nothing runs.
+
+As built (8.7): `POST /api/analysis/check` (`src/analysis/check.rs`, `analysis::check_head`)
+runs on the page's start, on each refresh (the window's focus, a run's status change, another
+live run's end) and when the settings change, whether or not the map is open. It reads the
+two commits only (`Repo::changed_paths`, `git diff --name-status --no-renames
+--ignore-submodules=all`; `git ls-tree`; `git show`), never the working tree, and holds no lock
+while it does: every write of `checked` is a compare and swap under `analysis.lock`. Only a
+reference whose path, or a folder above it, changed between `checked` and `HEAD` can start a
+run: after an update that failed at one commit, a later commit that touches none of its nodes
+starts none. The update is the Architecture's alone; a node whose only outdated reference is
+an edge's is sent. An update that replaces a node drops its edges out, which its prompt lists
+for the reply to give back, so a broken edge cannot force an update on every later commit.
+`checked` is claimed inside the run's creation, once the cap of 3 is checked and before the
+run's log exists, so of two windows one starts the run. A refused start answers `{"state":
+"blocked", "reason"}`, shown in the pane's strip, not an HTTP error. An Update of every diagram
+moves `checked` as it starts (on another history with nothing outdated it starts no run and
+answers `{"run": null}`); an Update of one diagram does not. A run that stores an Architecture
+sets `checked` to its fork when it is Analyze or the analysis had none; any other run leaves
+it. A file of version 1 or 2 is compared from the fork of its newest top-level Architecture
+diagram's run, or from `HEAD` when that run's thread is not in the record (an analysis written
+by hand); an analysis with no Architecture is not compared, and not written.
 
 ### Drawing and layout
 
