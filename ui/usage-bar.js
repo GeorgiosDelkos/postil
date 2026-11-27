@@ -6,16 +6,15 @@
 
 import { agentLogoIcon, el } from "./dom.js";
 import {
-  compactQuotaWindows,
   formatCost,
   formatCredits,
   formatPercent,
   formatReset,
   formatTokens,
   highestQuotaTone,
-  inlineQuotaText,
   quotaTone,
   rangeLabel,
+  tightestQuotaText,
   tightestQuotaWindow,
   usageUrl,
   visibleQuotaAgents,
@@ -108,7 +107,7 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
 
   function renderStrip() {
     const candidates = visibleQuotaAgents(ui.view?.agents, enabledNames());
-    const active = candidates.filter((agent) => Boolean(inlineQuotaText(agent.quota)));
+    const active = candidates.filter((agent) => Boolean(tightestQuotaText(agent.quota)));
 
     if (active.length === 0) {
       closePopover();
@@ -117,28 +116,25 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
       return;
     }
 
+    // Each row's cells are cells of the strip's grid, so the bars and the values line up in
+    // columns whatever the names. An agent with credits only has no bar, and its row is a flex
+    // row across the whole grid instead: a value placed in the grid's columns, even one spanning
+    // the bar column, widens the value column for every row and squeezes every name.
     const rows = active.map((agent) => {
-      const row = el("div", "quota-strip-row");
+      const tightest = tightestQuotaWindow(agent.quota);
+      const row = el("div", tightest ? "quota-strip-row" : "quota-strip-row is-credits");
       const left = el("span", "quota-strip-agent");
       const logo = agentLogoIcon(agent.name);
       if (logo) left.append(logo);
       left.append(el("span", "quota-strip-name", agent.name));
+      row.append(left);
 
-      const right = el("span", "quota-strip-meters");
-      const compact = compactQuotaWindows(agent.quota);
-      if (compact.length > 0) {
-        const bars = el("span", "quota-mini-bars");
-        for (const win of compact) {
-          const track = el("span", "quota-mini-track");
-          const fill = el("span", `quota-mini-fill tone-${win.tone}`);
-          fill.style.width = `${win.usedPercent}%`;
-          track.append(fill);
-          bars.append(track);
-        }
-        right.append(bars);
+      if (tightest) {
+        const bar = el("span", "quota-strip-bar");
+        bar.append(meter(tightest));
+        row.append(bar);
       }
-      right.append(el("span", "quota-strip-text", inlineQuotaText(agent.quota)));
-      row.append(left, right);
+      row.append(el("span", "quota-strip-text", tightestQuotaText(agent.quota)));
       return row;
     });
 
@@ -318,18 +314,21 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
   function inlineBadge(agentName) {
     const quota = quotaFor(agentName);
     const tightest = tightestQuotaWindow(quota);
-    const text = inlineQuotaText(quota);
+    const text = tightestQuotaText(quota);
     if (!text) return null;
     const badge = el("span", "menu-quota");
-    if (tightest) {
-      const track = el("span", "quota-mini-track");
-      const fill = el("span", `quota-mini-fill tone-${tightest.tone}`);
-      fill.style.width = `${tightest.usedPercent}%`;
-      track.append(fill);
-      badge.append(track);
-    }
+    if (tightest) badge.append(meter(tightest));
     badge.append(el("span", "menu-quota-text", text));
     return badge;
+  }
+
+  // A small bar filled to the window's used share, coloured by its tone.
+  function meter(win) {
+    const track = el("span", "quota-mini-track");
+    const fill = el("span", `quota-mini-fill tone-${win.tone}`);
+    fill.style.width = `${win.usedPercent}%`;
+    track.append(fill);
+    return track;
   }
 
   return {

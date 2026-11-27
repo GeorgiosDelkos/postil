@@ -10,9 +10,9 @@ import {
   formatReset,
   formatTokens,
   highestQuotaTone,
-  inlineQuotaText,
   quotaTone,
   summaryItems,
+  tightestQuotaText,
   tightestQuotaWindow,
   tokenBreakdownTitle,
   usageUrl,
@@ -100,7 +100,7 @@ test("summaryItems, usageUrl, and tokenBreakdownTitle format view metadata", () 
   assert.ok(tokenBreakdownTitle({ inputTokens: 120, outputTokens: 30 }).includes("Input:"));
 });
 
-test("compactQuotaWindows, inlineQuotaText, tightestQuotaWindow, and visibleQuotaAgents", () => {
+test("compactQuotaWindows, tightestQuotaWindow, tightestQuotaText, and visibleQuotaAgents", () => {
   const quota = {
     status: "ok",
     windows: [
@@ -111,7 +111,7 @@ test("compactQuotaWindows, inlineQuotaText, tightestQuotaWindow, and visibleQuot
   };
   const compact = compactQuotaWindows(quota);
   assert.equal(compact.length, 2);
-  assert.equal(inlineQuotaText(quota), "5h 35% · wk 81%");
+  assert.equal(tightestQuotaText(quota), "wk 81%", "one window: the tightest");
   assert.equal(tightestQuotaWindow(quota).label, "wk");
   assert.equal(tightestQuotaWindow(quota).tone, "warn");
 
@@ -120,8 +120,8 @@ test("compactQuotaWindows, inlineQuotaText, tightestQuotaWindow, and visibleQuot
     windows: [],
     credits: { used: 12.5, limit: 50, currency: "USD" },
   };
-  assert.equal(inlineQuotaText(creditsOnly), "$12.50 / $50.00");
-  assert.equal(inlineQuotaText({ status: "unavailable", windows: [] }), "");
+  assert.equal(tightestQuotaText(creditsOnly), "$12.50 / $50.00");
+  assert.equal(tightestQuotaText({ status: "unavailable", windows: [] }), "");
 
   const agents = [
     { name: "Claude", builtIn: true, found: "/bin/claude" },

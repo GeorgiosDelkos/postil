@@ -1091,9 +1091,11 @@ from Settings.
 The Usage view — the inline quota strip and popover at the foot of the sidebar (`ui/usage-bar.js`),
 the mini quota bars inside the agent picker, and the full Usage dialog (the Usage button above
 Settings, View > Usage, `Shift-Cmd-U`) — shows, per agent, the provider account's live quota and
-combined Postil + local CLI session activity. `GET /api/usage?scope=project|all&range=24h|7d|30d|all`
-answers it, and `POST /api/usage/refresh` probes quotas and rescans changed transcripts. The
-ranges roll back from now: the process has no time zone, so a calendar day is not offered.
+combined Postil + local CLI session activity. The strip and the picker show one bar per agent,
+its tightest window (`wk 58%`), with the bars in one column; the popover lists every window.
+`GET /api/usage?scope=project|all&range=24h|7d|30d|all` answers it, and
+`POST /api/usage/refresh` probes quotas and rescans changed transcripts. The ranges roll back
+from now: the process has no time zone, so a calendar day is not offered.
 
 Postil's own usage lives in `~/.config/postil/usage.jsonl` (`src/usage/ledger.rs`): one JSON
 line per finished run, appended under `usage.lock`, with the agent, the model, the outcome,
@@ -1114,7 +1116,8 @@ format, and runs whose log is reopened from disk, are not in the ledger.
 The account quotas (`src/usage/quota.rs`) are cached for 60 s so window focus events and menu
 opens do not spam provider endpoints. Codex is asked through `codex app-server`, Antigravity
 through `agy -p /usage --output-format json --print-timeout 12s`, and Grok through
-`grok agent stdio` (`_x.ai/billing`).
+`grok agent stdio` (`_x.ai/billing`, sent only after `initialize` has answered: Grok loads its
+sign-in while it answers, and fails an earlier billing request with "no auth context").
 Claude is asked over HTTPS with the agent's own sign-in: its token from the macOS Keychain item
 Claude Code writes, or `~/.claude/.credentials.json`. The token goes to `/usr/bin/curl` on
 stdin (`--config -`, with `--disable` so no `~/.curlrc` applies), never in its arguments; it is
