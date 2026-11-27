@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::acp::METHOD_NOT_FOUND;
 use crate::agents;
 use crate::usage::now_secs;
 
@@ -30,12 +31,13 @@ use crate::usage::now_secs;
 /// current enough, and closing and reopening the dialog within it sends no request.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Hard limit on one subprocess a probe runs (`security`, `curl`, or `codex app-server`).
+/// Hard limit on one subprocess a probe runs (`security`, `curl`, `codex app-server`,
+/// `agy -p /usage`, or `grok agent stdio`).
 /// A probe runs up to two of them one after the other (Claude: the Keychain read, then the
 /// usage request), so a probe can take up to twice this. Arbitrary:
-/// long enough for a slow network round trip, short enough that the dialog does not show
-/// "Loading" for long.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// long enough for `agy` to start its local language server when cold, short enough that the
+/// dialog does not show "Loading" for long.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long an in-flight `Loading` entry stays fresh before a later poll replaces its probe.
 /// Two [`PROBE_TIMEOUT`]s (the longest a probe should take) plus 4 s of margin, so only a
@@ -58,6 +60,10 @@ pub(crate) enum QuotaStatus {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QuotaWindow {
     pub(crate) label: String,
+    /// Compact label (`"5h"`, `"wk"`, `"1d"`, `"mo"`) for primary account windows shown in the
+    /// inline sidebar strip and agent picker; `None` on secondary per-model buckets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) short_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
     /// Percentage of the window consumed, clamped to `0.0..=100.0`.
@@ -335,14 +341,10 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
     match name {
         "Claude" => probe_claude(),
         "Codex" => probe_codex(search_path),
-        // agy keeps its sign-in to itself (no `~/.gemini/oauth_creds.json`, checked
-        // 2026-11-26, agy 1.5.18), so there is no token to ask Google's quota endpoint with.
-        "Gemini" => QuotaReport::unavailable(
-            "agy does not share its sign-in, so Postil cannot show Gemini's quota",
-        ),
-        "Grok" => QuotaReport::unavailable("Live quota is not exposed by the Grok CLI yet"),
+        "Antigravity" => probe_antigravity(search_path),
+        "Grok" => probe_grok(search_path),
         "OpenCode" => QuotaReport::unavailable(
-            "OpenCode routes across multiple providers — see Postil activity below",
+            "OpenCode routes across multiple providers — see activity below",
         ),
         _ => QuotaReport::unavailable("No provider quota source"),
     }
@@ -503,14 +505,14 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
         return QuotaReport::error("unreadable reply from Claude usage endpoint");
     };
     let mut windows = Vec::new();
-    let specs: [(&str, &str, Option<&str>); 5] = [
-        ("five_hour", "5-hour session", None),
-        ("seven_day", "7-day all models", None),
-        ("seven_day_sonnet", "7-day Sonnet", Some("sonnet")),
-        ("seven_day_opus", "7-day Opus", Some("opus")),
-        ("seven_day_oauth_apps", "7-day OAuth apps", None),
+    let specs: [(&str, &str, Option<&str>, Option<&str>); 5] = [
+        ("five_hour", "5-hour session", Some("5h"), None),
+        ("seven_day", "7-day all models", Some("wk"), None),
+        ("seven_day_sonnet", "7-day Sonnet", None, Some("sonnet")),
+        ("seven_day_opus", "7-day Opus", None, Some("opus")),
+        ("seven_day_oauth_apps", "7-day OAuth apps", None, None),
     ];
-    for (key, label, model) in specs {
+    for (key, label, short_label, model) in specs {
         let Some(bucket) = json.get(key).filter(|val| val.is_object()) else {
             continue;
         };
@@ -523,6 +525,7 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
             .and_then(parse_rfc3339_secs);
         windows.push(QuotaWindow {
             label: label.to_owned(),
+            short_label: short_label.map(str::to_owned),
             model: model.map(str::to_owned),
             used_percent: clamp_percent(utilization),
             resets_at,
@@ -573,6 +576,11 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
     }
 }
 
+/// Longest JSON-RPC line read from a quota probe's stdout, newline included; longer lines are
+/// skipped so a noisy or misbehaving CLI cannot grow memory without bound. Smaller in tests so
+/// oversized-line handling runs cheaply.
+const MAX_PROBE_LINE_BYTES: usize = if cfg!(test) { 16 << 10 } else { 1 << 20 };
+
 fn probe_codex(search_path: &OsStr) -> QuotaReport {
     let Some(program) = agents::find_program("codex", search_path) else {
         return QuotaReport::unavailable("Codex CLI not found on PATH");
@@ -592,29 +600,6 @@ fn probe_codex(search_path: &OsStr) -> QuotaReport {
         }
     };
 
-    let result = read_codex_replies(&mut child);
-    agents::kill_group(child.id());
-    drop(child.kill());
-    drop(child.wait());
-
-    match result {
-        Ok((account, limits)) => parse_codex_quota(account.as_ref(), limits.as_ref()),
-        Err(message) => QuotaReport::error(message),
-    }
-}
-
-/// Sends the `initialize`, `account/read` and `account/rateLimits/read` requests to a running
-/// `codex app-server`, and returns the account and rate-limit replies (each `None` when the
-/// server closed its output first). Waits at most [`PROBE_TIMEOUT`]; does not stop the server.
-fn read_codex_replies(child: &mut Child) -> Result<(Option<Value>, Option<Value>), String> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .expect("probe_codex starts codex app-server with a piped stdin");
-    let stdout = child
-        .stdout
-        .take()
-        .expect("probe_codex starts codex app-server with a piped stdout");
     let requests = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
         r#""params":{"clientInfo":{"name":"postil","version":""#,
@@ -628,22 +613,115 @@ fn read_codex_replies(child: &mut Child) -> Result<(Option<Value>, Option<Value>
         r#"{"jsonrpc":"2.0","id":3,"method":"account/rateLimits/read","params":{}}"#,
         "\n",
     );
-    stdin
+    let result = query_stdio_server(
+        &mut child,
+        "codex app-server",
+        requests,
+        collect_codex_replies,
+    );
+    agents::kill_group(child.id());
+    drop(child.kill());
+    drop(child.wait());
+
+    match result {
+        Ok((account, limits)) => parse_codex_quota(account.as_ref(), limits.as_ref()),
+        Err(message) => QuotaReport::error(message),
+    }
+}
+
+/// Sends `requests` to a running JSON-RPC stdio server and collects its replies within
+/// [`PROBE_TIMEOUT`]. Ignores `BrokenPipe` on write so a child that exits immediately still
+/// has its stdout/EOF read deterministically. Does not stop the child.
+fn query_stdio_server<T: Send + 'static>(
+    child: &mut Child,
+    server_name: &'static str,
+    requests: &str,
+    collect: impl FnOnce(ChildStdout) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("stdio quota probe starts child with piped stdin");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdio quota probe starts child with piped stdout");
+    if let Err(error) = stdin
         .write_all(requests.as_bytes())
         .and_then(|()| stdin.flush())
-        .map_err(|error| format!("cannot write to codex app-server: {error}"))?;
+        && error.kind() != ErrorKind::BrokenPipe
+    {
+        return Err(format!("cannot write to {server_name}: {error}"));
+    }
 
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("codex-quota-read".to_owned())
-        .spawn(move || drop(sender.send(collect_codex_replies(stdout))))
-        .map_err(|error| format!("cannot start a thread to read codex app-server: {error}"))?;
+        .name("quota-stdio-read".to_owned())
+        .spawn(move || drop(sender.send(collect(stdout))))
+        .map_err(|error| format!("cannot start a thread to read {server_name}: {error}"))?;
     receiver.recv_timeout(PROBE_TIMEOUT).map_err(|_| {
         format!(
-            "codex app-server did not answer within {} s",
+            "{server_name} did not answer within {} s",
             PROBE_TIMEOUT.as_secs()
         )
     })?
+}
+
+/// Reads bounded JSON-RPC response lines (ignoring notifications and server-initiated requests
+/// carrying `"method"`) until `on_reply` returns `Ok(true)`, an error, or EOF.
+fn read_jsonrpc_replies(
+    stdout: impl Read,
+    mut on_reply: impl FnMut(u64, Value) -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(MAX_PROBE_LINE_BYTES as u64)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.len() == MAX_PROBE_LINE_BYTES && line.last() != Some(&b'\n') {
+            if reader.skip_until(b'\n').is_err() {
+                break;
+            }
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let Ok(msg) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if msg.get("method").is_some() {
+            continue;
+        }
+        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        if on_reply(id, msg)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Extracts an `initialize` error message when `"error"` is present and non-null.
+fn rpc_init_error(msg: &Value, server_name: &str) -> Option<String> {
+    let err = msg.get("error").filter(|v| !v.is_null())?;
+    Some(
+        err.get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(
+                || format!("{server_name} refused initialize"),
+                bounded_provider_text,
+            ),
+    )
 }
 
 /// Reads `codex app-server` replies until both the account and the rate-limit reply arrived,
@@ -651,29 +729,19 @@ fn read_codex_replies(child: &mut Child) -> Result<(Option<Value>, Option<Value>
 fn collect_codex_replies(stdout: ChildStdout) -> Result<(Option<Value>, Option<Value>), String> {
     let mut account = None;
     let mut limits = None;
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        match msg.get("id").and_then(Value::as_u64) {
-            Some(1) if msg.get("error").is_some() => {
-                return Err(msg
-                    .get("error")
-                    .and_then(|err| err.get("message"))
-                    .and_then(Value::as_str)
-                    .map_or_else(
-                        || "codex app-server refused initialize".to_owned(),
-                        bounded_provider_text,
-                    ));
+    read_jsonrpc_replies(stdout, |id, msg| {
+        match id {
+            1 => {
+                if let Some(err) = rpc_init_error(&msg, "codex app-server") {
+                    return Err(err);
+                }
             }
-            Some(2) => account = Some(msg),
-            Some(3) => limits = Some(msg),
+            2 => account = Some(msg),
+            3 => limits = Some(msg),
             _ => {}
         }
-        if account.is_some() && limits.is_some() {
-            break;
-        }
-    }
+        Ok(account.is_some() && limits.is_some())
+    })?;
     Ok((account, limits))
 }
 
@@ -751,7 +819,11 @@ fn parse_codex_quota(account: Option<&Value>, limits: Option<&Value>) -> QuotaRe
 }
 
 fn collect_codex_bucket(bucket: &Value, model: Option<&str>, out: &mut Vec<QuotaWindow>) {
-    for (field, fallback_label) in [("primary", "5-hour window"), ("secondary", "7-day window")] {
+    let slots = [
+        ("primary", "5-hour window", "5h"),
+        ("secondary", "7-day window", "wk"),
+    ];
+    for (field, fallback_label, fallback_short) in slots {
         let Some(win) = bucket.get(field).filter(|v| v.is_object()) else {
             continue;
         };
@@ -770,11 +842,20 @@ fn collect_codex_bucket(bucket: &Value, model: Option<&str>, out: &mut Vec<Quota
             .get("windowDurationMins")
             .or_else(|| win.get("window_minutes"))
             .and_then(Value::as_u64);
-        let window_name = match mins {
-            Some(m) if m >= 60 * 24 => format!("{}-day window", m / (60 * 24)),
-            Some(m) if m >= 60 => format!("{}-hour window", m / 60),
-            Some(m) if m > 0 => format!("{m}-min window"),
-            _ => fallback_label.to_owned(),
+        let (window_name, short_code) = match mins {
+            Some(m) if (60 * 24 * 6..=60 * 24 * 8).contains(&m) => {
+                (format!("{}-day window", m / (60 * 24)), "wk".to_owned())
+            }
+            Some(m) if m >= 60 * 24 => {
+                let days = m / (60 * 24);
+                (format!("{days}-day window"), format!("{days}d"))
+            }
+            Some(m) if m >= 60 => {
+                let hours = m / 60;
+                (format!("{hours}-hour window"), format!("{hours}h"))
+            }
+            Some(m) if m > 0 => (format!("{m}-min window"), format!("{m}m")),
+            _ => (fallback_label.to_owned(), fallback_short.to_owned()),
         };
         let label = match model {
             Some(name) => format!("{name} ({window_name})"),
@@ -782,6 +863,7 @@ fn collect_codex_bucket(bucket: &Value, model: Option<&str>, out: &mut Vec<Quota
         };
         out.push(QuotaWindow {
             label,
+            short_label: model.is_none().then_some(short_code),
             model: model.map(str::to_owned),
             used_percent: clamp_percent(used),
             resets_at,
@@ -816,6 +898,418 @@ fn parse_codex_credits(bucket: &Value) -> Option<CreditInfo> {
         currency: None,
         unlimited,
     })
+}
+
+fn probe_antigravity(search_path: &OsStr) -> QuotaReport {
+    let Some(program) = agents::find_program("agy", search_path) else {
+        return QuotaReport::unavailable("Antigravity CLI (`agy`) not found on PATH");
+    };
+    let cwd = std::env::temp_dir().join("postil-quota");
+    if let Err(error) = fs::create_dir_all(&cwd) {
+        return QuotaReport::error(format!("cannot make the folder {}: {error}", cwd.display()));
+    }
+    let output = match run_timed(
+        Command::new(&program)
+            .args([
+                "-p",
+                "/usage",
+                "--output-format",
+                "json",
+                "--print-timeout",
+                "12s",
+            ])
+            .current_dir(&cwd)
+            .env("PATH", search_path)
+            .stdin(Stdio::null()),
+        None,
+        PROBE_TIMEOUT,
+    ) {
+        Ok(output) => output,
+        Err(message) => return QuotaReport::error(message),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_antigravity_quota(&stdout, output.status.success())
+}
+
+fn parse_antigravity_quota(stdout: &str, exit_ok: bool) -> QuotaReport {
+    let Some(json) = extract_antigravity_json(stdout) else {
+        return if exit_ok {
+            QuotaReport::error("unreadable reply from agy /usage")
+        } else {
+            QuotaReport::unavailable("Not signed in — run `agy login` in a terminal")
+        };
+    };
+
+    if let Some(report) = antigravity_error_report(&json) {
+        return report;
+    }
+
+    let groups = json
+        .get("command")
+        .and_then(|cmd| cmd.get("data"))
+        .or_else(|| json.get("data"))
+        .and_then(|data| data.get("groups"))
+        .and_then(Value::as_array);
+    let mut windows = Vec::new();
+    if let Some(groups) = groups {
+        let has_gemini = groups.iter().any(|group| {
+            group
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("Gemini Models"))
+        });
+        for (idx, group) in groups.iter().enumerate() {
+            let name = group.get("name").and_then(Value::as_str).unwrap_or("");
+            let is_primary =
+                name.eq_ignore_ascii_case("Gemini Models") || (!has_gemini && idx == 0);
+            collect_antigravity_group(group, is_primary, &mut windows);
+        }
+    }
+
+    if windows.is_empty() {
+        let message = if exit_ok {
+            "Antigravity reported no active quota windows"
+        } else {
+            "Not signed in — run `agy login` in a terminal"
+        };
+        return QuotaReport::unavailable(message);
+    }
+    QuotaReport {
+        status: QuotaStatus::Ok,
+        plan: None,
+        windows,
+        credits: None,
+        message: None,
+        fetched_at: Some(now_secs()),
+    }
+}
+
+fn extract_antigravity_json(stdout: &str) -> Option<Value> {
+    let trimmed = stdout.trim();
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+        && val.is_object()
+    {
+        return Some(val);
+    }
+    // Handle JSONL streams or trailing warning lines by scanning from the last object line.
+    if let Some(val) = trimmed
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|val| {
+            val.is_object()
+                && ["command", "status", "error", "data"]
+                    .iter()
+                    .any(|key| val.get(*key).is_some())
+        })
+    {
+        return Some(val);
+    }
+    // Fallback for multi-line pretty JSON preceded by startup banner lines.
+    trimmed
+        .rmatch_indices("\n{")
+        .find_map(|(idx, _)| serde_json::from_str::<Value>(&trimmed[idx + 1..]).ok())
+        .filter(Value::is_object)
+}
+
+fn antigravity_error_report(json: &Value) -> Option<QuotaReport> {
+    let status = json.get("status").and_then(Value::as_str);
+    let failed_status = status.is_some_and(|s| !s.eq_ignore_ascii_case("SUCCESS"));
+    let err_val = json
+        .get("error")
+        .or_else(|| json.get("command").and_then(|c| c.get("error")))
+        .filter(|v| !v.is_null());
+    if !failed_status && err_val.is_none() {
+        return None;
+    }
+    let message = err_val
+        .and_then(|err| {
+            err.as_str()
+                .or_else(|| err.get("message").and_then(Value::as_str))
+        })
+        .or_else(|| json.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(msg) = message else {
+        return Some(QuotaReport::unavailable(
+            "Not signed in — run `agy login` in a terminal",
+        ));
+    };
+    let lower = msg.to_ascii_lowercase();
+    let auth_issue = ["login", "sign in", "signed in", "auth", "credential"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let bounded = bounded_provider_text(msg);
+    Some(if auth_issue {
+        QuotaReport::unavailable(bounded)
+    } else {
+        QuotaReport::error(bounded)
+    })
+}
+
+fn collect_antigravity_group(group: &Value, is_primary: bool, out: &mut Vec<QuotaWindow>) {
+    let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
+        return;
+    };
+    let raw_group = group
+        .get("name")
+        .and_then(Value::as_str)
+        .map_or("", str::trim);
+    let (prefix, model) = if raw_group.is_empty() || raw_group.eq_ignore_ascii_case("Gemini Models")
+    {
+        ("Gemini models".to_owned(), None)
+    } else if raw_group.eq_ignore_ascii_case("Claude and GPT models") {
+        ("Claude & GPT".to_owned(), Some("claude-gpt".to_owned()))
+    } else {
+        let name = bounded_provider_text(raw_group);
+        (name.clone(), Some(name))
+    };
+
+    let mut group_windows: Vec<(u8, QuotaWindow)> = Vec::new();
+    for bucket in buckets {
+        let used = ["remaining_fraction", "remainingFraction"]
+            .into_iter()
+            .find_map(|key| bucket.get(key).and_then(Value::as_f64))
+            .filter(|val| val.is_finite())
+            .map(|rem| (1.0 - rem) * 100.0)
+            .or_else(|| {
+                ["used_percent", "usedPercent"]
+                    .into_iter()
+                    .find_map(|key| bucket.get(key).and_then(Value::as_f64))
+                    .filter(|val| val.is_finite())
+            });
+        let Some(used) = used else {
+            continue;
+        };
+        let (suffix, short, rank) = antigravity_window_labels(
+            bucket.get("window").and_then(Value::as_str),
+            bucket.get("name").and_then(Value::as_str),
+        );
+        // Unused buckets report `"1970-01-01T00:00:00Z"` (epoch 0), which means no timer has
+        // started yet rather than an imminent reset.
+        let resets_at = ["reset_time", "resetTime", "resets_at", "resetsAt"]
+            .into_iter()
+            .find_map(|key| bucket.get(key).and_then(Value::as_str))
+            .and_then(parse_rfc3339_secs)
+            .filter(|&ts| ts > 0);
+        group_windows.push((
+            rank,
+            QuotaWindow {
+                label: format!("{prefix} ({suffix})"),
+                short_label: is_primary.then_some(short).flatten().map(str::to_owned),
+                model: model.clone(),
+                used_percent: clamp_percent(used),
+                resets_at,
+                detail: None,
+            },
+        ));
+    }
+    group_windows.sort_by_key(|(rank, _)| *rank);
+    out.extend(group_windows.into_iter().map(|(_, win)| win));
+}
+
+fn antigravity_window_labels(
+    window: Option<&str>,
+    name: Option<&str>,
+) -> (String, Option<&'static str>, u8) {
+    match window.map(str::trim) {
+        Some("5h") => ("5h".to_owned(), Some("5h"), 0),
+        Some("daily" | "1d" | "24h") => ("24h".to_owned(), Some("1d"), 1),
+        Some("weekly") => ("weekly".to_owned(), Some("wk"), 2),
+        Some("monthly") => ("monthly".to_owned(), Some("mo"), 3),
+        other => {
+            let fallback = other
+                .filter(|s| !s.is_empty())
+                .or_else(|| name.map(str::trim).filter(|s| !s.is_empty()))
+                .unwrap_or("quota");
+            (bounded_provider_text(fallback), None, 4)
+        }
+    }
+}
+
+fn probe_grok(search_path: &OsStr) -> QuotaReport {
+    let Some(program) = agents::find_program("grok", search_path) else {
+        return QuotaReport::unavailable("Grok CLI not found on PATH");
+    };
+    let cwd = std::env::temp_dir().join("postil-quota");
+    if let Err(error) = fs::create_dir_all(&cwd) {
+        return QuotaReport::error(format!("cannot make the folder {}: {error}", cwd.display()));
+    }
+    let mut child = match Command::new(&program)
+        .args(["agent", "stdio"])
+        .current_dir(&cwd)
+        .env("PATH", search_path)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return QuotaReport::error(format!("could not start grok agent stdio: {error}"));
+        }
+    };
+
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":1,"clientCapabilities":"#,
+        r#"{"fs":{"readTextFile":false,"writeTextFile":false},"#,
+        r#""terminal":false,"elicitation":{"form":{}}}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"_x.ai/billing","params":{}}"#,
+        "\n",
+    );
+    let result = query_stdio_server(&mut child, "grok agent stdio", requests, collect_grok_reply);
+    agents::kill_group(child.id());
+    drop(child.kill());
+    drop(child.wait());
+
+    let has_api_key = std::env::var_os("XAI_API_KEY").is_some_and(|val| !val.is_empty());
+    match result {
+        Ok(billing) => parse_grok_quota(billing.as_ref(), has_api_key),
+        Err(message) => QuotaReport::error(message),
+    }
+}
+
+/// Reads `grok agent stdio` lines until the `_x.ai/billing` reply (`id: 2`) arrives, stdout
+/// ends, or `initialize` (`id: 1`) returned an error.
+fn collect_grok_reply(stdout: ChildStdout) -> Result<Option<Value>, String> {
+    let mut billing = None;
+    read_jsonrpc_replies(stdout, |id, msg| match id {
+        1 => match rpc_init_error(&msg, "grok agent stdio") {
+            Some(err) => Err(err),
+            None => Ok(false),
+        },
+        2 => {
+            billing = Some(msg);
+            Ok(true)
+        }
+        _ => Ok(false),
+    })?;
+    Ok(billing)
+}
+
+fn parse_grok_quota(billing: Option<&Value>, has_api_key: bool) -> QuotaReport {
+    let Some(billing_msg) = billing else {
+        return QuotaReport::unavailable("Grok did not return billing data");
+    };
+    if let Some(error) = billing_msg.get("error").filter(|v| !v.is_null()) {
+        if error.get("code").and_then(Value::as_i64) == Some(METHOD_NOT_FOUND) {
+            return QuotaReport::unavailable("Update Grok CLI (`grok update`) to check live quota");
+        }
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Not signed in — run `grok login` in a terminal");
+        return QuotaReport::unavailable(bounded_provider_text(message));
+    }
+    let Some(result) = billing_msg.get("result").filter(|v| v.is_object()) else {
+        return QuotaReport::unavailable("Grok did not return billing data");
+    };
+
+    let plan = ["subscription_tier", "subscriptionTier"]
+        .into_iter()
+        .find_map(|key| result.get(key).and_then(Value::as_str))
+        .map(|s| s.replace(['\r', '\n'], " "))
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| title_case(&bounded_provider_text(s)));
+
+    let mut windows = Vec::new();
+    let mut credits = None;
+    if let Some(config) = result.get("config").filter(|v| v.is_object()) {
+        // Only emit a window when `creditUsagePercent` is explicitly present: omitting it is
+        // not 0% consumption.
+        let used = ["creditUsagePercent", "credit_usage_percent"]
+            .into_iter()
+            .find_map(|key| config.get(key).and_then(Value::as_f64));
+        if let Some(used) = used {
+            let period = ["currentPeriod", "current_period"]
+                .into_iter()
+                .find_map(|key| config.get(key).filter(|v| v.is_object()));
+            let (label, short_label) =
+                grok_period_labels(period.and_then(|p| p.get("type")).and_then(Value::as_str));
+            let resets_at = period
+                .and_then(|p| p.get("end").and_then(Value::as_str))
+                .or_else(|| config.get("billingPeriodEnd").and_then(Value::as_str))
+                .and_then(parse_rfc3339_secs);
+            windows.push(QuotaWindow {
+                label: label.to_owned(),
+                short_label: Some(short_label.to_owned()),
+                model: None,
+                used_percent: clamp_percent(used),
+                resets_at,
+                detail: None,
+            });
+        }
+        credits = parse_grok_credits(config);
+    }
+
+    if windows.is_empty() && credits.is_none() {
+        let message = if plan.is_none() && has_api_key {
+            "API key mode — no subscription quota window"
+        } else {
+            "Grok reported no active quota windows"
+        };
+        return QuotaReport {
+            plan,
+            ..QuotaReport::unavailable(message)
+        };
+    }
+    QuotaReport {
+        status: QuotaStatus::Ok,
+        plan,
+        windows,
+        credits,
+        message: None,
+        fetched_at: Some(now_secs()),
+    }
+}
+
+fn grok_period_labels(period_type: Option<&str>) -> (&'static str, &'static str) {
+    match period_type {
+        Some("USAGE_PERIOD_TYPE_DAILY") => ("Daily window", "1d"),
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => ("Weekly window", "wk"),
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => ("Monthly window", "mo"),
+        _ => ("Usage window", "lim"),
+    }
+}
+
+fn parse_grok_credits(config: &Value) -> Option<CreditInfo> {
+    let amount = |keys: &[&str]| keys.iter().find_map(|key| cents_usd(config.get(*key)));
+    if let Some(limit) = amount(&["onDemandCap", "on_demand_cap"]).filter(|&cap| cap > 0.0) {
+        let used = amount(&["onDemandUsed", "on_demand_used"]).unwrap_or(0.0);
+        return Some(CreditInfo {
+            label: "On-demand".to_owned(),
+            used: Some(used),
+            limit: Some(limit),
+            remaining: Some((limit - used).max(0.0)),
+            currency: Some("USD".to_owned()),
+            unlimited: false,
+        });
+    }
+    let remaining = amount(&["prepaidBalance", "prepaid_balance"]).filter(|&bal| bal > 0.0)?;
+    Some(CreditInfo {
+        label: "Prepaid credits".to_owned(),
+        used: None,
+        limit: None,
+        remaining: Some(remaining),
+        currency: Some("USD".to_owned()),
+        unlimited: false,
+    })
+}
+
+/// Reads a `{ "val": <cents> }` billing wrapper into US dollars.
+fn cents_usd(field: Option<&Value>) -> Option<f64> {
+    let val = field?.get("val")?;
+    let cents = val
+        .as_f64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+    (cents.is_finite() && cents >= 0.0).then_some(cents / 100.0)
 }
 
 /// Reads a generic password secret from the macOS Keychain, bounded by [`PROBE_TIMEOUT`].
@@ -1008,7 +1502,7 @@ fn title_case(text: &str) -> String {
 
 /// Parses an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS(.frac)?(Z|[+-]HH:MM)`) into Unix
 /// seconds. Returns `None` on invalid input or dates before 1970-01-01.
-fn parse_rfc3339_secs(input: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_secs(input: &str) -> Option<u64> {
     let bytes = input.as_bytes();
     if bytes.len() < 20
         || bytes[4] != b'-'
@@ -1629,5 +2123,403 @@ mod tests {
         assert!(error.ends_with("is not a regular file"), "{error}");
         let error = read_credentials_file(dir.path()).unwrap_err();
         assert!(error.ends_with("is not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn parses_grok_weekly_quota_credits_and_missing_percent() {
+        let weekly = serde_json::json!({
+            "id": 2,
+            "error": null,
+            "result": {
+                "config": {
+                    "creditUsagePercent": 12.0,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-11-24T08:37:24.596441+00:00",
+                        "end": "2026-12-01T08:37:24.596441+00:00"
+                    },
+                    "onDemandCap": { "val": 0 },
+                    "onDemandUsed": { "val": 0 },
+                    "prepaidBalance": { "val": 0 },
+                    "isUnifiedBillingUser": true
+                },
+                "subscription_tier": "SuperGrok Heavy"
+            }
+        });
+        let report = parse_grok_quota(Some(&weekly), false);
+        assert_eq!(report.status, QuotaStatus::Ok);
+        assert_eq!(report.plan.as_deref(), Some("SuperGrok Heavy"));
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].label, "Weekly window");
+        assert!((report.windows[0].used_percent - 12.0).abs() < 1e-6);
+        assert!(report.windows[0].resets_at.is_some());
+        assert!(report.credits.is_none());
+
+        // On-demand budget cap and used cents convert to USD; omitting creditUsagePercent does
+        // not fabricate a 0% window.
+        let on_demand = serde_json::json!({
+            "id": 2,
+            "result": {
+                "config": {
+                    "on_demand_cap": { "val": 5000 },
+                    "on_demand_used": { "val": 1250 },
+                    "prepaid_balance": { "val": 900 }
+                },
+                "subscription_tier": null,
+                "subscriptionTier": "  free\ntier  "
+            }
+        });
+        let report = parse_grok_quota(Some(&on_demand), false);
+        assert_eq!(report.status, QuotaStatus::Ok);
+        assert_eq!(report.plan.as_deref(), Some("Free tier"));
+        assert_eq!(report.windows.len(), 0);
+        let credits = report.credits.unwrap();
+        assert_eq!(credits.label, "On-demand");
+        assert_eq!(credits.currency.as_deref(), Some("USD"));
+        assert!(!credits.unlimited);
+        assert!((credits.used.unwrap() - 12.5).abs() < 1e-6);
+        assert!((credits.limit.unwrap() - 50.0).abs() < 1e-6);
+        assert!((credits.remaining.unwrap() - 37.5).abs() < 1e-6);
+
+        // Over-limit on-demand spend clamps remaining to 0; prepaid credits parse trimmed strings.
+        let over = serde_json::json!({
+            "result": { "config": { "onDemandCap": { "val": 1000 }, "onDemandUsed": { "val": 1500 } } }
+        });
+        let over_credits = parse_grok_quota(Some(&over), false).credits.unwrap();
+        assert!((over_credits.remaining.unwrap()).abs() < 1e-6);
+
+        let prepaid = serde_json::json!({
+            "result": { "config": { "prepaidBalance": { "val": " 2500 " } } }
+        });
+        let prepaid_credits = parse_grok_quota(Some(&prepaid), false).credits.unwrap();
+        assert_eq!(prepaid_credits.label, "Prepaid credits");
+        assert_eq!(prepaid_credits.currency.as_deref(), Some("USD"));
+        assert!(!prepaid_credits.unlimited);
+        assert!((prepaid_credits.remaining.unwrap() - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grok_quota_handles_fallbacks_errors_and_api_key_modes() {
+        assert_eq!(
+            parse_grok_quota(None, false).message.as_deref(),
+            Some("Grok did not return billing data")
+        );
+        assert_eq!(
+            parse_grok_quota(Some(&serde_json::json!({ "id": 2, "result": null })), false)
+                .message
+                .as_deref(),
+            Some("Grok did not return billing data")
+        );
+
+        let unsupported = serde_json::json!({
+            "id": 2,
+            "error": { "code": METHOD_NOT_FOUND, "message": "Method not found" }
+        });
+        assert!(
+            parse_grok_quota(Some(&unsupported), false)
+                .message
+                .unwrap()
+                .contains("grok update")
+        );
+
+        let blank_err =
+            serde_json::json!({ "id": 2, "error": { "code": -32000, "message": "  " } });
+        assert_eq!(
+            parse_grok_quota(Some(&blank_err), false).message.as_deref(),
+            Some("Not signed in — run `grok login` in a terminal")
+        );
+        let long_msg = "x".repeat(MAX_PROVIDER_TEXT_CHARS + 5);
+        let auth_err =
+            serde_json::json!({ "id": 2, "error": { "code": -32000, "message": long_msg } });
+        assert_eq!(
+            parse_grok_quota(Some(&auth_err), false)
+                .message
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_PROVIDER_TEXT_CHARS + 1
+        );
+
+        // Null primary fields fall back to snake_case / billingPeriodEnd; percent is clamped;
+        // overlong plan names are bounded.
+        let fallback = serde_json::json!({
+            "result": {
+                "subscription_tier": "p".repeat(MAX_PROVIDER_TEXT_CHARS + 10),
+                "config": {
+                    "creditUsagePercent": null,
+                    "credit_usage_percent": 140.0,
+                    "currentPeriod": null,
+                    "current_period": { "type": "USAGE_PERIOD_TYPE_MONTHLY", "end": null },
+                    "billingPeriodEnd": "2026-12-31T00:00:00Z"
+                }
+            }
+        });
+        let report = parse_grok_quota(Some(&fallback), false);
+        assert_eq!(report.windows[0].label, "Monthly window");
+        assert!((report.windows[0].used_percent - 100.0).abs() < 1e-6);
+        assert!(report.windows[0].resets_at.is_some());
+        assert_eq!(
+            report.plan.unwrap().chars().count(),
+            MAX_PROVIDER_TEXT_CHARS + 1
+        );
+        assert_eq!(grok_period_labels(Some("OTHER")), ("Usage window", "lim"));
+
+        // Empty windows/credits matrix over (plan, has_api_key).
+        let empty_no_plan = serde_json::json!({ "result": { "config": {} } });
+        assert_eq!(
+            parse_grok_quota(Some(&empty_no_plan), false)
+                .message
+                .as_deref(),
+            Some("Grok reported no active quota windows")
+        );
+        assert_eq!(
+            parse_grok_quota(Some(&empty_no_plan), true)
+                .message
+                .as_deref(),
+            Some("API key mode — no subscription quota window")
+        );
+        let empty_with_plan = serde_json::json!({
+            "result": { "subscription_tier": "SuperGrok", "config": {} }
+        });
+        let with_plan = parse_grok_quota(Some(&empty_with_plan), true);
+        assert_eq!(with_plan.plan.as_deref(), Some("SuperGrok"));
+        assert_eq!(
+            with_plan.message.as_deref(),
+            Some("Grok reported no active quota windows")
+        );
+    }
+
+    #[test]
+    fn cents_usd_and_probe_agent_boundaries() {
+        assert_eq!(cents_usd(None), None);
+        assert_eq!(cents_usd(Some(&serde_json::json!({}))), None);
+        assert_eq!(cents_usd(Some(&serde_json::json!({ "val": 0 }))), Some(0.0));
+        assert_eq!(cents_usd(Some(&serde_json::json!({ "val": -1 }))), None);
+        assert_eq!(cents_usd(Some(&serde_json::json!({ "val": "NaN" }))), None);
+        assert_eq!(cents_usd(Some(&serde_json::json!({ "val": "inf" }))), None);
+
+        let empty_dir = crate::testing::TempDir::new("quota-empty-path");
+        let empty = empty_dir.path().as_os_str();
+        assert_eq!(
+            probe_agent("Grok", empty).message.as_deref(),
+            Some("Grok CLI not found on PATH")
+        );
+        assert_eq!(
+            probe_agent("Antigravity", empty).message.as_deref(),
+            Some("Antigravity CLI (`agy`) not found on PATH")
+        );
+        assert!(
+            probe_agent("OpenCode", empty)
+                .message
+                .unwrap()
+                .contains("OpenCode")
+        );
+        assert_eq!(
+            probe_agent("Other", empty).message.as_deref(),
+            Some("No provider quota source")
+        );
+    }
+
+    #[test]
+    fn parses_antigravity_usage_groups_orders_5h_before_weekly_and_skips_epoch_zero() {
+        let json = r#"{
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {
+                                    "id": "gemini-weekly",
+                                    "name": "Weekly Limit Remaining",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.8081,
+                                    "reset_time": "2026-12-03T07:10:47Z"
+                                },
+                                {
+                                    "id": "gemini-5h",
+                                    "name": "Five Hour Limit Remaining",
+                                    "window": "5h",
+                                    "remaining_fraction": 0.6469,
+                                    "reset_time": "2026-11-26T17:10:47Z"
+                                }
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {
+                                    "id": "3p-weekly",
+                                    "name": "Weekly Limit Remaining",
+                                    "window": "weekly",
+                                    "remaining_fraction": 1,
+                                    "reset_time": "1970-01-01T00:00:00Z"
+                                },
+                                {
+                                    "id": "3p-5h",
+                                    "name": "Five Hour Limit Remaining",
+                                    "window": "5h",
+                                    "remaining_fraction": 1,
+                                    "reset_time": "1970-01-01T00:00:00Z"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let report = parse_antigravity_quota(json, true);
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.windows.len(), 4);
+
+        assert_eq!(report.windows[0].label, "Gemini models (5h)");
+        assert_eq!(report.windows[0].short_label.as_deref(), Some("5h"));
+        assert!(report.windows[0].model.is_none());
+        assert!((report.windows[0].used_percent - 35.3).abs() < 1e-6);
+        assert!(report.windows[0].resets_at.is_some());
+
+        assert_eq!(report.windows[1].label, "Gemini models (weekly)");
+        assert_eq!(report.windows[1].short_label.as_deref(), Some("wk"));
+        assert!((report.windows[1].used_percent - 19.2).abs() < 1e-6);
+        assert!(report.windows[1].resets_at.is_some());
+
+        assert_eq!(report.windows[2].label, "Claude & GPT (5h)");
+        assert!(report.windows[2].short_label.is_none());
+        assert_eq!(report.windows[2].model.as_deref(), Some("claude-gpt"));
+        assert!((report.windows[2].used_percent).abs() < 1e-6);
+        assert!(
+            report.windows[2].resets_at.is_none(),
+            "epoch 0 means no reset timer started yet"
+        );
+
+        assert_eq!(report.windows[3].label, "Claude & GPT (weekly)");
+        assert!(report.windows[3].short_label.is_none());
+        assert!(report.windows[3].resets_at.is_none());
+    }
+
+    #[test]
+    fn probe_antigravity_runs_agy_usage_json_and_handles_auth_and_error_states() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("agy-usage");
+        let script = dir.path().join("agy");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" != \"-p\" ] || [ \"$2\" != \"/usage\" ] || ",
+                "[ \"$3\" != \"--output-format\" ] || [ \"$4\" != \"json\" ]; then exit 2; fi\n",
+                "printf 'banner line\\n{\"status\":\"SUCCESS\",\"command\":{\"data\":{\"groups\":",
+                "[{\"name\":\"Gemini Models\",\"buckets\":[{\"window\":\"5h\",",
+                "\"remaining_fraction\":0.75,\"reset_time\":\"2026-11-26T18:00:00Z\"}]}]}}}\\n'\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = probe_antigravity(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].short_label.as_deref(), Some("5h"));
+        assert!((report.windows[0].used_percent - 25.0).abs() < 1e-6);
+
+        let unauth = parse_antigravity_quota(
+            r#"{"status":"ERROR","error":{"message":"Not signed in: run agy login"}}"#,
+            false,
+        );
+        assert_eq!(unauth.status, QuotaStatus::Unavailable);
+        assert!(unauth.message.unwrap().contains("agy login"));
+
+        let server_err =
+            parse_antigravity_quota(r#"{"status":"ERROR","message":"backend down"}"#, false);
+        assert_eq!(server_err.status, QuotaStatus::Error);
+        assert_eq!(server_err.message.as_deref(), Some("backend down"));
+
+        let unreadable_fail = parse_antigravity_quota("", false);
+        assert_eq!(unreadable_fail.status, QuotaStatus::Unavailable);
+        let unreadable_ok = parse_antigravity_quota("not json", true);
+        assert_eq!(unreadable_ok.status, QuotaStatus::Error);
+
+        // JSONL stream with an init event before the usage reply and trailing warning text.
+        let jsonl = concat!(
+            r#"{"type":"init","session":"s1"}"#,
+            "\n",
+            r#"{"status":"SUCCESS","command":{"data":{"groups":[{"name":"Gemini Models","buckets":[{"window":"weekly","remaining_fraction":0.5}]}]}}}"#,
+            "\ntrailing cleanup note\n",
+        );
+        let from_jsonl = parse_antigravity_quota(jsonl, true);
+        assert_eq!(from_jsonl.status, QuotaStatus::Ok);
+        assert!((from_jsonl.windows[0].used_percent - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn probe_grok_talks_json_rpc_over_stdio_and_skips_noise_and_requests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("grok-agent-stdio");
+        let script = dir.path().join("grok");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" != \"agent\" ] || [ \"$2\" != \"stdio\" ]; then exit 2; fi\n",
+                "case \"$PWD\" in *postil-quota) ;; *) exit 3 ;; esac\n",
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"initialize\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1},\"error\":null}\\n'\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"fs/read_text_file\",\"params\":{}}\\n'\n",
+                "      printf '%020000d\\n' 0\n",
+                "      ;;\n",
+                "    *'\"method\":\"_x.ai/billing\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"config\":",
+                "{\"creditUsagePercent\":27.5,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_DAILY\",",
+                "\"end\":\"2026-12-01T00:00:00Z\"}},\"subscription_tier\":\"SuperGrok\"}}\\n'\n",
+                "      ;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = probe_grok(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Ok, "{report:?}");
+        assert_eq!(report.plan.as_deref(), Some("SuperGrok"));
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].label, "Daily window");
+        assert!((report.windows[0].used_percent - 27.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn probe_grok_handles_init_refusal_and_fast_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::testing::TempDir::new("grok-init-err");
+        let script = dir.path().join("grok");
+        fs::write(
+            &script,
+            "#!/bin/sh\nread -r _\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"   \"}}\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let report = probe_grok(dir.path().as_os_str());
+        assert_eq!(report.status, QuotaStatus::Error);
+        assert_eq!(
+            report.message.as_deref(),
+            Some("grok agent stdio refused initialize")
+        );
+
+        // Immediate exit closes stdin before or during write (`BrokenPipe` safe) -> Unavailable.
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let fast = probe_grok(dir.path().as_os_str());
+        assert_eq!(fast.status, QuotaStatus::Unavailable);
+        assert_eq!(
+            fast.message.as_deref(),
+            Some("Grok did not return billing data")
+        );
     }
 }

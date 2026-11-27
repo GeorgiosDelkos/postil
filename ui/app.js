@@ -27,6 +27,7 @@ import { settingsDialog } from "./settings-dialog.js";
 import { codeMetrics, formatSlot } from "./settings.js";
 import { reportOf, reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
+import { usageBar } from "./usage-bar.js";
 import { usageDialog } from "./usage-dialog.js";
 import { welcomeScreen } from "./welcome.js";
 import { wizardDialog } from "./wizard-dialog.js";
@@ -190,6 +191,7 @@ const tray = notesTray({
   notesEl,
   runs,
   menu,
+  quotaBadge: (name) => liveQuotas.inlineBadge(name),
   openNote: (id) => noteDetail.open(id),
   drawNoteDetail: () => noteDetail.draw(),
   deleteNote,
@@ -330,7 +332,10 @@ const welcome = welcomeScreen({
   codeEl,
   guardDraft,
   leaveFocus,
-  beforeSwitch: () => files.dropPendingSave(),
+  beforeSwitch: () => {
+    liveQuotas.closePopover();
+    files.dropPendingSave();
+  },
 });
 
 // ---- Notes --------------------------------------------------------------------------------
@@ -556,6 +561,9 @@ function followRun(run, previous, { liveEnded } = {}) {
     !fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run));
   if (moved || liveEnded) {
     refresh().catch((error) => showToast(String(error)));
+    if (["ended", "cancelled", "failed"].includes(run.status) && previous.status !== run.status) {
+      liveQuotas.refresh({ force: true });
+    }
   } else if (
     !run.problem &&
     // A follow-up marks no note sent, so it is not waited for.
@@ -736,6 +744,7 @@ window.addEventListener("focus", () => {
   // Before `refresh`, whose `forget` drops the threads read: the engineer may have merged a
   // pull request on GitHub while away.
   runs.checkPullRequests();
+  liveQuotas.refresh();
   refresh().catch((error) => notesEl.replaceChildren(el("div", "empty", String(error))));
 });
 
@@ -780,12 +789,14 @@ function showRepo(repo) {
 window.postil = {
   openFolder: (path) => {
     menu.close();
+    liveQuotas.closePopover();
     welcome.requestProject("api/open", path);
   },
   menu: (command) => {
     // A click in the menu bar reaches the page as no event at all, so nothing else closes
     // the right-click menu: it would stay drawn over the welcome screen or the filter.
     menu.close();
+    liveQuotas.closePopover();
     if (command === "open-folder") welcome.chooseFolder();
     else if (command === "switch-project") welcome.show();
     else if (command === "go-to-file") goToFile();
@@ -818,6 +829,7 @@ function toggleFocus() {
     return;
   }
   // The send step's ticks live in the tray, which focus mode hides: it closes first.
+  liveQuotas.closePopover();
   tray.closeSend();
   movePanes(() => document.body.classList.add("focus-mode"));
   drawMapMode();
@@ -975,14 +987,23 @@ function applySettings(settings) {
     window.ipc.postMessage(`theme:${settings.theme}`);
   }
   appliedTheme = settings.theme;
+  liveQuotas.setSettings(settings);
   tray.renderSendBar();
   // Another Analyzer may start the forced update a missing one held back.
   if (state.projectOpen) void map.check().catch((error) => showToast(String(error)));
 }
 
+const liveQuotas = usageBar({
+  stripEl: $("quota-strip"),
+  popoverEl: $("quota-popover"),
+  warnDotEl: $("usage-warn-dot"),
+  openUsage: () => usage.open(),
+});
+
 const settings = settingsDialog($("settings"), {
   apply: applySettings,
   openWizard: () => wizard.open(),
+  quotaBadge: (name) => liveQuotas.inlineBadge(name),
 });
 const wizard = wizardDialog($("wizard"), {
   apply: applySettings,
@@ -990,8 +1011,10 @@ const wizard = wizardDialog($("wizard"), {
   openFolder: () => welcome.chooseFolder(),
   canOpenFolder: () => !state.projectOpen,
   openSettings: () => settings.open(),
+  quotaBadge: (name) => liveQuotas.inlineBadge(name),
 });
 $("open-settings").addEventListener("click", () => {
+  liveQuotas.closePopover();
   wizard.close();
   settings.open();
 });
@@ -1001,14 +1024,14 @@ const usage = usageDialog($("usage"), {
     $("usage").close();
     settings.open();
   },
-  onTone: (tone) => {
-    const dot = $("usage-warn-dot");
-    dot.hidden = tone === null;
-    dot.classList.toggle("is-critical", tone === "critical");
-    dot.classList.toggle("is-warn", tone === "warn");
-  },
+  onView: (view) => liveQuotas.syncView(view),
 });
-$("open-usage").addEventListener("click", () => usage.open());
+$("usage").addEventListener("close", () => liveQuotas.refresh());
+$("open-usage").addEventListener("click", () => {
+  liveQuotas.closePopover();
+  usage.open();
+});
+$("repo-name").addEventListener("click", () => liveQuotas.closePopover());
 
 async function start() {
   // The icons load beside the repository, not before it: the tree can draw without them.
@@ -1027,6 +1050,7 @@ async function start() {
   const repo = await response.json();
   if (repo === null) {
     welcome.show();
+    liveQuotas.start();
     if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });
     return;
   }
@@ -1044,6 +1068,7 @@ async function start() {
     await runBench(state.repo.bench, { code, codeEl });
     return;
   }
+  liveQuotas.start();
   // Commits made while Postil was closed are checked once it opens.
   void map.check().catch((error) => showToast(String(error)));
   if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });

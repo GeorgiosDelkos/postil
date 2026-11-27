@@ -22,7 +22,7 @@ use crate::acp::wire::{
     NewSessionResult, Notification, Outcome, PermissionOption, PermissionOutcome, PermissionParams,
     PermissionResult, PromptParams, PromptResult, PromptUsage, Request, Response, RpcError,
     SessionUpdate, SetConfigOptionParams, SetConfigOptionResult, StopReason, ToolCallUpdate,
-    UpdateParams,
+    UpdateParams, UsageCost,
 };
 use crate::agents;
 use crate::error::{Error, Result};
@@ -113,11 +113,12 @@ pub(crate) struct QuestionRequest {
 
 /// How a turn ended.
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) enum TurnEnd {
     Stopped {
         reason: StopReason,
         usage: Option<PromptUsage>,
+        cost: Option<UsageCost>,
     },
     /// The agent answered the prompt with an error, or with a reply the app cannot read.
     Failed(String),
@@ -898,7 +899,8 @@ impl<F: FnMut(Event)> Reader<F> {
                     Ok(result) => match serde_json::from_value::<PromptResult>(result) {
                         Ok(result) => TurnEnd::Stopped {
                             reason: result.stop_reason,
-                            usage: result.usage,
+                            usage: result.token_usage(),
+                            cost: result.turn_cost(),
                         },
                         Err(error) => {
                             TurnEnd::Failed(format!("unreadable reply to the prompt: {error}"))
@@ -1287,6 +1289,7 @@ mod tests {
         let Event::TurnEnded(TurnEnd::Stopped {
             reason: StopReason::EndTurn,
             usage: Some(usage),
+            cost: None,
         }) = next(events)
         else {
             panic!("expected end_turn with usage");
@@ -1465,6 +1468,7 @@ mod tests {
             Event::TurnEnded(TurnEnd::Stopped {
                 reason: StopReason::Cancelled,
                 usage: None,
+                cost: None,
             })
         );
         assert!(matches!(
@@ -1496,6 +1500,7 @@ mod tests {
             Event::TurnEnded(TurnEnd::Stopped {
                 reason: StopReason::EndTurn,
                 usage: None,
+                cost: None,
             })
         );
     }

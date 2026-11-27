@@ -97,7 +97,7 @@ const EXTENSIONS = new Map([
 const AGENT_LOGOS = new Map([
   ["Claude", "agent-claude"],
   ["Codex", "agent-codex"],
-  ["Gemini", "agent-gemini"],
+  ["Antigravity", "agent-antigravity"],
   ["Grok", "agent-grok"],
   ["OpenCode", "agent-opencode"],
 ]);

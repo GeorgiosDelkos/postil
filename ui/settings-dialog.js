@@ -47,7 +47,7 @@ import {
 // `apply` is called with the settings in effect whenever they change (and once on opening),
 // so the page can follow them. `openWizard` opens the startup wizard. Closing gives the focus
 // back to where it was when the dialog opened, as `<dialog>` does: a note being written keeps it.
-export function settingsDialog(dialogEl, { apply, openWizard }) {
+export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
   // The menu of agents that "+ Add reviewer" opens.
   const agentMenu = dialogMenu(dialogEl);
   const ui = {
@@ -447,6 +447,7 @@ export function settingsDialog(dialogEl, { apply, openWizard }) {
     const control = reviewerControls(ui.view.settings, models.models, {
       disabled: locked(),
       menu: agentMenu,
+      quotaBadge,
       onMove: (index, step) => {
         // The focus follows the reviewer it moved, so pressing again keeps moving it.
         ui.focusNext = `${step < 0 ? "up" : "down"}-${index + step}`;

@@ -15,7 +15,7 @@ import {
   wizardSummary,
 } from "./wizard.js";
 
-const BUILT_IN = ["Claude", "Codex", "Gemini", "Grok", "OpenCode"];
+const BUILT_IN = ["Claude", "Codex", "Antigravity", "Grok", "OpenCode"];
 
 function defaults() {
   return {
@@ -43,7 +43,7 @@ function scannedAgents() {
       found: "/usr/local/bin/claude",
     },
     { name: "Codex", command: "npx -y @zed-industries/codex-acp", builtIn: true, found: null },
-    { name: "Gemini", command: "agy acp", builtIn: true, found: "/Users/me/.local/bin/agy" },
+    { name: "Antigravity", command: "agy acp", builtIn: true, found: "/Users/me/.local/bin/agy" },
     { name: "Grok", command: "grok agent stdio", builtIn: true, found: null },
     { name: "OpenCode", command: "opencode acp", builtIn: true, found: null },
   ];
@@ -57,11 +57,11 @@ test("step clamping stays inside the wizard's steps", () => {
 
 test("first-run defaults enable every found built-in agent and pick the first as default", () => {
   const next = applyDetectedDefaults(defaults(), scannedAgents());
-  assert.deepEqual(next.enabledAgents, ["Claude", "Gemini"]);
+  assert.deepEqual(next.enabledAgents, ["Claude", "Antigravity"]);
   assert.deepEqual(next.agent, slot("Claude"));
 
   // Does not overwrite choices once an agent is already enabled or selected.
-  const custom = { ...defaults(), enabledAgents: ["Gemini"], agent: slot("Gemini") };
+  const custom = { ...defaults(), enabledAgents: ["Antigravity"], agent: slot("Antigravity") };
   assert.equal(applyDetectedDefaults(custom, scannedAgents()), custom);
 
   // Leaves the draft unchanged when no built-in agent is found.
@@ -88,33 +88,33 @@ test("toggling an agent in the wizard reconciles the default agent and reviewers
   assert.deepEqual(draft.enabledAgents, ["Claude"]);
   assert.deepEqual(draft.agent, slot("Claude"), "first enabled agent becomes default");
 
-  draft = toggleWizardAgent(draft, "Gemini", true);
-  assert.deepEqual(draft.enabledAgents, ["Claude", "Gemini"]);
+  draft = toggleWizardAgent(draft, "Antigravity", true);
+  assert.deepEqual(draft.enabledAgents, ["Claude", "Antigravity"]);
   assert.deepEqual(draft.agent, slot("Claude"), "existing default is preserved");
 
   draft = {
     ...draft,
     agent: slot("Claude", "opus"),
-    analyzer: slot("Gemini", "gemini-4-carbon"),
-    reviewers: [slot("Claude"), slot("Gemini", "gemini-4-neon"), slot("Claude", "haiku")],
+    analyzer: slot("Antigravity", "gemini-4-carbon"),
+    reviewers: [slot("Claude"), slot("Antigravity", "gemini-4-neon"), slot("Claude", "haiku")],
   };
-  const analyzerOff = toggleWizardAgent(draft, "Gemini", false);
+  const analyzerOff = toggleWizardAgent(draft, "Antigravity", false);
   assert.equal(analyzerOff.analyzer, null, "analyses go to the default agent then");
   draft = toggleWizardAgent(draft, "Claude", false);
-  assert.deepEqual(draft.analyzer, slot("Gemini", "gemini-4-carbon"), "another's stays");
-  assert.deepEqual(draft.enabledAgents, ["Gemini"]);
+  assert.deepEqual(draft.analyzer, slot("Antigravity", "gemini-4-carbon"), "another's stays");
+  assert.deepEqual(draft.enabledAgents, ["Antigravity"]);
   assert.deepEqual(
     draft.agent,
-    slot("Gemini"),
+    slot("Antigravity"),
     "default falls back to the next enabled agent, on its own default model",
   );
   assert.deepEqual(
     draft.reviewers,
-    [slot("Gemini", "gemini-4-neon")],
+    [slot("Antigravity", "gemini-4-neon")],
     "disabled agent is removed from reviewers, the others keep their models",
   );
 
-  draft = toggleWizardAgent(draft, "Gemini", false);
+  draft = toggleWizardAgent(draft, "Antigravity", false);
   assert.deepEqual(draft.enabledAgents, []);
   assert.equal(draft.agent, null);
   assert.deepEqual(draft.reviewers, []);
@@ -177,14 +177,21 @@ test("wizardAgentRows merges unsaved custom agents and marks them pending PATH c
 test("npxWarning fires only when an enabled agent uses npx and npx is missing", () => {
   const agents = scannedAgents();
   const withClaude = { ...defaults(), enabledAgents: ["Claude"], agent: slot("Claude") };
-  const withGemini = { ...defaults(), enabledAgents: ["Gemini"], agent: slot("Gemini") };
+  const withAntigravity = {
+    ...defaults(),
+    enabledAgents: ["Antigravity"],
+    agent: slot("Antigravity"),
+  };
   const withBoth = { ...defaults(), enabledAgents: ["Claude", "Codex"], agent: slot("Claude") };
 
   assert.equal(
     npxWarning(withClaude, agents, { git: "/usr/bin/git", npx: "/usr/bin/npx", gh: null }),
     null,
   );
-  assert.equal(npxWarning(withGemini, agents, { git: "/usr/bin/git", npx: null, gh: null }), null);
+  assert.equal(
+    npxWarning(withAntigravity, agents, { git: "/usr/bin/git", npx: null, gh: null }),
+    null,
+  );
   assert.match(
     npxWarning(withClaude, agents, { git: "/usr/bin/git", npx: null, gh: null }),
     /Claude uses npx.*start it\./,
@@ -203,21 +210,21 @@ test("wizardSummary and readinessItems describe the chosen settings and tools", 
     codeFontSize: 15,
     tabWidth: 2,
     reopenLastProject: true,
-    enabledAgents: ["Claude", "Gemini"],
+    enabledAgents: ["Claude", "Antigravity"],
     agent: slot("Claude", "opus"),
-    reviewers: [slot("Gemini", "gemini-4-neon"), slot("Claude")],
+    reviewers: [slot("Antigravity", "gemini-4-neon"), slot("Claude")],
   };
-  // Claude reported its models; Gemini's probe is still running, so its id stands.
+  // Claude reported its models; Antigravity's probe is still running, so its id stands.
   const models = {
     Claude: { status: "ready", current: "opus", options: [{ value: "opus", name: "Opus 5.5" }] },
-    Gemini: { status: "loading" },
+    Antigravity: { status: "loading" },
   };
   assert.deepEqual(
     wizardSummary(draft, models).map((item) => [item.label, item.value]),
     [
-      ["Enabled agents", "Claude, Gemini"],
+      ["Enabled agents", "Claude, Antigravity"],
       ["Send notes to", "Claude · Opus 5.5"],
-      ["Reviewers", "Gemini · gemini-4-neon → Claude"],
+      ["Reviewers", "Antigravity · gemini-4-neon → Claude"],
       ["Appearance", "Dark · 15 px · 2-space tabs"],
       ["Startup", "Reopen the last project"],
     ],

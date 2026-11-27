@@ -388,7 +388,7 @@ export function customAgentForm(form, { onSubmit, onCancel }) {
 export function reviewerControls(
   settings,
   models,
-  { disabled = false, menu, onMove, onRemove, onAdd, onModel },
+  { disabled = false, menu, quotaBadge, onMove, onRemove, onAdd, onModel },
 ) {
   const list = el("ol", "reviewer-list");
   settings.reviewers.forEach((slot, index) => {
@@ -429,7 +429,7 @@ export function reviewerControls(
   });
 
   const card = el("div", "slot-card");
-  card.append(list, addReviewerRow(settings.enabledAgents, { disabled, menu, onAdd }));
+  card.append(list, addReviewerRow(settings.enabledAgents, { disabled, menu, quotaBadge, onAdd }));
   const control = el("div", "reviewers");
   if (!settings.reviewers.length) {
     const none = "No review: the agent's work comes straight back to you.";
@@ -442,12 +442,13 @@ export function reviewerControls(
 // The last row of the reviewers' card: "+ Add reviewer", which opens `menu` under itself on
 // the `enabled` agents, each with its logo; `onAdd` gets the one chosen. With no agent turned
 // on it is disabled, and its tooltip says why.
-function addReviewerRow(enabled, { disabled, menu, onAdd }) {
+function addReviewerRow(enabled, { disabled, menu, quotaBadge, onAdd }) {
   const add = controlButton("", "reviewer-add", () => {
     const { left, bottom } = add.getBoundingClientRect();
     const actions = enabled.map((name) => ({
       label: name,
       icon: agentLogoIcon(name),
+      badge: quotaBadge?.(name) ?? null,
       run: () => onAdd(name),
     }));
     menu.open(left, bottom + 4, actions);

@@ -531,7 +531,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
     }
     let unreadable =
         |error: serde_json::Error| format!("{shown} is not valid settings JSON: {error}");
-    let stored: SettingsFile<RawSettings> = if version == Some(V1) {
+    let mut stored: SettingsFile<RawSettings> = if version == Some(V1) {
         let mut value: Value = serde_json::from_str(json).map_err(unreadable)?;
         upgrade_v1(&mut value);
         serde_json::from_value(value).map_err(unreadable)?
@@ -539,8 +539,45 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
         // Read from the text, not through a `Value`, so serde's message names the line.
         serde_json::from_str(json).map_err(unreadable)?
     };
+    stored.settings.upgrade_legacy_agent_names();
     Settings::try_from(stored.settings)
         .map_err(|problem| format!("{shown} breaks a rule: {problem}"))
+}
+
+impl RawSettings {
+    /// Renames the built-in `"Gemini"` slot name (used before the `agy` catalog entry took its
+    /// own name `"Antigravity"`) when no custom agent claims `"Gemini"` or `"Antigravity"`.
+    fn upgrade_legacy_agent_names(&mut self) {
+        let custom_clash = self.custom_agents.iter().any(|agent| {
+            agent.name.eq_ignore_ascii_case("Gemini")
+                || agent.name.eq_ignore_ascii_case("Antigravity")
+        });
+        if custom_clash {
+            return;
+        }
+        let mut upgraded = Vec::with_capacity(self.enabled_agents.len());
+        for name in self.enabled_agents.drain(..) {
+            let mapped = if name == "Gemini" {
+                "Antigravity".to_owned()
+            } else {
+                name
+            };
+            if !upgraded.contains(&mapped) {
+                upgraded.push(mapped);
+            }
+        }
+        self.enabled_agents = upgraded;
+        let slots = self
+            .agent
+            .iter_mut()
+            .chain(self.analyzer.iter_mut())
+            .chain(self.reviewers.iter_mut());
+        for slot in slots {
+            if slot.name == "Gemini" {
+                "Antigravity".clone_into(&mut slot.name);
+            }
+        }
+    }
 }
 
 /// Rewrites a version 1 file, as parsed, into version 2's shape, which version 4 reads: the
@@ -684,5 +721,68 @@ mod tests {
 }
 "#;
         assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+    }
+
+    #[test]
+    fn legacy_gemini_slots_in_settings_file_upgrade_to_antigravity_unless_custom() {
+        let dir = crate::testing::TempDir::new("settings-legacy-gemini");
+        let file = dir.path().join("settings.json");
+        fs::write(
+            &file,
+            r#"{
+                "version": 2,
+                "settings": {
+                    "enabledAgents": ["Claude", "Gemini"],
+                    "agent": { "name": "Gemini", "model": "gemini-4-neon" },
+                    "reviewers": [{ "name": "Gemini", "model": null }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded = load(&file);
+        assert!(loaded.problem.is_none(), "{loaded:?}");
+        assert!(loaded.settings.is_enabled("Antigravity"));
+        assert!(!loaded.settings.is_enabled("Gemini"));
+        assert_eq!(loaded.settings.default_agent().unwrap().name, "Antigravity");
+        assert_eq!(
+            loaded.settings.reviewer_choices().unwrap()[0].name,
+            "Antigravity"
+        );
+
+        // The analyzer slot, new in version 4, is renamed too: left as "Gemini" it would name
+        // an agent that is no longer enabled, and the file would fail to load.
+        fs::write(
+            &file,
+            r#"{
+                "version": 4,
+                "settings": {
+                    "enabledAgents": ["Claude", "Gemini"],
+                    "agent": { "name": "Claude", "model": null },
+                    "analyzer": { "name": "Gemini", "model": "gemini-4-carbon" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let analyzer = load(&file);
+        assert!(analyzer.problem.is_none(), "{analyzer:?}");
+        assert_eq!(analyzer.settings.analyzer().unwrap().name, "Antigravity");
+
+        // A user-defined custom agent named "Gemini" keeps its own name untouched.
+        fs::write(
+            &file,
+            r#"{
+                "version": 2,
+                "settings": {
+                    "customAgents": [{ "name": "Gemini", "command": "my-gemini --acp" }],
+                    "enabledAgents": ["Gemini"],
+                    "agent": { "name": "Gemini", "model": null }
+                }
+            }"#,
+        )
+        .unwrap();
+        let custom = load(&file);
+        assert!(custom.problem.is_none(), "{custom:?}");
+        assert!(custom.settings.is_enabled("Gemini"));
+        assert_eq!(custom.settings.default_agent().unwrap().name, "Gemini");
     }
 }

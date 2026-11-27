@@ -27,6 +27,7 @@ export function notesTray({
   notesEl,
   runs,
   menu,
+  quotaBadge,
   openNote,
   drawNoteDetail,
   deleteNote,
@@ -449,6 +450,7 @@ export function notesTray({
     const actions = agents.map((name) => ({
       label: name,
       icon: agentLogoIcon(name),
+      badge: quotaBadge?.(name) ?? null,
       detail: name === state.settings.agent?.name ? "default" : "",
       key: name === chosenAgent() ? "✓" : "",
       run: () => {

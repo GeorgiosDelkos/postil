@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  compactQuotaWindows,
   formatCost,
   formatCredits,
   formatDuration,
@@ -9,10 +10,13 @@ import {
   formatReset,
   formatTokens,
   highestQuotaTone,
+  inlineQuotaText,
   quotaTone,
   summaryItems,
+  tightestQuotaWindow,
   tokenBreakdownTitle,
   usageUrl,
+  visibleQuotaAgents,
 } from "./usage.js";
 
 test("formatTokens compacts counts cleanly", () => {
@@ -94,4 +98,42 @@ test("summaryItems, usageUrl, and tokenBreakdownTitle format view metadata", () 
   ]);
   assert.equal(usageUrl("api/usage", "project", "7d"), "api/usage?scope=project&range=7d");
   assert.ok(tokenBreakdownTitle({ inputTokens: 120, outputTokens: 30 }).includes("Input:"));
+});
+
+test("compactQuotaWindows, inlineQuotaText, tightestQuotaWindow, and visibleQuotaAgents", () => {
+  const quota = {
+    status: "ok",
+    windows: [
+      { label: "Gemini models (5h)", shortLabel: "5h", usedPercent: 35.3 },
+      { label: "Gemini models (weekly)", shortLabel: "wk", usedPercent: 81.2 },
+      { label: "Claude & GPT (5h)", usedPercent: 0 },
+    ],
+  };
+  const compact = compactQuotaWindows(quota);
+  assert.equal(compact.length, 2);
+  assert.equal(inlineQuotaText(quota), "5h 35% · wk 81%");
+  assert.equal(tightestQuotaWindow(quota).label, "wk");
+  assert.equal(tightestQuotaWindow(quota).tone, "warn");
+
+  const creditsOnly = {
+    status: "ok",
+    windows: [],
+    credits: { used: 12.5, limit: 50, currency: "USD" },
+  };
+  assert.equal(inlineQuotaText(creditsOnly), "$12.50 / $50.00");
+  assert.equal(inlineQuotaText({ status: "unavailable", windows: [] }), "");
+
+  const agents = [
+    { name: "Claude", builtIn: true, found: "/bin/claude" },
+    { name: "Antigravity", builtIn: true, found: "/bin/agy" },
+    { name: "Custom", builtIn: false, found: "/bin/custom" },
+  ];
+  assert.deepEqual(
+    visibleQuotaAgents(agents, ["Antigravity"]).map((a) => a.name),
+    ["Antigravity"],
+  );
+  assert.deepEqual(
+    visibleQuotaAgents(agents, []).map((a) => a.name),
+    ["Claude", "Antigravity"],
+  );
 });

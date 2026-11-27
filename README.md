@@ -135,13 +135,13 @@ dry run with no release.
 Postil talks to any agent that speaks ACP over stdio. It detects these on the `PATH` and lists
 them in Settings (`Cmd-,`):
 
-| Agent    | Command it runs                                   |
-| -------- | ------------------------------------------------- |
-| Claude   | `npx -y @agentclientprotocol/claude-agent-acp`    |
-| Codex    | `npx -y @zed-industries/codex-acp`                |
-| Gemini   | `agy acp` (the Antigravity CLI)                   |
-| Grok     | `grok agent stdio`                                |
-| OpenCode | `opencode acp`                                    |
+| Agent       | Command it runs                                |
+| ----------- | ---------------------------------------------- |
+| Claude      | `npx -y @agentclientprotocol/claude-agent-acp` |
+| Codex       | `npx -y @zed-industries/codex-acp`             |
+| Antigravity | `agy acp`                                      |
+| Grok        | `grok agent stdio`                             |
+| OpenCode    | `opencode acp`                                 |
 
 You can add any other agent by name and command in Settings. Settings also choose the agent
 notes go to by default and the reviewers, in order, for a review, each with a model picked from

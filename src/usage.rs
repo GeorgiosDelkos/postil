@@ -1,15 +1,19 @@
 //! Usage statistics for autodetected and custom coding agents.
 //!
-//! Combines two complementary sources:
+//! Combines three complementary sources:
 //! - [`ledger`]: Postil's durable append-only ledger (`<config dir>/usage.jsonl`), recording
 //!   every completed run across projects with its agent, model, token counts, cost, and
 //!   duration so deleting notes never erases history;
+//! - [`scanner`]: read-only background scan of local CLI session transcripts (`~/.claude`,
+//!   `~/.codex`, `~/.grok`, `~/.gemini/antigravity-cli`), deduplicated against Postil's own
+//!   worktrees so terminal and IDE runs appear alongside Postil runs;
 //! - [`quota`]: on-demand background probes for live provider account quotas and rate-limit
-//!   windows (Claude and Codex, and graceful fallback for others), cached briefly in
-//!   memory so an idle window does zero work.
+//!   windows (`Claude`, `Codex`, `Antigravity`, and `Grok`, with graceful fallback for others),
+//!   cached briefly in memory so an idle window does zero work.
 
 pub(crate) mod ledger;
 pub(crate) mod quota;
+pub(crate) mod scanner;
 
 use std::time::SystemTime;
 

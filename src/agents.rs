@@ -33,9 +33,9 @@ pub(crate) struct BuiltIn {
 
 /// The catalog. Each command was checked against the tool's own `--help` on 2026-11-22 where
 /// the tool was at hand (Grok `agent stdio`); Claude and Codex speak ACP through the adapters
-/// docs/design.md names, and OpenCode through its `acp` command. Gemini runs through the
-/// Antigravity CLI, `agy`, whose `acp` subcommand answered `initialize` and `session/new` on
-/// 2026-11-26 (agy 1.5.18); the older `gemini` CLI is not used. The ACP milestone confirms
+/// docs/design.md names, and OpenCode through its `acp` command. Antigravity runs through its
+/// CLI, `agy`, whose `acp` subcommand answered `initialize` and `session/new` on 2026-11-26
+/// (agy 1.5.18); the older `gemini` CLI is not used. The ACP milestone confirms
 /// each one end to end. Cursor's CLI has no ACP mode, so it is not listed; a custom agent
 /// covers it if it gains one.
 pub(crate) const BUILT_IN: [BuiltIn; 5] = [
@@ -50,7 +50,7 @@ pub(crate) const BUILT_IN: [BuiltIn; 5] = [
         command: "npx -y @zed-industries/codex-acp",
     },
     BuiltIn {
-        name: "Gemini",
+        name: "Antigravity",
         program: "agy",
         command: "agy acp",
     },

@@ -1,7 +1,8 @@
 // The context menu: right-click on the code opens actions for the selected lines, right-click
 // on a row of the file list opens a note on its file or folder, and the send bar's agent
-// picker opens one too. Each action is `{ label, run, icon?, detail?, key?,
-// matches?(event), disabled?, separated? }`; `icon` is an element drawn before the label.
+// picker opens one too. Each action is `{ label, run, icon?, badge?, detail?, key?,
+// matches?(event), disabled?, separated? }`; `icon` is an element drawn before the label, and
+// `badge` an optional element (such as inline quota meters) drawn after it.
 
 import { el, showToast } from "./dom.js";
 
@@ -35,6 +36,7 @@ export function contextMenu({ menuEl, codeEl }) {
       if (action.icon) item.append(action.icon);
       else if (iconed) item.append(el("span", "menu-icon-slot"));
       item.append(el("span", "menu-label", action.label));
+      if (action.badge) item.append(action.badge);
       if (action.detail) item.append(el("span", "menu-detail", action.detail));
       if (action.key) item.append(el("kbd", "", action.key));
       item.addEventListener("click", () => runAction(action));
