@@ -28,6 +28,19 @@ const ERROR_FRESH_MS = 60_000;
 const AUTO_REFRESH_COOLDOWN_MS = 60_000;
 const MAX_POLLS = 45;
 
+function noteParagraph(text, isError = false) {
+  const node = el("p", `usage-note${isError ? " is-error" : ""}`);
+  const parts = String(text).split(/(`[^`]+`)/g);
+  for (const part of parts) {
+    if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
+      node.append(el("code", "", part.slice(1, -1)));
+    } else if (part) {
+      node.append(document.createTextNode(part));
+    }
+  }
+  return node;
+}
+
 export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
   const ui = {
     view: null,
@@ -236,11 +249,7 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
           section.append(el("p", "usage-note", "Checking live quota…"));
         } else {
           section.append(
-            el(
-              "p",
-              `usage-note${quota.status === "error" ? " is-error" : ""}`,
-              quota.message ?? "Live quota unavailable",
-            ),
+            noteParagraph(quota.message ?? "Live quota unavailable", quota.status === "error"),
           );
         }
       } else {
@@ -272,7 +281,7 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
         }
         section.append(rows);
         if (quota.status === "error" && quota.message) {
-          section.append(el("p", "usage-note is-error", quota.message));
+          section.append(noteParagraph(quota.message, true));
         }
       }
       list.append(section);
