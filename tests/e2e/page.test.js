@@ -263,16 +263,23 @@ test("a review's finding shows beside its line, unfolds its hunk as eyes, and on
     assert.ok(Date.now() < deadline, `R1 is ${status}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
 
+  // Its changes open before the review, with no finding yet; shown again after it, the same
+  // diff is not read again, but the findings are the review's.
   await page.locator("#tab-run").click();
   await page.locator("#run .run-entry").click();
   const detail = page.locator("#run-detail");
+  await detail.getByRole("button", { name: "Changes" }).click();
+  const changes = page.locator("#changes-view");
+  await changes.locator(".changes-step-number", { hasText: /^Step 1 of 1$/ }).waitFor();
+  assert.equal(await changes.locator(".changes-finding").count(), 0, "no review yet");
+  await api("api/run/review", { method: "POST", body: JSON.stringify({ of: "R1" }) });
+
+  await page.locator("#run .run-entry").click();
   // The run's dialog lists the findings once the page holds the review.
   await detail.locator(".run-card.finding").filter({ hasText: "no test" }).waitFor();
   await detail.getByRole("button", { name: "Changes" }).click();
 
-  const changes = page.locator("#changes-view");
   await changes
     .locator(":scope > .changes-loose .changes-finding", { hasText: "no test" })
     .waitFor();
@@ -2166,4 +2173,177 @@ test("an outdated node is marked, Not on the map lists 20 files of 205, and Upda
   assert.deepEqual(await picker.locator("option").allTextContents(), ["System", "Inside"]);
   await picker.selectOption({ label: "System" });
   await page.locator(".map-crumbs b", { hasText: /^System$/ }).waitFor();
+});
+
+// ---- The change map (docs/review-assist-plan.md, 8.6) -------------------------------------
+
+// The files the fake agent's `change-map` run changes (tests/fake-agent.mjs): old.txt it
+// deletes, big.txt it rewrites whole, line 15 of lib.txt alone; it adds new.txt.
+const numbered = (prefix, count) =>
+  Array.from({ length: count }, (_, index) => `${prefix}${index + 1}\n`).join("");
+const CHANGE_FILES = {
+  "old.txt": "1\n2\n3\n4\n",
+  "big.txt": numbered("b", 150),
+  "lib.txt": numbered("l", 20),
+};
+
+const citeLine = (path, line, snippet) => ({
+  path,
+  target: "lines",
+  lines: { start: line, end: line },
+  snippet,
+});
+const component = (id, label, anchors) => ({
+  id,
+  kind: "component",
+  label,
+  summary: "",
+  detail: "",
+  anchors,
+});
+
+// An Architecture of those files: Changed on lib.txt's changed line, Caller one edge from it
+// on line 1, Far two edges away on line 3, Gone on the deleted file and Rewritten on big.txt.
+const CHANGE_ANALYSIS = {
+  version: 2,
+  diagrams: [
+    {
+      id: "D1",
+      kind: "architecture",
+      title: "System",
+      run: "R1",
+      nodes: [
+        component("D1.1", "Changed", [citeLine("lib.txt", 15, "l15")]),
+        component("D1.2", "Caller", [citeLine("lib.txt", 1, "l1")]),
+        component("D1.3", "Gone", [{ path: "old.txt", target: "file", state: "found" }]),
+        component("D1.4", "Rewritten", [{ path: "big.txt", target: "file", state: "found" }]),
+        component("D1.5", "Far", [citeLine("lib.txt", 3, "l3")]),
+      ],
+      edges: [
+        { from: "D1.2", to: "D1.1", label: "calls" },
+        { from: "D1.5", to: "D1.2", label: "uses" },
+      ],
+    },
+  ],
+};
+
+test("Change map waits for an Architecture, marks what the run touched at its fork, and a click opens its hunk", async (t) => {
+  const { page, api } = await openProject(t, "change-map", "new", { files: CHANGE_FILES });
+  const request = { path: "lib.txt", lines: { start: 1, end: 1 }, snippet: "l1", body: "Do it." };
+  const review = await api("api/notes", { method: "POST", body: JSON.stringify(request) });
+  const notes = review.notes.map((note) => note.id);
+  await api("api/run", { method: "POST", body: JSON.stringify({ notes }) });
+  await page.locator("#tab-run").click();
+  await page.locator("#run .run-entry").click();
+  const detail = page.locator("#run-detail");
+  // The report's check is listed once the run ended with its report.
+  await detail.locator(".run-check code", { hasText: /^cargo test$/ }).waitFor();
+  await detail.locator(".run-detail-changes").waitFor();
+  assert.equal(await detail.locator(".run-detail-change-map").count(), 0, "no analysis, none");
+
+  // The window's focus reads the analysis again, which draws the open dialog again.
+  const refresh = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+  const [architecture] = CHANGE_ANALYSIS.diagrams;
+  await writeAnalysis(api, { version: 2, diagrams: [{ ...architecture, kind: "data" }] });
+  await refresh();
+  const offered = detail.locator(".run-detail-change-map");
+  await detail.locator(".run-detail-change-map:disabled").waitFor();
+  assert.equal(await offered.getAttribute("title"), "The map has no Architecture diagram");
+
+  // The checkout moves on since the thread's fork: lib.txt's lines are 10 further down, where
+  // the run's hunk is not, so only nodes placed at the fork are touched.
+  const { root } = await api("api/repo");
+  const lib = readFileSync(join(root, "lib.txt"), "utf8");
+  writeFileSync(join(root, "lib.txt"), `${"z\n".repeat(10)}${lib}`);
+  await writeAnalysis(api, CHANGE_ANALYSIS);
+  await refresh();
+  await detail.locator(".run-detail-change-map:enabled").click();
+  await detail.waitFor({ state: "hidden" });
+
+  const map = page.locator("#map");
+  const card = (id) => map.locator(`.map-node[data-node-id="${id}"]`);
+  await map.locator('.map-node.touched[data-node-id="D1.1"]').waitFor();
+  const classes = async (id) => (await card(id).getAttribute("class")).split(/\s+/);
+  assert.ok((await classes("D1.3")).includes("touched"), "the node of the deleted file");
+  assert.ok((await classes("D1.4")).includes("touched"), "the node of the rewritten file");
+  assert.ok((await classes("D1.2")).includes("near"), "one edge from Changed");
+  assert.ok(!(await classes("D1.2")).includes("touched"), "line 1 is outside the hunk");
+  const far = await classes("D1.5");
+  assert.ok(!far.includes("near") && !far.includes("touched"), "two edges away");
+  await map.locator(".map-change-label", { hasText: /^Change map · R\d+$/ }).waitFor();
+  await map.locator(".map-counts", { hasText: /· 3 touched$/ }).waitFor();
+  const unmapped = map.locator(".map-unmapped");
+  await unmapped.locator(".map-unmapped-title", { hasText: /^Not on the map · 1$/ }).click();
+  assert.deepEqual(await unmapped.locator(".map-unmapped-file").allTextContents(), ["new.txt"]);
+
+  // The code pane shows the checkout, where lib.txt moved 10 lines down: its line rings the
+  // node cited there, not the one the fork had on that line.
+  await openFile(page, "lib.txt");
+  await row(page, 24).locator(".n").click();
+  await onlyNode(page, "ringed", "D1.1");
+  await row(page, 14).locator(".n").click();
+  await map.locator(".map-node.ringed").waitFor({ state: "detached" });
+  await row(page, 10).locator(".n").click();
+  await onlyNode(page, "ringed", "D1.2");
+
+  // Changed opens the run's changes at lib.txt's hunk, the walkthrough's last step, scrolled
+  // past the long one before it.
+  await card("D1.1").click();
+  const changes = page.locator("#changes-view");
+  const current = changes.locator('.changes-step[aria-current="step"] .changes-step-number');
+  await current.filter({ hasText: /^Step 3 of 3$/ }).waitFor();
+  // The hunk of `path` is wholly in the view: the last one may not reach its top, with too
+  // little below it to scroll that far.
+  const inView = (path) =>
+    page.waitForFunction((wanted) => {
+      const view = document.getElementById("changes-view");
+      const block = view.querySelector(`.changes-hunk-block[data-path="${wanted}"]`);
+      if (!block) return false;
+      const top = block.getBoundingClientRect().top - view.getBoundingClientRect().top;
+      return top >= 0 && top + block.offsetHeight <= view.clientHeight + 1;
+    }, path);
+  await inView("lib.txt");
+  assert.ok(await changes.evaluate((view) => view.scrollTop > 0), "scrolled down to it");
+
+  // Gone opens the deleted file's hunk, which the report rates mechanical: unfolded. The click
+  // on Changed centred it, which in a pane this narrow pans Gone, at the layout's top left,
+  // out of the map's clipped body: 0 fits the diagram again, as an engineer would.
+  await card("D1.3").focus();
+  await page.keyboard.press("0");
+  await page.waitForFunction(() => {
+    const body = document.querySelector("#map .map-body").getBoundingClientRect();
+    const gone = document.querySelector('#map .map-node[data-node-id="D1.3"]');
+    const box = gone.getBoundingClientRect();
+    return box.left >= body.left && box.right <= body.right && box.top >= body.top;
+  });
+  await card("D1.3").click();
+  await current.filter({ hasText: /^Step 1 of 3$/ }).waitFor();
+  const gone = changes.locator('.changes-hunk-block[data-path="old.txt"]');
+  await gone.locator(".changes-line.del").nth(3).waitFor();
+  assert.equal(await gone.locator(".changes-fold").count(), 0, "unfolded");
+  await inView("old.txt");
+
+  // A file not on the map opens at its hunk in the changes: it is not in the checkout.
+  await unmapped.locator(".map-unmapped-file", { hasText: /^new\.txt$/ }).click();
+  await current.filter({ hasText: /^Not in the walkthrough$/ }).waitFor();
+  await inView("new.txt");
+
+  // Escape closes the changes view, then leaves the change map for the repository's map,
+  // where nothing is touched; the line selected in the code stays.
+  await changes.press("Escape");
+  await changes.waitFor({ state: "hidden" });
+  await page.locator("#code").focus();
+  await page.keyboard.press("Escape");
+  await map.locator(".map-change-label").waitFor({ state: "detached" });
+  await card("D1.1").waitFor();
+  assert.equal(await map.locator(".map-node.touched, .map-node.near").count(), 0);
+  assert.equal(await page.locator("#code-rows .ln.selected").count(), 1, "the selection stays");
+
+  // Opened again, its esc button goes back as well.
+  await page.locator("#run .run-entry").click();
+  await detail.locator(".run-detail-change-map:enabled").click();
+  await map.locator('.map-node.touched[data-node-id="D1.1"]').waitFor();
+  await map.locator(".map-change-exit").click();
+  await map.locator(".map-change-label").waitFor({ state: "detached" });
+  assert.equal(await map.locator(".map-node.touched, .map-node.near").count(), 0);
 });

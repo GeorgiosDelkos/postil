@@ -1388,3 +1388,99 @@ fn an_analysis_that_stored_nothing_goes_with_the_next_delete_of_a_note() {
     let (status, thread) = get(&site, &format!("postil://localhost/api/thread?id={id}"));
     assert_eq!((status, thread.as_str()), (StatusCode::OK, "null"));
 }
+
+/// An analysis for [`an_analysis_is_placed_at_a_commit`]: a node on lines, a whole file and a
+/// folder; a node citing the folder as a file and as lines, which a commit's listing of the
+/// folder (`git show <commit>:src/sub`, whose third line is `x.rs`) must not stand in for.
+const AT_COMMIT: &str = r#"{"version": 2, "diagrams": [{
+    "id": "D1", "kind": "architecture", "title": "Top", "run": "R1",
+    "nodes": [
+        {"id": "D1.1", "kind": "component", "label": "A", "summary": "s", "detail": "d",
+         "anchors": [
+            {"path": "src/a.rs", "target": "lines", "lines": {"start": 2, "end": 2},
+             "snippet": "    one();"},
+            {"path": "src/b.rs", "target": "file"},
+            {"path": "src/sub", "target": "folder"}
+         ]},
+        {"id": "D1.2", "kind": "component", "label": "B", "summary": "s", "detail": "d",
+         "anchors": [
+            {"path": "src/sub", "target": "file"},
+            {"path": "src/sub", "target": "lines", "lines": {"start": 3, "end": 3},
+             "snippet": "x.rs"}
+         ]}
+    ],
+    "edges": []
+}]}"#;
+
+#[test]
+fn an_analysis_is_placed_at_a_commit() {
+    let repo = TempRepo::new("analysis-at-commit");
+    let a = "fn a() {\n    one();\n}\n";
+    repo.write("src/a.rs", a);
+    repo.write("src/b.rs", "x\ny\nz\n");
+    repo.write("src/sub/x.rs", "x\n");
+    repo.commit();
+    let fork = git_out(&repo.root, &["rev-parse", "HEAD"]);
+    let tree = git_out(&repo.root, &["rev-parse", "HEAD^{tree}"]);
+    let site = repo.site();
+    let at = |commit: &str| format!("{ANALYSIS}?at={commit}");
+    assert_eq!(
+        get(&site, &at(&fork)),
+        (StatusCode::OK, "null".to_owned()),
+        "no analysis"
+    );
+    // The commit is checked before the analysis file is read: with none there, a bad id is an
+    // error still, not `null`.
+    for bad in ["HEAD", "-n", "", "main%3Asrc"] {
+        assert_eq!(get(&site, &at(bad)).0, StatusCode::BAD_REQUEST, "at={bad}");
+    }
+    let (status, body) = get(&site, &at("0123456789abcdef0123456789abcdef01234567"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+    let file = site.repo().unwrap().analysis_file();
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, AT_COMMIT).unwrap();
+    // The next commit moves the cited line down two and deletes the whole file and the
+    // folder; the working tree moves it down once more.
+    repo.write("src/a.rs", &format!("// one\n// two\n{a}"));
+    fs::remove_file(repo.root.join("src/b.rs")).unwrap();
+    fs::remove_dir_all(repo.root.join("src/sub")).unwrap();
+    repo.commit();
+    let next = git_out(&repo.root, &["rev-parse", "HEAD"]);
+    repo.write("src/a.rs", &format!("// zero\n// one\n// two\n{a}"));
+
+    let at_fork = [
+        "src/a.rs found 2-2",
+        "src/b.rs found",
+        "src/sub found",
+        "src/sub outdated",
+        "src/sub outdated 3-3",
+    ];
+    assert_eq!(anchors(&get_json(&site, &at(&fork))), at_fork);
+    // A snapshot from before threads is a tree, not a commit: placed the same.
+    assert_eq!(anchors(&get_json(&site, &at(&tree))), at_fork);
+    assert_eq!(
+        anchors(&get_json(&site, &at(&next))),
+        [
+            "src/a.rs found 4-4",
+            "src/b.rs outdated",
+            "src/sub outdated",
+            "src/sub outdated",
+            "src/sub outdated 3-3",
+        ]
+    );
+    let now = get_json(&site, ANALYSIS);
+    assert_eq!(
+        anchors(&now)[..3],
+        [
+            "src/a.rs found 5-5",
+            "src/b.rs outdated",
+            "src/sub outdated"
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        AT_COMMIT,
+        "a read never writes"
+    );
+}

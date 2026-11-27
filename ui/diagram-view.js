@@ -23,12 +23,15 @@ import {
   MAX_UPDATE_FILES,
   nodeAtLine,
   nodeState,
+  nodeTouchesHunk,
   notesOn,
   runProblem,
   searchNodes,
+  touched,
   zoomAt,
 } from "./diagram.js";
 import { actOnSecondClick, el } from "./dom.js";
+import { parsePatch } from "./patch.js";
 import { isLive } from "./run.js";
 import { formatSlot } from "./settings.js";
 
@@ -43,6 +46,10 @@ const GLIDE_MS = 160;
 // How much one notch of a pinch zooms: e^(-deltaY / 100). Arbitrary, read by feel on a
 // trackpad.
 const PINCH_RATE = 0.01;
+
+// The most changed files not on the map that the change map lists; it counts them all. As
+// many as the repository's map lists (src/analysis.rs, `MAX_UNMAPPED_SHOWN`).
+const CHANGE_UNMAPPED_SHOWN = 20;
 
 // The kinds a diagram is, as the switcher names them.
 const KINDS = [
@@ -60,6 +67,8 @@ const KINDS = [
 // - `showAnchor(anchor)` shows a code reference in the code pane, and a file not on the map as
 //   a reference to the whole file;
 // - `writeNote(anchor, intent)` writes a note ("change") or asks a question ("ask") on it;
+// - `showChangesAt(from, to, match)` shows what runs `from` to `to` changed, scrolled to the
+//   first hunk `match(file, hunk)` holds (changes-view.js, `show`);
 // - `alone()` says whether the map takes the whole code pane (a narrow window): a click then
 //   opens the node's dialog, whose Show in code gives the pane to the code;
 // - `onChange()` follows a new analysis, another diagram opened, and the map shown or hidden,
@@ -75,6 +84,7 @@ export function diagramView({
   noteCard,
   showAnchor,
   writeNote,
+  showChangesAt,
   alone,
   onChange,
   onError,
@@ -111,7 +121,16 @@ export function diagramView({
     flowOf: null,
     flowProblem: null,
     focusFlow: false,
+    // A run's change map (`showChangeMap`), drawn in place of the repository's map: null, or
+    // `{ status, from, to, error, analysis, touched }`, `status` "loading", "ready" or "error",
+    // `analysis` placed at the run's fork (`GET api/analysis?at=`), and `touched` what the run's
+    // diff touches there (diagram.js, `touched`). `analysis` above stays the checkout's, which
+    // the code's stripes and chips show, and which the code pane's lines are compared with.
+    change: null,
   };
+  // Every change map asked for is numbered, and a reply to an older one, or to one left since,
+  // is dropped.
+  let changeAsked = 0;
   // A node to centre once its diagram is drawn: `revealNode` asked for it while the layout
   // library or the analysis was still loading.
   let pendingCentre = null;
@@ -230,8 +249,13 @@ export function diagramView({
 
   // ---- Choosing the diagram ----------------------------------------------------------------
 
+  // The analysis drawn: a change map's, else the checkout's.
+  function shownAnalysis() {
+    return view.change ? view.change.analysis : view.analysis.data;
+  }
+
   function diagrams() {
-    return view.analysis.data?.diagrams ?? [];
+    return shownAnalysis()?.diagrams ?? [];
   }
 
   // The diagrams the switcher's `kind` shows at the top: those of that kind with no parent.
@@ -242,8 +266,10 @@ export function diagramView({
   // The diagram to draw: the one chosen while it is still there, whose kind the switcher then
   // shows, else the first at the top of the chosen kind, else none: that kind's empty card,
   // which offers to make one.
+  // A change map draws Architecture diagrams only (diagram.js, `touched`).
   function current() {
-    const chosen = diagrams().find((diagram) => diagram.id === view.diagramId);
+    const allowed = (diagram) => !view.change || diagram.kind === "architecture";
+    const chosen = diagrams().find((diagram) => diagram.id === view.diagramId && allowed(diagram));
     if (chosen) {
       view.kind = chosen.kind;
       return chosen;
@@ -253,8 +279,10 @@ export function diagramView({
     return shown;
   }
 
-  // The switcher's `kind`, at its first diagram at the top.
+  // The switcher's `kind`, at its first diagram at the top: of the repository's map, which a
+  // change map gives way to.
   function showKind(kind) {
+    leaveChange();
     view.kind = kind;
     if (kind !== "flow") view.focusFlow = false;
     openDiagram(topOf(kind)[0]?.id ?? null);
@@ -273,15 +301,23 @@ export function diagramView({
 
   function render() {
     if (!view.shown) return;
-    const diagram = view.analysis.status === "ready" ? current() : null;
+    const ready = (view.change ?? view.analysis).status === "ready";
+    const diagram = ready ? current() : null;
     renderHeader(diagram);
     renderTools(diagram);
     renderFlows();
     renderUnmapped(diagram);
     renderStrip();
-    if (view.analysis.status === "loading") return showCard(el("div", "map-card", "Loading…"));
-    if (view.analysis.status === "error") return showCard(errorCard());
-    if (!diagram) return showCard(view.kind === "flow" ? noFlowCard() : emptyCard());
+    if (view.change) {
+      const { status, error } = view.change;
+      if (status === "loading")
+        return showCard(el("div", "map-card", "Reading the run's changes…"));
+      if (status === "error") return showCard(el("div", "map-card map-error", error));
+      if (!diagram) return showCard(el("div", "map-card", "The map has no Architecture diagram."));
+    } else if (view.analysis.status === "loading") {
+      return showCard(el("div", "map-card", "Loading…"));
+    } else if (view.analysis.status === "error") return showCard(errorCard());
+    else if (!diagram) return showCard(view.kind === "flow" ? noFlowCard() : emptyCard());
     if (view.dagre === "failed") return showCard(dagreCard());
     if (view.dagre !== "ready") return showCard(el("div", "map-card", "Loading the map…"));
     drawDiagram(diagram);
@@ -289,8 +325,22 @@ export function diagramView({
 
   function renderHeader(diagram) {
     const crumbs = el("div", "crumbs map-crumbs");
+    // The way back is the header's first item, outside the crumbs: they clip what overflows
+    // them, and a long trail in a narrow map would hide a button among them.
+    const first = [];
+    if (view.change) {
+      const { from, to } = view.change;
+      const run = from === to ? from : `${from} to ${to}`;
+      const back = el("button", "button map-change-exit", "esc");
+      back.type = "button";
+      back.title = "Back to the repository's map";
+      back.addEventListener("click", leaveChangeMap);
+      first.push(back);
+      crumbs.append(el("b", "map-change-label", `Change map · ${run}`));
+      if (diagram) crumbs.append(" › ");
+    }
     if (diagram) {
-      const trail = breadcrumb(view.analysis.data, diagram);
+      const trail = breadcrumb(shownAnalysis(), diagram);
       trail.forEach((step, index) => {
         if (index > 0) crumbs.append(" › ");
         if (index === trail.length - 1) crumbs.append(el("b", "", step.title));
@@ -301,20 +351,24 @@ export function diagramView({
           crumbs.append(up);
         }
       });
-    } else crumbs.append(el("b", "", "Map"));
+    } else if (!view.change) crumbs.append(el("b", "", "Map"));
     const meta = el("div", "meta map-counts");
     if (diagram) {
       const counts = diagramCounts(diagram);
       const words = [`${counts.total} node${counts.total === 1 ? "" : "s"}`];
       if (counts.unverified) words.push(`${counts.unverified} unverified`);
       if (counts.outdated) words.push(`${counts.outdated} outdated`);
+      if (view.change) {
+        const marked = diagram.nodes.filter((node) => view.change.touched.nodes.has(node.id));
+        words.push(`${marked.length} touched`);
+      }
       meta.textContent = words.join(" · ");
       if (counts.dropped) {
         meta.title = counts.dropped;
         meta.append(el("span", "map-dropped", " · some left out"));
       }
     }
-    header.replaceChildren(crumbs, meta);
+    header.replaceChildren(...first, crumbs, meta);
   }
 
   // Whether the analysis can be added to: there is none yet, or one that reads.
@@ -326,7 +380,7 @@ export function diagramView({
   // Architecture, and an empty kind offers to make one. Then, with a diagram drawn, the node
   // search and Update.
   function renderTools(diagram) {
-    tools.hidden = !usable();
+    tools.hidden = !view.change && !usable();
     if (tools.hidden) return;
     const kinds = el("div", "map-kinds");
     kinds.setAttribute("role", "group");
@@ -334,7 +388,8 @@ export function diagramView({
     for (const [kind, name] of KINDS) {
       const button = el("button", "map-kind", name);
       button.type = "button";
-      button.setAttribute("aria-pressed", String(view.kind === kind));
+      // A change map is none of the repository's kinds: each goes back to that map.
+      button.setAttribute("aria-pressed", String(!view.change && view.kind === kind));
       button.addEventListener("click", () => showKind(kind));
       kinds.append(button);
     }
@@ -372,7 +427,9 @@ export function diagramView({
     });
     parts.push(search);
 
-    if (diagramCounts(diagram).outdated > 0 || unmappedOf(diagram)) {
+    // Update changes the repository's map, which a change map is not.
+    const stale = diagramCounts(diagram).outdated > 0 || unmappedOf(diagram);
+    if (!view.change && stale) {
       const update = el("button", "button map-update", "Update");
       update.type = "button";
       update.title =
@@ -389,7 +446,7 @@ export function diagramView({
   // A choice among the diagrams `tops` at the top of the shown kind, the one `diagram` is in
   // selected.
   function topPicker(tops, diagram) {
-    const top = breadcrumb(view.analysis.data, diagram)[0].id;
+    const top = breadcrumb(shownAnalysis(), diagram)[0].id;
     const picker = el("select", "field map-top");
     picker.setAttribute("aria-label", "Diagram at the top");
     for (const each of tops) {
@@ -528,8 +585,15 @@ export function diagramView({
   // ---- Not on the map ----------------------------------------------------------------------
 
   // The files not on `diagram`, a top-level Architecture (src/analysis.rs, `view`):
-  // `{ files, total }`, the first 20 and their count, or null when there are none.
+  // `{ files, total }`, the first 20 and their count, or null when there are none. On a change
+  // map, the files the run changed that no Architecture node covers, whichever is drawn, with
+  // `change` true.
   function unmappedOf(diagram) {
+    if (view.change) {
+      const all = view.change.touched.unmapped;
+      if (!all.length) return null;
+      return { files: all.slice(0, CHANGE_UNMAPPED_SHOWN), total: all.length, change: true };
+    }
     return view.analysis.data?.unmapped?.[diagram.id] ?? null;
   }
 
@@ -539,22 +603,32 @@ export function diagramView({
   function renderUnmapped(diagram) {
     const off = diagram && unmappedOf(diagram);
     unmapped.hidden = !off;
-    const key = off && JSON.stringify(off);
+    // A change map's buttons show its run's changes: another run's, of the same files, are
+    // built again.
+    const key = off && JSON.stringify([off, view.change?.from, view.change?.to]);
     if (!off || key === unmappedShown) return;
     unmappedShown = key;
     const summary = el("summary", "map-unmapped-title", `Not on the map · ${off.total}`);
-    summary.title = "Files added since this diagram's analysis that no node covers";
+    summary.title = off.change
+      ? "Files the run changed that no node covers"
+      : "Files added since this diagram's analysis that no node covers";
     const list = el("div", "map-unmapped-list");
     for (const path of off.files) {
       const file = el("button", "map-unmapped-file", path);
       file.type = "button";
-      file.addEventListener("click", () => showAnchor({ path, target: "file", state: "found" }));
+      // A changed file shows in the run's changes: one the run added may not be in the
+      // checkout until the thread is applied.
+      const { from, to } = view.change ?? {};
+      const show = off.change
+        ? () => showChangesAt(from, to, (changed) => changed.path === path)
+        : () => showAnchor({ path, target: "file", state: "found" });
+      file.addEventListener("click", show);
       list.append(file);
     }
     const parts = [summary, list];
     const more = off.total - off.files.length;
     if (more > 0) parts.push(el("p", "map-unmapped-more", `and ${more} more`));
-    if (off.total > MAX_UPDATE_FILES) {
+    if (!off.change && off.total > MAX_UPDATE_FILES) {
       parts.push(el("p", "map-unmapped-note", `Update sends at most ${MAX_UPDATE_FILES} paths.`));
     }
     unmapped.replaceChildren(...parts);
@@ -735,8 +809,102 @@ export function diagramView({
   // Analyze and Update change what is drawn already.
   function openMade(run) {
     if (run.analysis?.kind !== "deeper" && run.analysis?.kind !== "flow") return;
-    const made = diagrams().find((diagram) => diagram.run === run.id);
-    if (made) openDiagram(made.id);
+    // In the checkout's analysis, which a change map placed earlier does not hold.
+    const made = (view.analysis.data?.diagrams ?? []).find((diagram) => diagram.run === run.id);
+    if (!made) return;
+    leaveChange();
+    openDiagram(made.id);
+  }
+
+  // ---- The change map ----------------------------------------------------------------------
+
+  // Whether the map can show what a run touched (run-dialog.js): "none" with no analysis to
+  // read, "no-architecture" when it has no Architecture diagram, else "ready".
+  function changeMapState() {
+    if (view.analysis.status !== "ready") return "none";
+    const top = (diagram) => diagram.kind === "architecture" && !diagram.parent;
+    return view.analysis.data.diagrams.some(top) ? "ready" : "no-architecture";
+  }
+
+  // Draws what runs `from` to `to` changed on the Architecture, placed where its code was
+  // before the first of them (docs/review-assist-plan.md, 8.6): touched nodes filled, those
+  // one edge away outlined, and the changed files no node covers under "Not on the map".
+  async function showChangeMap(from, to) {
+    const asked = ++changeAsked;
+    // A glide under way pans the diagram this replaces.
+    stopGlide();
+    view.change = {
+      status: "loading",
+      from,
+      to,
+      error: null,
+      analysis: null,
+      touched: null,
+    };
+    view.kind = "architecture";
+    view.selected = null;
+    ensureDagre();
+    render();
+    let read;
+    try {
+      read = await readChange(from, to);
+    } catch (error) {
+      read = { status: "error", error: String(error.message ?? error) };
+    }
+    if (asked !== changeAsked) return;
+    // `render` draws the diagram chosen while it is an Architecture, else the first one.
+    view.change = { ...view.change, ...read };
+    render();
+    onChange();
+  }
+
+  // The change map's state once read: `{ status: "ready", analysis, touched }`, or
+  // `{ status: "error", error }` with the server's reason.
+  async function readChange(from, to) {
+    const query = `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+    const changes = await fetch(`api/run/changes?${query}`);
+    if (!changes.ok) return { status: "error", error: await changes.text() };
+    const { before, patch } = await changes.json();
+    const placed = await fetch(`api/analysis?at=${encodeURIComponent(before)}`);
+    if (!placed.ok) return { status: "error", error: await placed.text() };
+    const analysis = await placed.json();
+    if (!analysis) return { status: "error", error: "There is no analysis to draw the change on." };
+    const files = parsePatch(patch);
+    return { status: "ready", error: null, analysis, touched: touched(analysis, files) };
+  }
+
+  // Leaves the change map for the repository's map, and drops a reply still to come. Returns
+  // whether a change map was shown.
+  function leaveChange() {
+    if (!view.change) return false;
+    view.change = null;
+    changeAsked += 1;
+    return true;
+  }
+
+  // Escape on a change map (app.js): back to the repository's map.
+  function leaveChangeMap() {
+    if (!leaveChange()) return;
+    render();
+    onChange();
+  }
+
+  // `diagram` as the checkout's analysis places it, for what compares it with the code pane,
+  // which shows the files as they are now (`checkoutNode`): the drawn one when there is no
+  // change map, or the checkout's analysis no longer has it.
+  function checkoutDiagram(diagram) {
+    if (!view.change) return diagram;
+    const all = view.analysis.data?.diagrams ?? [];
+    return all.find((each) => each.id === diagram.id) ?? diagram;
+  }
+
+  // "touched" when the change map's run touched node `id`, "near" when it is one edge from one
+  // that is, else null.
+  function changeMark(id) {
+    const marks = view.change?.touched;
+    if (marks?.nodes.has(id)) return "touched";
+    if (marks?.near.has(id)) return "near";
+    return null;
   }
 
   // ---- The diagram -------------------------------------------------------------------------
@@ -794,7 +962,8 @@ export function diagramView({
       view.transforms.set(diagram.id, fitTransform(positioned, viewport()));
     }
     applyTransform();
-    view.codeNode = view.code && nodeAtLine(diagram, view.code.path, view.code.line);
+    const placed = checkoutDiagram(diagram);
+    view.codeNode = view.code && nodeAtLine(placed, view.code.path, view.code.line);
     syncRings();
     centrePending();
   }
@@ -841,11 +1010,13 @@ export function diagramView({
   // was never found.
   function groupBox(box) {
     const group = svgEl("g", `map-group ${nodeState(box.node)}`);
+    const mark = changeMark(box.id);
+    if (mark) group.classList.add(mark);
     const head = svgEl("g", "map-group-head", {
       role: "button",
       tabindex: "0",
       "data-node-id": box.id,
-      "aria-label": `${box.node.label}, boundary`,
+      "aria-label": `${box.node.label}, boundary${mark ? `, ${mark}` : ""}`,
     });
     head.append(svgText("map-group-label", box.x + 12, box.y + 18, box.node.label));
     head.classList.toggle("selected", box.id === view.selected);
@@ -886,9 +1057,11 @@ export function diagramView({
       "data-node-id": node.id,
     });
     const named = step ? `Step ${step}, ${node.label}` : node.label;
+    const mark = changeMark(node.id);
+    if (mark) card.classList.add(mark);
     card.setAttribute(
       "aria-label",
-      `${named}, ${node.kind}${state === "found" ? "" : `, ${state}`}`,
+      `${named}, ${node.kind}${state === "found" ? "" : `, ${state}`}${mark ? `, ${mark}` : ""}`,
     );
     const title = svgEl("title");
     title.textContent = node.summary ? `${node.label}\n${node.summary}` : node.label;
@@ -912,7 +1085,7 @@ export function diagramView({
       svgText("map-node-label", left, 22, shorten(node.label, step ? 21 : 24)),
       svgText("map-node-summary", 12, 40, shorten(sub ?? node.summary, 30)),
     );
-    if (childDiagram(view.analysis.data, node.id)) {
+    if (childDiagram(shownAnalysis(), node.id)) {
       card.append(svgText("map-node-deeper", box.width - 18, 22, "›"));
     }
     card.classList.toggle("selected", node.id === view.selected);
@@ -1054,7 +1227,8 @@ export function diagramView({
 
   // Selects node `id`, glides to it, and focuses its card. With `show`, a click's or Space's,
   // its code is shown, or its dialog opens when none of its code was found or the map takes
-  // the whole pane (`alone`).
+  // the whole pane (`alone`). On a change map, a touched node shows the run's changes at its
+  // first hunk instead.
   function select(id, { show }) {
     if (!drawn) return;
     view.selected = id;
@@ -1063,9 +1237,24 @@ export function diagramView({
     glideTo(centreOn(box, viewport(), transform()));
     drawn.cards.get(id)?.focus({ preventScroll: true });
     if (!show) return;
-    const anchor = firstFound(box.node);
+    if (view.change?.touched.nodes.has(id)) {
+      const { from, to } = view.change;
+      showChangesAt(from, to, (file, hunk) => nodeTouchesHunk(box.node, file, hunk));
+      return;
+    }
+    const node = checkoutNode(box.node);
+    const anchor = firstFound(node);
     if (anchor && !alone()) showAnchor(anchor);
-    else openNode(box.node);
+    else openNode(node);
+  }
+
+  // `node` as the checkout's analysis places it: a change map's nodes are placed at the run's
+  // fork, and their lines would open the wrong lines of the files as they are now. The node
+  // itself when the checkout's analysis no longer has it.
+  function checkoutNode(node) {
+    if (!view.change) return node;
+    const all = (view.analysis.data?.diagrams ?? []).flatMap((diagram) => diagram.nodes);
+    return all.find((each) => each.id === node.id) ?? node;
   }
 
   body.addEventListener("click", (event) => {
@@ -1076,7 +1265,9 @@ export function diagramView({
   // Selects node `nodeId` of diagram `diagramId`, a click on its stripe or chip in the code: at
   // once when that diagram is drawn, else once it is, opened if need be.
   function revealNode(diagramId, nodeId) {
-    if (drawn?.diagram.id === diagramId && drawn.cards.has(nodeId)) {
+    // A stripe or chip of the code is the checkout's: shown on the repository's map.
+    const left = leaveChange();
+    if (!left && drawn?.diagram.id === diagramId && drawn.cards.has(nodeId)) {
       select(nodeId, { show: false });
       return;
     }
@@ -1094,12 +1285,14 @@ export function diagramView({
   function followCode(path, line) {
     view.code = path && line ? { path, line } : null;
     if (!view.shown || !drawn) return;
-    const next = view.code && nodeAtLine(drawn.diagram, path, line);
+    const next = view.code && nodeAtLine(checkoutDiagram(drawn.diagram), path, line);
     if (next === view.codeNode) return;
     view.codeNode = next;
     syncRings();
     if (next === null || panning || viewport().width === 0) return;
+    // The checkout's node may be one a change map does not draw.
     const box = drawn.positioned.byId.get(next);
+    if (!box) return;
     const { x, y, scale } = transform();
     const { width, height } = viewport();
     const left = x + box.x * scale;
@@ -1160,7 +1353,7 @@ export function diagramView({
     } else if (event.key === "Enter") {
       // Into the node's deeper diagram, else its dialog, which offers Analyze deeper.
       event.preventDefault();
-      const child = childDiagram(view.analysis.data, id);
+      const child = childDiagram(shownAnalysis(), id);
       if (child) openDiagram(child.id);
       else openNode(drawn.positioned.byId.get(id).node);
     } else if (event.key.startsWith("Arrow")) {
@@ -1172,7 +1365,8 @@ export function diagramView({
 
   // ---- The node's dialog -------------------------------------------------------------------
 
-  function openNode(node) {
+  function openNode(shownNode) {
+    const node = checkoutNode(shownNode);
     const head = el("header", "note-dialog-header");
     const title = el("h2", "note-dialog-title", node.label);
     title.id = "node-dialog-title";
@@ -1228,7 +1422,7 @@ export function diagramView({
       for (const note of noted) cards.append(noteCard(note));
       main.append(section(noted.length === 1 ? "Note" : `Notes · ${noted.length}`, cards));
     }
-    const child = childDiagram(view.analysis.data, node.id);
+    const child = childDiagram(shownAnalysis(), node.id);
     if (child) {
       const deeper = el("button", "button node-deeper", `Open ${child.title}`);
       deeper.type = "button";
@@ -1258,7 +1452,7 @@ export function diagramView({
     };
     const deeper = action("Analyze deeper", "node-analyze-deeper", () => analyzeDeeper(node.id));
     deeper.disabled = Boolean(liveRun());
-    if (childDiagram(view.analysis.data, node.id)) {
+    if (view.analysis.data && childDiagram(view.analysis.data, node.id)) {
       deeper.title = "Draws its inside again, in place of the diagram it has";
     }
     action("Trace from here", "node-trace", () => traceFrom({ of: node.id, label: node.label }));
@@ -1292,7 +1486,8 @@ export function diagramView({
   // The edges into and out of `node`, each to the node at its other end, with the code that
   // justifies it when the agent cited one.
   function edgeList(node) {
-    const diagram = drawn?.diagram ?? current();
+    // Each edge's code is shown in the files as they are now.
+    const diagram = checkoutDiagram(drawn?.diagram ?? current());
     const byId = new Map(diagram.nodes.map((each) => [each.id, each]));
     const touching = diagram.edges.filter((edge) => edge.from === node.id || edge.to === node.id);
     if (!touching.length) return null;
@@ -1385,5 +1580,11 @@ export function diagramView({
     isAnalyzing: () => Boolean(liveRun()),
     hasDraft,
     holdDraft,
+    // The run dialog's Change map (run-dialog.js): whether it is offered, and what it shows.
+    changeMapState,
+    showChangeMap,
+    // Whether the map shows a change map, which Escape leaves, and leaving it.
+    showsChangeMap: () => view.shown && Boolean(view.change),
+    leaveChangeMap,
   };
 }

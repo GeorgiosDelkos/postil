@@ -947,9 +947,14 @@ impl Site {
 
     /// The reply to `GET /api/analysis`: the diagrams, each code reference placed where its
     /// code is now, with the files not on the map (`analysis::view`), or `null` when there is
-    /// no analysis. Reads the analysis file and never writes it.
-    fn analysis(&self) -> Result<Vec<u8>> {
+    /// no analysis. With `?at=<commit>`, the diagrams alone, placed where the code is in that
+    /// commit (`analysis::at`), for a run's change map. Reads the analysis file and never
+    /// writes it.
+    fn analysis(&self, query: &str) -> Result<Vec<u8>> {
         let repo = self.repo()?;
+        if let Some(commit) = query_value(query, "at") {
+            return Ok(to_json(&analysis::at(&repo, &commit)?));
+        }
         let analysis = analysis::current(&repo)?.map(|analysis| analysis::view(&repo, analysis));
         Ok(to_json(&analysis))
     }
@@ -1093,10 +1098,12 @@ impl Site {
         let query = request.uri().query().unwrap_or("");
         match request.uri().path() {
             "/api/analysis" => match *method {
-                Method::GET => json_or_error(self.analysis()),
+                Method::GET => json_or_error(self.analysis(query)),
                 Method::POST => json_or_error(self.start_analysis(body)),
                 Method::DELETE => json_or_error(self.delete_diagram(query)),
-                _ => not_allowed("GET, POST {\"kind\": ...}, or DELETE ?diagram=<diagram id>"),
+                _ => not_allowed(
+                    "GET, GET ?at=<commit>, POST {\"kind\": ...}, or DELETE ?diagram=<id>",
+                ),
             },
             "/api/analysis/update" => match *method {
                 Method::POST => json_or_error(self.update_analysis(body)),

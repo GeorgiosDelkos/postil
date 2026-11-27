@@ -553,11 +553,13 @@ export function stopKey(run) {
 // Escape while it has the focus; this is for when the focus is elsewhere.
 // `page` says what is open: `{ focusMode, composer, send, changes, selection, live }`, each a
 // boolean. Returns the action's name, or null.
-export function escapeAction({ focusMode, composer, send, changes, selection, live }) {
+export function escapeAction({ focusMode, composer, send, changes, changeMap, selection, live }) {
   if (focusMode && !composer) return "leave-focus";
   if (composer) return "close-composer";
   if (send) return "close-send";
   if (changes) return "close-changes";
+  // The change map's own esc: back to the repository's map, before a run would be stopped.
+  if (changeMap) return "leave-change-map";
   if (selection) return "clear-selection";
   if (live) return "stop";
   return null;

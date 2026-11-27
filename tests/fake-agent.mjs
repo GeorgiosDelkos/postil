@@ -493,6 +493,29 @@ async function prompt(id, params) {
       say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
       return send({ id, result: { stopReason: "end_turn" } });
     }
+    case "change-map": {
+      // What the change map draws (docs/review-assist-plan.md, 8.6): deletes old.txt, which
+      // the report rates mechanical (folded, first), rewrites every line of big.txt (a long
+      // step in between), changes line 15 of lib.txt alone (last), and adds new.txt.
+      const cwd = process.cwd();
+      rmSync(`${cwd}/old.txt`);
+      const big = Array.from({ length: 150 }, (_, index) => `B${index + 1}\n`).join("");
+      writeFileSync(`${cwd}/big.txt`, big);
+      const lib = Array.from({ length: 20 }, (_, index) => `l${index + 1}\n`).join("");
+      writeFileSync(`${cwd}/lib.txt`, lib.replace("l15\n", "fifteen\n"));
+      writeFileSync(`${cwd}/new.txt`, "new\n");
+      say("N1: done");
+      const report = {
+        steps: [
+          { path: "old.txt", lines: [1, 4], why: "no longer used", risk: "mechanical" },
+          { path: "big.txt", lines: [1, 150], why: "renamed", risk: "routine" },
+          { path: "lib.txt", lines: [15, 15], why: "the change", risk: "routine" },
+        ],
+        checks: [{ command: "cargo test", result: "passed" }],
+      };
+      say(`\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\``);
+      return send({ id, result: { stopReason: "end_turn" } });
+    }
     case "evidence": {
       // Two commands and a report that claims three checks (ui/run.js, `evidence`): one
       // passed as claimed, one that exited non-zero as Grok ends it (completed) though the

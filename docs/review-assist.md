@@ -5,8 +5,8 @@ Status: 2026-11-27. Designed. Built so far: an execute call's command and exit c
 walkthrough with its ratings and findings in the changes view (7.5), read-only threads with
 Ask (7.6), jump to definition (7.7), the analysis file with its citation checking (8.1),
 analysis runs (8.2), the split pane with the diagram view (8.3), the link shown in the
-code with code to diagram (8.4), and Analyze deeper, flows, the Data kind, outdated nodes,
-"Not on the map" and Update in the page (8.5). This document adds to
+code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated nodes,
+"Not on the map" and Update in the page (8.5), and the change map (8.6). This document adds to
 `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -339,7 +339,9 @@ The owner asked for the link to be visible in the code, as notes are.
   of the run's diff overlaps one of its anchors, placed in the run's snapshot before the run.
   Touched nodes fill with the added color, nodes one edge from a touched node get an outline,
   and changed files that no node covers list under "Not on the map". A click on a touched
-  node opens the changes view at its hunks.
+  node opens the changes view at its hunks. Built in step 8.6: `GET /api/analysis?at=<commit>`
+  places the analysis with `git show` at the snapshot before the run, so a checkout that moved
+  since does not mark the wrong nodes; only Architecture diagrams are drawn.
 
 ### Data structures
 

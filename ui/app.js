@@ -150,17 +150,35 @@ const runs = runPanel({
   openNote: (id) => noteDetail.open(id),
   openFile: (path) => code.openFile(path),
   reviewers: () => (state.settings?.reviewers ?? []).map((slot) => formatSlot(slot)),
-  showChanges: (from, to) => {
-    tray.closeSend();
-    // A walkthrough belongs to one run (docs/review-assist.md, "Guided walkthrough and risk").
-    const run = from === to ? runs.byId(from) : null;
-    const walk = run && {
-      report: reportOf(run)?.report ?? null,
-      findings: reviewOf(run.id, runs.knownViews())?.findings ?? [],
-    };
-    changes.show(from, to, walk);
+  showChanges: (from, to) => showChangesAt(from, to, null),
+  changeMapState: () => map.changeMapState(),
+  showChangeMap: (from, to) => {
+    showMap();
+    map.showChangeMap(from, to);
   },
 });
+
+// Shows what runs `from` to `to` changed in the code pane, scrolled to the first hunk
+// `match(file, hunk)` holds when given (changes-view.js, `show`).
+function showChangesAt(from, to, match) {
+  tray.closeSend();
+  // A window too narrow for both panes gives this one to the code, where the changes show.
+  showCode();
+  changes.show(from, to, walkOf(from, to), { match });
+}
+
+// What a walkthrough of runs `from` to `to` needs, `{ report, findings }`, or null for a thread
+// of several runs: a walkthrough belongs to one run (docs/review-assist.md, "Guided
+// walkthrough and risk").
+function walkOf(from, to) {
+  const run = from === to ? runs.byId(from) : null;
+  return (
+    run && {
+      report: reportOf(run)?.report ?? null,
+      findings: reviewOf(run.id, runs.knownViews())?.findings ?? [],
+    }
+  );
+}
 
 const tray = notesTray({
   state,
@@ -252,11 +270,14 @@ const map = diagramView({
     else code.showAnchor(anchor);
   },
   writeNote: writeOnAnchor,
+  showChangesAt,
   alone: () => mapMode.open && layout.isNarrow(),
-  // A new analysis, or a flow opened or closed, changes the stripes, chips and step numbers.
+  // A new analysis, or a flow opened or closed, changes the stripes, chips and step numbers,
+  // and whether a run's dialog offers Change map.
   onChange: () => {
     indexMarks();
     code.redecorate();
+    runs.drawDialog();
   },
   onError: showToast,
 });
@@ -541,6 +562,7 @@ window.addEventListener("keydown", (event) => {
       composer: Boolean(state.composer),
       send: Boolean(state.send),
       changes: changes.isOpen(),
+      changeMap: map.showsChangeMap(),
       selection: Boolean(state.selection),
       live: runs.live(),
     });
@@ -548,6 +570,7 @@ window.addEventListener("keydown", (event) => {
     else if (action === "close-composer") code.closeComposer({ save: false });
     else if (action === "close-send") tray.closeSend();
     else if (action === "close-changes") changes.close();
+    else if (action === "leave-change-map") map.leaveChangeMap();
     else if (action === "clear-selection") code.clearSelection();
     else if (action === "stop") runs.stop();
   } else if (state.send) {

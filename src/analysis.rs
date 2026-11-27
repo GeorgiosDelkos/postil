@@ -95,6 +95,44 @@ pub(crate) fn current(repo: &Repo) -> Result<Option<Analysis>> {
     Ok(Some(analysis))
 }
 
+/// Reads the analysis and places every verified code reference where its code is in commit
+/// `commit` (a tree id works too), as [`current`] places it in the working tree: what a run's
+/// change map compares with the diff from that commit (docs/review-assist-plan.md, 8.6). Reads
+/// the files with `git show`, each cited file once, and never the disk; does not write.
+/// `None` when there is no analysis file.
+///
+/// # Errors
+///
+/// [`Error::BadRequest`] when `commit` is not a hexadecimal object id, the git error when the
+/// repository has no such commit, whether or not there is an analysis, and as [`load`].
+pub(crate) fn at(repo: &Repo, commit: &str) -> Result<Option<Analysis>> {
+    // First, so a bad commit is an error even with no analysis to place.
+    let files = repo.files_at(commit)?;
+    let Some(mut analysis) = load(&repo.analysis_file())? else {
+        return Ok(None);
+    };
+    // Every folder above a file of the commit. A folder with no file in it is not in git.
+    let folders: HashSet<&str> = files
+        .iter()
+        .flat_map(|file| file.match_indices('/').map(|(slash, _)| &file[..slash]))
+        .collect();
+    place_with(
+        &mut analysis,
+        // Only a file of the commit is shown: `git show <commit>:<folder>` lists the folder.
+        |path| {
+            files
+                .contains(path)
+                .then(|| repo.read_at(commit, path).ok())
+                .flatten()
+        },
+        |path, kind| match kind {
+            PathKind::File => files.contains(path),
+            PathKind::Folder => folders.contains(path),
+        },
+    );
+    Ok(Some(analysis))
+}
+
 /// Reads the analysis file as it is, with no reference placed, or `None` when there is none.
 ///
 /// # Errors
@@ -327,7 +365,22 @@ fn unreadable(error: &Error) -> String {
 /// That is under the 10 ms above which results would be kept per path and stat, so nothing
 /// is cached.
 fn place(analysis: &mut Analysis, repo: &Repo) {
-    let mut read: HashMap<String, Option<String>> = HashMap::new();
+    place_with(
+        analysis,
+        |path| repo.read(path).ok(),
+        |path, kind| repo.kind(path).ok().flatten() == Some(kind),
+    );
+}
+
+/// [`place`] against any version of the files: `read(path)` gives a cited file's text, or
+/// `None` when it cannot be read, and is called once per path; `is(path, kind)` says whether
+/// the path is a file or folder of that kind there.
+fn place_with(
+    analysis: &mut Analysis,
+    mut read: impl FnMut(&str) -> Option<String>,
+    is: impl Fn(&str, PathKind) -> bool,
+) {
+    let mut texts: HashMap<String, Option<String>> = HashMap::new();
     for anchor in analysis.anchors_mut() {
         let RefDetail::Verified {
             target: Target::Lines { .. },
@@ -336,11 +389,11 @@ fn place(analysis: &mut Analysis, repo: &Repo) {
         else {
             continue;
         };
-        if !read.contains_key(&anchor.path) {
-            read.insert(anchor.path.clone(), repo.read(&anchor.path).ok());
+        if !texts.contains_key(&anchor.path) {
+            texts.insert(anchor.path.clone(), read(&anchor.path));
         }
     }
-    let split: HashMap<&str, Vec<&str>> = read
+    let split: HashMap<&str, Vec<&str>> = texts
         .iter()
         .filter_map(|(path, text)| Some((path.as_str(), text.as_deref()?.lines().collect())))
         .collect();
@@ -360,7 +413,7 @@ fn place(analysis: &mut Analysis, repo: &Repo) {
                     None => false,
                 }
             }
-            Target::Path(kind) => repo.kind(&anchor.path).ok().flatten() == Some(*kind),
+            Target::Path(kind) => is(&anchor.path, *kind),
         };
         *placed = if found {
             VerifiedState::Found
