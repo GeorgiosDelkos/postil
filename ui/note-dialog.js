@@ -538,7 +538,16 @@ export function noteDialog(
     return button;
   }
 
-  return { open, draw, holdDraft, isOpen: () => dialogEl.open };
+  function resolveOpen() {
+    if (!dialogEl.open || !shownId) return false;
+    const found = find(shownId);
+    const note = found?.note ?? found;
+    if (!note || isResolved(note)) return false;
+    resolve(note);
+    return true;
+  }
+
+  return { open, draw, holdDraft, resolveOpen, isOpen: () => dialogEl.open };
 }
 
 function section(label, content) {

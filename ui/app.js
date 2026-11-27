@@ -12,10 +12,16 @@ import { codeView } from "./code-view.js";
 import { contextMenu } from "./context-menu.js";
 import { diagramView } from "./diagram-view.js";
 import { fileMarks } from "./diagram.js";
-import { setDictationContext } from "./dictation.js";
+import {
+  isBoxDictating,
+  setDictationContext,
+  startDictationFor,
+  stopActiveDictation,
+} from "./dictation.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
+import { rank as rankFiles } from "./fuzzy.js";
 import { memoryDialog, rememberDialog } from "./memory-dialog.js";
 import { memoryTab } from "./memory-tab.js";
 import { noteDialog } from "./note-dialog.js";
@@ -30,6 +36,7 @@ import { reportOf, reviewOf } from "./status.js";
 import { buildTree } from "./tree.js";
 import { usageBar } from "./usage-bar.js";
 import { usageDialog } from "./usage-dialog.js";
+import { command as voiceCommand } from "./voice.js";
 import { welcomeScreen } from "./welcome.js";
 import { wizardDialog } from "./wizard-dialog.js";
 
@@ -646,6 +653,221 @@ window.addEventListener("keydown", (event) => {
     if (row) pathNote.open(row.path, row.target, { intent: "ask" });
     else code.askOnSelection();
   }
+});
+
+// ---- Hold-to-talk voice commands (docs/review-assist.md, "Voice commands") ----------------
+//
+// Right Option (`AltRight`), confirmed by the owner on 2026-11-27: starts after held 200 ms
+// with no other key, so typing an accented character with Option is never mistaken for a
+// command. Inside a text box it dictates there (10.2); anywhere else what is said is matched
+// against the fixed grammar in `ui/voice.js`.
+
+const HOLD_TO_TALK_CODE = "AltRight";
+const HOLD_DELAY_MS = 200;
+
+let holdTimer = null;
+let holdMode = null; // "box" | "command" | null
+let voiceUnsub = null;
+let voiceTranscript = "";
+let voiceHandled = false;
+
+function currentVoiceContext() {
+  const latestRun = runs.run();
+  const hasSnapshot = Boolean(
+    latestRun?.entries?.some((entry) => entry.kind === "snapshot" && entry.point === "before"),
+  );
+  const canSend = state.projectOpen && state.notes.some((note) => isOpen(note) && !isAsk(note));
+  return {
+    projectOpen: state.projectOpen && !welcome.isShown(),
+    changesOpen: changes.isOpen(),
+    hasChanges: Boolean(latestRun && hasSnapshot),
+    hasTarget: Boolean(state.selection || changes.currentTarget()),
+    composerOpen: Boolean(state.composer),
+    noteDialogOpen: noteDetail.isOpen(),
+    sendOpen: Boolean(state.send),
+    canSend,
+    liveRun: runs.live(),
+  };
+}
+
+async function runVoiceCommand(transcript) {
+  const trimmed = transcript.trim();
+  if (!trimmed) return;
+  const cmd = voiceCommand(trimmed, currentVoiceContext());
+  if (!cmd) {
+    showToast(`Not a command: "${trimmed}"`);
+    return;
+  }
+  if (cmd.type === "noop") {
+    showToast(cmd.reason);
+    return;
+  }
+  showToast(cmd.label);
+  switch (cmd.type) {
+    case "next":
+      if (!changes.step(1)) showToast("Already at the last step.");
+      break;
+    case "previous":
+      if (!changes.step(-1)) showToast("Already at the first step.");
+      break;
+    case "note":
+    case "ask": {
+      const intent = cmd.type === "ask" ? "ask" : "change";
+      if (changes.isOpen()) {
+        const target = changes.currentTarget();
+        if (!target) {
+          showToast("Nothing selected.");
+          return;
+        }
+        changes.close();
+        if (state.file?.path !== target.path && !(await code.openFile(target.path))) return;
+        const line = Math.max(0, target.line - 1);
+        code.openComposer({ start: line, end: line }, { intent, text: cmd.text });
+      } else {
+        code.openComposer(undefined, { intent, text: cmd.text });
+      }
+      break;
+    }
+    case "save":
+      code.closeComposer({ save: true });
+      break;
+    case "open": {
+      const matches = rankFiles(cmd.query, state.repo.files, 20);
+      if (matches.length === 0) {
+        showToast(`No file matching "${cmd.query}".`);
+      } else if (matches.length === 1) {
+        showCode();
+        await code.openFile(matches[0].path);
+      } else {
+        leaveFocus();
+        filterEl.value = cmd.query;
+        filterEl.dispatchEvent(new Event("input"));
+        filterEl.focus();
+      }
+      break;
+    }
+    case "goto":
+      showCode();
+      await code.jumpToName(cmd.name);
+      break;
+    case "show-map":
+      showMap();
+      break;
+    case "show-code":
+      changes.close();
+      tray.closeSend();
+      showCode();
+      break;
+    case "show-changes": {
+      const run = runs.run();
+      if (run) showChangesAt(run.id, run.id, null);
+      break;
+    }
+    case "resolve":
+      if (!noteDetail.resolveOpen()) showToast("Nothing to resolve.");
+      break;
+    case "send":
+      if (cmd.confirm) tray.sendNotes();
+      else tray.openSend();
+      break;
+    case "stop":
+      runs.stop();
+      break;
+    default:
+      break;
+  }
+}
+
+function finishVoiceCommandSession() {
+  if (voiceUnsub) {
+    voiceUnsub();
+    voiceUnsub = null;
+  }
+  if (!voiceHandled && voiceTranscript.trim()) {
+    voiceHandled = true;
+    void runVoiceCommand(voiceTranscript);
+  }
+  voiceTranscript = "";
+}
+
+function startVoiceCommandSession() {
+  const bridge = window.postil?.dictation;
+  if (!bridge) return;
+  voiceTranscript = "";
+  voiceHandled = false;
+  voiceUnsub = bridge.subscribe((event) => {
+    if (event.type === "transcript") {
+      voiceTranscript = event.text ?? "";
+      if (event.isFinal && !voiceHandled) {
+        voiceHandled = true;
+        const final = voiceTranscript;
+        finishVoiceCommandSession();
+        void runVoiceCommand(final);
+      }
+    } else if (event.type === "state") {
+      if (event.state === "listening") {
+        showToast("Listening…");
+      } else if (event.state === "denied" || event.state === "restricted") {
+        if (event.message) showToast(event.message);
+        finishVoiceCommandSession();
+      } else if (event.state === "idle") {
+        finishVoiceCommandSession();
+      }
+    } else if (event.type === "error") {
+      if (event.message) showToast(event.message);
+      finishVoiceCommandSession();
+    }
+  });
+  bridge.start();
+}
+
+function endHoldToTalk() {
+  if (holdTimer !== null) {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+  }
+  if (!holdMode) return;
+  const mode = holdMode;
+  holdMode = null;
+  if (mode === "box") {
+    stopActiveDictation();
+  } else if (mode === "command") {
+    window.postil?.dictation?.stop();
+  }
+}
+
+window.addEventListener("keydown", (event) => {
+  if (event.code === HOLD_TO_TALK_CODE) {
+    if (event.repeat || holdTimer !== null || holdMode !== null) return;
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      const focused = document.activeElement;
+      if (
+        focused &&
+        focused.matches("textarea, input[type='text'], input:not([type])") &&
+        startDictationFor(focused)
+      ) {
+        holdMode = "box";
+      } else if (!isBoxDictating()) {
+        holdMode = "command";
+        startVoiceCommandSession();
+      }
+    }, HOLD_DELAY_MS);
+    return;
+  }
+  // Any other key while waiting for the 200 ms hold cancels it (e.g. Option + letter for accents).
+  if (holdTimer !== null) {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+  }
+});
+
+window.addEventListener("keyup", (event) => {
+  if (event.code === HOLD_TO_TALK_CODE) endHoldToTalk();
+});
+
+window.addEventListener("blur", () => {
+  endHoldToTalk();
 });
 
 // A draft note lives only in the page, so anything that would end the page (quitting,

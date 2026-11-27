@@ -9,8 +9,8 @@ code with code to diagram (8.4), Analyze deeper, flows, the Data kind, outdated 
 "Not on the map" and Update in the page (8.5), the change map (8.6), the forced update
 (8.7), finding and setting up hippius-mem (9.1), the memory client with the Memory tab and
 the run's Memory section (9.2), team memory given to agents (9.3), Remember (9.4),
-reviews checked against memory (9.5), native dictation (10.1), and the dictation widget
-(10.2). Step 10.3 (voice commands) is not built. This document adds
+reviews checked against memory (9.5), native dictation (10.1), the dictation widget (10.2),
+and voice commands (10.3). Milestone 10 is built. This document adds
 to `docs/design.md`, which stays the reference for everything built so far.
 `docs/review-assist-plan.md` turns it into pull requests, with the edge cases and tests of each.
 Section "Decisions" lists what the owner settled on 2026-11-25; section "Open questions" lists
@@ -752,8 +752,9 @@ on-device recognition required: no model in the binary, no daemon, no network ca
 
 ### Voice commands
 
-The owner chose hold-to-talk over a listening mode: nothing is heard by accident and the
-microphone is off otherwise.
+Built (step 10.3): `ui/voice.js` (`command(transcript, context)`) and Right Option (`AltRight`)
+hold-to-talk in `ui/app.js` (confirmed by the owner on 2026-11-27). The owner chose hold-to-talk
+over a listening mode: nothing is heard by accident and the microphone is off otherwise.
 
 - **One key, held.** In a text box it dictates into the box. Anywhere else what is said is a
   command.

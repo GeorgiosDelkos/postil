@@ -603,5 +603,41 @@ export function changesView({
     }
   });
 
-  return { show, close, isOpen: () => shown !== null };
+  // Moves to the next (`by` 1) or previous (-1) step, or hunk when in Files order.
+  function step(by) {
+    if (!shown || !read) return false;
+    if (order === "walkthrough") {
+      const all = steps();
+      const next = current + by;
+      if (next < 0 || next >= all.length) return false;
+      move(by);
+      return true;
+    }
+    const blocks = [...viewEl.querySelectorAll(".changes-hunk-block")];
+    if (blocks.length === 0) return false;
+    const next = Math.max(0, Math.min(blocks.length - 1, current + by));
+    if (next === current && blocks.length > 1 && by !== 0) return false;
+    current = next;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const padding = parseFloat(getComputedStyle(viewEl).paddingTop) || 0;
+    viewEl.scrollTo({
+      top: blocks[next].offsetTop - padding,
+      behavior: reduce ? "auto" : "smooth",
+    });
+    return true;
+  }
+
+  // Returns `{ path, line }` for the first new-side line of the current walkthrough step or hunk.
+  function currentTarget() {
+    if (!shown) return null;
+    const scope =
+      order === "walkthrough"
+        ? (steps()[current] ?? viewEl)
+        : ([...viewEl.querySelectorAll(".changes-hunk-block")][current] ?? viewEl);
+    const number = scope.querySelector(".changes-number.new");
+    if (!number) return null;
+    return { path: number.dataset.path, line: Number(number.dataset.line) };
+  }
+
+  return { show, close, step, currentTarget, isOpen: () => shown !== null };
 }
