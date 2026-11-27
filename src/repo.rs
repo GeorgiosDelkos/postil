@@ -1127,7 +1127,7 @@ impl Repo {
         let valid_paths: Vec<&str> = paths
             .iter()
             .copied()
-            .filter(|file| self.inside(file).is_ok())
+            .filter(|file| !file.contains(['\n', '\r', '\0']) && self.inside(file).is_ok())
             .collect();
         if valid_paths.is_empty() {
             return results;
@@ -1180,12 +1180,23 @@ impl Repo {
                 }
                 let trimmed = header.trim_end_matches(['\r', '\n']);
                 // `<oid> <type> <size>` for existing objects; `<spec> missing` otherwise.
+                // Require exactly 3 tokens, a hex oid, and a known git object type so a missing
+                // path containing spaces (e.g. `HEAD:foo blob 10 missing`) can never be misparsed.
                 let mut parts = trimmed.split_whitespace();
-                let (_oid, kind, size) = (parts.next(), parts.next(), parts.next());
-                let Some(size) = size.and_then(|s| s.parse::<u64>().ok()) else {
+                let (Some(oid), Some(kind), Some(size_str), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
                     continue;
                 };
-                if kind == Some("blob") && size <= MAX_READ {
+                if !oid.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !matches!(kind, "blob" | "tree" | "commit" | "tag")
+                {
+                    continue;
+                }
+                let Ok(size) = size_str.parse::<u64>() else {
+                    continue;
+                };
+                if kind == "blob" && size <= MAX_READ {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "size <= MAX_READ (20 MB), which always fits in usize"

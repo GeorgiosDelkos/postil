@@ -453,14 +453,23 @@ function nodeTouchesFile(node, file) {
 // out: the change map is drawn on the Architecture.
 export function touched(analysis, files) {
   const diagrams = (analysis?.diagrams ?? []).filter((diagram) => diagram.kind === "architecture");
-  const filesByPath = new Map(files.map((file) => [file.path, file]));
+  // Map path -> File[] so git type-changes (deleted + added at the same path) keep both entries.
+  const filesByPath = new Map();
+  for (const file of files) {
+    let list = filesByPath.get(file.path);
+    if (!list) {
+      list = [];
+      filesByPath.set(file.path, list);
+    }
+    list.push(file);
+  }
   const nodes = new Set();
   for (const diagram of diagrams) {
     for (const node of diagram.nodes) {
       const hit = node.anchors.some((anchor) => {
         if (anchor.state === "unverified" || anchor.target === "folder") return false;
-        const file = filesByPath.get(anchor.path);
-        return file ? nodeTouchesFile(node, file) : false;
+        const matched = filesByPath.get(anchor.path);
+        return matched ? matched.some((file) => nodeTouchesFile(node, file)) : false;
       });
       if (hit) nodes.add(node.id);
     }

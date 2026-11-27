@@ -569,6 +569,8 @@ function followRun(run, previous, { liveEnded } = {}) {
   map.runChanged();
   $("tab-run").hidden = run === null;
   if (run === null) {
+    clearTimeout(editRefreshTimer);
+    editRefreshTimer = null;
     if (state.tab === "run") tray.showTab("notes");
     if (liveEnded) refresh().catch((error) => showToast(String(error)));
     return;

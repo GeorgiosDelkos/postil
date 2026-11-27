@@ -101,7 +101,25 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
     // memory draft, whose dialog is the Remember dialog (memory-dialog.js). A run
     // not read yet is left out until it is, since it may be one; a run that could not be read
     // shows its card, which says why.
-    const shown = list.slice(0, MAX_TAB_RUNS).filter((id) => {
+    // Include the newest runs up to `MAX_TAB_RUNS` plus any older thread roots that have a
+    // live run or recent follow-up so active threads never disappear behind newer analysis/review runs.
+    const candidates = list.slice(0, MAX_TAB_RUNS);
+    const seen = new Set(candidates);
+    const includeRoot = (rootId) => {
+      if (rootId && !seen.has(rootId) && list.includes(rootId)) {
+        seen.add(rootId);
+        candidates.push(rootId);
+      }
+    };
+    for (const live of store.liveRuns()) includeRoot(store.liveThread(live.id));
+    for (const id of [...candidates]) {
+      let cur = store.byId(id);
+      while (cur?.followUp?.of) {
+        includeRoot(cur.followUp.of);
+        cur = store.byId(cur.followUp.of);
+      }
+    }
+    const shown = candidates.filter((id) => {
       const view = store.byId(id);
       if (!view) return Boolean(store.failure(id));
       return !view.review && !view.followUp && !view.analysis && !view.remember;

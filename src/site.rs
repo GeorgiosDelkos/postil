@@ -404,7 +404,7 @@ struct LedgerCache {
 /// Cached `settings.json` load result, invalidated when `(modified, len)` changes.
 struct SettingsCache {
     /// `None` when the file did not exist at the cached check.
-    stamp: Option<(Option<SystemTime>, u64)>,
+    stamp: Option<(SystemTime, u64)>,
     loaded: settings::Loaded,
 }
 
@@ -419,13 +419,13 @@ struct FileCache {
 #[derive(Debug)]
 struct CachedFile {
     path: String,
-    modified: Option<SystemTime>,
+    modified: SystemTime,
     len: u64,
     json: Arc<[u8]>,
 }
 
 impl FileCache {
-    fn get(&mut self, path: &str, modified: Option<SystemTime>, len: u64) -> Option<Arc<[u8]>> {
+    fn get(&mut self, path: &str, modified: SystemTime, len: u64) -> Option<Arc<[u8]>> {
         let index = self.entries.iter().position(|entry| {
             entry.path == path && entry.modified == modified && entry.len == len
         })?;
@@ -435,7 +435,7 @@ impl FileCache {
         Some(json)
     }
 
-    fn insert(&mut self, path: String, modified: Option<SystemTime>, len: u64, json: Arc<[u8]>) {
+    fn insert(&mut self, path: String, modified: SystemTime, len: u64, json: Arc<[u8]>) {
         if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
             self.entries.remove(index);
         } else if self.entries.len() >= FILE_CACHE_CAP {
@@ -969,17 +969,10 @@ impl Site {
             }
         }
         let repo = Arc::new(repo);
-        self.memory.open_project(&repo);
-        // A run gives its agent team memory only once a check found hippius-mem Ready, and the
-        // first check would otherwise wait for the first send or the settings dialog: the send
-        // step's preview would leave out the line about it that the send then has.
         let team_memory = settings.map_or_else(
             || self.current_settings().team_memory(),
             Settings::team_memory,
         );
-        if team_memory == TeamMemory::On {
-            drop(self.memory.status());
-        }
         let runner = Runner::new(
             Arc::clone(&repo),
             self.agents.clone(),
@@ -990,7 +983,7 @@ impl Site {
         );
         let definitions = Definitions::new(Arc::clone(&repo));
         let next = Project {
-            repo,
+            repo: Arc::clone(&repo),
             runner,
             definitions,
             warning,
@@ -1008,6 +1001,15 @@ impl Site {
             }
             project.replace(next)
         };
+        // Switch `Memory` only after `project.replace(next)` commits so a refused open never
+        // switches team memory away from the still-open busy project.
+        self.memory.open_project(&repo);
+        // A run gives its agent team memory only once a check found hippius-mem Ready, and the
+        // first check would otherwise wait for the first send or the settings dialog: the send
+        // step's preview would leave out the line about it that the send then has.
+        if team_memory == TeamMemory::On {
+            drop(self.memory.status());
+        }
         // Stops the index and the agent of the project this one replaces, after the borrow
         // ends: stopping the agent waits for its process. The index is told first, as that
         // waits for nothing.
@@ -1198,12 +1200,14 @@ impl Site {
             let project = guard.as_ref().ok_or(Error::NoProject)?;
             (Arc::clone(&project.repo), Arc::clone(&project.file_cache))
         };
-        let stamp = repo
-            .inside(path)
-            .ok()
-            .and_then(|full| std::fs::metadata(full).ok())
-            .filter(std::fs::Metadata::is_file)
-            .map(|meta| (meta.modified().ok(), meta.len()));
+        let read_stamp = || {
+            repo.inside(path)
+                .ok()
+                .and_then(|full| std::fs::metadata(full).ok())
+                .filter(std::fs::Metadata::is_file)
+                .and_then(|meta| meta.modified().ok().map(|modified| (modified, meta.len())))
+        };
+        let stamp = read_stamp();
         if let Some((modified, len)) = stamp
             && let Some(cached) = file_cache
                 .lock()
@@ -1224,7 +1228,11 @@ impl Site {
             "the reply types are plain structs of strings, numbers, and sequences, which always \
              serialize",
         );
-        if let Some((modified, len)) = stamp {
+        // Only cache when `(modified, len)` is unchanged after reading so concurrent edits never
+        // populate the cache under a stale stamp.
+        if let Some((modified, len)) = stamp
+            && read_stamp() == Some((modified, len))
+        {
             file_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1984,7 +1992,10 @@ impl Site {
     /// Loads `settings.json` with an `(mtime, len)` cache so repeated polls skip re-parsing.
     fn load_settings_cached(&self, file: &Path) -> settings::Loaded {
         let stamp = match std::fs::metadata(file) {
-            Ok(meta) => Some((meta.modified().ok(), meta.len())),
+            Ok(meta) => match meta.modified() {
+                Ok(modified) => Some((modified, meta.len())),
+                Err(_) => return settings::load(file),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return settings::load(file),
         };
@@ -2008,6 +2019,13 @@ impl Site {
             loaded: loaded.clone(),
         });
         loaded
+    }
+
+    fn invalidate_settings_cache(&self) {
+        *self
+            .settings_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// The settings in effect: the file's, or the defaults when it cannot be used or there is
@@ -2076,12 +2094,14 @@ impl Site {
             }
         }
         settings::save(file, &settings, &request.revision)?;
+        self.invalidate_settings_cache();
         Ok(self.settings())
     }
 
     /// The reply to `POST /api/settings/reset`: writes the defaults over the file.
     fn reset_settings(&self) -> Result<Vec<u8>> {
         settings::reset(self.settings_file.as_deref().ok_or(Error::NoHome)?)?;
+        self.invalidate_settings_cache();
         Ok(self.settings())
     }
 

@@ -54,6 +54,11 @@ const entryParents = new WeakMap();
 export function appendEntries(base, added) {
   if (added.length === 0) return base;
   const next = base.concat(added);
+  // Truncate the parent chain at depth 8 (matching `startsWith`'s hop bound) so older
+  // intermediate arrays are not pinned in memory for the lifetime of the run.
+  let node = base;
+  for (let hops = 0; node && hops < 7; hops += 1) node = entryParents.get(node);
+  if (node) entryParents.delete(node);
   entryParents.set(next, base);
   return next;
 }

@@ -97,6 +97,19 @@ export function runStore({ render, onChange, onLoaded, onError }) {
     }
     const reply = await response.json();
     ids = reply.runs;
+    const valid = new Set(ids);
+    for (const id of others.keys()) {
+      if (!valid.has(id)) {
+        others.delete(id);
+        asked.delete(id);
+      }
+    }
+    for (const id of failed.keys()) {
+      if (!valid.has(id)) {
+        failed.delete(id);
+        asked.delete(id);
+      }
+    }
     liveThreads = new Map((reply.live ?? []).map((live) => [live.id, live.thread]));
   }
 

@@ -734,20 +734,32 @@ impl Run {
     }
 
     /// Reads a run log in a single pass when `keep(&header)` is true, or returns `Ok(None)`
-    /// without parsing the body entries when false.
+    /// after reading only line 1 when false so skipped analysis/remember logs are not loaded
+    /// whole into memory.
     fn read_if(
         file: &Path,
         keep: impl FnOnce(&Header) -> bool,
     ) -> std::result::Result<Option<Self>, String> {
-        let bytes = fs::read(file).map_err(|error| format!("it cannot be read ({error})"))?;
-        let mut lines = bytes.split(|&byte| byte == b'\n');
-        let header = parse_header(lines.next().unwrap_or_default())?;
+        let opened = File::open(file).map_err(|error| format!("it cannot be read ({error})"))?;
+        let mut reader = BufReader::new(opened);
+        let mut first = Vec::new();
+        reader
+            .read_until(b'\n', &mut first)
+            .map_err(|error| format!("it cannot be read ({error})"))?;
+        if first.last() == Some(&b'\n') {
+            first.pop();
+        }
+        let header = parse_header(&first)?;
         if !keep(&header) {
             return Ok(None);
         }
 
+        let mut rest = Vec::new();
+        reader
+            .read_to_end(&mut rest)
+            .map_err(|error| format!("it cannot be read ({error})"))?;
         let mut state = RunState::new(header, None, None);
-        for (index, line) in lines.enumerate() {
+        for (index, line) in rest.split(|&byte| byte == b'\n').enumerate() {
             if line.is_empty() {
                 continue;
             }
