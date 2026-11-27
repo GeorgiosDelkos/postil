@@ -47,17 +47,27 @@ export function sentIn(note) {
 // be changed by its callers.
 const folds = new WeakMap();
 
-// The state behind the last fold made, which the next one extends when its entries start with
-// the same entries: the store's list for the latest run grows by one fetch at a time
-// (run-store.js), and folding it whole on every fetch took time quadratic in the run's length.
-let latest = null;
+// Recent fold states kept for incremental extension: up to 3 live runs can stream side by
+// side, so a single slot would evict one run on every chunk of another and fall back to O(N^2)
+// full re-folds.
+const MAX_RECENT_FOLDS = 8;
+const recentFolds = [];
 
 export function foldRun(entries) {
   let fold = folds.get(entries);
   if (!fold) {
-    const base = latest && startsWith(entries, latest.entries) ? latest : emptyFold();
-    latest = foldMore(base, entries);
-    fold = { plan: latest.plan, items: latest.items };
+    let base = null;
+    for (let i = recentFolds.length - 1; i >= 0; i -= 1) {
+      if (startsWith(entries, recentFolds[i].entries)) {
+        base = recentFolds[i];
+        recentFolds.splice(i, 1);
+        break;
+      }
+    }
+    const next = foldMore(base ?? emptyFold(), entries);
+    recentFolds.push(next);
+    if (recentFolds.length > MAX_RECENT_FOLDS) recentFolds.shift();
+    fold = { plan: next.plan, items: next.items };
     folds.set(entries, fold);
   }
   return fold;
@@ -65,7 +75,14 @@ export function foldRun(entries) {
 
 // Whether `entries` begins with every entry of `prefix`, the same objects in the same order.
 function startsWith(entries, prefix) {
-  return prefix.length <= entries.length && prefix.every((entry, i) => entries[i] === entry);
+  const len = prefix.length;
+  if (len === 0 || len > entries.length) return false;
+  // Fast reject on endpoints before scanning the full prefix.
+  if (entries[0] !== prefix[0] || entries[len - 1] !== prefix[len - 1]) return false;
+  for (let i = 1; i < len - 1; i += 1) {
+    if (entries[i] !== prefix[i]) return false;
+  }
+  return true;
 }
 
 function emptyFold() {

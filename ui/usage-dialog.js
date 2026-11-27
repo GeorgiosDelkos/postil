@@ -64,10 +64,21 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
     return JSON.parse(text);
   }
 
+  const MAX_POLLS = 45;
+  let polls = 0;
+
+  function viewSignature(view) {
+    if (!view) return null;
+    const agents = (view.agents ?? [])
+      .map((a) => `${a.name}:${a.quota?.status ?? ""}:${a.quota?.fetchedAt ?? ""}:${a.runs ?? 0}`)
+      .join("|");
+    return `${view.scope}|${view.range}|${view.scanning}|${view.polling}|${view.totals?.runs ?? 0}|${agents}`;
+  }
+
   function show(view) {
     const merged = mergeUsageView(ui.view, view);
     const unchanged =
-      !ui.refreshing && ui.error === null && JSON.stringify(merged) === JSON.stringify(ui.view);
+      !ui.refreshing && ui.error === null && viewSignature(merged) === viewSignature(ui.view);
     ui.view = merged;
     ui.scope = merged.scope;
     ui.range = merged.range;
@@ -76,10 +87,20 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
     onTone?.(highestQuotaTone(merged.agents));
     onView?.(merged);
     clearTimeout(ui.pollTimer);
-    if (dialogEl.open && (merged.scanning || merged.polling)) {
+    ui.pollTimer = null;
+    if (
+      dialogEl.open &&
+      (merged.scanning || merged.polling) &&
+      polls < MAX_POLLS &&
+      !document.hidden
+    ) {
+      polls += 1;
       ui.pollTimer = setTimeout(() => {
+        ui.pollTimer = null;
         fetchView().catch(fail);
       }, POLL_MS);
+    } else if (!merged.scanning && !merged.polling) {
+      polls = 0;
     }
     if (!unchanged) render();
   }

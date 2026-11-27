@@ -676,7 +676,8 @@ fn persist_claude_credentials(creds: &ClaudeCredentials) {
     };
     match &creds.source {
         ClaudeCredentialSource::Keychain { service, account } => {
-            write_keychain_secret(service, account.as_deref(), &serialized);
+            let resolved = account.clone().or_else(|| read_keychain_account(service));
+            write_keychain_secret(service, resolved.as_deref(), &serialized);
         }
         ClaudeCredentialSource::File(path) => {
             drop(write_credentials_file_atomic(path, &serialized));
@@ -709,7 +710,8 @@ fn read_claude_credentials() -> Result<Option<ClaudeCredentials>, String> {
             &raw,
             ClaudeCredentialSource::Keychain {
                 service: CLAUDE_KEYCHAIN_SERVICE,
-                account: read_keychain_account(CLAUDE_KEYCHAIN_SERVICE),
+                // Fetched lazily in `persist_claude_credentials` only when a token is refreshed.
+                account: None,
             },
         )
     {

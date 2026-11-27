@@ -61,25 +61,41 @@ export function dividers({ onNarrow }) {
     return { mapOpen: panes.mapOpen, filesOpen: panes.filesOpen };
   }
 
+  const lastProps = new Map();
+  let lastNarrow = null;
+
+  function setRootProp(root, prop, value) {
+    if (lastProps.get(prop) === value) return;
+    lastProps.set(prop, value);
+    if (value === null) root.removeProperty(prop);
+    else root.setProperty(prop, value);
+  }
+
   function drawLayout() {
     const root = document.documentElement.style;
     if (panes.layout) {
       const drawn = fit(panes.layout, panes.limits, innerWidth, options());
       for (const { id, key, prop } of Object.values(DIVIDERS)) {
-        root.setProperty(prop, `${drawn[key]}px`);
-        $(id).setAttribute("aria-valuenow", String(drawn[key]));
+        const px = `${drawn[key]}px`;
+        if (lastProps.get(prop) !== px) {
+          setRootProp(root, prop, px);
+          $(id).setAttribute("aria-valuenow", String(drawn[key]));
+        }
       }
-      root.setProperty("--sidebar-drawn-width", panes.filesOpen ? `${drawn.sidebar}px` : "0px");
+      setRootProp(root, "--sidebar-drawn-width", panes.filesOpen ? `${drawn.sidebar}px` : "0px");
       panes.narrow = drawn.narrow;
     } else if (!panes.filesOpen) {
-      root.setProperty("--sidebar-drawn-width", "0px");
+      setRootProp(root, "--sidebar-drawn-width", "0px");
     } else {
-      root.removeProperty("--sidebar-drawn-width");
+      setRootProp(root, "--sidebar-drawn-width", null);
     }
     $("divider-files").hidden = !panes.filesOpen;
     // The map's divider shows only beside the map; a narrow window shows the map alone.
     $("divider-map").hidden = !panes.mapOpen || panes.narrow;
-    onNarrow(panes.narrow);
+    if (panes.narrow !== lastNarrow) {
+      lastNarrow = panes.narrow;
+      onNarrow(panes.narrow);
+    }
   }
 
   async function saveLayout() {
@@ -91,8 +107,14 @@ export function dividers({ onNarrow }) {
 
   for (const [divider, { id }] of Object.entries(DIVIDERS)) {
     const el = $(id);
+    let dragRaf = null;
+    let dragX = 0;
     const stop = () => {
       if (panes.dragging !== divider) return;
+      if (dragRaf !== null) {
+        cancelAnimationFrame(dragRaf);
+        dragRaf = null;
+      }
       panes.dragging = null;
       el.classList.remove("active");
       document.body.classList.remove("resizing");
@@ -110,9 +132,15 @@ export function dividers({ onNarrow }) {
       if (panes.dragging !== divider) return;
       // A release outside the window can arrive without a pointerup here.
       if ((event.buttons & 1) === 0) return stop();
-      const { layout, limits } = panes;
-      const next = drag(layout, limits, divider, event.clientX, innerWidth, options());
-      setLayout(next, { save: false });
+      dragX = event.clientX;
+      if (dragRaf !== null) return;
+      dragRaf = requestAnimationFrame(() => {
+        dragRaf = null;
+        if (panes.dragging !== divider) return;
+        const { layout, limits } = panes;
+        const next = drag(layout, limits, divider, dragX, innerWidth, options());
+        setLayout(next, { save: false });
+      });
     });
     // Fires after pointerup and pointercancel, and also when the capture is lost without either:
     // a dialog opened with Cmd-, mid-drag makes the divider inert.
@@ -133,8 +161,15 @@ export function dividers({ onNarrow }) {
   }
 
   // The kept widths are fitted to the window again whenever it changes size; that is drawing,
-  // not a change of layout, so nothing is saved.
-  window.addEventListener("resize", drawLayout);
+  // not a change of layout, so nothing is saved. Coalesced to one layout per frame.
+  let resizeRaf = null;
+  window.addEventListener("resize", () => {
+    if (resizeRaf !== null) return;
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = null;
+      drawLayout();
+    });
+  });
 
   return {
     load: loadLayout,

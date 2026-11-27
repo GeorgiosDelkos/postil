@@ -713,14 +713,39 @@ pub(crate) fn check_place(repo: &Repo, home: &Path, thread: &Thread) -> Result<(
 
 /// Deletes everything in the trash folder `trash` ([`empty`]) on a background thread: freed
 /// worktrees can hold hundreds of thousands of files. A delete cut short by a quit is
-/// finished by the next call.
+/// finished by the next call. At most one thread empties a given `trash` directory at a time.
 pub(crate) fn empty_trash(trash: &Path) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
     let trash = trash.to_owned();
+    {
+        let mut guard = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.insert(trash.clone()) {
+            return;
+        }
+    }
+    let dir = trash.clone();
     let spawned = std::thread::Builder::new()
         .name("empty-trash".to_owned())
-        .spawn(move || empty(&trash));
-    // No thread: the folder stays until the next call, which is no harm.
-    drop(spawned);
+        .spawn(move || {
+            empty(&dir);
+            let mut guard = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&dir);
+        });
+    if spawned.is_err() {
+        // No thread: release the slot so the next call retries.
+        let mut guard = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&trash);
+    }
 }
 
 /// Deletes everything in the folder `trash`, keeping the folder. Errors are ignored: what is

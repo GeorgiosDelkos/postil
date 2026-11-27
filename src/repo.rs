@@ -1251,7 +1251,10 @@ fn rev_parse_path(dir: &Path, search: Search, option: &str) -> Result<PathBuf> {
 fn run_git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
     // A file name that is not UTF-8 is shown with replacement characters and then fails to
     // open. Accepted: the page and its JSON are UTF-8, so such a name cannot round-trip.
-    run_git_bytes(dir, index, args).map(|out| String::from_utf8_lossy(&out).into_owned())
+    run_git_bytes(dir, index, args).map(|out| {
+        String::from_utf8(out)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    })
 }
 
 /// [`run_git`], returning the bytes git printed.

@@ -82,7 +82,12 @@ export function usageBar({ stripEl, popoverEl, warnDotEl, openUsage }) {
 
     clearTimeout(ui.pollTimer);
     ui.pollTimer = null;
-    if (!fromDialog && (merged.scanning || merged.polling) && ui.polls < MAX_POLLS) {
+    if (
+      !fromDialog &&
+      (merged.scanning || merged.polling) &&
+      ui.polls < MAX_POLLS &&
+      !document.hidden
+    ) {
       ui.polls += 1;
       ui.pollTimer = setTimeout(() => {
         ui.pollTimer = null;

@@ -3264,7 +3264,7 @@ fn undo_read_only(runner: &Runner, run: &Run, thread: Option<&Thread>) -> Option
         )
     })()
     .unwrap_or(true);
-    if !moved && run.state().work().diffs.is_empty() {
+    if !moved && !run.state().has_completed_diffs() {
         return None;
     }
     match tree.reset_to(&thread.branch, &thread.tip) {
@@ -3329,11 +3329,16 @@ struct Kept {
 fn thread_files(thread: &[Arc<Run>], mode: Mode) -> Vec<String> {
     match mode {
         Mode::Work => {
-            let diffs: Vec<Diff> = thread
-                .iter()
-                .flat_map(|run| run.state().work().diffs)
-                .collect();
-            edited_files(&diffs)
+            let mut seen = std::collections::HashSet::new();
+            let mut files = Vec::new();
+            for run in thread {
+                for path in run.state().edited_paths() {
+                    if seen.insert(path.clone()) {
+                        files.push(path);
+                    }
+                }
+            }
+            files
         }
         Mode::Read => Vec::new(),
     }

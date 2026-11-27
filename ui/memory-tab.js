@@ -123,15 +123,17 @@ export function memoryTab({ panelEl, headerEl, currentFile, openMemory, openSett
   }
 
   // Refresh: pulls the team's latest notes, then drops what was kept and asks again.
+  let stopRefresh = null;
   function startRefresh() {
     if (refreshing) return;
     refreshing = true;
     refresh.disabled = true;
     status.textContent = "Refreshing…";
-    pollMemory("api/memory/refresh", {
+    stopRefresh = pollMemory("api/memory/refresh", {
       method: "POST",
       onReply: (reply) => {
         if (reply.state === "pending") return;
+        stopRefresh = null;
         refreshing = false;
         refresh.disabled = false;
         status.textContent = replyProblem(reply) ?? "";
@@ -150,6 +152,12 @@ export function memoryTab({ panelEl, headerEl, currentFile, openMemory, openSett
     hide() {
       shown = false;
       stopAsking();
+      if (stopRefresh) {
+        stopRefresh();
+        stopRefresh = null;
+        refreshing = false;
+        refresh.disabled = false;
+      }
     },
     fileOpened: recall,
     // A memory was saved: what was kept may lack it, as the server's recalls did (src/memory.rs,

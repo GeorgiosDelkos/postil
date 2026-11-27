@@ -2,7 +2,7 @@
 // text, the best fuzzy matches. ui/tree.js and ui/fuzzy.js have the rules.
 
 import { el, icon, showToast } from "./dom.js";
-import { rank } from "./fuzzy.js";
+import { preparePaths, rank } from "./fuzzy.js";
 import { fileIcon, folderIcon } from "./icons.js";
 import { ancestors, folderCounts, visibleRows } from "./tree.js";
 
@@ -66,10 +66,18 @@ export function fileList({
     container.replaceChildren(fragment);
   }
 
+  // Cached pre-lowercased file paths for fuzzy filtering, refreshed when `state.repo.files` changes.
+  let preparedSource = null;
+  let preparedFiles = [];
+
   // With a filter: a flat list of the best fuzzy matches, with the matched characters marked.
   // The row at `activeMatch` is the one Enter opens.
   function filteredFileRows(needle) {
-    const matches = rank(needle, state.repo.files, MAX_MATCHES);
+    if (preparedSource !== state.repo.files) {
+      preparedSource = state.repo.files;
+      preparedFiles = preparePaths(preparedSource);
+    }
+    const matches = rank(needle, preparedFiles, MAX_MATCHES);
     activeMatch = Math.min(activeMatch, Math.max(0, matches.length - 1));
     return matches.map(({ path, positions }, index) => {
       const row = fileRow(path, markedPath(path, positions));
@@ -79,13 +87,24 @@ export function fileList({
     });
   }
 
-  // `path` as a label with the characters at `positions` wrapped in <mark>.
+  // `path` as a label with contiguous runs of matched characters wrapped in <mark>.
   function markedPath(path, positions) {
     const label = el("span", "name");
-    const marked = new Set(positions);
-    for (let index = 0; index < path.length; index += 1) {
-      label.append(marked.has(index) ? el("mark", "", path[index]) : path[index]);
+    let cursor = 0;
+    let i = 0;
+    while (i < positions.length) {
+      const start = positions[i];
+      if (start > cursor) label.append(path.slice(cursor, start));
+      let end = start + 1;
+      while (i + 1 < positions.length && positions[i + 1] === end) {
+        i += 1;
+        end += 1;
+      }
+      label.append(el("mark", "", path.slice(start, end)));
+      cursor = end;
+      i += 1;
     }
+    if (cursor < path.length) label.append(path.slice(cursor));
     return label;
   }
 
@@ -99,6 +118,7 @@ export function fileList({
       // Files get an empty chevron slot, so names line up with their folder's siblings.
       if (row.kind === "file") button.prepend(el("span", "chevron"), icon(fileIcon(row.name)));
       button.style.paddingLeft = `${INDENT_BASE + INDENT * row.depth}px`;
+      button.tabIndex = -1;
       button.setAttribute("role", "treeitem");
       button.setAttribute("aria-level", String(row.depth + 1));
       return button;
@@ -136,11 +156,11 @@ export function fileList({
 
   // One row of the tree is in the Tab order; the arrow keys move between rows (the ARIA tree
   // pattern). Without this, Tab would stop on every visible file.
+  let tabStopRow = null;
   function setTabStop(row) {
-    for (const other of filesEl.querySelectorAll(".file, .dir")) {
-      if (other !== row) other.tabIndex = -1;
-    }
-    if (row) row.tabIndex = 0;
+    if (tabStopRow && tabStopRow !== row && tabStopRow.isConnected) tabStopRow.tabIndex = -1;
+    tabStopRow = row ?? null;
+    if (tabStopRow) tabStopRow.tabIndex = 0;
   }
 
   function setFolderOpen(path, open) {
@@ -246,26 +266,35 @@ export function fileList({
   // folder, or moves into an open one; left closes an open folder, or moves to the parent.
   // Enter and Space are the buttons' own: open the file, or toggle the folder.
   filesEl.addEventListener("keydown", (event) => {
+    const key = event.key;
+    if (
+      key !== "ArrowDown" &&
+      key !== "ArrowUp" &&
+      key !== "Home" &&
+      key !== "End" &&
+      key !== "ArrowRight" &&
+      key !== "ArrowLeft"
+    ) {
+      return;
+    }
     const row = event.target.closest(".file, .dir");
     if (!row || filesEl.getAttribute("role") !== "tree") return;
 
-    const rows = [...filesEl.querySelectorAll(".file, .dir")];
-    const index = rows.indexOf(row);
     const path = row.dataset.path;
     const folder = row.classList.contains("dir");
     const open = row.getAttribute("aria-expanded") === "true";
 
-    if (event.key === "ArrowDown") rows[index + 1]?.focus();
-    else if (event.key === "ArrowUp") rows[index - 1]?.focus();
-    else if (event.key === "Home") rows[0]?.focus();
-    else if (event.key === "End") rows.at(-1)?.focus();
-    else if (event.key === "ArrowRight" && folder && !open) setFolderOpen(path, true);
-    else if (event.key === "ArrowRight" && folder) rows[index + 1]?.focus();
-    else if (event.key === "ArrowLeft" && folder && open) setFolderOpen(path, false);
-    else if (event.key === "ArrowLeft") {
+    if (key === "ArrowDown") row.nextElementSibling?.focus();
+    else if (key === "ArrowUp") row.previousElementSibling?.focus();
+    else if (key === "Home") filesEl.firstElementChild?.focus();
+    else if (key === "End") filesEl.lastElementChild?.focus();
+    else if (key === "ArrowRight" && folder && !open) setFolderOpen(path, true);
+    else if (key === "ArrowRight" && folder) row.nextElementSibling?.focus();
+    else if (key === "ArrowLeft" && folder && open) setFolderOpen(path, false);
+    else if (key === "ArrowLeft") {
       const parent = ancestors(path).at(-1);
       if (parent !== undefined) filesEl.querySelector(rowSelector(parent))?.focus();
-    } else return;
+    }
     event.preventDefault();
   });
 

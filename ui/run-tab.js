@@ -222,41 +222,63 @@ export function runTab({ store, dialog, panelEl, headerEl, statusEl }) {
   // click while the run streams.
   function renderHeader() {
     const run = store.run();
-    clearInterval(clock);
-    clock = null;
     if (!run) {
+      clearInterval(clock);
+      clock = null;
       header = null;
       headerEl.replaceChildren();
       return;
     }
     const key = stopKey(run);
+    const { text, tone } = statusLine(run);
+    const wordText = statusWord(run);
+    const icon = iconKind(run);
+    const titleSig = `${run.id}|${wordText}|${tone}|${icon}`;
     if (!header || header.key !== key) {
-      header = { key, title: el("span", "run-title"), stop: key === null ? null : stopButton() };
+      clearInterval(clock);
+      clock = null;
+      header = {
+        key,
+        titleSig: null,
+        title: el("span", "run-title"),
+        time: el("span", "run-time"),
+        stop: key === null ? null : stopButton(),
+      };
       headerEl.replaceChildren(header.title, ...(header.stop ? [header.stop.button] : []));
     }
-    const { text, tone } = statusLine(run);
     header.title.title = `${run.id} · ${run.agent} · ${text}`;
-    const time = el("span", "run-time");
-    // Reads the store on each tick, not `run`: a sync replaces the run before it draws again.
     const tick = () => {
+      if (document.hidden) return;
       const now = store.run();
-      if (isLive(now)) time.textContent = ` · ${elapsed(Date.now() / 1000 - now.startedAt)}`;
+      if (isLive(now) && header) {
+        header.time.textContent = ` · ${elapsed(Date.now() / 1000 - now.startedAt)}`;
+      }
     };
+    if (header.titleSig !== titleSig) {
+      header.titleSig = titleSig;
+      const word = el("strong", `run-word tone-${tone}`, wordText);
+      header.title.replaceChildren(statusIcon(icon), word, header.time);
+    }
     tick();
-    const word = el("strong", `run-word tone-${tone}`, statusWord(run));
-    header.title.replaceChildren(statusIcon(iconKind(run)), word, time);
     const stopping = isLive(run) && run.status === "cancelling";
     if (!stopping) forceAt = null;
     // The Rust process says how long until it would force the agent, so a reloaded page
     // offers Force stop as soon as the process would act on it.
     else forceAt ??= Date.now() + (run.forceIn ?? 0);
     const { stop: button } = header;
-    if (!button) return;
+    if (!button) {
+      clearInterval(clock);
+      clock = null;
+      return;
+    }
     button.label();
-    clock = setInterval(() => {
-      tick();
-      button.label();
-    }, 1000);
+    if (!clock) {
+      clock = setInterval(() => {
+        if (document.hidden) return;
+        tick();
+        header?.stop?.label();
+      }, 1000);
+    }
   }
 
   // The header's Stop, for the live run: `label()` sets its word and whether it can be

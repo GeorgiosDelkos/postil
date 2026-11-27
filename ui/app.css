@@ -7,6 +7,7 @@
   font-family: "Geist";
   src: url("fonts/Geist-Variable.woff2") format("woff2");
   font-weight: 100 900;
+  font-display: swap;
 }
 
 /* Geist Mono's ligatures are off wherever it is used: they change the shape of operators a
@@ -19,6 +20,7 @@
   font-family: "Geist Mono";
   src: url("fonts/GeistMono-Variable.woff2") format("woff2");
   font-weight: 100 900;
+  font-display: swap;
   font-feature-settings: "liga" 0;
 }
 
@@ -419,6 +421,7 @@ body.files-collapsed .sidebar {
   font: inherit;
   text-align: left;
   white-space: nowrap;
+  contain: layout style;
   transition: background-color 80ms linear;
   /* No `content-visibility: auto` here, though it would skip painting rows off screen. With
      it, WebKit stopped painting the row of a folder just opened once a file inside it was
@@ -573,6 +576,7 @@ body.files-collapsed .sidebar {
   display: flex;
   height: var(--line-height);
   line-height: var(--line-height);
+  contain: layout style;
 }
 
 /* The + that a hovered line number shows: click it to add a note on that line. It sits at
@@ -1414,8 +1418,6 @@ button.repo-name:hover {
 
 .settings::backdrop {
   background: var(--scrim);
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
 }
 
 /* min-width 0: a flex item is otherwise as wide as its longest unbreakable line, and a
@@ -2125,8 +2127,6 @@ body.keyboard-input .slot-add:focus-visible {
 
 .wizard::backdrop {
   background: var(--scrim);
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
 }
 
 /* min-width 0 as for `.settings-panel`. */
@@ -3361,8 +3361,6 @@ body.resizing * {
 
 .note-dialog::backdrop {
   background: var(--scrim);
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
 }
 
 .note-dialog-header {
@@ -3856,6 +3854,8 @@ body.keyboard-input .changes-view:focus-visible {
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300px;
 }
 
 .changes-file-head {
@@ -3903,6 +3903,7 @@ body.keyboard-input .changes-view:focus-visible {
   display: grid;
   grid-template-columns: 4ch 4ch 2ch 1fr;
   font: 12.5px/1.6 var(--font-mono);
+  contain: layout style;
 }
 
 .changes-line.add {
@@ -3991,6 +3992,8 @@ button.changes-number:focus-visible {
   margin-bottom: 22px;
   padding-left: 10px;
   border-left: 2px solid var(--border);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300px;
 }
 
 .changes-step[aria-current="step"] {

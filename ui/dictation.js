@@ -205,7 +205,14 @@ export function attachDictation(input, { onError = showToast } = {}) {
     }
   }
 
+  let levelRaf = null;
+  let pendingLevel = 0;
+
   function cleanup() {
+    if (levelRaf !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(levelRaf);
+      levelRaf = null;
+    }
     if (unsubscribe) {
       unsubscribe();
       unsubscribe = null;
@@ -245,8 +252,15 @@ export function attachDictation(input, { onError = showToast } = {}) {
     if (event.type === "transcript") {
       applyTranscript(event.text ?? "", Boolean(event.isFinal));
     } else if (event.type === "level") {
-      const clamped = Math.max(0, Math.min(1, Number(event.level) || 0));
-      meter.style.setProperty("--level", String(clamped));
+      pendingLevel = Math.max(0, Math.min(1, Number(event.level) || 0));
+      if (levelRaf === null && typeof requestAnimationFrame === "function") {
+        levelRaf = requestAnimationFrame(() => {
+          levelRaf = null;
+          meter.style.setProperty("--level", String(pendingLevel));
+        });
+      } else if (typeof requestAnimationFrame !== "function") {
+        meter.style.setProperty("--level", String(pendingLevel));
+      }
     } else if (event.type === "state") {
       if (event.state === "denied" || event.state === "restricted") {
         pendingStart = null;
@@ -301,11 +315,12 @@ export function attachDictation(input, { onError = showToast } = {}) {
       dialogCleanup = () => dialog.removeEventListener("close", onClose);
     }
 
-    if (typeof MutationObserver !== "undefined" && document.body) {
+    const observeRoot = dialog ?? input.parentElement ?? document.body;
+    if (typeof MutationObserver !== "undefined" && observeRoot) {
       observer = new MutationObserver(() => {
         if (!input.isConnected) cancel();
       });
-      observer.observe(document.body, { childList: true, subtree: true });
+      observer.observe(observeRoot, { childList: true, subtree: observeRoot !== document.body });
     }
 
     const context = contextProvider();

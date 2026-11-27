@@ -4,7 +4,10 @@ use super::*;
 
 /// Waits until the open project's index has finished the passes asked for so far.
 fn wait_for_index(site: &Site) {
-    let project = site.project.borrow();
+    let project = site
+        .project
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     project
         .as_ref()
         .expect("a project is open")

@@ -190,7 +190,7 @@ pub(super) struct RunState {
     pub(super) header: Header,
     entries: Vec<Entry>,
     /// The log, open for appending while live; `None` after it ended or a write failed.
-    log: Option<File>,
+    log: Option<std::io::BufWriter<File>>,
     /// The exclusive lock on its thread's `threads/<id>.lock` ([`hold_thread_lock`]), held
     /// from the run's creation until it ends: whether it is held is whether the run is live
     /// (`RunState::live`). A log read from disk has none.
@@ -704,9 +704,18 @@ impl Run {
             if fs::metadata(&file).is_ok_and(|meta| meta.len() == 0) {
                 continue;
             }
+            match read_header(&file) {
+                Ok(header) if header.analysis.is_some() || header.remember.is_some() => continue,
+                Ok(_) => {}
+                Err(problem) => {
+                    skipped.get_or_insert(format!(
+                        "{} is not shown: {problem} (move it aside to hide this)",
+                        file.display()
+                    ));
+                    continue;
+                }
+            }
             match Self::read(&file) {
-                Ok(run) if run.state().header.analysis.is_some() => {}
-                Ok(run) if run.state().header.remember.is_some() => {}
                 Ok(run) => {
                     if let Some(skipped) = skipped {
                         run.state().problem.get_or_insert(skipped);
@@ -817,15 +826,19 @@ impl Run {
     /// Appends `entry` to the log and to `state`, which the caller holds. Returns how the run
     /// ended when `entry` ended it.
     fn write(&self, state: &mut RunState, entry: Entry) -> Option<RunOutcome> {
-        if let Some(log) = &mut state.log
-            && let Err(error) = log.write_all(&json_line(&entry))
-        {
-            state.log = None;
-            state.problem.get_or_insert(format!(
-                "the run log {} could not be written, so this run will not be shown whole after \
-                 a restart: {error}",
-                self.file.display()
-            ));
+        let flush = !matches!(entry, Entry::Message { .. } | Entry::Thought { .. });
+        if let Some(log) = &mut state.log {
+            let result = log
+                .write_all(&json_line(&entry))
+                .and_then(|()| if flush { log.flush() } else { Ok(()) });
+            if let Err(error) = result {
+                state.log = None;
+                state.problem.get_or_insert(format!(
+                    "the run log {} could not be written, so this run will not be shown whole after \
+                     a restart: {error}",
+                    self.file.display()
+                ));
+            }
         }
         let outcome = state.apply(&entry);
         state.entries.push(entry);
@@ -1063,7 +1076,7 @@ impl RunState {
         Self {
             header,
             entries: Vec::new(),
-            log,
+            log: log.map(std::io::BufWriter::new),
             lock,
             started: false,
             cancel_requested: false,
@@ -1141,33 +1154,7 @@ impl RunState {
     /// finished tool calls, each call's last report, in the order the calls were made, and
     /// the author's report when it gave one.
     pub(super) fn work(&self) -> Work {
-        let mut calls: Vec<(&str, &[Output], bool)> = Vec::new();
-        for entry in &self.entries {
-            match entry {
-                Entry::Tool {
-                    id, status, output, ..
-                } => {
-                    let done = *status == ToolCallStatus::Completed;
-                    match calls.iter_mut().find(|call| call.0 == id) {
-                        Some(call) => *call = (id, output, done),
-                        None => calls.push((id, output, done)),
-                    }
-                }
-                Entry::ToolUpdate {
-                    id, status, output, ..
-                } => {
-                    if let Some(call) = calls.iter_mut().find(|call| call.0 == id) {
-                        if let Some(output) = output {
-                            call.1 = output;
-                        }
-                        if let Some(status) = status {
-                            call.2 = *status == ToolCallStatus::Completed;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let calls = self.tool_calls();
         let diffs = calls
             .into_iter()
             .filter(|call| call.2)
@@ -1196,6 +1183,65 @@ impl RunState {
             report,
             memories: MemoryBlock::default(),
         }
+    }
+
+    /// Whether any completed tool call produced a diff, without cloning diff bodies or building
+    /// the full reply.
+    pub(super) fn has_completed_diffs(&self) -> bool {
+        self.tool_calls()
+            .into_iter()
+            .filter(|call| call.2)
+            .flat_map(|call| call.1)
+            .any(|output| matches!(output, Output::Diff { .. }))
+    }
+
+    /// The file paths of diffs from completed tool calls, in call order, without cloning diff
+    /// bodies or building the reply.
+    pub(super) fn edited_paths(&self) -> Vec<String> {
+        self.tool_calls()
+            .into_iter()
+            .filter(|call| call.2)
+            .flat_map(|call| call.1)
+            .filter_map(|output| match output {
+                Output::Diff { path, .. } => Some(path.clone()),
+                Output::Text { .. } => None,
+            })
+            .collect()
+    }
+
+    fn tool_calls(&self) -> Vec<(&str, &[Output], bool)> {
+        let mut calls: Vec<(&str, &[Output], bool)> = Vec::new();
+        let mut index_by_id: HashMap<&str, usize> = HashMap::new();
+        for entry in &self.entries {
+            match entry {
+                Entry::Tool {
+                    id, status, output, ..
+                } => {
+                    let done = *status == ToolCallStatus::Completed;
+                    if let Some(&idx) = index_by_id.get(id.as_str()) {
+                        calls[idx] = (id, output, done);
+                    } else {
+                        index_by_id.insert(id.as_str(), calls.len());
+                        calls.push((id, output, done));
+                    }
+                }
+                Entry::ToolUpdate {
+                    id, status, output, ..
+                } => {
+                    if let Some(&idx) = index_by_id.get(id.as_str()) {
+                        let call = &mut calls[idx];
+                        if let Some(output) = output {
+                            call.1 = output;
+                        }
+                        if let Some(status) = status {
+                            call.2 = *status == ToolCallStatus::Completed;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls
     }
 
     /// Whether this process runs the run and it has not ended.
@@ -1490,8 +1536,14 @@ pub(super) fn run_numbers(dir: &Path) -> io::Result<Vec<u64>> {
 /// The number of the run id `R7`. Written back and compared, so `R07` or `R+7` is no id: it
 /// would name another log than its own, or none.
 pub(super) fn run_number(id: &str) -> Option<u64> {
-    let number = id.strip_prefix('R')?.parse::<u64>().ok()?;
-    (format!("R{number}") == id).then_some(number)
+    let rest = id.strip_prefix('R')?;
+    if rest.is_empty()
+        || (rest.len() > 1 && rest.starts_with('0'))
+        || !rest.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    rest.parse().ok()
 }
 
 /// A run log's first line, its header. The version is read on its own first: a newer header
@@ -1808,7 +1860,7 @@ mod tests {
         let run = create(&dir, "p");
         let written = fs::read(&run.file).unwrap();
         // A log that refuses writes, as a full disk would.
-        run.state().log = Some(File::open(&run.file).unwrap());
+        run.state().log = Some(std::io::BufWriter::new(File::open(&run.file).unwrap()));
 
         run.record(Entry::Started);
         run.record(Entry::Thought {
