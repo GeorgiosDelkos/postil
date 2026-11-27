@@ -5454,3 +5454,67 @@ body.keyboard-input .map-node:focus .map-node-box {
 .node-edge-code {
   color: var(--text-muted);
 }
+
+/* Dictation widget (ui/dictation.js, docs/review-assist.md, "Dictation"). */
+.dictation-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  color: var(--text-muted);
+}
+
+.dictation-btn:hover {
+  color: var(--text);
+}
+
+.dictation-btn.recording {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.dictation-btn.stopping {
+  opacity: 0.7;
+}
+
+.dictation-icon {
+  display: block;
+  flex-shrink: 0;
+}
+
+.dictation-meter {
+  display: none;
+  width: 6px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--accent);
+  transform-origin: bottom center;
+  transform: scaleY(calc(0.25 + var(--level, 0) * 0.75));
+  transition: transform 60ms linear;
+}
+
+.dictation-btn.recording .dictation-meter {
+  display: inline-block;
+}
+
+.dictation-field,
+.question-input-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.dictation-field > .field,
+.question-input-wrap > .field {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dictation-meter {
+    transform: none;
+    transition: none;
+    height: 6px;
+    border-radius: 50%;
+  }
+}

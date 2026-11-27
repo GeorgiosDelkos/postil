@@ -1,6 +1,7 @@
 // The form that answers an agent's question, shared by the note and run dialogs. ui/question.js
 // has the rules that read the question's fields and build the answer.
 
+import { attachDictation } from "./dictation.js";
 import { el } from "./dom.js";
 import { questionContent, questionFields } from "./question.js";
 import { foldRun, isLive, openQuestion } from "./run.js";
@@ -109,6 +110,12 @@ function fieldView(field, index, values) {
   input.addEventListener("input", () => {
     values[field.key] = input.value;
   });
-  part.append(input);
+  if (field.kind === "text") {
+    const wrap = el("div", "question-input-wrap");
+    wrap.append(input, attachDictation(input).button);
+    part.append(wrap);
+  } else {
+    part.append(input);
+  }
   return part;
 }

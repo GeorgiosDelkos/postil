@@ -12,6 +12,7 @@ import { codeView } from "./code-view.js";
 import { contextMenu } from "./context-menu.js";
 import { diagramView } from "./diagram-view.js";
 import { fileMarks } from "./diagram.js";
+import { setDictationContext } from "./dictation.js";
 import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
@@ -787,6 +788,18 @@ function showRepo(repo) {
 // - `menu`, with the id of a menu bar command (src/menu.rs, `Command::id`). The page runs
 //   them, so they share its guards, such as a draft note blocking Quit.
 // - `dictation`, the bridge to native on-device speech recognition (`src/dictation.rs`).
+setDictationContext(() => {
+  const words = new Set();
+  if (state.file?.path) {
+    words.add(state.file.path);
+    const base = state.file.path.split("/").at(-1);
+    if (base) words.add(base);
+  }
+  for (const label of map.nodeLabels()) {
+    if (label) words.add(label);
+  }
+  return [...words];
+});
 const dictationListeners = new Set();
 window.postil = {
   openFolder: (path) => {

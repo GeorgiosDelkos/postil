@@ -4,6 +4,7 @@
 import { definitionsDialog } from "./definitions-dialog.js";
 import { NO_DEFINITION, jumpHistory, nameAt } from "./definitions.js";
 import { askWarning } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import { $, el, showToast } from "./dom.js";
 import { onLines } from "./note-place.js";
 import { shouldReveal } from "./tree.js";
@@ -974,6 +975,8 @@ export function codeView({
     }
 
     const textarea = node.querySelector("textarea");
+    const dictation = attachDictation(textarea);
+    node.querySelector(".buttons").prepend(dictation.button);
     textarea.addEventListener("input", () => {
       composer.text = textarea.value;
       // Grow with the text, then tell the virtual list the new height.

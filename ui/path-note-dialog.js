@@ -6,6 +6,7 @@
 // the default agent at once.
 
 import { askWarning } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import { el, icon } from "./dom.js";
 import { fileIcon, folderIcon } from "./icons.js";
 
@@ -112,7 +113,15 @@ export function pathNoteDialog(dialogEl, { add, ask, uncommitted, openSend }) {
       : "Keeps the note in the tray, to send when you choose.";
     save.addEventListener("click", () => submit(input, why));
 
-    foot.append(el("span", "hint", "esc discard"), el("span", "spacer"), why, discard, save);
+    const dictation = attachDictation(input);
+    foot.append(
+      el("span", "hint", "esc discard"),
+      el("span", "spacer"),
+      why,
+      dictation.button,
+      discard,
+      save,
+    );
     return foot;
   }
 

@@ -2847,3 +2847,68 @@ test("a hunk a change map node opened stays whole when the changes are drawn aga
   await page.locator('[data-key="changes-risk-eyes"][aria-checked="true"]').waitFor();
   await whole();
 });
+
+test("dictation widget replaces partial text in place and keeps surrounding text", async (t) => {
+  const { page } = await openProject(t);
+  await page.locator('#files .dir[data-path="src"]').click();
+  await page.locator('#files .file[data-path="src/a.rs"]').click();
+  await page.locator("#code-rows .ln .n").first().click();
+  await page.keyboard.press("c");
+  const textarea = page.locator(".composer textarea");
+  await textarea.waitFor();
+  await textarea.fill("before  after");
+  await textarea.evaluate((el) => el.setSelectionRange(7, 7));
+
+  await page.locator(".composer .dictation-btn").click();
+  await page.evaluate(() => {
+    window.postil.dictation.emit({ type: "state", state: "listening" });
+    window.postil.dictation.emit({ type: "level", level: 0.6 });
+    window.postil.dictation.emit({ type: "transcript", text: "first", isFinal: false });
+  });
+  assert.equal(await textarea.inputValue(), "before first after");
+
+  // A growing partial replaces the earlier partial while preserving surrounding text.
+  await page.evaluate(() => {
+    window.postil.dictation.emit({ type: "transcript", text: "first draft", isFinal: false });
+  });
+  assert.equal(await textarea.inputValue(), "before first draft after");
+
+  // A final transcript commits and transitions back to idle.
+  await page.evaluate(() => {
+    window.postil.dictation.emit({ type: "transcript", text: "final words", isFinal: true });
+    window.postil.dictation.emit({ type: "state", state: "idle" });
+  });
+  assert.equal(await textarea.inputValue(), "before final words after");
+  assert.equal(
+    await page.locator(".composer .dictation-btn").getAttribute("aria-pressed"),
+    "false",
+  );
+});
+
+test("dictation widget handles dialog close and IME composition cleanly", async (t) => {
+  const { page } = await openProject(t);
+  await page.locator('#files .dir[data-path="src"]').click();
+  await page.locator('#files .file[data-path="src/a.rs"]').click();
+  await page.locator("#code-rows .ln .n").first().click();
+  await page.keyboard.press("c");
+  const textarea = page.locator(".composer textarea");
+  await textarea.waitFor();
+
+  // IME composition defers a final transcript + idle until compositionend.
+  await page.locator(".composer .dictation-btn").click();
+  await page.evaluate(() => {
+    const area = document.querySelector(".composer textarea");
+    window.postil.dictation.emit({ type: "state", state: "listening" });
+    area.dispatchEvent(new Event("compositionstart"));
+    window.postil.dictation.emit({ type: "transcript", text: "after ime", isFinal: true });
+    window.postil.dictation.emit({ type: "state", state: "idle" });
+  });
+  assert.equal(await textarea.inputValue(), "", "deferred while composing");
+  await page.evaluate(() => {
+    const area = document.querySelector(".composer textarea");
+    area.value = "漢 ";
+    area.setSelectionRange(2, 2);
+    area.dispatchEvent(new Event("compositionend"));
+  });
+  assert.equal(await textarea.inputValue(), "漢 after ime");
+});

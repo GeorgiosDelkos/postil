@@ -8,6 +8,7 @@
 // (dialog-parts.js, `fillMarkdown`), never as HTML.
 
 import { fillMarkdown } from "./dialog-parts.js";
+import { attachDictation } from "./dictation.js";
 import {
   anchorPlace,
   arrowTarget,
@@ -180,7 +181,8 @@ export function diagramView({
   flowInput.setAttribute("aria-label", "A flow to trace");
   const flowTrace = el("button", "button map-flow-trace", "Trace");
   flowTrace.type = "submit";
-  flowForm.append(flowFrom, flowInput, flowTrace);
+  const flowDictation = attachDictation(flowInput);
+  flowForm.append(flowFrom, flowInput, flowDictation.button, flowTrace);
   const flowProblem = el("p", "map-flow-problem");
   const flowList = el("div", "map-flow-list");
   flows.append(flowForm, flowProblem, flowList);
@@ -1637,7 +1639,10 @@ export function diagramView({
       if (view.shown === shown) return;
       view.shown = shown;
       onChange();
-      if (!shown) return;
+      if (!shown) {
+        flowDictation.cancel();
+        return;
+      }
       render();
       ensureDagre();
       load().catch((error) => onError(String(error)));
@@ -1656,6 +1661,8 @@ export function diagramView({
     isShown: () => view.shown,
     // The id of the diagram the map shows, or null while it is hidden.
     openDiagramId: () => (view.shown ? (current()?.id ?? null) : null),
+    // Labels of the nodes in the currently open diagram, for dictation contextualStrings.
+    nodeLabels: () => (view.shown ? (current()?.nodes?.map((node) => node.label) ?? []) : []),
     revealNode,
     followCode,
     focus,
