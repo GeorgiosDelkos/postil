@@ -12,6 +12,9 @@ export const CODE_MIN = 420;
 // side by side. A window with no room for both at their least shows one of them, whole.
 export const MAP_MIN = 320;
 
+// The fixed width of the left icon activity bar (Files, Map, Usage, Settings).
+export const RAIL_WIDTH = 48;
+
 // The fixed space around the panes: the body's two 8 px gaps between three columns, and its
 // 8 px right padding (app.css, body). The map shares the code pane's box, so it adds none.
 export const GAPS = 24;
@@ -23,25 +26,28 @@ export const BIG_STEP = 64;
 const clamp = (value, [min, max]) => Math.min(Math.max(value, min), max);
 
 // Whether a window `width` px wide is too narrow to show the map and the code side by side,
-// each at its least, beside the file list and the tray at theirs: the map then takes the whole
-// code pane, and Cmd-Shift-M switches between it and the code.
-function tooNarrow(limits, width) {
-  return width < limits.sidebar[0] + limits.tray[0] + MAP_MIN + CODE_MIN + GAPS;
+// each at its least, beside the activity bar, the file list (while open) and the tray at theirs:
+// the map then takes the whole code pane, and Cmd-Shift-M switches between it and the code.
+function tooNarrow(limits, width, { filesOpen = true } = {}) {
+  const sidebarMin = filesOpen ? limits.sidebar[0] : 0;
+  return width < RAIL_WIDTH + sidebarMin + limits.tray[0] + MAP_MIN + CODE_MIN + GAPS;
 }
 
 // The widths to draw for `layout` in a window `width` px wide, and whether the map is too
 // narrow to share the code pane (`narrow`). The code pane keeps CODE_MIN, and the map, while
-// open, its least too: the tray gives way first, then the map, then the file list, none below
-// its minimum. A window too narrow even for that draws the minimums, and the code pane is
-// what shrinks. A narrow window shows one of the map and the code at a time, so the side panes
-// leave room for the code alone, whichever shows: switching moves no pane.
-export function fit(layout, limits, width, { mapOpen = false } = {}) {
-  const narrow = mapOpen && tooNarrow(limits, width);
+// open, its least too: the tray gives way first, then the map, then the file list (while open),
+// none below its minimum. A window too narrow even for that draws the minimums, and the code
+// pane is what shrinks. A narrow window shows one of the map and the code at a time, so the side
+// panes leave room for the code alone, whichever shows: switching moves no pane.
+export function fit(layout, limits, width, { mapOpen = false, filesOpen = true } = {}) {
+  const narrow = mapOpen && tooNarrow(limits, width, { filesOpen });
   const sideBySide = mapOpen && !narrow;
   let sidebar = clamp(layout.sidebar, limits.sidebar);
   let tray = clamp(layout.tray, limits.tray);
   let map = clamp(layout.map, limits.map);
-  let excess = sidebar + tray + (sideBySide ? map : 0) + CODE_MIN + GAPS - width;
+  const sidebarUsed = filesOpen ? sidebar : 0;
+  let excess =
+    RAIL_WIDTH + sidebarUsed + tray + (sideBySide ? map : 0) + CODE_MIN + GAPS - width;
   const give = (current, min) => {
     const given = Math.max(0, Math.min(excess, current - min));
     excess -= given;
@@ -49,7 +55,7 @@ export function fit(layout, limits, width, { mapOpen = false } = {}) {
   };
   tray = give(tray, limits.tray[0]);
   if (sideBySide) map = give(map, limits.map[0]);
-  sidebar = give(sidebar, limits.sidebar[0]);
+  if (filesOpen) sidebar = give(sidebar, limits.sidebar[0]);
   return { sidebar, tray, map, narrow };
 }
 
@@ -59,13 +65,15 @@ export function fit(layout, limits, width, { mapOpen = false } = {}) {
 // the tray only what the drawn file list and map leave. A moved pane is kept at what is
 // drawn, so the saved width is the one the owner saw, and every key press moves the divider.
 function widest(layout, limits, width, options) {
+  const filesOpen = options.filesOpen ?? true;
   const drawn = fit(layout, limits, width, options);
+  const drawnSidebar = filesOpen ? drawn.sidebar : 0;
   const map = options.mapOpen && !drawn.narrow;
-  const room = width - CODE_MIN - GAPS;
+  const room = width - RAIL_WIDTH - CODE_MIN - GAPS;
   return {
     sidebar: Math.min(limits.sidebar[1], room - limits.tray[0] - (map ? limits.map[0] : 0)),
-    map: Math.min(limits.map[1], room - drawn.sidebar - limits.tray[0]),
-    tray: Math.min(limits.tray[1], room - drawn.sidebar - (map ? drawn.map : 0)),
+    map: Math.min(limits.map[1], room - drawnSidebar - limits.tray[0]),
+    tray: Math.min(limits.tray[1], room - drawnSidebar - (map ? drawn.map : 0)),
   };
 }
 
@@ -90,18 +98,18 @@ function moved(layout, limits, width, options, divider, value) {
 }
 
 // The layout once `divider` is dragged to `x`, the pointer's distance from the window's left
-// edge, in a window `width` px wide, with the map open or not (`options`, as `fit`). The
-// pointer holds the divider's centre: half a gap right of the file list, on the map's right
-// border, half a gap left of the tray. The tray is what lies right of the pointer, less the
-// body's right padding and half a gap. The list stops at its minimum, which still shows the
-// Settings button whole: the owner asked on 2026-11-23 for no narrower list, and no folded
-// rail.
+// edge, in a window `width` px wide, with the map and file list open or not (`options`, as
+// `fit`). The pointer holds the divider's centre: half a gap right of the file list (which starts
+// after RAIL_WIDTH), on the map's right border, half a gap left of the tray. The tray is what
+// lies right of the pointer, less the body's right padding and half a gap.
 export function drag(layout, limits, divider, x, width, options = {}) {
+  const filesOpen = options.filesOpen ?? true;
   const drawn = fit(layout, limits, width, options);
+  const drawnSidebar = filesOpen ? drawn.sidebar : 0;
   const value = {
-    files: x - 4,
-    // The map starts a gap right of the file list.
-    map: x - drawn.sidebar - 8,
+    files: x - RAIL_WIDTH - 4,
+    // The map starts a gap right of the left rail (activity bar + open file list).
+    map: x - RAIL_WIDTH - drawnSidebar - 8,
     tray: width - x - 12,
   }[divider];
   return moved(layout, limits, width, options, divider, value);

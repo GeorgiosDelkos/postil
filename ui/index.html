@@ -8,52 +8,63 @@
 </head>
 <body>
 
-<nav class="sidebar" aria-label="Files">
-  <div class="drag-strip" data-drag></div>
-  <div class="repo" data-drag>
-    <div class="repo-row">
-      <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
-      <button type="button" class="map-toggle" id="toggle-map" aria-pressed="false" aria-controls="map" title="Map (⇧⌘M)">
-        <svg class="map-toggle-glyph" viewBox="0 0 16 16" aria-hidden="true">
+<header class="titlebar" data-drag></header>
+
+<div class="left-rail">
+  <nav class="activity-bar" aria-label="Navigation">
+    <div class="activity-group">
+      <button type="button" class="activity-btn" id="toggle-files" aria-pressed="true" aria-controls="sidebar" aria-label="Files" title="Files (⌘B)">
+        <svg class="activity-glyph" viewBox="0 0 18 18" aria-hidden="true">
+          <path d="M4.5 2.75h5.25l3.75 3.75v8.75a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-11.5a1 1 0 0 1 1-1Z"/>
+          <path d="M9.75 2.75v3.75h3.75"/>
+        </svg>
+      </button>
+      <button type="button" class="activity-btn activity-btn-map" id="toggle-map" aria-pressed="false" aria-controls="map" aria-label="Map" title="Map (⇧⌘M)">
+        <svg class="activity-glyph" viewBox="0 0 16 16" aria-hidden="true">
           <rect x="2" y="2.5" width="4.5" height="3.5" rx="1"/>
           <rect x="9.5" y="2.5" width="4.5" height="3.5" rx="1"/>
           <rect x="5.75" y="10" width="4.5" height="3.5" rx="1"/>
           <path d="M6.5 4.25h3M4.25 6v1.5c0 .7.55 1.25 1.25 1.25h2.5V10M11.75 6v1.5c0 .7-.55 1.25-1.25 1.25H8"/>
         </svg>
-        <span>Map</span>
       </button>
     </div>
-    <div class="repo-branch" id="repo-branch"></div>
-    <div class="repo-warning" id="repo-warning" hidden></div>
-  </div>
-  <div class="filter">
-    <label class="visually-hidden" for="filter">Find file</label>
-    <input class="field" id="filter" type="text" placeholder="Find file" autocomplete="off" spellcheck="false">
-  </div>
-  <div class="files" id="files"></div>
-  <div class="sidebar-footer">
-    <button type="button" class="agent-status" id="agent-status" title="Show the run" hidden></button>
-    <button type="button" class="quota-strip" id="quota-strip" aria-haspopup="dialog" aria-expanded="false" title="Live provider quotas" hidden></button>
-    <button type="button" class="settings-button usage-button" id="open-usage" title="Usage (⇧⌘U)">
-      <svg class="settings-glyph" viewBox="0 0 16 16" aria-hidden="true">
-        <path d="M3.5 12.5V8.5M8 12.5V4M12.5 12.5V6.5"/>
-      </svg>
-      <span>Usage</span>
-      <span class="usage-warn-dot" id="usage-warn-dot" hidden></span>
-      <kbd>⇧⌘U</kbd>
-    </button>
-    <button type="button" class="settings-button" id="open-settings" title="Settings (⌘,)">
-      <svg class="settings-glyph" viewBox="0 0 16 16" aria-hidden="true">
-        <path d="M2 4.5h6M12 4.5h2M2 8h1.5M7.5 8H14M2 11.5h8M14 11.5h0"/>
-        <circle cx="10" cy="4.5" r="1.75"/>
-        <circle cx="5.5" cy="8" r="1.75"/>
-        <circle cx="12" cy="11.5" r="1.75"/>
-      </svg>
-      <span>Settings</span>
-      <kbd>⌘,</kbd>
-    </button>
-  </div>
-</nav>
+    <div class="activity-group">
+      <button type="button" class="activity-btn" id="open-usage" aria-label="Usage" title="Usage (⇧⌘U)">
+        <svg class="activity-glyph" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3.5 12.5V8.5M8 12.5V4M12.5 12.5V6.5"/>
+        </svg>
+        <span class="usage-warn-dot" id="usage-warn-dot" hidden></span>
+      </button>
+      <button type="button" class="activity-btn" id="open-settings" aria-label="Settings" title="Settings (⌘,)">
+        <svg class="activity-glyph activity-glyph-sliders" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2 4.5h6M12 4.5h2M2 8h1.5M7.5 8H14M2 11.5h8M14 11.5h0"/>
+          <circle cx="10" cy="4.5" r="1.75"/>
+          <circle cx="5.5" cy="8" r="1.75"/>
+          <circle cx="12" cy="11.5" r="1.75"/>
+        </svg>
+      </button>
+    </div>
+  </nav>
+
+  <nav class="sidebar" id="sidebar" aria-label="Files">
+    <div class="repo">
+      <div class="repo-row">
+        <button type="button" class="repo-name" id="repo-name" title="Switch project (⇧⌘O)"></button>
+      </div>
+      <div class="repo-branch" id="repo-branch"></div>
+      <div class="repo-warning" id="repo-warning" hidden></div>
+    </div>
+    <div class="filter">
+      <label class="visually-hidden" for="filter">Find file</label>
+      <input class="field" id="filter" type="text" placeholder="Find file" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="files" id="files"></div>
+    <div class="sidebar-footer">
+      <button type="button" class="agent-status" id="agent-status" title="Show the run" hidden></button>
+      <button type="button" class="quota-strip" id="quota-strip" aria-haspopup="dialog" aria-expanded="false" title="Live provider quotas" hidden></button>
+    </div>
+  </nav>
+</div>
 
 <main class="pane code-pane" id="code-pane">
   <section class="map-pane" id="map" aria-label="Map" hidden></section>
