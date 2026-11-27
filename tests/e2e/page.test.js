@@ -303,21 +303,21 @@ test("a note's remark on the code follows an edit and a delete of the note (JS18
   await page.locator("#notes .note").waitFor();
   await page.locator("#filter").fill("a.rs");
   await page.locator("#filter").press("Enter");
-  const remark = page.locator("#code-rows .remark");
-  await remark.filter({ hasText: "N1 · First." }).waitFor();
+  const chip = page.locator("#code-rows .note-chip");
+  await chip.filter({ hasText: "N1 · First." }).waitFor();
 
-  // An edit and a delete in the page decorate the rows drawn, which keep their remarks.
-  await page.locator("#notes .note").first().click();
+  // Clicking the chip opens the note's dialog; an edit and a delete decorate the rows drawn.
+  await chip.first().click();
   const dialog = page.locator("#note-dialog");
   await dialog.getByRole("button", { name: "Edit" }).click();
   await dialog.locator("textarea").fill("Second.");
   await dialog.getByRole("button", { name: /Save/ }).click();
-  await remark.filter({ hasText: "N1 · Second." }).waitFor();
-  assert.equal(await remark.count(), 1);
+  await chip.filter({ hasText: "N1 · Second." }).waitFor();
+  assert.equal(await chip.count(), 1);
 
   await dialog.getByRole("button", { name: "Delete note" }).click();
   await dialog.getByRole("button", { name: "Click again to delete" }).click();
-  await remark.waitFor({ state: "detached" });
+  await chip.waitFor({ state: "detached" });
 });
 
 test("Up and Down in the file filter move the highlight, and Enter opens that file (JS17)", async (t) => {
@@ -2233,21 +2233,22 @@ test("the stripe continues past the composer, and a note on a striped line shows
 
   await page.locator("#note-body").fill("On three.");
   await page.keyboard.press("Meta+Enter");
-  await row(page, 2).locator(".remark").waitFor();
-  // The chip comes before the remark, drawn in either order.
+  await row(page, 2).locator(".note-chip").waitFor();
+  // The map chip comes before the note chip, drawn in either order.
   const order = () =>
     row(page, 2).evaluate((line) =>
       [...line.children]
         .map((child) => child.className)
-        .filter((name) => ["map-chip", "map-chip-more", "remark"].includes(name)),
+        .filter((name) => ["map-chip", "map-chip-more", "note-chip"].includes(name)),
     );
   assert.match(await row(page, 2).getAttribute("class"), /\bnoted\b/);
   assert.equal(await row(page, 2).locator(".map-stripe:not(.continues)").count(), 1);
-  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "remark"]);
+  assert.equal(await row(page, 2).locator(".note-stripe:not(.continues)").count(), 1);
+  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "note-chip"]);
   await page.evaluate(() => window.postil.menu("map-markers"));
-  assert.deepEqual(await order(), ["remark"]);
+  assert.deepEqual(await order(), ["note-chip"]);
   await page.evaluate(() => window.postil.menu("map-markers"));
-  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "remark"]);
+  assert.deepEqual(await order(), ["map-chip", "map-chip-more", "note-chip"]);
 });
 
 test("Cmd-C over striped and chipped lines copies their code alone", async (t) => {
