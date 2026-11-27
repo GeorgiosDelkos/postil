@@ -520,15 +520,61 @@ kbd {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.ln .remark {
+/* A note on a line: an amber stripe along the gutter's right edge (between the line number
+   and the code, so it never collides with the map stripe at the left edge), and a clickable
+   chip on its first line matching `.map-chip`. */
+.ln .note-stripe {
+  position: absolute;
+  left: calc(var(--gutter-width) - 10px);
+  top: 0;
+  width: 8px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 3px solid var(--note);
+  background: none;
+  cursor: pointer;
+}
+
+.ln .note-stripe.resolved {
+  border-left-style: dashed;
+  opacity: 0.7;
+}
+
+.ln .note-stripe.continues {
+  height: calc(100% + var(--composer-height, 138px));
+}
+
+.ln .note-chip,
+.ln .note-chip-more {
   flex: none;
-  max-width: 420px;
+  align-self: center;
+  height: 17px;
+  padding: 0 7px;
+  margin-right: 6px;
+  background: var(--note-wash);
+  border: 1px solid var(--note);
+  border-radius: 5px;
+  color: var(--note);
+  font: 500 11.5px/15px "Geist", sans-serif;
+  white-space: nowrap;
+  user-select: none;
+  cursor: pointer;
+}
+
+.ln .note-chip {
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  font: 12px "Geist", sans-serif;
-  line-height: var(--line-height);
-  color: var(--note);
+}
+
+.ln .note-chip-more {
+  padding: 0 5px;
+}
+
+.ln .note-chip.resolved {
+  border-style: dashed;
+  opacity: 0.75;
 }
 
 /* The map's node on a line (docs/review-assist.md, "The link shown in the code"): a stripe at
@@ -606,7 +652,9 @@ kbd {
    container. */
 @container (width < 520px) {
   .ln .map-chip,
-  .ln .map-chip-more {
+  .ln .map-chip-more,
+  .ln .note-chip,
+  .ln .note-chip-more {
     display: none;
   }
 }

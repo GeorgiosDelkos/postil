@@ -26,7 +26,7 @@ import { rank as rankFiles } from "./fuzzy.js";
 import { memoryDialog, rememberDialog } from "./memory-dialog.js";
 import { memoryTab } from "./memory-tab.js";
 import { noteDialog } from "./note-dialog.js";
-import { fullPlace, onLines } from "./note-place.js";
+import { fullPlace, noteMarks } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
 import { pathNoteDialog } from "./path-note-dialog.js";
 import { runPanel } from "./run-panel.js";
@@ -68,9 +68,10 @@ const state = {
   // question, which is never sent with the notes (run.js, `isAsk`). `memory`, when there, is
   // the id of the team memory remembered from the note.
   notes: [],
-  // Derived from `notes` by `indexNotes`: the open note on each 0-based line of the open
-  // file, and the number of notes on each file or folder path.
+  // Derived from `notes` by `indexNotes`: the winning note on each 0-based line of the open
+  // file, its stripe and chip mark (note-place.js, `noteMarks`), and the count per path.
   noteByLine: new Map(),
+  noteMarkByLine: new Map(),
   noteCountByPath: new Map(),
   // Derived from the map's analysis (diagram-view.js, read from `api/analysis` at start, so
   // they show before the map is first opened) by `indexMarks`: the stripe and chip on each
@@ -127,6 +128,7 @@ const code = codeView({
   indexNotes,
   indexMarks,
   openMapNode: openNodeInMap,
+  openNote: (id) => noteDetail.open(id),
   traceFromHere: (path) => {
     showMap();
     map.traceFrom({ of: path, label: path });
@@ -385,18 +387,17 @@ function redrawNotes() {
   code.redecorate();
 }
 
-// Rebuilds the two lookups derived from `state.notes`. Lost notes are counted but not
-// drawn on the code: their lines no longer hold their text. When notes overlap on a line,
-// the newest one is shown there.
+// Rebuilds the lookups derived from `state.notes`. Lost notes are counted but not drawn on the
+// code: their lines no longer hold their text.
 function indexNotes() {
-  state.noteByLine = new Map();
   state.noteCountByPath = new Map();
   for (const note of state.notes) {
     state.noteCountByPath.set(note.path, (state.noteCountByPath.get(note.path) ?? 0) + 1);
-    if (!onLines(note) || note.path !== state.file?.path || note.anchor !== "found") continue;
-    for (let line = note.lines.start - 1; line < note.lines.end; line += 1) {
-      state.noteByLine.set(line, note);
-    }
+  }
+  state.noteMarkByLine = noteMarks(state.notes, state.file?.path, code.lineCount());
+  state.noteByLine = new Map();
+  for (const [line, mark] of state.noteMarkByLine) {
+    state.noteByLine.set(line, mark.note);
   }
 }
 

@@ -105,6 +105,8 @@ pub fn bench(dir: &Path, file: &str) -> Result<BenchReport> {
 enum AppEvent {
     /// The pointer went down on the window's drag strip.
     DragWindow,
+    /// The page opened a project and wants the window to fill the screen.
+    Maximize,
     /// The page asked for the folder dialog (Open Folder).
     ChooseFolder,
     /// The page confirmed quitting (Quit or Close Window from the menu, or the close button): no
@@ -142,6 +144,7 @@ impl AppEvent {
     fn parse(body: &str) -> Option<Self> {
         match body {
             "drag" => Some(Self::DragWindow),
+            "maximize" => Some(Self::Maximize),
             "choose-folder" => Some(Self::ChooseFolder),
             "quit" => Some(Self::Quit),
             "bench-painted" => Some(Self::BenchPainted),
@@ -190,7 +193,7 @@ fn serve(dir: Option<&Path>, bench: Option<&str>) -> Result<Option<BenchReport>>
         drop(closed.send_event(AppEvent::SiteClosed));
     })?;
 
-    let window = build_window(&event_loop, settings.theme())?;
+    let window = build_window(&event_loop, settings.theme(), bench.is_none())?;
 
     // The menu bar lives as long as this function, which is as long as the app.
     #[cfg(target_os = "macos")]
@@ -298,6 +301,7 @@ fn on_event(app: &mut App<'_>, event: Event<'_, AppEvent>, control_flow: &mut Co
             // to drag.
             drop(app.window.drag_window());
         }
+        Event::UserEvent(AppEvent::Maximize) => app.window.set_maximized(true),
         Event::UserEvent(AppEvent::ChooseFolder) => {
             if let Some(folder) = dialog::choose_folder() {
                 offer_folder(app.page.webview, &folder);
@@ -716,11 +720,19 @@ fn window_theme(theme: settings::Theme) -> Option<Theme> {
 
 /// Builds the window. Its appearance also sets the page's: WebKit answers the page's
 /// `prefers-color-scheme` from the window, so `ui/app.css` needs no theme of its own.
-fn build_window(event_loop: &EventLoop<AppEvent>, theme: settings::Theme) -> Result<Window> {
+///
+/// `maximized` fills the screen on start (left `false` for `--bench`, which keeps the fixed
+/// 1440 x 900 viewport for repeatable timings).
+fn build_window(
+    event_loop: &EventLoop<AppEvent>,
+    theme: settings::Theme,
+    maximized: bool,
+) -> Result<Window> {
     let builder = WindowBuilder::new()
         .with_theme(window_theme(theme))
         .with_title("Postil")
-        .with_inner_size(LogicalSize::new(1440.0, 900.0));
+        .with_inner_size(LogicalSize::new(1440.0, 900.0))
+        .with_maximized(maximized);
 
     // No title bar: the page draws up to the top edge and the window buttons sit over the
     // sidebar, 14 px in and 16 px down to line up with the sidebar's 44 px top strip.
@@ -809,6 +821,10 @@ mod tests {
         assert!(matches!(
             AppEvent::parse("drag"),
             Some(AppEvent::DragWindow)
+        ));
+        assert!(matches!(
+            AppEvent::parse("maximize"),
+            Some(AppEvent::Maximize)
         ));
         assert!(matches!(
             AppEvent::parse("choose-folder"),

@@ -47,6 +47,7 @@ export function codeView({
   indexNotes,
   indexMarks,
   openMapNode,
+  openNote,
   traceFromHere,
   onActiveLine,
   deleteNote,
@@ -312,21 +313,20 @@ export function codeView({
     const markKey = mark && `${mark.key}:${continues}`;
     if ((row.dataset.markKey ?? null) !== markKey) drawMark(row, mark, continues, markKey);
 
-    const note = state.noteByLine.get(index);
-    row.classList.toggle("noted", Boolean(note));
-    // The remark is replaced only when its text changes: a gutter drag decorates every row on
-    // each mousemove, and adding the remarks again took 0.4 ms of layout each time.
-    const remark = note && note.lines.end - 1 === index ? `${note.id} · ${note.body}` : null;
-    const shown = row.querySelector(".remark");
-    if ((shown?.textContent ?? null) === remark) return;
-    shown?.remove();
-    if (remark !== null) row.append(el("span", "remark", remark));
+    const noteMark = state.noteMarkByLine.get(index) ?? null;
+    row.classList.toggle("noted", Boolean(noteMark));
+    const nextNote = noteMark && state.composer?.end === index && state.noteMarkByLine.get(index + 1);
+    const noteContinues = Boolean(nextNote) && nextNote.noteId === noteMark.noteId;
+    const noteKey = noteMark && `${noteMark.key}:${noteContinues}`;
+    if ((row.dataset.noteKey ?? null) !== noteKey) {
+      drawNoteMark(row, noteMark, noteContinues, noteKey);
+    }
   }
 
   // Draws `mark` (app.js, `markByLine`) on `row`, or nothing for null: the stripe at the
   // gutter's left edge, beside the line number rather than in it, whose press would start a
-  // line selection; a flow's step number; and on the node's first line its chip, before the
-  // note's remark, and the count of other diagrams on the line. `continues` reaches the stripe
+  // line selection; a flow's step number; and on the node's first line its chip, before any
+  // note chip, and the count of other diagrams on the line. `continues` reaches the stripe
   // past the composer under the line to the node's next line.
   function drawMark(row, mark, continues, markKey) {
     for (const old of row.querySelectorAll(".map-stripe, .map-step, .map-chip, .map-chip-more")) {
@@ -349,12 +349,12 @@ export function codeView({
     if (mark.step !== null) number.before(el("span", "map-step", String(mark.step)));
     if (!mark.chip) return;
 
-    const remark = row.querySelector(".remark");
+    const noteChip = row.querySelector(".note-chip, .note-chip-more");
     const chip = el("button", "map-chip", mark.chip.label);
     chip.type = "button";
     chip.tabIndex = -1;
     chip.title = mark.chip.label;
-    row.insertBefore(chip, remark);
+    row.insertBefore(chip, noteChip);
     const { others } = mark.chip;
     if (others.length === 0) return;
     const more = el("button", "map-chip-more", `+${others.length}`);
@@ -362,7 +362,46 @@ export function codeView({
     more.tabIndex = -1;
     const diagrams = others.length === 1 ? "diagram" : "diagrams";
     more.setAttribute("aria-label", `${others.length} more ${diagrams} on this line`);
-    row.insertBefore(more, remark);
+    row.insertBefore(more, noteChip);
+  }
+
+  // Draws `mark` (app.js, `noteMarkByLine`) on `row`, or nothing for null: the amber stripe
+  // along the gutter's right edge spanning the note's lines, its clickable chip on its first
+  // line, and a `+N` menu button when other notes overlap on that line.
+  function drawNoteMark(row, mark, continues, noteKey) {
+    for (const old of row.querySelectorAll(".note-stripe, .note-chip, .note-chip-more")) {
+      old.remove();
+    }
+    if (mark === null) {
+      delete row.dataset.noteKey;
+      return;
+    }
+    row.dataset.noteKey = noteKey;
+    const number = row.querySelector(".n");
+    const stripe = el("button", "note-stripe");
+    stripe.type = "button";
+    stripe.tabIndex = -1;
+    stripe.classList.toggle("resolved", mark.resolved);
+    stripe.classList.toggle("continues", continues);
+    stripe.title = mark.resolved ? `${mark.label} (resolved)` : mark.label;
+    stripe.setAttribute("aria-label", `Note: ${mark.label}`);
+    number.after(stripe);
+    if (!mark.chip) return;
+
+    const chip = el("button", "note-chip", mark.chip.label);
+    chip.type = "button";
+    chip.tabIndex = -1;
+    chip.classList.toggle("resolved", mark.chip.resolved);
+    chip.title = mark.chip.label;
+    row.append(chip);
+    const { others } = mark.chip;
+    if (others.length === 0) return;
+    const more = el("button", "note-chip-more", `+${others.length}`);
+    more.type = "button";
+    more.tabIndex = -1;
+    const noun = others.length === 1 ? "note" : "notes";
+    more.setAttribute("aria-label", `${others.length} more ${noun} on this line`);
+    row.append(more);
   }
 
   function redecorateRows() {
@@ -456,9 +495,13 @@ export function codeView({
   let textDrag = null;
 
   rowsEl.addEventListener("mousedown", (event) => {
-    // A press on the + or on a map stripe or chip starts neither a text selection nor a drag,
-    // whose release would clear the selection: its click adds the note or opens the map.
-    if (event.target.closest(".add-note, .map-stripe, .map-chip, .map-chip-more")) {
+    // A press on the + or on a map or note stripe/chip starts neither a text selection nor a
+    // drag, whose release would clear the selection: its click adds/opens the note or map.
+    if (
+      event.target.closest(
+        ".add-note, .map-stripe, .map-chip, .map-chip-more, .note-stripe, .note-chip, .note-chip-more",
+      )
+    ) {
       event.preventDefault();
       return;
     }
@@ -474,10 +517,12 @@ export function codeView({
   });
 
   // The + on a line: a note on that line, or on the whole selection when the line is in it.
-  // A stripe or a chip opens the map at its node, and the count a menu of the other diagrams'.
+  // A map stripe or chip opens the map at its node; a note stripe or chip opens the note's
+  // detail; and a `+N` button opens a menu of the other diagrams or notes on that line.
   rowsEl.addEventListener("click", (event) => {
     const line = lineOfEvent(event);
     const mark = state.markByLine.get(line);
+    const noteMark = state.noteMarkByLine.get(line);
     if (event.target.closest(".map-stripe")) openMapNode(mark.diagramId, mark.nodeId);
     else if (event.target.closest(".map-chip")) openMapNode(mark.chip.diagramId, mark.chip.nodeId);
     else if (event.target.closest(".map-chip-more")) {
@@ -485,6 +530,15 @@ export function codeView({
         label: other.label,
         detail: other.diagramTitle,
         run: () => openMapNode(other.diagramId, other.nodeId),
+      }));
+      menu.open(event.clientX, event.clientY, others);
+    } else if (event.target.closest(".note-stripe")) openNote(noteMark.noteId);
+    else if (event.target.closest(".note-chip")) openNote(noteMark.chip.noteId);
+    else if (event.target.closest(".note-chip-more")) {
+      const others = noteMark.chip.others.map((other) => ({
+        label: other.noteId,
+        detail: other.body,
+        run: () => openNote(other.noteId),
       }));
       menu.open(event.clientX, event.clientY, others);
     } else if (event.target.closest(".add-note")) {

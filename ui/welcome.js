@@ -36,6 +36,7 @@ export function welcomeScreen({ state, welcomeEl, codeEl, guardDraft, leaveFocus
       return;
     }
     if (response.ok) {
+      window.ipc?.postMessage("maximize");
       location.reload();
       return;
     }
