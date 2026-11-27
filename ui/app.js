@@ -570,7 +570,7 @@ function followRun(run, previous, { liveEnded } = {}) {
     !fresh && (previous.status !== run.status || editsDone(previous) !== editsDone(run));
   if (moved || liveEnded) {
     refresh().catch((error) => showToast(String(error)));
-    if (["ended", "cancelled", "failed"].includes(run.status) && previous.status !== run.status) {
+    if (run.status === "ended" && previous.status !== run.status) {
       liveQuotas.refresh({ force: true });
     }
   } else if (

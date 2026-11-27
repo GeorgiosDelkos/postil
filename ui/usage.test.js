@@ -9,7 +9,9 @@ import {
   formatPercent,
   formatReset,
   formatTokens,
+  hasQuotaData,
   highestQuotaTone,
+  mergeUsageView,
   quotaTone,
   summaryItems,
   tightestQuotaText,
@@ -136,4 +138,94 @@ test("compactQuotaWindows, tightestQuotaWindow, tightestQuotaText, and visibleQu
     visibleQuotaAgents(agents, []).map((a) => a.name),
     ["Claude", "Antigravity"],
   );
+});
+
+test("cached quota data stays displayable during loading and transient errors", () => {
+  const cachedWindows = [{ label: "5-hour session", shortLabel: "5h", usedPercent: 92 }];
+  const loadingCached = { status: "loading", windows: cachedWindows };
+  const errorCached = { status: "error", message: "HTTP 429", windows: cachedWindows };
+  const unavailable = { status: "unavailable", message: "Signed out", windows: cachedWindows };
+
+  assert.equal(hasQuotaData(loadingCached), true);
+  assert.equal(hasQuotaData(errorCached), true);
+  assert.equal(hasQuotaData(unavailable), false);
+  assert.equal(hasQuotaData({ status: "loading", windows: [] }), false);
+
+  assert.equal(tightestQuotaText(loadingCached), "5h 92%");
+  assert.equal(tightestQuotaText(errorCached), "5h 92%");
+  assert.equal(tightestQuotaText(unavailable), "");
+
+  assert.equal(highestQuotaTone([{ quota: loadingCached }]), "warn");
+  assert.equal(highestQuotaTone([{ quota: errorCached }]), "warn");
+  assert.equal(highestQuotaTone([{ quota: unavailable }]), null);
+});
+
+test("mergeUsageView preserves agents across rescans, refreshes, and transient errors", () => {
+  const previous = {
+    scanning: false,
+    polling: false,
+    agents: [
+      {
+        name: "Claude",
+        builtIn: true,
+        found: "/bin/claude",
+        quota: {
+          status: "ok",
+          plan: "Max",
+          windows: [{ label: "5-hour session", shortLabel: "5h", usedPercent: 42 }],
+          fetchedAt: 1000,
+        },
+      },
+      {
+        name: "Codex",
+        builtIn: true,
+        found: "/bin/codex",
+        quota: {
+          status: "ok",
+          plan: "Plus",
+          windows: [{ label: "5-hour window", shortLabel: "5h", usedPercent: 15 }],
+          fetchedAt: 1000,
+        },
+      },
+    ],
+  };
+
+  // While scanning (agents === null), previous agents stay visible.
+  const scanning = mergeUsageView(previous, { scanning: true, polling: true, agents: null });
+  assert.equal(scanning.scanning, true);
+  assert.equal(scanning.agents.length, 2);
+
+  // Loading or error with empty windows keeps previous quota data; unavailable clears it.
+  const refreshing = mergeUsageView(previous, {
+    scanning: false,
+    polling: true,
+    agents: [
+      { name: "Claude", builtIn: true, found: "/bin/claude", quota: { status: "loading", windows: [] } },
+      { name: "Codex", builtIn: true, found: "/bin/codex", quota: { status: "error", message: "timeout", windows: [] } },
+    ],
+  });
+  assert.equal(refreshing.agents[0].quota.status, "loading");
+  assert.equal(refreshing.agents[0].quota.plan, "Max");
+  assert.equal(refreshing.agents[0].quota.windows[0].usedPercent, 42);
+  assert.equal(refreshing.agents[1].quota.status, "error");
+  assert.equal(refreshing.agents[1].quota.message, "timeout");
+  assert.equal(refreshing.agents[1].quota.windows[0].usedPercent, 15);
+
+  // Explicit unavailable (e.g. signed out) does not retain stale quota windows.
+  const signedOut = mergeUsageView(previous, {
+    scanning: false,
+    polling: false,
+    agents: [
+      { name: "Claude", builtIn: true, found: "/bin/claude", quota: { status: "unavailable", message: "Session expired", windows: [] } },
+      {
+        name: "Codex",
+        builtIn: true,
+        found: "/bin/codex",
+        quota: { status: "ok", plan: "Plus", windows: [{ label: "5-hour window", shortLabel: "5h", usedPercent: 20 }], fetchedAt: 2000 },
+      },
+    ],
+  });
+  assert.equal(signedOut.agents[0].quota.status, "unavailable");
+  assert.deepEqual(signedOut.agents[0].quota.windows, []);
+  assert.equal(signedOut.agents[1].quota.windows[0].usedPercent, 20);
 });

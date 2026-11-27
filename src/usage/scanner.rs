@@ -30,7 +30,9 @@ use crate::usage::ledger::{
 use crate::usage::quota::{QuotaFetch, parse_rfc3339_secs};
 
 /// How long a finished session scan stays fresh before the next open re-scans directory mtimes.
-const CACHE_TTL: Duration = Duration::from_secs(60);
+/// Aligned with `quota::CACHE_TTL` so `GET /api/usage` does not enter polling mode just for a
+/// session rescan while live quotas are still cached.
+const CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Maximum bytes read from a single JSONL line; longer lines (such as base64 image attachments)
 /// are skipped without buffering them whole.

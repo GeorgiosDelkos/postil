@@ -27,9 +27,14 @@ use crate::agents;
 use crate::usage::now_secs;
 
 /// How long a fetched quota snapshot stays fresh before the next open re-probes it.
-/// Arbitrary: provider windows move over minutes and hours, so a minute-old figure is
-/// current enough, and closing and reopening the dialog within it sends no request.
-const CACHE_TTL: Duration = Duration::from_secs(60);
+/// Provider windows move over hours and days, so a 5-minute cache keeps figures current
+/// without spamming provider endpoints (and triggering HTTP 429 rate limits) on window focus.
+const CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// How long a failed (`QuotaStatus::Error`) probe stays cached before an automatic retry.
+/// Short enough to recover from a transient network or rate-limit hiccup, long enough not to
+/// hammer a failing endpoint.
+const ERROR_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Hard limit on one subprocess a probe runs (`security`, `curl`, `codex app-server`,
 /// `agy -p /usage`, or `grok agent stdio`).
@@ -121,6 +126,22 @@ impl QuotaReport {
         }
     }
 
+    /// A `Loading` report that carries forward the last successful snapshot's windows, credits,
+    /// plan, and timestamp so agents stay visible in the UI while a background refresh runs.
+    fn loading_with_cached(last_ok: Option<&Self>) -> Self {
+        let Some(ok) = last_ok else {
+            return Self::loading();
+        };
+        Self {
+            status: QuotaStatus::Loading,
+            plan: ok.plan.clone(),
+            windows: ok.windows.clone(),
+            credits: ok.credits.clone(),
+            message: None,
+            fetched_at: ok.fetched_at,
+        }
+    }
+
     pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: QuotaStatus::Unavailable,
@@ -169,6 +190,10 @@ pub(crate) enum QuotaFetch {
 pub(crate) struct QuotaPoller {
     probe: ProbeFn,
     state: Arc<Mutex<PollerState>>,
+    /// How long a cached `Ok`/`Unavailable` report stays fresh. Always [`CACHE_TTL`] outside tests.
+    cache_ttl: Duration,
+    /// How long a cached `Error` report stays fresh. Always [`ERROR_CACHE_TTL`] outside tests.
+    error_cache_ttl: Duration,
     /// How long a probe may stay in flight before the next poll replaces it. Always
     /// [`LOADING_TIMEOUT`] outside tests.
     loading_timeout: Duration,
@@ -186,6 +211,9 @@ struct PollerState {
 
 struct CachedQuota {
     report: QuotaReport,
+    /// Most recent successful (`QuotaStatus::Ok`) report for this agent, preserved across
+    /// background refreshes (`Loading`) and transient failures (`Error`).
+    last_ok: Option<QuotaReport>,
     updated: Instant,
     /// Id of the latest probe started for this entry.
     probe: u64,
@@ -202,6 +230,8 @@ impl QuotaPoller {
         Self {
             probe: Arc::new(probe),
             state: Arc::new(Mutex::new(PollerState::default())),
+            cache_ttl: CACHE_TTL,
+            error_cache_ttl: ERROR_CACHE_TTL,
             loading_timeout: LOADING_TIMEOUT,
             #[cfg(test)]
             threads: Mutex::new(Vec::new()),
@@ -226,8 +256,11 @@ impl QuotaPoller {
                     let age = entry.updated.elapsed();
                     match entry.report.status {
                         QuotaStatus::Loading => age < self.loading_timeout,
-                        QuotaStatus::Ok | QuotaStatus::Unavailable | QuotaStatus::Error => {
-                            matches!(fetch, QuotaFetch::Cached) && age < CACHE_TTL
+                        QuotaStatus::Ok | QuotaStatus::Unavailable => {
+                            matches!(fetch, QuotaFetch::Cached) && age < self.cache_ttl
+                        }
+                        QuotaStatus::Error => {
+                            matches!(fetch, QuotaFetch::Cached) && age < self.error_cache_ttl
                         }
                     }
                 });
@@ -236,13 +269,18 @@ impl QuotaPoller {
                     continue;
                 }
 
+                let prev_last_ok = state
+                    .entries
+                    .get(name)
+                    .and_then(|entry| entry.last_ok.clone());
                 let probe = state.next_probe;
                 state.next_probe += 1;
-                let loading = QuotaReport::loading();
+                let loading = QuotaReport::loading_with_cached(prev_last_ok.as_ref());
                 state.entries.insert(
                     name.to_owned(),
                     CachedQuota {
                         report: loading.clone(),
+                        last_ok: prev_last_ok,
                         updated: Instant::now(),
                         probe,
                     },
@@ -295,6 +333,14 @@ impl QuotaPoller {
         self
     }
 
+    /// Replaces cache TTLs so tests can exercise expiry without sleeping.
+    #[cfg(test)]
+    fn with_cache_ttls(mut self, cache_ttl: Duration, error_cache_ttl: Duration) -> Self {
+        self.cache_ttl = cache_ttl;
+        self.error_cache_ttl = error_cache_ttl;
+        self
+    }
+
     /// Takes the handles of every probe thread started so far, in start order.
     #[cfg(test)]
     fn take_probes(&self) -> Vec<JoinHandle<()>> {
@@ -327,7 +373,33 @@ fn store(state: &Mutex<PollerState>, name: &str, probe: u64, report: QuotaReport
     if let Some(entry) = state.entries.get_mut(name)
         && entry.probe == probe
     {
-        entry.report = report;
+        match report.status {
+            QuotaStatus::Ok => {
+                entry.last_ok = Some(report.clone());
+                entry.report = report;
+            }
+            QuotaStatus::Error => {
+                if let Some(ok) = &entry.last_ok {
+                    entry.report = QuotaReport {
+                        status: QuotaStatus::Error,
+                        plan: ok.plan.clone(),
+                        windows: ok.windows.clone(),
+                        credits: ok.credits.clone(),
+                        message: report.message,
+                        fetched_at: ok.fetched_at,
+                    };
+                } else {
+                    entry.report = report;
+                }
+            }
+            QuotaStatus::Unavailable => {
+                entry.last_ok = None;
+                entry.report = report;
+            }
+            QuotaStatus::Loading => {
+                entry.report = report;
+            }
+        }
         entry.updated = Instant::now();
     }
 }
@@ -1823,6 +1895,143 @@ mod tests {
         poller.join_probes();
         let second = claude(&poller, QuotaFetch::Cached);
         assert_eq!(second.message.as_deref(), Some("call 2"));
+    }
+
+    #[test]
+    fn poller_preserves_last_ok_quota_during_refresh_and_on_transient_error() {
+        let step = Mutex::new(0_u32);
+        let poller = QuotaPoller::new(move |_, _| {
+            let n = {
+                let mut guard = lock(&step);
+                *guard += 1;
+                *guard
+            };
+            match n {
+                1 => QuotaReport {
+                    status: QuotaStatus::Ok,
+                    plan: Some("Max".to_owned()),
+                    windows: vec![QuotaWindow {
+                        label: "5-hour session".to_owned(),
+                        short_label: Some("5h".to_owned()),
+                        model: None,
+                        used_percent: 42.0,
+                        resets_at: Some(1_800_000_000),
+                        detail: None,
+                    }],
+                    credits: None,
+                    message: None,
+                    fetched_at: Some(1_795_000_000),
+                },
+                2 => QuotaReport::error("Claude usage endpoint returned HTTP 429"),
+                3 => QuotaReport {
+                    status: QuotaStatus::Ok,
+                    plan: Some("Max".to_owned()),
+                    windows: vec![QuotaWindow {
+                        label: "5-hour session".to_owned(),
+                        short_label: Some("5h".to_owned()),
+                        model: None,
+                        used_percent: 55.0,
+                        resets_at: Some(1_800_000_000),
+                        detail: None,
+                    }],
+                    credits: None,
+                    message: None,
+                    fetched_at: Some(1_795_000_300),
+                },
+                _ => QuotaReport::unavailable("Session expired"),
+            }
+        });
+
+        // Initial probe succeeds.
+        assert_eq!(
+            claude(&poller, QuotaFetch::Cached).status,
+            QuotaStatus::Loading
+        );
+        poller.join_probes();
+        let ok = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(ok.status, QuotaStatus::Ok);
+        assert_eq!(ok.windows[0].used_percent, 42.0);
+
+        // Refresh starts probe 2 while returning Loading with the previous good snapshot.
+        let refreshing = claude(&poller, QuotaFetch::Refresh);
+        assert_eq!(refreshing.status, QuotaStatus::Loading);
+        assert_eq!(refreshing.plan.as_deref(), Some("Max"));
+        assert_eq!(refreshing.windows.len(), 1);
+        assert_eq!(refreshing.windows[0].used_percent, 42.0);
+        assert_eq!(refreshing.fetched_at, Some(1_795_000_000));
+
+        // Probe 2 fails transiently (HTTP 429): status is Error with message, but windows survive.
+        poller.join_probes();
+        let failed = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(failed.status, QuotaStatus::Error);
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("Claude usage endpoint returned HTTP 429")
+        );
+        assert_eq!(failed.plan.as_deref(), Some("Max"));
+        assert_eq!(failed.windows.len(), 1);
+        assert_eq!(failed.windows[0].used_percent, 42.0);
+        assert_eq!(failed.fetched_at, Some(1_795_000_000));
+
+        // Probe 3 succeeds and updates the cached snapshot.
+        let _ = claude(&poller, QuotaFetch::Refresh);
+        poller.join_probes();
+        let updated = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(updated.status, QuotaStatus::Ok);
+        assert_eq!(updated.windows[0].used_percent, 55.0);
+        assert_eq!(updated.message, None);
+
+        // Probe 4 returns Unavailable (signed out): clears last_ok windows.
+        let _ = claude(&poller, QuotaFetch::Refresh);
+        poller.join_probes();
+        let unavail = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(unavail.status, QuotaStatus::Unavailable);
+        assert!(unavail.windows.is_empty());
+    }
+
+    #[test]
+    fn poller_respects_cache_ttl_and_shorter_error_ttl() {
+        let calls = Arc::new(Mutex::new(0_u32));
+        let counter = Arc::clone(&calls);
+        let poller = QuotaPoller::new(move |_, _| {
+            let mut guard = lock(&counter);
+            *guard += 1;
+            if *guard == 1 {
+                QuotaReport::error("temporary failure")
+            } else {
+                QuotaReport {
+                    status: QuotaStatus::Ok,
+                    plan: None,
+                    windows: vec![QuotaWindow {
+                        label: "5h".to_owned(),
+                        short_label: Some("5h".to_owned()),
+                        model: None,
+                        used_percent: 10.0,
+                        resets_at: None,
+                        detail: None,
+                    }],
+                    credits: None,
+                    message: None,
+                    fetched_at: Some(1_795_000_000),
+                }
+            }
+        })
+        .with_cache_ttls(Duration::from_secs(300), Duration::ZERO);
+
+        // First probe returns Error; with zero error_cache_ttl, the next Cached query retries.
+        let _ = claude(&poller, QuotaFetch::Cached);
+        poller.join_probes();
+        assert_eq!(*lock(&calls), 1);
+
+        let retry = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(retry.status, QuotaStatus::Loading);
+        poller.join_probes();
+        assert_eq!(*lock(&calls), 2);
+
+        // Now that it succeeded, repeated Cached queries within cache_ttl do not re-probe.
+        let cached = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(cached.status, QuotaStatus::Ok);
+        assert_eq!(*lock(&calls), 2);
     }
 
     #[test]

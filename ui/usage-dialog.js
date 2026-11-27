@@ -12,7 +12,9 @@ import {
   formatPercent,
   formatReset,
   formatTokens,
+  hasQuotaData,
   highestQuotaTone,
+  mergeUsageView,
   quotaTone,
   rangeLabel,
   summaryItems,
@@ -20,7 +22,7 @@ import {
   usageUrl,
 } from "./usage.js";
 
-const POLL_MS = 250;
+const POLL_MS = 1000;
 
 function button(text, key, onClick, className = "button") {
   const node = el("button", className, text);
@@ -50,17 +52,18 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
   }
 
   function show(view) {
+    const merged = mergeUsageView(ui.view, view);
     const unchanged =
-      !ui.refreshing && ui.error === null && JSON.stringify(view) === JSON.stringify(ui.view);
-    ui.view = view;
-    ui.scope = view.scope;
-    ui.range = view.range;
+      !ui.refreshing && ui.error === null && JSON.stringify(merged) === JSON.stringify(ui.view);
+    ui.view = merged;
+    ui.scope = merged.scope;
+    ui.range = merged.range;
     ui.error = null;
     ui.refreshing = false;
-    onTone?.(highestQuotaTone(view.agents));
-    onView?.(view);
+    onTone?.(highestQuotaTone(merged.agents));
+    onView?.(merged);
     clearTimeout(ui.pollTimer);
-    if (dialogEl.open && (view.scanning || view.polling)) {
+    if (dialogEl.open && (merged.scanning || merged.polling)) {
       ui.pollTimer = setTimeout(() => {
         fetchView().catch(fail);
       }, POLL_MS);
@@ -257,11 +260,11 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
   function quotaBlock(quota) {
     const block = el("div", "usage-sub");
     block.append(el("div", "usage-sub-heading", "Account quota · live"));
-    if (!quota || quota.status === "loading") {
-      block.append(el("p", "usage-note", "Checking live quota…"));
-      return block;
-    }
-    if (quota.status === "unavailable" || quota.status === "error") {
+    if (!hasQuotaData(quota)) {
+      if (!quota || quota.status === "loading") {
+        block.append(el("p", "usage-note", "Checking live quota…"));
+        return block;
+      }
       const note = el(
         "p",
         `usage-note${quota.status === "error" ? " is-error" : ""}`,
@@ -295,6 +298,9 @@ export function usageDialog(dialogEl, { openSettings, onTone, onView }) {
       list.append(creditRow);
     }
     block.append(list);
+    if (quota.status === "error" && quota.message) {
+      block.append(el("p", "usage-note is-error", quota.message));
+    }
     return block;
   }
 
