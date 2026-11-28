@@ -1270,9 +1270,9 @@ test("the startup wizard opens on first launch, saves settings, and stays closed
   assert.equal(saved.settings.theme, "dark");
   assert.deepEqual(saved.settings.agent, { name: "Local", model: null });
 
-  // Reloading after setup shows the welcome screen without reopening the wizard.
+  // Reloading after setup shows the Agentic Developer Hub without reopening the wizard.
   await page.reload();
-  await page.locator("#welcome").waitFor();
+  await page.locator("#hub").waitFor();
   assert.equal(await wizard.isVisible(), false);
 });
 
