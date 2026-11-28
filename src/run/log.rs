@@ -1407,6 +1407,16 @@ fn hold_run_lock(dir: &Path) -> Result<File> {
 /// hand, and this one names a file); [`Error::RunElsewhere`] while a run holds it; and
 /// [`Error::WriteRun`] when the file cannot be made or locked.
 pub(super) fn hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
+    lock_thread_file(dir, id, true)
+}
+
+/// Non-blocking variant of [`hold_thread_lock`] for background eviction (`room::take_idle`),
+/// returning [`Error::RunElsewhere`] immediately instead of sleeping for [`LOCK_PATIENCE`].
+pub(super) fn try_hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
+    lock_thread_file(dir, id, false)
+}
+
+fn lock_thread_file(dir: &Path, id: &str, wait: bool) -> Result<File> {
     if run_number(id).is_none() {
         return Err(Error::BadRequest(format!(
             "thread id {id:?}: expected R and a number"
@@ -1427,7 +1437,12 @@ pub(super) fn hold_thread_lock(dir: &Path, id: &str) -> Result<File> {
             path: path.clone(),
             source,
         })?;
-    take_lock(&file).map_err(|source| match source {
+    let locked = if wait {
+        take_lock(&file)
+    } else {
+        file.try_lock()
+    };
+    locked.map_err(|source| match source {
         TryLockError::WouldBlock => Error::RunElsewhere,
         TryLockError::Error(source) => Error::WriteRun { path, source },
     })?;

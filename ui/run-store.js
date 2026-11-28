@@ -54,6 +54,35 @@ export function runStore({ render, onChange, onLoaded, onError }) {
       if (hadLoaded) onLoaded();
     });
   }
+  // Coalesces rapid streaming `sync()` UI notifications into one animation frame in the browser,
+  // while keeping synchronous delivery in Node tests where `requestAnimationFrame` is absent.
+  let syncRaf = null;
+  let hasPendingSync = false;
+  let pendingPrevious = undefined;
+  let pendingLiveEnded = false;
+  function notifySync(previous, liveEnded) {
+    if (typeof requestAnimationFrame !== "function") {
+      render();
+      onChange(run, previous, { liveEnded });
+      return;
+    }
+    if (!hasPendingSync) {
+      pendingPrevious = previous;
+      hasPendingSync = true;
+    }
+    if (liveEnded) pendingLiveEnded = true;
+    if (syncRaf !== null) return;
+    syncRaf = requestAnimationFrame(() => {
+      syncRaf = null;
+      const prev = pendingPrevious;
+      const ended = pendingLiveEnded;
+      pendingPrevious = undefined;
+      pendingLiveEnded = false;
+      hasPendingSync = false;
+      render();
+      onChange(run, prev, { liveEnded: ended });
+    });
+  }
   function rememberOther(id, view) {
     others.delete(id);
     others.set(id, view);
@@ -188,8 +217,7 @@ export function runStore({ render, onChange, onLoaded, onError }) {
           const work = record?.pullRequestWork;
           if (work && work.kind !== "failed") threads.delete(id);
         }
-        render();
-        onChange(run, previous, { liveEnded });
+        notifySync(previous, liveEnded);
       } while (again);
       retryIn = 1000;
     } catch (error) {

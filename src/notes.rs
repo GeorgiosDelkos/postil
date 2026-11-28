@@ -228,12 +228,14 @@ pub(crate) fn check_new(repo: &Repo, new: NewNote) -> Result<CheckedNote> {
         }
     }
 
+    let mut read_cache = None;
     let target = match new.target {
         Target::Lines { lines, snippet } => {
-            let text = repo.read(&new.path)?;
+            let (text, stamp) = repo.read_with_stamp(&new.path)?;
             let lines = locate(&text, &snippet, lines).ok_or_else(|| Error::NoteTextChanged {
                 path: new.path.clone(),
             })?;
+            read_cache = Some((stamp, text));
             Target::Lines { lines, snippet }
         }
         Target::Path(kind) => {
@@ -250,6 +252,7 @@ pub(crate) fn check_new(repo: &Repo, new: NewNote) -> Result<CheckedNote> {
         path: new.path,
         target,
         body: body.to_owned(),
+        read_cache,
     })
 }
 
@@ -314,18 +317,36 @@ fn save_note(
         problem: format!("no note id is left after N{highest}"),
     })?;
 
+    let CheckedNote {
+        path,
+        target,
+        body,
+        read_cache,
+    } = checked;
+    let mut pre_read: HashMap<String, Option<String>> = HashMap::new();
+    if let Some((Some(stamp), text)) = read_cache {
+        let current_stamp = repo
+            .inside(&path)
+            .ok()
+            .and_then(|full| fs::metadata(full).ok())
+            .filter(fs::Metadata::is_file)
+            .and_then(|meta| meta.modified().ok().map(|modified| (modified, meta.len())));
+        if current_stamp == Some(stamp) {
+            pre_read.insert(path.clone(), Some(text));
+        }
+    }
     // Pushed last: the page finds the note it just added as the last of the reply's notes.
     review.notes.push(Note {
         id: NoteId(id),
-        path: checked.path,
-        target: checked.target,
-        body: checked.body,
+        path,
+        target,
+        body,
         anchor: Anchor::Found,
         state,
         intent,
         memory: None,
     });
-    review.relocate(repo, HashMap::new());
+    review.relocate(repo, pre_read);
     review.save(&file)?;
     Ok(review)
 }
@@ -338,6 +359,9 @@ pub(crate) struct CheckedNote {
     target: Target,
     /// Trimmed, never blank.
     body: String,
+    /// Cached file text and `(modified, len)` stamp from [`check_new`] so [`save_note`] skips
+    /// re-reading the same file when unchanged.
+    read_cache: Option<(Option<(std::time::SystemTime, u64)>, String)>,
 }
 
 impl CheckedNote {
@@ -922,6 +946,16 @@ impl Review {
     /// again for each note took 17 ms of a `GET /api/notes` with 200 notes on ten files of
     /// 5000 lines, 2 ms once split. Then compares every position in the file with each of its
     /// notes' snippets. A file or folder note costs one `lstat`, and reads nothing.
+    /// Yields `(path, is_line_note)` for every note in the review, for cache validation.
+    pub(crate) fn referenced_targets(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.notes.iter().map(|note| {
+            (
+                note.path.as_str(),
+                matches!(note.target, Target::Lines { .. }),
+            )
+        })
+    }
+
     fn relocate(&mut self, repo: &Repo, read: HashMap<String, Option<String>>) {
         self.relocate_filtered(repo, read, None);
     }
@@ -946,24 +980,43 @@ impl Review {
                 read.insert(note.path.clone(), repo.read(&note.path).ok());
             }
         }
-        // Split as `locate` splits.
-        let split: HashMap<&str, Vec<&str>> = read
-            .iter()
-            .filter_map(|(path, text)| Some((path.as_str(), text.as_deref()?.lines().collect())))
-            .collect();
+        // Lazily split each file into `Vec<&str>` only if a note in that file actually moved
+        // off its `last` range (or was lost); unchanged notes match via `anchor::locate`'s
+        // zero-allocation fast path without collecting all lines of the file.
+        let mut split: HashMap<&str, Vec<&str>> = HashMap::new();
         for note in &mut self.notes {
             if only.is_some_and(|ids| !ids.contains(&note.id)) {
                 continue;
             }
             let found = match &mut note.target {
                 Target::Lines { lines, snippet } => {
-                    let place = split.get(note.path.as_str());
-                    match place.and_then(|text| locate_lines(text, snippet, *lines)) {
-                        Some(now) => {
-                            *lines = now;
-                            true
-                        }
+                    let text = read.get(note.path.as_str()).and_then(Option::as_deref);
+                    match text {
                         None => false,
+                        Some(text) => {
+                            if let Some(cached_lines) = split.get(note.path.as_str()) {
+                                match locate_lines(cached_lines, snippet, *lines) {
+                                    Some(now) => {
+                                        *lines = now;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            } else if matches_at_range(text, snippet, *lines) {
+                                true
+                            } else {
+                                let cached_lines = split
+                                    .entry(note.path.as_str())
+                                    .or_insert_with(|| text.lines().collect());
+                                match locate_lines(cached_lines, snippet, *lines) {
+                                    Some(now) => {
+                                        *lines = now;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            }
+                        }
                     }
                 }
                 Target::Path(kind) => repo.kind(&note.path).ok().flatten() == Some(*kind),
@@ -971,6 +1024,20 @@ impl Review {
             note.anchor = if found { Anchor::Found } else { Anchor::Lost };
         }
     }
+}
+
+/// Zero-allocation fast-path check: whether `snippet` still appears verbatim at `range` in `text`.
+fn matches_at_range(text: &str, snippet: &str, range: LineRange) -> bool {
+    let count = range.end.saturating_sub(range.start) + 1;
+    let mut lines = text.lines().skip(range.start - 1);
+    let mut wanted = snippet.split('\n');
+    for _ in 0..count {
+        match (lines.next(), wanted.next()) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+    wanted.next().is_none()
 }
 
 /// Takes the exclusive lock on `review.lock` beside the review file (`files::lock`). The lock
@@ -1203,6 +1270,7 @@ mod tests {
             path: "src/a.rs".to_owned(),
             target: lines(),
             body: "secret body".to_owned(),
+            read_cache: None,
         };
         let shown = format!("{checked:?}");
         assert!(

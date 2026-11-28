@@ -862,8 +862,8 @@ impl<F: FnMut(Event)> Reader<F> {
                 let error = message.error.as_ref().map(RpcError::from_value);
                 self.reply(&id, message.result, error);
             }
-            (Some(id), Some(method)) => self.request(&id, &method, message.params),
-            (None, Some(method)) => self.notification(&method, message.params),
+            (Some(id), Some(method)) => self.request(&id, &method, message.params.as_deref()),
+            (None, Some(method)) => self.notification(&method, message.params.as_deref()),
             (None, None) => self.emit(Event::Unreadable(format!(
                 "a message with neither an id nor a method: {}",
                 excerpt(line)
@@ -872,7 +872,12 @@ impl<F: FnMut(Event)> Reader<F> {
     }
 
     /// A reply to one of the app's requests.
-    fn reply(&mut self, id: &Value, result: Option<Value>, error: Option<RpcError>) {
+    fn reply(
+        &mut self,
+        id: &Value,
+        result: Option<Box<serde_json::value::RawValue>>,
+        error: Option<RpcError>,
+    ) {
         let addressee = id.as_u64().and_then(|id| {
             let mut state = lock(&self.shared.state);
             if state.turn == Some(id) {
@@ -883,35 +888,26 @@ impl<F: FnMut(Event)> Reader<F> {
                 state.waiters.remove(&id).map(Addressee::Caller)
             }
         });
-        let outcome = match (result, error) {
-            (_, Some(error)) => Err(error),
-            (Some(result), None) => Ok(result),
-            // `"result": null` reads as no result; an `initialize` reply without one would
-            // fail its own parse below, so this needs no case of its own.
-            (None, None) => Ok(Value::Null),
-        };
         match addressee {
             // The caller timed out and left: nobody wants the reply.
-            Some(Addressee::Caller(sender)) => drop(sender.send(outcome)),
+            Some(Addressee::Caller(sender)) => {
+                let outcome = match (result, error) {
+                    (_, Some(error)) => Err(error),
+                    (Some(raw), None) => {
+                        Ok(serde_json::from_str::<Value>(raw.get()).unwrap_or(Value::Null))
+                    }
+                    (None, None) => Ok(Value::Null),
+                };
+                drop(sender.send(outcome));
+            }
             Some(Addressee::Turn(open)) => {
                 // A request still open when its turn ended is answered as a cancel, which
                 // ACP asks of a request its sender gave up on.
                 for open in open.values() {
                     drop(self.outbox.send(cancelled(open)));
                 }
-                let end = match outcome {
-                    Ok(result) => match serde_json::from_value::<PromptResult>(result) {
-                        Ok(result) => TurnEnd::Stopped {
-                            reason: result.stop_reason,
-                            usage: result.token_usage(),
-                            cost: result.turn_cost(),
-                        },
-                        Err(error) => {
-                            TurnEnd::Failed(format!("unreadable reply to the prompt: {error}"))
-                        }
-                    },
-                    // Worded as a refused start is, so a sign-in error keeps its hint.
-                    Err(error) => TurnEnd::Failed(
+                let end = match (result, error) {
+                    (_, Some(error)) => TurnEnd::Failed(
                         Error::AgentRefused {
                             step: "session/prompt",
                             code: error.code,
@@ -919,6 +915,21 @@ impl<F: FnMut(Event)> Reader<F> {
                         }
                         .to_string(),
                     ),
+                    (raw, None) => {
+                        let json = raw
+                            .as_deref()
+                            .map_or("null", serde_json::value::RawValue::get);
+                        match serde_json::from_str::<PromptResult>(json) {
+                            Ok(result) => TurnEnd::Stopped {
+                                reason: result.stop_reason,
+                                usage: result.token_usage(),
+                                cost: result.turn_cost(),
+                            },
+                            Err(error) => {
+                                TurnEnd::Failed(format!("unreadable reply to the prompt: {error}"))
+                            }
+                        }
+                    }
                 };
                 self.emit(Event::TurnEnded(end));
             }
@@ -929,7 +940,7 @@ impl<F: FnMut(Event)> Reader<F> {
 
     /// A request from the agent. The app serves permission requests and form questions; it
     /// advertised no file or terminal capability, so any other method is answered "not found".
-    fn request(&mut self, id: &Value, method: &str, params: Value) {
+    fn request(&mut self, id: &Value, method: &str, params: Option<&serde_json::value::RawValue>) {
         match method {
             "session/request_permission" => self.permission(id, params),
             // The name in ACP's unstable schema at the pinned commit, and the one Claude's
@@ -945,8 +956,9 @@ impl<F: FnMut(Event)> Reader<F> {
         }
     }
 
-    fn permission(&mut self, id: &Value, params: Value) {
-        let params: PermissionParams = match serde_json::from_value(params) {
+    fn permission(&mut self, id: &Value, params: Option<&serde_json::value::RawValue>) {
+        let json = params.map_or("null", serde_json::value::RawValue::get);
+        let params: PermissionParams = match serde_json::from_str(json) {
             Ok(params) => params,
             Err(error) => {
                 return self.refuse(id, format!("an unreadable permission request: {error}"));
@@ -973,8 +985,9 @@ impl<F: FnMut(Event)> Reader<F> {
 
     /// A question as a form. A URL question, or a form with no fields, is refused as one the
     /// app cannot show: the agent then goes on without an answer.
-    fn question(&mut self, id: &Value, params: Value) {
-        let params: ElicitationParams = match serde_json::from_value(params) {
+    fn question(&mut self, id: &Value, params: Option<&serde_json::value::RawValue>) {
+        let json = params.map_or("null", serde_json::value::RawValue::get);
+        let params: ElicitationParams = match serde_json::from_str(json) {
             Ok(params) => params,
             Err(error) => return self.refuse(id, format!("an unreadable question: {error}")),
         };
@@ -1033,7 +1046,7 @@ impl<F: FnMut(Event)> Reader<F> {
         self.emit(Event::Unreadable(problem));
     }
 
-    fn notification(&mut self, method: &str, params: Value) {
+    fn notification(&mut self, method: &str, params: Option<&serde_json::value::RawValue>) {
         // Agents send notifications of their own (Grok's `_x.ai/...`, Claude's
         // `_auth/...`); only session updates and withdrawn requests change what the app shows.
         if method == "$/cancel_request" {
@@ -1042,7 +1055,8 @@ impl<F: FnMut(Event)> Reader<F> {
         if method != "session/update" {
             return;
         }
-        match serde_json::from_value::<UpdateParams>(params) {
+        let json = params.map_or("null", serde_json::value::RawValue::get);
+        match serde_json::from_str::<UpdateParams>(json) {
             Ok(UpdateParams {
                 update: SessionUpdate::Other,
             }) => {}
@@ -1056,8 +1070,9 @@ impl<F: FnMut(Event)> Reader<F> {
     /// Closes the open request the agent withdrew, and answers it as a cancel: ACP's
     /// cancellation rule asks for a reply to the original request all the same. One already
     /// answered, or not the app's to answer, is ignored.
-    fn withdraw(&mut self, params: Value) {
-        let request_id = match serde_json::from_value::<CancelRequestParams>(params) {
+    fn withdraw(&mut self, params: Option<&serde_json::value::RawValue>) {
+        let json = params.map_or("null", serde_json::value::RawValue::get);
+        let request_id = match serde_json::from_str::<CancelRequestParams>(json) {
             Ok(params) => params.request_id,
             Err(error) => {
                 let problem = format!("an unreadable $/cancel_request: {error}");

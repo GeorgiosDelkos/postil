@@ -65,8 +65,9 @@ pub(crate) struct Incoming {
     pub(crate) id: Option<Value>,
     pub(crate) method: Option<String>,
     #[serde(default)]
-    pub(crate) params: Value,
-    pub(crate) result: Option<Value>,
+    pub(crate) params: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default)]
+    pub(crate) result: Option<Box<serde_json::value::RawValue>>,
     /// Read leniently by [`RpcError::from_value`]: a malformed error must still answer its
     /// request, or the caller would wait for a reply that has come.
     pub(crate) error: Option<Value>,

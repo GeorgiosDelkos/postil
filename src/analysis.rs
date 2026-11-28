@@ -298,15 +298,38 @@ fn check_in(cited: Cited, repo: &Repo, read: &mut ReadFiles) -> CodeRef {
         (PathKind::File, None) => CodeRef::found(path, Target::Path(PathKind::File)),
         (PathKind::Folder, Some(_)) => CodeRef::unverified(path, None),
         (PathKind::File, Some(_)) => {
-            let text = read
-                .0
-                .entry(path.clone())
-                .or_insert_with(|| repo.read(&path).map_err(|error| unreadable(&error)));
-            match text {
-                Ok(text) => check(cited, text),
+            let cached = read.0.entry(path.clone()).or_insert_with(|| {
+                repo.read(&path)
+                    .map(CachedFileLines::new)
+                    .map_err(|error| unreadable(&error))
+            });
+            match cached {
+                Ok(cached) => check_cached(cited, cached),
                 Err(reason) => CodeRef::unverified(path, Some(reason.clone())),
             }
         }
+    }
+}
+
+/// Pre-split line byte ranges for a cached file so repeated citations in the same file never
+/// re-scan or re-collect `text.lines()`.
+struct CachedFileLines {
+    text: String,
+    /// `(start, end)` byte offsets in `text` for each line, matching `str::lines()`.
+    ranges: Vec<(usize, usize)>,
+}
+
+impl CachedFileLines {
+    fn new(text: String) -> Self {
+        let base = text.as_ptr() as usize;
+        let ranges = text
+            .lines()
+            .map(|line| {
+                let start = line.as_ptr() as usize - base;
+                (start, start + line.len())
+            })
+            .collect();
+        Self { text, ranges }
     }
 }
 
@@ -315,7 +338,7 @@ fn check_in(cited: Cited, repo: &Repo, read: &mut ReadFiles) -> CodeRef {
 /// the agent's reader thread (the judge's measurement, 2026-11-26).
 /// Its `Debug` counts the files: their text is code.
 #[derive(Default)]
-struct ReadFiles(HashMap<String, std::result::Result<String, String>>);
+struct ReadFiles(HashMap<String, std::result::Result<CachedFileLines, String>>);
 
 impl fmt::Debug for ReadFiles {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -325,19 +348,23 @@ impl fmt::Debug for ReadFiles {
     }
 }
 
-/// [`check_in`] for a citation of lines in a file whose text is `text`: found at the stated
-/// lines or the shifted ones, or unverified. With no `lines`, a whole-file target.
-fn check(cited: Cited, text: &str) -> CodeRef {
+/// [`check_in`] for a citation of lines in a pre-split file: found at the stated lines or the
+/// shifted ones, or unverified. With no `lines`, a whole-file target.
+fn check_cached(cited: Cited, cached: &CachedFileLines) -> CodeRef {
     let Cited { path, lines, first } = cited;
     let Some(lines) = lines else {
         return CodeRef::found(path, Target::Path(PathKind::File));
     };
-    // Split as `locate` splits, so the snippet is placed later by the same lines.
-    let file: Vec<&str> = text.lines().collect();
-    let Some(range) = first.and_then(|first| cited_range(&file, lines, &first)) else {
+    let Some(range) = first.and_then(|first| cited_range_cached(cached, lines, &first)) else {
         return CodeRef::unverified(path, None);
     };
-    let snippet = file[range.start - 1..range.end].join("\n");
+    let mut snippet = String::new();
+    for (index, &(start, end)) in cached.ranges[range.start - 1..range.end].iter().enumerate() {
+        if index > 0 {
+            snippet.push('\n');
+        }
+        snippet.push_str(&cached.text[start..end]);
+    }
     CodeRef::found(
         path,
         Target::Lines {
@@ -347,37 +374,46 @@ fn check(cited: Cited, text: &str) -> CodeRef {
     )
 }
 
-/// Where the cited lines are in `file`: the stated range when its first line equals `first`,
-/// both trimmed, or else the range of the same length at the only line equal to `first`, when
-/// `first` is not blank and the range fits in the file. A stated range that is zero, reversed
-/// or past the end of the file is never found.
-fn cited_range(file: &[&str], cited: CitedLines, first: &str) -> Option<LineRange> {
+/// Zero-allocation version of [`cited_range`] operating directly on pre-split line ranges.
+fn cited_range_cached(
+    cached: &CachedFileLines,
+    cited: CitedLines,
+    first: &str,
+) -> Option<LineRange> {
     let CitedLines { start, end } = cited;
-    if start == 0 || start > end || end > file.len() {
+    if start == 0 || start > end || end > cached.ranges.len() {
         return None;
     }
     let count = end - start + 1;
     let first = first.trim();
-    if file[start - 1].trim() == first {
+    let line_at = |idx: usize| {
+        let (s, e) = cached.ranges[idx];
+        &cached.text[s..e]
+    };
+    if line_at(start - 1).trim() == first {
         return Some(LineRange { start, end });
     }
     if first.is_empty() {
         return None;
     }
-
-    let mut equal = file
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.trim() == first)
-        .map(|(index, _)| index);
-    let index = equal.next()?;
-    if equal.next().is_some() {
+    let mut matches = (0..cached.ranges.len()).filter(|&idx| line_at(idx).trim() == first);
+    let at = matches.next()?;
+    if matches.next().is_some() {
         return None;
     }
-    (index <= file.len() - count).then_some(LineRange {
-        start: index + 1,
-        end: index + count,
+    let shifted_start = at + 1;
+    let shifted_end = shifted_start + count - 1;
+    (shifted_end <= cached.ranges.len()).then_some(LineRange {
+        start: shifted_start,
+        end: shifted_end,
     })
+}
+
+/// [`check_in`] for a citation of lines in a file whose text is `text`: found at the stated
+/// lines or the shifted ones, or unverified. With no `lines`, a whole-file target.
+#[cfg(test)]
+fn check(cited: Cited, text: &str) -> CodeRef {
+    check_cached(cited, &CachedFileLines::new(text.to_owned()))
 }
 
 /// Why a file could not be read, for an unverified reference's dialog. It names no path: in
@@ -718,9 +754,11 @@ fn known_files(
         .into_iter()
         .map(|seen| seen.files);
     Ok(seen.next().map(|first| {
-        seen.fold(first, |known, files| {
-            known.intersection(&files).cloned().collect()
-        })
+        let mut known = (*first).clone();
+        for files in seen {
+            known.retain(|file| files.contains(file));
+        }
+        known
     }))
 }
 
@@ -728,7 +766,7 @@ fn known_files(
 /// started from.
 struct Seen {
     diagram: DiagramId,
-    files: HashSet<String>,
+    files: std::sync::Arc<HashSet<String>>,
 }
 
 /// What each top-level Architecture diagram in scope (every one for `None`) saw, for those

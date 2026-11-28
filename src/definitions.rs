@@ -29,7 +29,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -52,6 +52,9 @@ pub(crate) struct Definitions {
 /// What the handles and the thread share.
 struct Shared {
     state: Mutex<State>,
+    /// The published symbol index, updated incrementally on refresh so lookups never wait on a
+    /// full-repo rebuild.
+    index: RwLock<Option<Index>>,
     /// Lock-free mirror of `State::closed` checked between files without taking `state`.
     closed: AtomicBool,
     /// Signalled when a refresh is asked for, the handles are closed, or a pass ends.
@@ -65,7 +68,6 @@ struct State {
     requested: u64,
     /// The `requested` that the last finished pass started from.
     completed: u64,
-    index: Option<Arc<Index>>,
     closed: bool,
     /// What the thread is doing, for the tests: nothing else can see it wait or end.
     #[cfg(test)]
@@ -113,8 +115,8 @@ impl Definitions {
         if spawned.is_err() {
             // Fails only when the process is out of threads or memory. Lookups then find no
             // definitions rather than say "building" forever.
+            *shared.index.write().unwrap_or_else(PoisonError::into_inner) = Some(Index::default());
             let mut state = shared.lock();
-            state.index = Some(Arc::default());
             state.completed = state.requested;
         }
         Self { shared }
@@ -137,10 +139,14 @@ impl Definitions {
     }
 
     /// The definitions of `name`, those nearest `from` (a path in the repository, or empty)
-    /// first. Takes the lock only to clone the index; reads no file.
+    /// first. Takes a shared read lock on the index; reads no file.
     pub(crate) fn lookup(&self, name: &str, from: &str) -> Lookup {
-        let index = self.shared.lock().index.clone();
-        match index {
+        let guard = self
+            .shared
+            .index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match guard.as_ref() {
             Some(index) => index.lookup(name, from),
             None => Lookup::Building,
         }
@@ -168,13 +174,17 @@ impl Definitions {
 impl fmt::Debug for Definitions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.shared.lock();
+        let names = self
+            .shared
+            .index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|index| index.by_name.len());
         f.debug_struct("Definitions")
             .field("requested", &state.requested)
             .field("completed", &state.completed)
-            .field(
-                "names",
-                &state.index.as_ref().map(|index| index.by_name.len()),
-            )
+            .field("names", &names)
             .field("closed", &state.closed)
             .finish()
     }
@@ -186,13 +196,13 @@ impl Shared {
             state: Mutex::new(State {
                 requested: 1,
                 completed: 0,
-                index: None,
                 closed: false,
                 #[cfg(test)]
                 worker: Worker::Busy,
                 #[cfg(test)]
                 hold: false,
             }),
+            index: RwLock::new(None),
             closed: AtomicBool::new(false),
             changed: Condvar::new(),
         }
@@ -320,6 +330,43 @@ impl Index {
         Self { by_name }
     }
 
+    fn apply_delta(&mut self, delta: &PassDelta) {
+        for (path, old_symbols) in &delta.removed {
+            self.remove_file(path, old_symbols);
+        }
+        for (path, old_symbols, new_symbols) in &delta.updated {
+            if !old_symbols.is_empty() {
+                self.remove_file(path, old_symbols);
+            }
+            for symbol in new_symbols {
+                let def = StoredDefinition {
+                    path: Arc::clone(path),
+                    line: symbol.line,
+                    kind: symbol.kind,
+                };
+                if let Some(list) = self.by_name.get_mut(&symbol.name) {
+                    list.push(def);
+                } else {
+                    self.by_name.insert(Arc::clone(&symbol.name), vec![def]);
+                }
+            }
+        }
+    }
+
+    fn remove_file(&mut self, path: &str, old_symbols: &[FileSymbol]) {
+        for symbol in old_symbols {
+            let empty = if let Some(list) = self.by_name.get_mut(&symbol.name) {
+                list.retain(|def| def.path.as_ref() != path);
+                list.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.by_name.remove(&symbol.name);
+            }
+        }
+    }
+
     /// The definitions of `name`, ranked: in the file `from`, then in its folder, then the
     /// rest; by path and line within each.
     fn lookup(&self, name: &str, from: &str) -> Lookup {
@@ -406,35 +453,51 @@ fn work(repo: &Repo, shared: &Shared) {
             state.requested
         };
 
-        // The index is built, and the old one freed, outside the lock: a lookup never waits
-        // on either.
-        let built = match indexer.pass(|| shared.between_files()) {
+        let has_index = shared
+            .index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        match indexer.pass(|| shared.between_files(), has_index) {
             Pass::Closed => return,
-            Pass::Changed => Some(Arc::new(Index::build(&indexer.files))),
-            Pass::Unchanged => None,
-        };
-        let replaced = {
+            Pass::Changed(delta) => {
+                if has_index {
+                    let mut guard = shared.index.write().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(index) = guard.as_mut() {
+                        index.apply_delta(&delta);
+                    }
+                } else {
+                    let built = Index::build(&indexer.files);
+                    *shared.index.write().unwrap_or_else(PoisonError::into_inner) = Some(built);
+                }
+            }
+            Pass::Unchanged => {
+                if !has_index {
+                    // A project with no file to index still finishes building.
+                    *shared.index.write().unwrap_or_else(PoisonError::into_inner) =
+                        Some(Index::default());
+                }
+            }
+        }
+        {
             let mut state = shared.lock();
-            let replaced = if let Some(index) = built {
-                state.index.replace(index)
-            } else {
-                // A project with no file to index still finishes building.
-                state.index.get_or_insert_with(Arc::default);
-                None
-            };
             state.completed = target;
             shared.changed.notify_all();
-            replaced
-        };
-        drop(replaced);
+        }
     }
 }
 
+/// Incremental changes produced by a pass for updating the published [`Index`] in place.
+#[derive(Default)]
+struct PassDelta {
+    removed: Vec<(Arc<str>, Vec<FileSymbol>)>,
+    updated: Vec<(Arc<str>, Vec<FileSymbol>, Vec<FileSymbol>)>,
+}
+
 /// How a pass ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {
-    /// A file was added, removed, or reparsed: the index is built again.
-    Changed,
+    /// A file was added, removed, or reparsed.
+    Changed(PassDelta),
     Unchanged,
     /// The handles closed during the pass, which stopped between two files.
     Closed,
@@ -469,11 +532,14 @@ struct Stamp {
     modified: Option<SystemTime>,
 }
 
+#[derive(Clone)]
 struct FileSymbol {
     name: Arc<str>,
     line: u32,
     kind: DefinitionKind,
 }
+
+type ParsedFile = (String, Stamp, Option<Vec<FileSymbol>>);
 
 impl<'a> Indexer<'a> {
     fn new(repo: &'a Repo) -> Self {
@@ -489,7 +555,7 @@ impl<'a> Indexer<'a> {
     /// Looks at every file of the repository with a tags query: one `stat` for each, and a
     /// read and a parse for those that are new or changed. Files gone since the last pass
     /// drop out. Stops between two files once `closed` says so.
-    fn pass(&mut self, closed: impl Fn() -> bool) -> Pass {
+    fn pass(&mut self, closed: impl Fn() -> bool + Sync, track_delta: bool) -> Pass {
         // When git cannot list the files, the index stays as it was, an empty one after the
         // first pass, and the next refresh tries again. The file list fails the same way
         // (`GET /api/repo`), which is where the engineer sees git's message.
@@ -498,8 +564,9 @@ impl<'a> Indexer<'a> {
         };
         self.pass_id += 1;
         let pass_id = self.pass_id;
-        let mut changed = false;
+        let mut delta = PassDelta::default();
         let mut full = PathBuf::from(self.repo.root());
+        let mut to_parse: Vec<(String, PathBuf, Stamp, TagsGrammar)> = Vec::new();
         for path in paths {
             if closed() {
                 return Pass::Closed;
@@ -526,20 +593,87 @@ impl<'a> Indexer<'a> {
                 existing.seen_pass = pass_id;
                 continue;
             }
+            to_parse.push((path, full.clone(), stamp, grammar));
+        }
+
+        // Parse changed files in parallel when there are enough to amortize thread spawning
+        // (e.g. initial open of a large repo), falling back to sequential for small incremental
+        // updates.
+        let Some(parsed) = self.parse_batch(&to_parse, &closed) else {
+            return Pass::Closed;
+        };
+        let mut changed = self.apply_parsed(parsed, pass_id, track_delta, &mut delta);
+        self.files.retain(|key, file| {
+            if file.seen_pass == pass_id {
+                true
+            } else {
+                changed = true;
+                if track_delta {
+                    delta
+                        .removed
+                        .push((Arc::clone(key), std::mem::take(&mut file.symbols)));
+                }
+                false
+            }
+        });
+        // Release peak buffer capacity after scanning large files so idle threads stay light.
+        if self.read_buf.capacity() > 64 * 1024 {
+            self.read_buf.shrink_to(64 * 1024);
+        }
+        if changed {
+            Pass::Changed(delta)
+        } else {
+            Pass::Unchanged
+        }
+    }
+
+    fn apply_parsed(
+        &mut self,
+        parsed: Vec<ParsedFile>,
+        pass_id: u64,
+        track_delta: bool,
+        delta: &mut PassDelta,
+    ) -> bool {
+        let mut changed = false;
+        for (path, stamp, symbols) in parsed {
             // A file that cannot be read now is left out, so the next pass tries again;
             // the definitions it had go with it.
-            let Some(symbols) = self.symbols(&full, stamp, grammar) else {
-                changed |= self.files.remove(path.as_str()).is_some();
+            let Some(symbols) = symbols else {
+                if let Some((key, old)) = self.files.remove_entry(path.as_str()) {
+                    changed = true;
+                    if track_delta {
+                        delta.removed.push((key, old.symbols));
+                    }
+                }
                 continue;
             };
             changed = true;
-            if let Some(existing) = self.files.get_mut(path.as_str()) {
-                existing.stamp = stamp;
-                existing.symbols = symbols;
-                existing.seen_pass = pass_id;
+            if let Some(key) = self
+                .files
+                .get_key_value(path.as_str())
+                .map(|(k, _)| Arc::clone(k))
+            {
+                let entry = self
+                    .files
+                    .get_mut(&key)
+                    .expect("key came from get_key_value");
+                let old_symbols = std::mem::replace(&mut entry.symbols, symbols);
+                entry.stamp = stamp;
+                entry.seen_pass = pass_id;
+                if track_delta {
+                    delta
+                        .updated
+                        .push((key, old_symbols, entry.symbols.clone()));
+                }
             } else {
+                let key: Arc<str> = Arc::from(path);
+                if track_delta {
+                    delta
+                        .updated
+                        .push((Arc::clone(&key), Vec::new(), symbols.clone()));
+                }
                 self.files.insert(
-                    Arc::from(path),
+                    key,
                     IndexedFile {
                         stamp,
                         symbols,
@@ -548,18 +682,66 @@ impl<'a> Indexer<'a> {
                 );
             }
         }
-        let before_prune = self.files.len();
-        self.files.retain(|_, file| file.seen_pass == pass_id);
-        let removed = self.files.len() < before_prune;
-        // Release peak buffer capacity after scanning large files so idle threads stay light.
-        if self.read_buf.capacity() > 64 * 1024 {
-            self.read_buf.shrink_to(64 * 1024);
+        changed
+    }
+
+    fn parse_batch(
+        &mut self,
+        to_parse: &[(String, PathBuf, Stamp, TagsGrammar)],
+        closed: &(impl Fn() -> bool + Sync),
+    ) -> Option<Vec<ParsedFile>> {
+        if to_parse.len() < 8 {
+            let mut out = Vec::with_capacity(to_parse.len());
+            for (path, file_path, stamp, grammar) in to_parse {
+                if closed() {
+                    return None;
+                }
+                let syms = self.symbols(file_path, *stamp, *grammar);
+                out.push((path.clone(), *stamp, syms));
+            }
+            return Some(out);
         }
-        if changed || removed {
-            Pass::Changed
-        } else {
-            Pass::Unchanged
+        let workers = std::thread::available_parallelism()
+            .map_or(2, std::num::NonZeroUsize::get)
+            .min(4)
+            .min(to_parse.len());
+        let chunk_size = to_parse.len().div_ceil(workers);
+        let stopped = AtomicBool::new(false);
+        let mut batches: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = to_parse
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let stopped_ref = &stopped;
+                    scope.spawn(move || {
+                        let mut ctx = TagsContext::new();
+                        let mut buf = Vec::new();
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for (path, file_path, stamp, grammar) in chunk {
+                            if stopped_ref.load(Ordering::Relaxed) || closed() {
+                                stopped_ref.store(true, Ordering::Relaxed);
+                                return out;
+                            }
+                            let syms =
+                                parse_symbols(&mut ctx, &mut buf, file_path, *stamp, *grammar);
+                            out.push((path.clone(), *stamp, syms));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("definitions parser worker does not panic"))
+                .collect()
+        });
+        if stopped.load(Ordering::Relaxed) || closed() {
+            return None;
         }
+        let mut merged = Vec::with_capacity(to_parse.len());
+        for mut batch in batches.drain(..) {
+            merged.append(&mut batch);
+        }
+        Some(merged)
     }
 
     /// The definitions in the file at `full`; none for one over [`MAX_HIGHLIGHTED`] bytes or
@@ -570,51 +752,59 @@ impl<'a> Indexer<'a> {
         stamp: Stamp,
         grammar: TagsGrammar,
     ) -> Option<Vec<FileSymbol>> {
-        let limit = MAX_HIGHLIGHTED as u64;
-        if stamp.len > limit {
-            return Some(Vec::new());
-        }
-        // At most one byte past the limit: the file may have grown since its `stat`.
-        self.read_buf.clear();
-        File::open(full)
-            .and_then(|file| file.take(limit + 1).read_to_end(&mut self.read_buf))
-            .ok()?;
-        let Ok(source) = std::str::from_utf8(&self.read_buf) else {
-            return Some(Vec::new());
-        };
-        if source.len() > MAX_HIGHLIGHTED {
-            return Some(Vec::new());
-        }
-
-        let configuration = grammar.configuration();
-        let Ok((tags, _)) = self
-            .context
-            .generate_tags(configuration, source.as_bytes(), None)
-        else {
-            // Only a cancelled parse fails, and none is cancelled.
-            return Some(Vec::new());
-        };
-        let mut symbols = Vec::new();
-        // A tag that fails ends the file's tags: the iterator fails only when cancelled.
-        for tag in tags.map_while(Result::ok) {
-            if !tag.is_definition {
-                continue;
-            }
-            let Some(kind) =
-                DefinitionKind::from_capture(configuration.syntax_type_name(tag.syntax_type_id))
-            else {
-                continue;
-            };
-            let line = u32::try_from(tag.span.start.row + 1)
-                .expect("a file of at most MAX_HIGHLIGHTED bytes has fewer lines than u32::MAX");
-            symbols.push(FileSymbol {
-                name: Arc::from(&source[tag.name_range]),
-                line,
-                kind,
-            });
-        }
-        Some(symbols)
+        parse_symbols(&mut self.context, &mut self.read_buf, full, stamp, grammar)
     }
+}
+
+/// Parses definitions in `full` using the caller's reusable `context` and `read_buf`.
+fn parse_symbols(
+    context: &mut TagsContext,
+    read_buf: &mut Vec<u8>,
+    full: &std::path::Path,
+    stamp: Stamp,
+    grammar: TagsGrammar,
+) -> Option<Vec<FileSymbol>> {
+    let limit = MAX_HIGHLIGHTED as u64;
+    if stamp.len > limit {
+        return Some(Vec::new());
+    }
+    // At most one byte past the limit: the file may have grown since its `stat`.
+    read_buf.clear();
+    File::open(full)
+        .and_then(|file| file.take(limit + 1).read_to_end(read_buf))
+        .ok()?;
+    let Ok(source) = std::str::from_utf8(read_buf) else {
+        return Some(Vec::new());
+    };
+    if source.len() > MAX_HIGHLIGHTED {
+        return Some(Vec::new());
+    }
+
+    let configuration = grammar.configuration();
+    let Ok((tags, _)) = context.generate_tags(configuration, source.as_bytes(), None) else {
+        // Only a cancelled parse fails, and none is cancelled.
+        return Some(Vec::new());
+    };
+    let mut symbols = Vec::new();
+    // A tag that fails ends the file's tags: the iterator fails only when cancelled.
+    for tag in tags.map_while(Result::ok) {
+        if !tag.is_definition {
+            continue;
+        }
+        let Some(kind) =
+            DefinitionKind::from_capture(configuration.syntax_type_name(tag.syntax_type_id))
+        else {
+            continue;
+        };
+        let line = u32::try_from(tag.span.start.row + 1)
+            .expect("a file of at most MAX_HIGHLIGHTED bytes has fewer lines than u32::MAX");
+        symbols.push(FileSymbol {
+            name: Arc::from(&source[tag.name_range]),
+            line,
+            kind,
+        });
+    }
+    Some(symbols)
 }
 
 #[cfg(test)]

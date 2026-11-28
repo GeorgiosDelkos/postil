@@ -4196,14 +4196,9 @@ body.focus-mode .map-pane {
   display: none;
 }
 
-/* Side panes open and close in 160 ms (docs/design.md, "Motion"). Only while focus mode or
-   the file list changes: a divider dragged by hand must follow the pointer at once. */
-body.panes-moving {
-  transition:
-    grid-template-columns 160ms ease-out,
-    padding 160ms ease-out;
-}
-
+/* Side panes fade in 160 ms (docs/design.md, "Motion"). The grid layout snaps once instead of
+   transitioning `grid-template-columns` or `padding`, avoiding per-frame reflow and ResizeObserver
+   storms. */
 body.panes-moving > .left-rail,
 body.panes-moving > .tray,
 body.panes-moving .sidebar {
@@ -4316,7 +4311,6 @@ body.focus-mode .code {
     animation: none;
   }
 
-  body.panes-moving,
   body.panes-moving > .left-rail,
   body.panes-moving > .tray,
   body.panes-moving .sidebar {
@@ -4429,9 +4423,9 @@ body.focus-mode .code {
   max-height: min(460px, 100vh - 24px);
   display: flex;
   flex-direction: column;
-  background: color-mix(in srgb, var(--raised) 92%, transparent);
-  backdrop-filter: blur(24px) saturate(1.6);
-  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  background: color-mix(in srgb, var(--raised) 96%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--border-strong);
   border-radius: 11px;
   box-shadow: var(--shadow-menu);

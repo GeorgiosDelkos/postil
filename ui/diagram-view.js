@@ -145,6 +145,7 @@ export function diagramView({
   // already applied is dropped, as the notes are (app.js, `fetchNotes`).
   let analysisAsked = 0;
   let analysisShown = 0;
+  let lastAnalysisRaw = null;
   // Every check of HEAD is numbered too, and a reply older than one applied is dropped.
   let checkAsked = 0;
   let checkShown = 0;
@@ -163,6 +164,53 @@ export function diagramView({
   const body = el("div", "map-body");
   body.tabIndex = -1;
   mapEl.replaceChildren(header, tools, flows, unmapped, strip, body);
+
+  // The toolbar's persistent controls (`renderTools`): built once and updated in place so
+  // `.map-search` never loses focus or caret during refreshes or streaming updates.
+  const kindsGroup = el("div", "map-kinds");
+  kindsGroup.setAttribute("role", "group");
+  kindsGroup.setAttribute("aria-label", "Diagram");
+  const kindButtons = KINDS.map(([kind, name]) => {
+    const button = el("button", "map-kind", name);
+    button.type = "button";
+    button.addEventListener("click", () => showKind(kind));
+    kindsGroup.append(button);
+    return [kind, button];
+  });
+  const searchInput = el("input", "field map-search");
+  searchInput.type = "search";
+  searchInput.placeholder = "Find node  /";
+  searchInput.setAttribute("aria-label", "Find a node");
+  searchInput.addEventListener("input", () => {
+    view.search = searchInput.value;
+    syncRings();
+  });
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const diagram = drawn?.diagram ?? current();
+      if (!diagram) return;
+      const [first] = searchNodes(diagram, view.search);
+      if (first) select(first, { show: false });
+    } else if (event.key === "Escape" && searchInput.value) {
+      // Clears the search; an empty search lets Escape act on the page as elsewhere.
+      event.stopPropagation();
+      searchInput.value = "";
+      view.search = "";
+      syncRings();
+    }
+  });
+  const updateButton = el("button", "button map-update", "Update");
+  updateButton.type = "button";
+  updateButton.title =
+    "Asks the Analyzer again for the outdated nodes of this diagram, and to place the files not on it";
+  updateButton.addEventListener("click", () => {
+    const diagram = drawn?.diagram ?? current();
+    if (diagram) startRun("api/analysis/update", { diagram: diagram.id });
+  });
+  let topPickerEl = null;
+  let topPickerKey = null;
+  tools.append(kindsGroup, searchInput, updateButton);
 
   // The Flows list (`renderFlows`): the box that asks for a flow, and a row per flow. Built once
   // and changed in place, so a redraw while a run streams keeps what is typed and the caret,
@@ -235,10 +283,14 @@ export function diagramView({
     const number = ++analysisAsked;
     const response = await asked;
     if (!response.ok) {
-      return { number, analysis: { status: "error", data: null, error: await response.text() } };
+      return {
+        number,
+        raw: null,
+        analysis: { status: "error", data: null, error: await response.text() },
+      };
     }
-    const data = await response.json();
-    return { number, analysis: { status: data ? "ready" : "none", data, error: null } };
+    const raw = await response.text();
+    return { number, raw, analysis: null };
   }
 
   // Takes a reply of `fetchAnalysis`, for the code's stripes and chips even while the map is
@@ -246,7 +298,22 @@ export function diagramView({
   async function applyAnalysis(reply) {
     if (reply.number < analysisShown) return;
     analysisShown = reply.number;
-    view.analysis = reply.analysis;
+    // Reuse the existing `view.analysis` object reference when the payload is unchanged so
+    // `drawn.diagram === diagram` stays true and `drawDiagram()` avoids rebuilding the SVG.
+    if (reply.raw !== null && reply.raw === lastAnalysisRaw) {
+      if (!view.shown) return;
+      if (view.analysis.status !== "ready") await loadUncommitted();
+      render();
+      return;
+    }
+    if (reply.analysis) {
+      lastAnalysisRaw = null;
+      view.analysis = reply.analysis;
+    } else {
+      lastAnalysisRaw = reply.raw;
+      const data = JSON.parse(reply.raw);
+      view.analysis = { status: data ? "ready" : "none", data, error: null };
+    }
     onChange();
     if (!view.shown) return;
     if (view.analysis.status !== "ready") await loadUncommitted();
@@ -349,8 +416,9 @@ export function diagramView({
     if (!view.shown) return;
     const ready = (view.change ?? view.analysis).status === "ready";
     const diagram = ready ? current() : null;
-    renderHeader(diagram);
-    renderTools(diagram);
+    const counts = diagram ? diagramCounts(diagram) : null;
+    renderHeader(diagram, counts);
+    renderTools(diagram, counts);
     renderFlows();
     renderUnmapped(diagram);
     renderStrip();
@@ -369,7 +437,7 @@ export function diagramView({
     drawDiagram(diagram);
   }
 
-  function renderHeader(diagram) {
+  function renderHeader(diagram, counts) {
     const crumbs = el("div", "crumbs map-crumbs");
     // The way back is the header's first item, outside the crumbs: they clip what overflows
     // them, and a long trail in a narrow map would hide a button among them.
@@ -400,7 +468,6 @@ export function diagramView({
     } else if (!view.change) crumbs.append(el("b", "", "Map"));
     const meta = el("div", "meta map-counts");
     if (diagram) {
-      const counts = diagramCounts(diagram);
       const words = [`${counts.total} node${counts.total === 1 ? "" : "s"}`];
       if (counts.unverified) words.push(`${counts.unverified} unverified`);
       if (counts.outdated) words.push(`${counts.outdated} outdated`);
@@ -425,75 +492,55 @@ export function diagramView({
   // The switcher, whose every kind can be chosen, with nothing of it yet too: a flow needs no
   // Architecture, and an empty kind offers to make one. Then, with a diagram drawn, the node
   // search and Update.
-  function renderTools(diagram) {
+  function renderTools(diagram, counts) {
     tools.hidden = !view.change && !usable();
     if (tools.hidden) return;
-    const kinds = el("div", "map-kinds");
-    kinds.setAttribute("role", "group");
-    kinds.setAttribute("aria-label", "Diagram");
-    for (const [kind, name] of KINDS) {
-      const button = el("button", "map-kind", name);
-      button.type = "button";
+    for (const [kind, button] of kindButtons) {
       // A change map is none of the repository's kinds: each goes back to that map.
       button.setAttribute("aria-pressed", String(!view.change && view.kind === kind));
-      button.addEventListener("click", () => showKind(kind));
-      kinds.append(button);
     }
-    const parts = [kinds];
     if (!diagram) {
-      tools.replaceChildren(...parts);
+      if (topPickerEl) {
+        topPickerEl.remove();
+        topPickerEl = null;
+        topPickerKey = null;
+      }
+      searchInput.hidden = true;
+      updateButton.hidden = true;
       return;
     }
     // Analyze deeper of a path no node covers adds an Architecture at the top: there may be
     // several. The Flows list chooses among flows.
     const tops = topOf(view.kind);
-    if (view.kind !== "flow" && tops.length > 1) parts.push(topPicker(tops, diagram));
-
-    const search = el("input", "field map-search");
-    search.type = "search";
-    search.placeholder = "Find node  /";
-    search.setAttribute("aria-label", "Find a node");
-    search.value = view.search;
-    search.addEventListener("input", () => {
-      view.search = search.value;
-      syncRings();
-    });
-    search.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        const [first] = searchNodes(diagram, view.search);
-        if (first) select(first, { show: false });
-      } else if (event.key === "Escape" && search.value) {
-        // Clears the search; an empty search lets Escape act on the page as elsewhere.
-        event.stopPropagation();
-        search.value = "";
-        view.search = "";
-        syncRings();
+    if (view.kind !== "flow" && tops.length > 1) {
+      const top = breadcrumb(shownAnalysis(), diagram)[0].id;
+      const key = JSON.stringify([top, tops.map((each) => [each.id, each.title])]);
+      if (key !== topPickerKey) {
+        topPickerKey = key;
+        const nextPicker = topPicker(tops, top);
+        if (topPickerEl) topPickerEl.replaceWith(nextPicker);
+        else searchInput.before(nextPicker);
+        topPickerEl = nextPicker;
       }
-    });
-    parts.push(search);
+    } else if (topPickerEl) {
+      topPickerEl.remove();
+      topPickerEl = null;
+      topPickerKey = null;
+    }
+
+    searchInput.hidden = false;
+    if (searchInput.value !== view.search) searchInput.value = view.search;
 
     // Update changes the repository's map, which a change map is not. While the strip offers
     // the Update of a checkout on another history, it is the one Update.
-    const stale = diagramCounts(diagram).outdated > 0 || unmappedOf(diagram);
-    if (!view.change && stale && !divergedShown()) {
-      const update = el("button", "button map-update", "Update");
-      update.type = "button";
-      update.title =
-        "Asks the Analyzer again for the outdated nodes of this diagram, and to place the files not on it";
-      update.disabled = Boolean(liveRun());
-      update.addEventListener("click", () =>
-        startRun("api/analysis/update", { diagram: diagram.id }),
-      );
-      parts.push(update);
-    }
-    tools.replaceChildren(...parts);
+    const stale = counts.outdated > 0 || unmappedOf(diagram);
+    const showUpdate = !view.change && stale && !divergedShown();
+    updateButton.hidden = !showUpdate;
+    if (showUpdate) updateButton.disabled = Boolean(liveRun());
   }
 
-  // A choice among the diagrams `tops` at the top of the shown kind, the one `diagram` is in
-  // selected.
-  function topPicker(tops, diagram) {
-    const top = breadcrumb(shownAnalysis(), diagram)[0].id;
+  // A choice among the diagrams `tops` at the top of the shown kind, `top` selected.
+  function topPicker(tops, top) {
     const picker = el("select", "field map-top");
     picker.setAttribute("aria-label", "Diagram at the top");
     for (const each of tops) {
@@ -585,7 +632,7 @@ export function diagramView({
   async function deleteDiagram(id) {
     const route = `api/analysis?diagram=${encodeURIComponent(id)}`;
     const reply = await readAnalysis(fetch(route, { method: "DELETE" }));
-    if (reply.analysis.status === "error") {
+    if (reply.analysis?.status === "error") {
       onError(reply.analysis.error);
       return;
     }
@@ -1045,6 +1092,10 @@ export function diagramView({
     }
     // A glide under way is towards a node of the diagram drawn before: it would pan this one.
     stopGlide();
+    if (transformRaf !== null) {
+      cancelAnimationFrame(transformRaf);
+      transformRaf = null;
+    }
     let positioned;
     try {
       positioned = layoutDiagram(diagram, window.dagre, layouts);
@@ -1063,6 +1114,12 @@ export function diagramView({
     svg.append(arrowMarker());
     const pane = document.createElementNS(SVG, "g");
     pane.classList.add("map-viewport");
+    pane.style.transformOrigin = "0 0";
+    // Precompute parent node IDs once so `nodeCard` checks deeper-diagram existence in O(1).
+    const parentIds = new Set();
+    for (const each of shownAnalysis()?.diagrams ?? []) {
+      if (each.parent) parentIds.add(each.parent);
+    }
     // The cards, and the boundaries' labels, which select and open a boundary as a card does.
     const cards = new Map();
     for (const group of positioned.groups) {
@@ -1075,7 +1132,7 @@ export function diagramView({
     // (diagram.js, `fileMarks`).
     const flow = diagram.kind === "flow";
     for (const [index, box] of positioned.nodes.entries()) {
-      const card = nodeCard(box, flow ? index + 1 : null);
+      const card = nodeCard(box, flow ? index + 1 : null, parentIds);
       cards.set(box.id, card);
       pane.append(card);
     }
@@ -1241,7 +1298,7 @@ export function diagramView({
   // A card: the node's label and summary, or "not found in code"; its shape by its kind; a
   // mark when a diagram deepens it; in a flow, its `step` number before the label. A button
   // for the keyboard and assistive technology.
-  function nodeCard(box, step) {
+  function nodeCard(box, step, parentIds) {
     const { node } = box;
     const state = nodeState(node);
     const card = svgEl("g", `map-node kind-${node.kind} ${state}`, {
@@ -1284,7 +1341,7 @@ export function diagramView({
       left = 10 + badgeW + 6;
       labelMax = digits.length > 1 ? 17 : 20;
     }
-    const hasChild = Boolean(childDiagram(shownAnalysis(), node.id));
+    const hasChild = parentIds.has(node.id);
     if (hasChild) labelMax -= 2;
     card.append(
       svgText("map-node-label", left, 23, shorten(node.label, labelMax)),
@@ -1324,20 +1381,34 @@ export function diagramView({
     if (transformRaf !== null) return;
     transformRaf = requestAnimationFrame(() => {
       transformRaf = null;
+      if (!drawn) return;
+      view.transforms.set(
+        drawn.diagram.id,
+        clampTransform(drawn.positioned, viewport(), transform()),
+      );
       applyTransform();
     });
   }
 
   function setTransform(next, { immediate = false } = {}) {
-    view.transforms.set(drawn.diagram.id, clampTransform(drawn.positioned, viewport(), next));
-    if (immediate) applyTransform();
-    else scheduleApplyTransform();
+    if (immediate) {
+      view.transforms.set(drawn.diagram.id, clampTransform(drawn.positioned, viewport(), next));
+      applyTransform();
+    } else {
+      view.transforms.set(drawn.diagram.id, next);
+      scheduleApplyTransform();
+    }
+  }
+
+  function syncWillChange() {
+    if (!drawn) return;
+    drawn.pane.style.willChange = panning || glide ? "transform" : "";
   }
 
   function applyTransform() {
     if (!drawn) return;
     const { x, y, scale } = transform();
-    drawn.pane.setAttribute("transform", `translate(${x} ${y}) scale(${scale})`);
+    drawn.pane.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
     if (drawn.zoomReadout) {
       const pct = Math.round(scale * 100);
       if (pct !== drawn.lastZoomPct) {
@@ -1350,6 +1421,7 @@ export function diagramView({
   function stopGlide() {
     if (glide) cancelAnimationFrame(glide);
     glide = null;
+    syncWillChange();
   }
 
   // Pans to `target` over GLIDE_MS, easing out, or at once when motion is reduced. Any pan or
@@ -1368,8 +1440,10 @@ export function diagramView({
         { immediate: true },
       );
       glide = t < 1 ? requestAnimationFrame(frame) : null;
+      if (!glide) syncWillChange();
     };
     glide = requestAnimationFrame(frame);
+    syncWillChange();
   }
 
   // Set from gesturestart to gestureend (below): the pinch's ctrl+wheel events then zoom
@@ -1434,6 +1508,7 @@ export function diagramView({
     body.setPointerCapture(event.pointerId);
     panning = { x: event.clientX, y: event.clientY, from: transform() };
     body.classList.add("panning");
+    syncWillChange();
   });
   body.addEventListener("pointermove", (event) => {
     if (!panning) return;
@@ -1447,6 +1522,7 @@ export function diagramView({
   body.addEventListener("lostpointercapture", () => {
     panning = null;
     body.classList.remove("panning");
+    syncWillChange();
   });
 
   // A pane resized (a divider, the window) keeps the pan, brought back if it lost every node;
@@ -1587,7 +1663,7 @@ export function diagramView({
     if (event.target.matches("input, select") || event.metaKey || event.ctrlKey) return;
     if (event.key === "/") {
       event.preventDefault();
-      tools.querySelector(".map-search")?.focus();
+      if (!searchInput.hidden) searchInput.focus();
       return;
     }
     if (!drawn) return;

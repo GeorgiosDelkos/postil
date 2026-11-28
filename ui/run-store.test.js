@@ -182,3 +182,51 @@ test("knownViews is read-only and does not trigger fetches for uncached run ids"
   assert.equal(views[0].id, "R50");
   assert.equal(fetched.length, countAfterSync, "knownViews must not trigger byId fetches");
 });
+
+test("sync coalesces rapid streaming notifications into one animation frame when rAF is present", async (t) => {
+  const frames = [];
+  const prevRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (fn) => {
+    frames.push(fn);
+    return frames.length;
+  };
+  t.after(() => {
+    globalThis.requestAnimationFrame = prevRaf;
+  });
+
+  const replies = {
+    "api/run?after=0": {
+      id: "R1",
+      notes: ["N1"],
+      prompt: "p",
+      status: "running",
+      total: 1,
+      entries: ["a"],
+    },
+    "api/run?after=1": { id: "R1", status: "running", total: 2, entries: ["b"] },
+    "api/run?after=2": { id: "R1", status: "ended", total: 3, entries: ["c"] },
+    "api/runs": { runs: ["R1"] },
+  };
+  t.mock.method(globalThis, "fetch", async (url) => new Response(JSON.stringify(replies[url])));
+  let renders = 0;
+  const changes = [];
+  const store = runStore({
+    render: () => {
+      renders += 1;
+    },
+    onChange: (run, previous, meta) => {
+      changes.push({ status: run.status, prevStatus: previous?.status ?? null, meta });
+    },
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+
+  await store.sync();
+  await store.sync();
+  await store.sync();
+  assert.equal(renders, 0, "UI updates wait for the scheduled animation frame");
+  assert.equal(frames.length, 1, "three rapid syncs schedule only one frame");
+  frames.shift()();
+  assert.equal(renders, 1);
+  assert.deepEqual(changes, [{ status: "ended", prevStatus: null, meta: { liveEnded: false } }]);
+});

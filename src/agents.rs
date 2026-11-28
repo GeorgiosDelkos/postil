@@ -10,6 +10,7 @@
 //! `~/.local/bin`, Homebrew, nvm and the other places agents are installed, so the login
 //! shell is asked for the `PATH` a terminal would have.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufRead, BufReader, IsTerminal};
@@ -92,12 +93,39 @@ const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`Scanner::rescan`]. While the latest scan runs, [`Scanner::path`] is `None` and the page
 /// asks again shortly. An older scan that finishes after a newer one started is dropped, so
 /// a rescan always shows its own result.
+/// Result of looking up a program on [`Scanner`]'s cached search path.
+#[derive(Debug, Clone)]
+pub(crate) enum ProgramLookup {
+    Scanning,
+    Found(PathBuf),
+    Missing,
+}
+
+impl ProgramLookup {
+    pub(crate) fn into_path(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(path) => Some(path),
+            Self::Scanning | Self::Missing => None,
+        }
+    }
+}
+
+/// The scan state shared by [`Scanner`] handles.
+#[derive(Debug)]
+struct ScanState {
+    /// The number of the latest scan (0 before the first).
+    scan: u64,
+    /// The path the latest scan found once it finished, or `None` while it runs.
+    path: Option<OsString>,
+    /// Cached `program -> Option<PathBuf>` lookups for the current `path`, cleared on rescan.
+    programs: HashMap<String, Option<PathBuf>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Scanner {
     find: Arc<dyn Fn() -> OsString + Send + Sync>,
-    /// The number of the latest scan (0 before the first), and the path it found once it
-    /// finished. Locked only to read or replace both; never held while a scan runs.
-    state: Arc<Mutex<(u64, Option<OsString>)>>,
+    /// The latest scan state. Locked only to read or replace; never held while a scan runs.
+    state: Arc<Mutex<ScanState>>,
     /// Signalled whenever a scan stores its path, for [`Scanner::wait`].
     found: Arc<Condvar>,
 }
@@ -107,7 +135,11 @@ impl Scanner {
     pub(crate) fn new(find: impl Fn() -> OsString + Send + Sync + 'static) -> Self {
         Self {
             find: Arc::new(find),
-            state: Arc::new(Mutex::new((0, None))),
+            state: Arc::new(Mutex::new(ScanState {
+                scan: 0,
+                path: None,
+                programs: HashMap::new(),
+            })),
             found: Arc::new(Condvar::new()),
         }
     }
@@ -121,21 +153,50 @@ impl Scanner {
     /// first scan.
     pub(crate) fn path(&self) -> Option<OsString> {
         let mut state = lock(&self.state);
-        if state.0 == 0 {
+        if state.scan == 0 {
             self.start(&mut state);
         }
-        state.1.clone()
+        state.path.clone()
+    }
+
+    /// Resolves `program` on the latest scan's search path, caching results per scan generation.
+    pub(crate) fn find_program(&self, program: &str) -> ProgramLookup {
+        let (scan, search_path) = {
+            let mut state = lock(&self.state);
+            if state.scan == 0 {
+                self.start(&mut state);
+            }
+            let Some(path) = state.path.as_ref() else {
+                return ProgramLookup::Scanning;
+            };
+            if let Some(cached) = state.programs.get(program) {
+                return match cached {
+                    Some(found) => ProgramLookup::Found(found.clone()),
+                    None => ProgramLookup::Missing,
+                };
+            }
+            (state.scan, path.clone())
+        };
+        let found = find_program(program, &search_path);
+        let mut state = lock(&self.state);
+        if state.scan == scan {
+            state.programs.insert(program.to_owned(), found.clone());
+        }
+        match found {
+            Some(found) => ProgramLookup::Found(found),
+            None => ProgramLookup::Missing,
+        }
     }
 
     /// The latest scan's search path, waiting for the scan to finish. Starts the first scan
     /// when none ran. A rescan started while this waits is waited for too.
     pub(crate) fn wait(&self) -> OsString {
         let mut state = lock(&self.state);
-        if state.0 == 0 {
+        if state.scan == 0 {
             self.start(&mut state);
         }
         loop {
-            if let Some(path) = &state.1 {
+            if let Some(path) = &state.path {
                 return path.clone();
             }
             state = self
@@ -147,17 +208,20 @@ impl Scanner {
 
     /// Starts a scan, with the state already locked so two first calls start one scan. The
     /// scan's thread takes the lock only after `find` returns.
-    fn start(&self, state: &mut (u64, Option<OsString>)) {
-        *state = (state.0 + 1, None);
-        let scan = state.0;
+    fn start(&self, state: &mut ScanState) {
+        state.scan += 1;
+        state.path = None;
+        state.programs.clear();
+        let scan = state.scan;
         let find = Arc::clone(&self.find);
         let shared = Arc::clone(&self.state);
         let found = Arc::clone(&self.found);
         let finish = move || {
             let path = find();
             let mut state = lock(&shared);
-            if state.0 == scan {
-                state.1 = Some(path);
+            if state.scan == scan {
+                state.path = Some(path);
+                state.programs.clear();
                 found.notify_all();
             }
         };
@@ -168,7 +232,7 @@ impl Scanner {
             // Fails only when the process is out of threads or memory. The settings then list
             // every agent as not found rather than wait for a scan that never runs. A `wait`
             // blocked on an earlier scan, which this one replaced, is woken to read it.
-            state.1 = Some(OsString::new());
+            state.path = Some(OsString::new());
             self.found.notify_all();
         }
     }
@@ -202,11 +266,13 @@ pub(crate) fn search_path() -> OsString {
     let login = shell.and_then(|shell| login_shell_path(&shell, LOGIN_SHELL_TIMEOUT));
     let own = std::env::var_os("PATH");
     let parts = [login, own];
+    let mut seen = HashSet::new();
     std::env::join_paths(
         parts
             .iter()
             .flatten()
-            .flat_map(|path| std::env::split_paths(path)),
+            .flat_map(|path| std::env::split_paths(path))
+            .filter(|dir| seen.insert(dir.clone())),
     )
     .expect("split_paths never yields a part holding `:`, the one thing join_paths refuses")
 }

@@ -39,6 +39,15 @@ export function notesTray({
   const previewEl = $("prompt-preview");
   const sendBarEl = $("send-bar");
 
+  function liveNoteIds(live) {
+    const ids = new Set();
+    for (const run of live) {
+      if (run.review) continue;
+      for (const id of run.notes) ids.add(id);
+    }
+    return ids;
+  }
+
   // The tray: in the send step, every note with its checkbox, in the prompt's order; otherwise
   // the notes grouped by where they are in the loop (status.js), each card with its status.
   // Drawn again only when what it shows changed: a run updates many times a second, and a
@@ -63,16 +72,24 @@ export function notesTray({
       notesEl.replaceChildren(empty);
       return;
     }
+    const live = runs.liveRuns();
+    const liveIds = liveNoteIds(live);
     if (state.send) {
-      drawnNotes = null;
       // A resolved note is sent only once reopened (src/notes.rs, `resolve`), and an ask never.
       const offered = state.notes.filter((note) => !isResolved(note) && !isAsk(note));
-      notesEl.replaceChildren(...offered.map(sendItem));
+      const cards = offered.map((note) => [note, cardOf(note, live, liveIds)]);
+      const key = JSON.stringify([
+        "send",
+        cards.map(([, card]) => card),
+        [...state.send.ticked].sort(),
+      ]);
+      if (key === drawnNotes) return;
+      drawnNotes = key;
+      notesEl.replaceChildren(...cards.map(([note, card]) => sendItem(note, card)));
       return;
     }
 
-    const live = runs.liveRuns();
-    const cards = new Map(state.notes.map((note) => [note.id, cardOf(note)]));
+    const cards = new Map(state.notes.map((note) => [note.id, cardOf(note, live, liveIds)]));
     const key = JSON.stringify([
       ...cards.values(),
       ...live.map((run) => [run.id, run.status, planProgress(run)]),
@@ -116,16 +133,16 @@ export function notesTray({
   }
 
   // The run a note's status comes from, or null (status.js, `runOf`).
-  function runFor(note) {
-    return runOf(note, { get: (id) => runs.byId(id) }, runs.liveRuns());
+  function runFor(note, live = runs.liveRuns()) {
+    return runOf(note, { get: (id) => runs.byId(id) }, live);
   }
 
   // Everything a note's card shows, as plain data: two cards with equal data look the same. A
   // card is small, its status and the note in two lines at most, so the tray scans fast; what
   // the agent said and did is in the note's detail. The owner set this for every view on
   // 2026-11-23: compact cards, full information in the dialogs.
-  function cardOf(note) {
-    const run = runFor(note);
+  function cardOf(note, live = runs.liveRuns(), liveIds = null) {
+    const run = runFor(note, live);
     const status = noteStatus(note, run);
     return {
       id: note.id,
@@ -134,7 +151,7 @@ export function notesTray({
       body: note.body,
       outdated: note.anchor === "lost",
       status,
-      sendable: canSendAlone() && !isResolved(note) && !isAsk(note) && !inLiveRun(note),
+      sendable: canSendAlone() && !isResolved(note) && !isAsk(note) && !inLiveRun(note, liveIds),
     };
   }
 
@@ -189,10 +206,10 @@ export function notesTray({
   }
 
   // A card of the send step: the same card, with its checkbox, and a click that ticks it.
-  function sendItem(note) {
+  function sendItem(note, card = cardOf(note)) {
     const item = el("div", "note-item");
-    const card = noteCard(cardOf(note), () => toggleTick(note.id));
-    item.append(tickBox(note), card, deleteButton(item, note));
+    const node = noteCard(card, () => toggleTick(note.id));
+    item.append(tickBox(note), node, deleteButton(item, note));
     return item;
   }
 
@@ -302,13 +319,15 @@ export function notesTray({
   // Whether a run of this window under way carries `note`. A note is marked sent only once
   // its agent takes the turn, so until then it reads as open; sending it again would put it in
   // two threads at once, which the Rust process refuses.
-  function inLiveRun(note) {
+  function inLiveRun(note, liveIds = null) {
+    if (liveIds) return liveIds.has(note.id);
     return runs.liveRuns().some((run) => !run.review && run.notes.includes(note.id));
   }
 
   // The ids of the notes a send takes now (`sendable`), those in a run under way left out.
   function sendableNow() {
-    return sendable(state.notes.filter((note) => !inLiveRun(note)));
+    const liveIds = liveNoteIds(runs.liveRuns());
+    return sendable(state.notes.filter((note) => !inLiveRun(note, liveIds)));
   }
 
   // Opens the send step with `ids` ticked: the open notes not in a run under way, or the one

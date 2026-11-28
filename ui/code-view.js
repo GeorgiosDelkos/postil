@@ -258,16 +258,22 @@ export function codeView({
     const newLast = Math.min(count, visibleLast + OVERSCAN);
     rendered = { first: newFirst, last: newLast };
 
-    // When scrolling overlaps the existing rendered window (and no composer is mounted),
-    // incrementally remove exiting edge rows and prepend/append entering edge rows instead
-    // of tearing down and rebuilding all ~120 rows.
+    // When scrolling overlaps the existing rendered window, incrementally remove exiting edge
+    // rows and prepend/append entering edge rows instead of tearing down and rebuilding all ~120
+    // rows. When the composer is open, keep incremental diffing active as long as the composer
+    // stays inside (or stays outside) the window; only fall back to a full rebuild if it enters
+    // or leaves the rendered window.
+    const composerEnd = state.composer?.end;
+    const hadComposer = Boolean(state.composer && composerEnd >= first && composerEnd < last);
+    const hasComposer = Boolean(state.composer && composerEnd >= newFirst && composerEnd < newLast);
+    const expectedChildren = last - first + (hadComposer ? 1 : 0);
     const canDiff =
       !force &&
-      !state.composer &&
+      hadComposer === hasComposer &&
       last > first &&
       newFirst < last &&
       newLast > first &&
-      rowsEl.childElementCount === last - first;
+      rowsEl.childElementCount === expectedChildren;
     if (canDiff) {
       if (newFirst > first) {
         let drop = newFirst - first;
@@ -995,9 +1001,12 @@ export function codeView({
     const textarea = composer.node.querySelector("textarea");
     if (text) {
       textarea.value = text;
-      textarea.style.height = "auto";
-      textarea.style.height = `${textarea.scrollHeight}px`;
-      requestAnimationFrame(() => measureComposer(composer.node));
+      requestAnimationFrame(() => {
+        if (!textarea.isConnected) return;
+        textarea.style.height = "auto";
+        textarea.style.height = `${textarea.scrollHeight}px`;
+        measureComposer(composer.node);
+      });
     }
     textarea.focus();
     if (intent === "ask") showAskWarning(composer);
@@ -1098,20 +1107,27 @@ export function codeView({
     const textarea = node.querySelector("textarea");
     const dictation = attachDictation(textarea);
     node.querySelector(".buttons").prepend(dictation.button);
-    let measureQueued = false;
+    let lastLength = composer.text.length;
+    let shrunk = false;
+    let resizeRaf = null;
     textarea.addEventListener("input", () => {
       composer.text = textarea.value;
-      // Grow with the text, then tell the virtual list the new height on the next frame so we
-      // do not force two synchronous layouts per keypress.
-      textarea.style.height = "auto";
-      textarea.style.height = `${textarea.scrollHeight}px`;
-      if (!measureQueued) {
-        measureQueued = true;
-        requestAnimationFrame(() => {
-          measureQueued = false;
+      if (textarea.value.length < lastLength) shrunk = true;
+      lastLength = textarea.value.length;
+      // Defer auto-resize and composer height measurement into a single animation frame, and
+      // skip `height = "auto"` when text grew without overflowing the current height.
+      if (resizeRaf !== null) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        const needsShrink = shrunk;
+        shrunk = false;
+        if (!textarea.isConnected) return;
+        if (needsShrink || textarea.scrollHeight > textarea.clientHeight) {
+          textarea.style.height = "auto";
+          textarea.style.height = `${textarea.scrollHeight}px`;
           measureComposer(node);
-        });
-      }
+        }
+      });
     });
     textarea.addEventListener("keydown", (event) => {
       // Cmd-Shift-Enter is Send, which the window's handler answers.

@@ -946,10 +946,7 @@ impl Memory {
                     server.call_tool("recall", &arguments, deadline)
                 });
                 self.store(next, done, |calls, answer| {
-                    if calls.recalls.len() >= 256 && !calls.recalls.contains_key(&query.text) {
-                        calls.recalls.clear();
-                    }
-                    calls.recalls.insert(query.text.clone(), answer);
+                    calls.insert_recall(query.text.clone(), answer);
                 });
             }
             Task::Detail(id) => {
@@ -960,10 +957,7 @@ impl Memory {
                     Ok(Detail::new(note, history))
                 });
                 self.store(next, done, |calls, answer| {
-                    if calls.details.len() >= 256 && !calls.details.contains_key(id) {
-                        calls.details.clear();
-                    }
-                    calls.details.insert(id.clone(), answer);
+                    calls.insert_detail(id.clone(), answer);
                 });
             }
             Task::Refresh => {
@@ -972,8 +966,7 @@ impl Memory {
                 });
                 self.store(next, done, |calls, answer| {
                     if answer.is_ok() {
-                        calls.recalls.clear();
-                        calls.details.clear();
+                        calls.clear_caches();
                     }
                     calls.refreshed = Some(answer);
                 });
@@ -1064,13 +1057,9 @@ impl Memory {
         let recall: Recall = self.found(done)?;
         let mut inner = self.lock();
         if inner.calls.epoch == next.epoch {
-            if inner.calls.recalls.len() >= 256 && !inner.calls.recalls.contains_key(query) {
-                inner.calls.recalls.clear();
-            }
             inner
                 .calls
-                .recalls
-                .insert(query.to_owned(), Ok(recall.clone()));
+                .insert_recall(query.to_owned(), Ok(recall.clone()));
         }
         Ok(recall)
     }
@@ -1141,13 +1130,9 @@ impl Memory {
             // The next recall and read include the new memory, or the one hippius-mem
             // reinforced.
             if answer.is_ok() {
-                calls.recalls.clear();
-                calls.details.clear();
+                calls.clear_caches();
             }
-            if calls.remembered.len() >= 64 && !calls.remembered.contains_key(job) {
-                calls.remembered.clear();
-            }
-            calls.remembered.insert(job.clone(), answer);
+            calls.insert_remembered(job.clone(), answer);
         }
         self.shared.changed.notify_all();
     }
@@ -1668,11 +1653,14 @@ struct Calls {
     queue: VecDeque<Task>,
     running: Option<Task>,
     recalls: HashMap<String, Answer<Recall>>,
+    recalls_order: VecDeque<String>,
     details: HashMap<MemoryId, Answer<Detail>>,
+    details_order: VecDeque<MemoryId>,
     /// The last refresh's ending, until read.
     refreshed: Option<Answer<Refreshed>>,
     /// Each remember's ending, until read once ([`Memory::remember`]).
     remembered: HashMap<RememberJob, Answer<Remembered>>,
+    remembered_order: VecDeque<RememberJob>,
     /// Counts the reviews' recalls asked, to tell each apart ([`ReviewRecall::id`]).
     reviews: u64,
     health: Health,
@@ -1683,14 +1671,59 @@ struct Calls {
 }
 
 impl Calls {
+    fn clear_caches(&mut self) {
+        self.recalls.clear();
+        self.recalls_order.clear();
+        self.details.clear();
+        self.details_order.clear();
+    }
+
+    fn insert_recall(&mut self, key: String, answer: Answer<Recall>) {
+        if !self.recalls.contains_key(&key) {
+            while self.recalls.len() >= 256 {
+                let Some(oldest) = self.recalls_order.pop_front() else {
+                    break;
+                };
+                self.recalls.remove(&oldest);
+            }
+            self.recalls_order.push_back(key.clone());
+        }
+        self.recalls.insert(key, answer);
+    }
+
+    fn insert_detail(&mut self, key: MemoryId, answer: Answer<Detail>) {
+        if !self.details.contains_key(&key) {
+            while self.details.len() >= 256 {
+                let Some(oldest) = self.details_order.pop_front() else {
+                    break;
+                };
+                self.details.remove(&oldest);
+            }
+            self.details_order.push_back(key.clone());
+        }
+        self.details.insert(key, answer);
+    }
+
+    fn insert_remembered(&mut self, key: RememberJob, answer: Answer<Remembered>) {
+        if !self.remembered.contains_key(&key) {
+            while self.remembered.len() >= 64 {
+                let Some(oldest) = self.remembered_order.pop_front() else {
+                    break;
+                };
+                self.remembered.remove(&oldest);
+            }
+            self.remembered_order.push_back(key.clone());
+        }
+        self.remembered.insert(key, answer);
+    }
+
     /// Forgets what made the server unusable, and the answers kept: a new check. Starts a new
     /// epoch, so nothing begun before it stores an answer or a health, and its server stops.
     fn reset(&mut self) {
         self.epoch += 1;
         self.health = Health::Usable;
         self.last_death = None;
-        self.recalls.clear();
-        self.details.clear();
+        self.clear_caches();
     }
 
     /// Another project opened: everything of the last one goes, its server first.

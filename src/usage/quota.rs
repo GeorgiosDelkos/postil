@@ -2093,6 +2093,9 @@ fn curl_quote(value: &str) -> String {
     out
 }
 
+/// Maximum bytes read from a quota probe child's stdout so a runaway probe cannot exhaust memory.
+const MAX_PROBE_STDOUT_BYTES: u64 = 256 * 1024;
+
 /// Runs `cmd` in its own process group with optional stdin bytes and a hard `timeout`,
 /// killing the entire process group if the timeout elapses. The error says which step
 /// failed: starting the program, writing its stdin, or waiting for it.
@@ -2101,6 +2104,7 @@ fn run_timed(
     stdin_bytes: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<Output, String> {
+    use std::io::Read;
     let program = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .process_group(0)
@@ -2120,7 +2124,20 @@ fn run_timed(
     let (sender, receiver) = mpsc::sync_channel(1);
     let waiter = std::thread::Builder::new()
         .name("quota-wait".to_owned())
-        .spawn(move || drop(sender.send(child.wait_with_output())));
+        .spawn(move || {
+            let mut stdout = Vec::new();
+            let read_result = child.stdout.take().map_or(Ok(0), |out| {
+                out.take(MAX_PROBE_STDOUT_BYTES).read_to_end(&mut stdout)
+            });
+            let result = read_result.and_then(|_| {
+                child.wait().map(|status| Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            });
+            drop(sender.send(result));
+        });
     if let Err(error) = waiter {
         agents::kill_group(pid);
         return Err(format!(

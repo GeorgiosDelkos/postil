@@ -20,6 +20,11 @@ import { segmented } from "./settings-controls.js";
 // regenerated lockfile brings, each of which is four elements.
 const LINES_SHOWN = 400;
 
+// Total initial rendered-line budget across all files/steps in a single diff so multi-file
+// diffs do not build tens of thousands of DOM nodes up front; remaining files start collapsed
+// behind a "Show file" button.
+const INITIAL_LINE_BUDGET = 1200;
+
 // `viewEl` is the view's element. `setHeader(title, meta, controls)` fills the code pane's
 // header, `controls` being elements to show beside the meta; `notes()` gives the notes;
 // `noteCard(note)` builds a note's card, which opens its dialog; `addNote(path, line)` writes a
@@ -48,13 +53,17 @@ export function changesView({
   let opened = new Set();
   // The index of the current step among the drawn `.changes-step` sections.
   let current = 0;
-  // The memories the findings name: drawn again where it was as each summary is read.
+  // The memories the findings name: patch matching memory-link elements in place as each
+  // summary settles instead of rebuilding the entire diff DOM.
   const cited = findingMemories({
     onSettled: () => {
       if (!read) return;
-      const top = viewEl.scrollTop;
-      draw();
-      viewEl.scrollTop = top;
+      for (const link of viewEl.querySelectorAll(".finding-memory[data-memory-id]")) {
+        const id = link.dataset.memoryId;
+        const summary = cited.summary(id);
+        const text = summary ? `${id} · ${summary}` : id;
+        if (link.textContent !== text) link.textContent = text;
+      }
     },
   });
   // The `match(file, hunk)` of the latest `focusOn`, which says whether a hunk is wanted (`hunk`
@@ -75,9 +84,10 @@ export function changesView({
   async function show(from, to, run = null, { match = null } = {}) {
     if (shown && read && !read.sinceNow && shown.from === from && shown.to === to) {
       // A review that ended since brings its findings.
+      const runChanged = shown.run !== run;
       shown.run = run;
       viewEl.focus();
-      focusOn(match);
+      if (match || runChanged || viewEl.childElementCount === 0) focusOn(match);
       return;
     }
     shown = { from, to, run };
@@ -125,21 +135,25 @@ export function changesView({
     aiming = true;
     draw();
     aiming = false;
-    if (!target) return;
-    const step = target.closest(".changes-step");
+    const scrollTarget = target;
+    target = null;
+    if (!scrollTarget) return;
+    const step = scrollTarget.closest(".changes-step");
     if (step) {
       current = steps().indexOf(step);
       markCurrent();
     }
-    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const padding = paddingTop();
-    const top =
-      target.getBoundingClientRect().top -
-      viewEl.getBoundingClientRect().top +
-      viewEl.scrollTop -
-      padding;
-    viewEl.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
-    target = null;
+    requestAnimationFrame(() => {
+      if (!scrollTarget.isConnected) return;
+      const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const padding = paddingTop();
+      const top =
+        scrollTarget.getBoundingClientRect().top -
+        viewEl.getBoundingClientRect().top +
+        viewEl.scrollTop -
+        padding;
+      viewEl.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
+    });
   }
 
   // Whether `focus` wants one of `entries` (`{ file, hunk }`): they are then drawn whole.
@@ -186,7 +200,7 @@ export function changesView({
     }
     if (files.length === 0) parts.push(el("div", "empty", "No file changed."));
     const marks = marksOf(files);
-    const guide = shown.run?.report ? walkthrough(files, shown.run.report.steps) : null;
+    const guide = guideOf(files);
     const loose = (shown.run?.findings ?? []).filter(
       (finding) =>
         !finding.path || (order === "files" && !files.some((f) => f.path === finding.path)),
@@ -195,9 +209,13 @@ export function changesView({
     if (order === "walkthrough") parts.push(...walkthroughParts(guide, files, marks));
     else {
       const risks = risksOf(guide);
+      let budget = INITIAL_LINE_BUDGET;
       for (const file of files) {
-        const limit = holdsFocus(entriesOf(file)) ? Infinity : LINES_SHOWN;
+        const focused = holdsFocus(entriesOf(file));
+        const limit = focused ? Infinity : budget > 0 ? Math.min(LINES_SHOWN, budget) : 0;
+        const total = file.hunks.reduce((sum, hunk) => sum + hunk.lines.length, 0);
         parts.push(fileView(file, marks, risks, limit));
+        if (!focused && budget > 0) budget = Math.max(0, budget - Math.min(total, limit));
       }
     }
     viewEl.replaceChildren(...parts);
@@ -240,16 +258,39 @@ export function changesView({
     return [orderControl, riskControl];
   }
 
-  // Each file's notes and findings by line, read once per draw.
+  // Each file's notes and findings by line, cached per `(files, notes, findings)`.
+  let cachedMarks = null;
   function marksOf(files) {
     const all = notes();
     const findings = shown.run?.findings ?? [];
-    return new Map(
+    if (
+      cachedMarks &&
+      cachedMarks.files === files &&
+      cachedMarks.notes === all &&
+      cachedMarks.findings === findings
+    ) {
+      return cachedMarks.value;
+    }
+    const value = new Map(
       files.map((file) => [
         file,
         { notes: notesByLine(file, all), findings: findingsByLine(file, findings) },
       ]),
     );
+    cachedMarks = { files, notes: all, findings, value };
+    return value;
+  }
+
+  let cachedGuide = null;
+  function guideOf(files) {
+    const steps = shown.run?.report?.steps ?? null;
+    if (!steps) return null;
+    if (cachedGuide && cachedGuide.files === files && cachedGuide.steps === steps) {
+      return cachedGuide.value;
+    }
+    const value = walkthrough(files, steps);
+    cachedGuide = { files, steps, value };
+    return value;
   }
 
   // The rating of each hunk under the report: its step's, `eyes` for a hunk no step names.
@@ -289,17 +330,24 @@ export function changesView({
     const ordered = eyesFirst
       ? [...named.filter(isEyes), ...named.filter((group) => !isEyes(group))]
       : named;
-    const limit = (entries) => (holdsFocus(entries) ? Infinity : LINES_SHOWN);
+    let budget = INITIAL_LINE_BUDGET;
+    const takeLimit = (entries) => {
+      if (holdsFocus(entries)) return Infinity;
+      const limit = budget > 0 ? Math.min(LINES_SHOWN, budget) : 0;
+      const total = entries.reduce((sum, entry) => sum + (entry.hunk?.lines.length ?? 0), 0);
+      if (budget > 0) budget = Math.max(0, budget - Math.min(total, limit));
+      return limit;
+    };
     const parts = ordered.map((group) =>
       stepView(
         group,
         groups.length,
         { marks, findings: looseFindings.get(group) },
-        limit(group.entries),
+        takeLimit(group.entries),
       ),
     );
     if (rest.length || restFindings.length) {
-      parts.push(restView(rest, marks, restFindings, limit(rest)));
+      parts.push(restView(rest, marks, restFindings, takeLimit(rest)));
     }
     // A step that names no changed line is listed last, so a wrong report is visible.
     for (const group of empty) parts.push(stepView(group, groups.length, { marks, findings: [] }));
@@ -380,7 +428,7 @@ export function changesView({
       used += drawn.used;
       rows.append(drawn.node);
     }
-    if (used < total) nodes.push(moreButton(total - used, more));
+    if (used < total) nodes.push(moreButton(total - used, more, { collapsed: used === 0 }));
     return nodes;
   }
 
@@ -407,8 +455,10 @@ export function changesView({
     part.append(rows);
     if (used < total) {
       part.append(
-        moreButton(total - used, () =>
-          redraw(part, fileView(file, marks, risks, limit + LINES_SHOWN)),
+        moreButton(
+          total - used,
+          () => redraw(part, fileView(file, marks, risks, limit + LINES_SHOWN)),
+          { collapsed: used === 0 },
         ),
       );
     }
@@ -431,9 +481,12 @@ export function changesView({
     return el("div", "changes-notice changes-no-hunks", text);
   }
 
-  function moreButton(count, more) {
-    const label =
-      count > LINES_SHOWN
+  function moreButton(count, more, { collapsed = false } = {}) {
+    const label = collapsed
+      ? count > LINES_SHOWN
+        ? `Show ${LINES_SHOWN} of ${count} lines`
+        : `Show ${count} lines`
+      : count > LINES_SHOWN
         ? `Show ${LINES_SHOWN} more of ${count} lines`
         : `Show the other ${count} lines`;
     const button = el("button", "button changes-more", label);
@@ -520,7 +573,9 @@ export function changesView({
     card.append(head, el("div", "note-body", finding.text));
     if (finding.fix) card.append(el("div", "changes-finding-fix", `Fix: ${finding.fix}`));
     if (finding.memory) {
-      card.append(findingMemoryLink(finding.memory, cited.summary(finding.memory), openMemory));
+      const link = findingMemoryLink(finding.memory, cited.summary(finding.memory), openMemory);
+      link.dataset.memoryId = finding.memory;
+      card.append(link);
     }
     return card;
   }
@@ -587,6 +642,8 @@ export function changesView({
     shown = null;
     read = null;
     focus = null;
+    cachedMarks = null;
+    cachedGuide = null;
     cited.stop();
     request += 1;
     viewEl.hidden = true;

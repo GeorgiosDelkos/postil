@@ -323,12 +323,40 @@ pub(crate) fn read(file: &Path) -> io::Result<Vec<LedgerRecord>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    Ok(bytes
+    Ok(parse_records(&bytes))
+}
+
+/// Reads valid v1 records appended to `file` starting at byte `offset`, returning the parsed
+/// records and the new file offset.
+///
+/// # Errors
+///
+/// Returns the I/O error if the file exists but cannot be read.
+pub(crate) fn read_from(file: &Path, offset: u64) -> io::Result<(Vec<LedgerRecord>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut opened = match fs::File::open(file) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(error),
+    };
+    let end = opened.metadata()?.len();
+    if offset >= end {
+        return Ok((Vec::new(), end));
+    }
+    opened.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    opened.read_to_end(&mut bytes)?;
+    let new_offset = offset.saturating_add(bytes.len() as u64);
+    Ok((parse_records(&bytes), new_offset))
+}
+
+fn parse_records(bytes: &[u8]) -> Vec<LedgerRecord> {
+    bytes
         .split(|&byte| byte == b'\n')
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_slice::<LedgerRecord>(line).ok())
         .filter(|record| record.version == RECORD_VERSION)
-        .collect())
+        .collect()
 }
 
 /// Maps legacy built-in agent names in `usage.jsonl` to their current catalog name when no
