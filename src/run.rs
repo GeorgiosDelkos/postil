@@ -67,6 +67,7 @@
 //! The page is told about every change through `notify`, and fetches what it has not seen.
 
 mod log;
+pub(crate) mod pipeline;
 mod pull;
 mod room;
 
@@ -151,6 +152,8 @@ pub(crate) struct Runner {
     /// What this window is doing about each thread's pull request, by thread id
     /// ([`pull::PullWork`]); a lock never held with another.
     pull_work: Mutex<HashMap<String, pull::PullWork>>,
+    /// Persisted Lane pipelines (`Easy`, `Middle`, `Hard`), keyed by root thread id.
+    pipelines: Mutex<HashMap<String, pipeline::PipelineRun>>,
     /// Holds a review's next stage, once, until a test lets it start
     /// ([`Runner::hold_next_stage`]): between a stage's end and the next stage's start is a
     /// window no request can otherwise be timed into.
@@ -492,6 +495,9 @@ struct NewRun {
     review: Option<Chain>,
     /// As [`Pending::review_recall`].
     review_recall: Option<ReviewSnapshots>,
+    /// Forces this individual stage to run read-only even inside a `Mode::Work` thread (e.g.,
+    /// Hard Lane Planner / Plan Judge / Reviewers).
+    stage_read_only: bool,
     place: Place,
 }
 
@@ -594,6 +600,7 @@ impl Runner {
             // No thread: the folders stay until the next open, which is no harm.
             drop(swept);
         }
+        let pipelines = pipeline::load_pipelines(&repo.pipelines_file());
         Arc::new(Self {
             repo,
             agents,
@@ -604,6 +611,7 @@ impl Runner {
             slots: Mutex::new(Slots::default()),
             disk_runs: Mutex::new(Vec::new()),
             pull_work: Mutex::default(),
+            pipelines: Mutex::new(pipelines),
             #[cfg(test)]
             next_stage_gate: Mutex::new(None),
             #[cfg(test)]
@@ -684,6 +692,7 @@ impl Runner {
             conversation: Conversation::Fresh,
             review: None,
             review_recall: None,
+            stage_read_only: false,
             place: Place::New {
                 fork,
                 title,
@@ -732,6 +741,7 @@ impl Runner {
             conversation: Conversation::Fresh,
             review: None,
             review_recall: None,
+            stage_read_only: false,
             place: Place::New {
                 fork,
                 title,
@@ -935,6 +945,7 @@ impl Runner {
             conversation: Conversation::Fresh,
             review: None,
             review_recall: None,
+            stage_read_only: false,
             place: Place::New {
                 fork: fork.as_str().to_owned(),
                 title,
@@ -1106,6 +1117,7 @@ impl Runner {
             },
             review: None,
             review_recall: None,
+            stage_read_only: false,
             place: Place::Open(record),
         };
         self.launch(slots, new, |_| Ok(Content { notes, prompt }))
@@ -1235,6 +1247,7 @@ impl Runner {
             origin: Origin::Remember(Remember { of: of.to_owned() }),
             review: None,
             review_recall: None,
+            stage_read_only: false,
             place: Place::Open(record),
         };
         let mut id = None;
@@ -1486,6 +1499,7 @@ impl Runner {
             place: Place::Open(record),
             review: Some(chain),
             review_recall: snapshots,
+            stage_read_only: false,
         };
         self.launch(slots, new, |_| Ok(content))
     }
@@ -1560,14 +1574,16 @@ impl Runner {
             conversation,
             review,
             review_recall,
+            stage_read_only,
             place,
         } = new;
         let snapshot = place.mode() == Mode::Work
+            && !stage_read_only
             && !matches!(&origin, Origin::Review(stage) if !stage.judges())
             && !matches!(origin, Origin::Remember(_));
         let listed = !matches!(origin, Origin::Analysis(_) | Origin::Remember(_));
         let Created { run, prompt, marks } =
-            self.create_run(&agent.name, origin, &place, content)?;
+            self.create_run(&agent.name, origin, &place, stage_read_only, content)?;
         let (thread, worktree) = match self.place(&run, place, snapshot) {
             Ok(placed) => placed,
             Err(error) => {
@@ -1657,14 +1673,20 @@ impl Runner {
     /// # Errors
     ///
     /// As [`Run::create`], and the error of `content`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is an independent launch property passed once from `Runner::launch`"
+    )]
     fn create_run(
         &self,
         agent: &str,
         origin: Origin,
         place: &Place,
+        stage_read_only: bool,
         content: impl FnOnce(&str) -> Result<Content>,
     ) -> Result<Created> {
-        let read_only = place.mode() == Mode::Read || matches!(origin, Origin::Remember(_));
+        let read_only =
+            stage_read_only || place.mode() == Mode::Read || matches!(origin, Origin::Remember(_));
         // A follow-up and a review mark no note sent: the notes went to the run they follow or
         // review. An ask, the run of notes in a thread that only reads, is saved sent in its
         // run already (`notes::save_ask`).
@@ -1786,6 +1808,7 @@ impl Runner {
         let mut result = Ok(());
         // A stopped reviewer ends its review: the next stage does not start.
         slot.chain = None;
+        let cancel_thread_id = slot.thread.id.clone();
         match (started, asked) {
             (false, _) if slot.making => {
                 // Git is still making the worktree, which cannot be cut short. The run, and
@@ -1832,6 +1855,7 @@ impl Runner {
             }
         }
         drop(slots);
+        self.stop_pipeline(&cancel_thread_id);
         // Dropping the agent kills it and waits for its process to be reaped.
         drop(released);
         // An analysis merging its reply ends the run itself, once it is done.
@@ -2385,10 +2409,11 @@ impl Runner {
         // Read once: the slots are not held while logs are read, so the agents' events, which
         // need them, are never kept waiting on the disk.
         let live = self.live();
+        let pipeline_ids = self.pipeline_run_ids();
         let mut deleted = Vec::new();
         for number in numbers {
             let id = format!("R{number}");
-            if live.iter().any(|(run, _)| *run == id) {
+            if live.iter().any(|(run, _)| *run == id) || pipeline_ids.contains(&id) {
                 continue;
             }
             let file = dir.join(format!("{id}.jsonl"));
@@ -3256,6 +3281,8 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         #[cfg(test)]
         runner.pass_next_stage_gate();
         runner.advance(id, &ended);
+    } else if ends_turn && let Some(ended) = &run {
+        runner.advance_pipeline(id, ended, ended_well && !edited);
     }
 }
 

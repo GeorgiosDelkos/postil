@@ -6,7 +6,8 @@
 // costs nothing noticeable, and one drawing function is easier to keep right than updates by
 // hand. The control that had the focus gets it back by its `data-key`.
 
-import { el } from "./dom.js";
+import { agentLogoIcon, el } from "./dom.js";
+import { memoryBackendSummary } from "./hub.js";
 import {
   SCAN_POLL_MS,
   THEMES,
@@ -18,6 +19,7 @@ import {
   fetchSettingsJson,
   fontStepper,
   modelReports,
+  modelSelect,
   restoreDialogFocus,
   reviewerControls,
   segmented,
@@ -27,21 +29,27 @@ import {
   toggleSwitch,
 } from "./settings-controls.js";
 import {
+  CAPABILITY_TIERS,
   addReviewer,
+  addTierSlot,
   agentRows,
   canSetUp,
   memoryState,
   moveReviewer,
   removeCustomAgent,
   removeReviewer,
+  removeTierSlot,
   saveCustomAgent,
   setAgent,
   setAgentModel,
   setAnalyzer,
   setAnalyzerModel,
   setAgentMemory,
+  setAutoTriage,
   setEnabled,
+  setHardHumanGate,
   setReviewerModel,
+  setTierSlotModel,
 } from "./settings.js";
 
 // `apply` is called with the settings in effect whenever they change (and once on opening),
@@ -74,6 +82,8 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     // team memory on: on by default once ready (docs/review-assist.md, "Finding and setting
     // it up").
     settingUp: false,
+    // Inline hippius-mem paid S3 upgrade or invite-bundle form: null | { kind: "s3", ... } | { kind: "join", bundle }
+    memoryForm: null,
     pollTimer: null,
   };
 
@@ -201,7 +211,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     if (!ui.view) body.append(el("p", "settings-hint", "Loading…"));
     else {
       if (ui.view.problem) body.append(problem());
-      body.append(appearance(), startup(), agents(), teamMemory());
+      body.append(appearance(), startup(), agents(), capabilityTiers(), executionLanes(), teamMemory());
     }
     node.append(header, body, footer());
     return node;
@@ -466,6 +476,106 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     return node;
   }
 
+  function capabilityTiers() {
+    const settings = ui.view.settings;
+    const tiers = settings.modelTiers ?? { fast: [], standard: [], frontier: [] };
+    const enabled = settings.enabledAgents;
+    const node = settingSection(
+      "Model capability tiers",
+      el(
+        "p",
+        "settings-hint",
+        "Group your enabled (Agent, Model) pairs into Fast, Standard, and Frontier tiers. " +
+          "Add two Frontier models so Hard Lane plans and judges across independent models.",
+      ),
+    );
+    for (const [tierKey, label, hint] of CAPABILITY_TIERS) {
+      const slots = tiers[tierKey] ?? [];
+      const card = el("div", "slot-card");
+      const list = el("ol", "reviewer-list");
+      slots.forEach((slot, index) => {
+        const agent = el("span", "slot-agent");
+        const logo = agentLogoIcon(slot.name);
+        if (logo) agent.append(logo);
+        agent.append(el("span", "slot-agent-name", slot.name));
+        const model = modelSelect(
+          `tier-${tierKey}-model-${index}`,
+          slot,
+          models.models[slot.name],
+          (chosen) => save(setTierSlotModel(ui.view.settings, tierKey, index, chosen)),
+          { disabled: locked() },
+        );
+        const remove = controlButton(
+          "×",
+          `tier-${tierKey}-remove-${index}`,
+          () => save(removeTierSlot(ui.view.settings, tierKey, index)),
+          "icon-button",
+        );
+        remove.disabled = locked();
+        remove.tabIndex = 0;
+        const row = el("li", "slot-row");
+        row.append(el("span", "slot-lead", `${index + 1}.`), agent, model, remove);
+        list.append(row);
+      });
+      const add = controlButton("", `tier-${tierKey}-add`, () => {
+        const { left, bottom } = add.getBoundingClientRect();
+        const actions = enabled.map((name) => ({
+          label: name,
+          icon: agentLogoIcon(name),
+          badge: quotaBadge?.(name) ?? null,
+          run: () => save(addTierSlot(ui.view.settings, tierKey, name)),
+        }));
+        agentMenu.open(left, bottom + 4, actions);
+      });
+      add.className = "slot-add";
+      add.tabIndex = 0;
+      add.append(el("span", "slot-lead", "+"), el("span", "", `Add to ${label}`));
+      add.disabled = locked() || enabled.length === 0;
+      const addRow = el("div", "slot-row");
+      addRow.append(add);
+      card.append(list, addRow);
+      const row = settingRow(label, hint, card);
+      row.classList.add("stacked");
+      node.append(row);
+    }
+    return node;
+  }
+
+  function executionLanes() {
+    const lanes = ui.view.settings.lanes ?? { hardHumanGate: true, autoTriage: true };
+    const gate = toggleSwitch(
+      "hard-human-gate",
+      lanes.hardHumanGate,
+      () => save(setHardHumanGate(ui.view.settings, !lanes.hardHumanGate)),
+      { label: "Pause Hard Lane after Plan Judge", disabled: locked() },
+    );
+    const triage = toggleSwitch(
+      "auto-triage",
+      lanes.autoTriage,
+      () => save(setAutoTriage(ui.view.settings, !lanes.autoTriage)),
+      { label: "Auto-triage Hub queue", disabled: locked() },
+    );
+    return settingSection(
+      "Execution lanes & Hub",
+      el(
+        "p",
+        "settings-hint",
+        "Easy: 1 agent, no review · Middle: 1 agent + independent review · Hard: 2 Frontier " +
+          "models plan & judge + implementation + 2 independent reviews + final judge.",
+      ),
+      settingRow(
+        "Pause Hard Lane at Plan Gate",
+        "Let you approve or toggle Plan Judge proposals before implementation begins",
+        gate,
+      ),
+      settingRow(
+        "Automatic Hub priority triage",
+        "Analyze monitored repositories with hippius-mem on sync (cached per revision)",
+        triage,
+      ),
+    );
+  }
+
   // hippius-mem: where it stands, what to do next, the output of the last set up as it printed
   // it, and the switch. The switch shows once hippius-mem is ready, or while it is on, so a
   // removed hippius-mem can be let go.
@@ -484,9 +594,13 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     );
 
     const shown = memoryState(memory, on);
+    const backend = memoryBackendSummary(memory);
     const row = el("div", `agent-row ${shown.kind}`);
     const text = el("div", "agent-text");
-    text.append(el("span", "agent-name", "hippius-mem"), el("span", "agent-usage", shown.label));
+    text.append(
+      el("span", "agent-name", "hippius-mem"),
+      el("span", "agent-usage", `${shown.label} · ${backend.detail}`),
+    );
     if (state?.path) {
       text.append(el("span", "agent-command", state.path));
       row.title = `${shown.label}: ${state.path}`;
@@ -537,6 +651,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     }
 
     node.append(memoryActions(state, setup?.status === "running"));
+    if (ui.memoryForm) node.append(memoryBackendForm(ui.memoryForm));
     if (state?.kind === "ready" || on) {
       const flip = () => save(setAgentMemory(ui.view.settings, !on, state));
       const control = toggleSwitch("agent-memory", on, flip, {
@@ -571,13 +686,115 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     check.disabled = state === null || settingUp;
     actions.append(check);
     if (canSetUp(state)) {
-      const setUp = controlButton("Set up a trial vault", "memory-setup", () =>
+      const setUp = controlButton("Set up local trial vault", "memory-setup", () =>
         memoryJob("api/memory/setup", { setUp: true }),
       );
       setUp.disabled = settingUp;
       actions.append(setUp);
     }
+    if (state && state.kind !== "missing") {
+      const s3 = controlButton("Upgrade to Remote S3…", "memory-s3", () => {
+        ui.memoryForm = {
+          kind: "s3",
+          bucket: "",
+          accessKeyId: "",
+          secretAccessKey: "",
+          endpoint: "",
+          team: "",
+        };
+        render();
+      });
+      s3.disabled = settingUp;
+      const join = controlButton("Join Team Vault…", "memory-join", () => {
+        ui.memoryForm = { kind: "join", bundle: "" };
+        render();
+      });
+      join.disabled = settingUp;
+      actions.append(s3, join);
+    }
     return actions;
+  }
+
+  function memoryBackendForm(form) {
+    const node = el("form", "agent-form");
+    const makeField = (label, key, value, placeholder, type = "text") => {
+      const wrap = el("label", "agent-field");
+      const input = el("input", "field");
+      input.type = type;
+      input.value = value;
+      input.placeholder = placeholder;
+      input.dataset.key = key;
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.addEventListener("input", () => {
+        form[key] = input.value;
+      });
+      wrap.append(el("span", "settings-hint", label), input);
+      return wrap;
+    };
+    if (form.kind === "s3") {
+      node.append(
+        el(
+          "p",
+          "settings-hint",
+          "Runs `hippius-mem upgrade` to copy your local vault to a paid Hippius / S3 bucket. " +
+            "Your secret key is passed via stdin and never stored by Postil.",
+        ),
+        makeField("Bucket", "bucket", form.bucket, "my-team-vault"),
+        makeField("Access key ID", "accessKeyId", form.accessKeyId, "AKIA…"),
+        makeField("Secret access key", "secretAccessKey", form.secretAccessKey, "••••••••", "password"),
+        makeField("Endpoint (optional)", "endpoint", form.endpoint, "https://s3.hippius.com"),
+        makeField("Team name (optional)", "team", form.team, "core"),
+      );
+    } else {
+      const wrap = el("label", "agent-field");
+      const area = el("textarea", "field");
+      area.rows = 3;
+      area.value = form.bundle;
+      area.placeholder = "Paste founder's hippius-mem invite bundle…";
+      area.addEventListener("input", () => {
+        form.bundle = area.value;
+      });
+      wrap.append(el("span", "settings-hint", "Invite bundle (`hippius-mem join --bundle -`)"), area);
+      node.append(wrap);
+    }
+    const actions = el("div", "settings-actions");
+    const submit = el("button", "button primary", form.kind === "s3" ? "Upgrade to S3" : "Join Vault");
+    submit.type = "submit";
+    actions.append(
+      controlButton("Cancel", "memory-form-cancel", () => {
+        ui.memoryForm = null;
+        render();
+      }),
+      submit,
+    );
+    node.append(actions);
+    node.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const route = form.kind === "s3" ? "api/memory/upgrade" : "api/memory/join";
+      const payload =
+        form.kind === "s3"
+          ? {
+              bucket: form.bucket,
+              accessKeyId: form.accessKeyId,
+              secretAccessKey: form.secretAccessKey,
+              endpoint: form.endpoint || null,
+              team: form.team || null,
+            }
+          : { bundle: form.bundle };
+      ui.memoryForm = null;
+      try {
+        const view = await fetchSettingsJson(route, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        ui.settingUp = true;
+        show(view);
+      } catch (error) {
+        fail(error);
+      }
+    });
+    return node;
   }
 
   // Starts a check or a set up of hippius-mem; the reply says it runs, and `show` asks again
@@ -625,6 +842,9 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
       const view = await fetchSettingsJson();
       show(view);
       return view;
+    },
+    view() {
+      return ui.view;
     },
     // Updates the cached view when another flow (the startup wizard) saved settings.
     sync(view) {

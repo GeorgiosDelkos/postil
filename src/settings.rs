@@ -42,8 +42,11 @@ use crate::agents::{self, AgentChoice, BUILT_IN};
 use crate::error::{Error, Result};
 use crate::files::{save_json, version_of};
 
-/// The format version this build writes. It also reads [`V3`], [`V2`] and [`V1`].
-const VERSION: u32 = 4;
+/// The format version this build writes. It also reads [`V4`], [`V3`], [`V2`] and [`V1`].
+const VERSION: u32 = 5;
+
+/// The format before capability tiers and lane/hub settings: read as it is, with defaults.
+const V4: u32 = 4;
 
 /// The format before team memory: read as it is, with it off.
 const V3: u32 = 3;
@@ -86,6 +89,46 @@ pub(crate) enum TeamMemory {
     On,
 }
 
+/// Capability tier of an `(Agent, Model)` pair for lane orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CapabilityTier {
+    /// Fast / economy models for priority triage and Easy Lane tasks.
+    Fast,
+    /// Standard workhorse models for day-to-day implementation and peer reviews.
+    Standard,
+    /// Top-tier Frontier models for Hard Lane planning, plan judging, and final review.
+    Frontier,
+}
+
+/// Ordered `(Agent, Model)` slots grouped by capability tier.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub(crate) struct ModelTiers {
+    pub(crate) fast: Vec<AgentSlot>,
+    pub(crate) standard: Vec<AgentSlot>,
+    pub(crate) frontier: Vec<AgentSlot>,
+}
+
+/// Preferences governing execution lanes and the multi-repo Hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub(crate) struct LaneSettings {
+    /// Whether Hard Lane pauses after Stage 2 (Plan Judge) for human approval before coding.
+    pub(crate) hard_human_gate: bool,
+    /// Whether the Hub automatically runs cached Tier-1 AI triage on newly synced items.
+    pub(crate) auto_triage: bool,
+}
+
+impl Default for LaneSettings {
+    fn default() -> Self {
+        Self {
+            hard_human_gate: true,
+            auto_triage: true,
+        }
+    }
+}
+
 /// The settings in effect, each rule in the module docs kept: made only from a
 /// [`RawSettings`] that passes them, so settings that break one never reach the file, the
 /// page, or a run. Serialized as the [`RawSettings`] it holds.
@@ -123,6 +166,12 @@ pub(crate) struct RawSettings {
     /// Whether agents get team memory (hippius-mem). Off by default: it is turned on only
     /// once hippius-mem is ready (`site.rs`, `save_settings`), which a file does not know.
     agent_memory: bool,
+
+    /// Model capability tiers (Fast, Standard, Frontier) used by execution lanes.
+    model_tiers: ModelTiers,
+
+    /// Execution lane and Hub triage preferences.
+    lanes: LaneSettings,
 }
 
 /// A place in the workflow: the agent notes are sent to, or one reviewer. One type for both,
@@ -219,6 +268,37 @@ impl Settings {
             .iter()
             .map(|slot| self.choice(&slot.name, slot.model.clone()))
             .collect()
+    }
+
+    /// Whether `tier` has at least one configured `(Agent, Model)` entry.
+    pub(crate) fn has_tier(&self, tier: CapabilityTier) -> bool {
+        !self.tier_slots(tier).is_empty()
+    }
+
+    /// The raw slots assigned to capability `tier`.
+    fn tier_slots(&self, tier: CapabilityTier) -> &[AgentSlot] {
+        match tier {
+            CapabilityTier::Fast => &self.0.model_tiers.fast,
+            CapabilityTier::Standard => &self.0.model_tiers.standard,
+            CapabilityTier::Frontier => &self.0.model_tiers.frontier,
+        }
+    }
+
+    /// The resolved `(Agent, Model)` choices configured for capability `tier`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Settings::choice`].
+    pub(crate) fn tier_choices(&self, tier: CapabilityTier) -> Result<Vec<AgentChoice>> {
+        self.tier_slots(tier)
+            .iter()
+            .map(|slot| self.choice(&slot.name, slot.model.clone()))
+            .collect()
+    }
+
+    /// Execution lane and Hub triage preferences.
+    pub(crate) fn lanes(&self) -> &LaneSettings {
+        &self.0.lanes
     }
 
     /// The command of the agent called `name`, when it is a custom one.
@@ -358,6 +438,21 @@ impl RawSettings {
             }
             check_model(reviewer)?;
         }
+        for (tier_name, slots) in [
+            ("fast", &self.model_tiers.fast),
+            ("standard", &self.model_tiers.standard),
+            ("frontier", &self.model_tiers.frontier),
+        ] {
+            for slot in slots {
+                if !enabled(slot) {
+                    return Err(format!(
+                        "{:?} cannot be assigned to the {tier_name} tier: it is not an enabled agent",
+                        slot.name
+                    ));
+                }
+                check_model(slot)?;
+            }
+        }
         Ok(())
     }
 }
@@ -422,6 +517,8 @@ impl Default for RawSettings {
             analyzer: None,
             reviewers: Vec::new(),
             agent_memory: false,
+            model_tiers: ModelTiers::default(),
+            lanes: LaneSettings::default(),
         }
     }
 }
@@ -524,7 +621,7 @@ fn parse(file: &Path, json: &str) -> std::result::Result<Settings, String> {
                 "{shown} was written by a newer Postil (format version {version})"
             ));
         }
-        Some(version) if ![VERSION, V3, V2, V1].contains(&version) => {
+        Some(version) if ![VERSION, V4, V3, V2, V1].contains(&version) => {
             return Err(format!("{shown} has an unknown format version {version}"));
         }
         _ => {}
@@ -571,7 +668,10 @@ impl RawSettings {
             .agent
             .iter_mut()
             .chain(self.analyzer.iter_mut())
-            .chain(self.reviewers.iter_mut());
+            .chain(self.reviewers.iter_mut())
+            .chain(self.model_tiers.fast.iter_mut())
+            .chain(self.model_tiers.standard.iter_mut())
+            .chain(self.model_tiers.frontier.iter_mut());
         for slot in slots {
             if slot.name == "Gemini" {
                 "Antigravity".clone_into(&mut slot.name);
@@ -682,7 +782,7 @@ mod tests {
         save(&file, &settings, "").unwrap();
 
         let expected = r#"{
-  "version": 4,
+  "version": 5,
   "settings": {
     "theme": "dark",
     "codeFontSize": 14,
@@ -716,7 +816,16 @@ mod tests {
         "model": null
       }
     ],
-    "agentMemory": true
+    "agentMemory": true,
+    "modelTiers": {
+      "fast": [],
+      "standard": [],
+      "frontier": []
+    },
+    "lanes": {
+      "hardHumanGate": true,
+      "autoTriage": true
+    }
   }
 }
 "#;

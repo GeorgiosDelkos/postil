@@ -110,7 +110,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hash;
-use std::io::{self, Read};
+use std::io::{self, Read, Write as _};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -235,12 +235,63 @@ pub(crate) enum Setup {
     },
 }
 
-/// What is known: the state (`None` while a check runs, or before the first check), and the
-/// last set up (`None` before the first).
+/// What storage backend `hippius-mem` is configured to use, read from the non-secret fields
+/// of the engineer's configuration file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BackendKind {
+    /// Local trial vault on disk (no gateway / no remote S3).
+    Local,
+    /// Paid remote Hippius / S3-compatible synced team vault.
+    S3,
+    /// Configuration missing or unrecognized.
+    Unknown,
+}
+
+/// Non-secret summary of the active `hippius-mem` storage backend for the Hub and Settings UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackendInfo {
+    pub(crate) kind: BackendKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_path: Option<String>,
+}
+
+/// Parameters for `hippius-mem upgrade` (flipping a local trial vault to a paid remote S3 bucket).
+/// Secret access key is piped via stdin, never argv, and omitted from `Debug`.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpgradeS3Request {
+    pub(crate) bucket: String,
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    #[serde(default)]
+    pub(crate) endpoint: Option<String>,
+    #[serde(default)]
+    pub(crate) team: Option<String>,
+}
+
+impl fmt::Debug for UpgradeS3Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpgradeS3Request")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("team", &self.team)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What is known: the state (`None` while a check runs, or before the first check), the
+/// last set up (`None` before the first), and the detected storage backend.
 #[derive(Debug)]
 pub(crate) struct Status {
     pub(crate) state: Option<State>,
     pub(crate) setup: Option<Setup>,
+    pub(crate) backend: BackendInfo,
 }
 
 /// Checks and sets up hippius-mem in the background (module docs, "Invariants"). One per
@@ -299,11 +350,13 @@ struct Inner {
     finished: u64,
 }
 
-/// The two kinds of job.
-#[derive(Debug, Clone, Copy)]
+/// The kinds of setup/check job.
+#[derive(Debug, Clone)]
 enum Job {
     Check,
     Setup,
+    UpgradeS3(UpgradeS3Request),
+    JoinBundle(String),
 }
 
 impl Memory {
@@ -346,6 +399,7 @@ impl Memory {
             let status = Status {
                 state: inner.state.clone(),
                 setup: inner.setup.clone(),
+                backend: self.detect_backend(),
             };
             (path, status)
         };
@@ -359,6 +413,7 @@ impl Memory {
             return Status {
                 state: inner.state.clone(),
                 setup: inner.setup.clone(),
+                backend: self.detect_backend(),
             };
         }
         status
@@ -392,6 +447,72 @@ impl Memory {
             return Err(Error::MemorySetupRunning);
         }
         self.start(&mut inner, Job::Setup)
+    }
+
+    /// Starts upgrading a local trial vault to a paid remote Hippius/S3 bucket
+    /// (`hippius-mem upgrade`), passing the S3 secret strictly over stdin, then runs `doctor`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when required fields are blank; [`Error::MemorySetupRunning`] while
+    /// another setup runs; [`Error::StartMemory`] when the thread cannot start.
+    pub(crate) fn upgrade_s3(&self, request: UpgradeS3Request) -> Result<()> {
+        if request.bucket.trim().is_empty()
+            || request.access_key_id.trim().is_empty()
+            || request.secret_access_key.trim().is_empty()
+        {
+            return Err(Error::BadRequest(
+                "bucket, access key ID, and secret access key are required to upgrade to remote S3"
+                    .to_owned(),
+            ));
+        }
+        let mut inner = self.lock();
+        if inner.setup == Some(Setup::Running) {
+            return Err(Error::MemorySetupRunning);
+        }
+        self.start(&mut inner, Job::UpgradeS3(request))
+    }
+
+    /// Joins an existing paid team vault using an invite bundle (`hippius-mem join --bundle -`),
+    /// piping the bundle over stdin, then runs `doctor`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadRequest`] when the bundle is blank; [`Error::MemorySetupRunning`] while
+    /// another setup runs; [`Error::StartMemory`] when the thread cannot start.
+    pub(crate) fn join_bundle(&self, bundle: String) -> Result<()> {
+        if bundle.trim().is_empty() {
+            return Err(Error::BadRequest(
+                "paste a hippius-mem invite bundle first".to_owned(),
+            ));
+        }
+        let mut inner = self.lock();
+        if inner.setup == Some(Setup::Running) {
+            return Err(Error::MemorySetupRunning);
+        }
+        self.start(&mut inner, Job::JoinBundle(bundle))
+    }
+
+    /// Reads the non-secret storage backend metadata from the engineer's `hippius-mem.toml`.
+    pub(crate) fn detect_backend(&self) -> BackendInfo {
+        let Ok(path) = &self.config else {
+            return BackendInfo {
+                kind: BackendKind::Unknown,
+                bucket: None,
+                endpoint: None,
+                config_path: None,
+            };
+        };
+        let config_path = Some(path.to_string_lossy().into_owned());
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return BackendInfo {
+                kind: BackendKind::Unknown,
+                bucket: None,
+                endpoint: None,
+                config_path,
+            };
+        };
+        parse_backend_toml(&text, config_path)
     }
 
     /// Runs doctor and the memory server in `repo`'s root from now on (module docs), and checks
@@ -429,22 +550,24 @@ impl Memory {
             .map_or_else(std::env::temp_dir, |project| project.root.clone());
         let name = match job {
             Job::Check => "memory-check",
-            Job::Setup => "memory-setup",
+            Job::Setup | Job::UpgradeS3(_) | Job::JoinBundle(_) => "memory-setup",
         };
+        let is_check = matches!(job, Job::Check);
         std::thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || memory.run(job, number, &dir))
+            .spawn(move || memory.run(&job, number, &dir))
             .map_err(Error::StartMemory)?;
         inner.job = number;
-        match job {
-            Job::Check => inner.state = None,
-            Job::Setup => inner.setup = Some(Setup::Running),
+        if is_check {
+            inner.state = None;
+        } else {
+            inner.setup = Some(Setup::Running);
         }
         Ok(())
     }
 
     /// The job's thread: runs it in `dir` and stores what it found.
-    fn run(&self, job: Job, number: u64, dir: &Path) {
+    fn run(&self, job: &Job, number: u64, dir: &Path) {
         // Blocks until the login shell has said where programs are, a few seconds at most
         // and only once per app.
         let search_path = self.agents.wait();
@@ -455,10 +578,12 @@ impl Memory {
         };
         let setup = match (job, &program) {
             (Job::Check, _) => None,
-            (Job::Setup, None) => Some(Setup::Failed {
+            (_, None) => Some(Setup::Failed {
                 error: format!("{PROGRAM} is not installed on PATH"),
             }),
             (Job::Setup, Some(path)) => Some(self.quickstart(path, &at)),
+            (Job::UpgradeS3(request), Some(path)) => Some(self.run_upgrade_s3(path, &at, request)),
+            (Job::JoinBundle(bundle), Some(path)) => Some(self.run_join_bundle(path, &at, bundle)),
         };
         let state = match program {
             None => State::Missing,
@@ -545,6 +670,81 @@ impl Memory {
             Outcome::TimedOut => Setup::Failed {
                 error: format!(
                     "{PROGRAM} quickstart did not finish within {} s",
+                    SETUP_TIMEOUT.as_secs()
+                ),
+            },
+            Outcome::NotStarted(error) => Setup::Failed {
+                error: format!("cannot start {}: {error}", path.display()),
+            },
+        }
+    }
+
+    /// Runs `hippius-mem upgrade` with S3 secret piped via stdin (never argv).
+    fn run_upgrade_s3(&self, path: &Path, at: &Place<'_>, req: &UpgradeS3Request) -> Setup {
+        let mut args: Vec<&str> = vec![
+            "upgrade",
+            "--bucket",
+            req.bucket.trim(),
+            "--access-key-id",
+            req.access_key_id.trim(),
+        ];
+        if let Some(endpoint) = req
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.push("--endpoint");
+            args.push(endpoint);
+        }
+        if let Some(team) = req.team.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            args.push("--team");
+            args.push(team);
+        }
+        let command = match self.command(path, at, &args) {
+            Ok(command) => command,
+            Err(error) => return Setup::Failed { error },
+        };
+        let stdin_secret = format!("{}\n", req.secret_access_key.trim());
+        match run_with_stdin(command, Some(stdin_secret.as_bytes()), SETUP_TIMEOUT) {
+            Outcome::Exited {
+                code: Some(0),
+                stdout,
+                ..
+            } => Setup::Succeeded { output: stdout },
+            Outcome::Exited { stdout, stderr, .. } => Setup::Failed {
+                error: if stderr.is_empty() { stdout } else { stderr },
+            },
+            Outcome::TimedOut => Setup::Failed {
+                error: format!(
+                    "{PROGRAM} upgrade did not finish within {} s",
+                    SETUP_TIMEOUT.as_secs()
+                ),
+            },
+            Outcome::NotStarted(error) => Setup::Failed {
+                error: format!("cannot start {}: {error}", path.display()),
+            },
+        }
+    }
+
+    /// Runs `hippius-mem join --bundle -` with the bundle piped via stdin.
+    fn run_join_bundle(&self, path: &Path, at: &Place<'_>, bundle: &str) -> Setup {
+        let command = match self.command(path, at, &["join", "--bundle", "-"]) {
+            Ok(command) => command,
+            Err(error) => return Setup::Failed { error },
+        };
+        match run_with_stdin(command, Some(bundle.as_bytes()), SETUP_TIMEOUT) {
+            Outcome::Exited {
+                code: Some(0),
+                stdout,
+                ..
+            } => Setup::Succeeded { output: stdout },
+            Outcome::Exited { stdout, stderr, .. } => Setup::Failed {
+                error: if stderr.is_empty() { stdout } else { stderr },
+            },
+            Outcome::TimedOut => Setup::Failed {
+                error: format!(
+                    "{PROGRAM} join did not finish within {} s",
                     SETUP_TIMEOUT.as_secs()
                 ),
             },
@@ -825,6 +1025,45 @@ impl Memory {
             // Dropped from the queue before it ran: the server cannot be asked, another
             // project opened, or the window closed.
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.stopped_why()),
+        }
+    }
+
+    /// Recalls strong team memories for an explicit repository name (e.g. during Hub priority
+    /// triage or pre-flight evaluation, even when no workspace project is open). Uses
+    /// `hippius-mem recall` via the same configured `HIPPIUS_MEM_CONFIG`, bounded to `CALL_TIMEOUT`.
+    /// Returns an empty list if hippius-mem is not Ready or returns no strong pointers.
+    pub(crate) fn recall_for_hub_repo(
+        &self,
+        repo_dir: &Path,
+        repo_name: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<HubMemoryHit> {
+        let Some(State::Ready { path }) = self.status().state else {
+            return Vec::new();
+        };
+        let search_path = self.agents.wait();
+        let at = Place {
+            search_path: &search_path,
+            dir: repo_dir,
+        };
+        let cut_query = cut(query.to_owned());
+        let k_str = limit.clamp(1, 10).to_string();
+        let mut args: Vec<&str> = vec!["recall", &cut_query, "--k", &k_str];
+        if let Some(repo) = repo_name {
+            args.push("--repo");
+            args.push(repo);
+        }
+        let Ok(command) = self.command(&path, &at, &args) else {
+            return Vec::new();
+        };
+        match run(command, self.call_timeout) {
+            Outcome::Exited {
+                code: Some(0),
+                stdout,
+                ..
+            } => parse_cli_recall(&stdout),
+            _ => Vec::new(),
         }
     }
 
@@ -2152,10 +2391,121 @@ enum Outcome {
 /// is killed ([`agents::kill_group`]) before the program is reaped, so its pid, and with it
 /// the group id, cannot have been reused, and nothing it left running stays. A program that
 /// exited is a zombie by then, which the kill does not change, so its exit code is kept.
-fn run(mut command: Command, timeout: Duration) -> Outcome {
+/// A lightweight team memory hit surfaced on Hub cards and task evaluations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HubMemoryHit {
+    pub(crate) id: String,
+    pub(crate) summary: String,
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+}
+
+/// Parses non-secret storage metadata (`storage`, `bucket`, `endpoint`) from `hippius-mem.toml`.
+fn parse_backend_toml(text: &str, config_path: Option<String>) -> BackendInfo {
+    let mut kind = BackendKind::Unknown;
+    let mut bucket = None;
+    let mut endpoint = None;
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = value.trim().trim_matches('"').trim_matches('\'');
+        if val.is_empty() {
+            continue;
+        }
+        match key {
+            "storage" => {
+                if val.eq_ignore_ascii_case("s3") || val.eq_ignore_ascii_case("hippius") {
+                    kind = BackendKind::S3;
+                } else if val.eq_ignore_ascii_case("local") || val.eq_ignore_ascii_case("fs") {
+                    kind = BackendKind::Local;
+                }
+            }
+            "bucket" if bucket.is_none() => bucket = Some(val.to_owned()),
+            "endpoint" | "s3_endpoint" if endpoint.is_none() => endpoint = Some(val.to_owned()),
+            _ => {}
+        }
+    }
+    if kind == BackendKind::Unknown && bucket.is_some() {
+        kind = BackendKind::S3;
+    }
+    BackendInfo {
+        kind,
+        bucket,
+        endpoint,
+        config_path,
+    }
+}
+
+/// Parses memory hits from `hippius-mem recall` stdout (handles either JSON or human-readable
+/// lines containing `mem_<ULID>`).
+fn parse_cli_recall(stdout: &str) -> Vec<HubMemoryHit> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout)
+        && let Some(pointers) = value.get("pointers").and_then(serde_json::Value::as_array)
+    {
+        return pointers
+            .iter()
+            .filter(|p| {
+                !p.get("weak")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .filter_map(|p| {
+                let id = p.get("id")?.as_str()?.to_owned();
+                let summary = p.get("summary")?.as_str()?.trim().to_owned();
+                let kind = p
+                    .get("type")
+                    .or_else(|| p.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                Some(HubMemoryHit { id, summary, kind })
+            })
+            .collect();
+    }
+    let mut hits = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        let Some(pos) = trimmed.find("mem_") else {
+            continue;
+        };
+        let after = &trimmed[pos..];
+        let id: String = after
+            .chars()
+            .take_while(|c| *c == '_' || c.is_ascii_alphanumeric())
+            .collect();
+        if MemoryId::parse(&id).is_err() {
+            continue;
+        }
+        let rest = after[id.len()..]
+            .trim()
+            .trim_start_matches([':', '-', ']', ')', '·'])
+            .trim();
+        if !rest.is_empty() && !hits.iter().any(|h: &HubMemoryHit| h.id == id) {
+            hits.push(HubMemoryHit {
+                id,
+                summary: rest.to_owned(),
+                kind: None,
+            });
+        }
+    }
+    hits
+}
+
+fn run(command: Command, timeout: Duration) -> Outcome {
+    run_with_stdin(command, None, timeout)
+}
+
+fn run_with_stdin(mut command: Command, input: Option<&[u8]>, timeout: Duration) -> Outcome {
     let spawned = command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -2163,6 +2513,16 @@ fn run(mut command: Command, timeout: Duration) -> Outcome {
         Ok(child) => child,
         Err(error) => return Outcome::NotStarted(error),
     };
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        let owned = bytes.to_vec();
+        drop(
+            std::thread::Builder::new()
+                .name("memory-stdin".to_owned())
+                .spawn(move || {
+                    drop(stdin.write_all(&owned));
+                }),
+        );
+    }
 
     let deadline = Instant::now() + timeout;
     let stdout = read_on_thread(child.stdout.take());

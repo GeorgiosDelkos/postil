@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   addReviewer,
+  addTierSlot,
   agentRows,
   agentState,
   codeMetrics,
@@ -12,14 +13,18 @@ import {
   moveReviewer,
   removeCustomAgent,
   removeReviewer,
+  removeTierSlot,
   saveCustomAgent,
   setAgent,
   setAgentModel,
   setAnalyzer,
   setAnalyzerModel,
   setAgentMemory,
+  setAutoTriage,
   setEnabled,
+  setHardHumanGate,
   setReviewerModel,
+  setTierSlotModel,
 } from "./settings.js";
 import { modelSelectOptions } from "./settings-controls.js";
 
@@ -300,4 +305,21 @@ test("Set up is offered only when doctor found no configuration, whatever its ex
   for (const state of [null, { kind: "missing" }, { kind: "ready", path: "/p" }]) {
     assert.equal(canSetUp(state), false);
   }
+});
+
+test("capability tier slots validate enabled agents, block disabling, and support lane toggles", () => {
+  const added = addTierSlot(settings(), "frontier", "Claude", "opus-4.5").settings;
+  assert.deepEqual(added.modelTiers.frontier, [slot("Claude", "opus-4.5")]);
+  assert.match(setEnabled(added, "Claude", false).error, /Tier 3 \(Frontier\)/);
+  assert.match(addTierSlot(settings(), "fast", "Antigravity").error, /Turn Antigravity on first/);
+
+  const updated = setTierSlotModel(added, "frontier", 0, "opus-5").settings;
+  assert.deepEqual(updated.modelTiers.frontier, [slot("Claude", "opus-5")]);
+  const removed = removeTierSlot(updated, "frontier", 0).settings;
+  assert.deepEqual(removed.modelTiers.frontier, []);
+
+  const gated = setHardHumanGate(settings(), false).settings;
+  assert.equal(gated.lanes.hardHumanGate, false);
+  const triaged = setAutoTriage(gated, false).settings;
+  assert.equal(triaged.lanes.autoTriage, false);
 });

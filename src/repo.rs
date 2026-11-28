@@ -207,8 +207,13 @@ impl Repo {
         self.postil_dir().join("runs")
     }
 
+    /// Where this working tree's lane pipelines are stored (`run/pipeline.rs`).
+    pub(crate) fn pipelines_file(&self) -> PathBuf {
+        self.postil_dir().join("pipelines.json")
+    }
+
     /// The directory that holds every file Postil keeps for this working tree.
-    fn postil_dir(&self) -> PathBuf {
+    pub(crate) fn postil_dir(&self) -> PathBuf {
         self.git_dir.join("postil")
     }
 

@@ -13,6 +13,14 @@
 <div class="left-rail">
   <nav class="activity-bar" aria-label="Navigation">
     <div class="activity-group">
+      <button type="button" class="activity-btn" id="toggle-hub" aria-pressed="false" aria-controls="hub" aria-label="Hub" title="Agentic Hub (⌘1)">
+        <svg class="activity-glyph" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="2" y="2" width="5" height="5" rx="1"/>
+          <rect x="9" y="2" width="5" height="5" rx="1"/>
+          <rect x="2" y="9" width="5" height="5" rx="1"/>
+          <rect x="9" y="9" width="5" height="5" rx="1"/>
+        </svg>
+      </button>
       <button type="button" class="activity-btn" id="toggle-files" aria-pressed="true" aria-controls="sidebar" aria-label="Files" title="Files (⌘B)">
         <svg class="activity-glyph" viewBox="0 0 18 18" aria-hidden="true">
           <path d="M4.5 2.75h5.25l3.75 3.75v8.75a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-11.5a1 1 0 0 1 1-1Z"/>
@@ -73,6 +81,8 @@
       <div class="crumbs" id="crumbs"></div>
       <div class="meta" id="file-meta"></div>
     </header>
+    <div class="pipeline-strip" id="pipeline-strip" hidden></div>
+    <div class="plan-gate" id="plan-gate" hidden></div>
     <div class="code" id="code" tabindex="0">
       <div class="code-rows" id="code-rows"></div>
       <div class="empty" id="code-empty">Pick a file on the left.</div>
@@ -109,6 +119,8 @@
 <div class="divider" id="divider-map" role="separator" aria-orientation="vertical" aria-label="Map width" aria-controls="map" tabindex="0" title="Drag to resize · double-click to reset" hidden></div>
 <div class="divider" id="divider-tray" role="separator" aria-orientation="vertical" aria-label="Tray width" aria-controls="tray" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
+<section class="hub" id="hub" aria-label="Agentic Hub" hidden></section>
+
 <section class="welcome" id="welcome" aria-labelledby="welcome-title" hidden>
   <div class="drag-strip" data-drag></div>
   <div class="welcome-body">
@@ -139,6 +151,7 @@
 <dialog class="note-dialog memory-dialog" id="memory-dialog" aria-labelledby="memory-dialog-title" tabindex="-1"></dialog>
 <dialog class="settings" id="settings" aria-labelledby="settings-title" tabindex="-1"></dialog>
 <dialog class="settings usage-dialog" id="usage" aria-labelledby="usage-title" tabindex="-1"></dialog>
+<dialog class="settings pr-review-dialog" id="pr-review-dialog" aria-labelledby="pr-review-title" tabindex="-1"></dialog>
 <dialog class="wizard" id="wizard" aria-labelledby="wizard-title" tabindex="-1"></dialog>
 
 <div class="context-menu" id="context-menu" role="menu" aria-label="Actions" tabindex="-1" hidden></div>

@@ -283,6 +283,9 @@ impl Runner {
     /// quotes the code they are on. A thread whose first run or notes cannot be read gets a
     /// title naming it, and a body saying where it came from only.
     fn pull_request_text(&self, id: &str) -> (String, String) {
+        if let Some(text) = self.pipeline_pr_text(id) {
+            return text;
+        }
         let ids = self
             .header_by_id(id)
             .map_or_else(|_| Vec::new(), |header| header.notes);

@@ -234,6 +234,22 @@ pub(crate) fn runs_named(repo: &Repo) -> Result<HashSet<String>> {
         .collect())
 }
 
+/// Unique component labels stored in `analysis.json`, for Hub priority and scope matching.
+pub(crate) fn node_labels(repo: &Repo) -> Vec<String> {
+    let Ok(Some(loaded)) = load(&repo.analysis_file()) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for diagram in loaded.diagrams {
+        for node in diagram.nodes {
+            if !node.label.is_empty() && !names.contains(&node.label) {
+                names.push(node.label);
+            }
+        }
+    }
+    names
+}
+
 /// Takes the exclusive lock on `analysis.lock` beside the analysis file `file`
 /// (`files::lock`), waiting up to `files::LOCK_WAIT` for another writer. The lock is released
 /// when the returned file is dropped. A writer takes it before it reads the analysis it

@@ -19,6 +19,8 @@ mod files;
 mod folders;
 mod github;
 mod highlight;
+mod hub;
+mod lane;
 mod layout;
 mod memory;
 #[cfg(target_os = "macos")]

@@ -23,12 +23,15 @@ import { dividers } from "./dividers.js";
 import { $, el, loadIcons, showToast } from "./dom.js";
 import { fileList } from "./file-list.js";
 import { rank as rankFiles } from "./fuzzy.js";
+import { hubView } from "./hub-view.js";
 import { memoryDialog, rememberDialog } from "./memory-dialog.js";
 import { memoryTab } from "./memory-tab.js";
 import { noteDialog } from "./note-dialog.js";
 import { fullPlace, noteMarks } from "./note-place.js";
 import { notesTray } from "./notes-tray.js";
 import { pathNoteDialog } from "./path-note-dialog.js";
+import { planGateView } from "./plan-gate.js";
+import { prReviewDialog } from "./pr-review.js";
 import { runPanel } from "./run-panel.js";
 import { escapeAction, foldRun, isAsk, isOpen, isResolved, sentIn } from "./run.js";
 import { settingsDialog } from "./settings-dialog.js";
@@ -362,6 +365,89 @@ const welcome = welcomeScreen({
   },
 });
 
+const PENDING_LANE_KEY = "postil:pendingLane";
+let hubPickPending = false;
+
+const prReview = prReviewDialog($("pr-review-dialog"), {
+  notes: () => state.notes,
+  onSubmitted: (message) => {
+    showToast(message);
+    void pipelineGate.sync();
+  },
+  onError: showToast,
+});
+
+const pipelineGate = planGateView({
+  stripEl: $("pipeline-strip"),
+  gateEl: $("plan-gate"),
+  openRun: (id) => runs.openRun(id),
+  showChanges: (from, to) => showChangesAt(from, to, null),
+  openPrReview: (pipeline) => prReview.open(pipeline),
+  onUpdated: () => {
+    void runs.sync();
+    void pipelineGate.sync();
+  },
+  onError: showToast,
+});
+
+async function startLaneInCurrentRepo(payload) {
+  const response = await fetch("api/lane/start", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const started = await response.json();
+  hideHub();
+  tray.showTab("run");
+  await Promise.all([runs.sync(), pipelineGate.sync()]);
+  pipelineGate.select(started.id);
+  showToast(`Started ${started.lane} lane for #${started.number}`);
+}
+
+const hub = hubView({
+  hubEl: $("hub"),
+  getSettingsView: () => settings.view(),
+  openSettings: () => settings.open(),
+  openRepo: (path) => {
+    hideHub();
+    void welcome.requestProject("api/open", path);
+  },
+  chooseFolderForHub: () => {
+    hubPickPending = true;
+    window.ipc?.postMessage("choose-folder");
+  },
+  launchLane: async (payload) => {
+    const { repoPath, ...lanePayload } = payload;
+    if (state.projectOpen && state.repo?.root === repoPath) {
+      await startLaneInCurrentRepo(lanePayload);
+      return;
+    }
+    sessionStorage.setItem(PENDING_LANE_KEY, JSON.stringify({ repoPath, lanePayload }));
+    await welcome.requestProject("api/open", repoPath);
+  },
+  onError: showToast,
+});
+
+function showHub() {
+  leaveFocus();
+  welcome.hide();
+  hub.show();
+  $("toggle-hub").setAttribute("aria-pressed", "true");
+}
+
+function hideHub() {
+  hub.hide();
+  $("toggle-hub").setAttribute("aria-pressed", "false");
+}
+
+$("toggle-hub").addEventListener("click", () => {
+  if (hub.isShown()) {
+    if (state.projectOpen) hideHub();
+  } else {
+    showHub();
+  }
+});
+
 // ---- Notes --------------------------------------------------------------------------------
 
 // The reply to `api/notes`: { ok, body }, the body the notes or the reason they failed.
@@ -626,6 +712,20 @@ window.addEventListener("keydown", (event) => {
   // once. A dialog and the welcome screen cover the panes: their keys must not act on what
   // cannot be seen. Each dialog handles its own keys (Escape closes it).
   if (document.querySelector("dialog[open]")) return;
+  if (event.metaKey && event.key === "1") {
+    event.preventDefault();
+    showHub();
+    return;
+  }
+  if (event.metaKey && event.key === "2" && state.projectOpen) {
+    event.preventDefault();
+    hideHub();
+    return;
+  }
+  if (hub.isShown()) {
+    if (event.key === "Escape" && state.projectOpen) hideHub();
+    return;
+  }
   if (welcome.isShown()) {
     if (event.key === "Escape" && state.projectOpen) welcome.hide();
     return;
@@ -1114,6 +1214,11 @@ window.postil = {
   openFolder: (path) => {
     menu.close();
     liveQuotas.closePopover();
+    if (hubPickPending || hub.isShown()) {
+      hubPickPending = false;
+      void hub.addMonitoredRepo(path);
+      return;
+    }
     welcome.requestProject("api/open", path);
   },
   menu: (command) => {
@@ -1138,7 +1243,11 @@ window.postil = {
     else if (command === "close-window" || command === "quit") quit();
   },
   // The run changed (src/run.rs); fetch what is new.
-  runChanged: () => runs.sync(),
+  runChanged: () => {
+    void runs.sync();
+    void pipelineGate.sync();
+    hub.refresh();
+  },
   dictation: {
     start(options) {
       const payload = options ? JSON.stringify(options) : "";
@@ -1370,6 +1479,7 @@ function applySettings(settings) {
   appliedTheme = settings.theme;
   liveQuotas.setSettings(settings);
   tray.renderSendBar();
+  hub.invalidateStages();
   // Another Analyzer may start the forced update a missing one held back.
   if (state.projectOpen) void map.check().catch((error) => showToast(String(error)));
 }
@@ -1429,7 +1539,7 @@ async function start() {
   }
   const repo = await response.json();
   if (repo === null) {
-    welcome.show();
+    showHub();
     liveQuotas.start();
     if (settingsView?.firstRun) wizard.open({ firstRun: true, view: settingsView });
     return;
@@ -1455,7 +1565,20 @@ async function start() {
     await map.applyAnalysis(analysis).catch((error) => showToast(String(error)));
   }
   // The latest run, this session's or one from before a restart.
-  await runs.sync();
+  await Promise.all([runs.sync(), pipelineGate.sync()]);
+
+  const pendingRaw = sessionStorage.getItem(PENDING_LANE_KEY);
+  if (pendingRaw) {
+    sessionStorage.removeItem(PENDING_LANE_KEY);
+    try {
+      const pending = JSON.parse(pendingRaw);
+      if (pending?.repoPath === repo.root && pending.lanePayload) {
+        await startLaneInCurrentRepo(pending.lanePayload);
+      }
+    } catch (error) {
+      showToast(String(error.message ?? error));
+    }
+  }
 
   if (state.repo.bench) {
     await runBench(state.repo.bench, { code, codeEl });
