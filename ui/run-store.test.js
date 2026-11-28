@@ -182,3 +182,183 @@ test("knownViews is read-only and does not trigger fetches for uncached run ids"
   assert.equal(views[0].id, "R50");
   assert.equal(fetched.length, countAfterSync, "knownViews must not trigger byId fetches");
 });
+
+test("sync coalesces rapid intra-run streaming notifications into one animation frame when rAF is present", async (t) => {
+  const frames = new Map();
+  let nextId = 1;
+  const prevRaf = globalThis.requestAnimationFrame;
+  const prevCancel = globalThis.cancelAnimationFrame;
+  globalThis.requestAnimationFrame = (fn) => {
+    const id = nextId++;
+    frames.set(id, fn);
+    return id;
+  };
+  globalThis.cancelAnimationFrame = (id) => {
+    frames.delete(id);
+  };
+  t.after(() => {
+    globalThis.requestAnimationFrame = prevRaf;
+    globalThis.cancelAnimationFrame = prevCancel;
+  });
+
+  const replies = {
+    "api/run?after=0": {
+      id: "R1",
+      notes: ["N1"],
+      prompt: "p",
+      status: "running",
+      total: 1,
+      entries: ["a"],
+    },
+    "api/run?after=1": { id: "R1", status: "running", total: 2, entries: ["b"] },
+    "api/run?after=2": { id: "R1", status: "running", total: 3, entries: ["c"] },
+    "api/runs": { runs: ["R1"] },
+  };
+  t.mock.method(globalThis, "fetch", async (url) => new Response(JSON.stringify(replies[url])));
+  let renders = 0;
+  const changes = [];
+  const store = runStore({
+    render: () => {
+      renders += 1;
+    },
+    onChange: (run, previous, meta) => {
+      changes.push({
+        id: run.id,
+        total: run.total,
+        status: run.status,
+        prevTotal: previous?.total ?? null,
+        meta,
+      });
+    },
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+
+  // Initial load transitions null -> R1 and flushes synchronously.
+  await store.sync();
+  assert.equal(renders, 1);
+  assert.equal(frames.size, 0);
+
+  // Two rapid intra-run streaming updates coalesce into one scheduled animation frame.
+  await store.sync();
+  await store.sync();
+  assert.equal(renders, 1, "intra-run streaming updates wait for the scheduled animation frame");
+  assert.equal(frames.size, 1, "two rapid streaming syncs schedule only one frame");
+  const [id, fn] = frames.entries().next().value;
+  frames.delete(id);
+  fn();
+  assert.equal(renders, 2);
+  assert.deepEqual(changes, [
+    { id: "R1", total: 1, status: "running", prevTotal: null, meta: { liveEnded: false } },
+    { id: "R1", total: 3, status: "running", prevTotal: 1, meta: { liveEnded: false } },
+  ]);
+});
+
+test("sync flushes status and run-ID transitions synchronously and cancels pending rAF", async (t) => {
+  const frames = new Map();
+  let nextId = 1;
+  const prevRaf = globalThis.requestAnimationFrame;
+  const prevCancel = globalThis.cancelAnimationFrame;
+  globalThis.requestAnimationFrame = (fn) => {
+    const id = nextId++;
+    frames.set(id, fn);
+    return id;
+  };
+  globalThis.cancelAnimationFrame = (id) => {
+    frames.delete(id);
+  };
+  t.after(() => {
+    globalThis.requestAnimationFrame = prevRaf;
+    globalThis.cancelAnimationFrame = prevCancel;
+  });
+
+  let runReply = {
+    id: "R1",
+    notes: ["N1"],
+    prompt: "p",
+    status: "running",
+    total: 1,
+    entries: ["a"],
+  };
+  let runsList = ["R1"];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    if (url === "api/runs") return new Response(JSON.stringify({ runs: runsList }));
+    return new Response(JSON.stringify(runReply));
+  });
+  let renders = 0;
+  const changes = [];
+  const store = runStore({
+    render: () => {
+      renders += 1;
+    },
+    onChange: (run, previous, meta) => {
+      changes.push({
+        id: run.id,
+        status: run.status,
+        prevId: previous?.id ?? null,
+        prevStatus: previous?.status ?? null,
+        prevTotal: previous?.total ?? null,
+        meta,
+      });
+    },
+    onLoaded() {},
+    onError: (text) => assert.fail(text),
+  });
+
+  // 1. Initial sync (null -> R1 running): synchronous.
+  await store.sync();
+  assert.equal(renders, 1);
+
+  // 2. Intra-run streaming update (R1 running -> R1 running): deferred to rAF.
+  runReply = { id: "R1", status: "running", total: 2, entries: ["b"] };
+  await store.sync();
+  assert.equal(renders, 1);
+  assert.equal(frames.size, 1);
+
+  // 3. Status transition (R1 running -> R1 ended): cancels pending rAF and flushes synchronously
+  //    with the pending previous snapshot preserved.
+  runReply = { id: "R1", status: "ended", total: 3, entries: ["c"] };
+  await store.sync();
+  assert.equal(frames.size, 0, "pending rAF is cancelled on status transition");
+  assert.equal(renders, 2);
+
+  // 4. Run-ID transition (R1 ended -> R2 running): flushes synchronously.
+  runsList = ["R2", "R1"];
+  runReply = {
+    id: "R2",
+    notes: ["N2"],
+    prompt: "p2",
+    status: "running",
+    total: 1,
+    entries: ["x"],
+  };
+  await store.sync();
+  assert.equal(frames.size, 0);
+  assert.equal(renders, 3);
+  assert.deepEqual(changes, [
+    {
+      id: "R1",
+      status: "running",
+      prevId: null,
+      prevStatus: null,
+      prevTotal: null,
+      meta: { liveEnded: false },
+    },
+    {
+      id: "R1",
+      status: "ended",
+      prevId: "R1",
+      prevStatus: "running",
+      prevTotal: 1,
+      meta: { liveEnded: false },
+    },
+    {
+      id: "R2",
+      status: "running",
+      prevId: "R1",
+      prevStatus: "ended",
+      prevTotal: 3,
+      meta: { liveEnded: false },
+    },
+  ]);
+});

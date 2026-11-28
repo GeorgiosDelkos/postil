@@ -12,7 +12,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::SystemTime;
 
 use crate::error::{Error, Result};
 
@@ -40,6 +41,47 @@ pub(crate) struct Upstream {
     pub(crate) branch: String,
 }
 
+/// Maximum number of immutable commit file-sets cached per [`Repo`] by [`Repo::files_at`].
+const FILES_AT_CACHE_CAP: usize = 16;
+
+/// Cached `origin` remote name keyed by git config `(mtime, len)`.
+#[derive(Debug, Default)]
+struct MemoryNameCache {
+    stamp: Option<(SystemTime, u64)>,
+    name: Option<String>,
+}
+
+/// In-flight coalescer for concurrent [`Repo::files`] calls.
+#[derive(Debug)]
+struct InFlightFiles {
+    done: Mutex<Option<std::result::Result<Arc<[String]>, String>>>,
+    ready: Condvar,
+}
+
+/// Ensures an in-flight [`Repo::files`] leader clears the slot and wakes waiters even on unwind.
+struct FilesFlightGuard<'a> {
+    slot: &'a Mutex<Option<Arc<InFlightFiles>>>,
+    leader: Arc<InFlightFiles>,
+    completed: bool,
+}
+
+impl Drop for FilesFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            let mut done = self
+                .leader
+                .done
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if done.is_none() {
+                *done = Some(Err("files listing aborted".to_owned()));
+            }
+            self.leader.ready.notify_all();
+        }
+    }
+}
+
 /// A git working tree on disk.
 #[derive(Debug)]
 pub(crate) struct Repo {
@@ -51,6 +93,13 @@ pub(crate) struct Repo {
     /// Held while a snapshot writes its index ([`Repo::snapshot`]): a run's snapshot and the
     /// changes view's may come at once.
     snapshotting: Mutex<()>,
+    /// Cached `memory_name()` keyed by git config `(mtime, len)`.
+    memory_name_cache: Mutex<Option<MemoryNameCache>>,
+    /// Coalesces concurrent [`Repo::files`] calls (e.g. `GET /api/repo`, `GET /api/analysis`,
+    /// and `Definitions` on open/focus) into a single pair of `git ls-files` spawns.
+    files_in_flight: Mutex<Option<Arc<InFlightFiles>>>,
+    /// Bounded LRU cache of immutable commit tree file sets returned by [`Repo::files_at`].
+    files_at_cache: Mutex<Vec<(String, Arc<HashSet<String>>)>>,
     /// How many times a copy of the real index was started, for tests: git
     /// replaces the index file on every write, so nothing on disk tells a copy apart.
     #[cfg(test)]
@@ -77,10 +126,10 @@ impl Repo {
                 path: dir.to_owned(),
             });
         }
-        // One option per call: git ends each path with a newline, which a path can also hold,
-        // so two paths in one output could not be told apart.
-        let root = match rev_parse_path(dir, Search::Up, "--show-toplevel") {
-            Ok(root) => root,
+        // One `git rev-parse` call for both paths in the common case (no embedded newlines);
+        // fall back to two separate calls if the output does not have exactly two newlines.
+        let (root, git_dir) = match rev_parse_root_and_git_dir(dir) {
+            Ok(pair) => pair,
             // `git` runs in the C locale (see `git`), so this message is stable. A folder
             // that has a `.git` of its own is a broken repository (a linked worktree whose
             // git directory is gone, say), not a plain folder: `git init` there would be
@@ -99,11 +148,13 @@ impl Repo {
             }
             Err(error) => return Err(error),
         };
-        let git_dir = rev_parse_path(dir, Search::Up, "--absolute-git-dir")?;
         Ok(Self {
             root,
             git_dir,
             snapshotting: Mutex::new(()),
+            memory_name_cache: Mutex::new(None),
+            files_in_flight: Mutex::new(None),
+            files_at_cache: Mutex::new(Vec::new()),
             #[cfg(test)]
             copies: AtomicU64::new(0),
         })
@@ -178,15 +229,68 @@ impl Repo {
 
     /// The name hippius-mem gives this repository's notes: the last segment of its `origin`
     /// remote, as [`memory_repo_name`] reads it. `None` with no `origin`, or one it cannot
-    /// read, when hippius-mem binds no repository either. Runs `git` once.
+    /// read, when hippius-mem binds no repository either. Cached by git config `(mtime, len)`.
     pub(crate) fn memory_name(&self) -> Option<String> {
+        let config_path = self.config_file_path();
+        let stamp = fs::metadata(&config_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok().map(|modified| (modified, meta.len())));
+        if let Some(stamp) = stamp {
+            let guard = self
+                .memory_name_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.stamp == Some(stamp)
+            {
+                return cached.name.clone();
+            }
+        }
         // Fails when there is no `origin`: no name then, as for hippius-mem.
-        let url = git(&self.root, &["remote", "get-url", "origin"]).ok()?;
-        memory_repo_name(&url).map(str::to_owned)
+        let name = git(&self.root, &["remote", "get-url", "origin"])
+            .ok()
+            .and_then(|url| memory_repo_name(&url).map(str::to_owned));
+        if let Some(stamp) = stamp {
+            *self
+                .memory_name_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(MemoryNameCache {
+                stamp: Some(stamp),
+                name: name.clone(),
+            });
+        }
+        name
+    }
+
+    /// Resolves the repository's `config` file (following `commondir` in a linked worktree).
+    fn config_file_path(&self) -> PathBuf {
+        let commondir = self.git_dir.join("commondir");
+        if let Ok(rel) = fs::read_to_string(&commondir) {
+            let trimmed = rel.trim();
+            if !trimmed.is_empty() {
+                return self.git_dir.join(trimmed).join("config");
+            }
+        }
+        self.git_dir.join("config")
     }
 
     /// The checked-out branch, or an empty string when `HEAD` is detached.
+    /// Reads `.git/HEAD` directly in the common case, falling back to `git branch --show-current`.
     pub(crate) fn branch(&self) -> Result<String> {
+        if let Ok(head) = fs::read_to_string(self.git_dir.join("HEAD")) {
+            let trimmed = head.trim();
+            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/")
+                && branch != ".invalid"
+                && !branch.contains('\n')
+            {
+                return Ok(branch.to_owned());
+            }
+            if (trimmed.len() == 40 || trimmed.len() == 64)
+                && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Ok(String::new());
+            }
+        }
         let branch = git(&self.root, &["branch", "--show-current"])?;
         Ok(branch.trim_end().to_owned())
     }
@@ -196,7 +300,64 @@ impl Repo {
     /// untracked one: they are directories, not files to open, and their files are not this
     /// repository's. So are tracked files git keeps off the disk, those outside a sparse
     /// checkout.
+    ///
+    /// Concurrent callers share a single in-flight pair of `git ls-files` calls.
     pub(crate) fn files(&self) -> Result<Vec<String>> {
+        let leader = {
+            let mut slot = self
+                .files_in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(existing) = slot.as_ref() {
+                let existing = Arc::clone(existing);
+                drop(slot);
+                let mut done = existing.done.lock().unwrap_or_else(PoisonError::into_inner);
+                while done.is_none() {
+                    done = existing
+                        .ready
+                        .wait(done)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                return match done.as_ref().expect("in-flight files completed") {
+                    Ok(files) => Ok(files.to_vec()),
+                    Err(_) => self.files_uncached(),
+                };
+            }
+            let flight = Arc::new(InFlightFiles {
+                done: Mutex::new(None),
+                ready: Condvar::new(),
+            });
+            *slot = Some(Arc::clone(&flight));
+            flight
+        };
+
+        let mut guard = FilesFlightGuard {
+            slot: &self.files_in_flight,
+            leader: Arc::clone(&leader),
+            completed: false,
+        };
+
+        let result = self.files_uncached();
+        {
+            let mut slot = self
+                .files_in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *slot = None;
+        }
+        {
+            let mut done = leader.done.lock().unwrap_or_else(PoisonError::into_inner);
+            *done = Some(match &result {
+                Ok(files) => Ok(Arc::from(files.as_slice())),
+                Err(error) => Err(error.to_string()),
+            });
+            leader.ready.notify_all();
+        }
+        guard.completed = true;
+        result
+    }
+
+    fn files_uncached(&self) -> Result<Vec<String>> {
         let tracked_args = ["ls-files", "-z", "--stage", "-t"];
         let untracked_args = ["ls-files", "-z", "--others", "--exclude-standard"];
         let (tracked, untracked) = std::thread::scope(|scope| {
@@ -245,21 +406,49 @@ impl Repo {
 
     /// The files commit `commit` holds, relative to the root, submodules left out as
     /// [`Repo::files`] leaves them out. Reads the commit's tree, not the disk.
+    /// Cached per commit id since git commit trees are immutable.
     ///
     /// # Errors
     ///
     /// [`Error::BadRequest`] when `commit` is not a hexadecimal object id, and the git error,
     /// such as a commit the repository does not have.
-    pub(crate) fn files_at(&self, commit: &str) -> Result<HashSet<String>> {
+    pub(crate) fn files_at(&self, commit: &str) -> Result<Arc<HashSet<String>>> {
         check_object_id("commit", commit)?;
+        {
+            let mut cache = self
+                .files_at_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(pos) = cache.iter().position(|(id, _)| id == commit) {
+                let entry = cache.remove(pos);
+                let set = Arc::clone(&entry.1);
+                cache.push(entry);
+                return Ok(set);
+            }
+        }
         let listed = git(&self.root, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
         // `<mode> <type> <object>\t<path>`. A submodule is mode 160000, a gitlink.
-        Ok(listed
-            .split_terminator('\0')
-            .filter_map(|entry| entry.split_once('\t'))
-            .filter(|(fields, _)| !fields.starts_with("160000"))
-            .map(|(_, path)| path.to_owned())
-            .collect())
+        let set: Arc<HashSet<String>> = Arc::new(
+            listed
+                .split_terminator('\0')
+                .filter_map(|entry| entry.split_once('\t'))
+                .filter(|(fields, _)| !fields.starts_with("160000"))
+                .map(|(_, path)| path.to_owned())
+                .collect(),
+        );
+        {
+            let mut cache = self
+                .files_at_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(pos) = cache.iter().position(|(id, _)| id == commit) {
+                cache.remove(pos);
+            } else if cache.len() >= FILES_AT_CACHE_CAP {
+                cache.remove(0);
+            }
+            cache.push((commit.to_owned(), Arc::clone(&set)));
+        }
+        Ok(set)
     }
 
     /// Takes a snapshot of the working tree, every tracked file and every untracked file that
@@ -1011,6 +1200,15 @@ impl Repo {
     /// above [`MAX_READ`] bytes, and [`Error::Read`] when the file cannot be read as UTF-8
     /// text.
     pub(crate) fn read(&self, file: &str) -> Result<String> {
+        self.read_with_stamp(file).map(|(text, _)| text)
+    }
+
+    /// Reads one file as text and returns its `(modified, len)` stamp from the already-open file
+    /// descriptor when it is a regular file, avoiding extra `stat` syscalls.
+    pub(crate) fn read_with_stamp(
+        &self,
+        file: &str,
+    ) -> Result<(String, Option<(SystemTime, u64)>)> {
         let path = self.inside(file)?;
         let opened = File::open(&path).map_err(|source| Error::Read {
             path: path.clone(),
@@ -1019,6 +1217,7 @@ impl Repo {
         // Check size from the already-open fd before reading so oversized regular files are
         // rejected without reading 20 MB, and valid files allocate once instead of doubling.
         let mut capacity = 0usize;
+        let mut stamp = None;
         if let Ok(meta) = opened.metadata()
             && meta.is_file()
         {
@@ -1028,6 +1227,7 @@ impl Repo {
                     bytes: meta.len(),
                 });
             }
+            stamp = meta.modified().ok().map(|modified| (modified, meta.len()));
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "meta.len() <= MAX_READ (20 MB), which always fits in usize"
@@ -1050,10 +1250,13 @@ impl Repo {
                     .max(MAX_READ + 1);
                 Err(Error::FileTooLarge { path, bytes })
             }
-            Ok(_) => String::from_utf8(bytes).map_err(|error| Error::Read {
-                path,
-                source: io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()),
-            }),
+            Ok(_) => {
+                let text = String::from_utf8(bytes).map_err(|error| Error::Read {
+                    path,
+                    source: io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()),
+                })?;
+                Ok((text, stamp))
+            }
             Err(source) => Err(Error::Read { path, source }),
         }
     }
@@ -1380,6 +1583,28 @@ fn check_object_id(kind: &str, id: &str) -> Result<()> {
 /// Runs `git` in `dir` and returns what it printed.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     run_git(dir, None, args)
+}
+
+/// Runs a single `git rev-parse --show-toplevel --absolute-git-dir` in `dir`, falling back to
+/// two separate calls only when either path holds an embedded newline.
+fn rev_parse_root_and_git_dir(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let args = ["rev-parse", "--show-toplevel", "--absolute-git-dir"].map(OsStr::new);
+    let out = run_git_with(dir, Search::Up, None, &args, None)?;
+    if let Some(body) = out.strip_suffix(b"\n")
+        && let Some(split) = body.iter().position(|&b| b == b'\n')
+    {
+        let root = &body[..split];
+        let git_dir = &body[split + 1..];
+        if !root.is_empty() && !git_dir.is_empty() && !git_dir.contains(&b'\n') {
+            return Ok((
+                PathBuf::from(OsString::from_vec(root.to_vec())),
+                PathBuf::from(OsString::from_vec(git_dir.to_vec())),
+            ));
+        }
+    }
+    let root = rev_parse_path(dir, Search::Up, "--show-toplevel")?;
+    let git_dir = rev_parse_path(dir, Search::Up, "--absolute-git-dir")?;
+    Ok((root, git_dir))
 }
 
 /// Runs `git rev-parse <option>` in `dir` and returns the one path it prints, byte for byte:

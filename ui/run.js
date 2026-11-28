@@ -83,7 +83,7 @@ export function foldRun(entries) {
     const next = foldMore(base ?? emptyFold(), entries);
     recentFolds.push(next);
     if (recentFolds.length > MAX_RECENT_FOLDS) recentFolds.shift();
-    fold = { plan: next.plan, items: next.items };
+    fold = { plan: next.plan, items: next.items, completedEdits: next.completedEdits };
     folds.set(entries, fold);
   }
   return fold;
@@ -108,11 +108,22 @@ function startsWith(entries, prefix) {
   return true;
 }
 
+// The tool kinds that change files: a check that passed before one of these ended is stale,
+// and `completedEdits` counts how many have finished.
+// An execute call can change files too (a formatter); Postil cannot see into it, so the
+// stale state says "an edit after it" and claims no more.
+const EDITS = new Set(["edit", "delete", "move"]);
+
+function isCompletedEdit(tool) {
+  return tool.status === "completed" && EDITS.has(tool.tool);
+}
+
 function emptyFold() {
   return {
     entries: [],
     plan: null,
     items: [],
+    completedEdits: 0,
     // Item indices: of each tool call by id, and of each permission request and question by
     // request number.
     tools: new Map(),
@@ -139,6 +150,7 @@ function foldMore(base, entries) {
     return items[index];
   };
   let plan = base.plan;
+  let completedEdits = base.completedEdits;
 
   // A part joins the item before it when both are of one type and one message: the agent's
   // message id when it sends one, else parts in a row are one message.
@@ -184,7 +196,11 @@ function foldMore(base, entries) {
         if (known === undefined) {
           tools.set(entry.id, items.length);
           items.push(tool);
-        } else items[known] = tool;
+        } else {
+          if (isCompletedEdit(items[known])) completedEdits -= 1;
+          items[known] = tool;
+        }
+        if (isCompletedEdit(tool)) completedEdits += 1;
         break;
       }
       case "toolUpdate": {
@@ -205,12 +221,15 @@ function foldMore(base, entries) {
           });
         }
         const tool = own(tools.get(entry.id));
+        const wasEdit = isCompletedEdit(tool);
         for (const field of ["title", "tool", "status", "places", "output", "command", "exit"]) {
           if (entry[field] !== null && entry[field] !== undefined) tool[field] = entry[field];
         }
         if (entry.status !== null && entry.status !== undefined) {
           tool.endedAt = ended(tool.endedAt, entry.status, at);
         }
+        const isEdit = isCompletedEdit(tool);
+        if (wasEdit !== isEdit) completedEdits += isEdit ? 1 : -1;
         break;
       }
       case "plan":
@@ -267,7 +286,7 @@ function foldMore(base, entries) {
         break;
     }
   }
-  return { entries, plan, items, tools, permissions, early };
+  return { entries, plan, items, completedEdits, tools, permissions, early };
 }
 
 // The open question, if any: the one the engineer is asked to answer.
@@ -352,11 +371,6 @@ export function toolRow(tool, live) {
   const running = live && underWay(tool);
   return { verb, target, state, running };
 }
-
-// The tool kinds that change files: a check that passed before one of these ended is stale.
-// An execute call can change files too (a formatter); Postil cannot see into it, so the
-// stale state says "an edit after it" and claims no more.
-const EDITS = new Set(["edit", "delete", "move"]);
 
 // What a turn's checks show (docs/review-assist.md, "Evidence on the run"): each command the
 // author's report (src/report.rs) says it ran, against the execute calls the log holds, then

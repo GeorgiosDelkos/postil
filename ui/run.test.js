@@ -722,3 +722,45 @@ test("a step that exited non-zero shows failed, whatever its status", () => {
   const passed = foldRun([ran("c1", "cargo test", { exit: 0 })]).items[0];
   assert.equal(toolRow(passed, false).state, "done");
 });
+
+test("foldRun tracks completedEdits incrementally across tool starts, updates, and replacements", () => {
+  const pending = [
+    {
+      kind: "tool",
+      id: "e1",
+      title: "a.rs",
+      tool: "edit",
+      status: "in_progress",
+      places: [],
+      output: [],
+    },
+    {
+      kind: "tool",
+      id: "r1",
+      title: "b.rs",
+      tool: "read",
+      status: "completed",
+      places: [],
+      output: [],
+    },
+  ];
+  assert.equal(foldRun(pending).completedEdits, 0);
+  const done = [...pending, { kind: "toolUpdate", id: "e1", status: "completed" }];
+  assert.equal(foldRun(done).completedEdits, 1);
+  const deleted = [
+    ...done,
+    {
+      kind: "tool",
+      id: "d1",
+      title: "c.rs",
+      tool: "delete",
+      status: "completed",
+      places: [],
+      output: [],
+    },
+  ];
+  assert.equal(foldRun(deleted).completedEdits, 2);
+  // A call re-reported as failed decrements the counter.
+  const failed = [...deleted, { kind: "toolUpdate", id: "e1", status: "failed" }];
+  assert.equal(foldRun(failed).completedEdits, 1);
+});

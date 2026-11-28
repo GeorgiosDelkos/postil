@@ -31,9 +31,15 @@ const CHECK_TITLES = {
 
 // The worst state of the checks `turn`'s report claims (`worstEvidence`), or null when it
 // claims none. The latest turn's: a later turn's checks are what the work stands on now.
+// Memoized by `turn.entries` (replaced, never mutated, on growth) so historical runs are not
+// re-scanned on every streamed token.
+const checksCache = new WeakMap();
 function checksOf(turn) {
+  if (checksCache.has(turn.entries)) return checksCache.get(turn.entries);
   const report = reportOf(turn)?.report;
-  return report ? worstEvidence(evidence(report, foldRun(turn.entries).items)) : null;
+  const result = report ? worstEvidence(evidence(report, foldRun(turn.entries).items)) : null;
+  checksCache.set(turn.entries, result);
+  return result;
 }
 
 // Cap how many historical runs the Run tab eagerly fetches so it stays below `runStore`'s

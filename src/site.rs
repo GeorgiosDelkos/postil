@@ -397,7 +397,9 @@ pub(crate) struct Site {
 /// Cached parsed `usage.jsonl` records, invalidated when `(modified, len)` changes.
 struct LedgerCache {
     modified: Option<SystemTime>,
-    len: u64,
+    parsed_offset: u64,
+    dev: u64,
+    ino: u64,
     records: Arc<[ledger::LedgerRecord]>,
 }
 
@@ -410,10 +412,15 @@ struct SettingsCache {
 
 /// Bounded LRU cache of serialized `GET /api/file` JSON responses for the open project.
 const FILE_CACHE_CAP: usize = 24;
+/// Maximum total bytes held by [`FileCache`] across all cached entries.
+const FILE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Largest single serialized `GET /api/file` response eligible for caching.
+const FILE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct FileCache {
     entries: Vec<CachedFile>,
+    total_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -436,11 +443,21 @@ impl FileCache {
     }
 
     fn insert(&mut self, path: String, modified: SystemTime, len: u64, json: Arc<[u8]>) {
-        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
-            self.entries.remove(index);
-        } else if self.entries.len() >= FILE_CACHE_CAP {
-            self.entries.remove(0);
+        if json.len() > FILE_CACHE_MAX_ENTRY_BYTES {
+            return;
         }
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            let old = self.entries.remove(index);
+            self.total_bytes = self.total_bytes.saturating_sub(old.json.len());
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= FILE_CACHE_CAP
+                || self.total_bytes.saturating_add(json.len()) > FILE_CACHE_MAX_BYTES)
+        {
+            let evicted = self.entries.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.json.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(json.len());
         self.entries.push(CachedFile {
             path,
             modified,
@@ -448,6 +465,68 @@ impl FileCache {
             json,
         });
     }
+}
+
+/// Cached `GET /api/notes` serialized JSON keyed by `review.json` stamp and referenced file stamps.
+#[derive(Debug)]
+struct NotesCache {
+    review_stamp: Option<(SystemTime, u64)>,
+    path_stamps: Vec<(String, PathStamp)>,
+    json: Arc<[u8]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PathStamp {
+    File(Option<(SystemTime, u64)>),
+    Kind(Option<crate::repo::PathKind>),
+}
+
+impl NotesCache {
+    fn matches(&self, repo: &Repo) -> bool {
+        if file_stamp(&repo.review_file()) != self.review_stamp {
+            return false;
+        }
+        self.path_stamps
+            .iter()
+            .all(|(path, expected)| match expected {
+                PathStamp::File(expected_stamp) => {
+                    let current = repo.inside(path).ok().and_then(|full| file_stamp(&full));
+                    current == *expected_stamp
+                }
+                PathStamp::Kind(expected_kind) => repo.kind(path).ok().flatten() == *expected_kind,
+            })
+    }
+
+    fn capture(repo: &Repo, review: &notes::Review, json: Arc<[u8]>) -> Self {
+        let review_stamp = file_stamp(&repo.review_file());
+        let mut seen_files = std::collections::HashSet::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        let mut path_stamps = Vec::new();
+        for (path, is_line) in review.referenced_targets() {
+            if is_line {
+                if seen_files.insert(path.to_owned()) {
+                    let stamp = repo.inside(path).ok().and_then(|full| file_stamp(&full));
+                    path_stamps.push((path.to_owned(), PathStamp::File(stamp)));
+                }
+            } else if seen_paths.insert(path.to_owned()) {
+                let kind = repo.kind(path).ok().flatten();
+                path_stamps.push((path.to_owned(), PathStamp::Kind(kind)));
+            }
+        }
+        Self {
+            review_stamp,
+            path_stamps,
+            json,
+        }
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    meta.modified().ok().map(|modified| (modified, meta.len()))
 }
 
 /// The open project.
@@ -463,6 +542,8 @@ struct Project {
     warning: Option<String>,
     /// Bounded cache of highlighted file JSON payloads, validated by `(modified, len)`.
     file_cache: Arc<Mutex<FileCache>>,
+    /// Cached `GET /api/notes` response keyed by `review.json` and referenced file stamps.
+    notes_cache: Arc<Mutex<Option<NotesCache>>>,
 }
 
 /// The reply to `/api/repo` when a project is open; `null` when none is.
@@ -988,6 +1069,7 @@ impl Site {
             definitions,
             warning,
             file_cache: Arc::new(Mutex::new(FileCache::default())),
+            notes_cache: Arc::new(Mutex::new(None)),
         };
         let old = {
             let mut project = self.project.write().unwrap_or_else(PoisonError::into_inner);
@@ -1010,9 +1092,8 @@ impl Site {
         if team_memory == TeamMemory::On {
             drop(self.memory.status());
         }
-        // Stops the index and the agent of the project this one replaces, after the borrow
-        // ends: stopping the agent waits for its process. The index is told first, as that
-        // waits for nothing.
+        // Stops the index and the agent of the project this one replaces, while still holding
+        // `open_lock` so a concurrent `POST /api/open` cannot overlap with `old.runner.close()`.
         if let Some(old) = old {
             old.definitions.close();
             old.runner.close();
@@ -1200,15 +1281,8 @@ impl Site {
             let project = guard.as_ref().ok_or(Error::NoProject)?;
             (Arc::clone(&project.repo), Arc::clone(&project.file_cache))
         };
-        let read_stamp = || {
-            repo.inside(path)
-                .ok()
-                .and_then(|full| std::fs::metadata(full).ok())
-                .filter(std::fs::Metadata::is_file)
-                .and_then(|meta| meta.modified().ok().map(|modified| (modified, meta.len())))
-        };
-        let stamp = read_stamp();
-        if let Some((modified, len)) = stamp
+        let read_stamp = || repo.inside(path).ok().and_then(|full| file_stamp(&full));
+        if let Some((modified, len)) = read_stamp()
             && let Some(cached) = file_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1216,7 +1290,7 @@ impl Site {
         {
             return Ok(cached.to_vec());
         }
-        let text = repo.read(path)?;
+        let (text, stamp) = repo.read_with_stamp(path)?;
         let lines = self.highlighter.lines(path, &text)?;
         let view = FileView {
             path,
@@ -1231,6 +1305,7 @@ impl Site {
         // Only cache when `(modified, len)` is unchanged after reading so concurrent edits never
         // populate the cache under a stale stamp.
         if let Some((modified, len)) = stamp
+            && out.len() <= FILE_CACHE_MAX_ENTRY_BYTES
             && read_stamp() == Some((modified, len))
         {
             file_cache
@@ -1277,10 +1352,33 @@ impl Site {
     }
 
     /// The reply to `GET /api/notes`: every note, moved to where its snippet is now. Reads
-    /// the review file and never writes it.
+    /// the review file and never writes it. Cached by `review.json` and referenced file stamps.
     fn notes(&self) -> Result<Vec<u8>> {
-        let review = notes::current(&*self.repo()?)?;
-        Ok(to_json(&review))
+        let (repo, notes_cache) = {
+            let guard = self.project.read().unwrap_or_else(PoisonError::into_inner);
+            let project = guard.as_ref().ok_or(Error::NoProject)?;
+            (Arc::clone(&project.repo), Arc::clone(&project.notes_cache))
+        };
+        {
+            let guard = notes_cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.matches(&repo)
+            {
+                return Ok(cached.json.to_vec());
+            }
+        }
+        let pre_review_stamp = file_stamp(&repo.review_file());
+        let review = notes::current(&repo)?;
+        let json = to_json(&review);
+        let entry = NotesCache::capture(&repo, &review, Arc::from(json.as_slice()));
+        // Only populate the cache when `review.json` did not change during `notes::current` so a
+        // concurrent mutation cannot pin stale JSON under the new stamp.
+        if entry.review_stamp == pre_review_stamp {
+            *notes_cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(entry);
+        } else {
+            *notes_cache.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+        Ok(json)
     }
 
     /// The reply to `GET /api/analysis`: the diagrams, each code reference placed where its
@@ -2059,8 +2157,10 @@ impl Site {
         let search_path = self.agents.path();
         let agents = search_path
             .as_deref()
-            .map(|path| agent_views(&loaded.settings, path));
-        let tools = search_path.as_deref().map(tools_view);
+            .map(|path| agent_views(&loaded.settings, &self.agents, path));
+        let tools = search_path
+            .as_deref()
+            .map(|path| tools_view(&self.agents, path));
         to_json(&SettingsView {
             settings: &loaded.settings,
             problem: loaded.problem,
@@ -2118,19 +2218,16 @@ impl Site {
     fn agent_models(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: ModelsRequest = parse_body(body, Error::BadRequest)?;
         let settings = self.current_settings();
-        let search_path = self.agents.path();
         let mut models = BTreeMap::new();
         let mut probed: Vec<(String, String)> = Vec::new();
         for name in request.agents {
             if let Some(agent) = BUILT_IN.iter().find(|agent| agent.name == name) {
-                let report = match search_path.as_deref() {
-                    None => ModelReport::Loading,
-                    Some(path) if agents::find_program(agent.program, path).is_none() => {
-                        ModelReport::Failed {
-                            error: format!("{name} is not installed"),
-                        }
-                    }
-                    Some(_) => {
+                let report = match self.agents.find_program(agent.program) {
+                    agents::ProgramLookup::Scanning => ModelReport::Loading,
+                    agents::ProgramLookup::Missing => ModelReport::Failed {
+                        error: format!("{name} is not installed"),
+                    },
+                    agents::ProgramLookup::Found(_) => {
                         probed.push((name, agent.command.to_owned()));
                         continue;
                     }
@@ -2256,8 +2353,11 @@ impl Site {
         }))
     }
 
-    /// Reads `usage.jsonl` with an `(mtime, len)` cache so repeated usage polls skip re-parsing.
+    /// Reads `usage.jsonl` with an `(dev, ino, parsed_offset, mtime)` cache and safe
+    /// incremental tailing so repeated usage polls and appended runs avoid re-parsing the full
+    /// history without duplicating records or skipping partial lines.
     fn read_ledger_cached(&self, file: &Path) -> std::io::Result<Arc<[ledger::LedgerRecord]>> {
+        use std::os::unix::fs::MetadataExt;
         let meta = match std::fs::metadata(file) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2271,25 +2371,72 @@ impl Site {
         };
         let modified = meta.modified().ok();
         let len = meta.len();
-        {
+        let dev = meta.dev();
+        let ino = meta.ino();
+        let tail_base = {
             let guard = self
                 .ledger_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(cached) = guard.as_ref()
-                && cached.len == len
-                && cached.modified == modified
+                && cached.dev == dev
+                && cached.ino == ino
             {
-                return Ok(Arc::clone(&cached.records));
+                if cached.parsed_offset == len && cached.modified == modified {
+                    return Ok(Arc::clone(&cached.records));
+                }
+                if len >= cached.parsed_offset {
+                    Some((cached.parsed_offset, Arc::clone(&cached.records)))
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-        }
-        let records: Arc<[ledger::LedgerRecord]> = Arc::from(ledger::read(file)?);
+        };
+        let (records, parsed_offset, chunk_modified, chunk_dev, chunk_ino) =
+            if let Some((offset, prev)) = tail_base
+                && let Some(chunk) = ledger::read_chunk(file, offset, Some((dev, ino)))?
+            {
+                let mut combined = Vec::with_capacity(prev.len() + chunk.records.len());
+                combined.extend_from_slice(&prev);
+                combined.extend(chunk.records);
+                (
+                    Arc::from(combined),
+                    chunk.parsed_offset,
+                    chunk.modified,
+                    chunk.dev,
+                    chunk.ino,
+                )
+            } else {
+                let chunk = match ledger::read_chunk(file, 0, None) {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => unreachable!("read_chunk with expected_id=None never returns None"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        *self
+                            .ledger_cache
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = None;
+                        return Ok(Arc::from([]));
+                    }
+                    Err(error) => return Err(error),
+                };
+                (
+                    Arc::from(chunk.records),
+                    chunk.parsed_offset,
+                    chunk.modified,
+                    chunk.dev,
+                    chunk.ino,
+                )
+            };
         *self
             .ledger_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(LedgerCache {
-            modified,
-            len,
+            modified: chunk_modified,
+            parsed_offset,
+            dev: chunk_dev,
+            ino: chunk_ino,
             records: Arc::clone(&records),
         });
         Ok(records)
@@ -2302,18 +2449,19 @@ impl Site {
         activities: &mut BTreeMap<String, AgentActivity>,
         fetch: QuotaFetch,
     ) -> Vec<UsageAgentView> {
+        let find = |program: &str| {
+            find_cached_program(&self.agents, program, search_path)
+                .map(|path| path.to_string_lossy().into_owned())
+        };
         let mut entries: Vec<(String, bool, Option<String>)> = Vec::new();
         for agent in BUILT_IN {
-            let found = agents::find_program(agent.program, search_path)
-                .map(|path| path.to_string_lossy().into_owned());
+            let found = find(agent.program);
             if found.is_some() || activities.contains_key(agent.name) {
                 entries.push((agent.name.to_owned(), true, found));
             }
         }
         for agent in settings.custom_agents() {
-            let found = agents::program_of(&agent.command)
-                .and_then(|program| agents::find_program(program, search_path))
-                .map(|path| path.to_string_lossy().into_owned());
+            let found = agents::program_of(&agent.command).and_then(find);
             if found.is_some() || activities.contains_key(&agent.name) {
                 entries.push((agent.name.clone(), false, found));
             }
@@ -2400,12 +2548,30 @@ impl Drop for Site {
     }
 }
 
+/// Looks up `program` in `agents`'s per-scan cache, falling back to the snapshotted
+/// `search_path` if a concurrent `rescan()` started mid-request.
+fn find_cached_program(
+    agents: &agents::Scanner,
+    program: &str,
+    search_path: &OsStr,
+) -> Option<PathBuf> {
+    match agents.find_program(program) {
+        agents::ProgramLookup::Found(path) => Some(path),
+        agents::ProgramLookup::Missing => None,
+        agents::ProgramLookup::Scanning => agents::find_program(program, search_path),
+    }
+}
+
 /// The built-in agents, then the custom ones, each with where its program was found on
-/// `search_path`.
-fn agent_views<'a>(settings: &'a Settings, search_path: &OsStr) -> Vec<AgentView<'a>> {
+/// `agents`'s cached search path.
+fn agent_views<'a>(
+    settings: &'a Settings,
+    agents: &agents::Scanner,
+    search_path: &OsStr,
+) -> Vec<AgentView<'a>> {
     let found = |program: Option<&str>| {
         program
-            .and_then(|program| agents::find_program(program, search_path))
+            .and_then(|program| find_cached_program(agents, program, search_path))
             .map(|path| path.to_string_lossy().into_owned())
     };
     let built_in = BUILT_IN.iter().map(|agent| AgentView {
@@ -2423,11 +2589,13 @@ fn agent_views<'a>(settings: &'a Settings, search_path: &OsStr) -> Vec<AgentView
     built_in.chain(custom).collect()
 }
 
-/// Where external tools Postil relies on live on `search_path`: `git` for repositories, `npx`
-/// for the Claude and Codex adapters, and `gh` for optional draft pull requests.
-fn tools_view(search_path: &OsStr) -> ToolsView {
+/// Where external tools Postil relies on live on `agents`'s cached search path: `git` for
+/// repositories, `npx` for the Claude and Codex adapters, and `gh` for optional draft pull
+/// requests.
+fn tools_view(agents: &agents::Scanner, search_path: &OsStr) -> ToolsView {
     let find = |program| {
-        agents::find_program(program, search_path).map(|path| path.to_string_lossy().into_owned())
+        find_cached_program(agents, program, search_path)
+            .map(|path| path.to_string_lossy().into_owned())
     };
     ToolsView {
         git: find("git"),
@@ -2554,7 +2722,14 @@ pub(crate) fn page_asset(path: &str) -> Option<Reply> {
     }
     PAGE.iter()
         .find(|(served, ..)| *served == path)
-        .map(|&(_, kind, body)| reply(StatusCode::OK, kind, body))
+        .map(|&(_, kind, body)| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, kind)
+                .header(wry::http::header::CACHE_CONTROL, "no-cache")
+                .body(Cow::Borrowed(body))
+                .expect("a status code and two static headers always make a valid response")
+        })
 }
 
 pub(crate) fn reply(

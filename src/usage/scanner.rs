@@ -1049,6 +1049,10 @@ fn for_each_jsonl_line(path: &Path, mut visit: impl FnMut(Value) -> bool) {
         {
             break;
         }
+        // Release peak line buffer capacity after giant transcript entries so the scanner stays light.
+        if line.capacity() > 64 * 1024 {
+            line.shrink_to(64 * 1024);
+        }
     }
 }
 

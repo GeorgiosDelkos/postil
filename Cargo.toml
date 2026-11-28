@@ -18,7 +18,7 @@ wry = { version = "0.57.3", default-features = false, features = ["os-webview"] 
 tao = { version = "0.37.3", default-features = false, features = ["rwh_06"] }
 # JSON for the page: the file list and the highlighted lines.
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std", "raw_value"] }
 # Syntax colors. One grammar crate per language.
 tree-sitter-highlight = "0.27.2"
 # Jump to definition: runs the grammars' tags queries (`src/definitions.rs`).

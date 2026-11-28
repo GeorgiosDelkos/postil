@@ -551,10 +551,7 @@ function beforeSend() {
 
 // File edits the run has finished, to tell when the open file may have changed.
 function editsDone(run) {
-  const edits = ["edit", "delete", "move"];
-  return foldRun(run.entries).items.filter(
-    (item) => item.type === "tool" && item.status === "completed" && edits.includes(item.tool),
-  ).length;
+  return foldRun(run.entries).completedEdits;
 }
 
 // Coalesces edit-triggered refreshes and prevents overlapping `loadNotes` polls during streaming.

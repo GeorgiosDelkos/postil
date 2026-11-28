@@ -119,6 +119,20 @@ const FORCE_AFTER: Duration = Duration::from_secs(3);
 /// page; tests count the calls.
 pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// Maximum number of disk-read historical runs cached in memory per [`Runner`].
+const DISK_RUN_CACHE_CAP: usize = 8;
+
+/// Maximum number of changed file paths included in a review's memory recall queries.
+const MAX_REVIEW_QUERY_PATHS: usize = 16;
+
+/// A run log read from disk, cached by `(id, modified, len)` so repeated views skip re-parsing.
+struct CachedDiskRun {
+    id: String,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    run: Arc<Run>,
+}
+
 /// The runs of the open project, and the agent kept between them.
 pub(crate) struct Runner {
     repo: Arc<Repo>,
@@ -132,6 +146,8 @@ pub(crate) struct Runner {
     /// Durable global usage ledger (`<config dir>/usage.jsonl`), when configured.
     usage_file: Option<PathBuf>,
     slots: Mutex<Slots>,
+    /// Bounded LRU cache of disk-read runs (`Run::read`), validated by `(modified, len)`.
+    disk_runs: Mutex<Vec<CachedDiskRun>>,
     /// What this window is doing about each thread's pull request, by thread id
     /// ([`pull::PullWork`]); a lock never held with another.
     pull_work: Mutex<HashMap<String, pull::PullWork>>,
@@ -586,6 +602,7 @@ impl Runner {
             home,
             usage_file,
             slots: Mutex::new(Slots::default()),
+            disk_runs: Mutex::new(Vec::new()),
             pull_work: Mutex::default(),
             #[cfg(test)]
             next_stage_gate: Mutex::new(None),
@@ -1394,10 +1411,45 @@ impl Runner {
             problem,
         };
         let file = self.repo.runs_dir().join(format!("R{number}.jsonl"));
-        if !file.exists() {
+        let Ok(meta) = std::fs::metadata(&file) else {
             return Err(no_such("there is no such run log".to_owned()));
+        };
+        let modified = meta.modified().ok();
+        let len = meta.len();
+        {
+            let mut cache = self
+                .disk_runs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(pos) = cache
+                .iter()
+                .position(|entry| entry.id == of && entry.len == len && entry.modified == modified)
+            {
+                let entry = cache.remove(pos);
+                let run = Arc::clone(&entry.run);
+                cache.push(entry);
+                return Ok(run);
+            }
         }
-        Run::read(&file).map(Arc::new).map_err(no_such)
+        let run = Run::read(&file).map(Arc::new).map_err(no_such)?;
+        {
+            let mut cache = self
+                .disk_runs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(pos) = cache.iter().position(|entry| entry.id == of) {
+                cache.remove(pos);
+            } else if cache.len() >= DISK_RUN_CACHE_CAP {
+                cache.remove(0);
+            }
+            cache.push(CachedDiskRun {
+                id: of.to_owned(),
+                modified,
+                len,
+                run: Arc::clone(&run),
+            });
+        }
+        Ok(run)
     }
 
     /// Starts `chain`'s current stage as a new run, with a fresh agent, so a reviewer never
@@ -2138,6 +2190,11 @@ impl Runner {
                 trashed.delete_later();
             }
         });
+        if ended.is_ok() {
+            // The thread is Applied or Discarded and can never run again: clean up its lock file
+            // while still holding `_lock` so `live_threads` does not scan dead lock files.
+            remove_thread_lock(&self.repo.runs_dir(), id);
+        }
         (self.notify)();
         ended
     }
@@ -2803,8 +2860,11 @@ impl Runner {
         files: Vec<String>,
         snapshots: &ReviewSnapshots,
     ) -> std::result::Result<Vec<String>, String> {
+        let mut seen: std::collections::HashSet<String> = files.iter().cloned().collect();
         let mut paths = files;
-        if let (Some(before), Some(after)) = (&snapshots.before, &snapshots.after)
+        paths.truncate(MAX_REVIEW_QUERY_PATHS);
+        if paths.len() < MAX_REVIEW_QUERY_PATHS
+            && let (Some(before), Some(after)) = (&snapshots.before, &snapshots.after)
             && before != after
         {
             let changed = self.repo.changed_paths(before, after).map_err(|error| {
@@ -2814,7 +2874,10 @@ impl Runner {
                 )
             })?;
             for changed in changed {
-                if !paths.contains(&changed.path) {
+                if paths.len() >= MAX_REVIEW_QUERY_PATHS {
+                    break;
+                }
+                if seen.insert(changed.path.clone()) {
                     paths.push(changed.path);
                 }
             }
@@ -3058,6 +3121,10 @@ impl fmt::Debug for Runner {
 /// was let go. An agent that exited, or whose turn failed, is let go: the next send starts a
 /// fresh one, since a failed turn can mean a broken session (an adapter whose backend died,
 /// a sign-in that expired), and a lost conversation costs less than a stuck one.
+#[expect(
+    clippy::too_many_lines,
+    reason = "coordinates slot inspection, lock-free read-only undo, turn finish, and logging"
+)]
 fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
     let Some(runner) = runner.upgrade() else {
         return;
@@ -3070,13 +3137,20 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         })
     );
     let ends_turn = matches!(event, Event::TurnEnded(_) | Event::Exited { .. });
-    let (run, thread, released, answer, next, edited, analyzing) = {
+    let ends_agent = matches!(
+        event,
+        Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
+    );
+    let (run, thread, root_path, answer, stage, analyzing, drafting, should_undo) = {
         let mut slots = runner.slots();
         if slots.let_go(id, generation) {
             return;
         }
         let slot = slots.by_thread.get_mut(id).expect("let_go found the slot");
-        let thread = Some(slot.thread.clone());
+        // Avoid cloning the entire `Thread` (6+ Strings) on every streamed token chunk; only
+        // clone it when the turn ends and snapshots/undo/cleanup need the full record.
+        let root_path = slot.thread.path.clone();
+        let thread = ends_turn.then(|| slot.thread.clone());
         let (review, read_only_thread, analyzing, drafting) =
             slot.run
                 .as_ref()
@@ -3105,53 +3179,54 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         if ends_turn && !ended_well && stage.is_some() {
             slot.chain = None;
         }
-        let ends_agent = matches!(
-            event,
-            Event::Exited { .. } | Event::TurnEnded(TurnEnd::Failed(_))
-        );
         let run = slot.run.clone();
-        // However a read-only run's turn ends, what it changed is put back before the end is
-        // logged, under the lock, so no run starts in the worktree first.
-        // Only for a live run: a kept agent that exits after its run ended (a proposer whose
-        // review found nothing, an ask's) must not reset what the engineer has committed or
-        // edited in the worktree since.
-        let undone = run
-            .as_deref()
-            .filter(|run| ends_turn && run.state().live())
-            .and_then(|run| undo_read_only(&runner, run, thread.as_ref()));
-        // An analysis that changed files stores nothing: its tree is not the one it was given.
-        let edited = undone.is_some();
-        // An analysis's agent goes with its turn: its thread ends with the run. So does a memory
-        // draft's: the draft is the slot's run now, so no turn could reuse its agent.
-        let released = if ends_agent || (ends_turn && (analyzing || drafting)) {
-            slot.release()
-        } else {
-            Held::None
+        let should_undo =
+            ends_turn && read_only && run.as_deref().is_some_and(|run| run.state().live());
+        (
+            run,
+            thread,
+            root_path,
+            answer,
+            stage,
+            analyzing,
+            drafting,
+            should_undo,
+        )
+    };
+    // Run `undo_read_only` outside `runner.slots()` so 4-6 synchronous git subprocesses never
+    // stall concurrent API requests or other live agents. The run is still live and still holds
+    // its thread lock file, so no other run can enter the worktree before `Entry::Ended` is logged.
+    let undone = if should_undo {
+        run.as_deref()
+            .and_then(|run| undo_read_only(&runner, run, thread.as_ref()))
+    } else {
+        None
+    };
+    // An analysis that changed files stores nothing: its tree is not the one it was given.
+    let edited = undone.is_some();
+    let (released, next) = if ends_turn || ends_agent {
+        let Some(finished) = finish_turn_slot(
+            &runner,
+            id,
+            generation,
+            ends_turn,
+            ends_agent,
+            ended_well,
+            analyzing,
+            drafting,
+            stage.as_ref(),
+            run.as_ref(),
+            undone,
+        ) else {
+            return;
         };
-        // Decided under the lock, before the stage's end is logged: a reader that sees the end
-        // sees the decision, and no Stop or new review can replace the chain meanwhile. The
-        // next stage starts once the end is logged.
-        let next = match (&stage, &run) {
-            (Some(stage), Some(run)) if ended_well => {
-                decide(slot, run, stage, undone).then(|| Arc::clone(run))
-            }
-            (_, Some(run)) => {
-                // No findings are logged for this end: the run says it, in its log, before the
-                // end.
-                if let Some(text) = undone {
-                    run.record(Entry::Undone { text });
-                }
-                None
-            }
-            _ => None,
-        };
-        (run, thread, released, answer, next, edited, analyzing)
+        finished
+    } else {
+        (Held::None, None)
     };
     if let Some(run) = &run {
         // The agent names files in the worktree it works in.
-        let root = thread
-            .as_ref()
-            .map_or(runner.repo.root(), |thread| thread.path.as_path());
+        let root = root_path.as_path();
         // Before the end is logged, so a reader that sees the end sees what the run changed,
         // and its report.
         if ends_turn {
@@ -3182,6 +3257,68 @@ fn on_event(runner: &Weak<Runner>, id: &str, generation: u64, event: Event) {
         runner.pass_next_stage_gate();
         runner.advance(id, &ended);
     }
+}
+
+/// Releases the slot's agent if needed and decides whether a review chain advances to its next
+/// stage, under `runner.slots()` after any read-only undo has finished outside the lock.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper split out of `on_event` to keep `on_event` readable"
+)]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "mirrors the turn-end flags already computed in `on_event`"
+)]
+fn finish_turn_slot(
+    runner: &Runner,
+    id: &str,
+    generation: u64,
+    ends_turn: bool,
+    ends_agent: bool,
+    ended_well: bool,
+    analyzing: bool,
+    drafting: bool,
+    stage: Option<&Stage>,
+    run: Option<&Arc<Run>>,
+    undone: Option<String>,
+) -> Option<(Held, Option<Arc<Run>>)> {
+    let mut slots = runner.slots();
+    if slots.let_go(id, generation) {
+        return None;
+    }
+    let slot = slots.by_thread.get_mut(id).expect("let_go found the slot");
+    // An analysis's agent goes with its turn: its thread ends with the run. So does a memory
+    // draft's: the draft is the slot's run now, so no turn could reuse its agent.
+    let released = if ends_agent || (ends_turn && (analyzing || drafting)) {
+        slot.release()
+    } else {
+        Held::None
+    };
+    // Re-verify `slot.chain` under the lock: a non-forced `Runner::cancel()` during unlocked
+    // `undo_read_only` may have cleared `slot.chain` without releasing the slot.
+    let stage = stage.filter(|stage| {
+        slot.chain
+            .as_ref()
+            .is_some_and(|chain| chain.stage == **stage)
+    });
+    // Decided under the lock, before the stage's end is logged: a reader that sees the end
+    // sees the decision, and no Stop or new review can replace the chain meanwhile. The
+    // next stage starts once the end is logged.
+    let next = match (stage, run) {
+        (Some(stage), Some(run)) if ended_well => {
+            decide(slot, run, stage, undone).then(|| Arc::clone(run))
+        }
+        (_, Some(run)) => {
+            // No findings are logged for this end: the run says it, in its log, before the
+            // end.
+            if let Some(text) = undone {
+                run.record(Entry::Undone { text });
+            }
+            None
+        }
+        _ => None,
+    };
+    Some((released, next))
 }
 
 /// Ends review stage `stage` of `run`, whose turn ended well in `thread`'s worktree, and decides
