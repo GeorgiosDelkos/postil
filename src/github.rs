@@ -3,15 +3,24 @@
 //! knows GitHub Enterprise hosts; Postil holds no token of its own.
 
 use std::ffi::OsStr;
-use std::io::Write as _;
+use std::io::{self, Read, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agents;
 use crate::error::{Error, Result};
 use crate::thread::PullState;
+
+/// Hard bound on any `gh` CLI subprocess so stalled network calls cannot wedge worker threads.
+const GH_TIMEOUT: Duration = Duration::from_secs(45);
+/// Maximum bytes read from `gh` stdout/stderr.
+const MAX_GH_OUTPUT: u64 = 16 * 1024 * 1024;
 
 /// A pull request to open with [`create`].
 #[derive(Debug)]
@@ -325,15 +334,23 @@ pub(crate) fn submit_pr_review(
             message: format!("could not determine owner/repo slug: {slug:?}"),
         });
     }
+    for c in review.comments {
+        if c.path.trim().is_empty() || c.line == 0 || c.body.trim().is_empty() {
+            return Err(Error::BadRequest(format!(
+                "invalid inline review comment on {:?}:{} (path, line >= 1, and body are required)",
+                c.path, c.line
+            )));
+        }
+    }
     let api_comments: Vec<Value> = review
         .comments
         .iter()
         .map(|c| {
             serde_json::json!({
-                "path": c.path,
+                "path": c.path.trim(),
                 "line": c.line,
                 "side": "RIGHT",
-                "body": c.body,
+                "body": c.body.trim(),
             })
         })
         .collect();
@@ -500,14 +517,19 @@ fn summarize_checks(rollup: Option<&Value>) -> String {
     let mut saw_pending = false;
     let mut saw_pass = false;
     for entry in items {
-        let state = entry
-            .get("conclusion")
-            .or_else(|| entry.get("state"))
-            .or_else(|| entry.get("status"))
-            .and_then(Value::as_str)
+        let non_empty = |key: &str| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        };
+        let state = non_empty("conclusion")
+            .or_else(|| non_empty("state"))
+            .or_else(|| non_empty("status"))
             .unwrap_or("");
         match state {
-            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" => {
+            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+            | "STARTUP_FAILURE" => {
                 return "failing".to_owned();
             }
             "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" => saw_pending = true,
@@ -524,8 +546,8 @@ fn summarize_checks(rollup: Option<&Value>) -> String {
     }
 }
 
-/// Runs `gh` with `args` in `dir`, writing `input` to its standard input, and returns what it
-/// printed.
+/// Runs `gh` with `args` in `dir`, writing `input` to its standard input, bounded to `GH_TIMEOUT`,
+/// and returns what it printed.
 fn run(
     program: &Path,
     dir: &Path,
@@ -533,7 +555,7 @@ fn run(
     args: &[&str],
     input: Option<&str>,
 ) -> Result<String> {
-    let command_line = format!("gh {}", args[..2].join(" "));
+    let command_line = format!("gh {}", args[..args.len().min(2)].join(" "));
     let failed = |message: String| Error::GitHub {
         command: command_line.clone(),
         message,
@@ -541,6 +563,7 @@ fn run(
     let mut child = Command::new(program)
         .args(args)
         .current_dir(dir)
+        .process_group(0)
         // Credential helpers and `git`, which gh runs, are found by the login shell's PATH.
         .env("PATH", search_path)
         // Never a question on a terminal there is none of: gh fails and says why instead.
@@ -556,20 +579,89 @@ fn run(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| failed(error.to_string()))?;
-    let output = std::thread::scope(|scope| {
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-            // On a thread of its own, as `repo.rs` writes to git: gh may exit before it reads
-            // the body (not signed in), which fails the write, and its exit status and message
-            // then say why. The pipe closes when `stdin` drops, which ends gh's read.
-            scope.spawn(move || drop(stdin.write_all(input.as_bytes())));
-        }
-        child.wait_with_output()
-    })
-    .map_err(|error| failed(error.to_string()))?;
-    if !output.status.success() {
-        return Err(failed(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        let bytes = text.as_bytes().to_vec();
+        drop(
+            std::thread::Builder::new()
+                .name("gh-stdin".to_owned())
+                .spawn(move || drop(stdin.write_all(&bytes))),
+        );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+
+    let deadline = Instant::now() + GH_TIMEOUT;
+    let stdout_rx = read_pipe(child.stdout.take());
+    let stderr_rx = read_pipe(child.stderr.take());
+    let stdout = recv_before(&stdout_rx, deadline);
+    let stderr = stdout
+        .as_ref()
+        .and_then(|_| recv_before(&stderr_rx, deadline));
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        agents::kill_group(child.id());
+        drop(child.kill());
+        drop(child.wait());
+        return Err(failed(format!(
+            "timed out after {} s",
+            GH_TIMEOUT.as_secs()
+        )));
+    };
+    let status = child.wait().map_err(|error| failed(error.to_string()))?;
+    if !status.success() {
+        let err = stderr.trim();
+        let out = stdout.trim();
+        let combined = match (err.is_empty(), out.is_empty()) {
+            (false, false) => format!("{err} ({out})"),
+            (false, true) => err.to_owned(),
+            (true, false) => out.to_owned(),
+            (true, true) => format!("exited with status {status}"),
+        };
+        return Err(failed(combined));
+    }
+    Ok(stdout)
+}
+
+fn read_pipe(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    if let Some(mut pipe) = pipe {
+        drop(
+            std::thread::Builder::new()
+                .name("gh-output".to_owned())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    drop((&mut pipe).take(MAX_GH_OUTPUT).read_to_end(&mut bytes));
+                    drop(io::copy(&mut pipe, &mut io::sink()));
+                    drop(tx.send(String::from_utf8_lossy(&bytes).into_owned()));
+                }),
+        );
+    }
+    rx
+}
+
+fn recv_before(rx: &mpsc::Receiver<String>, deadline: Instant) -> Option<String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    rx.recv_timeout(left).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_checks_handles_null_conclusion_and_startup_failure() {
+        let running = serde_json::json!([
+            { "conclusion": "SUCCESS", "status": "COMPLETED" },
+            { "conclusion": null, "status": "IN_PROGRESS" }
+        ]);
+        assert_eq!(summarize_checks(Some(&running)), "pending");
+
+        let empty_conclusion = serde_json::json!([
+            { "conclusion": "", "status": "QUEUED" }
+        ]);
+        assert_eq!(summarize_checks(Some(&empty_conclusion)), "pending");
+
+        let startup_fail = serde_json::json!([
+            { "conclusion": "STARTUP_FAILURE", "status": "COMPLETED" }
+        ]);
+        assert_eq!(summarize_checks(Some(&startup_fail)), "failing");
+    }
 }

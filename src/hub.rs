@@ -14,7 +14,7 @@ use crate::error::{Error, Result, error_chain};
 use crate::files::{Stored, load_versioned, save_json_relaxed};
 use crate::github::{self, GhIssue, GhPr};
 use crate::lane::{Lane, WorkKind};
-use crate::memory::{HubMemoryHit, Memory};
+use crate::memory::{HubMemoryHit, HubRecallRequest, Memory};
 use crate::repo::Repo;
 use crate::run::Notify;
 
@@ -114,6 +114,9 @@ pub(crate) struct HubItem {
     /// Cache fingerprint (`updated_at` + `head_oid`) so unchanged items reuse cached triage.
     #[serde(default)]
     pub(crate) revision: String,
+    /// True once `hippius-mem` recall ran for this revision (even when 0 memories matched).
+    #[serde(default)]
+    pub(crate) memories_checked: bool,
 }
 
 /// Summary of one monitored repository returned by `GET /api/hub`.
@@ -147,6 +150,7 @@ pub(crate) struct HubView {
 struct RepoSyncState {
     items: Vec<HubItem>,
     syncing: bool,
+    generation: u64,
     last_synced: Option<u64>,
     error: Option<String>,
 }
@@ -156,6 +160,7 @@ struct Inner {
     repos: Vec<MonitoredRepo>,
     by_path: HashMap<String, RepoSyncState>,
     sync_generation: u64,
+    newer_file: bool,
 }
 
 /// Manages monitored repositories, background GitHub syncing, and `hippius-mem` priority triage.
@@ -186,7 +191,7 @@ impl HubManager {
         memory: Memory,
         notify: Notify,
     ) -> Self {
-        let repos = file.as_deref().map_or_else(Vec::new, load_monitored);
+        let (repos, newer_file) = file.as_deref().map_or((Vec::new(), false), load_monitored);
         let mut by_path = HashMap::new();
         for entry in &repos {
             if let Ok(repo) = Repo::open(Path::new(&entry.path))
@@ -197,6 +202,7 @@ impl HubManager {
                     RepoSyncState {
                         items: cached.items,
                         syncing: false,
+                        generation: 0,
                         last_synced: Some(cached.synced_at),
                         error: None,
                     },
@@ -212,6 +218,7 @@ impl HubManager {
                 repos,
                 by_path,
                 sync_generation: 0,
+                newer_file,
             })),
         }
     }
@@ -221,7 +228,7 @@ impl HubManager {
     /// # Errors
     ///
     /// [`Error::NotARepository`] / [`Error::NotAFolder`] if `path` is not a valid git repo.
-    pub(crate) fn add_repo(&self, path: &Path) -> Result<()> {
+    pub(crate) fn add_repo(&self, path: &Path, use_memory: bool) -> Result<()> {
         let repo = Repo::open(path)?;
         let canonical = repo.root().to_string_lossy().into_owned();
         let cached = load_repo_cache(&repo);
@@ -243,13 +250,14 @@ impl HubManager {
                     .or_insert(RepoSyncState {
                         items: cache.items,
                         syncing: false,
+                        generation: 0,
                         last_synced: Some(cache.synced_at),
                         error: None,
                     });
             }
             self.save_locked(&inner);
         }
-        self.sync_repo(&canonical);
+        self.sync_repo(&canonical, use_memory);
         Ok(())
     }
 
@@ -289,38 +297,49 @@ impl HubManager {
     }
 
     /// Triggers a background GitHub + `hippius-mem` sync for all monitored repositories.
-    pub(crate) fn sync_all(&self) {
+    pub(crate) fn sync_all(&self, use_memory: bool) {
         let paths: Vec<String> = {
             let inner = lock(&self.inner);
             inner.repos.iter().map(|r| r.path.clone()).collect()
         };
         for path in paths {
-            self.sync_repo(&path);
+            self.sync_repo(&path, use_memory);
         }
     }
 
     /// Triggers a background sync for one monitored repository.
-    pub(crate) fn sync_repo(&self, path: &str) {
+    pub(crate) fn sync_repo(&self, path: &str, use_memory: bool) {
         let generation = {
             let mut inner = lock(&self.inner);
-            let entry = inner.by_path.entry(path.to_owned()).or_default();
-            if entry.syncing {
+            if inner.by_path.get(path).is_some_and(|e| e.syncing) {
                 return;
             }
-            entry.syncing = true;
-            entry.error = None;
             inner.sync_generation += 1;
-            inner.sync_generation
+            let gen_id = inner.sync_generation;
+            let entry = inner.by_path.entry(path.to_owned()).or_default();
+            entry.syncing = true;
+            entry.generation = gen_id;
+            entry.error = None;
+            gen_id
         };
         let manager = self.clone();
         let target = path.to_owned();
-        drop(
-            std::thread::Builder::new()
-                .name("hub-sync".to_owned())
-                .spawn(move || {
-                    manager.run_sync(&target, generation);
-                }),
-        );
+        let spawned = std::thread::Builder::new()
+            .name("hub-sync".to_owned())
+            .spawn(move || {
+                manager.run_sync(&target, generation, use_memory);
+            });
+        if let Err(err) = spawned {
+            let mut inner = lock(&self.inner);
+            if let Some(entry) = inner.by_path.get_mut(path)
+                && entry.generation == generation
+            {
+                entry.syncing = false;
+                entry.error = Some(format!("could not start sync thread: {err}"));
+            }
+            drop(inner);
+            (self.notify)();
+        }
     }
 
     /// Re-evaluates a single item with fresh `hippius-mem` recall and architecture map matching.
@@ -333,45 +352,64 @@ impl HubManager {
         repo_path: &str,
         kind: WorkKind,
         number: u64,
+        use_memory: bool,
     ) -> Result<HubItem> {
-        let existing = {
+        let canonical = canonical_or_raw(repo_path);
+        let (key_used, existing) = {
             let inner = lock(&self.inner);
-            inner
+            let found = inner
                 .by_path
-                .get(repo_path)
-                .and_then(|s| {
-                    s.items
-                        .iter()
-                        .find(|i| i.kind == kind && i.number == number)
-                })
-                .cloned()
+                .get(&canonical)
+                .map(|s| (canonical.as_str(), s))
+                .or_else(|| inner.by_path.get(repo_path).map(|s| (repo_path, s)));
+            found.and_then(|(k, s)| {
+                s.items
+                    .iter()
+                    .find(|i| i.kind == kind && i.number == number)
+                    .cloned()
+                    .map(|item| (k.to_owned(), item))
+            })
         }
         .ok_or_else(|| Error::BadRequest(format!("item #{number} not found in {repo_path}")))?;
 
-        let repo = Repo::open(Path::new(repo_path))?;
+        let repo = Repo::open(Path::new(&key_used))?;
         let memory_repo = repo.memory_name();
         let components = repo_components(&repo);
-        let query = format!("{} {}", existing.title, existing.labels.join(" "));
-        let memories =
-            self.memory
-                .recall_for_hub_repo(repo.root(), memory_repo.as_deref(), &query, 4);
-        let updated = re_score_item(existing, memories, &components);
+        let memories = if use_memory {
+            let query = format!("{} {}", existing.title, existing.labels.join(" "));
+            self.memory.recall_for_hub_repo(&HubRecallRequest {
+                repo_dir: repo.root(),
+                repo_name: memory_repo.as_deref(),
+                query: &query,
+                limit: 4,
+                wait_for_check: false,
+            })
+        } else {
+            Vec::new()
+        };
+        let mut updated = re_score_item(existing, memories, &components);
+        updated.memories_checked = use_memory && self.memory.is_ready();
 
-        let mut inner = lock(&self.inner);
-        if let Some(state) = inner.by_path.get_mut(repo_path) {
-            if let Some(slot) = state
-                .items
-                .iter_mut()
-                .find(|i| i.kind == kind && i.number == number)
-            {
-                *slot = updated.clone();
-            }
-            save_repo_cache(
-                &repo,
-                state.last_synced.unwrap_or_else(now_secs),
-                &state.items,
-            );
+        let to_save = {
+            let mut inner = lock(&self.inner);
+            inner.by_path.get_mut(&key_used).map(|state| {
+                if let Some(slot) = state
+                    .items
+                    .iter_mut()
+                    .find(|i| i.kind == kind && i.number == number)
+                {
+                    *slot = updated.clone();
+                }
+                (
+                    state.last_synced.unwrap_or_else(now_secs),
+                    state.items.clone(),
+                )
+            })
+        };
+        if let Some((ts, items_snapshot)) = to_save {
+            save_repo_cache(&repo, ts, &items_snapshot);
         }
+        (self.notify)();
         Ok(updated)
     }
 
@@ -382,10 +420,12 @@ impl HubManager {
         kind: WorkKind,
         number: u64,
     ) -> Option<HubItem> {
+        let canonical = canonical_or_raw(repo_path);
         let inner = lock(&self.inner);
         inner
             .by_path
-            .get(repo_path)?
+            .get(&canonical)
+            .or_else(|| inner.by_path.get(repo_path))?
             .items
             .iter()
             .find(|item| item.kind == kind && item.number == number)
@@ -394,16 +434,48 @@ impl HubManager {
 
     /// Current view of all monitored repos and the priority-ranked queue for selected repos.
     pub(crate) fn view(&self) -> HubView {
+        struct RepoSnapshot {
+            entry: MonitoredRepo,
+            syncing: bool,
+            last_synced: Option<u64>,
+            error: Option<String>,
+            items: Vec<HubItem>,
+        }
         let gh_available = matches!(
             self.agents.find_program("gh"),
             agents::ProgramLookup::Found(_)
         );
-        let inner = lock(&self.inner);
-        let mut repos = Vec::with_capacity(inner.repos.len());
+        // Snapshot in-memory state under the lock, then perform git/fs checks unlocked.
+        let snapshot: Vec<RepoSnapshot> = {
+            let inner = lock(&self.inner);
+            inner
+                .repos
+                .iter()
+                .map(|entry| {
+                    let sync = inner.by_path.get(&entry.path);
+                    RepoSnapshot {
+                        entry: entry.clone(),
+                        syncing: sync.is_some_and(|s| s.syncing),
+                        last_synced: sync.and_then(|s| s.last_synced),
+                        error: sync.and_then(|s| s.error.clone()),
+                        items: sync.map_or_else(Vec::new, |s| s.items.clone()),
+                    }
+                })
+                .collect()
+        };
+
+        let mut repos = Vec::with_capacity(snapshot.len());
         let mut items = Vec::new();
         let mut any_syncing = false;
 
-        for entry in &inner.repos {
+        for RepoSnapshot {
+            entry,
+            syncing,
+            last_synced,
+            error,
+            items: repo_items,
+        } in snapshot
+        {
             let folder = Path::new(&entry.path);
             let exists = folder.is_dir();
             let opened = exists.then(|| Repo::open(folder).ok()).flatten();
@@ -417,10 +489,7 @@ impl HubManager {
             );
             let branch = opened.as_ref().and_then(|r| r.branch().ok());
             let memory_repo = opened.as_ref().and_then(Repo::memory_name);
-            let sync = inner.by_path.get(&entry.path);
-            let syncing = sync.is_some_and(|s| s.syncing);
             any_syncing |= syncing;
-            let repo_items = sync.map_or(&[][..], |s| s.items.as_slice());
             let open_issues = repo_items
                 .iter()
                 .filter(|i| i.kind == WorkKind::Issue)
@@ -431,7 +500,7 @@ impl HubManager {
                 .count();
 
             repos.push(HubRepoView {
-                path: entry.path.clone(),
+                path: entry.path,
                 name,
                 selected: entry.selected,
                 exists,
@@ -440,12 +509,12 @@ impl HubManager {
                 open_issues,
                 open_prs,
                 syncing,
-                last_synced: sync.and_then(|s| s.last_synced),
-                error: sync.and_then(|s| s.error.clone()),
+                last_synced,
+                error,
             });
 
             if entry.selected {
-                items.extend(repo_items.iter().cloned());
+                items.extend(repo_items);
             }
         }
 
@@ -466,32 +535,44 @@ impl HubManager {
         }
     }
 
-    fn run_sync(&self, path: &str, _gen: u64) {
-        let result = self.fetch_repo_items(path);
-        {
+    fn run_sync(&self, path: &str, generation: u64, use_memory: bool) {
+        let result = self.fetch_repo_items(path, use_memory);
+        let cache_to_write = {
             let mut inner = lock(&self.inner);
-            if let Some(state) = inner.by_path.get_mut(path) {
-                state.syncing = false;
-                match result {
-                    Ok(items) => {
-                        let ts = now_secs();
-                        state.items = items;
-                        state.last_synced = Some(ts);
-                        state.error = None;
-                        if let Ok(repo) = Repo::open(Path::new(path)) {
-                            save_repo_cache(&repo, ts, &state.items);
-                        }
-                    }
-                    Err(error) => {
-                        state.error = Some(error);
-                    }
+            let Some(state) = inner.by_path.get_mut(path) else {
+                return;
+            };
+            if state.generation != generation {
+                return;
+            }
+            state.syncing = false;
+            match result {
+                Ok(items) => {
+                    let ts = now_secs();
+                    state.items.clone_from(&items);
+                    state.last_synced = Some(ts);
+                    state.error = None;
+                    Some((ts, items))
+                }
+                Err(error) => {
+                    state.error = Some(error);
+                    None
                 }
             }
+        };
+        if let Some((ts, items)) = cache_to_write
+            && let Ok(repo) = Repo::open(Path::new(path))
+        {
+            save_repo_cache(&repo, ts, &items);
         }
         (self.notify)();
     }
 
-    fn fetch_repo_items(&self, path: &str) -> std::result::Result<Vec<HubItem>, String> {
+    fn fetch_repo_items(
+        &self,
+        path: &str,
+        use_memory: bool,
+    ) -> std::result::Result<Vec<HubItem>, String> {
         let repo = Repo::open(Path::new(path)).map_err(|e| error_chain(&e))?;
         let search_path = self.agents.wait();
         let Some(gh) = agents::find_program("gh", &search_path) else {
@@ -519,7 +600,7 @@ impl HubManager {
         let repo_name = repo.name();
         let memory_repo = repo.memory_name();
         let components = repo_components(&repo);
-        let mem_ready = self.memory.is_ready();
+        let mem_ready = use_memory && self.memory.is_ready();
 
         let mut items = Vec::with_capacity(issues.len() + prs.len());
 
@@ -527,48 +608,65 @@ impl HubManager {
             let rev = issue.updated_at.clone();
             let cached_memories = prev_by_key
                 .get(&(WorkKind::Issue, issue.number))
-                .filter(|prev| prev.revision == rev && !prev.memories.is_empty())
+                .filter(|prev| {
+                    prev.revision == rev && (prev.memories_checked || !prev.memories.is_empty())
+                })
                 .map(|prev| prev.memories.clone());
-            let memories = match cached_memories {
-                Some(m) => m,
-                None if mem_ready => {
+            let (memories, checked) = match cached_memories {
+                Some(m) if use_memory => (m, true),
+                _ if use_memory => {
                     let query = format!("{} {}", issue.title, issue.labels.join(" "));
-                    self.memory
-                        .recall_for_hub_repo(repo.root(), memory_repo.as_deref(), &query, 3)
+                    let hits = self.memory.recall_for_hub_repo(&HubRecallRequest {
+                        repo_dir: repo.root(),
+                        repo_name: memory_repo.as_deref(),
+                        query: &query,
+                        limit: 3,
+                        wait_for_check: true,
+                    });
+                    (hits, mem_ready || self.memory.is_ready())
                 }
-                None => Vec::new(),
+                _ => (Vec::new(), false),
             };
-            items.push(evaluate_issue(
-                path,
-                &repo_name,
-                issue,
-                memories,
-                &components,
-            ));
+            let mut evaluated = evaluate_issue(path, &repo_name, issue, memories, &components);
+            evaluated.memories_checked = checked;
+            items.push(evaluated);
         }
 
         for pr in prs {
             let rev = format!("{}:{}", pr.updated_at, pr.head_oid);
             let cached_memories = prev_by_key
                 .get(&(WorkKind::PullRequest, pr.number))
-                .filter(|prev| prev.revision == rev && !prev.memories.is_empty())
+                .filter(|prev| {
+                    prev.revision == rev && (prev.memories_checked || !prev.memories.is_empty())
+                })
                 .map(|prev| prev.memories.clone());
-            let memories = match cached_memories {
-                Some(m) => m,
-                None if mem_ready => {
+            let (memories, checked) = match cached_memories {
+                Some(m) if use_memory => (m, true),
+                _ if use_memory => {
                     let query = format!("{} {}", pr.title, pr.labels.join(" "));
-                    self.memory
-                        .recall_for_hub_repo(repo.root(), memory_repo.as_deref(), &query, 3)
+                    let hits = self.memory.recall_for_hub_repo(&HubRecallRequest {
+                        repo_dir: repo.root(),
+                        repo_name: memory_repo.as_deref(),
+                        query: &query,
+                        limit: 3,
+                        wait_for_check: true,
+                    });
+                    (hits, mem_ready || self.memory.is_ready())
                 }
-                None => Vec::new(),
+                _ => (Vec::new(), false),
             };
-            items.push(evaluate_pr(path, &repo_name, pr, memories, &components));
+            let mut evaluated = evaluate_pr(path, &repo_name, pr, memories, &components);
+            evaluated.memories_checked = checked;
+            items.push(evaluated);
         }
 
         Ok(items)
     }
 
     fn save_locked(&self, inner: &Inner) {
+        if inner.newer_file {
+            return;
+        }
         let Some(file) = &self.file else { return };
         let stored = HubFile {
             version: HUB_VERSION,
@@ -619,6 +717,7 @@ pub(crate) fn evaluate_issue(
         memories: Vec::new(),
         affected_components: Vec::new(),
         revision: rev,
+        memories_checked: false,
     };
     re_score_item(base, memories, components)
 }
@@ -664,6 +763,7 @@ pub(crate) fn evaluate_pr(
         memories: Vec::new(),
         affected_components: Vec::new(),
         revision: rev,
+        memories_checked: false,
     };
     re_score_item(base, memories, components)
 }
@@ -930,10 +1030,11 @@ fn repo_components(repo: &Repo) -> Vec<String> {
     analysis::node_labels(repo)
 }
 
-fn load_monitored(file: &Path) -> Vec<MonitoredRepo> {
+fn load_monitored(file: &Path) -> (Vec<MonitoredRepo>, bool) {
     match load_versioned::<HubFile>(file, HUB_VERSION) {
-        Stored::Current(hub) => hub.repos,
-        Stored::Newer | Stored::Nothing => Vec::new(),
+        Stored::Current(hub) => (hub.repos, false),
+        Stored::Newer => (Vec::new(), true),
+        Stored::Nothing => (Vec::new(), false),
     }
 }
 

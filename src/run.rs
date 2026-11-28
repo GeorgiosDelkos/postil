@@ -1559,6 +1559,9 @@ impl Runner {
         new: NewRun,
         content: impl FnOnce(&str) -> Result<Content>,
     ) -> Result<()> {
+        if slots.closed {
+            return Err(Error::BadRequest("project is closing".to_owned()));
+        }
         // A worktree still being made counts as a run under way: its agent has not started.
         // Between two review stages the chain has been taken by `advance`, which launches the
         // next one, so the thread is not busy for it.
@@ -1652,9 +1655,10 @@ impl Runner {
                 if new_thread {
                     self.drop_new_thread(&id);
                 }
-                run.record(Entry::Failed {
-                    error: format!("cannot start a thread for the agent: {error}"),
-                });
+                let msg = format!("cannot start a thread for the agent: {error}");
+                run.record(Entry::Failed { error: msg.clone() });
+                let run_id = run.state().header.id.clone();
+                self.fail_pipeline_run(&id, &run_id, msg);
             }
             replaced
         };
@@ -2112,7 +2116,7 @@ impl Runner {
         let first = match (review, drafted, follow_of) {
             (Some(of), _, _) => of,
             (None, Some(of), _) | (None, None, Some(of)) => self.root_run_id(&of)?,
-            (None, None, None) => id,
+            (None, None, None) => self.thread_of_pipeline_run(&id).unwrap_or(id),
         };
         thread::find(&self.repo, &first)
     }
@@ -2274,6 +2278,9 @@ impl Runner {
             }
             state.header.notes.clone()
         };
+        if notes.is_empty() {
+            return;
+        }
         let Ok(left) = notes::ids(&self.repo) else {
             return;
         };
@@ -2553,7 +2560,7 @@ impl Runner {
     pub(crate) fn busy(&self) -> bool {
         // The slots are let go before `pull_work` is taken: the two are never held together.
         let running = self.slots().busy();
-        running || self.opening_pull_request()
+        running || self.opening_pull_request() || self.has_running_pipeline()
     }
 
     /// Stops every agent, running or starting, and ignores anything they would still report:
@@ -2595,6 +2602,7 @@ impl Runner {
             }
             self.end_analysis_thread(&run, &thread);
         }
+        self.stop_all_pipelines();
     }
 
     fn slots(&self) -> MutexGuard<'_, Slots> {
@@ -2634,13 +2642,15 @@ impl Runner {
             let mut pending = pending;
             let generation = pending.generation;
             let id = pending.thread.id.clone();
+            let run_id = pending.run.state().header.id.clone();
             if !runner.ready_for_agent(&mut pending) {
+                runner.fail_pipeline_run(&id, &run_id, "worktree preparation failed".to_owned());
                 return (runner.notify)();
             }
             let failed = |error: &Error| {
-                pending.run.record(Entry::Failed {
-                    error: error_chain(error),
-                });
+                let msg = error_chain(error);
+                pending.run.record(Entry::Failed { error: msg.clone() });
+                runner.fail_pipeline_run(&id, &run_id, msg);
             };
             // Blocks until the login shell has said where programs are, a few seconds at most
             // and only once per app.
@@ -2698,29 +2708,8 @@ impl Runner {
                     slot.agent = Held::None;
                     failed(&error);
                 }
-                Ok(Opened {
-                    agent,
-                    servers_refused,
-                }) => {
-                    // The line goes with the server, whatever the state was when the prompt was
-                    // built: a check may have ended Ready meanwhile, or the agent refused it.
-                    let given = if !servers.is_empty() && servers_refused.is_none() {
-                        TeamMemory::On
-                    } else {
-                        TeamMemory::Off
-                    };
-                    if let Some(refused) = servers_refused {
-                        let notice = format!("team memory was not given: {refused}");
-                        first_memory_notice(&pending.run, notice);
-                    }
-                    let prompt = pending.prompt.for_memory(given);
-                    let root = &pending.thread.path;
-                    begin(&agent, &pending.run, &pending.ids, &prompt, root);
-                    slot.agent = Held::Ready {
-                        choice: pending.agent,
-                        agent,
-                        memory: given,
-                    };
+                Ok(opened) => {
+                    Self::finish_opened_session(slot, pending, opened, !servers.is_empty());
                 }
             }
             drop(slots);
@@ -2738,6 +2727,38 @@ impl Runner {
             .name("agent-start".to_owned())
             .spawn(start)
             .map(drop)
+    }
+
+    /// Starts a newly opened ACP session on `slot`, recording any team-memory refusal notice.
+    fn finish_opened_session(slot: &mut Slot, pending: Pending, opened: Opened, had_servers: bool) {
+        let Opened {
+            agent,
+            servers_refused,
+        } = opened;
+        let given = if had_servers && servers_refused.is_none() {
+            TeamMemory::On
+        } else {
+            TeamMemory::Off
+        };
+        if let Some(refused) = servers_refused {
+            first_memory_notice(
+                &pending.run,
+                format!("team memory was not given: {refused}"),
+            );
+        }
+        let prompt = pending.prompt.for_memory(given);
+        begin(
+            &agent,
+            &pending.run,
+            &pending.ids,
+            &prompt,
+            &pending.thread.path,
+        );
+        slot.agent = Held::Ready {
+            choice: pending.agent,
+            agent,
+            memory: given,
+        };
     }
 
     /// Makes the worktree of `pending`'s new or evicted thread on its start thread, once the

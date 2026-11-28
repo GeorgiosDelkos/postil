@@ -374,7 +374,6 @@ const prReview = prReviewDialog($("pr-review-dialog"), {
     showToast(message);
     void pipelineGate.sync();
   },
-  onError: showToast,
 });
 
 const pipelineGate = planGateView({
@@ -423,9 +422,22 @@ const hub = hubView({
       return;
     }
     sessionStorage.setItem(PENDING_LANE_KEY, JSON.stringify({ repoPath, lanePayload }));
-    await welcome.requestProject("api/open", repoPath);
+    hideHub();
+    const outcome = await welcome.requestProject("api/open", repoPath);
+    if (outcome !== true && outcome !== "conflict") {
+      sessionStorage.removeItem(PENDING_LANE_KEY);
+    }
   },
   onError: showToast,
+});
+
+// Clear stale `hubPickPending` if the engineer cancelled the native folder picker and focus
+// returned to the window without `window.postil.openFolder` firing.
+window.addEventListener("focus", () => {
+  if (!hubPickPending) return;
+  setTimeout(() => {
+    hubPickPending = false;
+  }, 400);
 });
 
 function showHub() {
@@ -433,11 +445,18 @@ function showHub() {
   welcome.hide();
   hub.show();
   $("toggle-hub").setAttribute("aria-pressed", "true");
+  $("toggle-files").setAttribute("aria-pressed", "false");
+  $("toggle-map").setAttribute("aria-pressed", "false");
 }
 
 function hideHub() {
+  hubPickPending = false;
   hub.hide();
   $("toggle-hub").setAttribute("aria-pressed", "false");
+  if (state.projectOpen) {
+    $("toggle-files").setAttribute("aria-pressed", String(filesOpen));
+    $("toggle-map").setAttribute("aria-pressed", String(mapMode.open));
+  }
 }
 
 $("toggle-hub").addEventListener("click", () => {
@@ -805,7 +824,7 @@ let voiceTranscript = "";
 let voiceHandled = false;
 
 function currentVoiceContext() {
-  const projectOpen = state.projectOpen && !welcome.isShown();
+  const projectOpen = state.projectOpen && !welcome.isShown() && !hub.isShown();
   const dialogOpen = Boolean(document.querySelector("dialog[open]"));
   const latestRun = projectOpen ? runs.run() : null;
   const hasSnapshot = Boolean(
@@ -1052,6 +1071,7 @@ function guardDraft(action) {
   // takes the focus last: `welcome.hide` gives it to the code, which would blur the box.
   if (map.hasDraft()) {
     for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
+    hideHub();
     welcome.hide();
     showMap();
     map.holdDraft(action);
@@ -1060,6 +1080,7 @@ function guardDraft(action) {
   if (!state.composer?.text.trim()) return false;
   // The note must be in view to be saved or discarded: a dialog over it would make it inert.
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
+  hideHub();
   welcome.hide();
   const label = state.composer.node.querySelector(".composer-label");
   const draft =
@@ -1214,11 +1235,12 @@ window.postil = {
   openFolder: (path) => {
     menu.close();
     liveQuotas.closePopover();
-    if (hubPickPending || hub.isShown()) {
+    if (hubPickPending) {
       hubPickPending = false;
       void hub.addMonitoredRepo(path);
       return;
     }
+    hideHub();
     welcome.requestProject("api/open", path);
   },
   menu: (command) => {
@@ -1226,9 +1248,13 @@ window.postil = {
     // the right-click menu: it would stay drawn over the welcome screen or the filter.
     menu.close();
     liveQuotas.closePopover();
-    if (command === "open-folder") welcome.chooseFolder();
-    else if (command === "switch-project") welcome.show();
-    else if (command === "go-to-file") goToFile();
+    if (command === "open-folder") {
+      hubPickPending = false;
+      welcome.chooseFolder();
+    } else if (command === "switch-project") {
+      hideHub();
+      welcome.show();
+    } else if (command === "go-to-file") goToFile();
     else if (command === "settings") {
       wizard.close();
       settings.open();
@@ -1282,7 +1308,7 @@ window.postil = {
 // The pill shows only in focus mode, by CSS: no code path can leave it behind. Every way out
 // goes through `leaveFocus`.
 function toggleFocus() {
-  if (welcome.isShown()) return;
+  if (welcome.isShown() || hub.isShown() || !state.projectOpen) return;
   if (inFocus()) {
     leaveFocus();
     return;
@@ -1341,7 +1367,12 @@ function showFiles() {
 }
 
 function toggleFiles() {
-  if (welcome.isShown()) return;
+  if (welcome.isShown() || !state.projectOpen) return;
+  if (hub.isShown()) {
+    hideHub();
+    setFilesOpen(true);
+    return;
+  }
   const hidden = inFocus();
   leaveFocus();
   if (hidden) setFilesOpen(true);
@@ -1356,7 +1387,12 @@ $("toggle-files").addEventListener("click", toggleFiles);
 // switches between the two, and the sidebar's Map button closes it. Focus mode hides the map,
 // so it gives way, and an open map shows again rather than closing unseen.
 function toggleMap() {
-  if (welcome.isShown()) return;
+  if (welcome.isShown() || !state.projectOpen) return;
+  if (hub.isShown()) {
+    hideHub();
+    setMapOpen(true);
+    return;
+  }
   const hidden = inFocus();
   // Out of focus mode onto the map, which is what was asked for, in a narrow window too.
   if (hidden) mapMode.shows = "map";
@@ -1380,7 +1416,12 @@ function setMapOpen(open) {
 }
 
 $("toggle-map").addEventListener("click", () => {
-  if (welcome.isShown()) return;
+  if (welcome.isShown() || !state.projectOpen) return;
+  if (hub.isShown()) {
+    hideHub();
+    setMapOpen(true);
+    return;
+  }
   leaveFocus();
   setMapOpen(!mapMode.open);
 });
@@ -1449,7 +1490,8 @@ async function writeOnAnchor(anchor, intent) {
 
 // Focuses the file filter, as Cmd-P does. Nothing to find on the welcome screen.
 function goToFile() {
-  if (welcome.isShown()) return;
+  if (welcome.isShown() || !state.projectOpen) return;
+  if (hub.isShown()) hideHub();
   // The filter is in the file list, which focus mode or a collapsed drawer hides.
   showFiles();
   filterEl.focus();
@@ -1495,11 +1537,15 @@ const settings = settingsDialog($("settings"), {
   apply: applySettings,
   openWizard: () => wizard.open(),
   quotaBadge: (name) => liveQuotas.inlineBadge(name),
+  onMemoryChanged: () => hub.renderMemory(),
 });
 const wizard = wizardDialog($("wizard"), {
   apply: applySettings,
   onSaved: (view) => settings.sync(view),
-  openFolder: () => welcome.chooseFolder(),
+  openFolder: () => {
+    hubPickPending = false;
+    welcome.chooseFolder();
+  },
   canOpenFolder: () => !state.projectOpen,
   openSettings: () => settings.open(),
   quotaBadge: (name) => liveQuotas.inlineBadge(name),
@@ -1574,6 +1620,8 @@ async function start() {
       const pending = JSON.parse(pendingRaw);
       if (pending?.repoPath === repo.root && pending.lanePayload) {
         await startLaneInCurrentRepo(pending.lanePayload);
+      } else if (pending?.lanePayload) {
+        showToast("Opened a different repository than the pending Hub task; launch cancelled.");
       }
     } catch (error) {
       showToast(String(error.message ?? error));

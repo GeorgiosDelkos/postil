@@ -1,18 +1,19 @@
 // Workspace Pipeline Strip & Interactive Hard Lane Plan Gate.
 //
-// Shows the active Lane pipeline stepper (`Plan ✓ -> Plan Judge ✓ -> [Gate] -> Implement ->
-// Review 1 -> Review 2 -> Final Judge`) inside the workspace and renders the interactive
-// Plan & Plan Judge review surface when Hard Lane pauses for human approval.
+// Shows the active Lane pipeline stepper (`Plan -> Plan Judge -> [Gate] -> Implement ->
+// Review 1 -> Review 2 -> Final Judge`) inside the workspace using Postil's native `statusIcon`,
+// `agentLogoIcon`, `postilCheckbox`, and inline SVG icons, and renders the interactive Plan &
+// Plan Judge review surface when Hard Lane pauses for human approval.
 
-import { el } from "./dom.js";
+import { agentLogoIcon, el, postilCheckbox, statusIcon, uiIcon } from "./dom.js";
 import { laneLabel } from "./hub.js";
 
-const STAGE_ICON = {
-  completed: "✓",
-  running: "●",
-  failed: "×",
-  skipped: "–",
-  pending: "○",
+const STAGE_TO_STATUS_ICON = {
+  completed: "resolved",
+  running: "working",
+  failed: "failed",
+  skipped: "silent",
+  pending: "pending",
 };
 
 export function planGateView({
@@ -26,11 +27,15 @@ export function planGateView({
 }) {
   let pipelines = [];
   let activeId = null;
+  let dismissedIds = new Set();
   let checkedProposals = new Set();
   let extraText = "";
   let feedbackText = "";
   let busy = false;
-  let gateShown = false;
+  let gateCollapsed = false;
+  let lastGateKey = null;
+  let lastRenderedGateSig = null;
+  let syncSeq = 0;
 
   async function fetchJson(route, init) {
     const response = await fetch(route, init);
@@ -39,35 +44,64 @@ export function planGateView({
     return JSON.parse(text);
   }
 
+  function gateKeyFor(pipeline) {
+    if (!pipeline) return null;
+    const judgeRun = pipeline.stages?.find((s) => s.kind === "planJudge")?.runId ?? "";
+    const planRun = pipeline.stages?.find((s) => s.kind === "plan")?.runId ?? "";
+    return `${pipeline.id}:${planRun}:${judgeRun}:${pipeline.status}`;
+  }
+
+  function syncGateState(pipeline) {
+    const key = gateKeyFor(pipeline);
+    if (pipeline?.status === "awaitingGate" && key !== lastGateKey) {
+      lastGateKey = key;
+      checkedProposals = new Set(pipeline.acceptedProposals ?? []);
+      extraText = pipeline.extraInstructions ?? "";
+      feedbackText = "";
+      gateCollapsed = false;
+      lastRenderedGateSig = null;
+    } else if (pipeline?.status !== "awaitingGate") {
+      lastGateKey = key;
+    }
+  }
+
   async function sync() {
+    const seq = ++syncSeq;
     try {
       const list = await fetchJson("api/pipelines");
+      if (seq !== syncSeq) return;
       pipelines = Array.isArray(list) ? list : [];
       const active = current();
-      if (active?.status === "awaitingGate" && active.id !== activeId) {
+      if (active) {
         activeId = active.id;
-        checkedProposals = new Set(active.acceptedProposals ?? []);
-        extraText = active.extraInstructions ?? "";
-        feedbackText = "";
-      } else if (active) {
-        activeId = active.id;
+        syncGateState(active);
       }
       render();
     } catch {
-      // No open project yet: hide silently.
+      if (seq !== syncSeq) return;
       pipelines = [];
       render();
     }
   }
 
+  function visiblePipelines() {
+    return pipelines.filter((p) => {
+      const terminal = p.status === "completed" || p.status === "failed" || p.status === "stopped";
+      return !(terminal && dismissedIds.has(p.id));
+    });
+  }
+
   function current() {
-    if (pipelines.length === 0) return null;
-    return pipelines.find((p) => p.id === activeId) ?? pipelines[0];
+    const visible = visiblePipelines();
+    if (visible.length === 0) return null;
+    return visible.find((p) => p.id === activeId) ?? visible[0];
   }
 
   async function approve(pipeline) {
     if (busy) return;
+    const seq = ++syncSeq;
     busy = true;
+    lastRenderedGateSig = null;
     render();
     try {
       const updated = await fetchJson("api/lane/gate/approve", {
@@ -78,13 +112,16 @@ export function planGateView({
           extraInstructions: extraText.trim() || null,
         }),
       });
+      if (seq !== syncSeq) return;
       replace(updated);
-      gateShown = false;
+      syncGateState(updated);
       onUpdated();
     } catch (error) {
+      if (seq !== syncSeq) return;
       onError(String(error.message ?? error));
     } finally {
       busy = false;
+      lastRenderedGateSig = null;
       render();
     }
   }
@@ -95,7 +132,9 @@ export function planGateView({
       onError("Enter feedback for the Planner before requesting a revision.");
       return;
     }
+    const seq = ++syncSeq;
     busy = true;
+    lastRenderedGateSig = null;
     render();
     try {
       const updated = await fetchJson("api/lane/gate/revise", {
@@ -105,18 +144,25 @@ export function planGateView({
           feedback: feedbackText.trim(),
         }),
       });
+      if (seq !== syncSeq) return;
+      feedbackText = "";
+      extraText = "";
+      checkedProposals.clear();
       replace(updated);
-      gateShown = false;
+      syncGateState(updated);
       onUpdated();
     } catch (error) {
+      if (seq !== syncSeq) return;
       onError(String(error.message ?? error));
     } finally {
       busy = false;
+      lastRenderedGateSig = null;
       render();
     }
   }
 
   function replace(updated) {
+    dismissedIds.delete(updated.id);
     const idx = pipelines.findIndex((p) => p.id === updated.id);
     if (idx >= 0) pipelines[idx] = updated;
     else pipelines.unshift(updated);
@@ -128,32 +174,71 @@ export function planGateView({
     if (!pipeline) {
       stripEl.hidden = true;
       gateEl.hidden = true;
+      lastRenderedGateSig = null;
       return;
     }
     renderStrip(pipeline);
-    const shouldShowGate = pipeline.status === "awaitingGate" || gateShown;
+    const shouldShowGate = pipeline.status === "awaitingGate" && !gateCollapsed;
     gateEl.hidden = !shouldShowGate;
-    if (shouldShowGate) renderGate(pipeline);
+    if (shouldShowGate) {
+      const sig = JSON.stringify({
+        key: gateKeyFor(pipeline),
+        busy,
+        plan: pipeline.plan,
+        planReply: pipeline.planReply,
+        planJudge: pipeline.planJudge,
+      });
+      if (sig !== lastRenderedGateSig) {
+        lastRenderedGateSig = sig;
+        renderGate(pipeline);
+      }
+    } else {
+      lastRenderedGateSig = null;
+    }
   }
 
   function renderStrip(pipeline) {
     stripEl.hidden = false;
+    const visible = visiblePipelines();
     const head = el("div", "pipeline-head");
     const kindWord = pipeline.kind === "pullRequest" ? `PR #${pipeline.number}` : `Issue #${pipeline.number}`;
     head.append(
       el("span", `hub-lane-chip lane-${pipeline.lane}`, `${laneLabel(pipeline.lane)} Lane`),
+      uiIcon(pipeline.kind === "pullRequest" ? "pr" : "issue", "hub-meta-icon"),
       el("span", "pipeline-title", `${kindWord}: ${pipeline.title}`),
       el("span", `pipeline-status status-${pipeline.status}`, statusLabel(pipeline.status)),
     );
+
+    if (visible.length > 1) {
+      const switcher = el("select", "select pipeline-switcher");
+      switcher.setAttribute("aria-label", "Switch active pipeline");
+      for (const each of visible) {
+        const prefix = each.kind === "pullRequest" ? "PR" : "Issue";
+        const opt = el("option", "", `${prefix} #${each.number} (${laneLabel(each.lane)})`);
+        opt.value = each.id;
+        opt.selected = each.id === pipeline.id;
+        switcher.append(opt);
+      }
+      switcher.addEventListener("change", () => {
+        activeId = switcher.value;
+        syncGateState(current());
+        lastRenderedGateSig = null;
+        render();
+      });
+      head.append(switcher);
+    }
 
     const stepper = el("div", "pipeline-stepper");
     for (const stage of pipeline.stages) {
       const pill = el("button", `pipeline-stage stage-${stage.status}`);
       pill.type = "button";
       pill.disabled = !stage.runId;
-      pill.title = `${stage.label} — ${stage.agent}${stage.model ? ` · ${stage.model}` : ""}`;
+      const who = `${stage.agent}${stage.model ? ` · ${stage.model}` : ""}`;
+      pill.title = stage.error
+        ? `${stage.label} — ${who}\nError: ${stage.error}`
+        : `${stage.label} — ${who}`;
       pill.append(
-        el("span", "stage-glyph", STAGE_ICON[stage.status] ?? "○"),
+        statusIcon(STAGE_TO_STATUS_ICON[stage.status] ?? "pending"),
         el("span", "", `${stage.index + 1}. ${stage.label}`),
       );
       if (stage.runId) {
@@ -164,10 +249,15 @@ export function planGateView({
 
     const actions = el("div", "pipeline-actions");
     if (pipeline.status === "awaitingGate") {
-      const btn = el("button", "button primary hub-mini-btn", "Review Plan Gate");
+      const btn = el("button", "button primary hub-mini-btn hub-icon-btn");
       btn.type = "button";
+      btn.append(
+        uiIcon(gateCollapsed ? "chevronRight" : "chevronDown"),
+        el("span", "", gateCollapsed ? "Review Plan Gate" : "Hide Plan Gate"),
+      );
       btn.addEventListener("click", () => {
-        gateShown = !gateShown;
+        gateCollapsed = !gateCollapsed;
+        lastRenderedGateSig = null;
         render();
       });
       actions.append(btn);
@@ -186,8 +276,39 @@ export function planGateView({
       prBtn.addEventListener("click", () => openPrReview(pipeline));
       actions.append(prBtn);
     }
+    const terminal =
+      pipeline.status === "completed" ||
+      pipeline.status === "failed" ||
+      pipeline.status === "stopped";
+    if (terminal) {
+      const dismiss = el("button", "icon-button pipeline-dismiss");
+      dismiss.type = "button";
+      dismiss.append(uiIcon("close"));
+      dismiss.setAttribute("aria-label", "Dismiss pipeline bar");
+      dismiss.title = "Dismiss pipeline bar";
+      dismiss.addEventListener("click", () => {
+        dismissedIds.add(pipeline.id);
+        render();
+      });
+      actions.append(dismiss);
+    }
 
     stripEl.replaceChildren(head, stepper, actions);
+  }
+
+  function renderStageSubhead(prefix, stage, fallbackName) {
+    const row = el("div", "hub-subhead plan-stage-head");
+    row.append(el("span", "", prefix));
+    if (stage) {
+      const who = el("span", "plan-stage-agent");
+      const logo = agentLogoIcon(stage.agent);
+      if (logo) who.append(logo);
+      who.append(el("span", "", `${stage.agent}${stage.model ? ` · ${stage.model}` : ""}`));
+      row.append(who);
+    } else {
+      row.append(el("span", "", fallbackName));
+    }
+    return row;
   }
 
   function renderGate(pipeline) {
@@ -203,10 +324,10 @@ export function planGateView({
     // Left: Planner (Model A)
     const planBox = el("section", "plan-box");
     const plannerStage = pipeline.stages.find((s) => s.kind === "plan");
-    const plannerName = plannerStage
-      ? `${plannerStage.agent}${plannerStage.model ? ` · ${plannerStage.model}` : ""}`
-      : "Planner";
-    planBox.append(el("div", "hub-subhead", `Stage 1 · Architect Plan (${plannerName})`));
+    planBox.append(renderStageSubhead("Stage 1 · Architect Plan", plannerStage, "Planner"));
+    if (plannerStage?.error && !pipeline.plan) {
+      planBox.append(el("div", "hub-roster-error", `Plan parse note: ${plannerStage.error}`));
+    }
     if (pipeline.plan) {
       planBox.append(el("p", "plan-summary", pipeline.plan.summary));
       if (pipeline.plan.approach) {
@@ -228,6 +349,12 @@ export function planGateView({
           el("p", "hub-insp-hint", pipeline.plan.invariants.join(" · ")),
         );
       }
+      if (pipeline.plan.risks?.length) {
+        planBox.append(
+          el("div", "hub-subhead", "Risks"),
+          el("p", "hub-insp-hint", pipeline.plan.risks.join(" · ")),
+        );
+      }
       if (pipeline.plan.tests?.length) {
         planBox.append(
           el("div", "hub-subhead", "Planned Tests"),
@@ -241,10 +368,10 @@ export function planGateView({
     // Right: Plan Judge (Model B)
     const judgeBox = el("section", "plan-box");
     const judgeStage = pipeline.stages.find((s) => s.kind === "planJudge");
-    const judgeName = judgeStage
-      ? `${judgeStage.agent}${judgeStage.model ? ` · ${judgeStage.model}` : ""}`
-      : "Plan Judge";
-    judgeBox.append(el("div", "hub-subhead", `Stage 2 · Plan Judge & Proposals (${judgeName})`));
+    judgeBox.append(renderStageSubhead("Stage 2 · Plan Judge & Proposals", judgeStage, "Plan Judge"));
+    if (judgeStage?.error && !pipeline.planJudge) {
+      judgeBox.append(el("div", "hub-roster-error", `Judge parse note: ${judgeStage.error}`));
+    }
     if (pipeline.planJudge) {
       judgeBox.append(
         el("div", "plan-verdict", `Verdict: ${pipeline.planJudge.verdict.toUpperCase()}`),
@@ -256,12 +383,13 @@ export function planGateView({
         const list = el("div", "proposal-list");
         for (const prop of pipeline.planJudge.proposals) {
           const row = el("label", "proposal-item");
-          const cb = el("input");
-          cb.type = "checkbox";
-          cb.checked = checkedProposals.has(prop.id);
-          cb.addEventListener("change", () => {
-            if (cb.checked) checkedProposals.add(prop.id);
-            else checkedProposals.delete(prop.id);
+          const cb = postilCheckbox({
+            checked: checkedProposals.has(prop.id),
+            ariaLabel: `Include proposal ${prop.id}: ${prop.title}`,
+            onChange: (checked) => {
+              if (checked) checkedProposals.add(prop.id);
+              else checkedProposals.delete(prop.id);
+            },
           });
           const text = el("div", "proposal-text");
           text.append(
@@ -289,6 +417,7 @@ export function planGateView({
     extraBox.rows = 2;
     extraBox.value = extraText;
     extraBox.placeholder = "Any constraints, naming preferences, or scope limits…";
+    extraBox.disabled = busy;
     extraBox.addEventListener("input", () => {
       extraText = extraBox.value;
     });
@@ -300,6 +429,7 @@ export function planGateView({
     revBox.type = "text";
     revBox.value = feedbackText;
     revBox.placeholder = "Describe what the Planner should rethink…";
+    revBox.disabled = busy;
     revBox.addEventListener("input", () => {
       feedbackText = revBox.value;
     });
@@ -312,13 +442,13 @@ export function planGateView({
     reviseBtn.disabled = busy;
     reviseBtn.addEventListener("click", () => void revise(pipeline));
 
-    const approveBtn = el(
-      "button",
-      "button primary",
-      busy ? "Starting Implementer…" : "Approve Plan & Start Implementation →",
-    );
+    const approveBtn = el("button", "button primary hub-icon-btn");
     approveBtn.type = "button";
     approveBtn.disabled = busy;
+    approveBtn.append(
+      el("span", "", busy ? "Starting Implementer…" : "Approve Plan & Start Implementation"),
+      uiIcon("arrowRight"),
+    );
     approveBtn.addEventListener("click", () => void approve(pipeline));
     actions.append(reviseBtn, approveBtn);
 
@@ -330,7 +460,10 @@ export function planGateView({
     sync,
     current,
     select(id) {
+      dismissedIds.delete(id);
       activeId = id;
+      syncGateState(current());
+      lastRenderedGateSig = null;
       render();
     },
   };

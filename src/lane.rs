@@ -13,7 +13,6 @@
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::agents::AgentChoice;
 use crate::error::{Error, Result};
@@ -777,6 +776,20 @@ fn write_task_header(text: &mut String, task: &TaskContext) {
 /// the agent has the full read-only worktree to read any file in full.
 const MAX_PROMPT_DIFF_BYTES: usize = 48 * 1024;
 
+fn backtick_fence(text: &str) -> String {
+    let mut longest = 2usize;
+    let mut run = 0usize;
+    for b in text.bytes() {
+        if b == b'`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat(longest + 1)
+}
+
 fn write_pr_diff(text: &mut String, task: &TaskContext) {
     let Some(diff) = task.diff.as_deref() else {
         return;
@@ -784,12 +797,16 @@ fn write_pr_diff(text: &mut String, task: &TaskContext) {
     if diff.trim().is_empty() {
         return;
     }
-    text.push_str("Pull request diff:\n```diff\n");
-    if diff.len() <= MAX_PROMPT_DIFF_BYTES {
-        text.push_str(diff.trim_end());
+    let slice = if diff.len() <= MAX_PROMPT_DIFF_BYTES {
+        diff.trim_end()
     } else {
         let cut = diff.floor_char_boundary(MAX_PROMPT_DIFF_BYTES);
-        text.push_str(&diff[..cut]);
+        &diff[..cut]
+    };
+    let fence = backtick_fence(slice);
+    writeln!(text, "Pull request diff:\n{fence}diff").expect("writing to String cannot fail");
+    text.push_str(slice);
+    if diff.len() > MAX_PROMPT_DIFF_BYTES {
         writeln!(
             text,
             "\n... (diff truncated from {} bytes; read the files in this worktree for full context)",
@@ -797,136 +814,170 @@ fn write_pr_diff(text: &mut String, task: &TaskContext) {
         )
         .expect("writing to String cannot fail");
     }
-    text.push_str("\n```\n\n");
+    writeln!(text, "\n{fence}\n").expect("writing to String cannot fail");
 }
 
-/// Parses a [`PlanDocument`] from the last ```` ```json ```` block in an agent reply.
+#[derive(Deserialize)]
+struct RawPlanDocument {
+    summary: String,
+    #[serde(default)]
+    approach: String,
+    #[serde(default)]
+    steps: Vec<RawPlanStep>,
+    #[serde(default)]
+    invariants: Vec<String>,
+    #[serde(default)]
+    risks: Vec<String>,
+    #[serde(default)]
+    tests: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPlanStep {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    change: String,
+}
+
+#[derive(Deserialize)]
+struct RawPlanJudge {
+    verdict: String,
+    #[serde(default)]
+    critique: String,
+    #[serde(default)]
+    proposals: Vec<RawPlanProposal>,
+}
+
+#[derive(Deserialize)]
+struct RawPlanProposal {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    priority: Option<String>,
+}
+
+/// Parses a [`PlanDocument`] from the last matching ```` ```json ```` block in an agent reply.
 ///
 /// # Errors
 ///
 /// Returns why the plan block could not be found or parsed.
 pub(crate) fn parse_plan(reply: &str) -> std::result::Result<PlanDocument, String> {
-    let value: Value = crate::review::last_json_block(reply)?;
-    let summary = value
-        .get("summary")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "plan JSON is missing a non-empty summary".to_owned())?
-        .to_owned();
-    let approach = value
-        .get("approach")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    let steps = value
-        .get("steps")
-        .and_then(Value::as_array)
-        .map_or_default(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let change = item.get("change").and_then(Value::as_str)?.trim();
-                    if change.is_empty() {
-                        return None;
-                    }
-                    let path = item
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|p| !p.is_empty())
-                        .map(str::to_owned);
-                    Some(PlanStep {
-                        path,
-                        change: change.to_owned(),
-                    })
-                })
-                .collect()
-        });
-    let string_list = |key: &str| -> Vec<String> {
-        value
-            .get(key)
-            .and_then(Value::as_array)
-            .map_or_default(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
+    let raw: RawPlanDocument = crate::review::last_json_block(reply)?;
+    let summary = raw.summary.trim().to_owned();
+    if summary.is_empty() {
+        return Err("plan JSON is missing a non-empty summary".to_owned());
+    }
+    let clean_list = |items: Vec<String>| -> Vec<String> {
+        items
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
+    let steps = raw
+        .steps
+        .into_iter()
+        .filter_map(|step| {
+            let change = step.change.trim().to_owned();
+            if change.is_empty() {
+                return None;
+            }
+            let path = step
+                .path
+                .map(|p| p.trim().to_owned())
+                .filter(|p| !p.is_empty());
+            Some(PlanStep { path, change })
+        })
+        .collect();
     Ok(PlanDocument {
         summary,
-        approach,
+        approach: raw.approach.trim().to_owned(),
         steps,
-        invariants: string_list("invariants"),
-        risks: string_list("risks"),
-        tests: string_list("tests"),
+        invariants: clean_list(raw.invariants),
+        risks: clean_list(raw.risks),
+        tests: clean_list(raw.tests),
     })
 }
 
-/// Parses a [`PlanJudgeResult`] from the last ```` ```json ```` block in an agent reply.
+/// Parses a [`PlanJudgeResult`] from the last matching ```` ```json ```` block in an agent reply.
 ///
 /// # Errors
 ///
 /// Returns why the judgment block could not be found or parsed.
 pub(crate) fn parse_plan_judge(reply: &str) -> std::result::Result<PlanJudgeResult, String> {
-    let value: Value = crate::review::last_json_block(reply)?;
-    let verdict = value
-        .get("verdict")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| s == "approve" || s == "revise")
-        .unwrap_or_else(|| "revise".to_owned());
-    let critique = value
-        .get("critique")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    let proposals = value
-        .get("proposals")
-        .and_then(Value::as_array)
-        .map_or_default(|arr| {
-            arr.iter()
-                .enumerate()
-                .filter_map(|(idx, item)| {
-                    let title = item.get("title").and_then(Value::as_str)?.trim();
-                    let detail = item
-                        .get("detail")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim();
-                    if title.is_empty() && detail.is_empty() {
-                        return None;
-                    }
-                    let id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map_or_else(|| format!("P{}", idx + 1), str::to_owned);
-                    let priority = item
-                        .get("priority")
-                        .and_then(Value::as_str)
-                        .map(|s| s.trim().to_ascii_lowercase())
-                        .filter(|s| matches!(s.as_str(), "must" | "should" | "optional"))
-                        .unwrap_or_else(default_priority);
-                    Some(PlanProposal {
-                        id,
-                        title: title.to_owned(),
-                        detail: detail.to_owned(),
-                        priority,
-                    })
-                })
-                .collect()
-        });
+    let raw: RawPlanJudge = crate::review::last_json_block(reply)?;
+    let verdict = raw.verdict.trim().to_ascii_lowercase();
+    if verdict != "approve" && verdict != "revise" {
+        return Err(format!(
+            "plan judge verdict {verdict:?} must be \"approve\" or \"revise\""
+        ));
+    }
+    let proposals = raw
+        .proposals
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let title = item.title.trim().to_owned();
+            let detail = item.detail.trim().to_owned();
+            if title.is_empty() && detail.is_empty() {
+                return None;
+            }
+            let id = item
+                .id
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("P{}", idx + 1));
+            let priority = item
+                .priority
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| matches!(s.as_str(), "must" | "should" | "optional"))
+                .unwrap_or_else(default_priority);
+            Some(PlanProposal {
+                id,
+                title,
+                detail,
+                priority,
+            })
+        })
+        .collect();
     Ok(PlanJudgeResult {
         verdict,
-        critique,
+        critique: raw.critique.trim().to_owned(),
         proposals,
     })
+}
+
+/// Parses per-finding verdicts (`F1: accepted ...` / `F2: rejected ...`) emitted by a PR
+/// Synthesis Judge. Returns a map of uppercase finding id -> `accepted`.
+pub(crate) fn parse_pr_verdicts(reply: &str) -> std::collections::HashMap<String, bool> {
+    let mut verdicts = std::collections::HashMap::new();
+    for line in reply.lines() {
+        let trimmed = line
+            .trim()
+            .trim_start_matches(['-', '*', '•'])
+            .trim()
+            .trim_start_matches("**")
+            .trim();
+        let Some((left, right)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let id = left.trim().trim_matches('*').trim().to_ascii_uppercase();
+        if !id.starts_with('F') || id.len() < 2 || !id[1..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let rest = right.trim().trim_matches('*').to_ascii_lowercase();
+        if rest.starts_with("accepted") {
+            verdicts.insert(id, true);
+        } else if rest.starts_with("rejected") {
+            verdicts.insert(id, false);
+        }
+    }
+    verdicts
 }
 
 #[cfg(test)]
@@ -1013,6 +1064,24 @@ mod tests {
         assert_eq!(judged.verdict, "revise");
         assert_eq!(judged.proposals.len(), 1);
         assert_eq!(judged.proposals[0].id, "P1");
+
+        // Trailing non-plan JSON must not shadow an earlier valid plan block.
+        let with_trailing = format!("{plan_reply}\nNote: ```json\n{{\"unrelated\": true}}\n```");
+        assert_eq!(
+            parse_plan(&with_trailing).unwrap().summary,
+            "Fix lock order"
+        );
+
+        // Invalid verdict JSON must fail rather than silently defaulting to revise.
+        assert!(parse_plan_judge("```json\n{\"unrelated\": 42}\n```").is_err());
+
+        // PR synthesis verdict parser & dynamic diff backtick fence.
+        let verdicts =
+            parse_pr_verdicts("- **F1**: accepted — real bug\n- F2: rejected — false positive\n");
+        assert_eq!(verdicts.get("F1"), Some(&true));
+        assert_eq!(verdicts.get("F2"), Some(&false));
+        assert_eq!(backtick_fence("normal diff"), "```");
+        assert_eq!(backtick_fence("contains ``` fence"), "````");
     }
 
     #[test]

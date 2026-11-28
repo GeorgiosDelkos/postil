@@ -1882,7 +1882,10 @@ impl Site {
             },
             "/api/hub/sync" => match *method {
                 Method::POST => {
-                    self.hub.sync_all();
+                    let settings = self.current_settings();
+                    let use_memory =
+                        settings.lanes().auto_triage && settings.team_memory() == TeamMemory::On;
+                    self.hub.sync_all(use_memory);
                     reply(
                         StatusCode::OK,
                         "application/json",
@@ -1908,7 +1911,10 @@ impl Site {
                     .as_deref()
                     .filter(|p| !p.trim().is_empty())
                     .ok_or_else(|| Error::BadRequest("expected path to monitor".to_owned()))?;
-                self.hub.add_repo(Path::new(path))?;
+                let settings = self.current_settings();
+                let use_memory =
+                    settings.lanes().auto_triage && settings.team_memory() == TeamMemory::On;
+                self.hub.add_repo(Path::new(path), use_memory)?;
             }
             "remove" => {
                 let path = request
@@ -1940,9 +1946,11 @@ impl Site {
 
     fn hub_evaluate(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request: HubEvaluateRequest = parse_body(body, Error::BadRequest)?;
-        let item = self
-            .hub
-            .evaluate_item(&request.repo, request.kind, request.number)?;
+        let settings = self.current_settings();
+        let use_memory = settings.team_memory() == TeamMemory::On;
+        let item =
+            self.hub
+                .evaluate_item(&request.repo, request.kind, request.number, use_memory)?;
         Ok(to_json(&item))
     }
 
@@ -2013,6 +2021,8 @@ impl Site {
 
     fn start_lane(&self, body: &[u8]) -> Result<Vec<u8>> {
         let mut request: StartPipelineRequest = parse_body(body, Error::BadRequest)?;
+        let settings = self.current_settings();
+        let use_memory = settings.team_memory() == TeamMemory::On;
         // Hydrate body/labels/memories from Hub cache when the caller passes only minimal fields.
         if request.body.is_empty()
             && let Ok(repo) = self.repo()
@@ -2027,7 +2037,7 @@ impl Site {
             if request.labels.is_empty() {
                 request.labels = cached.labels;
             }
-            if request.memories.is_empty() {
+            if use_memory && request.memories.is_empty() {
                 request.memories = cached.memories;
             }
             if request.base_branch.is_none() {
@@ -2037,7 +2047,9 @@ impl Site {
                 request.head_branch = cached.head_ref;
             }
         }
-        let settings = self.current_settings();
+        if !use_memory {
+            request.memories.clear();
+        }
         let pipeline = self.runner()?.start_pipeline(request, &settings)?;
         Ok(to_json(&pipeline))
     }

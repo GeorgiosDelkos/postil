@@ -6,7 +6,7 @@
 // costs nothing noticeable, and one drawing function is easier to keep right than updates by
 // hand. The control that had the focus gets it back by its `data-key`.
 
-import { agentLogoIcon, el } from "./dom.js";
+import { agentLogoIcon, el, uiIcon } from "./dom.js";
 import { memoryBackendSummary } from "./hub.js";
 import {
   SCAN_POLL_MS,
@@ -55,7 +55,7 @@ import {
 // `apply` is called with the settings in effect whenever they change (and once on opening),
 // so the page can follow them. `openWizard` opens the startup wizard. Closing gives the focus
 // back to where it was when the dialog opened, as `<dialog>` does: a note being written keeps it.
-export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
+export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge, onMemoryChanged }) {
   // The menu of agents that "+ Add reviewer" opens.
   const agentMenu = dialogMenu(dialogEl);
   const ui = {
@@ -106,18 +106,23 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
   function show(view) {
     const ahead = ui.pending > 0 && ui.view !== null;
     const scanning = view.agents === null;
+    const prevSettingsJson = ui.view ? JSON.stringify(ui.view.settings) : null;
+    const prevMemoryJson = ui.view ? JSON.stringify(ui.view.memory) : null;
     const next = {
       ...view,
       settings: ahead ? ui.view.settings : view.settings,
       agents: scanning ? (ui.view?.agents ?? null) : view.agents,
     };
     const unchanged = scanning === ui.scanning && JSON.stringify(next) === JSON.stringify(ui.view);
+    const settingsChanged = !ahead && JSON.stringify(view.settings) !== prevSettingsJson;
+    const memoryChanged = JSON.stringify(next.memory) !== prevMemoryJson;
     ui.view = next;
     ui.scanning = scanning;
-    if (!ahead) apply(view.settings);
+    if (settingsChanged) apply(view.settings);
+    if (memoryChanged) onMemoryChanged?.(next.memory);
     if (dialogEl.open && !view.problem) models.request(ui.view.settings);
     clearTimeout(ui.pollTimer);
-    if ((scanning || view.memory.pending) && dialogEl.open) {
+    if ((scanning || view.memory.pending) && (dialogEl.open || view.memory.pending)) {
       ui.pollTimer = setTimeout(() => refresh().catch(fail), SCAN_POLL_MS);
     }
     if (!unchanged && dialogEl.open) render();
@@ -495,6 +500,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
       const list = el("ol", "reviewer-list");
       slots.forEach((slot, index) => {
         const agent = el("span", "slot-agent");
+        agent.title = slot.name;
         const logo = agentLogoIcon(slot.name);
         if (logo) agent.append(logo);
         agent.append(el("span", "slot-agent-name", slot.name));
@@ -506,18 +512,24 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
           { disabled: locked() },
         );
         const remove = controlButton(
-          "×",
+          "",
           `tier-${tierKey}-remove-${index}`,
           () => save(removeTierSlot(ui.view.settings, tierKey, index)),
           "icon-button",
         );
+        remove.append(uiIcon("close"));
+        remove.setAttribute("aria-label", `Remove ${slot.name} from ${label}`);
+        remove.title = `Remove ${slot.name} from ${label}`;
         remove.disabled = locked();
         remove.tabIndex = 0;
+        const actions = el("div", "slot-actions");
+        actions.append(remove);
         const row = el("li", "slot-row");
-        row.append(el("span", "slot-lead", `${index + 1}.`), agent, model, remove);
+        row.append(el("span", "slot-lead", `${index + 1}.`), agent, model, actions);
         list.append(row);
       });
-      const add = controlButton("", `tier-${tierKey}-add`, () => {
+      const addKey = `tier-${tierKey}-add`;
+      const add = controlButton("", addKey, () => {
         const { left, bottom } = add.getBoundingClientRect();
         const actions = enabled.map((name) => ({
           label: name,
@@ -525,10 +537,12 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
           badge: quotaBadge?.(name) ?? null,
           run: () => save(addTierSlot(ui.view.settings, tierKey, name)),
         }));
-        agentMenu.open(left, bottom + 4, actions);
+        agentMenu.open(left, bottom + 4, actions, addKey);
       });
       add.className = "slot-add";
       add.tabIndex = 0;
+      add.setAttribute("aria-haspopup", "menu");
+      add.setAttribute("aria-label", `Add to ${label}`);
       add.append(el("span", "slot-lead", "+"), el("span", "", `Add to ${label}`));
       add.disabled = locked() || enabled.length === 0;
       const addRow = el("div", "slot-row");
@@ -597,9 +611,13 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     const backend = memoryBackendSummary(memory);
     const row = el("div", `agent-row ${shown.kind}`);
     const text = el("div", "agent-text");
+    const statusText =
+      state?.kind === "ready" && backend.storage !== "unknown"
+        ? `${shown.label} · ${backend.detail}`
+        : shown.label;
     text.append(
       el("span", "agent-name", "hippius-mem"),
-      el("span", "agent-usage", `${shown.label} · ${backend.detail}`),
+      el("span", "agent-usage", statusText),
     );
     if (state?.path) {
       text.append(el("span", "agent-command", state.path));
@@ -717,15 +735,23 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
 
   function memoryBackendForm(form) {
     const node = el("form", "agent-form");
+    node.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      ui.memoryForm = null;
+      render();
+    });
     const makeField = (label, key, value, placeholder, type = "text") => {
       const wrap = el("label", "agent-field");
       const input = el("input", "field");
       input.type = type;
       input.value = value;
       input.placeholder = placeholder;
-      input.dataset.key = key;
+      input.dataset.key = `memory-${key}`;
       input.autocomplete = "off";
       input.spellcheck = false;
+      input.disabled = Boolean(form.submitting);
       input.addEventListener("input", () => {
         form[key] = input.value;
       });
@@ -751,47 +777,66 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
       const area = el("textarea", "field");
       area.rows = 3;
       area.value = form.bundle;
+      area.dataset.key = "memory-join-bundle";
       area.placeholder = "Paste founder's hippius-mem invite bundle…";
+      area.disabled = Boolean(form.submitting);
       area.addEventListener("input", () => {
         form.bundle = area.value;
       });
       wrap.append(el("span", "settings-hint", "Invite bundle (`hippius-mem join --bundle -`)"), area);
       node.append(wrap);
     }
+    if (form.error) {
+      node.append(el("div", "form-error", form.error));
+    }
     const actions = el("div", "settings-actions");
-    const submit = el("button", "button primary", form.kind === "s3" ? "Upgrade to S3" : "Join Vault");
-    submit.type = "submit";
-    actions.append(
-      controlButton("Cancel", "memory-form-cancel", () => {
-        ui.memoryForm = null;
-        render();
-      }),
-      submit,
+    const submit = el(
+      "button",
+      "button primary",
+      form.submitting
+        ? "Working…"
+        : form.kind === "s3"
+          ? "Upgrade to S3"
+          : "Join Vault",
     );
+    submit.type = "submit";
+    submit.disabled = Boolean(form.submitting);
+    const cancel = controlButton("Cancel", "memory-form-cancel", () => {
+      ui.memoryForm = null;
+      render();
+    });
+    cancel.disabled = Boolean(form.submitting);
+    actions.append(cancel, submit);
     node.append(actions);
     node.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (form.submitting) return;
       const route = form.kind === "s3" ? "api/memory/upgrade" : "api/memory/join";
       const payload =
         form.kind === "s3"
           ? {
-              bucket: form.bucket,
-              accessKeyId: form.accessKeyId,
+              bucket: form.bucket.trim(),
+              accessKeyId: form.accessKeyId.trim(),
               secretAccessKey: form.secretAccessKey,
-              endpoint: form.endpoint || null,
-              team: form.team || null,
+              endpoint: form.endpoint.trim() || null,
+              team: form.team.trim() || null,
             }
           : { bundle: form.bundle };
-      ui.memoryForm = null;
+      form.submitting = true;
+      form.error = null;
+      render();
       try {
         const view = await fetchSettingsJson(route, {
           method: "POST",
           body: JSON.stringify(payload),
         });
+        ui.memoryForm = null;
         ui.settingUp = true;
         show(view);
       } catch (error) {
-        fail(error);
+        form.submitting = false;
+        form.error = String(error.message ?? error);
+        render();
       }
     });
     return node;
@@ -829,6 +874,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge }) {
     clearTimeout(ui.pollTimer);
     models.reset();
     ui.form = null;
+    ui.memoryForm = null;
     ui.confirmReset = false;
   });
   // A click on the backdrop lands on the dialog element itself, outside its panel.

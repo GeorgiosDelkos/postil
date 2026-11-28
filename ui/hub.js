@@ -69,24 +69,34 @@ export function laneLabel(lane) {
 
 // Summarizes hippius-mem storage backend status for the Hub sidebar and Settings.
 export function memoryBackendSummary(memoryView) {
-  if (!memoryView) return { kind: "unchecked", title: "hippius-mem", detail: "Checking…" };
+  if (!memoryView) {
+    return { kind: "unchecked", storage: "unknown", title: "hippius-mem", detail: "Checking…" };
+  }
   const state = memoryView.state;
   const backend = memoryView.backend;
-  if (state === null) return { kind: "unchecked", title: "hippius-mem", detail: "Checking…" };
+  if (state === null) {
+    return { kind: "unchecked", storage: "unknown", title: "hippius-mem", detail: "Checking…" };
+  }
   if (state.kind === "missing") {
-    return { kind: "absent", title: "hippius-mem", detail: "Not installed on PATH" };
+    return { kind: "absent", storage: "unknown", title: "hippius-mem", detail: "Not installed on PATH" };
   }
   if (state.kind === "unconfigured") {
-    return { kind: "unchecked", title: "hippius-mem", detail: "Not configured yet" };
+    const failed = Boolean(state.problem);
+    return {
+      kind: failed ? "missing" : "unchecked",
+      storage: "unknown",
+      title: "hippius-mem",
+      detail: failed ? "Doctor check failed" : "Not configured yet",
+    };
   }
   if (backend?.kind === "s3") {
     const where = backend.bucket ? `Remote S3 · ${backend.bucket}` : "Remote S3 (paid)";
-    return { kind: "installed", title: "hippius-mem", detail: where };
+    return { kind: "installed", storage: "s3", title: "hippius-mem", detail: where };
   }
   if (backend?.kind === "local") {
-    return { kind: "installed", title: "hippius-mem", detail: "Local trial vault" };
+    return { kind: "installed", storage: "local", title: "hippius-mem", detail: "Local trial vault" };
   }
-  return { kind: "installed", title: "hippius-mem", detail: "Ready" };
+  return { kind: "installed", storage: "unknown", title: "hippius-mem", detail: "Ready" };
 }
 
 // Formats a Unix timestamp (seconds) or ISO date string as a compact relative age.

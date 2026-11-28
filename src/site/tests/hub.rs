@@ -162,8 +162,12 @@ fn hard_lane_issue_pauses_at_plan_gate_and_completes_after_approval() {
     let finished = wait_for_pipeline_status(&site, &nudges, &pipeline_id, "completed");
     let stages = finished["stages"].as_array().unwrap();
     assert_eq!(stages.len(), 6);
-    for stage in stages {
-        assert_eq!(stage["status"], "completed", "stage not completed: {stage}");
+    for (idx, stage) in stages.iter().enumerate() {
+        let expected = if idx == 5 { "skipped" } else { "completed" };
+        assert_eq!(
+            stage["status"], expected,
+            "stage {idx} unexpected status: {stage}"
+        );
     }
     assert!(
         repo.root.join(".git/postil/pipelines.json").is_file(),

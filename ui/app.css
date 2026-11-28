@@ -1171,7 +1171,8 @@ body.welcome-mode {
 
 body.welcome-mode > .titlebar,
 body.welcome-mode > .left-rail,
-body.welcome-mode > .pane {
+body.welcome-mode > .pane,
+body.welcome-mode > .hub {
   display: none;
 }
 
@@ -1375,7 +1376,7 @@ button.repo-name:hover {
 
 .toast {
   position: fixed;
-  z-index: 20;
+  z-index: 40;
   left: 50%;
   bottom: 20px;
   max-width: min(560px, 100% - 48px);
@@ -2576,9 +2577,18 @@ body.keyboard-input .slot-add:focus-visible {
   flex-direction: column;
 }
 
+.code-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .prompt-preview {
   position: absolute;
-  inset: 40px 0 0;
+  inset: 0;
   z-index: 2;
   overflow: auto;
   padding: 22px 28px;
@@ -3823,7 +3833,7 @@ body.resizing * {
 /* The changes view: what runs changed, over the open file (ui/changes-view.js). */
 .changes-view {
   position: absolute;
-  inset: 40px 0 0;
+  inset: 0;
   z-index: 2;
   overflow: auto;
   padding: 16px 20px 28px;
@@ -5907,6 +5917,99 @@ body.keyboard-input .map-node:focus .map-node-box {
 
 /* ---- Agentic Developer Hub, Lane Pipelines, Plan Gate & PR Review ------------------------ */
 
+/* Native Postil inline stroke icons & styled checkboxes shared across Hub, Plan Gate,
+   PR Review, and Settings. */
+.ui-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ui-icon.spinning {
+  animation: spin 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-icon.spinning {
+    animation: none;
+  }
+}
+
+.icon-button .ui-icon {
+  display: block;
+  margin: auto;
+}
+
+.hub-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.hub-meta-icon {
+  width: 12px;
+  height: 12px;
+  color: var(--text-muted);
+}
+
+.hub-diverse-icon {
+  width: 12px;
+  height: 12px;
+  color: var(--accent);
+}
+
+/* Custom Postil checkbox: crisp rounded square with an SVG checkmark mask, consistent across
+   Graphite and Paper themes. */
+.postil-check {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  border-radius: 4px;
+  border: 1.5px solid var(--border-strong);
+  background: var(--canvas);
+  cursor: pointer;
+  transition: background-color 100ms ease, border-color 100ms ease;
+}
+
+.postil-check:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.postil-check:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.postil-check:checked::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--canvas);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M4.6 9.6 1.8 6.8l1.1-1.1 1.7 1.7 4.5-4.5 1.1 1.1z'/%3E%3C/svg%3E")
+    center / 11px 11px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M4.6 9.6 1.8 6.8l1.1-1.1 1.7 1.7 4.5-4.5 1.1 1.1z'/%3E%3C/svg%3E")
+    center / 11px 11px no-repeat;
+}
+
+.postil-check:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.postil-check:disabled {
+  opacity: var(--disabled-opacity);
+  cursor: default;
+}
+
 .hub {
   position: fixed;
   inset: 38px 8px 8px var(--rail-width, 48px);
@@ -5918,10 +6021,16 @@ body.keyboard-input .map-node:focus .map-node-box {
 
 .hub-shell {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 370px;
+  grid-template-columns: minmax(210px, 250px) minmax(260px, 1fr) minmax(300px, 370px);
   gap: 8px;
   height: 100%;
   min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .hub-shell {
+    grid-template-columns: minmax(180px, 210px) minmax(200px, 1fr) minmax(250px, 310px);
+  }
 }
 
 .hub-repos,
@@ -6014,9 +6123,16 @@ body.keyboard-input .map-node:focus .map-node-box {
 }
 
 .hub-repo-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-size: 11.5px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .hub-repo-error {
@@ -6067,6 +6183,14 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-recent-btn:hover {
   background: var(--hover);
   border-color: var(--border-strong);
+}
+
+.hub-recent-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 500;
+  color: var(--text-strong);
 }
 
 .hub-recent-sub {
@@ -6137,28 +6261,18 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-queue-header {
   justify-content: space-between;
   gap: 8px;
+  flex-wrap: wrap;
+  min-height: 36px;
+  height: auto;
+  padding-top: 4px;
+  padding-bottom: 4px;
 }
 
-.hub-filter-tabs {
-  display: flex;
-  gap: 4px;
-}
-
-.hub-filter-tab {
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  padding: 3px 8px;
-  font: inherit;
-  font-size: 12px;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-
-.hub-filter-tab.active {
-  background: var(--card);
-  border-color: var(--border-strong);
-  color: var(--text-strong);
+.hub-kind-tabs .segment {
+  min-width: 0;
+  height: 22px;
+  padding: 0 9px;
+  font-size: 11.5px;
 }
 
 .hub-queue-controls {
@@ -6273,6 +6387,9 @@ body.keyboard-input .map-node:focus .map-node-box {
 
 .hub-repo-pill,
 .hub-kind-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-muted);
@@ -6307,17 +6424,20 @@ body.keyboard-input .map-node:focus .map-node-box {
   font-weight: 600;
   color: var(--text-strong);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .hub-card-reason {
   font-size: 12px;
   color: var(--text-soft);
+  overflow-wrap: anywhere;
 }
 
 .hub-card-foot {
   font-size: 11px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .hub-subhead {
@@ -6330,6 +6450,9 @@ body.keyboard-input .map-node:focus .map-node-box {
 }
 
 .hub-insp-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--text-muted);
@@ -6339,6 +6462,7 @@ body.keyboard-input .map-node:focus .map-node-box {
   margin: 0;
   font-size: 15px;
   color: var(--text-strong);
+  overflow-wrap: anywhere;
 }
 
 .hub-insp-section {
@@ -6347,18 +6471,21 @@ body.keyboard-input .map-node:focus .map-node-box {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  min-width: 0;
 }
 
 .hub-insp-text {
   margin: 0;
   font-size: 12.5px;
   color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .hub-insp-hint {
   margin: 0;
   font-size: 11.5px;
   color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .hub-insp-desc {
@@ -6480,6 +6607,10 @@ body.keyboard-input .map-node:focus .map-node-box {
 
 .hub-stage-model {
   grid-column: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -6488,15 +6619,21 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-roster-error {
   font-size: 12px;
   color: var(--attention);
+  overflow-wrap: anywhere;
 }
 
 .hub-gate-toggle {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 10px;
   font-size: 12px;
   color: var(--text-soft);
-  padding-top: 4px;
+  padding-top: 6px;
+}
+
+.hub-gate-label {
+  min-width: 0;
 }
 
 .hub-insp-foot {
@@ -6696,16 +6833,46 @@ body.keyboard-input .map-node:focus .map-node-box {
   cursor: pointer;
 }
 
+.pipeline-switcher {
+  font-size: 11.5px;
+  padding: 2px 6px;
+  max-width: 170px;
+}
+
+.pipeline-dismiss {
+  flex: none;
+}
+
+.plan-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.plan-stage-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: var(--font-mono);
+  color: var(--text-soft);
+}
+
 .proposal-text {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
 }
 
 .proposal-title {
   font-weight: 600;
   font-size: 12px;
   color: var(--text-strong);
+  overflow-wrap: anywhere;
 }
 
 .plan-gate-inputs {
@@ -6742,4 +6909,16 @@ body.keyboard-input .map-node:focus .map-node-box {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.pr-review-footer {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pr-review-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
 }

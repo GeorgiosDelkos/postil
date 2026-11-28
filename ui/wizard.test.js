@@ -249,3 +249,27 @@ test("wizardSummary and readinessItems describe the chosen settings and tools", 
     ],
   );
 });
+
+test("toggleWizardAgent and removeWizardCustomAgent clear modelTiers references", () => {
+  const custom = { name: "MyBot", command: "my-bot --acp" };
+  const draft = {
+    ...defaults(),
+    customAgents: [custom],
+    enabledAgents: ["Claude", "MyBot"],
+    agent: slot("Claude"),
+    modelTiers: {
+      fast: [slot("MyBot", "fast-1")],
+      standard: [slot("Claude"), slot("MyBot")],
+      frontier: [slot("MyBot", "big-1")],
+    },
+  };
+  const disabled = toggleWizardAgent(draft, "MyBot", false);
+  assert.deepEqual(disabled.modelTiers.fast, []);
+  assert.deepEqual(disabled.modelTiers.standard, [slot("Claude")]);
+  assert.deepEqual(disabled.modelTiers.frontier, []);
+
+  const removed = removeWizardCustomAgent(draft, "MyBot");
+  assert.ok(removed, "removeWizardCustomAgent returns updated settings");
+  assert.deepEqual(removed.customAgents, []);
+  assert.deepEqual(removed.modelTiers.frontier, []);
+});

@@ -351,12 +351,23 @@ struct Inner {
 }
 
 /// The kinds of setup/check job.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Job {
     Check,
     Setup,
     UpgradeS3(UpgradeS3Request),
     JoinBundle(String),
+}
+
+impl std::fmt::Debug for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Check => f.write_str("Job::Check"),
+            Self::Setup => f.write_str("Job::Setup"),
+            Self::UpgradeS3(req) => f.debug_tuple("Job::UpgradeS3").field(req).finish(),
+            Self::JoinBundle(_) => f.write_str("Job::JoinBundle(<redacted>)"),
+        }
+    }
 }
 
 impl Memory {
@@ -384,7 +395,8 @@ impl Memory {
     /// launch that never asks runs no `doctor`. Looks at the disk once when the state names
     /// the program: a program removed since its check is [`State::Missing`] at once.
     pub(crate) fn status(&self) -> Status {
-        let (path_to_check, status) = {
+        let backend = self.detect_backend();
+        let (path_to_check, state, setup) = {
             let mut inner = self.lock();
             if inner.job == 0 {
                 // A thread that cannot start leaves the job number at 0, so the next call tries
@@ -396,12 +408,7 @@ impl Memory {
                 .as_ref()
                 .and_then(State::path)
                 .map(Path::to_owned);
-            let status = Status {
-                state: inner.state.clone(),
-                setup: inner.setup.clone(),
-                backend: self.detect_backend(),
-            };
-            (path, status)
+            (path, inner.state.clone(), inner.setup.clone())
         };
         if let Some(path) = path_to_check
             && !agents::is_executable(&path)
@@ -413,10 +420,14 @@ impl Memory {
             return Status {
                 state: inner.state.clone(),
                 setup: inner.setup.clone(),
-                backend: self.detect_backend(),
+                backend,
             };
         }
-        status
+        Status {
+            state,
+            setup,
+            backend,
+        }
     }
 
     /// Starts a new check: finds the program and runs `doctor`. The state is unknown until it
@@ -457,14 +468,25 @@ impl Memory {
     /// [`Error::BadRequest`] when required fields are blank; [`Error::MemorySetupRunning`] while
     /// another setup runs; [`Error::StartMemory`] when the thread cannot start.
     pub(crate) fn upgrade_s3(&self, request: UpgradeS3Request) -> Result<()> {
-        if request.bucket.trim().is_empty()
-            || request.access_key_id.trim().is_empty()
-            || request.secret_access_key.trim().is_empty()
-        {
+        validate_cli_arg("bucket", &request.bucket, true)?;
+        validate_cli_arg("access key ID", &request.access_key_id, true)?;
+        let secret = request.secret_access_key.trim();
+        if secret.is_empty() {
             return Err(Error::BadRequest(
                 "bucket, access key ID, and secret access key are required to upgrade to remote S3"
                     .to_owned(),
             ));
+        }
+        if secret.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
+            return Err(Error::BadRequest(
+                "secret access key must not contain newlines or control characters".to_owned(),
+            ));
+        }
+        if let Some(endpoint) = request.endpoint.as_deref() {
+            validate_cli_arg("endpoint", endpoint, false)?;
+        }
+        if let Some(team) = request.team.as_deref() {
+            validate_cli_arg("team", team, false)?;
         }
         let mut inner = self.lock();
         if inner.setup == Some(Setup::Running) {
@@ -1031,29 +1053,40 @@ impl Memory {
     /// Recalls strong team memories for an explicit repository name (e.g. during Hub priority
     /// triage or pre-flight evaluation, even when no workspace project is open). Uses
     /// `hippius-mem recall` via the same configured `HIPPIUS_MEM_CONFIG`, bounded to `CALL_TIMEOUT`.
-    /// Returns an empty list if hippius-mem is not Ready or returns no strong pointers.
-    pub(crate) fn recall_for_hub_repo(
-        &self,
-        repo_dir: &Path,
-        repo_name: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Vec<HubMemoryHit> {
-        let Some(State::Ready { path }) = self.status().state else {
+    /// When `req.wait_for_check` is true (background Hub sync threads), waits for the initial
+    /// `doctor` check rather than returning empty on cold start.
+    pub(crate) fn recall_for_hub_repo(&self, req: &HubRecallRequest<'_>) -> Vec<HubMemoryHit> {
+        let state = if req.wait_for_check {
+            self.checked_state()
+        } else {
+            self.status().state
+        };
+        let Some(State::Ready { path }) = state else {
             return Vec::new();
         };
         let search_path = self.agents.wait();
         let at = Place {
             search_path: &search_path,
-            dir: repo_dir,
+            dir: req.repo_dir,
         };
-        let cut_query = cut(query.to_owned());
-        let k_str = limit.clamp(1, 10).to_string();
-        let mut args: Vec<&str> = vec!["recall", &cut_query, "--k", &k_str];
-        if let Some(repo) = repo_name {
+        let cut_query = cut(req.query.to_owned());
+        if cut_query.trim().is_empty() {
+            return Vec::new();
+        }
+        let k_str = req.limit.clamp(1, 10).to_string();
+        let mut args: Vec<&str> = vec!["recall", "--k", &k_str];
+        let safe_repo = req
+            .repo_name
+            .map(str::trim)
+            .filter(|r| !r.is_empty() && !r.starts_with('-') && !r.chars().any(char::is_control));
+        if let Some(repo) = safe_repo {
             args.push("--repo");
             args.push(repo);
         }
+        // End-of-options separator so untrusted external GitHub issue/PR titles beginning with
+        // `-` are never parsed as CLI flags by `hippius-mem`.
+        args.push("--");
+        args.push(&cut_query);
         let Ok(command) = self.command(&path, &at, &args) else {
             return Vec::new();
         };
@@ -2391,6 +2424,16 @@ enum Outcome {
 /// is killed ([`agents::kill_group`]) before the program is reaped, so its pid, and with it
 /// the group id, cannot have been reused, and nothing it left running stays. A program that
 /// exited is a zombie by then, which the kill does not change, so its exit code is kept.
+/// Request parameters for [`Memory::recall_for_hub_repo`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HubRecallRequest<'a> {
+    pub(crate) repo_dir: &'a Path,
+    pub(crate) repo_name: Option<&'a str>,
+    pub(crate) query: &'a str,
+    pub(crate) limit: usize,
+    pub(crate) wait_for_check: bool,
+}
+
 /// A lightweight team memory hit surfaced on Hub cards and task evaluations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2401,13 +2444,75 @@ pub(crate) struct HubMemoryHit {
     pub(crate) kind: Option<String>,
 }
 
-/// Parses non-secret storage metadata (`storage`, `bucket`, `endpoint`) from `hippius-mem.toml`.
+/// Validates a CLI option value passed to `hippius-mem upgrade`: rejects leading `-` (flag
+/// injection) and control/newline characters.
+fn validate_cli_arg(label: &str, raw: &str, required: bool) -> Result<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        if required {
+            return Err(Error::BadRequest(format!(
+                "{label} is required to upgrade to remote S3"
+            )));
+        }
+        return Ok(());
+    }
+    if trimmed.starts_with('-') {
+        return Err(Error::BadRequest(format!(
+            "{label} must not start with '-'"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(Error::BadRequest(format!(
+            "{label} must not contain newlines or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Strips TOML `#` comments outside single- and double-quoted strings.
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_double && !in_single => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Parses non-secret storage metadata (`storage`, `bucket`, `endpoint`) from `hippius-mem.toml`,
+/// ignoring unrelated TOML tables such as `[embedding]` or inactive `[profiles.*]`.
 fn parse_backend_toml(text: &str, config_path: Option<String>) -> BackendInfo {
     let mut kind = BackendKind::Unknown;
     let mut bucket = None;
     let mut endpoint = None;
+    let mut section = String::new();
     for raw_line in text.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line
+                .trim_matches(|c| c == '[' || c == ']')
+                .trim()
+                .to_ascii_lowercase();
+            continue;
+        }
+        // Only inspect top-level keys or `[storage]` / `[s3]` / `[hippius]` sections.
+        if !section.is_empty() && !matches!(section.as_str(), "storage" | "s3" | "hippius") {
+            continue;
+        }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -2417,7 +2522,7 @@ fn parse_backend_toml(text: &str, config_path: Option<String>) -> BackendInfo {
             continue;
         }
         match key {
-            "storage" => {
+            "storage" | "backend" => {
                 if val.eq_ignore_ascii_case("s3") || val.eq_ignore_ascii_case("hippius") {
                     kind = BackendKind::S3;
                 } else if val.eq_ignore_ascii_case("local") || val.eq_ignore_ascii_case("fs") {
@@ -2446,49 +2551,68 @@ fn parse_cli_recall(stdout: &str) -> Vec<HubMemoryHit> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout)
         && let Some(pointers) = value.get("pointers").and_then(serde_json::Value::as_array)
     {
-        return pointers
-            .iter()
-            .filter(|p| {
-                !p.get("weak")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .filter_map(|p| {
-                let id = p.get("id")?.as_str()?.to_owned();
-                let summary = p.get("summary")?.as_str()?.trim().to_owned();
-                let kind = p
-                    .get("type")
-                    .or_else(|| p.get("kind"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                Some(HubMemoryHit { id, summary, kind })
-            })
-            .collect();
+        let mut hits = Vec::new();
+        for p in pointers {
+            if p.get("weak")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(id) = p.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if MemoryId::parse(id).is_err() {
+                continue;
+            }
+            let Some(summary) = p
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if hits.iter().any(|h: &HubMemoryHit| h.id == id) {
+                continue;
+            }
+            let kind = p
+                .get("type")
+                .or_else(|| p.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            hits.push(HubMemoryHit {
+                id: id.to_owned(),
+                summary: summary.to_owned(),
+                kind,
+            });
+        }
+        return hits;
     }
     let mut hits = Vec::new();
     for line in stdout.lines() {
-        let trimmed = line.trim();
-        let Some(pos) = trimmed.find("mem_") else {
-            continue;
-        };
-        let after = &trimmed[pos..];
-        let id: String = after
-            .chars()
-            .take_while(|c| *c == '_' || c.is_ascii_alphanumeric())
-            .collect();
-        if MemoryId::parse(&id).is_err() {
-            continue;
-        }
-        let rest = after[id.len()..]
-            .trim()
-            .trim_start_matches([':', '-', ']', ')', '·'])
-            .trim();
-        if !rest.is_empty() && !hits.iter().any(|h: &HubMemoryHit| h.id == id) {
-            hits.push(HubMemoryHit {
-                id,
-                summary: rest.to_owned(),
-                kind: None,
-            });
+        let mut cursor = line.trim();
+        while let Some(pos) = cursor.find("mem_") {
+            let after = &cursor[pos..];
+            let id: String = after
+                .chars()
+                .take_while(|c| *c == '_' || c.is_ascii_alphanumeric())
+                .collect();
+            if MemoryId::parse(&id).is_ok() {
+                let rest = after[id.len()..]
+                    .trim()
+                    .trim_start_matches([':', '-', ']', ')', '·'])
+                    .trim();
+                if !rest.is_empty() && !hits.iter().any(|h: &HubMemoryHit| h.id == id) {
+                    hits.push(HubMemoryHit {
+                        id,
+                        summary: rest.to_owned(),
+                        kind: None,
+                    });
+                }
+                break;
+            }
+            cursor = &after["mem_".len()..];
         }
     }
     hits
@@ -2810,6 +2934,49 @@ mod tests {
         let latin1 = Some(OsString::from_vec(b"/caf\xe9.toml".to_vec()));
         let error = user_config_from(latin1, None, Some(OsString::from("/home")), cwd).unwrap_err();
         assert!(error.contains("is not UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn parse_backend_toml_respects_sections_and_quoted_hashes() {
+        let toml = r#"
+storage = "local"
+[embedding]
+endpoint = "https://embed.example.com"
+[profiles.prod]
+bucket = "wrong-profile-bucket"
+[s3]
+storage = "s3"
+bucket = "team-vault#1" # trailing comment
+endpoint = "https://s3.hippius.com"
+"#;
+        let info = parse_backend_toml(toml, None);
+        assert_eq!(info.kind, BackendKind::S3);
+        assert_eq!(info.bucket.as_deref(), Some("team-vault#1"));
+        assert_eq!(info.endpoint.as_deref(), Some("https://s3.hippius.com"));
+    }
+
+    #[test]
+    fn parse_cli_recall_validates_ids_and_scans_multiple_mem_tokens() {
+        let json = r#"{"pointers":[
+            {"id":"not-a-mem-id","summary":"skip me","weak":false},
+            {"id":"mem_01J00000000000000000000001","summary":"Valid hit","weak":false},
+            {"id":"mem_01J00000000000000000000001","summary":"Duplicate","weak":false},
+            {"id":"mem_01J00000000000000000000002","summary":"   ","weak":false}
+        ]}"#;
+        let hits = parse_cli_recall(json);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].summary, "Valid hit");
+
+        let text =
+            "mem_pool mention before mem_01J00000000000000000000003: Always hold lock first\n";
+        let text_hits = parse_cli_recall(text);
+        assert_eq!(text_hits.len(), 1);
+        assert_eq!(text_hits[0].id, "mem_01J00000000000000000000003");
+        assert_eq!(text_hits[0].summary, "Always hold lock first");
+
+        assert!(validate_cli_arg("bucket", "--evil", true).is_err());
+        assert!(validate_cli_arg("bucket", "ok\nline2", true).is_err());
+        assert!(validate_cli_arg("bucket", "my-bucket", true).is_ok());
     }
 
     /// One query with many hits does not push out another query's best: the review takes

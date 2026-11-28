@@ -95,6 +95,11 @@ test("memoryBackendSummary distinguishes local trial vault vs paid remote S3", (
     "Remote S3 · team-vault",
   );
   assert.equal(memoryBackendSummary({ state: { kind: "missing" } }).kind, "absent");
+  assert.equal(
+    memoryBackendSummary({ state: { kind: "unconfigured", problem: "bad key" } }).kind,
+    "missing",
+  );
+  assert.equal(memoryBackendSummary({ state: { kind: "unconfigured" } }).kind, "unchecked");
 });
 
 test("formatAge and itemKey format compact timestamps and stable keys", () => {

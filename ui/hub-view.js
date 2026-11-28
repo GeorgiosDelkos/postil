@@ -3,8 +3,11 @@
 // Center column: priority-ranked Issues & Pull Requests across selected repos
 // Right column: task evaluation, hippius-mem memories, affected architecture, lane selector,
 //               live tier-resolved stage roster, and launch button.
+//
+// Builds the 3-pane shell and search input once so typing, scrolling, and background sync polls
+// never drop focus, caret position, or scroll offsets.
 
-import { el } from "./dom.js";
+import { agentLogoIcon, el, postilCheckbox, uiIcon } from "./dom.js";
 import {
   LANES,
   filterHubItems,
@@ -15,6 +18,7 @@ import {
   laneSummary,
   memoryBackendSummary,
 } from "./hub.js";
+import { stateMark, toggleSwitch } from "./settings-controls.js";
 
 const POLL_SYNC_MS = 1000;
 
@@ -43,6 +47,8 @@ export function hubView({
     evaluating: false,
     launching: false,
     pollTimer: null,
+    loadSeq: 0,
+    dom: null,
   };
 
   async function fetchJson(route, init) {
@@ -53,16 +59,19 @@ export function hubView({
   }
 
   async function load({ sync = false } = {}) {
+    const seq = ++ui.loadSeq;
     try {
       const [hub, recent] = await Promise.all([
         fetchJson(sync ? "api/hub/sync" : "api/hub", sync ? { method: "POST" } : undefined),
         fetchJson("api/recent").catch(() => []),
       ]);
+      if (seq !== ui.loadSeq) return;
       ui.data = hub;
       ui.recent = recent;
       syncPoll();
       render();
     } catch (error) {
+      if (seq !== ui.loadSeq) return;
       onError(String(error.message ?? error));
     }
   }
@@ -77,14 +86,18 @@ export function hubView({
   }
 
   async function mutateRepo(payload) {
+    const seq = ++ui.loadSeq;
     try {
-      ui.data = await fetchJson("api/hub/repos", {
+      const next = await fetchJson("api/hub/repos", {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      if (seq !== ui.loadSeq) return;
+      ui.data = next;
       syncPoll();
       render();
     } catch (error) {
+      if (seq !== ui.loadSeq) return;
       onError(String(error.message ?? error));
     }
   }
@@ -97,6 +110,17 @@ export function hubView({
   function activeItem(items) {
     if (items.length === 0) return null;
     return items.find((item) => itemKey(item) === ui.selectedKey) ?? items[0];
+  }
+
+  function selectItem(item) {
+    const settingsView = getSettingsView?.() ?? null;
+    ui.selectedKey = itemKey(item);
+    ui.chosenLane = item.recommendedLane;
+    ui.humanGate = settingsView?.settings?.lanes?.hardHumanGate ?? true;
+    ui.stagePreviewKey = null;
+    ui.stagePreview = null;
+    ui.stagePreviewError = null;
+    render();
   }
 
   async function fetchStagePreview(lane, kind) {
@@ -121,6 +145,7 @@ export function hubView({
 
   async function reEvaluate(item) {
     if (ui.evaluating) return;
+    const targetKey = itemKey(item);
     ui.evaluating = true;
     render();
     try {
@@ -136,7 +161,10 @@ export function hubView({
         const idx = ui.data.items.findIndex((each) => itemKey(each) === itemKey(updated));
         if (idx >= 0) ui.data.items[idx] = updated;
       }
-      ui.chosenLane = updated.recommendedLane;
+      if (ui.selectedKey === targetKey) {
+        ui.chosenLane = updated.recommendedLane;
+        ui.stagePreviewKey = null;
+      }
     } catch (error) {
       onError(String(error.message ?? error));
     } finally {
@@ -172,8 +200,125 @@ export function hubView({
     }
   }
 
+  function ensureShell() {
+    if (ui.dom) return ui.dom;
+
+    const shell = el("div", "hub-shell");
+
+    // Left pane: Monitored Repos
+    const reposPane = el("aside", "pane hub-repos");
+    const reposHeader = el("header", "pane-header");
+    reposHeader.dataset.drag = "";
+    const addBtn = el("button", "button hub-mini-btn hub-icon-btn");
+    addBtn.type = "button";
+    addBtn.append(uiIcon("plus"), el("span", "", "Monitor…"));
+    addBtn.addEventListener("click", () => chooseFolderForHub());
+    reposHeader.append(el("span", "hub-pane-title", "Monitored Repos"), addBtn);
+    const repoList = el("div", "hub-repo-list");
+    const reposFoot = el("footer", "hub-repos-foot");
+    reposPane.append(reposHeader, repoList, reposFoot);
+
+    // Center pane: Priority Queue (static header + search input so typing never loses focus)
+    const queuePane = el("section", "pane hub-queue");
+    const queueHeader = el("header", "pane-header hub-queue-header");
+    queueHeader.dataset.drag = "";
+
+    const kindTabs = el("div", "segmented hub-kind-tabs");
+    kindTabs.setAttribute("role", "radiogroup");
+    kindTabs.setAttribute("aria-label", "Filter work type");
+    const kindButtons = new Map();
+    for (const [value, label] of [
+      ["all", "All"],
+      ["issue", "Issues"],
+      ["pullRequest", "PRs"],
+    ]) {
+      const btn = el("button", "segment", label);
+      btn.type = "button";
+      btn.setAttribute("role", "radio");
+      btn.setAttribute("aria-checked", String(ui.kind === value));
+      btn.addEventListener("click", () => {
+        ui.kind = value;
+        render();
+      });
+      kindButtons.set(value, btn);
+      kindTabs.append(btn);
+    }
+
+    const controls = el("div", "hub-queue-controls");
+    const prioSelect = el("select", "select hub-prio-select");
+    prioSelect.setAttribute("aria-label", "Filter by priority");
+    for (const [val, label] of [
+      ["all", "All priorities"],
+      ["P0", "P0 Critical"],
+      ["P1", "P1 High"],
+      ["P2", "P2 Medium"],
+      ["P3", "P3 Low"],
+    ]) {
+      const opt = el("option", "", label);
+      opt.value = val;
+      prioSelect.append(opt);
+    }
+    prioSelect.addEventListener("change", () => {
+      ui.priority = prioSelect.value;
+      render();
+    });
+
+    const syncBtn = el("button", "button hub-mini-btn hub-icon-btn");
+    syncBtn.type = "button";
+    const syncIcon = uiIcon("refresh");
+    const syncLabel = el("span", "", "Sync");
+    syncBtn.append(syncIcon, syncLabel);
+    syncBtn.addEventListener("click", () => void load({ sync: true }));
+    controls.append(prioSelect, syncBtn);
+    queueHeader.append(kindTabs, controls);
+
+    const searchWrap = el("div", "hub-search-wrap");
+    const searchInput = el("input", "field hub-search");
+    searchInput.type = "text";
+    searchInput.setAttribute("aria-label", "Filter issues and pull requests");
+    searchInput.placeholder = "Filter issues & PRs by repo, #number, label, or keyword…";
+    searchInput.autocomplete = "off";
+    searchInput.spellcheck = false;
+    searchInput.addEventListener("input", () => {
+      ui.query = searchInput.value;
+      render();
+    });
+    searchWrap.append(searchInput);
+
+    const queueList = el("div", "hub-queue-list");
+    queuePane.append(queueHeader, searchWrap, queueList);
+
+    // Right pane: Evaluation & Lane Launch
+    const inspPane = el("aside", "pane hub-inspector");
+    const inspHeader = el("header", "pane-header");
+    inspHeader.dataset.drag = "";
+    inspHeader.append(el("span", "hub-pane-title", "Evaluation & Lane Launch"));
+    const inspBody = el("div", "hub-inspector-body");
+    const inspFoot = el("footer", "hub-insp-foot");
+    inspPane.append(inspHeader, inspBody, inspFoot);
+
+    shell.append(reposPane, queuePane, inspPane);
+    hubEl.replaceChildren(shell);
+
+    ui.dom = {
+      repoList,
+      reposFoot,
+      kindButtons,
+      prioSelect,
+      syncBtn,
+      syncIcon,
+      syncLabel,
+      searchInput,
+      queueList,
+      inspBody,
+      inspFoot,
+    };
+    return ui.dom;
+  }
+
   function render() {
     if (!ui.shown) return;
+    const dom = ensureShell();
     const settingsView = getSettingsView?.() ?? null;
     const items = visibleItems();
     const selected = activeItem(items);
@@ -188,53 +333,53 @@ export function hubView({
       void fetchStagePreview(lane, selected.kind);
     }
 
-    const shell = el("div", "hub-shell");
-    shell.append(renderReposPane(settingsView), renderQueuePane(items, selected), renderInspector(selected));
-    hubEl.replaceChildren(shell);
+    // Preserve scroll positions across redraws.
+    const repoScroll = dom.repoList.scrollTop;
+    const queueScroll = dom.queueList.scrollTop;
+    const inspScroll = dom.inspBody.scrollTop;
+
+    renderReposContent(dom, settingsView);
+    renderQueueContent(dom, items, selected);
+    renderInspectorContent(dom, selected);
+
+    dom.repoList.scrollTop = repoScroll;
+    dom.queueList.scrollTop = queueScroll;
+    dom.inspBody.scrollTop = inspScroll;
   }
 
-  function renderReposPane(settingsView) {
-    const pane = el("aside", "pane hub-repos");
-    const header = el("header", "pane-header");
-    header.dataset.drag = "";
-    const title = el("span", "hub-pane-title", "Monitored Repos");
-    const addBtn = el("button", "button hub-mini-btn", "+ Monitor…");
-    addBtn.type = "button";
-    addBtn.addEventListener("click", () => chooseFolderForHub());
-    header.append(title, addBtn);
-
-    const list = el("div", "hub-repo-list");
+  function renderReposContent(dom, settingsView) {
+    const frag = document.createDocumentFragment();
     const repos = ui.data?.repos ?? [];
     if (repos.length > 0) {
       const allSelected = repos.every((r) => r.selected);
       const allRow = el("label", "hub-repo-all");
-      const cb = el("input");
-      cb.type = "checkbox";
-      cb.checked = allSelected;
-      cb.addEventListener("change", () =>
-        mutateRepo({ action: "selectAll", selected: cb.checked }),
-      );
+      const cb = postilCheckbox({
+        checked: allSelected,
+        ariaLabel: "Toggle all monitored repositories",
+        onChange: (checked) => mutateRepo({ action: "selectAll", selected: checked }),
+      });
       allRow.append(cb, el("span", "", `All monitored (${repos.length})`));
-      list.append(allRow);
+      frag.append(allRow);
 
       for (const repo of repos) {
         const card = el("div", `hub-repo-card${repo.selected ? " selected" : ""}`);
         const top = el("div", "hub-repo-top");
-        const toggle = el("input");
-        toggle.type = "checkbox";
-        toggle.checked = repo.selected;
-        toggle.title = "Include in priority queue";
-        toggle.addEventListener("change", () =>
-          mutateRepo({ action: "select", path: repo.path, selected: toggle.checked }),
-        );
+        const toggle = postilCheckbox({
+          checked: repo.selected,
+          ariaLabel: `Include ${repo.name} in priority queue`,
+          title: "Include in priority queue",
+          onChange: (checked) => mutateRepo({ action: "select", path: repo.path, selected: checked }),
+        });
         const nameBtn = el("button", "hub-repo-name", repo.name);
         nameBtn.type = "button";
         nameBtn.title = `Open ${repo.path} in code workspace`;
         nameBtn.disabled = !repo.exists;
         nameBtn.addEventListener("click", () => openRepo(repo.path));
 
-        const removeBtn = el("button", "icon-button hub-repo-remove", "×");
+        const removeBtn = el("button", "icon-button hub-repo-remove");
         removeBtn.type = "button";
+        removeBtn.append(uiIcon("close"));
+        removeBtn.setAttribute("aria-label", `Stop monitoring ${repo.name}`);
         removeBtn.title = "Stop monitoring";
         removeBtn.addEventListener("click", () =>
           mutateRepo({ action: "remove", path: repo.path }),
@@ -244,12 +389,15 @@ export function hubView({
         const meta = el("div", "hub-repo-meta");
         const branch = repo.branch || (repo.exists ? "detached" : "missing");
         const counts = `${repo.openIssues} iss · ${repo.openPrs} PR`;
-        meta.textContent = repo.syncing ? `${branch} · syncing…` : `${branch} · ${counts}`;
+        meta.append(
+          uiIcon("branch", "hub-meta-icon"),
+          el("span", "", repo.syncing ? `${branch} · syncing…` : `${branch} · ${counts}`),
+        );
         card.append(top, meta);
         if (repo.error) {
           card.append(el("div", "hub-repo-error", repo.error));
         }
-        list.append(card);
+        frag.append(card);
       }
     } else {
       const empty = el("div", "hub-empty-block");
@@ -261,7 +409,7 @@ export function hubView({
           "Add local git repositories to monitor open GitHub issues & PRs ranked by priority.",
         ),
       );
-      list.append(empty);
+      frag.append(empty);
     }
 
     // Quick-add from recent projects not yet monitored
@@ -273,96 +421,46 @@ export function hubView({
       for (const proj of suggestions) {
         const row = el("button", "hub-recent-btn");
         row.type = "button";
-        row.append(el("span", "", `+ ${proj.name}`), el("span", "hub-recent-sub", proj.path));
+        const head = el("span", "hub-recent-head");
+        head.append(uiIcon("plus", "hub-meta-icon"), el("span", "", proj.name));
+        row.append(head, el("span", "hub-recent-sub", proj.path));
         row.addEventListener("click", () => mutateRepo({ action: "add", path: proj.path }));
         sec.append(row);
       }
-      list.append(sec);
+      frag.append(sec);
     }
 
-    // hippius-mem storage badge at footer
-    const foot = el("footer", "hub-repos-foot");
+    dom.repoList.replaceChildren(frag);
+
+    // hippius-mem storage badge at footer using Postil's native `stateMark` + storage icon
     const mem = memoryBackendSummary(settingsView?.memory);
     const memBtn = el("button", `hub-mem-pill ${mem.kind}`);
     memBtn.type = "button";
     memBtn.title = "Configure hippius-mem (Local Vault or Remote S3) in Settings";
+    const storageIcon = mem.storage === "s3" ? uiIcon("cloud", "hub-meta-icon") : uiIcon("database", "hub-meta-icon");
     memBtn.append(
-      el("span", "hub-mem-dot"),
+      stateMark({ kind: mem.kind, label: `${mem.title}: ${mem.detail}` }),
+      storageIcon,
       el("span", "hub-mem-title", mem.title),
       el("span", "hub-mem-detail", mem.detail),
     );
     memBtn.addEventListener("click", () => openSettings());
-    foot.append(memBtn);
-
-    pane.append(header, list, foot);
-    return pane;
+    dom.reposFoot.replaceChildren(memBtn);
   }
 
-  function renderQueuePane(items, selected) {
-    const pane = el("section", "pane hub-queue");
-    const header = el("header", "pane-header hub-queue-header");
-    header.dataset.drag = "";
-
-    const tabs = el("div", "hub-filter-tabs");
-    for (const [value, label] of [
-      ["all", "All"],
-      ["issue", "Issues"],
-      ["pullRequest", "PRs"],
-    ]) {
-      const btn = el("button", `hub-filter-tab${ui.kind === value ? " active" : ""}`, label);
-      btn.type = "button";
-      btn.addEventListener("click", () => {
-        ui.kind = value;
-        render();
-      });
-      tabs.append(btn);
+  function renderQueueContent(dom, items, selected) {
+    for (const [value, btn] of dom.kindButtons.entries()) {
+      btn.setAttribute("aria-checked", String(ui.kind === value));
     }
+    dom.prioSelect.value = ui.priority;
+    const syncing = Boolean(ui.data?.syncing);
+    dom.syncBtn.disabled = syncing || (ui.data?.repos?.length ?? 0) === 0;
+    dom.syncIcon.classList.toggle("spinning", syncing);
+    dom.syncLabel.textContent = syncing ? "Syncing…" : "Sync";
 
-    const controls = el("div", "hub-queue-controls");
-    const prio = el("select", "select hub-prio-select");
-    prio.setAttribute("aria-label", "Filter by priority");
-    for (const [val, label] of [
-      ["all", "All priorities"],
-      ["P0", "P0 Critical"],
-      ["P1", "P1 High"],
-      ["P2", "P2 Medium"],
-      ["P3", "P3 Low"],
-    ]) {
-      const opt = el("option", "", label);
-      opt.value = val;
-      opt.selected = ui.priority === val;
-      prio.append(opt);
-    }
-    prio.addEventListener("change", () => {
-      ui.priority = prio.value;
-      render();
-    });
-
-    const syncBtn = el(
-      "button",
-      "button hub-mini-btn",
-      ui.data?.syncing ? "Syncing…" : "↻ Sync",
-    );
-    syncBtn.type = "button";
-    syncBtn.disabled = Boolean(ui.data?.syncing) || (ui.data?.repos?.length ?? 0) === 0;
-    syncBtn.addEventListener("click", () => void load({ sync: true }));
-    controls.append(prio, syncBtn);
-    header.append(tabs, controls);
-
-    const searchWrap = el("div", "hub-search-wrap");
-    const search = el("input", "field hub-search");
-    search.type = "text";
-    search.placeholder = "Filter issues & PRs by repo, #number, label, or keyword…";
-    search.value = ui.query;
-    search.addEventListener("input", () => {
-      ui.query = search.value;
-      render();
-    });
-    searchWrap.append(search);
-
-    const body = el("div", "hub-queue-list");
+    const frag = document.createDocumentFragment();
     if (ui.data && !ui.data.ghAvailable) {
-      body.append(
+      frag.append(
         el(
           "div",
           "hub-banner",
@@ -376,32 +474,26 @@ export function hubView({
       const msg =
         (ui.data?.repos?.length ?? 0) === 0
           ? "Monitor a repository on the left to load prioritized issues and PRs."
-          : ui.data?.syncing
+          : syncing
             ? "Fetching open issues & PRs and recalling team memory…"
             : "No open issues or pull requests match the current filters.";
-      body.append(el("div", "empty", msg));
+      frag.append(el("div", "empty", msg));
     } else {
       for (const group of groups) {
-        const heading = el("div", `hub-group-head tone-${group.tone}`, group.label);
-        body.append(heading);
+        frag.append(el("div", `hub-group-head tone-${group.tone}`, group.label));
         for (const item of group.items) {
           const isSelected = selected && itemKey(item) === itemKey(selected);
           const card = el("button", `hub-card${isSelected ? " selected" : ""}`);
           card.type = "button";
-          card.addEventListener("click", () => {
-            ui.selectedKey = itemKey(item);
-            ui.chosenLane = item.recommendedLane;
-            ui.stagePreviewKey = null;
-            render();
-          });
+          card.addEventListener("click", () => selectItem(item));
 
           const row1 = el("div", "hub-card-top");
           const badge = el("span", `hub-prio-badge tone-${group.tone}`, item.priority);
           const repoTag = el("span", "hub-repo-pill", item.repoName);
-          const kindTag = el(
-            "span",
-            "hub-kind-pill",
-            item.kind === "pullRequest" ? `PR #${item.number}` : `Issue #${item.number}`,
+          const kindTag = el("span", "hub-kind-pill");
+          kindTag.append(
+            uiIcon(item.kind === "pullRequest" ? "pr" : "issue", "hub-meta-icon"),
+            el("span", "", item.kind === "pullRequest" ? `#${item.number}` : `#${item.number}`),
           );
           const laneChip = el(
             "span",
@@ -430,33 +522,30 @@ export function hubView({
           row3.textContent = parts.join(" · ");
 
           card.append(row1, titleEl, reasonEl, row3);
-          body.append(card);
+          frag.append(card);
         }
       }
     }
 
-    pane.append(header, searchWrap, body);
-    return pane;
+    dom.queueList.replaceChildren(frag);
   }
 
-  function renderInspector(item) {
-    const pane = el("aside", "pane hub-inspector");
-    const header = el("header", "pane-header");
-    header.dataset.drag = "";
-    header.append(el("span", "hub-pane-title", "Evaluation & Lane Launch"));
-
-    const body = el("div", "hub-inspector-body");
+  function renderInspectorContent(dom, item) {
     if (!item) {
-      body.append(el("div", "empty", "Select an issue or PR from the queue to inspect and launch."));
-      pane.append(header, body);
-      return pane;
+      dom.inspBody.replaceChildren(
+        el("div", "empty", "Select an issue or PR from the queue to inspect and launch."),
+      );
+      dom.inspFoot.hidden = true;
+      return;
     }
+    dom.inspFoot.hidden = false;
 
+    const frag = document.createDocumentFragment();
     const kindWord = item.kind === "pullRequest" ? "Pull Request" : "Issue";
-    const metaLine = el(
-      "div",
-      "hub-insp-meta",
-      `${item.repoName} · ${kindWord} #${item.number} · Score ${item.priorityScore}/100`,
+    const metaLine = el("div", "hub-insp-meta");
+    metaLine.append(
+      uiIcon(item.kind === "pullRequest" ? "pr" : "issue", "hub-meta-icon"),
+      el("span", "", `${item.repoName} · ${kindWord} #${item.number} · Score ${item.priorityScore}/100`),
     );
     const titleEl = el("h2", "hub-insp-title", item.title);
 
@@ -466,17 +555,17 @@ export function hubView({
       el("p", "hub-insp-text", item.priorityReason),
       el("p", "hub-insp-hint", item.laneReason),
     );
-    const evalBtn = el(
-      "button",
-      "button hub-mini-btn",
-      ui.evaluating ? "Re-evaluating…" : "Re-evaluate with hippius-mem",
-    );
+    const evalBtn = el("button", "button hub-mini-btn hub-icon-btn");
     evalBtn.type = "button";
     evalBtn.disabled = ui.evaluating;
+    evalBtn.append(
+      uiIcon("refresh", ui.evaluating ? "spinning" : ""),
+      el("span", "", ui.evaluating ? "Re-evaluating…" : "Re-evaluate with hippius-mem"),
+    );
     evalBtn.addEventListener("click", () => void reEvaluate(item));
     signals.append(evalBtn);
 
-    body.append(metaLine, titleEl, signals);
+    frag.append(metaLine, titleEl, signals);
 
     // Team memory hits
     if (item.memories?.length) {
@@ -487,7 +576,7 @@ export function hubView({
         card.append(el("span", "hub-mem-id", hit.id), el("span", "", hit.summary));
         memSec.append(card);
       }
-      body.append(memSec);
+      frag.append(memSec);
     }
 
     // Affected architecture components
@@ -499,7 +588,7 @@ export function hubView({
         chips.append(el("span", "hub-map-chip", comp));
       }
       mapSec.append(chips);
-      body.append(mapSec);
+      frag.append(mapSec);
     }
 
     // Description preview
@@ -509,7 +598,7 @@ export function hubView({
         el("div", "hub-subhead", "Description"),
         el("pre", "hub-insp-desc", item.body.trim().slice(0, 1200)),
       );
-      body.append(desc);
+      frag.append(desc);
     }
 
     // Lane selector
@@ -535,7 +624,7 @@ export function hubView({
     }
     laneSec.append(laneGroup);
 
-    // Stage Roster preview
+    // Stage Roster preview with Postil's native agent logos
     const roster = el("div", "hub-stage-roster");
     if (ui.stagePreviewError) {
       const err = el("div", "hub-roster-error", ui.stagePreviewError);
@@ -547,12 +636,21 @@ export function hubView({
       roster.append(el("div", "hub-subhead", "Stage Roster (from Capability Tiers)"));
       for (const [idx, st] of ui.stagePreview.stages.entries()) {
         const row = el("div", "hub-stage-row");
+        const modelRow = el("span", "hub-stage-model");
+        const logo = agentLogoIcon(st.agent);
+        if (logo) modelRow.append(logo);
         const who = st.model ? `${st.agent} · ${st.model}` : st.agent;
         const mode = st.readOnly ? "RO" : "RW";
+        modelRow.append(el("span", "", `${who} (${st.tier}, ${mode})`));
+        if (st.diverse) {
+          const divIcon = uiIcon("sparkles", "hub-diverse-icon");
+          divIcon.setAttribute("title", "Cross-model diverse pairing");
+          modelRow.append(divIcon);
+        }
         row.append(
           el("span", "hub-stage-num", `${idx + 1}.`),
           el("span", "hub-stage-name", st.label),
-          el("span", "hub-stage-model", `${who} (${st.tier}, ${mode})${st.diverse ? " ✦" : ""}`),
+          modelRow,
         );
         roster.append(row);
       }
@@ -562,37 +660,40 @@ export function hubView({
     laneSec.append(roster);
 
     if (lane === "hard" && item.kind === "issue") {
-      const gateRow = el("label", "hub-gate-toggle");
-      const gateCb = el("input");
-      gateCb.type = "checkbox";
-      gateCb.checked = ui.humanGate;
-      gateCb.addEventListener("change", () => {
-        ui.humanGate = gateCb.checked;
-      });
-      gateRow.append(gateCb, el("span", "", "Pause after Stage 2 (Plan Judge) for my approval"));
+      const gateRow = el("div", "hub-gate-toggle");
+      const gateSwitch = toggleSwitch(
+        "hub-hard-human-gate",
+        ui.humanGate,
+        () => {
+          ui.humanGate = !ui.humanGate;
+          render();
+        },
+        { label: "Pause after Stage 2 (Plan Judge) for my approval" },
+      );
+      gateRow.append(
+        el("span", "hub-gate-label", "Pause after Stage 2 (Plan Judge) for approval"),
+        gateSwitch,
+      );
       laneSec.append(gateRow);
     }
-    body.append(laneSec);
+    frag.append(laneSec);
+    dom.inspBody.replaceChildren(frag);
 
     // Footer launch bar
-    const foot = el("footer", "hub-insp-foot");
     const openBtn = el("button", "button", "Inspect Repo");
     openBtn.type = "button";
     openBtn.addEventListener("click", () => openRepo(item.repoPath));
 
     const verb = item.kind === "pullRequest" ? "Review PR" : "Implement";
-    const startBtn = el(
-      "button",
-      "button primary",
-      ui.launching ? "Starting…" : `${verb} in ${laneLabel(lane)} Lane →`,
-    );
+    const startBtn = el("button", "button primary hub-icon-btn");
     startBtn.type = "button";
     startBtn.disabled = ui.launching || Boolean(ui.stagePreviewError);
+    startBtn.append(
+      el("span", "", ui.launching ? "Starting…" : `${verb} in ${laneLabel(lane)} Lane`),
+      uiIcon("arrowRight"),
+    );
     startBtn.addEventListener("click", () => void startSelected(item, lane));
-    foot.append(openBtn, startBtn);
-
-    pane.append(header, body, foot);
-    return pane;
+    dom.inspFoot.replaceChildren(openBtn, startBtn);
   }
 
   return {
@@ -612,6 +713,9 @@ export function hubView({
     isShown: () => ui.shown,
     refresh: () => {
       if (ui.shown) void load();
+    },
+    renderMemory: () => {
+      if (ui.shown && ui.dom) renderReposContent(ui.dom, getSettingsView?.() ?? null);
     },
     async addMonitoredRepo(path) {
       await mutateRepo({ action: "add", path });

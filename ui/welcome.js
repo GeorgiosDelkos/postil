@@ -23,7 +23,7 @@ export function welcomeScreen({ state, welcomeEl, codeEl, guardDraft, leaveFocus
   // is stopped only with `{ stop: true }`, sent once the engineer agreed: without it, opening
   // another project during a run answers 409.
   async function requestProject(route, path, { stop = false } = {}) {
-    if (guardDraft("opening another project")) return;
+    if (guardDraft("opening another project")) return false;
     beforeSwitch();
     state.switching = true;
     let response;
@@ -33,12 +33,12 @@ export function welcomeScreen({ state, welcomeEl, codeEl, guardDraft, leaveFocus
       state.switching = false;
       showWelcome();
       showWelcomeError(`cannot open ${path}: ${error}`, null);
-      return;
+      return false;
     }
     if (response.ok) {
       window.ipc?.postMessage("maximize");
       location.reload();
-      return;
+      return true;
     }
     state.switching = false;
     showWelcome();
@@ -49,11 +49,12 @@ export function welcomeScreen({ state, welcomeEl, codeEl, guardDraft, leaveFocus
         label: "Stop the run and open",
         run: () => requestProject(route, path, { stop: true }),
       });
-      return;
+      return "conflict";
     }
     // 422: the folder is not in a repository, which `git init` can fix in place.
     const init = { label: "Make it a git repository", run: () => requestProject("api/init", path) };
     showWelcomeError(await response.text(), response.status === 422 ? init : null);
+    return false;
   }
 
   // Shows `text` on the welcome screen, with a button for `action` (`{ label, run }`) or none.

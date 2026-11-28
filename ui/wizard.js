@@ -56,7 +56,14 @@ export function toggleWizardAgent(draft, name, enabled) {
   const agent = draft.agent?.name === name ? fallback : draft.agent;
   // Analyses then go to the default agent.
   const analyzer = draft.analyzer?.name === name ? null : (draft.analyzer ?? null);
-  return { ...draft, enabledAgents, agent, analyzer, reviewers };
+  const modelTiers = draft.modelTiers
+    ? {
+        fast: (draft.modelTiers.fast ?? []).filter((slot) => slot.name !== name),
+        standard: (draft.modelTiers.standard ?? []).filter((slot) => slot.name !== name),
+        frontier: (draft.modelTiers.frontier ?? []).filter((slot) => slot.name !== name),
+      }
+    : draft.modelTiers;
+  return { ...draft, enabledAgents, agent, analyzer, reviewers, modelTiers };
 }
 
 // Adds or edits a custom agent in the wizard's draft. Returns `{ settings }` or `{ error }`.
