@@ -27,7 +27,7 @@ use std::path::Path;
 use crate::error::{Error, Result, error_chain};
 #[cfg(test)]
 use crate::run::lock;
-use crate::run::log::try_hold_thread_lock;
+use crate::run::log::hold_thread_lock;
 use crate::run::{Held, Runner, Slot};
 use crate::thread::{self, State, Thread, Trashed};
 
@@ -183,7 +183,7 @@ impl Runner {
         if busy_here() {
             return Taken::Kept("at work in this window".to_owned());
         }
-        let lock = match try_hold_thread_lock(&self.repo.runs_dir(), &other.id) {
+        let lock = match hold_thread_lock(&self.repo.runs_dir(), &other.id) {
             Ok(lock) => lock,
             // Another window's run, or another run of this window making room at once.
             Err(Error::RunElsewhere) => return Taken::Kept("at work in another run".to_owned()),
