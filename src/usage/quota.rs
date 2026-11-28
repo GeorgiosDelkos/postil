@@ -7,15 +7,17 @@
 //! `/usr/bin/curl` over stdin (`--config -`), never passed in process arguments.
 
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 #[cfg(test)]
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -33,9 +35,15 @@ use crate::usage::now_secs;
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// How long a failed (`QuotaStatus::Error`) probe stays cached before an automatic retry.
-/// Short enough to recover from a transient network or rate-limit hiccup, long enough not to
-/// hammer a failing endpoint.
+/// Short enough to recover from a transient network hiccup, long enough not to hammer a
+/// failing endpoint.
 const ERROR_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Minimum cooldown after a provider returns HTTP 429 (rate-limited).
+const RATE_LIMIT_CACHE_TTL: Duration = Duration::from_mins(5);
+
+/// Maximum cooldown after repeated HTTP 429 responses on Claude OAuth/usage endpoints.
+const RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_mins(15);
 
 /// Hard limit on one subprocess a probe runs (`security`, `curl`, `codex app-server`,
 /// `agy -p /usage`, or `grok agent stdio`).
@@ -113,6 +121,9 @@ pub(crate) struct QuotaReport {
     pub(crate) message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
+    /// Minimum cooldown before an automatic cached re-probe, used to back off after HTTP 429.
+    #[serde(skip)]
+    pub(crate) retry_after: Option<Duration>,
 }
 
 impl QuotaReport {
@@ -124,6 +135,7 @@ impl QuotaReport {
             credits: None,
             message: None,
             fetched_at: None,
+            retry_after: None,
         }
     }
 
@@ -140,6 +152,7 @@ impl QuotaReport {
             credits: ok.credits.clone(),
             message: None,
             fetched_at: ok.fetched_at,
+            retry_after: None,
         }
     }
 
@@ -151,6 +164,7 @@ impl QuotaReport {
             credits: None,
             message: Some(message.into()),
             fetched_at: Some(now_secs()),
+            retry_after: None,
         }
     }
 
@@ -162,6 +176,14 @@ impl QuotaReport {
             credits: None,
             message: Some(message.into()),
             fetched_at: Some(now_secs()),
+            retry_after: None,
+        }
+    }
+
+    pub(crate) fn rate_limited(message: impl Into<String>, retry_after: Duration) -> Self {
+        Self {
+            retry_after: Some(retry_after),
+            ..Self::error(message)
         }
     }
 }
@@ -173,8 +195,8 @@ type ProbeFn = Arc<dyn Fn(&str, &OsStr) -> QuotaReport + Send + Sync>;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum QuotaFetch {
     /// Serve cached reports; probe only an entry that is missing, older than
-    /// [`CACHE_TTL`] (or [`ERROR_CACHE_TTL`] for failed probes), or in flight past
-    /// [`LOADING_TIMEOUT`]. `GET /api/usage`.
+    /// [`CACHE_TTL`] (or [`ERROR_CACHE_TTL`] / `retry_after` for failed probes), or in flight
+    /// past [`LOADING_TIMEOUT`]. `GET /api/usage`.
     Cached,
     /// Probe every finished entry again, but keep a probe still in flight within
     /// [`LOADING_TIMEOUT`]: its result is the fresh one. `POST /api/usage/refresh`.
@@ -262,7 +284,13 @@ impl QuotaPoller {
                             matches!(fetch, QuotaFetch::Cached) && age < self.cache_ttl
                         }
                         QuotaStatus::Error => {
-                            matches!(fetch, QuotaFetch::Cached) && age < self.error_cache_ttl
+                            let ttl = entry
+                                .report
+                                .retry_after
+                                .map_or(self.error_cache_ttl, |wait| {
+                                    wait.max(self.error_cache_ttl)
+                                });
+                            matches!(fetch, QuotaFetch::Cached) && age < ttl
                         }
                     }
                 });
@@ -389,6 +417,7 @@ fn store(state: &Mutex<PollerState>, name: &str, probe: u64, report: QuotaReport
                         credits: ok.credits.clone(),
                         message: report.message,
                         fetched_at: ok.fetched_at,
+                        retry_after: report.retry_after,
                     };
                 } else {
                     entry.report = report;
@@ -426,11 +455,98 @@ fn probe_agent(name: &str, search_path: &OsStr) -> QuotaReport {
 
 /// Claude Code's public OAuth 2.0 client id and token refresh endpoint.
 const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CLAUDE_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Refresh proactively if the access token expires within this many seconds.
 const TOKEN_EXPIRY_SKEW_SECS: u64 = 60;
+
+/// Per-token cooldown after HTTP 429 from Claude's OAuth or usage endpoints so automatic polls,
+/// ended-run refreshes, and repeated Refresh clicks cannot hammer the endpoint and extend the
+/// rate-limit window. Stores only a keyed hash of the token (never the raw secret) so running
+/// `claude` or `claude /login` in a terminal bypasses the cooldown immediately.
+struct TokenRateLimitBackoff {
+    hasher: RandomState,
+    token_hash: Option<u64>,
+    until: Option<Instant>,
+    attempts: u32,
+}
+
+impl Default for TokenRateLimitBackoff {
+    fn default() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            token_hash: None,
+            until: None,
+            attempts: 0,
+        }
+    }
+}
+
+impl TokenRateLimitBackoff {
+    fn fingerprint(&self, token: &str) -> u64 {
+        self.hasher.hash_one(token)
+    }
+
+    fn remaining(&self, token: &str, now: Instant) -> Option<Duration> {
+        if self.token_hash != Some(self.fingerprint(token)) {
+            return None;
+        }
+        self.until
+            .and_then(|until| until.checked_duration_since(now))
+            .filter(|wait| !wait.is_zero())
+    }
+
+    fn record_rate_limit(&mut self, token: &str, now: Instant) -> Duration {
+        let fp = self.fingerprint(token);
+        if self.token_hash == Some(fp) {
+            self.attempts = self.attempts.saturating_add(1);
+        } else {
+            self.token_hash = Some(fp);
+            self.attempts = 1;
+        }
+        let shift = self.attempts.saturating_sub(1).min(4);
+        let secs = RATE_LIMIT_CACHE_TTL
+            .as_secs()
+            .saturating_mul(1_u64 << shift);
+        let wait = Duration::from_secs(secs).min(RATE_LIMIT_MAX_BACKOFF);
+        self.until = Some(now + wait);
+        wait
+    }
+
+    fn clear(&mut self) {
+        self.token_hash = None;
+        self.until = None;
+        self.attempts = 0;
+    }
+}
+
+fn claude_refresh_backoff() -> &'static Mutex<TokenRateLimitBackoff> {
+    static BACKOFF: OnceLock<Mutex<TokenRateLimitBackoff>> = OnceLock::new();
+    BACKOFF.get_or_init(|| Mutex::new(TokenRateLimitBackoff::default()))
+}
+
+fn claude_usage_backoff() -> &'static Mutex<TokenRateLimitBackoff> {
+    static BACKOFF: OnceLock<Mutex<TokenRateLimitBackoff>> = OnceLock::new();
+    BACKOFF.get_or_init(|| Mutex::new(TokenRateLimitBackoff::default()))
+}
+
+fn clear_claude_backoffs() {
+    lock(claude_refresh_backoff()).clear();
+    lock(claude_usage_backoff()).clear();
+}
+
+fn format_claude_refresh_rate_limit(wait: Duration) -> String {
+    let mins = wait.as_secs().div_ceil(60).max(1);
+    format!(
+        "Claude session refresh rate-limited (HTTP 429) — retrying in ~{mins} min, or run `claude` in a terminal to refresh"
+    )
+}
+
+fn format_claude_usage_rate_limit(wait: Duration) -> String {
+    let mins = wait.as_secs().div_ceil(60).max(1);
+    format!("Claude usage endpoint rate-limited (HTTP 429) — retrying automatically in ~{mins} min")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClaudeCredentialSource {
@@ -464,6 +580,7 @@ fn probe_claude() -> QuotaReport {
     let mut creds = match read_claude_credentials() {
         Ok(Some(creds)) => creds,
         Ok(None) => {
+            clear_claude_backoffs();
             if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|val| !val.is_empty()) {
                 return QuotaReport::unavailable("API key mode — no subscription quota window");
             }
@@ -474,67 +591,121 @@ fn probe_claude() -> QuotaReport {
         Err(message) => return QuotaReport::error(message),
     };
 
+    let now = now_secs();
     let mut refreshed = false;
-    if is_token_expired(creds.expires_at_ms, now_secs()) && creds.refresh_token.is_some() {
+    if is_token_expired(creds.expires_at_ms, now) && creds.refresh_token.is_some() {
         match try_refresh_claude_credentials(&mut creds) {
             Ok(()) => refreshed = true,
-            Err(RefreshOutcome::ReauthRequired) => {
-                return QuotaReport::unavailable(
-                    "Claude session expired — run `claude /login` in a terminal, then click Refresh",
-                );
+            Err(outcome @ RefreshOutcome::ReauthRequired) => return outcome.into_report(),
+            Err(RefreshOutcome::RateLimited {
+                message,
+                retry_after,
+            }) => {
+                // If the access token is already past its expiry timestamp, skip the usage
+                // call so Refresh/ended-run polls don't spam CLAUDE_USAGE_URL with an expired
+                // token or clobber the refresh backoff.
+                if is_token_past_expiry(creds.expires_at_ms, now) {
+                    return QuotaReport::rate_limited(message, retry_after);
+                }
+                // Within the proactive skew window the current access token may still work;
+                // if it fails, preserve at least the refresh backoff.
+                return match fetch_claude_usage_checked(&creds.access_token) {
+                    Ok((200, body)) => {
+                        clear_claude_backoffs();
+                        parse_claude_quota(&body, creds.plan)
+                    }
+                    Ok((401, _)) => QuotaReport::rate_limited(message, retry_after),
+                    Ok((status, _)) => {
+                        preserve_retry_after(claude_usage_status_error(status), retry_after)
+                    }
+                    Err(err) => preserve_retry_after(*err, retry_after),
+                };
             }
-            Err(RefreshOutcome::Transient(message)) => {
+            Err(outcome @ RefreshOutcome::Transient(_)) => {
                 // Fall through and try the current token anyway; if it also fails with 401,
                 // surface the transient refresh error rather than falsely claiming reauth.
-                return match fetch_claude_usage(&creds.access_token) {
-                    Ok((200, body)) => parse_claude_quota(&body, creds.plan),
-                    Ok((401, _)) => QuotaReport::error(message),
-                    Ok((403, _)) => QuotaReport::unavailable(
-                        "Claude account cannot read usage (HTTP 403) — run `claude /login` in a terminal to re-authorize",
-                    ),
-                    Ok((status, _)) => {
-                        QuotaReport::error(format!("Claude usage endpoint returned HTTP {status}"))
+                return match fetch_claude_usage_checked(&creds.access_token) {
+                    Ok((200, body)) => {
+                        clear_claude_backoffs();
+                        parse_claude_quota(&body, creds.plan)
                     }
-                    Err(err) => QuotaReport::error(err),
+                    Ok((401, _)) => outcome.into_report(),
+                    Ok((status, _)) => claude_usage_status_error(status),
+                    Err(err) => *err,
                 };
             }
         }
     }
 
-    match fetch_claude_usage(&creds.access_token) {
-        Ok((200, body)) => parse_claude_quota(&body, creds.plan),
+    match fetch_claude_usage_checked(&creds.access_token) {
+        Ok((200, body)) => {
+            clear_claude_backoffs();
+            parse_claude_quota(&body, creds.plan)
+        }
         Ok((401, _)) if !refreshed && creds.refresh_token.is_some() => {
             match try_refresh_claude_credentials(&mut creds) {
-                Ok(()) => match fetch_claude_usage(&creds.access_token) {
-                    Ok((200, body)) => parse_claude_quota(&body, creds.plan),
-                    Ok((401, _)) => QuotaReport::unavailable(
-                        "Claude session expired — run `claude /login` in a terminal, then click Refresh",
-                    ),
-                    Ok((403, _)) => QuotaReport::unavailable(
-                        "Claude account cannot read usage (HTTP 403) — run `claude /login` in a terminal to re-authorize",
-                    ),
-                    Ok((status, _)) => {
-                        QuotaReport::error(format!("Claude usage endpoint returned HTTP {status}"))
+                Ok(()) => match fetch_claude_usage_checked(&creds.access_token) {
+                    Ok((200, body)) => {
+                        clear_claude_backoffs();
+                        parse_claude_quota(&body, creds.plan)
                     }
-                    Err(message) => QuotaReport::error(message),
+                    Ok((401, _)) => RefreshOutcome::ReauthRequired.into_report(),
+                    Ok((status, _)) => claude_usage_status_error(status),
+                    Err(err) => *err,
                 },
-                Err(RefreshOutcome::ReauthRequired) => QuotaReport::unavailable(
-                    "Claude session expired — run `claude /login` in a terminal, then click Refresh",
-                ),
-                Err(RefreshOutcome::Transient(message)) => QuotaReport::error(message),
+                Err(outcome) => outcome.into_report(),
             }
         }
-        Ok((401, _)) => QuotaReport::unavailable(
-            "Claude session expired — run `claude /login` in a terminal, then click Refresh",
-        ),
-        Ok((403, _)) => QuotaReport::unavailable(
+        Ok((401, _)) => RefreshOutcome::ReauthRequired.into_report(),
+        Ok((status, _)) => claude_usage_status_error(status),
+        Err(err) => *err,
+    }
+}
+
+fn preserve_retry_after(mut report: QuotaReport, min_retry_after: Duration) -> QuotaReport {
+    if report.status == QuotaStatus::Error {
+        report.retry_after = Some(
+            report
+                .retry_after
+                .map_or(min_retry_after, |existing| existing.max(min_retry_after)),
+        );
+    }
+    report
+}
+
+fn claude_usage_status_error(status: u16) -> QuotaReport {
+    match status {
+        403 => QuotaReport::unavailable(
             "Claude account cannot read usage (HTTP 403) — run `claude /login` in a terminal to re-authorize",
         ),
-        Ok((status, _)) => {
-            QuotaReport::error(format!("Claude usage endpoint returned HTTP {status}"))
-        }
-        Err(message) => QuotaReport::error(message),
+        429 => QuotaReport::rate_limited(
+            format_claude_usage_rate_limit(RATE_LIMIT_CACHE_TTL),
+            RATE_LIMIT_CACHE_TTL,
+        ),
+        other => QuotaReport::error(format!("Claude usage endpoint returned HTTP {other}")),
     }
+}
+
+/// Calls `fetch_claude_usage`, short-circuiting with a rate-limited `QuotaReport` if this
+/// access token is already in a 429 cooldown, and recording any fresh HTTP 429 into
+/// [`claude_usage_backoff`].
+fn fetch_claude_usage_checked(token: &str) -> Result<(u16, String), Box<QuotaReport>> {
+    if let Some(remaining) = lock(claude_usage_backoff()).remaining(token, Instant::now()) {
+        return Err(Box::new(QuotaReport::rate_limited(
+            format_claude_usage_rate_limit(remaining),
+            remaining,
+        )));
+    }
+    let (status, body) =
+        fetch_claude_usage(token).map_err(|err| Box::new(QuotaReport::error(err)))?;
+    if status == 429 {
+        let wait = lock(claude_usage_backoff()).record_rate_limit(token, Instant::now());
+        return Err(Box::new(QuotaReport::rate_limited(
+            format_claude_usage_rate_limit(wait),
+            wait,
+        )));
+    }
+    Ok((status, body))
 }
 
 fn fetch_claude_usage(token: &str) -> Result<(u16, String), String> {
@@ -548,7 +719,26 @@ fn fetch_claude_usage(token: &str) -> Result<(u16, String), String> {
 
 enum RefreshOutcome {
     ReauthRequired,
+    RateLimited {
+        message: String,
+        retry_after: Duration,
+    },
     Transient(String),
+}
+
+impl RefreshOutcome {
+    fn into_report(self) -> QuotaReport {
+        match self {
+            Self::ReauthRequired => QuotaReport::unavailable(
+                "Claude session expired — run `claude /login` in a terminal, then click Refresh",
+            ),
+            Self::RateLimited {
+                message,
+                retry_after,
+            } => QuotaReport::rate_limited(message, retry_after),
+            Self::Transient(message) => QuotaReport::error(message),
+        }
+    }
 }
 
 fn is_token_expired(expires_at_ms: Option<u64>, now_secs: u64) -> bool {
@@ -561,10 +751,24 @@ fn is_token_expired(expires_at_ms: Option<u64>, now_secs: u64) -> bool {
     expires_ms <= cutoff_ms
 }
 
+fn is_token_past_expiry(expires_at_ms: Option<u64>, now_secs: u64) -> bool {
+    let Some(expires_ms) = expires_at_ms else {
+        return false;
+    };
+    expires_ms <= now_secs.saturating_mul(1000)
+}
+
 fn try_refresh_claude_credentials(creds: &mut ClaudeCredentials) -> Result<(), RefreshOutcome> {
     let Some(refresh_token) = creds.refresh_token.as_deref() else {
         return Err(RefreshOutcome::ReauthRequired);
     };
+    if let Some(remaining) = lock(claude_refresh_backoff()).remaining(refresh_token, Instant::now())
+    {
+        return Err(RefreshOutcome::RateLimited {
+            message: format_claude_refresh_rate_limit(remaining),
+            retry_after: remaining,
+        });
+    }
     let payload = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -581,6 +785,7 @@ fn try_refresh_claude_credentials(creds: &mut ClaudeCredentials) -> Result<(), R
         })?;
     match status {
         200 => {
+            lock(claude_refresh_backoff()).clear();
             let refreshed = parse_claude_refresh_response(&body, now_secs()).ok_or_else(|| {
                 RefreshOutcome::Transient(
                     "Could not refresh Claude session (unreadable OAuth reply)".to_owned(),
@@ -592,7 +797,18 @@ fn try_refresh_claude_credentials(creds: &mut ClaudeCredentials) -> Result<(), R
             persist_claude_credentials(creds);
             Ok(())
         }
-        400 | 401 | 403 => Err(RefreshOutcome::ReauthRequired),
+        400 | 401 | 403 => {
+            lock(claude_refresh_backoff()).clear();
+            Err(RefreshOutcome::ReauthRequired)
+        }
+        429 => {
+            let wait =
+                lock(claude_refresh_backoff()).record_rate_limit(refresh_token, Instant::now());
+            Err(RefreshOutcome::RateLimited {
+                message: format_claude_refresh_rate_limit(wait),
+                retry_after: wait,
+            })
+        }
         other => Err(RefreshOutcome::Transient(format!(
             "Could not refresh Claude session (HTTP {other}) — click Refresh to try again"
         ))),
@@ -937,6 +1153,7 @@ fn parse_claude_quota(body: &str, plan: Option<String>) -> QuotaReport {
         credits,
         message: None,
         fetched_at: Some(now_secs()),
+        retry_after: None,
     }
 }
 
@@ -1184,6 +1401,7 @@ fn parse_codex_quota(account: Option<&Value>, limits: Option<&Value>) -> QuotaRe
         credits,
         message: None,
         fetched_at: Some(now_secs()),
+        retry_after: None,
     }
 }
 
@@ -1350,6 +1568,7 @@ fn parse_antigravity_quota(stdout: &str, exit_ok: bool) -> QuotaReport {
         credits: None,
         message: None,
         fetched_at: Some(now_secs()),
+        retry_after: None,
     }
 }
 
@@ -1651,6 +1870,7 @@ fn parse_grok_quota(billing: Option<&Value>, has_api_key: bool) -> QuotaReport {
         credits,
         message: None,
         fetched_at: Some(now_secs()),
+        retry_after: None,
     }
 }
 
@@ -2274,6 +2494,7 @@ mod tests {
                     credits: None,
                     message: None,
                     fetched_at: Some(1_795_000_000),
+                    retry_after: None,
                 },
                 2 => QuotaReport::error("Claude usage endpoint returned HTTP 429"),
                 3 => QuotaReport {
@@ -2290,6 +2511,7 @@ mod tests {
                     credits: None,
                     message: None,
                     fetched_at: Some(1_795_000_300),
+                    retry_after: None,
                 },
                 _ => QuotaReport::unavailable("Session expired"),
             }
@@ -2366,6 +2588,7 @@ mod tests {
                     credits: None,
                     message: None,
                     fetched_at: Some(1_795_000_000),
+                    retry_after: None,
                 }
             }
         })
@@ -2385,6 +2608,153 @@ mod tests {
         let cached = claude(&poller, QuotaFetch::Cached);
         assert_eq!(cached.status, QuotaStatus::Ok);
         assert_eq!(*lock(&calls), 2);
+    }
+
+    #[test]
+    fn poller_honors_retry_after_on_rate_limited_errors() {
+        let calls = Arc::new(Mutex::new(0_u32));
+        let counter = Arc::clone(&calls);
+        let poller = QuotaPoller::new(move |_, _| {
+            let n = {
+                let mut guard = lock(&counter);
+                *guard += 1;
+                *guard
+            };
+            match n {
+                1 => QuotaReport {
+                    status: QuotaStatus::Ok,
+                    plan: Some("Max".to_owned()),
+                    windows: vec![QuotaWindow {
+                        label: "5-hour session".to_owned(),
+                        short_label: Some("5h".to_owned()),
+                        model: None,
+                        used_percent: 33.0,
+                        resets_at: Some(1_800_000_000),
+                        detail: None,
+                    }],
+                    credits: None,
+                    message: None,
+                    fetched_at: Some(1_795_000_000),
+                    retry_after: None,
+                },
+                2 => QuotaReport::rate_limited("rate limited", Duration::from_mins(5)),
+                _ => QuotaReport::rate_limited("expired cooldown", Duration::ZERO),
+            }
+        })
+        .with_cache_ttls(Duration::from_mins(5), Duration::ZERO);
+
+        // Probe 1 succeeds so `last_ok` is populated.
+        let _ = claude(&poller, QuotaFetch::Cached);
+        poller.join_probes();
+        assert_eq!(*lock(&calls), 1);
+
+        // Probe 2 fails with rate_limited: `store` preserves `last_ok` windows AND `retry_after`.
+        let _ = claude(&poller, QuotaFetch::Refresh);
+        poller.join_probes();
+        assert_eq!(*lock(&calls), 2);
+
+        // Even with zero error_cache_ttl, retry_after keeps Cached from re-probing.
+        let cached = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(cached.status, QuotaStatus::Error);
+        assert_eq!(cached.message.as_deref(), Some("rate limited"));
+        assert_eq!(cached.windows.len(), 1);
+        assert_eq!(cached.retry_after, Some(Duration::from_mins(5)));
+        assert_eq!(*lock(&calls), 2);
+
+        // Explicit Refresh still probes (e.g. after user runs `claude` in a terminal).
+        let _ = claude(&poller, QuotaFetch::Refresh);
+        poller.join_probes();
+        assert_eq!(*lock(&calls), 3);
+
+        // Once retry_after has elapsed (Duration::ZERO), Cached re-probes again.
+        let retry = claude(&poller, QuotaFetch::Cached);
+        assert_eq!(retry.status, QuotaStatus::Loading);
+        poller.join_probes();
+        assert_eq!(*lock(&calls), 4);
+    }
+
+    #[test]
+    fn claude_refresh_backoff_escalates_and_bypasses_when_token_changes() {
+        let mut backoff = TokenRateLimitBackoff::default();
+        let t0 = Instant::now();
+        assert_eq!(backoff.remaining("rt-1", t0), None);
+
+        let w1 = backoff.record_rate_limit("rt-1", t0);
+        assert_eq!(w1, Duration::from_mins(5));
+        assert_eq!(
+            backoff.remaining("rt-1", t0 + Duration::from_secs(60)),
+            Some(Duration::from_secs(240))
+        );
+        // A fresh token (e.g. from `claude` CLI) bypasses the old cooldown immediately.
+        assert_eq!(
+            backoff.remaining("rt-2", t0 + Duration::from_secs(60)),
+            None
+        );
+
+        // Consecutive 429s escalate up to RATE_LIMIT_MAX_BACKOFF (15 min).
+        let t1 = t0 + w1;
+        assert_eq!(backoff.remaining("rt-1", t1), None);
+        let w2 = backoff.record_rate_limit("rt-1", t1);
+        assert_eq!(w2, Duration::from_mins(10));
+        let w3 = backoff.record_rate_limit("rt-1", t1 + w2);
+        assert_eq!(w3, Duration::from_mins(15));
+        let w4 = backoff.record_rate_limit("rt-1", t1 + w2 + w3);
+        assert_eq!(w4, Duration::from_mins(15));
+
+        backoff.clear();
+        assert_eq!(backoff.remaining("rt-1", t1 + w2 + w3), None);
+
+        let refresh_msg = format_claude_refresh_rate_limit(Duration::from_secs(250));
+        assert!(refresh_msg.contains("HTTP 429"));
+        assert!(refresh_msg.contains("~5 min"));
+        assert!(refresh_msg.contains("`claude`"));
+        assert!(!refresh_msg.contains("click Refresh"));
+
+        let usage_msg = format_claude_usage_rate_limit(Duration::from_secs(250));
+        assert!(usage_msg.contains("HTTP 429"));
+        assert!(usage_msg.contains("~5 min"));
+    }
+
+    #[test]
+    fn claude_status_errors_and_refresh_outcomes_map_retry_after() {
+        let forbidden = claude_usage_status_error(403);
+        assert_eq!(forbidden.status, QuotaStatus::Unavailable);
+        assert_eq!(forbidden.retry_after, None);
+
+        let limited = claude_usage_status_error(429);
+        assert_eq!(limited.status, QuotaStatus::Error);
+        assert_eq!(limited.retry_after, Some(RATE_LIMIT_CACHE_TTL));
+
+        let server_err = claude_usage_status_error(503);
+        assert_eq!(server_err.status, QuotaStatus::Error);
+        assert_eq!(server_err.retry_after, None);
+
+        let preserved = preserve_retry_after(server_err, Duration::from_mins(10));
+        assert_eq!(preserved.retry_after, Some(Duration::from_mins(10)));
+        let preserved_max = preserve_retry_after(limited, Duration::from_mins(10));
+        assert_eq!(preserved_max.retry_after, Some(Duration::from_mins(10)));
+        let preserved_unavail = preserve_retry_after(forbidden, Duration::from_mins(10));
+        assert_eq!(preserved_unavail.retry_after, None);
+
+        let reauth = RefreshOutcome::ReauthRequired.into_report();
+        assert_eq!(reauth.status, QuotaStatus::Unavailable);
+        assert_eq!(reauth.retry_after, None);
+
+        let rl = RefreshOutcome::RateLimited {
+            message: "slow down".to_owned(),
+            retry_after: Duration::from_mins(10),
+        }
+        .into_report();
+        assert_eq!(rl.status, QuotaStatus::Error);
+        assert_eq!(rl.retry_after, Some(Duration::from_mins(10)));
+
+        let transient = RefreshOutcome::Transient("oops".to_owned()).into_report();
+        assert_eq!(transient.status, QuotaStatus::Error);
+        assert_eq!(transient.retry_after, None);
+
+        assert!(!is_token_past_expiry(None, 1_000));
+        assert!(is_token_past_expiry(Some(1_000_000), 1_000));
+        assert!(!is_token_past_expiry(Some(1_030_000), 1_000));
     }
 
     #[test]

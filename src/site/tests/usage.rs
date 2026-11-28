@@ -37,6 +37,7 @@ fn usage_lists_installed_built_in_agents_with_live_quotas_and_refresh() {
             credits: None,
             message: None,
             fetched_at: Some(1_795_000_000),
+            retry_after: None,
         }
     });
 
