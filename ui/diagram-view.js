@@ -210,7 +210,7 @@ export function diagramView({
   });
   let topPickerEl = null;
   let topPickerKey = null;
-  tools.append(kindsGroup, searchInput, updateButton);
+  tools.append(kindsGroup, searchInput);
 
   // The Flows list (`renderFlows`): the box that asks for a flow, and a row per flow. Built once
   // and changed in place, so a redraw while a run streams keeps what is typed and the caret,
@@ -506,7 +506,7 @@ export function diagramView({
         topPickerKey = null;
       }
       searchInput.hidden = true;
-      updateButton.hidden = true;
+      updateButton.remove();
       return;
     }
     // Analyze deeper of a path no node covers adds an Architecture at the top: there may be
@@ -535,8 +535,12 @@ export function diagramView({
     // the Update of a checkout on another history, it is the one Update.
     const stale = counts.outdated > 0 || unmappedOf(diagram);
     const showUpdate = !view.change && stale && !divergedShown();
-    updateButton.hidden = !showUpdate;
-    if (showUpdate) updateButton.disabled = Boolean(liveRun());
+    if (showUpdate) {
+      updateButton.disabled = Boolean(liveRun());
+      if (!updateButton.isConnected) tools.append(updateButton);
+    } else {
+      updateButton.remove();
+    }
   }
 
   // A choice among the diagrams `tops` at the top of the shown kind, `top` selected.

@@ -2204,14 +2204,21 @@ test("a stripe's node keeps the focus when the map, opened by the stripe, reads 
   await page.locator("#toggle-map").click();
   await page.locator("#map").waitFor({ state: "hidden" });
 
-  // The map opens drawn from the analysis it holds, at once, and draws again once it has read
-  // it anew. The card focused by the click is taken in the click's own task, before that.
+  // The map opens drawn from the analysis it holds, at once, and reads api/analysis anew.
+  // When the analysis is unchanged, the SVG is reused in place so the focused card stays
+  // connected and focused without teardown.
+  const analysisRead = page.waitForResponse(
+    (response) => response.url().endsWith("/api/analysis") && response.status() === 200,
+  );
   await page.evaluate(() => {
     document.querySelector('#code-rows .ln[data-line="9"] .map-stripe').click();
     window.focusedCard = document.activeElement;
   });
   assert.equal(await page.evaluate(() => window.focusedCard.dataset.nodeId), "D1.3");
-  await page.waitForFunction(() => !window.focusedCard.isConnected);
+  await analysisRead;
+  // Wait a frame so any post-fetch render completes.
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(resolve)));
+  assert.equal(await page.evaluate(() => window.focusedCard.isConnected), true);
   assert.equal(await page.evaluate(() => document.activeElement?.dataset?.nodeId), "D1.3");
 });
 
