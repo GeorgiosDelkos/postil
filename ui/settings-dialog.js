@@ -216,7 +216,14 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge, onMemo
     if (!ui.view) body.append(el("p", "settings-hint", "Loading…"));
     else {
       if (ui.view.problem) body.append(problem());
-      body.append(appearance(), startup(), agents(), capabilityTiers(), executionLanes(), teamMemory());
+      body.append(
+        appearance(),
+        startup(),
+        agents(),
+        capabilityTiers(),
+        executionLanes(),
+        teamMemory(),
+      );
     }
     node.append(header, body, footer());
     return node;
@@ -615,10 +622,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge, onMemo
       state?.kind === "ready" && backend.storage !== "unknown"
         ? `${shown.label} · ${backend.detail}`
         : shown.label;
-    text.append(
-      el("span", "agent-name", "hippius-mem"),
-      el("span", "agent-usage", statusText),
-    );
+    text.append(el("span", "agent-name", "hippius-mem"), el("span", "agent-usage", statusText));
     if (state?.path) {
       text.append(el("span", "agent-command", state.path));
       row.title = `${shown.label}: ${state.path}`;
@@ -768,7 +772,13 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge, onMemo
         ),
         makeField("Bucket", "bucket", form.bucket, "my-team-vault"),
         makeField("Access key ID", "accessKeyId", form.accessKeyId, "AKIA…"),
-        makeField("Secret access key", "secretAccessKey", form.secretAccessKey, "••••••••", "password"),
+        makeField(
+          "Secret access key",
+          "secretAccessKey",
+          form.secretAccessKey,
+          "••••••••",
+          "password",
+        ),
         makeField("Endpoint (optional)", "endpoint", form.endpoint, "https://s3.hippius.com"),
         makeField("Team name (optional)", "team", form.team, "core"),
       );
@@ -783,7 +793,10 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge, onMemo
       area.addEventListener("input", () => {
         form.bundle = area.value;
       });
-      wrap.append(el("span", "settings-hint", "Invite bundle (`hippius-mem join --bundle -`)"), area);
+      wrap.append(
+        el("span", "settings-hint", "Invite bundle (`hippius-mem join --bundle -`)"),
+        area,
+      );
       node.append(wrap);
     }
     if (form.error) {
@@ -793,11 +806,7 @@ export function settingsDialog(dialogEl, { apply, openWizard, quotaBadge, onMemo
     const submit = el(
       "button",
       "button primary",
-      form.submitting
-        ? "Working…"
-        : form.kind === "s3"
-          ? "Upgrade to S3"
-          : "Join Vault",
+      form.submitting ? "Working…" : form.kind === "s3" ? "Upgrade to S3" : "Join Vault",
     );
     submit.type = "submit";
     submit.disabled = Boolean(form.submitting);

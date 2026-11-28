@@ -368,7 +368,8 @@ export function hubView({
           checked: repo.selected,
           ariaLabel: `Include ${repo.name} in priority queue`,
           title: "Include in priority queue",
-          onChange: (checked) => mutateRepo({ action: "select", path: repo.path, selected: checked }),
+          onChange: (checked) =>
+            mutateRepo({ action: "select", path: repo.path, selected: checked }),
         });
         const nameBtn = el("button", "hub-repo-name", repo.name);
         nameBtn.type = "button";
@@ -414,7 +415,9 @@ export function hubView({
 
     // Quick-add from recent projects not yet monitored
     const monitoredPaths = new Set(repos.map((r) => r.path));
-    const suggestions = ui.recent.filter((p) => p.exists && !monitoredPaths.has(p.path)).slice(0, 5);
+    const suggestions = ui.recent
+      .filter((p) => p.exists && !monitoredPaths.has(p.path))
+      .slice(0, 5);
     if (suggestions.length > 0) {
       const sec = el("div", "hub-recent-add");
       sec.append(el("div", "hub-subhead", "Add from Recent"));
@@ -437,7 +440,8 @@ export function hubView({
     const memBtn = el("button", `hub-mem-pill ${mem.kind}`);
     memBtn.type = "button";
     memBtn.title = "Configure hippius-mem (Local Vault or Remote S3) in Settings";
-    const storageIcon = mem.storage === "s3" ? uiIcon("cloud", "hub-meta-icon") : uiIcon("database", "hub-meta-icon");
+    const storageIcon =
+      mem.storage === "s3" ? uiIcon("cloud", "hub-meta-icon") : uiIcon("database", "hub-meta-icon");
     memBtn.append(
       stateMark({ kind: mem.kind, label: `${mem.title}: ${mem.detail}` }),
       storageIcon,
@@ -545,7 +549,11 @@ export function hubView({
     const metaLine = el("div", "hub-insp-meta");
     metaLine.append(
       uiIcon(item.kind === "pullRequest" ? "pr" : "issue", "hub-meta-icon"),
-      el("span", "", `${item.repoName} · ${kindWord} #${item.number} · Score ${item.priorityScore}/100`),
+      el(
+        "span",
+        "",
+        `${item.repoName} · ${kindWord} #${item.number} · Score ${item.priorityScore}/100`,
+      ),
     );
     const titleEl = el("h2", "hub-insp-title", item.title);
 

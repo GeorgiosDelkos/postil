@@ -201,7 +201,8 @@ export function planGateView({
     stripEl.hidden = false;
     const visible = visiblePipelines();
     const head = el("div", "pipeline-head");
-    const kindWord = pipeline.kind === "pullRequest" ? `PR #${pipeline.number}` : `Issue #${pipeline.number}`;
+    const kindWord =
+      pipeline.kind === "pullRequest" ? `PR #${pipeline.number}` : `Issue #${pipeline.number}`;
     head.append(
       el("span", `hub-lane-chip lane-${pipeline.lane}`, `${laneLabel(pipeline.lane)} Lane`),
       uiIcon(pipeline.kind === "pullRequest" ? "pr" : "issue", "hub-meta-icon"),
@@ -362,13 +363,17 @@ export function planGateView({
         );
       }
     } else {
-      planBox.append(el("pre", "hub-insp-desc", pipeline.planReply || "No structured plan captured."));
+      planBox.append(
+        el("pre", "hub-insp-desc", pipeline.planReply || "No structured plan captured."),
+      );
     }
 
     // Right: Plan Judge (Model B)
     const judgeBox = el("section", "plan-box");
     const judgeStage = pipeline.stages.find((s) => s.kind === "planJudge");
-    judgeBox.append(renderStageSubhead("Stage 2 · Plan Judge & Proposals", judgeStage, "Plan Judge"));
+    judgeBox.append(
+      renderStageSubhead("Stage 2 · Plan Judge & Proposals", judgeStage, "Plan Judge"),
+    );
     if (judgeStage?.error && !pipeline.planJudge) {
       judgeBox.append(el("div", "hub-roster-error", `Judge parse note: ${judgeStage.error}`));
     }

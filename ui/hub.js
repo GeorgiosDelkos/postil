@@ -78,7 +78,12 @@ export function memoryBackendSummary(memoryView) {
     return { kind: "unchecked", storage: "unknown", title: "hippius-mem", detail: "Checking…" };
   }
   if (state.kind === "missing") {
-    return { kind: "absent", storage: "unknown", title: "hippius-mem", detail: "Not installed on PATH" };
+    return {
+      kind: "absent",
+      storage: "unknown",
+      title: "hippius-mem",
+      detail: "Not installed on PATH",
+    };
   }
   if (state.kind === "unconfigured") {
     const failed = Boolean(state.problem);
@@ -94,7 +99,12 @@ export function memoryBackendSummary(memoryView) {
     return { kind: "installed", storage: "s3", title: "hippius-mem", detail: where };
   }
   if (backend?.kind === "local") {
-    return { kind: "installed", storage: "local", title: "hippius-mem", detail: "Local trial vault" };
+    return {
+      kind: "installed",
+      storage: "local",
+      title: "hippius-mem",
+      detail: "Local trial vault",
+    };
   }
   return { kind: "installed", storage: "unknown", title: "hippius-mem", detail: "Ready" };
 }

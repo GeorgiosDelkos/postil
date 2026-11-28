@@ -85,7 +85,9 @@ export function prReviewDialog(dialogEl, { notes, onSubmitted }) {
       if (!response.ok) throw new Error(await response.text());
       submitting = false;
       dialogEl.close();
-      onSubmitted(`Submitted review to PR #${pipeline.number} (${comments.length} inline comments).`);
+      onSubmitted(
+        `Submitted review to PR #${pipeline.number} (${comments.length} inline comments).`,
+      );
     } catch (error) {
       submitting = false;
       submitError = String(error.message ?? error);
@@ -97,7 +99,11 @@ export function prReviewDialog(dialogEl, { notes, onSubmitted }) {
     if (!pipeline) return;
     const panel = el("div", "settings-panel pr-review-panel");
     const header = el("header", "settings-header");
-    const title = el("h2", "settings-title", `PR #${pipeline.number} Review · ${laneLabel(pipeline.lane)} Lane`);
+    const title = el(
+      "h2",
+      "settings-title",
+      `PR #${pipeline.number} Review · ${laneLabel(pipeline.lane)} Lane`,
+    );
     title.id = "pr-review-title";
     const close = el("button", "icon-button");
     close.type = "button";
@@ -219,7 +225,11 @@ export function prReviewDialog(dialogEl, { notes, onSubmitted }) {
     body.append(sumLabel);
 
     const footer = el("footer", "settings-footer pr-review-footer");
-    const statusEl = el("span", `settings-status${submitError ? " failed" : ""}`, submitError ?? "");
+    const statusEl = el(
+      "span",
+      `settings-status${submitError ? " failed" : ""}`,
+      submitError ?? "",
+    );
     statusEl.setAttribute("role", "status");
     const btns = el("div", "pr-review-actions");
     const cancel = el("button", "button", "Cancel");

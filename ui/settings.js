@@ -22,7 +22,11 @@ export function codeMetrics(fontSize) {
 // AgentSlot). The analyzer is null when analyses go to the agent notes are sent to.
 
 export const CAPABILITY_TIERS = [
-  ["frontier", "Tier 3 · Frontier", "Hard Lane planning, plan judging, deep implementation & final judge"],
+  [
+    "frontier",
+    "Tier 3 · Frontier",
+    "Hard Lane planning, plan judging, deep implementation & final judge",
+  ],
   ["standard", "Tier 2 · Standard", "Day-to-day implementation & Middle Lane peer reviews"],
   ["fast", "Tier 1 · Fast", "Queue triage, quick checks & Easy Lane trivial tasks"],
 ];

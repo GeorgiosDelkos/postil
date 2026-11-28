@@ -18,10 +18,7 @@ const SVG = "http://www.w3.org/2000/svg";
 const UI_ICON_PATHS = {
   plus: ['<path d="M8 3.25v9.5M3.25 8h9.5"/>'],
   close: ['<path d="M4.25 4.25l7.5 7.5M11.75 4.25l-7.5 7.5"/>'],
-  refresh: [
-    '<path d="M13 8a5 5 0 1 1-1.35-3.42"/>',
-    '<path d="M13 3.25v2.75h-2.75"/>',
-  ],
+  refresh: ['<path d="M13 8a5 5 0 1 1-1.35-3.42"/>', '<path d="M13 3.25v2.75h-2.75"/>'],
   issue: [
     '<circle cx="8" cy="8" r="5.5"/>',
     '<circle cx="8" cy="8" r="1.25" fill="currentColor" stroke="none"/>',
@@ -42,9 +39,7 @@ const UI_ICON_PATHS = {
   arrowRight: ['<path d="M3.5 8h9M9 4.5 12.5 8 9 11.5"/>'],
   chevronDown: ['<path d="M4 6l4 4 4-4"/>'],
   chevronRight: ['<path d="M6 4l4 4-4 4"/>'],
-  sparkles: [
-    '<path d="M8 2.5 9.2 6.8 13.5 8 9.2 9.2 8 13.5 6.8 9.2 2.5 8 6.8 6.8Z"/>',
-  ],
+  sparkles: ['<path d="M8 2.5 9.2 6.8 13.5 8 9.2 9.2 8 13.5 6.8 9.2 2.5 8 6.8 6.8Z"/>'],
   cloud: [
     '<path d="M4.75 12h7a2.5 2.5 0 0 0 .4-4.96A3.75 3.75 0 0 0 5 6.2a2.75 2.75 0 0 0-.25 5.8Z"/>',
   ],
@@ -68,7 +63,7 @@ export function uiIcon(name, className = "") {
       `<svg xmlns="${SVG}">${(UI_ICON_PATHS[name] ?? []).join("")}</svg>`,
       "image/svg+xml",
     );
-    for (const child of [...doc.documentElement.childNodes]) {
+    for (const child of doc.documentElement.childNodes) {
       svg.append(document.importNode(child, true));
     }
     cached = svg;
@@ -82,7 +77,13 @@ export function uiIcon(name, className = "") {
 // A styled Postil checkbox wrapping a native `<input type="checkbox">` so keyboard navigation,
 // screen-reader semantics, and Graphite/Paper visuals all stay uniform across Hub, Plan Gate,
 // and PR Review.
-export function postilCheckbox({ checked = false, disabled = false, ariaLabel = "", title = "", onChange }) {
+export function postilCheckbox({
+  checked = false,
+  disabled = false,
+  ariaLabel = "",
+  title = "",
+  onChange,
+}) {
   const input = el("input", "postil-check");
   input.type = "checkbox";
   input.checked = checked;
