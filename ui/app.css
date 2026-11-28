@@ -6010,10 +6010,21 @@ body.keyboard-input .map-node:focus .map-node-box {
   cursor: default;
 }
 
+body.hub-mode {
+  grid-template-columns: var(--rail-width, 48px) minmax(0, 1fr);
+}
+
+body.hub-mode > .pane,
+body.hub-mode > .divider,
+body.hub-mode .sidebar {
+  display: none;
+}
+
 .hub {
-  position: fixed;
-  inset: 38px 8px 8px var(--rail-width, 48px);
-  z-index: 25;
+  grid-column: 2;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
   background: var(--canvas);
   display: flex;
   flex-direction: column;
@@ -6021,37 +6032,60 @@ body.keyboard-input .map-node:focus .map-node-box {
 
 .hub-shell {
   display: grid;
-  grid-template-columns: minmax(210px, 250px) minmax(260px, 1fr) minmax(300px, 370px);
-  gap: 8px;
+  grid-template-columns:
+    var(--hub-repos-width, 250px)
+    8px
+    minmax(0, 1fr)
+    8px
+    var(--hub-inspector-width, 360px);
   height: 100%;
   min-height: 0;
 }
 
-@media (max-width: 900px) {
-  .hub-shell {
-    grid-template-columns: minmax(180px, 210px) minmax(200px, 1fr) minmax(250px, 310px);
-  }
+.hub-divider {
+  position: relative;
+  cursor: col-resize;
+  outline: none;
+}
+
+.hub-divider::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 3px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.hub-divider:hover::after,
+.hub-divider:focus-visible::after,
+body.resizing .hub-divider.active::after {
+  opacity: 1;
 }
 
 .hub-repos,
 .hub-queue,
 .hub-inspector {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  min-width: 0;
 }
 
 .hub-pane-title {
   font-weight: 600;
   color: var(--text-strong);
   font-size: 12.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .hub-mini-btn {
+  flex: none;
+  white-space: nowrap;
   font-size: 11.5px;
   padding: 3px 8px;
 }
@@ -6248,10 +6282,13 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-mem-title {
   font-weight: 600;
   color: var(--text-strong);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .hub-mem-detail {
   margin-left: auto;
+  min-width: 0;
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6420,6 +6457,11 @@ body.keyboard-input .map-node:focus .map-node-box {
   background: var(--map-wash);
 }
 
+.hub-lane-chip.lane-custom {
+  color: var(--note);
+  background: var(--note-wash);
+}
+
 .hub-card-title {
   font-weight: 600;
   color: var(--text-strong);
@@ -6452,10 +6494,38 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-insp-meta {
   display: flex;
   align-items: center;
-  gap: 5px;
+  flex-wrap: wrap;
+  gap: 6px;
   font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--text-muted);
+}
+
+.hub-score-pill {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text-soft);
+}
+
+.hub-score-pill.tone-attention {
+  color: var(--attention);
+  border-color: var(--attention-border);
+  background: var(--removed-wash);
+}
+
+.hub-score-pill.tone-note {
+  color: var(--note);
+  background: var(--note-wash);
+}
+
+.hub-score-pill.tone-accent {
+  color: var(--accent);
+  background: var(--selection);
 }
 
 .hub-insp-title {
@@ -6466,12 +6536,40 @@ body.keyboard-input .map-node:focus .map-node-box {
 }
 
 .hub-insp-section {
-  padding-top: 8px;
+  padding-top: 10px;
   border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
   min-width: 0;
+}
+
+.hub-eval-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+}
+
+.hub-eval-card.tone-attention {
+  border-left-color: var(--attention);
+}
+
+.hub-eval-card.tone-note {
+  border-left-color: var(--note);
+}
+
+.hub-eval-card.tone-accent {
+  border-left-color: var(--accent);
+}
+
+.hub-eval-card.tone-muted {
+  border-left-color: var(--border-strong);
 }
 
 .hub-insp-text {
@@ -6490,16 +6588,20 @@ body.keyboard-input .map-node:focus .map-node-box {
 
 .hub-insp-desc {
   margin: 0;
-  padding: 8px;
-  border-radius: 5px;
+  padding: 12px 14px;
+  border-radius: 7px;
   background: var(--canvas);
   border: 1px solid var(--border);
   font-family: var(--font-mono);
-  font-size: 11.5px;
-  color: var(--text-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
   white-space: pre-wrap;
-  max-height: 150px;
+  overflow-wrap: anywhere;
+  min-height: 120px;
+  max-height: 360px;
   overflow-y: auto;
+  resize: vertical;
   user-select: text;
 }
 
@@ -6507,10 +6609,11 @@ body.keyboard-input .map-node:focus .map-node-box {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 6px 8px;
-  border-radius: 5px;
+  padding: 7px 9px;
+  border-radius: 6px;
   background: var(--card);
   border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
   font-size: 12px;
 }
 
@@ -6538,7 +6641,7 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-lane-picker {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
 }
 
 .hub-lane-opt {
@@ -6546,30 +6649,85 @@ body.keyboard-input .map-node:focus .map-node-box {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 7px 9px;
+  padding: 8px 10px;
   color: var(--text);
   font: inherit;
   cursor: pointer;
+  transition: border-color 100ms ease, background-color 100ms ease;
 }
 
-.hub-lane-opt.active {
+.hub-lane-opt:hover {
+  border-color: var(--border-strong);
+  background: var(--hover);
+}
+
+.hub-lane-opt.active.lane-easy {
+  border-color: var(--added);
+  background: var(--added-wash);
+}
+
+.hub-lane-opt.active.lane-middle {
   border-color: var(--accent);
   background: var(--selection);
+}
+
+.hub-lane-opt.active.lane-hard {
+  border-color: var(--map);
+  background: var(--map-wash);
+}
+
+.hub-lane-opt.active.lane-custom {
+  border-color: var(--note);
+  background: var(--note-wash);
 }
 
 .hub-lane-opt-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 6px;
   font-weight: 600;
   font-size: 12.5px;
   color: var(--text-strong);
+}
+
+.hub-lane-opt-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.hub-lane-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-muted);
+}
+
+.hub-lane-dot.lane-easy {
+  background: var(--added);
+}
+
+.hub-lane-dot.lane-middle {
+  background: var(--accent);
+}
+
+.hub-lane-dot.lane-hard {
+  background: var(--map);
+}
+
+.hub-lane-dot.lane-custom {
+  background: var(--note);
 }
 
 .hub-rec-badge {
   font-size: 10.5px;
   font-weight: 600;
   color: var(--accent);
+  background: var(--selection);
+  padding: 1px 6px;
+  border-radius: 4px;
 }
 
 .hub-lane-opt-desc {
@@ -6581,39 +6739,174 @@ body.keyboard-input .map-node:focus .map-node-box {
 .hub-stage-roster {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px;
-  border-radius: 6px;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 7px;
   background: var(--canvas);
   border: 1px solid var(--border);
+  border-top: 2px solid var(--accent);
+}
+
+.hub-stage-roster.lane-easy {
+  border-top-color: var(--added);
+}
+
+.hub-stage-roster.lane-middle {
+  border-top-color: var(--accent);
+}
+
+.hub-stage-roster.lane-hard {
+  border-top-color: var(--map);
+}
+
+.hub-stage-roster.lane-custom {
+  border-top-color: var(--note);
+}
+
+.hub-roster-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.hub-roster-head .hub-subhead {
+  margin-bottom: 0;
+}
+
+.hub-roster-reset {
+  padding: 2px 7px;
+  font-size: 11px;
 }
 
 .hub-stage-row {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  column-gap: 4px;
+  grid-template-columns: 20px minmax(0, 1fr);
+  column-gap: 8px;
+  row-gap: 5px;
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--card);
+  border: 1px solid var(--border);
   font-size: 11.5px;
 }
 
 .hub-stage-num {
-  color: var(--text-muted);
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
   font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  background: var(--selection);
+  color: var(--accent);
+}
+
+.hub-stage-num.lane-easy {
+  background: var(--added-wash);
+  color: var(--added);
+}
+
+.hub-stage-num.lane-middle {
+  background: var(--selection);
+  color: var(--accent);
+}
+
+.hub-stage-num.lane-hard {
+  background: var(--map-wash);
+  color: var(--map);
+}
+
+.hub-stage-num.lane-custom {
+  background: var(--note-wash);
+  color: var(--note);
+}
+
+.hub-stage-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
 }
 
 .hub-stage-name {
   color: var(--text-strong);
-  font-weight: 500;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.hub-stage-model {
-  grid-column: 2;
+.hub-stage-tags {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  flex-wrap: wrap;
-  color: var(--text-muted);
+  gap: 4px;
+  flex: none;
+}
+
+.hub-tier-pill,
+.hub-mode-pill {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.hub-tier-pill.tier-fast {
+  color: var(--added);
+  background: var(--added-wash);
+}
+
+.hub-tier-pill.tier-standard {
+  color: var(--accent);
+  background: var(--selection);
+}
+
+.hub-tier-pill.tier-frontier {
+  color: var(--map);
+  background: var(--map-wash);
+}
+
+.hub-mode-pill.mode-ro {
+  color: var(--text-muted);
+  background: var(--canvas);
+  border: 1px solid var(--border);
+}
+
+.hub-mode-pill.mode-rw {
+  color: var(--note);
+  background: var(--note-wash);
+}
+
+.hub-stage-controls {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.hub-stage-select {
+  height: 26px;
+  padding: 0 22px 0 7px;
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.hub-stage-agent {
+  flex: 0 1 42%;
+}
+
+.hub-stage-model-select {
+  flex: 1 1 58%;
 }
 
 .hub-roster-error {

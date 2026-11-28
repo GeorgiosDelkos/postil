@@ -30,6 +30,8 @@ pub(crate) enum Lane {
     Middle,
     /// Complex/high-risk task: 2 Frontier models plan + judge plan, then implement + >=2 reviews + final judge.
     Hard,
+    /// Customized stage roster with per-stage agent/model overrides chosen from the Hub view.
+    Custom,
 }
 
 impl Lane {
@@ -39,6 +41,7 @@ impl Lane {
             Self::Easy => "Easy",
             Self::Middle => "Middle",
             Self::Hard => "Hard",
+            Self::Custom => "Custom",
         }
     }
 }
@@ -322,6 +325,7 @@ pub(crate) fn resolve_stages(
             )?;
             Ok(vec![plan, plan_judge, implement, rev1, rev2, judge])
         }
+        (Lane::Custom, kind) => resolve_stages(settings, Lane::Middle, kind),
         (Lane::Hard, WorkKind::PullRequest) => {
             let ctx = make(StageKind::Plan, CapabilityTier::Frontier, true, 0, None)?;
             let rev1 = make(

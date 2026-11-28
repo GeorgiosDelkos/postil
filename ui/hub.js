@@ -8,7 +8,7 @@ export const PRIORITY_META = {
   P3: { id: "P3", label: "P3 · Low", tone: "muted" },
 };
 
-export const LANES = ["easy", "middle", "hard"];
+export const LANES = ["easy", "middle", "hard", "custom"];
 
 // Filters Hub items by kind ("all" | "issue" | "pullRequest"), priority ("all" | "P0".."P3"),
 // and a case-insensitive search query over title, repo name, number, and labels.
@@ -50,6 +50,9 @@ export function groupByPriority(items) {
 
 // Concise description of what each lane runs for an issue or pull request.
 export function laneSummary(lane, kind) {
+  if (lane === "custom") {
+    return "Customized stage roster · pick agent & model per stage";
+  }
   if (kind === "pullRequest") {
     if (lane === "easy") return "1 Fast/Standard reviewer · no extra verification pass";
     if (lane === "middle") return "Primary reviewer + independent second-opinion verifier";
@@ -64,7 +67,25 @@ export function laneSummary(lane, kind) {
 export function laneLabel(lane) {
   if (lane === "easy") return "Easy";
   if (lane === "hard") return "Hard";
+  if (lane === "custom") return "Custom";
   return "Middle";
+}
+
+// Returns a new stage list with stage `index` updated to `{ agent, model }` and cross-model
+// `diverse` flags recomputed against the preceding stage.
+export function applyStageOverride(stages, index, { agent, model }) {
+  const next = stages.map((st, idx) => {
+    if (idx !== index) return { ...st };
+    const nextAgent = agent ?? st.agent;
+    const nextModel =
+      agent !== undefined && agent !== st.agent ? (model ?? null) : (model === undefined ? st.model : model);
+    return { ...st, agent: nextAgent, model: nextModel || null };
+  });
+  for (let idx = 1; idx < next.length; idx += 1) {
+    const prev = next[idx - 1];
+    next[idx].diverse = next[idx].agent !== prev.agent || next[idx].model !== prev.model;
+  }
+  return next;
 }
 
 // Summarizes hippius-mem storage backend status for the Hub sidebar and Settings.
@@ -127,4 +148,64 @@ export function formatAge(value, nowMs = Date.now()) {
 // Stable unique key for an item in the Hub priority queue.
 export function itemKey(item) {
   return `${item.repoPath}::${item.kind}::${item.number}`;
+}
+
+// Resizable pane widths for the 3-pane Hub shell (Monitored Repos, Priority Queue, Inspector).
+// Kept pure here so `node --test` tests them alongside `ui/panes.js`.
+export const HUB_PANE_DEFAULTS = { repos: 250, inspector: 360 };
+export const HUB_PANE_LIMITS = { repos: [180, 480], inspector: [280, 720] };
+export const HUB_QUEUE_MIN = 260;
+export const HUB_DIVIDER_GAPS = 16;
+
+const clamp = (value, [min, max]) => Math.min(Math.max(value, min), max);
+const within = (value, min, max) => Math.max(Math.min(value, max), min);
+
+// Fits the left repos pane and right inspector pane into `shellWidth` px while keeping at least
+// `HUB_QUEUE_MIN` px for the center queue. The inspector gives way first, then the repos pane.
+export function fitHubPanes(layout, shellWidth, limits = HUB_PANE_LIMITS) {
+  let repos = clamp(layout.repos, limits.repos);
+  let inspector = clamp(layout.inspector, limits.inspector);
+  if (!Number.isFinite(shellWidth) || shellWidth <= 0) return { repos, inspector };
+  let excess = repos + inspector + HUB_QUEUE_MIN + HUB_DIVIDER_GAPS - shellWidth;
+  const give = (current, min) => {
+    const given = Math.max(0, Math.min(excess, current - min));
+    excess -= given;
+    return current - given;
+  };
+  inspector = give(inspector, limits.inspector[0]);
+  repos = give(repos, limits.repos[0]);
+  return { repos, inspector };
+}
+
+function widestHubPanes(layout, shellWidth, limits = HUB_PANE_LIMITS) {
+  const drawn = fitHubPanes(layout, shellWidth, limits);
+  const room = shellWidth - HUB_QUEUE_MIN - HUB_DIVIDER_GAPS;
+  return {
+    repos: Math.min(limits.repos[1], room - limits.inspector[0]),
+    inspector: Math.min(limits.inspector[1], room - drawn.repos),
+  };
+}
+
+function movedHubPane(layout, divider, value, shellWidth, limits = HUB_PANE_LIMITS) {
+  const max = widestHubPanes(layout, shellWidth, limits)[divider];
+  return { ...layout, [divider]: within(Math.round(value), limits[divider][0], max) };
+}
+
+// Computes the updated Hub layout when `divider` ("repos" | "inspector") is dragged to `relX`
+// (pointer X relative to `.hub-shell`'s left edge) inside a shell `shellWidth` px wide.
+export function dragHubPane(layout, divider, relX, shellWidth, limits = HUB_PANE_LIMITS) {
+  const value = divider === "repos" ? relX - 4 : shellWidth - relX - 4;
+  return movedHubPane(layout, divider, value, shellWidth, limits);
+}
+
+// Moves a focused Hub divider by `delta` px (ArrowRight positive, ArrowLeft negative).
+export function stepHubPane(layout, divider, delta, shellWidth, limits = HUB_PANE_LIMITS) {
+  const sign = divider === "repos" ? 1 : -1;
+  const drawn = fitHubPanes(layout, shellWidth, limits);
+  return movedHubPane(layout, divider, drawn[divider] + sign * delta, shellWidth, limits);
+}
+
+// Resets one Hub pane back to its default width (double-click on its divider).
+export function resetHubPane(layout, divider, defaults = HUB_PANE_DEFAULTS) {
+  return { ...layout, [divider]: defaults[divider] };
 }

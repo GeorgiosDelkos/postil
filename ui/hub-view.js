@@ -9,18 +9,52 @@
 
 import { agentLogoIcon, el, postilCheckbox, uiIcon } from "./dom.js";
 import {
+  HUB_PANE_DEFAULTS,
+  HUB_PANE_LIMITS,
   LANES,
+  PRIORITY_META,
+  applyStageOverride,
+  dragHubPane,
   filterHubItems,
+  fitHubPanes,
   formatAge,
   groupByPriority,
   itemKey,
   laneLabel,
   laneSummary,
   memoryBackendSummary,
+  resetHubPane,
+  stepHubPane,
 } from "./hub.js";
-import { stateMark, toggleSwitch } from "./settings-controls.js";
+import { BIG_STEP, STEP } from "./panes.js";
+import { modelReports, modelSelect, stateMark, toggleSwitch } from "./settings-controls.js";
 
 const POLL_SYNC_MS = 1000;
+const HUB_LAYOUT_KEY = "postil.hub.layout";
+
+function loadHubLayout() {
+  try {
+    const raw = localStorage.getItem(HUB_LAYOUT_KEY);
+    if (!raw) return { ...HUB_PANE_DEFAULTS };
+    const parsed = JSON.parse(raw);
+    const repos = Number(parsed?.repos);
+    const inspector = Number(parsed?.inspector);
+    return {
+      repos: Number.isFinite(repos) ? repos : HUB_PANE_DEFAULTS.repos,
+      inspector: Number.isFinite(inspector) ? inspector : HUB_PANE_DEFAULTS.inspector,
+    };
+  } catch {
+    return { ...HUB_PANE_DEFAULTS };
+  }
+}
+
+function saveHubLayout(layout) {
+  try {
+    localStorage.setItem(HUB_LAYOUT_KEY, JSON.stringify(layout));
+  } catch {
+    // Ignore storage quota / privacy mode errors.
+  }
+}
 
 export function hubView({
   hubEl,
@@ -40,6 +74,8 @@ export function hubView({
     query: "",
     selectedKey: null,
     chosenLane: null,
+    baseLane: null,
+    customStages: null,
     humanGate: true,
     stagePreview: null,
     stagePreviewKey: null,
@@ -48,8 +84,17 @@ export function hubView({
     launching: false,
     pollTimer: null,
     loadSeq: 0,
+    layout: loadHubLayout(),
+    dragging: null,
     dom: null,
   };
+
+  const models = modelReports({
+    onChange: () => {
+      if (ui.shown) render();
+    },
+    onError: () => {},
+  });
 
   async function fetchJson(route, init) {
     const response = await fetch(route, init);
@@ -116,6 +161,8 @@ export function hubView({
     const settingsView = getSettingsView?.() ?? null;
     ui.selectedKey = itemKey(item);
     ui.chosenLane = item.recommendedLane;
+    ui.baseLane = item.recommendedLane;
+    ui.customStages = null;
     ui.humanGate = settingsView?.settings?.lanes?.hardHumanGate ?? true;
     ui.stagePreviewKey = null;
     ui.stagePreview = null;
@@ -124,14 +171,15 @@ export function hubView({
   }
 
   async function fetchStagePreview(lane, kind) {
-    const key = `${lane}:${kind}`;
+    const previewLane = lane === "custom" ? (ui.baseLane ?? "middle") : lane;
+    const key = `${previewLane}:${kind}`;
     if (ui.stagePreviewKey === key && (ui.stagePreview || ui.stagePreviewError)) return;
     ui.stagePreviewKey = key;
     ui.stagePreview = null;
     ui.stagePreviewError = null;
     try {
       const reply = await fetchJson(
-        `api/lanes/preview?lane=${encodeURIComponent(lane)}&kind=${encodeURIComponent(kind)}`,
+        `api/lanes/preview?lane=${encodeURIComponent(previewLane)}&kind=${encodeURIComponent(kind)}`,
       );
       if (ui.stagePreviewKey !== key) return;
       ui.stagePreview = reply;
@@ -141,6 +189,22 @@ export function hubView({
       ui.stagePreviewError = String(error.message ?? error);
       render();
     }
+  }
+
+  function activeStages() {
+    if (ui.chosenLane === "custom" && ui.customStages) return ui.customStages;
+    return ui.stagePreview?.stages ?? null;
+  }
+
+  function editStage(index, patch) {
+    const current = activeStages();
+    if (!current || index < 0 || index >= current.length) return;
+    if (ui.chosenLane !== "custom") {
+      ui.baseLane = ui.chosenLane ?? "middle";
+    }
+    ui.customStages = applyStageOverride(current, index, patch);
+    ui.chosenLane = "custom";
+    render();
   }
 
   async function reEvaluate(item) {
@@ -163,6 +227,8 @@ export function hubView({
       }
       if (ui.selectedKey === targetKey) {
         ui.chosenLane = updated.recommendedLane;
+        ui.baseLane = updated.recommendedLane;
+        ui.customStages = null;
         ui.stagePreviewKey = null;
       }
     } catch (error) {
@@ -178,7 +244,10 @@ export function hubView({
     ui.launching = true;
     render();
     try {
-      await launchLane({
+      const stages = activeStages();
+      const hasPlanJudge =
+        lane === "hard" || (lane === "custom" && Boolean(stages?.some((s) => s.kind === "planJudge")));
+      const payload = {
         repoPath: item.repoPath,
         lane,
         kind: item.kind,
@@ -189,9 +258,19 @@ export function hubView({
         labels: item.labels,
         baseBranch: item.baseRef,
         headBranch: item.headRef,
-        humanGate: lane === "hard" ? ui.humanGate : false,
+        humanGate: hasPlanJudge ? ui.humanGate : false,
         memories: item.memories ?? [],
-      });
+      };
+      if (lane === "custom") {
+        payload.baseLane = ui.baseLane ?? "middle";
+        if (ui.customStages?.length) {
+          payload.stageOverrides = ui.customStages.map((st) => ({
+            agent: st.agent,
+            model: st.model ?? null,
+          }));
+        }
+      }
+      await launchLane(payload);
     } catch (error) {
       onError(String(error.message ?? error));
     } finally {
@@ -207,11 +286,13 @@ export function hubView({
 
     // Left pane: Monitored Repos
     const reposPane = el("aside", "pane hub-repos");
+    reposPane.id = "hub-repos";
     const reposHeader = el("header", "pane-header");
     reposHeader.dataset.drag = "";
     const addBtn = el("button", "button hub-mini-btn hub-icon-btn");
     addBtn.type = "button";
-    addBtn.append(uiIcon("plus"), el("span", "", "Monitor…"));
+    addBtn.title = "Add repository to monitoring";
+    addBtn.append(uiIcon("plus"), el("span", "", "Add"));
     addBtn.addEventListener("click", () => chooseFolderForHub());
     reposHeader.append(el("span", "hub-pane-title", "Monitored Repos"), addBtn);
     const repoList = el("div", "hub-repo-list");
@@ -220,6 +301,7 @@ export function hubView({
 
     // Center pane: Priority Queue (static header + search input so typing never loses focus)
     const queuePane = el("section", "pane hub-queue");
+    queuePane.id = "hub-queue";
     const queueHeader = el("header", "pane-header hub-queue-header");
     queueHeader.dataset.drag = "";
 
@@ -290,17 +372,98 @@ export function hubView({
 
     // Right pane: Evaluation & Lane Launch
     const inspPane = el("aside", "pane hub-inspector");
+    inspPane.id = "hub-inspector";
     const inspHeader = el("header", "pane-header");
     inspHeader.dataset.drag = "";
-    inspHeader.append(el("span", "hub-pane-title", "Evaluation & Lane Launch"));
+    const inspLaneChip = el("span", "hub-lane-chip");
+    inspLaneChip.hidden = true;
+    inspHeader.append(el("span", "hub-pane-title", "Evaluation & Lane Launch"), inspLaneChip);
     const inspBody = el("div", "hub-inspector-body");
     const inspFoot = el("footer", "hub-insp-foot");
     inspPane.append(inspHeader, inspBody, inspFoot);
 
-    shell.append(reposPane, queuePane, inspPane);
+    function makeDivider(key, label, controlsId) {
+      const div = el("div", "hub-divider");
+      div.id = `divider-hub-${key}`;
+      div.setAttribute("role", "separator");
+      div.setAttribute("aria-orientation", "vertical");
+      div.setAttribute("aria-label", label);
+      div.setAttribute("aria-controls", controlsId);
+      const [min, max] = HUB_PANE_LIMITS[key];
+      div.setAttribute("aria-valuemin", String(min));
+      div.setAttribute("aria-valuemax", String(max));
+      div.tabIndex = 0;
+      div.title = "Drag to resize · double-click to reset";
+
+      let dragRaf = null;
+      let dragClientX = 0;
+      const applyDrag = () => {
+        const rect = shell.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        ui.layout = dragHubPane(ui.layout, key, dragClientX - rect.left, rect.width);
+        drawHubLayout();
+      };
+      const stop = () => {
+        if (ui.dragging !== key) return;
+        if (dragRaf !== null) {
+          cancelAnimationFrame(dragRaf);
+          dragRaf = null;
+          applyDrag();
+        }
+        ui.dragging = null;
+        div.classList.remove("active");
+        document.body.classList.remove("resizing");
+        saveHubLayout(ui.layout);
+      };
+      div.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        div.setPointerCapture(event.pointerId);
+        ui.dragging = key;
+        div.classList.add("active");
+        document.body.classList.add("resizing");
+      });
+      div.addEventListener("pointermove", (event) => {
+        if (ui.dragging !== key) return;
+        if ((event.buttons & 1) === 0) return stop();
+        dragClientX = event.clientX;
+        if (dragRaf !== null) return;
+        dragRaf = requestAnimationFrame(() => {
+          dragRaf = null;
+          if (ui.dragging !== key) return;
+          applyDrag();
+        });
+      });
+      div.addEventListener("lostpointercapture", stop);
+      div.addEventListener("dblclick", () => {
+        ui.layout = resetHubPane(ui.layout, key);
+        drawHubLayout();
+        saveHubLayout(ui.layout);
+      });
+      div.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = shell.getBoundingClientRect();
+        const size = event.shiftKey ? BIG_STEP : STEP;
+        const delta = event.key === "ArrowRight" ? size : -size;
+        ui.layout = stepHubPane(ui.layout, key, delta, rect.width);
+        drawHubLayout();
+        saveHubLayout(ui.layout);
+      });
+      return div;
+    }
+
+    const reposDivider = makeDivider("repos", "Monitored repositories width", "hub-repos");
+    const inspDivider = makeDivider("inspector", "Evaluation panel width", "hub-inspector");
+
+    shell.append(reposPane, reposDivider, queuePane, inspDivider, inspPane);
     hubEl.replaceChildren(shell);
 
     ui.dom = {
+      shell,
+      reposDivider,
+      inspDivider,
       repoList,
       reposFoot,
       kindButtons,
@@ -310,16 +473,41 @@ export function hubView({
       syncLabel,
       searchInput,
       queueList,
+      inspLaneChip,
       inspBody,
       inspFoot,
     };
+    drawHubLayout();
     return ui.dom;
   }
+
+  function drawHubLayout() {
+    if (!ui.dom) return;
+    const { shell, reposDivider, inspDivider } = ui.dom;
+    const shellWidth = shell.getBoundingClientRect().width;
+    const drawn = fitHubPanes(ui.layout, shellWidth);
+    shell.style.setProperty("--hub-repos-width", `${drawn.repos}px`);
+    shell.style.setProperty("--hub-inspector-width", `${drawn.inspector}px`);
+    reposDivider.setAttribute("aria-valuenow", String(drawn.repos));
+    inspDivider.setAttribute("aria-valuenow", String(drawn.inspector));
+  }
+
+  let resizeRaf = null;
+  window.addEventListener("resize", () => {
+    if (!ui.shown || !ui.dom || resizeRaf !== null) return;
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = null;
+      if (ui.shown) drawHubLayout();
+    });
+  });
 
   function render() {
     if (!ui.shown) return;
     const dom = ensureShell();
     const settingsView = getSettingsView?.() ?? null;
+    if (settingsView?.settings) {
+      models.request(settingsView.settings);
+    }
     const items = visibleItems();
     const selected = activeItem(items);
     if (selected) {
@@ -327,6 +515,8 @@ export function hubView({
       if (ui.selectedKey !== key) {
         ui.selectedKey = key;
         ui.chosenLane = selected.recommendedLane;
+        ui.baseLane = selected.recommendedLane;
+        ui.customStages = null;
         ui.humanGate = settingsView?.settings?.lanes?.hardHumanGate ?? true;
       }
       const lane = ui.chosenLane ?? selected.recommendedLane;
@@ -340,7 +530,7 @@ export function hubView({
 
     renderReposContent(dom, settingsView);
     renderQueueContent(dom, items, selected);
-    renderInspectorContent(dom, selected);
+    renderInspectorContent(dom, selected, settingsView);
 
     dom.repoList.scrollTop = repoScroll;
     dom.queueList.scrollTop = queueScroll;
@@ -534,8 +724,9 @@ export function hubView({
     dom.queueList.replaceChildren(frag);
   }
 
-  function renderInspectorContent(dom, item) {
+  function renderInspectorContent(dom, item, settingsView) {
     if (!item) {
+      dom.inspLaneChip.hidden = true;
       dom.inspBody.replaceChildren(
         el("div", "empty", "Select an issue or PR from the queue to inspect and launch."),
       );
@@ -544,21 +735,30 @@ export function hubView({
     }
     dom.inspFoot.hidden = false;
 
+    const lane = ui.chosenLane ?? item.recommendedLane;
+    const prioMeta = PRIORITY_META[item.priority] ?? PRIORITY_META.P2;
+    const tone = prioMeta.tone;
+
+    dom.inspLaneChip.hidden = false;
+    dom.inspLaneChip.className = `hub-lane-chip lane-${lane}`;
+    dom.inspLaneChip.textContent = `${laneLabel(lane)} Lane`;
+
     const frag = document.createDocumentFragment();
-    const kindWord = item.kind === "pullRequest" ? "Pull Request" : "Issue";
     const metaLine = el("div", "hub-insp-meta");
-    metaLine.append(
+    const prioBadge = el("span", `hub-prio-badge tone-${tone}`, item.priority);
+    const repoTag = el("span", "hub-repo-pill", item.repoName);
+    const kindTag = el("span", "hub-kind-pill");
+    kindTag.append(
       uiIcon(item.kind === "pullRequest" ? "pr" : "issue", "hub-meta-icon"),
-      el(
-        "span",
-        "",
-        `${item.repoName} · ${kindWord} #${item.number} · Score ${item.priorityScore}/100`,
-      ),
+      el("span", "", `#${item.number}`),
     );
+    const scoreTag = el("span", `hub-score-pill tone-${tone}`, `Score ${item.priorityScore}/100`);
+    metaLine.append(prioBadge, repoTag, kindTag, scoreTag);
     const titleEl = el("h2", "hub-insp-title", item.title);
 
     const signals = el("div", "hub-insp-section");
-    signals.append(
+    const evalCard = el("div", `hub-eval-card tone-${tone}`);
+    evalCard.append(
       el("div", "hub-subhead", "Priority & Evaluation"),
       el("p", "hub-insp-text", item.priorityReason),
       el("p", "hub-insp-hint", item.laneReason),
@@ -571,7 +771,8 @@ export function hubView({
       el("span", "", ui.evaluating ? "Re-evaluating…" : "Re-evaluate with hippius-mem"),
     );
     evalBtn.addEventListener("click", () => void reEvaluate(item));
-    signals.append(evalBtn);
+    evalCard.append(evalBtn);
+    signals.append(evalCard);
 
     frag.append(metaLine, titleEl, signals);
 
@@ -604,61 +805,135 @@ export function hubView({
       const desc = el("div", "hub-insp-section");
       desc.append(
         el("div", "hub-subhead", "Description"),
-        el("pre", "hub-insp-desc", item.body.trim().slice(0, 1200)),
+        el("pre", "hub-insp-desc", item.body.trim().slice(0, 4000)),
       );
       frag.append(desc);
     }
 
     // Lane selector
-    const lane = ui.chosenLane ?? item.recommendedLane;
     const laneSec = el("div", "hub-insp-section");
     laneSec.append(el("div", "hub-subhead", "Execution Lane"));
     const laneGroup = el("div", "hub-lane-picker");
     for (const candidate of LANES) {
       const active = lane === candidate;
       const rec = item.recommendedLane === candidate;
-      const opt = el("button", `hub-lane-opt${active ? " active" : ""}`);
+      const opt = el("button", `hub-lane-opt lane-${candidate}${active ? " active" : ""}`);
       opt.type = "button";
       opt.addEventListener("click", () => {
+        if (candidate === "custom") {
+          if (!ui.customStages && ui.stagePreview?.stages) {
+            ui.customStages = ui.stagePreview.stages.map((st) => ({ ...st }));
+          }
+          if (ui.chosenLane !== "custom") {
+            ui.baseLane = ui.chosenLane ?? item.recommendedLane;
+          }
+          ui.chosenLane = "custom";
+          render();
+          return;
+        }
         ui.chosenLane = candidate;
+        ui.baseLane = candidate;
+        ui.customStages = null;
         ui.stagePreviewKey = null;
         render();
       });
       const head = el("div", "hub-lane-opt-head");
-      head.append(el("span", "", `${laneLabel(candidate)} Lane`));
+      const nameWrap = el("span", "hub-lane-opt-name");
+      nameWrap.append(el("span", `hub-lane-dot lane-${candidate}`), el("span", "", `${laneLabel(candidate)} Lane`));
+      head.append(nameWrap);
       if (rec) head.append(el("span", "hub-rec-badge", "Recommended"));
       opt.append(head, el("div", "hub-lane-opt-desc", laneSummary(candidate, item.kind)));
       laneGroup.append(opt);
     }
     laneSec.append(laneGroup);
 
-    // Stage Roster preview with Postil's native agent logos
-    const roster = el("div", "hub-stage-roster");
-    if (ui.stagePreviewError) {
+    // Stage Roster preview with inline Agent & Model selectors (editing auto-switches to Custom Lane)
+    const roster = el("div", `hub-stage-roster lane-${lane}`);
+    const stages = activeStages();
+    const enabledAgents = settingsView?.settings?.enabledAgents ?? [];
+    if (ui.stagePreviewError && !ui.customStages) {
       const err = el("div", "hub-roster-error", ui.stagePreviewError);
       const cfg = el("button", "button hub-mini-btn", "Configure Tiers in Settings");
       cfg.type = "button";
       cfg.addEventListener("click", () => openSettings());
       roster.append(err, cfg);
-    } else if (ui.stagePreview?.stages) {
-      roster.append(el("div", "hub-subhead", "Stage Roster (from Capability Tiers)"));
-      for (const [idx, st] of ui.stagePreview.stages.entries()) {
+    } else if (stages) {
+      const rosterHead = el("div", "hub-roster-head");
+      rosterHead.append(
+        el(
+          "div",
+          "hub-subhead",
+          lane === "custom" ? "Stage Roster (Customized)" : "Stage Roster (from Capability Tiers)",
+        ),
+      );
+      if (lane === "custom") {
+        const resetBtn = el("button", "button hub-mini-btn hub-roster-reset", "Reset");
+        resetBtn.type = "button";
+        resetBtn.title = `Reset to ${laneLabel(ui.baseLane ?? item.recommendedLane)} Lane defaults`;
+        resetBtn.addEventListener("click", () => {
+          ui.chosenLane = ui.baseLane ?? item.recommendedLane;
+          ui.customStages = null;
+          render();
+        });
+        rosterHead.append(resetBtn);
+      }
+      roster.append(rosterHead);
+
+      for (const [idx, st] of stages.entries()) {
         const row = el("div", "hub-stage-row");
-        const modelRow = el("span", "hub-stage-model");
-        const logo = agentLogoIcon(st.agent);
-        if (logo) modelRow.append(logo);
-        const who = st.model ? `${st.agent} · ${st.model}` : st.agent;
-        const mode = st.readOnly ? "RO" : "RW";
-        modelRow.append(el("span", "", `${who} (${st.tier}, ${mode})`));
+        const topLine = el("div", "hub-stage-top");
+        const tags = el("span", "hub-stage-tags");
+        if (st.tier) {
+          tags.append(el("span", `hub-tier-pill tier-${st.tier}`, st.tier));
+        }
+        tags.append(
+          el(
+            "span",
+            `hub-mode-pill mode-${st.readOnly ? "ro" : "rw"}`,
+            st.readOnly ? "RO" : "RW",
+          ),
+        );
         if (st.diverse) {
           const divIcon = uiIcon("sparkles", "hub-diverse-icon");
           divIcon.setAttribute("title", "Cross-model diverse pairing");
-          modelRow.append(divIcon);
+          tags.append(divIcon);
         }
+        topLine.append(el("span", "hub-stage-name", st.label), tags);
+
+        const controlsRow = el("div", "hub-stage-controls");
+        const logo = agentLogoIcon(st.agent);
+        if (logo) controlsRow.append(logo);
+
+        const agentChoices = enabledAgents.includes(st.agent)
+          ? enabledAgents
+          : [st.agent, ...enabledAgents];
+        const agentSel = el("select", "select hub-stage-select hub-stage-agent");
+        agentSel.setAttribute("aria-label", `Agent for ${st.label}`);
+        for (const name of agentChoices) {
+          const opt = el("option", "", name);
+          opt.value = name;
+          opt.selected = name === st.agent;
+          agentSel.append(opt);
+        }
+        agentSel.addEventListener("change", () => {
+          editStage(idx, { agent: agentSel.value, model: null });
+        });
+
+        const modelSel = modelSelect(
+          `hub-stage-${idx}-model`,
+          { name: st.agent, model: st.model ?? null },
+          models.models[st.agent],
+          (chosen) => editStage(idx, { model: chosen }),
+        );
+        modelSel.classList.add("hub-stage-select", "hub-stage-model-select");
+        modelSel.setAttribute("aria-label", `Model for ${st.label}`);
+
+        controlsRow.append(agentSel, modelSel);
+
         row.append(
-          el("span", "hub-stage-num", `${idx + 1}.`),
-          el("span", "hub-stage-name", st.label),
-          modelRow,
+          el("span", `hub-stage-num lane-${lane}`, `${idx + 1}`),
+          topLine,
+          controlsRow,
         );
         roster.append(row);
       }
@@ -667,7 +942,9 @@ export function hubView({
     }
     laneSec.append(roster);
 
-    if (lane === "hard" && item.kind === "issue") {
+    const hasPlanJudge =
+      lane === "hard" || (lane === "custom" && Boolean(stages?.some((s) => s.kind === "planJudge")));
+    if (hasPlanJudge && item.kind === "issue") {
       const gateRow = el("div", "hub-gate-toggle");
       const gateSwitch = toggleSwitch(
         "hub-hard-human-gate",
@@ -695,7 +972,7 @@ export function hubView({
     const verb = item.kind === "pullRequest" ? "Review PR" : "Implement";
     const startBtn = el("button", "button primary hub-icon-btn");
     startBtn.type = "button";
-    startBtn.disabled = ui.launching || Boolean(ui.stagePreviewError);
+    startBtn.disabled = ui.launching || (Boolean(ui.stagePreviewError) && !ui.customStages);
     startBtn.append(
       el("span", "", ui.launching ? "Starting…" : `${verb} in ${laneLabel(lane)} Lane`),
       uiIcon("arrowRight"),
@@ -710,11 +987,13 @@ export function hubView({
       document.body.classList.add("hub-mode");
       hubEl.hidden = false;
       render();
+      drawHubLayout();
       void load();
     },
     hide() {
       ui.shown = false;
       clearTimeout(ui.pollTimer);
+      models.reset();
       document.body.classList.remove("hub-mode");
       hubEl.hidden = true;
     },

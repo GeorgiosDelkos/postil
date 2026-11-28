@@ -189,11 +189,24 @@ impl PipelineRun {
     }
 }
 
+/// Per-stage agent/model override sent when launching a customized lane roster.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StageOverride {
+    pub(crate) agent: String,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+}
+
 /// Request payload to start a new Lane pipeline (`POST /api/lane/start`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct StartPipelineRequest {
     pub(crate) lane: Lane,
+    #[serde(default)]
+    pub(crate) base_lane: Option<Lane>,
+    #[serde(default)]
+    pub(crate) stage_overrides: Vec<StageOverride>,
     pub(crate) kind: WorkKind,
     pub(crate) number: u64,
     pub(crate) title: String,
@@ -491,8 +504,43 @@ impl Runner {
                 "pipeline task title cannot be blank".to_owned(),
             ));
         }
-        let resolved: Vec<ResolvedStage> =
-            lane::resolve_stages(settings, request.lane, request.kind)?;
+        let template_lane = match request.lane {
+            Lane::Custom => match request.base_lane {
+                Some(Lane::Custom) | None => Lane::Middle,
+                Some(other) => other,
+            },
+            other => other,
+        };
+        let mut resolved: Vec<ResolvedStage> =
+            lane::resolve_stages(settings, template_lane, request.kind)?;
+        if !request.stage_overrides.is_empty() {
+            if request.stage_overrides.len() != resolved.len() {
+                return Err(Error::BadRequest(format!(
+                    "stageOverrides length {} does not match {} stage(s) for {} lane",
+                    request.stage_overrides.len(),
+                    resolved.len(),
+                    template_lane.label(),
+                )));
+            }
+            for (stage, ov) in resolved.iter_mut().zip(request.stage_overrides.iter()) {
+                let model = ov
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(ToOwned::to_owned);
+                let choice = settings.choice(&ov.agent, model)?;
+                stage.agent = choice.name.clone();
+                stage.model = choice.model.clone();
+                stage.choice = choice;
+            }
+            for idx in 1..resolved.len() {
+                let prev = &resolved[idx - 1];
+                let curr_diverse =
+                    resolved[idx].agent != prev.agent || resolved[idx].model != prev.model;
+                resolved[idx].diverse = curr_diverse;
+            }
+        }
         let fork = self.repo.head()?.ok_or(Error::NoCommit)?;
         let team_memory = settings.team_memory();
         let human_gate = request
