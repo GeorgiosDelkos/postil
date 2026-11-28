@@ -1107,13 +1107,17 @@ export function codeView({
     const textarea = node.querySelector("textarea");
     const dictation = attachDictation(textarea);
     node.querySelector(".buttons").prepend(dictation.button);
+    const countLines = (text) => text.split("\n").length;
     let lastLength = composer.text.length;
+    let lastLines = countLines(composer.text);
     let shrunk = false;
     let resizeRaf = null;
     textarea.addEventListener("input", () => {
       composer.text = textarea.value;
-      if (textarea.value.length < lastLength) shrunk = true;
+      const lines = countLines(textarea.value);
+      if (textarea.value.length < lastLength || lines < lastLines) shrunk = true;
       lastLength = textarea.value.length;
+      lastLines = lines;
       // Defer auto-resize and composer height measurement into a single animation frame, and
       // skip `height = "auto"` when text grew without overflowing the current height.
       if (resizeRaf !== null) return;

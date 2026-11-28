@@ -58,6 +58,30 @@ struct InFlightFiles {
     ready: Condvar,
 }
 
+/// Ensures an in-flight [`Repo::files`] leader clears the slot and wakes waiters even on unwind.
+struct FilesFlightGuard<'a> {
+    slot: &'a Mutex<Option<Arc<InFlightFiles>>>,
+    leader: Arc<InFlightFiles>,
+    completed: bool,
+}
+
+impl Drop for FilesFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            let mut done = self
+                .leader
+                .done
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if done.is_none() {
+                *done = Some(Err("files listing aborted".to_owned()));
+            }
+            self.leader.ready.notify_all();
+        }
+    }
+}
+
 /// A git working tree on disk.
 #[derive(Debug)]
 pub(crate) struct Repo {
@@ -255,7 +279,10 @@ impl Repo {
     pub(crate) fn branch(&self) -> Result<String> {
         if let Ok(head) = fs::read_to_string(self.git_dir.join("HEAD")) {
             let trimmed = head.trim();
-            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/")
+                && branch != ".invalid"
+                && !branch.contains('\n')
+            {
                 return Ok(branch.to_owned());
             }
             if (trimmed.len() == 40 || trimmed.len() == 64)
@@ -304,6 +331,12 @@ impl Repo {
             flight
         };
 
+        let mut guard = FilesFlightGuard {
+            slot: &self.files_in_flight,
+            leader: Arc::clone(&leader),
+            completed: false,
+        };
+
         let result = self.files_uncached();
         {
             let mut slot = self
@@ -320,6 +353,7 @@ impl Repo {
             });
             leader.ready.notify_all();
         }
+        guard.completed = true;
         result
     }
 

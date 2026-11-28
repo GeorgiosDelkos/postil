@@ -78,12 +78,13 @@ export function notesTray({
       // A resolved note is sent only once reopened (src/notes.rs, `resolve`), and an ask never.
       const offered = state.notes.filter((note) => !isResolved(note) && !isAsk(note));
       const cards = offered.map((note) => [note, cardOf(note, live, liveIds)]);
-      const key = JSON.stringify([
-        "send",
-        cards.map(([, card]) => card),
-        [...state.send.ticked].sort(),
-      ]);
-      if (key === drawnNotes) return;
+      const key = JSON.stringify(["send", cards.map(([, card]) => card)]);
+      if (key === drawnNotes) {
+        for (const box of notesEl.querySelectorAll("input.note-tick")) {
+          box.checked = state.send.ticked.has(box.dataset.noteId);
+        }
+        return;
+      }
       drawnNotes = key;
       notesEl.replaceChildren(...cards.map(([note, card]) => sendItem(note, card)));
       return;

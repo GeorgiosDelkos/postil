@@ -3294,6 +3294,13 @@ fn finish_turn_slot(
     } else {
         Held::None
     };
+    // Re-verify `slot.chain` under the lock: a non-forced `Runner::cancel()` during unlocked
+    // `undo_read_only` may have cleared `slot.chain` without releasing the slot.
+    let stage = stage.filter(|stage| {
+        slot.chain
+            .as_ref()
+            .is_some_and(|chain| chain.stage == **stage)
+    });
     // Decided under the lock, before the stage's end is logged: a reader that sees the end
     // sees the decision, and no Stop or new review can replace the chain meanwhile. The
     // next stage starts once the end is logged.

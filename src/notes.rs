@@ -1028,7 +1028,10 @@ impl Review {
 
 /// Zero-allocation fast-path check: whether `snippet` still appears verbatim at `range` in `text`.
 fn matches_at_range(text: &str, snippet: &str, range: LineRange) -> bool {
-    let count = range.end.saturating_sub(range.start) + 1;
+    if range.start == 0 || range.start > range.end {
+        return false;
+    }
+    let count = range.end - range.start + 1;
     let mut lines = text.lines().skip(range.start - 1);
     let mut wanted = snippet.split('\n');
     for _ in 0..count {

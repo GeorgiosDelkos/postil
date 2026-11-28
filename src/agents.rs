@@ -101,15 +101,6 @@ pub(crate) enum ProgramLookup {
     Missing,
 }
 
-impl ProgramLookup {
-    pub(crate) fn into_path(self) -> Option<PathBuf> {
-        match self {
-            Self::Found(path) => Some(path),
-            Self::Scanning | Self::Missing => None,
-        }
-    }
-}
-
 /// The scan state shared by [`Scanner`] handles.
 #[derive(Debug)]
 struct ScanState {

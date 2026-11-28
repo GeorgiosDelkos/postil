@@ -725,7 +725,7 @@ impl Memory {
     fn recall(&self, query: Query) -> Result<Reply<Recall>> {
         let text = query.text.clone();
         self.ask(Task::Recall(query), |calls| {
-            settled(&mut calls.recalls, &text)
+            settled(&mut calls.recalls, &mut calls.recalls_order, &text)
         })
     }
 
@@ -736,7 +736,9 @@ impl Memory {
     /// As [`Memory::recall_file`].
     pub(crate) fn detail(&self, id: MemoryId) -> Result<Reply<Detail>> {
         let key = id.clone();
-        self.ask(Task::Detail(id), |calls| settled(&mut calls.details, &key))
+        self.ask(Task::Detail(id), |calls| {
+            settled(&mut calls.details, &mut calls.details_order, &key)
+        })
     }
 
     /// Pulls the team's latest notes into the server's index: the first call queues it, and
@@ -761,7 +763,13 @@ impl Memory {
     /// and refreshes, which it never drops.
     pub(crate) fn remember(&self, job: RememberJob) -> Result<Reply<Remembered>> {
         let key = job.clone();
-        self.ask(Task::Remember(job), |calls| calls.remembered.remove(&key))
+        self.ask(Task::Remember(job), |calls| {
+            let removed = calls.remembered.remove(&key);
+            if removed.is_some() {
+                calls.remembered_order.retain(|k| k != &key);
+            }
+            removed
+        })
     }
 
     /// The memories a review checks the work against, recalled for `queries`: the run's prompt
@@ -1733,6 +1741,7 @@ impl Calls {
         self.open_file = None;
         self.refreshed = None;
         self.remembered.clear();
+        self.remembered_order.clear();
         self.kill_server();
     }
 
@@ -1938,11 +1947,14 @@ struct RememberArguments<'a> {
 /// The answer kept in `answers` under `key`: a found one stays, a failure is read once.
 fn settled<K: Hash + Eq, T: Clone>(
     answers: &mut HashMap<K, Answer<T>>,
+    order: &mut VecDeque<K>,
     key: &K,
 ) -> Option<Answer<T>> {
-    match answers.get(key)? {
-        Ok(found) => Some(Ok(found.clone())),
-        Err(_) => answers.remove(key),
+    if let Ok(found) = answers.get(key)? {
+        Some(Ok(found.clone()))
+    } else {
+        order.retain(|k| k != key);
+        answers.remove(key)
     }
 }
 

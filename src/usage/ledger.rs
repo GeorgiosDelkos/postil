@@ -317,6 +317,7 @@ pub(crate) fn append(file: &Path, record: &LedgerRecord) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns the I/O error if the file exists but cannot be read.
+#[cfg(test)]
 pub(crate) fn read(file: &Path) -> io::Result<Vec<LedgerRecord>> {
     let bytes = match fs::read(file) {
         Ok(bytes) => bytes,
@@ -326,28 +327,62 @@ pub(crate) fn read(file: &Path) -> io::Result<Vec<LedgerRecord>> {
     Ok(parse_records(&bytes))
 }
 
-/// Reads valid v1 records appended to `file` starting at byte `offset`, returning the parsed
-/// records and the new file offset.
+/// A chunk of valid v1 records read from `usage.jsonl` together with the exact file identity
+/// and parsed byte offset (never advancing past an unterminated trailing line).
+#[derive(Debug)]
+pub(crate) struct ReadChunk {
+    pub(crate) records: Vec<LedgerRecord>,
+    pub(crate) parsed_offset: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+/// Reads valid v1 records from `file` starting at byte `offset`. When `expected_id` is `Some`,
+/// verifies that the open file descriptor still has the same `(dev, ino)` and `len >= offset`;
+/// returns `Ok(None)` if the file was replaced or truncated so the caller can re-read from 0.
+/// Never advances `parsed_offset` past an unterminated trailing line.
 ///
 /// # Errors
 ///
-/// Returns the I/O error if the file exists but cannot be read.
-pub(crate) fn read_from(file: &Path, offset: u64) -> io::Result<(Vec<LedgerRecord>, u64)> {
+/// Returns the I/O error if the file exists but cannot be opened or read.
+pub(crate) fn read_chunk(
+    file: &Path,
+    offset: u64,
+    expected_id: Option<(u64, u64)>,
+) -> io::Result<Option<ReadChunk>> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut opened = match fs::File::open(file) {
-        Ok(opened) => opened,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-        Err(error) => return Err(error),
-    };
-    let end = opened.metadata()?.len();
-    if offset >= end {
-        return Ok((Vec::new(), end));
+    use std::os::unix::fs::MetadataExt;
+
+    let mut opened = fs::File::open(file)?;
+    let meta = opened.metadata()?;
+    let dev = meta.dev();
+    let ino = meta.ino();
+    let modified = meta.modified().ok();
+    if let Some((exp_dev, exp_ino)) = expected_id
+        && (dev != exp_dev || ino != exp_ino || meta.len() < offset)
+    {
+        return Ok(None);
     }
-    opened.seek(SeekFrom::Start(offset))?;
+    if offset > 0 {
+        opened.seek(SeekFrom::Start(offset))?;
+    }
     let mut bytes = Vec::new();
     opened.read_to_end(&mut bytes)?;
-    let new_offset = offset.saturating_add(bytes.len() as u64);
-    Ok((parse_records(&bytes), new_offset))
+    // Only parse and advance through the last complete `\n`-terminated line so a mid-write
+    // partial line is never skipped permanently.
+    let complete_len = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |pos| pos + 1);
+    let parsed_offset = offset.saturating_add(complete_len as u64);
+    Ok(Some(ReadChunk {
+        records: parse_records(&bytes[..complete_len]),
+        parsed_offset,
+        modified,
+        dev,
+        ino,
+    }))
 }
 
 fn parse_records(bytes: &[u8]) -> Vec<LedgerRecord> {

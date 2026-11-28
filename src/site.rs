@@ -397,7 +397,9 @@ pub(crate) struct Site {
 /// Cached parsed `usage.jsonl` records, invalidated when `(modified, len)` changes.
 struct LedgerCache {
     modified: Option<SystemTime>,
-    len: u64,
+    parsed_offset: u64,
+    dev: u64,
+    ino: u64,
     records: Arc<[ledger::LedgerRecord]>,
 }
 
@@ -1017,7 +1019,7 @@ impl Site {
     ) -> Result<()> {
         // Serialize concurrent `open` calls without holding `self.project.write()` across disk
         // I/O, settings parsing, and runner/definitions construction.
-        let opening = self
+        let _opening = self
             .open_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -1084,18 +1086,14 @@ impl Site {
         // Switch `Memory` only after `project.replace(next)` commits so a refused open never
         // switches team memory away from the still-open busy project.
         self.memory.open_project(&repo);
-        // Release `open_lock` before closing the replaced project so switching projects does not
-        // stall the UI while the old agent shuts down and takes its final snapshot.
-        drop(opening);
         // A run gives its agent team memory only once a check found hippius-mem Ready, and the
         // first check would otherwise wait for the first send or the settings dialog: the send
         // step's preview would leave out the line about it that the send then has.
         if team_memory == TeamMemory::On {
             drop(self.memory.status());
         }
-        // Stops the index and the agent of the project this one replaces, after releasing
-        // `open_lock` and swapping `self.project`: the index is told first, as that waits for
-        // nothing, and the old agent is stopped before `POST /api/open` returns.
+        // Stops the index and the agent of the project this one replaces, while still holding
+        // `open_lock` so a concurrent `POST /api/open` cannot overlap with `old.runner.close()`.
         if let Some(old) = old {
             old.definitions.close();
             old.runner.close();
@@ -1369,10 +1367,17 @@ impl Site {
                 return Ok(cached.json.to_vec());
             }
         }
+        let pre_review_stamp = file_stamp(&repo.review_file());
         let review = notes::current(&repo)?;
         let json = to_json(&review);
         let entry = NotesCache::capture(&repo, &review, Arc::from(json.as_slice()));
-        *notes_cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(entry);
+        // Only populate the cache when `review.json` did not change during `notes::current` so a
+        // concurrent mutation cannot pin stale JSON under the new stamp.
+        if entry.review_stamp == pre_review_stamp {
+            *notes_cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(entry);
+        } else {
+            *notes_cache.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
         Ok(json)
     }
 
@@ -2152,8 +2157,10 @@ impl Site {
         let search_path = self.agents.path();
         let agents = search_path
             .as_deref()
-            .map(|_| agent_views(&loaded.settings, &self.agents));
-        let tools = search_path.as_deref().map(|_| tools_view(&self.agents));
+            .map(|path| agent_views(&loaded.settings, &self.agents, path));
+        let tools = search_path
+            .as_deref()
+            .map(|path| tools_view(&self.agents, path));
         to_json(&SettingsView {
             settings: &loaded.settings,
             problem: loaded.problem,
@@ -2346,9 +2353,11 @@ impl Site {
         }))
     }
 
-    /// Reads `usage.jsonl` with an `(mtime, len)` cache and incremental tailing so repeated
-    /// usage polls and appended runs avoid re-parsing the full history.
+    /// Reads `usage.jsonl` with an `(dev, ino, parsed_offset, mtime)` cache and safe
+    /// incremental tailing so repeated usage polls and appended runs avoid re-parsing the full
+    /// history without duplicating records or skipping partial lines.
     fn read_ledger_cached(&self, file: &Path) -> std::io::Result<Arc<[ledger::LedgerRecord]>> {
+        use std::os::unix::fs::MetadataExt;
         let meta = match std::fs::metadata(file) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2362,17 +2371,22 @@ impl Site {
         };
         let modified = meta.modified().ok();
         let len = meta.len();
+        let dev = meta.dev();
+        let ino = meta.ino();
         let tail_base = {
             let guard = self
                 .ledger_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(cached) = guard.as_ref() {
-                if cached.len == len && cached.modified == modified {
+            if let Some(cached) = guard.as_ref()
+                && cached.dev == dev
+                && cached.ino == ino
+            {
+                if cached.parsed_offset == len && cached.modified == modified {
                     return Ok(Arc::clone(&cached.records));
                 }
-                if len > cached.len {
-                    Some((cached.len, Arc::clone(&cached.records)))
+                if len >= cached.parsed_offset {
+                    Some((cached.parsed_offset, Arc::clone(&cached.records)))
                 } else {
                     None
                 }
@@ -2380,25 +2394,49 @@ impl Site {
                 None
             }
         };
-        let records: Arc<[ledger::LedgerRecord]> = if let Some((offset, prev)) = tail_base {
-            let (appended, new_offset) = ledger::read_from(file, offset)?;
-            if new_offset == len {
-                let mut combined = Vec::with_capacity(prev.len() + appended.len());
+        let (records, parsed_offset, chunk_modified, chunk_dev, chunk_ino) =
+            if let Some((offset, prev)) = tail_base
+                && let Some(chunk) = ledger::read_chunk(file, offset, Some((dev, ino)))?
+            {
+                let mut combined = Vec::with_capacity(prev.len() + chunk.records.len());
                 combined.extend_from_slice(&prev);
-                combined.extend(appended);
-                Arc::from(combined)
+                combined.extend(chunk.records);
+                (
+                    Arc::from(combined),
+                    chunk.parsed_offset,
+                    chunk.modified,
+                    chunk.dev,
+                    chunk.ino,
+                )
             } else {
-                Arc::from(ledger::read(file)?)
-            }
-        } else {
-            Arc::from(ledger::read(file)?)
-        };
+                let chunk = match ledger::read_chunk(file, 0, None) {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => unreachable!("read_chunk with expected_id=None never returns None"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        *self
+                            .ledger_cache
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = None;
+                        return Ok(Arc::from([]));
+                    }
+                    Err(error) => return Err(error),
+                };
+                (
+                    Arc::from(chunk.records),
+                    chunk.parsed_offset,
+                    chunk.modified,
+                    chunk.dev,
+                    chunk.ino,
+                )
+            };
         *self
             .ledger_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(LedgerCache {
-            modified,
-            len,
+            modified: chunk_modified,
+            parsed_offset,
+            dev: chunk_dev,
+            ino: chunk_ino,
             records: Arc::clone(&records),
         });
         Ok(records)
@@ -2411,21 +2449,19 @@ impl Site {
         activities: &mut BTreeMap<String, AgentActivity>,
         fetch: QuotaFetch,
     ) -> Vec<UsageAgentView> {
+        let find = |program: &str| {
+            find_cached_program(&self.agents, program, search_path)
+                .map(|path| path.to_string_lossy().into_owned())
+        };
         let mut entries: Vec<(String, bool, Option<String>)> = Vec::new();
         for agent in BUILT_IN {
-            let found = self
-                .agents
-                .find_program(agent.program)
-                .into_path()
-                .map(|path| path.to_string_lossy().into_owned());
+            let found = find(agent.program);
             if found.is_some() || activities.contains_key(agent.name) {
                 entries.push((agent.name.to_owned(), true, found));
             }
         }
         for agent in settings.custom_agents() {
-            let found = agents::program_of(&agent.command)
-                .and_then(|program| self.agents.find_program(program).into_path())
-                .map(|path| path.to_string_lossy().into_owned());
+            let found = agents::program_of(&agent.command).and_then(find);
             if found.is_some() || activities.contains_key(&agent.name) {
                 entries.push((agent.name.clone(), false, found));
             }
@@ -2512,12 +2548,30 @@ impl Drop for Site {
     }
 }
 
+/// Looks up `program` in `agents`'s per-scan cache, falling back to the snapshotted
+/// `search_path` if a concurrent `rescan()` started mid-request.
+fn find_cached_program(
+    agents: &agents::Scanner,
+    program: &str,
+    search_path: &OsStr,
+) -> Option<PathBuf> {
+    match agents.find_program(program) {
+        agents::ProgramLookup::Found(path) => Some(path),
+        agents::ProgramLookup::Missing => None,
+        agents::ProgramLookup::Scanning => agents::find_program(program, search_path),
+    }
+}
+
 /// The built-in agents, then the custom ones, each with where its program was found on
 /// `agents`'s cached search path.
-fn agent_views<'a>(settings: &'a Settings, agents: &agents::Scanner) -> Vec<AgentView<'a>> {
+fn agent_views<'a>(
+    settings: &'a Settings,
+    agents: &agents::Scanner,
+    search_path: &OsStr,
+) -> Vec<AgentView<'a>> {
     let found = |program: Option<&str>| {
         program
-            .and_then(|program| agents.find_program(program).into_path())
+            .and_then(|program| find_cached_program(agents, program, search_path))
             .map(|path| path.to_string_lossy().into_owned())
     };
     let built_in = BUILT_IN.iter().map(|agent| AgentView {
@@ -2538,11 +2592,9 @@ fn agent_views<'a>(settings: &'a Settings, agents: &agents::Scanner) -> Vec<Agen
 /// Where external tools Postil relies on live on `agents`'s cached search path: `git` for
 /// repositories, `npx` for the Claude and Codex adapters, and `gh` for optional draft pull
 /// requests.
-fn tools_view(agents: &agents::Scanner) -> ToolsView {
+fn tools_view(agents: &agents::Scanner, search_path: &OsStr) -> ToolsView {
     let find = |program| {
-        agents
-            .find_program(program)
-            .into_path()
+        find_cached_program(agents, program, search_path)
             .map(|path| path.to_string_lossy().into_owned())
     };
     ToolsView {
@@ -2674,10 +2726,7 @@ pub(crate) fn page_asset(path: &str) -> Option<Reply> {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, kind)
-                .header(
-                    wry::http::header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
-                )
+                .header(wry::http::header::CACHE_CONTROL, "no-cache")
                 .body(Cow::Borrowed(body))
                 .expect("a status code and two static headers always make a valid response")
         })

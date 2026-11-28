@@ -90,17 +90,17 @@ export function fileList({
     const count = treeData.length;
     if (count === 0) {
       treeWindow = { first: 0, last: 0 };
+      tabStopRow = null;
       filesEl.style.paddingTop = "";
       filesEl.style.paddingBottom = "";
       filesEl.replaceChildren();
       return;
     }
     const viewHeight = filesEl.clientHeight || 600;
-    const visibleFirst = Math.max(0, Math.floor(filesEl.scrollTop / ROW_HEIGHT));
-    const visibleLast = Math.min(
-      count,
-      Math.ceil((filesEl.scrollTop + viewHeight) / ROW_HEIGHT) + 1,
-    );
+    const maxScroll = Math.max(0, count * ROW_HEIGHT + TREE_PADDING_BOTTOM - viewHeight);
+    const scrollTop = Math.min(filesEl.scrollTop, maxScroll);
+    const visibleFirst = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT));
+    const visibleLast = Math.min(count, Math.ceil((scrollTop + viewHeight) / ROW_HEIGHT) + 1);
     const { first, last } = treeWindow;
     const covered = visibleFirst >= first && visibleLast <= last;
     const nearEdge =
@@ -115,13 +115,18 @@ export function fileList({
     const activePath =
       focused ??
       (filesEl.contains(document.activeElement) ? document.activeElement.dataset.path : null);
+    let nextTabStopRow = null;
     const fragment = document.createDocumentFragment();
     for (let index = newFirst; index < newLast; index += 1) {
-      fragment.append(buildTreeRow(treeData[index], treeTotals));
+      const button = buildTreeRow(treeData[index], treeTotals);
+      if (treeData[index].path === tabStopPath) nextTabStopRow = button;
+      fragment.append(button);
     }
+    tabStopRow = nextTabStopRow;
     filesEl.replaceChildren(fragment);
     filesEl.style.paddingTop = `${newFirst * ROW_HEIGHT}px`;
     filesEl.style.paddingBottom = `${(count - newLast) * ROW_HEIGHT + TREE_PADDING_BOTTOM}px`;
+    if (filesEl.scrollTop > maxScroll) filesEl.scrollTop = maxScroll;
     if (activePath) {
       filesEl.querySelector(rowSelector(activePath))?.focus({ preventScroll: true });
     }
@@ -130,9 +135,9 @@ export function fileList({
   function scrollToIndex(index) {
     const top = index * ROW_HEIGHT;
     const bottom = top + ROW_HEIGHT;
-    const viewHeight = filesEl.clientHeight;
+    const viewHeight = filesEl.clientHeight || 600;
     if (top < filesEl.scrollTop) filesEl.scrollTop = top;
-    else if (viewHeight > 0 && bottom > filesEl.scrollTop + viewHeight) {
+    else if (bottom > filesEl.scrollTop + viewHeight) {
       filesEl.scrollTop = bottom - viewHeight;
     }
     renderTreeWindow();

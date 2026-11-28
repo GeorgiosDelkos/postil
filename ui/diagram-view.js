@@ -310,8 +310,8 @@ export function diagramView({
       lastAnalysisRaw = null;
       view.analysis = reply.analysis;
     } else {
-      lastAnalysisRaw = reply.raw;
       const data = JSON.parse(reply.raw);
+      lastAnalysisRaw = reply.raw;
       view.analysis = { status: data ? "ready" : "none", data, error: null };
     }
     onChange();
@@ -1114,7 +1114,6 @@ export function diagramView({
     svg.append(arrowMarker());
     const pane = document.createElementNS(SVG, "g");
     pane.classList.add("map-viewport");
-    pane.style.transformOrigin = "0 0";
     // Precompute parent node IDs once so `nodeCard` checks deeper-diagram existence in O(1).
     const parentIds = new Set();
     for (const each of shownAnalysis()?.diagrams ?? []) {
@@ -1400,15 +1399,10 @@ export function diagramView({
     }
   }
 
-  function syncWillChange() {
-    if (!drawn) return;
-    drawn.pane.style.willChange = panning || glide ? "transform" : "";
-  }
-
   function applyTransform() {
     if (!drawn) return;
     const { x, y, scale } = transform();
-    drawn.pane.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
+    drawn.pane.setAttribute("transform", `translate(${x} ${y}) scale(${scale})`);
     if (drawn.zoomReadout) {
       const pct = Math.round(scale * 100);
       if (pct !== drawn.lastZoomPct) {
@@ -1421,7 +1415,6 @@ export function diagramView({
   function stopGlide() {
     if (glide) cancelAnimationFrame(glide);
     glide = null;
-    syncWillChange();
   }
 
   // Pans to `target` over GLIDE_MS, easing out, or at once when motion is reduced. Any pan or
@@ -1440,24 +1433,13 @@ export function diagramView({
         { immediate: true },
       );
       glide = t < 1 ? requestAnimationFrame(frame) : null;
-      if (!glide) syncWillChange();
     };
     glide = requestAnimationFrame(frame);
-    syncWillChange();
   }
 
   // Set from gesturestart to gestureend (below): the pinch's ctrl+wheel events then zoom
   // nothing.
   let gesturing = false;
-
-  let cachedBounds = null;
-  function bodyBounds() {
-    if (!cachedBounds) cachedBounds = body.getBoundingClientRect();
-    return cachedBounds;
-  }
-  window.addEventListener("resize", () => {
-    cachedBounds = null;
-  });
 
   body.addEventListener(
     "wheel",
@@ -1470,7 +1452,7 @@ export function diagramView({
         // The gesture events below zoom a pinch already: a second zoom here would double it.
         if (gesturing) return;
         // A trackpad pinch arrives as a wheel with the control key (WebKit).
-        const bounds = bodyBounds();
+        const bounds = body.getBoundingClientRect();
         const at = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
         setTransform(zoomAt(now, Math.exp(-event.deltaY * PINCH_RATE), at));
       } else setTransform({ ...now, x: now.x - event.deltaX, y: now.y - event.deltaY });
@@ -1485,7 +1467,6 @@ export function diagramView({
     event.preventDefault();
     pinched = 1;
     gesturing = true;
-    cachedBounds = body.getBoundingClientRect();
   });
   body.addEventListener("gestureend", () => {
     gesturing = false;
@@ -1494,7 +1475,7 @@ export function diagramView({
     if (!drawn) return;
     event.preventDefault();
     stopGlide();
-    const bounds = bodyBounds();
+    const bounds = body.getBoundingClientRect();
     const at = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
     setTransform(zoomAt(transform(), event.scale / pinched, at));
     pinched = event.scale;
@@ -1508,7 +1489,6 @@ export function diagramView({
     body.setPointerCapture(event.pointerId);
     panning = { x: event.clientX, y: event.clientY, from: transform() };
     body.classList.add("panning");
-    syncWillChange();
   });
   body.addEventListener("pointermove", (event) => {
     if (!panning) return;
@@ -1522,7 +1502,6 @@ export function diagramView({
   body.addEventListener("lostpointercapture", () => {
     panning = null;
     body.classList.remove("panning");
-    syncWillChange();
   });
 
   // A pane resized (a divider, the window) keeps the pan, brought back if it lost every node;
@@ -1531,7 +1510,6 @@ export function diagramView({
   new ResizeObserver((entries) => {
     const rect = entries[0]?.contentRect;
     if (rect) cachedViewport = { width: rect.width, height: rect.height };
-    cachedBounds = null;
     if (!drawn || viewport().width === 0) return;
     if (!view.transforms.has(drawn.diagram.id)) {
       view.transforms.set(drawn.diagram.id, fitTransform(drawn.positioned, viewport()));

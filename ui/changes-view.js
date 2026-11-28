@@ -161,6 +161,21 @@ export function changesView({
     return Boolean(focus) && entries.some(({ file, hunk }) => focus(file, hunk));
   }
 
+  // Whether any hunk in `entries` carries a placed note or finding: those files/steps are
+  // exempt from collapsing under `INITIAL_LINE_BUDGET` so findings and notes are never hidden.
+  function hasPlacedMarks(entries, marks) {
+    return entries.some(({ file, hunk }) => {
+      if (!hunk) return false;
+      const fileMarks = marks.get(file);
+      if (!fileMarks) return false;
+      return hunk.lines.some(
+        (line) =>
+          line.new !== null &&
+          (fileMarks.notes.has(line.new) || fileMarks.findings.placed.has(line.new)),
+      );
+    });
+  }
+
   // `element`, drawn for `hunk` of `file`, is what `focusOn`'s draw scrolls to when it is the
   // first that `focus` asks for.
   function aim(element, file, hunk) {
@@ -211,8 +226,16 @@ export function changesView({
       const risks = risksOf(guide);
       let budget = INITIAL_LINE_BUDGET;
       for (const file of files) {
-        const focused = holdsFocus(entriesOf(file));
-        const limit = focused ? Infinity : budget > 0 ? Math.min(LINES_SHOWN, budget) : 0;
+        const entries = entriesOf(file);
+        const focused = holdsFocus(entries);
+        const marked = !focused && hasPlacedMarks(entries, marks);
+        const limit = focused
+          ? Infinity
+          : marked
+            ? LINES_SHOWN
+            : budget > 0
+              ? Math.min(LINES_SHOWN, budget)
+              : 0;
         const total = file.hunks.reduce((sum, hunk) => sum + hunk.lines.length, 0);
         parts.push(fileView(file, marks, risks, limit));
         if (!focused && budget > 0) budget = Math.max(0, budget - Math.min(total, limit));
@@ -333,7 +356,8 @@ export function changesView({
     let budget = INITIAL_LINE_BUDGET;
     const takeLimit = (entries) => {
       if (holdsFocus(entries)) return Infinity;
-      const limit = budget > 0 ? Math.min(LINES_SHOWN, budget) : 0;
+      const marked = hasPlacedMarks(entries, marks);
+      const limit = marked ? LINES_SHOWN : budget > 0 ? Math.min(LINES_SHOWN, budget) : 0;
       const total = entries.reduce((sum, entry) => sum + (entry.hunk?.lines.length ?? 0), 0);
       if (budget > 0) budget = Math.max(0, budget - Math.min(total, limit));
       return limit;

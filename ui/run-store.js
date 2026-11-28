@@ -54,25 +54,43 @@ export function runStore({ render, onChange, onLoaded, onError }) {
       if (hadLoaded) onLoaded();
     });
   }
-  // Coalesces rapid streaming `sync()` UI notifications into one animation frame in the browser,
-  // while keeping synchronous delivery in Node tests where `requestAnimationFrame` is absent.
+  // Coalesces rapid intra-run streaming `sync()` UI notifications into one animation frame in the
+  // browser, while flushing run-ID/status transitions and `liveEnded` synchronously (and keeping
+  // synchronous delivery in Node tests where `requestAnimationFrame` is absent).
   let syncRaf = null;
+  let syncToken = 0;
   let hasPendingSync = false;
   let pendingPrevious = undefined;
   let pendingLiveEnded = false;
   function notifySync(previous, liveEnded) {
-    if (typeof requestAnimationFrame !== "function") {
+    const coalescable =
+      typeof requestAnimationFrame === "function" &&
+      previous?.id === run?.id &&
+      previous?.status === run?.status &&
+      !liveEnded;
+    if (!coalescable) {
+      syncToken += 1;
+      if (syncRaf !== null) {
+        if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(syncRaf);
+        syncRaf = null;
+      }
+      const prev = hasPendingSync ? pendingPrevious : previous;
+      const ended = pendingLiveEnded || liveEnded;
+      pendingPrevious = undefined;
+      pendingLiveEnded = false;
+      hasPendingSync = false;
       render();
-      onChange(run, previous, { liveEnded });
+      onChange(run, prev, { liveEnded: ended });
       return;
     }
     if (!hasPendingSync) {
       pendingPrevious = previous;
       hasPendingSync = true;
     }
-    if (liveEnded) pendingLiveEnded = true;
     if (syncRaf !== null) return;
+    const token = ++syncToken;
     syncRaf = requestAnimationFrame(() => {
+      if (token !== syncToken) return;
       syncRaf = null;
       const prev = pendingPrevious;
       const ended = pendingLiveEnded;
