@@ -314,7 +314,7 @@ impl Settings {
     /// # Errors
     ///
     /// [`Error::BadRequest`] when it is not enabled.
-    fn choice(&self, name: &str, model: Option<String>) -> Result<AgentChoice> {
+    pub(crate) fn choice(&self, name: &str, model: Option<String>) -> Result<AgentChoice> {
         if !self.0.enabled_agents.iter().any(|enabled| enabled == name) {
             return Err(Error::BadRequest(format!(
                 "turn {name} on in Settings before sending to it"

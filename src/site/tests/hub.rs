@@ -174,3 +174,61 @@ fn hard_lane_issue_pauses_at_plan_gate_and_completes_after_approval() {
         "pipeline state persisted to disk"
     );
 }
+
+#[test]
+fn custom_lane_applies_stage_overrides_and_rejects_mismatched_length() {
+    let repo = TempRepo::new("hub-custom-lane");
+    repo.write("a.txt", "initial\n");
+    let (site, nudges) = run_site(&repo, "writes");
+
+    let settings = get_json(&site, SETTINGS);
+    let enabled = settings["settings"]["enabledAgents"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(serde_json::Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    // Mismatched override count for Easy base lane (expects 1 stage, given 2) returns 400.
+    let bad_body = serde_json::json!({
+        "lane": "custom",
+        "baseLane": "easy",
+        "stageOverrides": [
+            { "agent": enabled, "model": "custom-m1" },
+            { "agent": enabled, "model": "custom-m2" }
+        ],
+        "kind": "issue",
+        "number": 77,
+        "title": "Bad override count",
+    })
+    .to_string();
+    let (status, _) = post(&site, LANE_START, &bad_body);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Valid custom lane overrides stage 0's agent & model and completes.
+    let good_body = serde_json::json!({
+        "lane": "custom",
+        "baseLane": "easy",
+        "stageOverrides": [
+            { "agent": enabled, "model": "pro" }
+        ],
+        "kind": "issue",
+        "number": 78,
+        "title": "Run with custom stage override",
+        "body": "Apply custom agent/model override.",
+        "humanGate": false,
+    })
+    .to_string();
+    let (status, body) = post(&site, LANE_START, &good_body);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let pipeline_id = started["id"].as_str().unwrap().to_owned();
+
+    let finished = wait_for_pipeline_status(&site, &nudges, &pipeline_id, "completed");
+    assert_eq!(finished["lane"], "custom");
+    let stages = finished["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 1);
+    assert_eq!(stages[0]["agent"], enabled);
+    assert_eq!(stages[0]["model"], "pro");
+    assert_eq!(stages[0]["status"], "completed");
+}
