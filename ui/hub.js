@@ -78,7 +78,11 @@ export function applyStageOverride(stages, index, { agent, model }) {
     if (idx !== index) return { ...st };
     const nextAgent = agent ?? st.agent;
     const nextModel =
-      agent !== undefined && agent !== st.agent ? (model ?? null) : (model === undefined ? st.model : model);
+      agent !== undefined && agent !== st.agent
+        ? (model ?? null)
+        : model === undefined
+          ? st.model
+          : model;
     return { ...st, agent: nextAgent, model: nextModel || null };
   });
   for (let idx = 1; idx < next.length; idx += 1) {

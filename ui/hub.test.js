@@ -167,10 +167,7 @@ test("dragHubPane, stepHubPane, and resetHubPane match main pane divider semanti
 
   // Respects room left for queue minimum in a narrow shell.
   const narrow = dragHubPane(start, "repos", 600, 900);
-  assert.equal(
-    narrow.repos,
-    900 - HUB_QUEUE_MIN - HUB_DIVIDER_GAPS - HUB_PANE_LIMITS.inspector[0],
-  );
+  assert.equal(narrow.repos, 900 - HUB_QUEUE_MIN - HUB_DIVIDER_GAPS - HUB_PANE_LIMITS.inspector[0]);
 
   // Arrow keys: right widens repos and narrows inspector.
   assert.equal(stepHubPane(start, "repos", 16, 1400).repos, 266);

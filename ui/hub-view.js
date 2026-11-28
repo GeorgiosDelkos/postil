@@ -246,7 +246,8 @@ export function hubView({
     try {
       const stages = activeStages();
       const hasPlanJudge =
-        lane === "hard" || (lane === "custom" && Boolean(stages?.some((s) => s.kind === "planJudge")));
+        lane === "hard" ||
+        (lane === "custom" && Boolean(stages?.some((s) => s.kind === "planJudge")));
       const payload = {
         repoPath: item.repoPath,
         lane,
@@ -839,7 +840,10 @@ export function hubView({
       });
       const head = el("div", "hub-lane-opt-head");
       const nameWrap = el("span", "hub-lane-opt-name");
-      nameWrap.append(el("span", `hub-lane-dot lane-${candidate}`), el("span", "", `${laneLabel(candidate)} Lane`));
+      nameWrap.append(
+        el("span", `hub-lane-dot lane-${candidate}`),
+        el("span", "", `${laneLabel(candidate)} Lane`),
+      );
       head.append(nameWrap);
       if (rec) head.append(el("span", "hub-rec-badge", "Recommended"));
       opt.append(head, el("div", "hub-lane-opt-desc", laneSummary(candidate, item.kind)));
@@ -887,11 +891,7 @@ export function hubView({
           tags.append(el("span", `hub-tier-pill tier-${st.tier}`, st.tier));
         }
         tags.append(
-          el(
-            "span",
-            `hub-mode-pill mode-${st.readOnly ? "ro" : "rw"}`,
-            st.readOnly ? "RO" : "RW",
-          ),
+          el("span", `hub-mode-pill mode-${st.readOnly ? "ro" : "rw"}`, st.readOnly ? "RO" : "RW"),
         );
         if (st.diverse) {
           const divIcon = uiIcon("sparkles", "hub-diverse-icon");
@@ -930,11 +930,7 @@ export function hubView({
 
         controlsRow.append(agentSel, modelSel);
 
-        row.append(
-          el("span", `hub-stage-num lane-${lane}`, `${idx + 1}`),
-          topLine,
-          controlsRow,
-        );
+        row.append(el("span", `hub-stage-num lane-${lane}`, `${idx + 1}`), topLine, controlsRow);
         roster.append(row);
       }
     } else {
@@ -943,7 +939,8 @@ export function hubView({
     laneSec.append(roster);
 
     const hasPlanJudge =
-      lane === "hard" || (lane === "custom" && Boolean(stages?.some((s) => s.kind === "planJudge")));
+      lane === "hard" ||
+      (lane === "custom" && Boolean(stages?.some((s) => s.kind === "planJudge")));
     if (hasPlanJudge && item.kind === "issue") {
       const gateRow = el("div", "hub-gate-toggle");
       const gateSwitch = toggleSwitch(
@@ -993,6 +990,10 @@ export function hubView({
     hide() {
       ui.shown = false;
       clearTimeout(ui.pollTimer);
+      if (ui.dragging) {
+        ui.dragging = null;
+        document.body.classList.remove("resizing");
+      }
       models.reset();
       document.body.classList.remove("hub-mode");
       hubEl.hidden = true;
@@ -1009,6 +1010,7 @@ export function hubView({
     },
     invalidateStages() {
       ui.stagePreviewKey = null;
+      models.reset();
       if (ui.shown) render();
     },
   };

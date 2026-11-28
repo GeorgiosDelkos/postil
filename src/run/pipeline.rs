@@ -530,8 +530,8 @@ impl Runner {
                     .filter(|m| !m.is_empty())
                     .map(ToOwned::to_owned);
                 let choice = settings.choice(&ov.agent, model)?;
-                stage.agent = choice.name.clone();
-                stage.model = choice.model.clone();
+                stage.agent.clone_from(&choice.name);
+                stage.model.clone_from(&choice.model);
                 stage.choice = choice;
             }
             for idx in 1..resolved.len() {
