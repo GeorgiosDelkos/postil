@@ -24,6 +24,15 @@ fn custom_settings() -> serde_json::Value {
             { "name": "Grok", "model": null },
         ],
         "agentMemory": false,
+        "modelTiers": {
+            "fast": [],
+            "standard": [],
+            "frontier": [],
+        },
+        "lanes": {
+            "hardHumanGate": true,
+            "autoTriage": true,
+        },
     })
 }
 
@@ -57,7 +66,7 @@ fn settings_start_as_the_defaults_and_saved_ones_survive_a_restart() {
     assert_eq!(restarted["settings"], custom_settings());
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["version"], 5);
     assert_eq!(stored["settings"], custom_settings());
 }
 
@@ -197,8 +206,8 @@ fn a_settings_file_that_cannot_be_used_is_kept_until_it_is_reset() {
             "is not valid settings JSON",
         ),
         (
-            "{\"version\": 5, \"settings\": {}}",
-            "written by a newer Postil (format version 5)",
+            "{\"version\": 6, \"settings\": {}}",
+            "written by a newer Postil (format version 6)",
         ),
         (
             "{\"version\": 1, \"settings\": {\"agent\": 7}}",
@@ -443,7 +452,7 @@ fn a_version_1_file_is_read_as_slots_without_models_and_saved_as_version_4() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["version"], 5);
     assert_eq!(stored["settings"]["analyzer"], serde_json::Value::Null);
     assert_eq!(stored["settings"]["agent"], view["settings"]["agent"]);
     assert_eq!(stored["settings"]["reviewers"][0]["model"], "grok-4.7");

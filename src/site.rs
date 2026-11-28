@@ -23,12 +23,17 @@ use crate::error::{Error, Result, error_chain};
 use crate::files::config_dir;
 use crate::folders::{self, Folders};
 use crate::highlight::{self, HighlightedLines, Highlighter};
+use crate::hub::HubManager;
+use crate::lane::{self, Lane, WorkKind};
 use crate::layout::{self, Layout, RawLayout};
-use crate::memory::{self, Memory, MemoryId, RememberRequest};
+use crate::memory::{self, BackendInfo, Memory, MemoryId, RememberRequest, UpgradeS3Request};
 use crate::models::{ModelProber, ModelReport};
 use crate::notes::{self, NewNote, Review};
 use crate::recent;
 use crate::repo::Repo;
+use crate::run::pipeline::{
+    ApproveGateRequest, ReviseGateRequest, StartPipelineRequest, SubmitPrReviewRequest,
+};
 use crate::run::{Ending, Notify, Runner, StartedUpdate};
 use crate::settings::{self, CustomAgent, RawSettings, Settings, TeamMemory};
 use crate::usage::{
@@ -242,6 +247,22 @@ const PAGE: &[(&str, &str, &[u8])] = &[
         "text/javascript",
         include_bytes!("../ui/welcome.js"),
     ),
+    ("/hub.js", "text/javascript", include_bytes!("../ui/hub.js")),
+    (
+        "/hub-view.js",
+        "text/javascript",
+        include_bytes!("../ui/hub-view.js"),
+    ),
+    (
+        "/plan-gate.js",
+        "text/javascript",
+        include_bytes!("../ui/plan-gate.js"),
+    ),
+    (
+        "/pr-review.js",
+        "text/javascript",
+        include_bytes!("../ui/pr-review.js"),
+    ),
     (
         "/diagram.js",
         "text/javascript",
@@ -390,6 +411,8 @@ pub(crate) struct Site {
     models: ModelProber,
     /// Whether hippius-mem is installed and set up, checked in the background (`memory.rs`).
     memory: Memory,
+    /// Multi-repo Agentic Developer Hub (`hub.rs`): monitored repos, GitHub sync, priority triage.
+    hub: HubManager,
     /// Tells the page a run changed (`run.rs`).
     notify: Notify,
 }
@@ -604,6 +627,8 @@ struct MemoryView {
     state: Option<MemoryStateView>,
     /// The last set up; `None` before the first.
     setup: Option<memory::Setup>,
+    /// Detected storage backend (`local` trial vault vs paid remote `s3` bucket).
+    backend: BackendInfo,
 }
 
 /// [`memory::State`] with its path as text.
@@ -635,6 +660,7 @@ impl From<memory::Status> for MemoryView {
             pending: state.is_none() || status.setup == Some(memory::Setup::Running),
             state,
             setup: status.setup,
+            backend: status.backend,
         }
     }
 }
@@ -865,6 +891,33 @@ struct AskRun {
     note: NewNote,
 }
 
+/// The body of `POST /api/memory/join`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinBundleBody {
+    bundle: String,
+}
+
+/// The body of `POST /api/hub/repos`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HubRepoRequest {
+    action: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    selected: Option<bool>,
+}
+
+/// The body of `POST /api/hub/evaluate`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HubEvaluateRequest {
+    repo: String,
+    kind: WorkKind,
+    number: u64,
+}
+
 /// The body of `POST /api/open` and `POST /api/init`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -929,6 +982,12 @@ impl Site {
         let memory = Memory::new(agents.clone());
         #[cfg(test)]
         let memory = Memory::new(Scanner::new(OsString::new));
+        let hub = HubManager::new(
+            config.map(|dir| dir.join("hub.json")),
+            agents.clone(),
+            memory.clone(),
+            Arc::clone(&notify),
+        );
         Self {
             project: RwLock::new(None),
             open_lock: Mutex::new(()),
@@ -943,6 +1002,7 @@ impl Site {
             home: home.map(Path::to_owned),
             models: ModelProber::live(agents.clone()),
             memory,
+            hub,
             agents,
             quotas: QuotaPoller::live(),
             sessions: SessionScanner::disabled(),
@@ -1200,6 +1260,9 @@ impl Site {
             }
             path if path == "/api/thread" || path.starts_with("/api/thread/") => {
                 self.respond_thread(path, method, query, body)
+            }
+            path if is_hub_or_lane_path(path) => {
+                self.respond_hub_or_lane(path, method, query, body)
             }
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
@@ -1689,6 +1752,16 @@ impl Site {
                 Method::POST => json_or_error(self.memory.setup().map(|()| self.settings())),
                 _ => not_allowed("POST with no body"),
             },
+            "/api/memory/upgrade" => match *method {
+                Method::POST => json_or_error(self.memory_upgrade_s3(request.body())),
+                _ => not_allowed(
+                    "POST {\"bucket\": ..., \"accessKeyId\": ..., \"secretAccessKey\": ...}",
+                ),
+            },
+            "/api/memory/join" => match *method {
+                Method::POST => json_or_error(self.memory_join_bundle(request.body())),
+                _ => not_allowed("POST {\"bundle\": ...}"),
+            },
             _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
         }
     }
@@ -1768,6 +1841,235 @@ impl Site {
         let repo = self.repo()?;
         let job = request.into_job(&repo)?;
         Ok(to_json(&self.memory.remember(job)?))
+    }
+
+    fn memory_upgrade_s3(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: UpgradeS3Request = parse_body(body, Error::BadRequest)?;
+        self.memory.upgrade_s3(request)?;
+        Ok(self.settings())
+    }
+
+    fn memory_join_bundle(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: JoinBundleBody = parse_body(body, Error::BadRequest)?;
+        self.memory.join_bundle(request.bundle)?;
+        Ok(self.settings())
+    }
+
+    fn respond_hub_or_lane(&self, path: &str, method: &Method, query: &str, body: &[u8]) -> Reply {
+        if path == "/api/hub" || path.starts_with("/api/hub/") {
+            self.respond_hub(path, method, body)
+        } else {
+            self.respond_lane(path, method, query, body)
+        }
+    }
+
+    /// Replies to `/api/hub` and `/api/hub/*`.
+    fn respond_hub(&self, path: &str, method: &Method, body: &[u8]) -> Reply {
+        match path {
+            "/api/hub" => match *method {
+                Method::GET => reply(
+                    StatusCode::OK,
+                    "application/json",
+                    to_json(&self.hub.view()),
+                ),
+                _ => not_allowed("GET"),
+            },
+            "/api/hub/repos" => match *method {
+                Method::POST => json_or_error(self.hub_repos(body)),
+                _ => not_allowed(
+                    "POST {\"action\": \"add\"|\"remove\"|\"select\"|\"selectAll\", ...}",
+                ),
+            },
+            "/api/hub/sync" => match *method {
+                Method::POST => {
+                    let settings = self.current_settings();
+                    let use_memory =
+                        settings.lanes().auto_triage && settings.team_memory() == TeamMemory::On;
+                    self.hub.sync_all(use_memory);
+                    reply(
+                        StatusCode::OK,
+                        "application/json",
+                        to_json(&self.hub.view()),
+                    )
+                }
+                _ => not_allowed("POST with no body"),
+            },
+            "/api/hub/evaluate" => match *method {
+                Method::POST => json_or_error(self.hub_evaluate(body)),
+                _ => not_allowed("POST {\"repo\": ..., \"kind\": ..., \"number\": ...}"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    fn hub_repos(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: HubRepoRequest = parse_body(body, Error::BadRequest)?;
+        match request.action.as_str() {
+            "add" => {
+                let path = request
+                    .path
+                    .as_deref()
+                    .filter(|p| !p.trim().is_empty())
+                    .ok_or_else(|| Error::BadRequest("expected path to monitor".to_owned()))?;
+                let settings = self.current_settings();
+                let use_memory =
+                    settings.lanes().auto_triage && settings.team_memory() == TeamMemory::On;
+                self.hub.add_repo(Path::new(path), use_memory)?;
+            }
+            "remove" => {
+                let path = request
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| Error::BadRequest("expected path to remove".to_owned()))?;
+                self.hub.remove_repo(path);
+            }
+            "select" => {
+                let path = request
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| Error::BadRequest("expected path to select".to_owned()))?;
+                let selected = request.selected.unwrap_or(true);
+                self.hub.set_selected(path, selected);
+            }
+            "selectAll" => {
+                let selected = request.selected.unwrap_or(true);
+                self.hub.set_all_selected(selected);
+            }
+            other => {
+                return Err(Error::BadRequest(format!(
+                    "unknown hub action {other:?}: expected add, remove, select, or selectAll"
+                )));
+            }
+        }
+        Ok(to_json(&self.hub.view()))
+    }
+
+    fn hub_evaluate(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: HubEvaluateRequest = parse_body(body, Error::BadRequest)?;
+        let settings = self.current_settings();
+        let use_memory = settings.team_memory() == TeamMemory::On;
+        let item =
+            self.hub
+                .evaluate_item(&request.repo, request.kind, request.number, use_memory)?;
+        Ok(to_json(&item))
+    }
+
+    /// Replies to `/api/lanes/preview`, `/api/pipelines`, `/api/lane/*`, and `/api/pr/submit-review`.
+    fn respond_lane(&self, path: &str, method: &Method, query: &str, body: &[u8]) -> Reply {
+        match path {
+            "/api/lanes/preview" => match *method {
+                Method::GET => json_or_error(self.lane_preview(query)),
+                _ => not_allowed("GET ?lane=easy|middle|hard&kind=issue|pullRequest"),
+            },
+            "/api/pipelines" => match *method {
+                Method::GET => {
+                    json_or_error(self.runner().map(|runner| to_json(&runner.pipelines())))
+                }
+                _ => not_allowed("GET"),
+            },
+            "/api/lane/start" => match *method {
+                Method::POST => json_or_error(self.start_lane(body)),
+                _ => not_allowed(
+                    "POST {\"lane\": ..., \"kind\": ..., \"number\": ..., \"title\": ...}",
+                ),
+            },
+            "/api/lane/gate/approve" => match *method {
+                Method::POST => json_or_error(self.approve_lane_gate(body)),
+                _ => not_allowed("POST {\"pipeline\": \"R1\", ...}"),
+            },
+            "/api/lane/gate/revise" => match *method {
+                Method::POST => json_or_error(self.revise_lane_gate(body)),
+                _ => not_allowed("POST {\"pipeline\": \"R1\", \"feedback\": ...}"),
+            },
+            "/api/pr/submit-review" => match *method {
+                Method::POST => json_or_error(self.submit_pr_review(body)),
+                _ => not_allowed("POST {\"number\": ..., \"verdict\": ..., ...}"),
+            },
+            _ => reply(StatusCode::NOT_FOUND, "text/plain", &b"not found"[..]),
+        }
+    }
+
+    fn lane_preview(&self, query: &str) -> Result<Vec<u8>> {
+        let lane = match query_value(query, "lane").as_deref() {
+            Some("easy") => Lane::Easy,
+            Some("middle") => Lane::Middle,
+            Some("hard") => Lane::Hard,
+            other => {
+                return Err(Error::BadRequest(format!(
+                    "lane={other:?}: expected easy, middle, or hard"
+                )));
+            }
+        };
+        let kind = match query_value(query, "kind").as_deref() {
+            Some("issue") => WorkKind::Issue,
+            Some("pullRequest") => WorkKind::PullRequest,
+            other => {
+                return Err(Error::BadRequest(format!(
+                    "kind={other:?}: expected issue or pullRequest"
+                )));
+            }
+        };
+        let settings = self.current_settings();
+        let stages = lane::resolve_stages(&settings, lane, kind)?;
+        Ok(to_json(&serde_json::json!({
+            "lane": lane,
+            "kind": kind,
+            "hardHumanGate": settings.lanes().hard_human_gate,
+            "stages": stages,
+        })))
+    }
+
+    fn start_lane(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let mut request: StartPipelineRequest = parse_body(body, Error::BadRequest)?;
+        let settings = self.current_settings();
+        let use_memory = settings.team_memory() == TeamMemory::On;
+        // Hydrate body/labels/memories from Hub cache when the caller passes only minimal fields.
+        if request.body.is_empty()
+            && let Ok(repo) = self.repo()
+            && let Some(cached) =
+                self.hub
+                    .find_item(&repo.root().to_string_lossy(), request.kind, request.number)
+        {
+            request.body = cached.body;
+            if request.url.is_empty() {
+                request.url = cached.url;
+            }
+            if request.labels.is_empty() {
+                request.labels = cached.labels;
+            }
+            if use_memory && request.memories.is_empty() {
+                request.memories = cached.memories;
+            }
+            if request.base_branch.is_none() {
+                request.base_branch = cached.base_ref;
+            }
+            if request.head_branch.is_none() {
+                request.head_branch = cached.head_ref;
+            }
+        }
+        if !use_memory {
+            request.memories.clear();
+        }
+        let pipeline = self.runner()?.start_pipeline(request, &settings)?;
+        Ok(to_json(&pipeline))
+    }
+
+    fn approve_lane_gate(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: ApproveGateRequest = parse_body(body, Error::BadRequest)?;
+        let pipeline = self.runner()?.approve_pipeline_gate(request)?;
+        Ok(to_json(&pipeline))
+    }
+
+    fn revise_lane_gate(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: ReviseGateRequest = parse_body(body, Error::BadRequest)?;
+        let pipeline = self.runner()?.revise_pipeline_gate(&request)?;
+        Ok(to_json(&pipeline))
+    }
+
+    fn submit_pr_review(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let request: SubmitPrReviewRequest = parse_body(body, Error::BadRequest)?;
+        self.runner()?.submit_pr_review(&request)?;
+        Ok(b"{}".to_vec())
     }
 
     /// The replies to `/api/thread` and the routes under it, as [`Site::respond`] gives them:
@@ -2611,6 +2913,15 @@ fn after_of(query: &str) -> Result<usize> {
             Error::BadRequest(format!("after={after:?}: expected a number of entries"))
         })
     })
+}
+
+fn is_hub_or_lane_path(path: &str) -> bool {
+    path == "/api/hub"
+        || path.starts_with("/api/hub/")
+        || path == "/api/pipelines"
+        || path.starts_with("/api/lanes/")
+        || path.starts_with("/api/lane/")
+        || path == "/api/pr/submit-review"
 }
 
 fn to_json<T: Serialize>(value: &T) -> Vec<u8> {

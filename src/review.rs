@@ -217,6 +217,11 @@ impl MemoryBlock {
         self.ids.is_empty()
     }
 
+    /// The formatted memory block text, empty when no memories were recalled.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+
     /// Whether memory `id` is in the block.
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.ids.iter().any(|held| held == id)

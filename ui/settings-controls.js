@@ -476,12 +476,19 @@ export function dialogMenu(dialogEl) {
   element.setAttribute("aria-label", "Agents");
   element.tabIndex = -1;
   element.hidden = true;
+  let returnKey = "reviewer-add";
   // When the menu closes with the focus in it, the focus goes back to the button that opened
   // it, found by its key, since a redraw may have replaced the button meanwhile.
-  const back = { focus: () => restoreDialogFocus(dialogEl, "reviewer-add") };
+  const back = { focus: () => restoreDialogFocus(dialogEl, returnKey) };
   const menu = contextMenu({ menuEl: element, codeEl: back });
   dialogEl.addEventListener("close", menu.close);
-  return { element, open: menu.open };
+  return {
+    element,
+    open(x, y, actions, focusKey = "reviewer-add") {
+      returnKey = focusKey;
+      menu.open(x, y, actions);
+    },
+  };
 }
 
 // Restores focus inside `dialogEl` after a full redraw, using each control's `data-key`.

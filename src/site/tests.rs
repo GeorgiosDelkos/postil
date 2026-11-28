@@ -7,6 +7,7 @@ mod analysis;
 mod asks;
 mod definitions;
 mod files;
+mod hub;
 mod memory;
 mod notes;
 mod page_e2e;

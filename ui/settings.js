@@ -21,11 +21,39 @@ export function codeMetrics(fontSize) {
 // agent and the model it runs, `model` null for the agent's own default (src/settings.rs,
 // AgentSlot). The analyzer is null when analyses go to the agent notes are sent to.
 
+export const CAPABILITY_TIERS = [
+  [
+    "frontier",
+    "Tier 3 · Frontier",
+    "Hard Lane planning, plan judging, deep implementation & final judge",
+  ],
+  ["standard", "Tier 2 · Standard", "Day-to-day implementation & Middle Lane peer reviews"],
+  ["fast", "Tier 1 · Fast", "Queue triage, quick checks & Easy Lane trivial tasks"],
+];
+
+function tiersOf(settings) {
+  return settings.modelTiers ?? { fast: [], standard: [], frontier: [] };
+}
+
+function lanesOf(settings) {
+  return settings.lanes ?? { hardHumanGate: true, autoTriage: true };
+}
+
 // What an agent is used for, in words, or null when it is free to disable or remove.
 export function usage(settings, name) {
   if (settings.agent?.name === name) return "notes are sent to it";
   if (settings.analyzer?.name === name) return "it analyzes the repository";
   if (settings.reviewers.some((slot) => slot.name === name)) return "it reviews the agent's work";
+  const tiers = tiersOf(settings);
+  for (const [tier, label] of [
+    ["frontier", "Tier 3 (Frontier)"],
+    ["standard", "Tier 2 (Standard)"],
+    ["fast", "Tier 1 (Fast)"],
+  ]) {
+    if ((tiers[tier] ?? []).some((slot) => slot.name === name)) {
+      return `it is in ${label}`;
+    }
+  }
   return null;
 }
 
@@ -110,6 +138,14 @@ export function saveCustomAgent(settings, agent, previous, builtInNames) {
   const rename = (each) => (each === previous ? name : each);
   // The model stays: the agent is the same one under another name.
   const renameSlot = (slot) => ({ ...slot, name: rename(slot.name) });
+  const prevTiers = settings.modelTiers;
+  const modelTiers = prevTiers
+    ? {
+        fast: (prevTiers.fast ?? []).map(renameSlot),
+        standard: (prevTiers.standard ?? []).map(renameSlot),
+        frontier: (prevTiers.frontier ?? []).map(renameSlot),
+      }
+    : undefined;
   return {
     settings: {
       ...settings,
@@ -118,6 +154,7 @@ export function saveCustomAgent(settings, agent, previous, builtInNames) {
       agent: settings.agent === null ? null : renameSlot(settings.agent),
       analyzer: settings.analyzer ? renameSlot(settings.analyzer) : null,
       reviewers: settings.reviewers.map(renameSlot),
+      ...(modelTiers ? { modelTiers } : {}),
     },
   };
 }
@@ -230,4 +267,36 @@ export function setAgentMemory(settings, enabled, state) {
     return { error: "Set up hippius-mem before giving agents team memory." };
   }
   return { settings: { ...settings, agentMemory: enabled } };
+}
+
+// Adds an enabled agent to a capability tier ("fast" | "standard" | "frontier").
+export function addTierSlot(settings, tier, name, model = null) {
+  if (!settings.enabledAgents.includes(name)) return { error: `Turn ${name} on first.` };
+  const tiers = tiersOf(settings);
+  const next = [...(tiers[tier] ?? []), { name, model }];
+  return { settings: { ...settings, modelTiers: { ...tiers, [tier]: next } } };
+}
+
+// Updates the model of a slot inside a capability tier.
+export function setTierSlotModel(settings, tier, index, model) {
+  const tiers = tiersOf(settings);
+  const next = (tiers[tier] ?? []).map((slot, at) => (at === index ? { ...slot, model } : slot));
+  return { settings: { ...settings, modelTiers: { ...tiers, [tier]: next } } };
+}
+
+// Removes a slot from a capability tier.
+export function removeTierSlot(settings, tier, index) {
+  const tiers = tiersOf(settings);
+  const next = (tiers[tier] ?? []).toSpliced(index, 1);
+  return { settings: { ...settings, modelTiers: { ...tiers, [tier]: next } } };
+}
+
+// Toggles whether Hard Lane pauses after Stage 2 (Plan Judge) for human approval.
+export function setHardHumanGate(settings, enabled) {
+  return { settings: { ...settings, lanes: { ...lanesOf(settings), hardHumanGate: enabled } } };
+}
+
+// Toggles whether the Hub runs automatic cached triage on synced items.
+export function setAutoTriage(settings, enabled) {
+  return { settings: { ...settings, lanes: { ...lanesOf(settings), autoTriage: enabled } } };
 }

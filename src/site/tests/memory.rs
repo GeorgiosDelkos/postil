@@ -342,7 +342,7 @@ fn team_memory_turns_on_only_when_ready_and_stays_on_when_the_program_goes() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(stored["version"], 4);
+    assert_eq!(stored["version"], 5);
     assert_eq!(stored["settings"]["agentMemory"], true);
 
     // Uninstalled later: other changes still save, and it can be turned off, not on again.
